@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::jobs::JobKind;
 use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
@@ -21,11 +22,11 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::family_report;
+use aruna_operations::jobs::lifecycle::report::family_report;
 use aruna_operations::jobs::service::{
-    ArtifactLookup, JobKind, JobReportLookup, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
-    read_report_routed, resolve_job_owner,
+    ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
+    delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
+    resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::node::node_info::read_info_documents;
@@ -38,8 +39,6 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
@@ -449,12 +448,7 @@ struct ReportCursor {
 
 fn decode_report_cursor(cursor: Option<&str>) -> ServerResult<Option<ReportCursor>> {
     cursor
-        .map(|cursor| {
-            URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)
-                .and_then(|bytes| postcard::from_bytes(&bytes).map_err(|_| ServerError::BadRequest))
-        })
+        .map(|cursor| aruna_core::cursor::decode_value(cursor).map_err(|_| ServerError::BadRequest))
         .transpose()
 }
 
@@ -465,12 +459,11 @@ fn encode_report_cursor(
 ) -> ServerResult<Option<String>> {
     last_key
         .map(|last_key| {
-            postcard::to_allocvec(&ReportCursor {
+            aruna_core::cursor::encode_value(&ReportCursor {
                 job_id,
                 report_digest,
                 last_key,
             })
-            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
             .map_err(|error| ServerError::InternalError(error.into()))
         })
         .transpose()
@@ -508,7 +501,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::UploadClaimError;
+            use aruna_operations::jobs::import::upload::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,

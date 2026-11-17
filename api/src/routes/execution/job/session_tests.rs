@@ -6,8 +6,9 @@ use super::*;
 use crate::auth::UnrestrictedAuth;
 use aruna_compute::ExecutorRegistry;
 use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
-use aruna_compute::session::{SessionConfig, SessionPhase};
+use aruna_compute::session::{Session, SessionConfig};
 use aruna_core::UserId;
+use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
@@ -37,8 +38,10 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, cancel_running_job, claim_job, insert_job, put_job_entry, read_job_record,
+use aruna_operations::jobs::store::put_job_entry;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{
+    ClaimOutcome, cancel_running_job, claim_job, read_job_record,
 };
 use aruna_storage::{FjallStorage, StorageHandle};
 use async_trait::async_trait;

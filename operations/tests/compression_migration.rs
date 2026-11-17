@@ -138,7 +138,7 @@ async fn restart_resumes_migration() {
         compute_handle: None,
         outbound_handle: None,
     });
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(restarted, task_handle, JobsRuntime::new(), &shutdown).await;
 
     // A generous cap only detects lost progress; the run itself needs a few seconds.

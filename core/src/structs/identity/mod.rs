@@ -7,6 +7,7 @@ pub mod auth;
 pub mod group;
 pub mod group_delete;
 pub mod identifier;
+pub mod node_state;
 pub mod realm;
 pub mod s3_session;
 pub mod user;

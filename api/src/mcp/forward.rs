@@ -8,7 +8,7 @@ use super::data::map_bucket_error;
 use super::{McpServer, explained, internal_error, server_error};
 use crate::error::ServerError;
 use crate::lookup::map_guard_error;
-use crate::lookup::{RELAY_NODE_HEADER, capped_body, node_directed};
+use crate::routes::storage::relay::{RELAY_NODE_HEADER, capped_body, node_directed};
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmConfigDocument;

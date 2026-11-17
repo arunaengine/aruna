@@ -5,8 +5,8 @@
 use super::*;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
-    test_storage, write_doc,
+    seed_group_docs, seed_realm_auth, seed_realm_config, test_state as build_state, test_storage,
+    write_doc,
 };
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
@@ -27,6 +27,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_operations::sync::mirror_repair::{SyncMirrorRecord, process_mirror_repairs};
+use aruna_operations::testing::test_context;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -186,7 +187,7 @@ async fn decrypting_source(state: &ServerState, user: UserId) {
 #[tokio::test]
 async fn decrypting_copy_consent() {
     use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
-    use aruna_operations::jobs::store::iter_prefix_page;
+    use aruna_operations::jobs::store::query::iter_prefix_page;
     use aruna_operations::replication::plaintext::{job_consent, read_consent};
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;

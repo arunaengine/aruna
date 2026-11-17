@@ -43,9 +43,10 @@ use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
-use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, complete_job, fail_job, insert_job, put_purge_checkpoint,
-    transition_to_running,
+use aruna_operations::jobs::store::put_purge_checkpoint;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{
+    ClaimOutcome, claim_job, complete_job, fail_job, transition_to_running,
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
@@ -73,6 +74,7 @@ use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
 use aruna_operations::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_operations::testing::read_value;
 use aruna_storage::{StorageHandle, storage};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -373,7 +375,7 @@ async fn scoped_fence_isolates() {
                 object_size: None,
                 created_by: context.user_id,
                 quota_ceiling: None,
-                now_ms: aruna_operations::driver::now_ms(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             }),
             &context.driver,
         )
@@ -846,24 +848,6 @@ async fn write_value(storage: &StorageHandle, keyspace: &str, key: Vec<u8>, valu
     ));
 }
 
-async fn read_value(
-    storage: &StorageHandle,
-    keyspace: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read event")
-    };
-    value
-}
-
 /// Stores a current version of `key` that reads a linked file written as backend version `p1`.
 async fn seed_linked(context: &TestContext, key: &str, version_id: Ulid) -> BackendLocation {
     let storage = &context.driver.storage_handle;
@@ -1109,7 +1093,7 @@ async fn cancelled_queue_releases() {
     cancel_owned_job(&context.driver, &runtime, context.user_id, job_id)
         .await
         .unwrap();
-    let stored = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let stored = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1263,7 +1247,7 @@ async fn purge_releases_copies() {
     let mut released = releases(storage).await;
     released.sort_by_key(|file| file.backend_path.clone());
     assert_eq!(released, [location, copy]);
-    let (left, _) = aruna_operations::jobs::store::iter_prefix_page(
+    let (left, _) = aruna_operations::jobs::store::query::iter_prefix_page(
         storage,
         aruna_core::keyspaces::RENAMED_ROW_KEYSPACE,
         None,

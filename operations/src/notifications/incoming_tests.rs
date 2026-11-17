@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::driver::drive;
-use crate::jobs::store::find_dedup_plan;
+use crate::jobs::store::query::find_dedup_plan;
 use crate::metadata::api::load_realm_config;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,

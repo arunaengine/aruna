@@ -6,7 +6,7 @@ use crate::blob::reclaim::{ReclaimBlobOperation, ReclaimVerdict};
 use crate::blob::records::{iter_index_effect, owners_scan_effect};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};

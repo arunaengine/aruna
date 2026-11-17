@@ -19,12 +19,12 @@ use super::walk::{PageFailure, directory_list_path, first_key, target_of, walk_p
 use super::{checkpoint_key, persist_rows};
 use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
 /// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
 /// job holds a bounded number of pages whatever the source holds.
-pub(super) const LANE_LIMIT: usize = 4;
+const LANE_LIMIT: usize = 4;
 /// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.
@@ -704,8 +704,8 @@ mod tests {
     // The run after a conflict checks every guard again: a claim lost meanwhile stops it.
     #[tokio::test]
     async fn retry_rechecks_guards() {
-        use crate::jobs::store::ClaimGuard;
         use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::ClaimGuard;
         use aruna_core::structs::execution::job::job_record_key;
         let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
         let input = page_input(&ctx, &spec).await;
@@ -805,9 +805,9 @@ mod tests {
     #[tokio::test]
     async fn waiting_rechecks_guards() {
         use crate::driver::drive;
-        use crate::jobs::store::ClaimGuard;
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::ClaimGuard;
         use aruna_core::structs::execution::job::job_record_key;
         let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
         let input = page_input(&ctx, &spec).await;
@@ -896,7 +896,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&ctx.driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&ctx.driver.storage_handle, &record)
             .await
             .unwrap();
         JobContext {
@@ -1037,7 +1037,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&driver.storage_handle, &record)
             .await
             .unwrap();
         let ctx = JobContext {

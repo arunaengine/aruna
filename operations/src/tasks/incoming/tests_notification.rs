@@ -261,7 +261,7 @@ async fn drain_retries_queueing() {
     assert!(remaining.is_empty());
     let key = format!("webhook/{}", record.notification_id);
     let key = aruna_core::structs::execution::job::user_dedup_key(recipient, &key);
-    let queued = crate::jobs::store::find_dedup_plan(&storage, recipient, &key, None)
+    let queued = crate::jobs::store::query::find_dedup_plan(&storage, recipient, &key, None)
         .await
         .expect("dedup read");
     assert!(queued.is_some(), "the retry queues the held record");

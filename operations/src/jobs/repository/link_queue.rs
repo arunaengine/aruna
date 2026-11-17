@@ -26,13 +26,13 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
+use super::link_store::{change_link, document_links, ensure_lineage, read_link};
 use super::links::{
-    ChangeLinkOperation, LinkChange, LinkError, change_link, document_links, ensure_lineage,
-    id_key, read_link, schedule_drain,
+    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, id_key, schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
@@ -43,8 +43,6 @@ use crate::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;
-/// How often a check waits for a running push before it looks again.
-pub(super) const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
 /// Push-check rows for the push links of changed documents that push or retry after unmet
@@ -82,7 +80,7 @@ pub(crate) async fn queue_rows(
     {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let mut rows = Vec::new();
     for ((link_id, document_id), (_, existing)) in candidates.into_iter().zip(queued) {
@@ -123,7 +121,7 @@ async fn scan_queue(
             next_start_after,
         }) => Ok((values, next_start_after)),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -243,9 +241,10 @@ async fn settle_stale(
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
     // A push that finished remotely but failed to record it still counts as pushed.
-    let checkpoint = crate::jobs::export::stored_checkpoint(&context.storage_handle, job_id)
-        .await
-        .map_err(LinkError::Unexpected)?;
+    let checkpoint =
+        crate::jobs::export::archive::stored_checkpoint(&context.storage_handle, job_id)
+            .await
+            .map_err(LinkError::Unexpected)?;
     let pushed = checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.pushed_outcome());
@@ -389,10 +388,7 @@ async fn push_revision(
 }
 
 /// Whether the dataset was deleted, which removes its registry record.
-pub(super) async fn document_gone(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<bool, LinkError> {
+async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<bool, LinkError> {
     let event = storage
         .send_effect(read_document_registry(document_id, None))
         .await;
@@ -426,7 +422,7 @@ async fn settle_entry(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let result = settle_in(storage, link_id, queued, retry_at, txn_id).await;
     if result.is_err() {
@@ -458,7 +454,7 @@ async fn settle_in(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     };
     let unchanged = current.as_ref() == Some(queued);
     let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
@@ -489,7 +485,7 @@ async fn settle_in(
         Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
         Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => return Err(LinkError::Unexpected(other.label().to_string())),
     }
     match storage
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
@@ -497,7 +493,7 @@ async fn settle_in(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -512,7 +508,7 @@ async fn delete_entry(storage: &StorageHandle, key: Key) -> Result<(), LinkError
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
@@ -528,7 +524,7 @@ async fn write_row(storage: &StorageHandle, row: (String, Key, Value)) -> Result
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 

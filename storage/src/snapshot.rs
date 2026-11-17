@@ -10,6 +10,17 @@ use std::path::PathBuf;
 use std::time::Duration;
 use thiserror::Error;
 
+/// File name of the backup socket in the node's storage directory.
+pub const BACKUP_SOCKET: &str = "backup.sock";
+/// Keyspace name prefixes of the node, document sync and metadata stores in a backup.
+pub const MAIN_PREFIX: &str = "main/";
+pub const SYNC_PREFIX: &str = "document-sync/";
+pub const METADATA_PREFIX: &str = "craqle/";
+/// Pseudo keyspace holding the Git repositories: relative path to file bytes, `/` ends a directory.
+pub const GIT_KEYSPACE: &str = "git";
+/// The store prefixes in stream order: node, document sync, metadata.
+pub const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
+
 const SNAPSHOT_MAGIC: &[u8] = b"ARUNA_DB_SNAPSHOT";
 const SNAPSHOT_VERSION: u16 = 1;
 const RECORD_BEGIN_KEYSPACE: u8 = 1;

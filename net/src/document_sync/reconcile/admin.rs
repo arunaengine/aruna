@@ -187,19 +187,8 @@ pub(in crate::document_sync) async fn apply_user_operation(
             Ok(None) => return abort_txn(storage, txn_id).await,
             Err(error) => return Err(abort_error(storage, txn_id, error).await),
         };
-        match replace_batch_in(storage, txn_id, attempt_deletes, attempt_writes).await {
-            Ok(()) => return Ok(()),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, attempt_deletes, attempt_writes).await? {
+            return Ok(());
         }
     }
     Err(NetError::Dht(
@@ -461,9 +450,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 if !matches!(error, NetError::Storage(StorageError::TransactionConflict)) {
                     return Err(error);
                 }
@@ -793,75 +780,6 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
     ))
 }
 
-/// Realm-config ops the reducer stores as order-insensitive immutable values
-/// and whose validation no other such op can influence: a consecutive run of
-/// them may apply as one read-reduce-write cycle instead of one per event.
-pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::CandidateMapPublished { .. }
-            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::ConfigTransitionStarted { .. }
-            | AdminDocumentOperation::TransitionBarrierReported { .. }
-            | AdminDocumentOperation::TransitionProofSubmitted { .. }
-            | AdminDocumentOperation::ConfigTransitionAborted { .. }
-            | AdminDocumentOperation::TransitionBucketForced { .. }
-            | AdminDocumentOperation::TransitionStallReported { .. }
-            | AdminDocumentOperation::TransitionDrainReported { .. }
-    )
-}
-
-/// Realm-config operations this document applier owns; every other family has
-/// its own applier.
-fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::ConfigNodeEnsured { .. }
-            | AdminDocumentOperation::ConfigNodeRemoved { .. }
-            | AdminDocumentOperation::OidcProviderUpserted { .. }
-            | AdminDocumentOperation::OidcProviderRemoved { .. }
-            | AdminDocumentOperation::ConfigSettingsSet { .. }
-            | AdminDocumentOperation::ConfigDescriptionSet { .. }
-            | AdminDocumentOperation::ConfigQuotaSet { .. }
-            | AdminDocumentOperation::NodePlacementSet { .. }
-            | AdminDocumentOperation::NodePlacementRemoved { .. }
-            | AdminDocumentOperation::PlacementStrategyUpserted { .. }
-            | AdminDocumentOperation::PlacementStrategyRemoved { .. }
-            | AdminDocumentOperation::ConfigStrategySet { .. }
-            | AdminDocumentOperation::JobFamilySet { .. }
-            | AdminDocumentOperation::StrategyBindingSet { .. }
-            | AdminDocumentOperation::StrategyBindingRemoved { .. }
-            | AdminDocumentOperation::PlacementOverrideSet { .. }
-            | AdminDocumentOperation::PlacementOverrideRemoved { .. }
-            | AdminDocumentOperation::PlacementBindingAppended { .. }
-            | AdminDocumentOperation::HandleRangeGranted { .. }
-            | AdminDocumentOperation::BandPoolAssigned { .. }
-            | AdminDocumentOperation::ConfigPoliciesSet { .. }
-            | AdminDocumentOperation::CandidateMapPublished { .. }
-            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::ConfigTransitionStarted { .. }
-            | AdminDocumentOperation::TransitionBarrierReported { .. }
-            | AdminDocumentOperation::TransitionProofSubmitted { .. }
-            | AdminDocumentOperation::ConfigTransitionAborted { .. }
-            | AdminDocumentOperation::TransitionBucketForced { .. }
-            | AdminDocumentOperation::TransitionStallReported { .. }
-            | AdminDocumentOperation::TransitionDrainReported { .. }
-            | AdminDocumentOperation::ConfigComputeSet { .. }
-            | AdminDocumentOperation::ConfigFederationSet { .. }
-            | AdminDocumentOperation::ConfigPortalSet { .. }
-            | AdminDocumentOperation::ConfigReplicasSet { .. }
-            | AdminDocumentOperation::NodeNameSet { .. }
-            | AdminDocumentOperation::NodePlaceSet { .. }
-            | AdminDocumentOperation::ConfigTokenRevoked { .. }
-            | AdminDocumentOperation::MergeCoordinatorSet { .. }
-            | AdminDocumentOperation::ConfigVaultSet { .. }
-            | AdminDocumentOperation::ConfigEmailSet { .. }
-            | AdminDocumentOperation::ConfigSecretSet { .. }
-            | AdminDocumentOperation::ConfigPluginSet { .. }
-            | AdminDocumentOperation::ConfigInstallSet { .. }
-    )
-}
-
 /// Flushes a buffered run of coalescible realm-config events, if any, and
 /// drops the validation snapshot the applied events just outdated.
 pub(in crate::document_sync) async fn flush_config_run(
@@ -1113,176 +1031,6 @@ pub(in crate::document_sync) async fn apply_config_events(
     ))
 }
 
-pub(in crate::document_sync) fn materialize_group_authorization(
-    auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentState,
-    event: &AdminDocumentEvent,
-) {
-    if let AdminDocumentOperation::GroupJoinDecided { decision } = &event.op {
-        for role_id in &decision.role_ids {
-            overlay_group_role(auth_doc, reducer_state, *role_id);
-        }
-        return;
-    }
-    if let AdminDocumentOperation::GroupPoliciesSet { .. } = &event.op {
-        if !reducer_state
-            .conflicts
-            .contains_key(aruna_core::reducer::GROUP_POLICIES_PATH)
-            && let Some(policies) = reducer_state.materialized_group_policies()
-        {
-            auth_doc.policies = policies;
-        }
-        return;
-    }
-
-    if let AdminDocumentOperation::GroupRoleCreated { role } = &event.op {
-        materialize_group_role(auth_doc, reducer_state, role);
-        return;
-    }
-
-    if let AdminDocumentOperation::GroupRoleRemoved { role_id } = &event.op {
-        auth_doc.roles.remove(role_id);
-        return;
-    }
-
-    let (role_id, user_id) = match &event.op {
-        AdminDocumentOperation::GroupAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::GroupAssignmentRemoved { role_id, user_id } => (role_id, user_id),
-        _ => return,
-    };
-    let path = group_user_path(role_id, user_id);
-    if reducer_state.conflicts.contains_key(&path) {
-        if let Some(role) = auth_doc.roles.get_mut(role_id) {
-            role.assigned_users.remove(user_id);
-        }
-        return;
-    }
-    let Some(role) = auth_doc.roles.get_mut(role_id) else {
-        return;
-    };
-    let assigned = reducer_state
-        .user_subject_ids
-        .get(&path)
-        .and_then(|version| version.value.as_deref())
-        .and_then(|value| UserId::from_string(value).ok())
-        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
-    if assigned {
-        role.assigned_users.insert(*user_id);
-    } else {
-        role.assigned_users.remove(user_id);
-    }
-}
-
-pub(in crate::document_sync) fn materialize_group_role(
-    auth_doc: &mut GroupAuthorizationDocument,
-    reducer_state: &AdminDocumentState,
-    role: &AdminRoleDefinition,
-) {
-    let role_path = group_role_path(&role.role_id);
-    if reducer_state.conflicts.contains_key(&role_path)
-        || !reducer_state
-            .materialized_group_roles()
-            .contains(&role.role_id)
-    {
-        auth_doc.roles.remove(&role.role_id);
-        return;
-    }
-
-    let assigned_users = auth_doc
-        .roles
-        .get(&role.role_id)
-        .map(|role| role.assigned_users.clone())
-        .unwrap_or_default();
-    auth_doc.roles.insert(
-        role.role_id,
-        Role {
-            role_id: role.role_id,
-            name: role.name.clone(),
-            permissions: role
-                .permissions
-                .iter()
-                .map(|(path, permission)| (path.clone(), permission.clone()))
-                .collect(),
-            assigned_users,
-        },
-    );
-    overlay_group_role(auth_doc, reducer_state, role.role_id);
-}
-
-pub(in crate::document_sync) fn materialize_realm_authorization(
-    auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentState,
-    event: &AdminDocumentEvent,
-) {
-    if let AdminDocumentOperation::RealmRoleCreated { role } = &event.op {
-        materialize_realm_role(auth_doc, reducer_state, role);
-        return;
-    }
-
-    let (role_id, user_id) = match &event.op {
-        AdminDocumentOperation::RealmAssignmentAdded { role_id, user_id }
-        | AdminDocumentOperation::RealmAssignmentRemoved { role_id, user_id } => (role_id, user_id),
-        _ => return,
-    };
-    let path = realm_user_path(role_id, user_id);
-    if reducer_state.conflicts.contains_key(&path) {
-        if let Some(role) = auth_doc.roles.get_mut(role_id) {
-            role.assigned_users.remove(user_id);
-        }
-        return;
-    }
-    let Some(role) = auth_doc.roles.get_mut(role_id) else {
-        return;
-    };
-    let assigned = reducer_state
-        .user_subject_ids
-        .get(&path)
-        .and_then(|version| version.value.as_deref())
-        .and_then(|value| UserId::from_string(value).ok())
-        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
-    if assigned {
-        role.assigned_users.insert(*user_id);
-    } else {
-        role.assigned_users.remove(user_id);
-    }
-}
-
-pub(in crate::document_sync) fn materialize_realm_role(
-    auth_doc: &mut RealmAuthorizationDocument,
-    reducer_state: &AdminDocumentState,
-    role: &AdminRoleDefinition,
-) {
-    let role_path = realm_role_path(&role.role_id);
-    if reducer_state.conflicts.contains_key(&role_path)
-        || !reducer_state
-            .materialized_realm_roles()
-            .contains(&role.role_id)
-    {
-        auth_doc.roles.remove(&role.role_id);
-        return;
-    }
-
-    let assigned_users = auth_doc
-        .roles
-        .get(&role.role_id)
-        .map(|role| role.assigned_users.clone())
-        .unwrap_or_default();
-    auth_doc.roles.insert(
-        role.role_id,
-        Role {
-            role_id: role.role_id,
-            name: role.name.clone(),
-            permissions: role
-                .permissions
-                .iter()
-                .map(|(path, permission)| (path.clone(), permission.clone()))
-                .collect(),
-            assigned_users,
-        },
-    );
-    overlay_realm_role(auth_doc, reducer_state, role.role_id);
-}
-
 /// The end of `user`'s merge pointers once that account exists in the realm and lists `user` as
 /// merged; `None` until then, when unmerged, or when pointers loop. `applied`, the account the
 /// event being applied changes, is read as just materialized, since its row is not written yet.
@@ -1329,179 +1077,21 @@ async fn read_user(
     .map(|user| user.filter(|user| user.user_id == user_id))
 }
 
-pub(in crate::document_sync) fn materialize_user_operation(
-    user_id: UserId,
-    previous_user: Option<&User>,
-    reducer_state: &AdminDocumentState,
-    event: &AdminDocumentEvent,
-) -> User {
-    let mut user = previous_user.cloned().unwrap_or_else(|| User {
-        user_id,
-        name: String::new(),
-        subject_ids: Vec::new(),
-        alias_user_ids: Default::default(),
-        attributes: Default::default(),
-    });
-
-    match &event.op {
-        AdminDocumentOperation::UserNameSet { .. } => {
-            if reducer_state.conflicts.contains_key(USER_NAME_PATH) {
-                user.name.clear();
-            } else if let Some(name) = reducer_state.materialized_user_name() {
-                user.name = name;
-            }
-        }
-        AdminDocumentOperation::SubjectIdAdded { subject_id }
-        | AdminDocumentOperation::SubjectIdRemoved { subject_id } => {
-            let path = user_subject_path(subject_id);
-            let materialized_subject_id = if reducer_state.conflicts.contains_key(&path) {
-                None
-            } else {
-                reducer_state
-                    .user_subject_ids
-                    .get(subject_id)
-                    .and_then(|version| version.value.clone())
-            };
-
-            user.subject_ids.retain(|candidate| candidate != subject_id);
-            if let Some(materialized_subject_id) = materialized_subject_id
-                && !user.subject_ids.contains(&materialized_subject_id)
-            {
-                user.subject_ids.push(materialized_subject_id);
-            }
-        }
-        AdminDocumentOperation::UserAliasAdded { alias }
-        | AdminDocumentOperation::UserAliasRemoved { alias } => {
-            if reducer_state.materialized_alias(alias) {
-                user.alias_user_ids.insert(*alias);
-            } else {
-                user.alias_user_ids.remove(alias);
-            }
-        }
-        AdminDocumentOperation::UserAttributeSet { key, .. }
-        | AdminDocumentOperation::UserAttributeRemoved { key } => {
-            let path = user_attribute_path(key);
-            if reducer_state.conflicts.contains_key(&path) {
-                if key.starts_with(aruna_core::user::profile::VISIBILITY_PREFIX) {
-                    user.attributes.insert(key.clone(), "private".to_string());
-                } else {
-                    user.attributes.remove(key);
-                }
-            } else {
-                match reducer_state
-                    .user_attributes
-                    .get(key)
-                    .and_then(|version| version.value.clone())
-                {
-                    Some(value) => {
-                        user.attributes.insert(key.clone(), value);
-                    }
-                    None => {
-                        user.attributes.remove(key);
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    user
-}
-
 pub(in crate::document_sync) const APPLY_CONFLICT_ATTEMPTS: usize = 64;
-
-/// The realm a realm-config operation addresses: the sync target, payload
-/// target, and document must all name the same realm.
-fn validate_config_target(
-    document_target: &DocumentTarget,
-    event: &AdminDocumentEvent,
-) -> Result<RealmId> {
-    let DocumentTarget::RealmConfig { realm_id } = document_target else {
-        return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports realm config targets".to_string(),
-        ));
-    };
-    let AdminDocumentTarget::RealmConfig {
-        realm_id: event_realm_id,
-    } = &event.target
-    else {
-        return Err(NetError::Bootstrap(
-            "admin document operation payload target is not a realm config".to_string(),
-        ));
-    };
-    if event_realm_id != realm_id {
-        return Err(NetError::Bootstrap(format!(
-            "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
-        )));
-    }
-    Ok(*realm_id)
-}
-
-/// Whether a realm-config event's origin node and actor belong to the target
-/// realm.
-fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<()> {
-    // A federated user may only revoke its own token, which this realm issued.
-    let own_revocation = matches!(
-        &event.op,
-        AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. }
-            if *token_owner == event.actor.user_id && !token_owner.is_nil()
-    );
-    if event.origin_node_id != event.actor.node_id
-        || event.actor.realm_id != realm_id
-        || (event.actor.user_id.realm_id != realm_id && !own_revocation)
-    {
-        return Err(NetError::Bootstrap(
-            "realm config event actor and origin do not match the target realm".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Re-checks a revocation against the transaction snapshot: the origin must
-/// already be onboarded and the payload valid under the snapshot clock.
-fn validate_revocation_snapshot(
-    previous_config: Option<&RealmConfigDocument>,
-    previous_state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    realm_id: RealmId,
-    raw_now: u64,
-) -> Result<()> {
-    let valid = revocation_origin_known(previous_config, previous_state, event, realm_id);
-    if !valid {
-        return Err(NetError::Bootstrap(
-            "revocation origin is not an onboarded realm node in the transaction snapshot"
-                .to_string(),
-        ));
-    }
-    if let AdminDocumentOperation::ConfigTokenRevoked {
-        token_hash,
-        expires_at,
-        token_owner,
-    } = &event.op
-        && (!aruna_core::auth::valid_token_hash(token_hash)
-            || !valid_revocation_expiry(*expires_at, raw_now)
-            || token_owner.is_nil())
-    {
-        return Err(NetError::Bootstrap(
-            "replicated revocation has invalid hash, expiry, or owner".to_string(),
-        ));
-    }
-    Ok(())
-}
 
 async fn apply_realm_config(
     storage: &StorageHandle,
     document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
-    let realm_id = validate_config_target(&document_target, &event)?;
+    let realm_id = validate_config_target(&document_target, &event).map_err(NetError::Bootstrap)?;
     if !config_mutation_allowed(&event.op) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, portal updates, and token revocations"
                 .to_string(),
         ));
     }
-    validate_config_actor(realm_id, &event)?;
+    validate_config_actor(realm_id, &event).map_err(NetError::Bootstrap)?;
 
     let is_revocation = matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. });
 
@@ -1547,7 +1137,7 @@ async fn apply_realm_config(
         };
 
         if is_revocation
-            && let Err(error) = validate_revocation_snapshot(
+            && let Err(reason) = validate_revocation_snapshot(
                 previous_config.as_ref(),
                 previous_state.as_ref(),
                 &event,
@@ -1555,7 +1145,7 @@ async fn apply_realm_config(
                 raw_now,
             )
         {
-            return Err(abort_error(storage, txn_id, error).await);
+            return Err(abort_error(storage, txn_id, NetError::Bootstrap(reason)).await);
         }
 
         let effective_now = previous_state

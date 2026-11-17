@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -16,9 +17,8 @@ use crate::driver::DriverContext;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{
-    Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve, update_work,
-};
+use crate::plugins::work::tests::edit_work;
+use crate::plugins::work::{Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve};
 use crate::s3::object::copy::test::{put_config, seed_bucket, with_blob};
 use crate::s3::object::put::PutObjectOperation;
 
@@ -108,9 +108,12 @@ async fn recorded(
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = reserve(&fixture.ctx, (install, &identity), row)
-        .await
-        .unwrap();
+    let (row, _) = drive(
+        reserve((install, &identity), row, None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let spec = PluginWorkSpec {
         realm_id: fixture.actor.realm_id,
         install_id: install.install_id,
@@ -136,7 +139,7 @@ fn name(outcome: &JobRunOutcome) -> (&'static str, Option<JobErrorKind>) {
 }
 
 async fn boundary(fixture: &Fixture, (install_id, work_id): (Ulid, Ulid)) -> Option<SendBoundary> {
-    let found = read_work(&fixture.ctx, install_id, work_id).await;
+    let found = drive(read_work(install_id, work_id), &fixture.ctx).await;
     found.unwrap().unwrap().boundary
 }
 
@@ -178,7 +181,7 @@ async fn open_post_undecided() {
     let (base, seen) = server(201).await;
     let (row, spec) = recorded(&fixture, &install, (&base, "POST")).await;
     let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    update_work(&fixture.ctx, (install.install_id, row.work_id), begun)
+    edit_work(&fixture.ctx, (install.install_id, row.work_id), begun)
         .await
         .unwrap();
     let ctx = job_context(&blob, &fixture);
@@ -213,14 +216,14 @@ async fn put_sent_again() {
 #[tokio::test]
 async fn marked_source_kept() {
     // A version a job with a secret wrote never leaves the node.
-    use crate::plugins::marks::{Mark, mark_in};
-    use crate::plugins::store::{Txn, transact};
+    use crate::plugins::marks::{Mark, mark_row};
+    use crate::plugins::rows::write_rows;
     let fixture = Fixture::new().await;
     let install = uploader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;
     let (base, seen) = server(201).await;
     let (_, spec) = recorded(&fixture, &install, (&base, "PUT")).await;
-    let version = crate::plugins::marks::unmarked(&blob, ("in", "a.txt"), None).await;
+    let version = crate::plugins::broker::unmarked(&blob, ("in", "a.txt"), None).await;
     let version = version.unwrap().unwrap();
     let mark = Mark {
         install_id: Ulid::from_parts(8, 8),
@@ -229,8 +232,8 @@ async fn marked_source_kept() {
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert_eq!(name(&outcome), ("failed", Some(JobErrorKind::Permanent)));
@@ -364,7 +367,7 @@ async fn recovers_without_source() {
     }
     let ids = (install.install_id, row.work_id);
     let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    update_work(&fixture.ctx, ids, begun).await.unwrap();
+    edit_work(&fixture.ctx, ids, begun).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "undecided");
     let answered = |row: &mut WorkRow| {
@@ -375,7 +378,7 @@ async fn recovers_without_source() {
             version: Ulid::from_parts(5, 2),
         })
     };
-    update_work(&fixture.ctx, ids, answered).await.unwrap();
+    edit_work(&fixture.ctx, ids, answered).await.unwrap();
     let outcome = run_plugin_work(&ctx, &spec).await;
     let JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes, version_id }) = outcome
     else {

@@ -51,6 +51,7 @@ use aruna_operations::s3::object::metadata::{
     QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
 };
 use aruna_operations::s3::object::put::PutObjectResult;
+use aruna_operations::testing::read_value;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
 use http::Extensions;
@@ -467,7 +468,7 @@ async fn put_survives_queue() {
 
     assert_eq!(response.output.version_id, Some(version_id.to_string()));
     assert!(
-        read_storage_value(
+        read_value(
             &storage_handle,
             REPLICATION_OBLIGATION_KEYSPACE,
             obligation_key.as_ref().to_vec(),
@@ -924,25 +925,6 @@ async fn write_realm_config(storage: &storage::StorageHandle, realm_id: RealmId,
             .unwrap(),
     )
     .await;
-}
-
-async fn read_storage_value(
-    storage: &storage::StorageHandle,
-    keyspace: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read event")
-    };
-
-    value
 }
 
 async fn write_reference_version(

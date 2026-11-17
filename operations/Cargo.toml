@@ -13,7 +13,7 @@ rust-version.workspace = true
 autotests = false
 
 [features]
-# Test seams for integration tests; only aruna's dev-dependencies enable it.
+# Test seams and shared test helpers; only dev-dependencies enable it.
 test-hooks = []
 
 [dependencies]
@@ -75,6 +75,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-operations = { workspace = true, features = ["test-hooks"] }
 axum = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

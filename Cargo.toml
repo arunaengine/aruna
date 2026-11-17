@@ -9,6 +9,7 @@ members = [
     "blob",
     "compute",
     "core",
+    "wire",
     "kpabe",
     "kpabe/wasm",
     "storage",
@@ -54,6 +55,7 @@ aruna-plugin = { path = "plugins/sdk" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
+aruna-wire = { path = "wire" }
 
 # Third-party crates
 aes-gcm = "0.11.1"

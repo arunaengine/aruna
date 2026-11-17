@@ -13,7 +13,7 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
 
 use super::*;
-use crate::jobs::store::put_crate_outcome;
+use crate::jobs::store::attempt::put_crate_outcome;
 
 fn user(seed: u8, realm_id: RealmId) -> UserId {
     UserId::local(Ulid::from_bytes([seed; 16]), realm_id)

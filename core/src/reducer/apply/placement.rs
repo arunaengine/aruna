@@ -17,14 +17,14 @@ impl AdminDocumentState {
                         label.to_string(),
                     ));
                 }
-                self.apply_placement_field(
+                self.apply_value(
                     event,
                     placement_node_path(&entry.node_id),
                     Some(placement_entry_value(entry)),
                 );
             }
             AdminDocumentOperation::NodePlacementRemoved { node_id } => {
-                self.apply_placement_field(event, placement_node_path(node_id), None);
+                self.apply_value(event, placement_node_path(node_id), None);
             }
             AdminDocumentOperation::PlacementStrategyUpserted { strategy } => {
                 if strategy.replica_count == Some(0) {
@@ -43,7 +43,7 @@ impl AdminDocumentState {
                 {
                     return Err(AdminDocumentError::ShardCountChanged);
                 }
-                self.apply_placement_field(
+                self.apply_value(
                     event,
                     placement_strategy_path(&strategy.strategy_id),
                     Some(placement_strategy_value(strategy)),
@@ -53,7 +53,7 @@ impl AdminDocumentState {
                 if self.materialized_family_strategy() == Some(*strategy_id) {
                     return Err(AdminDocumentError::JobFamilyRemoved);
                 }
-                self.apply_placement_field(event, placement_strategy_path(strategy_id), None);
+                self.apply_value(event, placement_strategy_path(strategy_id), None);
             }
             AdminDocumentOperation::ConfigStrategySet { strategy_id } => {
                 self.apply_config_setting(event, CONFIG_STRATEGY_PATH, strategy_id.to_string());
@@ -71,24 +71,24 @@ impl AdminDocumentState {
                 self.apply_config_setting(event, JOB_FAMILY_PATH, strategy_id.to_string());
             }
             AdminDocumentOperation::StrategyBindingSet { binding } => {
-                self.apply_placement_field(
+                self.apply_value(
                     event,
                     strategy_binding_path(&binding.scope),
                     Some(strategy_binding_value(binding)),
                 );
             }
             AdminDocumentOperation::StrategyBindingRemoved { scope } => {
-                self.apply_placement_field(event, strategy_binding_path(scope), None);
+                self.apply_value(event, strategy_binding_path(scope), None);
             }
             AdminDocumentOperation::PlacementOverrideSet { record } => {
-                self.apply_placement_field(
+                self.apply_value(
                     event,
                     placement_override_path(&record.subject),
                     Some(placement_override_value(record)),
                 );
             }
             AdminDocumentOperation::PlacementOverrideRemoved { subject } => {
-                self.apply_placement_field(event, placement_override_path(subject), None);
+                self.apply_value(event, placement_override_path(subject), None);
             }
             AdminDocumentOperation::PlacementBindingAppended { binding } => {
                 self.apply_placement_binding(event, binding);

@@ -2,25 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::route::JobRouteError;
 use std::sync::Arc;
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::alpn::Alpn;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobPayload};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_net::streams::{BiStream, RecvStream, SendStream};
+use aruna_net::job_control::{JOB_IO_TIMEOUT, read_frame, send_request, write_frame};
+use aruna_net::streams::BiStream;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::warn;
@@ -32,15 +30,11 @@ use super::service::{
     resolve_job_owner,
 };
 use super::staging::read_staging_checkpoint;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::WritePeerError;
 
-pub(crate) use aruna_core::jobs::{
-    JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange,
-};
-
-const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+use aruna_core::jobs::{JobRequest, JobResponse, JobStatusView, WireArtifact, WireRange};
 
 impl From<&OwnedArtifact> for WireArtifact {
     fn from(owned: &OwnedArtifact) -> Self {
@@ -81,30 +75,15 @@ pub(crate) async fn send_job_request(
         .net_handle
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let expects_body = matches!(request, JobRequest::Artifact { range: Some(_), .. });
-    let mut stream = net_handle
-        .open_stream(owner, Alpn::JobControl)
+    let reply = send_request(net_handle, owner, request)
         .await
-        .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-    timeout(JOB_IO_TIMEOUT, write_frame(&mut stream.0, &request))
-        .await
-        .map_err(|_| JobRouteError::Unavailable("job request timed out".to_string()))?
         .map_err(JobRouteError::Unavailable)?;
-    stream
-        .0
-        .finish()
-        .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-    let response = timeout(JOB_IO_TIMEOUT, read_frame(&mut stream.1))
-        .await
-        .map_err(|_| JobRouteError::Unavailable("job response timed out".to_string()))?
-        .map_err(JobRouteError::Unavailable)?;
-    let body = if expects_body && matches!(response, JobResponse::ArtifactReady { .. }) {
-        Some(BackendStream::new(ReaderStream::new(stream.into_recv())))
-    } else {
-        stream.1.stop(0u32.into()).ok();
-        None
-    };
-    Ok(RemoteJobReply { response, body })
+    Ok(RemoteJobReply {
+        response: reply.response,
+        body: reply
+            .body
+            .map(|stream| BackendStream::new(ReaderStream::new(stream.into_recv()))),
+    })
 }
 
 pub(crate) async fn handle_job_stream(
@@ -327,7 +306,7 @@ async fn owner_gate(
     job_id: JobId,
     local_node: Option<NodeId>,
 ) -> Option<PreparedResponse> {
-    match crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await {
+    match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(Some(_)) => return None,
         Ok(None) => {}
         Err(error) => {
@@ -459,9 +438,7 @@ async fn prepare_cancel(
     auth_token: AuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
-    let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
-        .await
-    {
+    let requested_family = match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(family) => family,
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     };
@@ -472,11 +449,12 @@ async fn prepare_cancel(
     // A cancel that already reached this node is never forwarded again: divergent
     // holder views would bounce it. A non-holder answers only for its executions.
     if !holds {
-        let reservations =
-            match crate::jobs::lifecycle::reservation::held_reservations(context).await {
-                Ok(reservations) => reservations,
-                Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error)),
-            };
+        let reservations = match drive(HeldReservations::all(), context).await {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+            }
+        };
         let mut stopped = None;
         for reservation in reservations {
             let matches = match reservation_matches(
@@ -533,13 +511,12 @@ async fn prepare_cancel(
     .await
     {
         Some(Ok(())) => {
-            let reservations =
-                match crate::jobs::lifecycle::reservation::held_reservations(context).await {
-                    Ok(reservations) => reservations,
-                    Err(error) => {
-                        return PreparedResponse::new(JobResponse::Unavailable(error));
-                    }
-                };
+            let reservations = match drive(HeldReservations::all(), context).await {
+                Ok(reservations) => reservations,
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                }
+            };
             for reservation in reservations {
                 let matches = match reservation_matches(
                     context,
@@ -646,44 +623,11 @@ async fn reservation_matches(
     reservation_alias: JobId,
 ) -> Result<bool, JobRouteError> {
     match requested_family {
-        Some(family) => Ok(crate::jobs::lifecycle::routing::family_of_alias(
-            context,
-            reservation_alias,
-        )
-        .await?
-            == Some(family)),
+        Some(family) => {
+            Ok(drive(AliasFamilyOperation::new(reservation_alias), context).await? == Some(family))
+        }
         None => Ok(requested_alias == reservation_alias),
     }
-}
-
-async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {
-    let bytes = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_FRAME_SIZE {
-        return Err("job-control frame exceeds maximum size".to_string());
-    }
-    send.write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    send.write_all(&bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    send.flush().await.map_err(|error| error.to_string())
-}
-
-async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, String> {
-    let mut length = [0u8; 4];
-    recv.read_exact(&mut length)
-        .await
-        .map_err(|error| error.to_string())?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_FRAME_SIZE {
-        return Err("job-control frame exceeds maximum size".to_string());
-    }
-    let mut bytes = vec![0u8; length];
-    recv.read_exact(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -692,7 +636,7 @@ mod pure_tests {
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
     use ulid::Ulid;
 
-    use crate::jobs::service::JobKind;
+    use aruna_core::jobs::JobKind;
 
     fn user(realm_id: RealmId) -> UserId {
         UserId::new(Ulid::from_bytes([2u8; 16]), realm_id)

@@ -61,7 +61,7 @@ struct TestNode {
     context: Arc<DriverContext>,
     /// Keeps the inbound handler's scheduled tasks tied to a live owner for
     /// the node's whole lifetime.
-    _shutdown: aruna_core::shutdown::Shutdown,
+    _shutdown: aruna_tasks::shutdown::Shutdown,
 }
 
 async fn unread_count_remote(
@@ -553,7 +553,7 @@ async fn build_node(
     });
 
     let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     initialize_net_holder(
         context.clone(),
         aruna_core::structs::execution::job::RoCrateLimits::default(),

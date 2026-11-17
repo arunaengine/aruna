@@ -44,13 +44,13 @@ async fn pack(
 /// Replaces a draft branch's metadata with `jsonld` as a new version on that branch.
 pub async fn edit(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     branch: &str,
     jsonld: String,
     options: WriteOptions<'_>,
 ) -> Result<Version, GitError> {
+    let store = super::store(context)?;
     let WriteOptions { message, expected } = options;
     if protected(branch) {
         return Err(GitError::Refused(format!(
@@ -133,13 +133,13 @@ pub struct Merged {
 /// differently refuse the merge. A merge into main also updates the metadata document.
 pub async fn merge(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     source: &str,
     into: &str,
     options: WriteOptions<'_>,
 ) -> Result<Merged, GitError> {
+    let store = super::store(context)?;
     let (document, projection, _guard) = open(context, store, auth, id, Permission::WRITE).await?;
     let source = resolve(store, auth, id, source).await?;
     merge_into(
@@ -278,11 +278,11 @@ async fn merge_into(
 /// Merges a kept conflict into its branch and removes it in the same record.
 pub async fn resolve_conflict(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     (id, conflict): (Ulid, Ulid),
     expected: Option<&str>,
 ) -> Result<Merged, GitError> {
+    let store = super::store(context)?;
     let (document, projection, _guard) = open(context, store, auth, id, Permission::WRITE).await?;
     let (name, kept) = projection
         .state

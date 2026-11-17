@@ -7,7 +7,6 @@ use super::{
     publish_core_documents, retry_deadline, sync_peer_topic, sync_with_retry, unique_user_topic,
     watch_target_needed,
 };
-use crate::identity::PersistedNodeIdentity;
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
@@ -19,6 +18,7 @@ use aruna_core::structs::execution::notification_watch::{
     interest_node_key,
 };
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};

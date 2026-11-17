@@ -309,7 +309,7 @@ impl SourceEditOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(SourceEditError::UnexpectedEvent {
                 state,
-                received: crate::staging::describe_event(&event),
+                received: event.label().to_string(),
             }),
         }
     }

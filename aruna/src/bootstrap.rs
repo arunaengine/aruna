@@ -2,8 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::identity::PersistedNodeState;
-use aruna_api::server::state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
+use aruna_core::auth::ONBOARDING_SECRET_KEY;
 use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
@@ -12,9 +11,11 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE}
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
 };
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation};
 use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::placement::target_placement_ref;
@@ -506,7 +507,7 @@ async fn sync_with_retry(
 }
 
 /// Persisted onboarding secret, encrypted at rest under the node key.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct EncryptedOnboardingSecret {
     nonce: [u8; 24],
     ciphertext: Vec<u8>,
@@ -524,9 +525,12 @@ pub async fn ensure_onboarding_secret(
     net_secret_key: &[u8; 32],
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
-    if let Some(encrypted) =
-        load_persisted_state::<EncryptedOnboardingSecret>(driver_ctx, ONBOARDING_SECRET_KEY).await
-    {
+    let stored = LoadStateOperation::<EncryptedOnboardingSecret>::new(ONBOARDING_SECRET_KEY);
+    let stored = drive(stored, driver_ctx).await.unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to load persisted API state");
+        None
+    });
+    if let Some(encrypted) = stored {
         let nonce = crypto_box::Nonce::from(encrypted.nonce);
         let plaintext = onboarding_secret_box(net_secret_key)
             .decrypt(&nonce, encrypted.ciphertext.as_ref())
@@ -566,15 +570,17 @@ pub async fn ensure_onboarding_secret(
         .map_err(|_| "failed to encrypt onboarding secret")?;
     let mut nonce_bytes = [0u8; 24];
     nonce_bytes.copy_from_slice(nonce.as_slice());
-    persist_state(
-        driver_ctx,
-        ONBOARDING_SECRET_KEY,
-        &EncryptedOnboardingSecret {
-            nonce: nonce_bytes,
-            ciphertext,
-        },
-    )
-    .await;
+    let encrypted = EncryptedOnboardingSecret {
+        nonce: nonce_bytes,
+        ciphertext,
+    };
+    let saved = match SaveStateOperation::new(ONBOARDING_SECRET_KEY, &encrypted) {
+        Ok(operation) => drive(operation, driver_ctx).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = saved {
+        warn!(error = %error, "Failed to persist API state");
+    }
     Ok(onboarding_secret)
 }
 

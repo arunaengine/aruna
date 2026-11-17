@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::jobs::executor::ProgressReporter;
-use crate::jobs::store::find_dedup_plan;
+use crate::jobs::store::query::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};

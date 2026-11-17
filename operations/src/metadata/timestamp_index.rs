@@ -9,10 +9,10 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::Key;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 use ulid::Ulid;
 

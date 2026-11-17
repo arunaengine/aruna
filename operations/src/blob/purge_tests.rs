@@ -192,7 +192,7 @@ async fn plans_until_ended() {
     plan_files(&context, job, &found).await.unwrap();
     plan_files(&context, job, &found).await.unwrap();
     let works = || async {
-        let page = crate::jobs::store::iter_prefix_page(
+        let page = crate::jobs::store::query::iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
             None,
@@ -228,7 +228,7 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::insert_job(&context.storage_handle, &record)
+    crate::jobs::store::query::insert_job(&context.storage_handle, &record)
         .await
         .unwrap();
     crate::blob::cleanup::process_cleanup_batch(&context)

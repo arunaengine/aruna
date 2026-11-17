@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -17,27 +18,24 @@ use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
     RunLink, run_crate_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 
 use smallvec::smallvec;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::LifecycleError;
-use crate::driver::DriverContext;
-use crate::jobs::records::keys::{family_prefix, record_key};
-use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
+use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::jobs::store::{iter_prefix_page, job_insert_entries};
+use aruna_core::structs::execution::job::job_insert_entries;
+use aruna_core::structs::execution::job::record_keys::{family_prefix, record_key};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.
 pub const MAX_RESERVATION_SCAN: usize = 512;
-
-/// Capacity held for one physical execution: the shared core contract, written
-/// with the receipt and released at that execution's terminal state.
-pub use aruna_core::compute::quota::JobReservationRecord as ExecutionReservation;
 
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())
@@ -46,7 +44,7 @@ pub fn reservation_key(execution_id: Ulid) -> Key {
 /// Whether one more execution fits the backend's static ceilings. An unmeasured
 /// ceiling never filters, and a zero concurrency ceiling admits nothing.
 pub fn fits(
-    held: &[ExecutionReservation],
+    held: &[JobReservationRecord],
     request: &EffectiveResources,
     envelope: &ResourceEnvelope,
 ) -> bool {
@@ -76,46 +74,6 @@ pub fn fits(
             .is_none_or(|max| concurrent <= u64::from(max))
 }
 
-/// Reservations this node currently holds, oldest key first.
-pub async fn held_reservations(
-    context: &DriverContext,
-) -> Result<Vec<ExecutionReservation>, String> {
-    let mut held = Vec::new();
-    let mut cursor = None;
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            JOB_RESERVATION_KEYSPACE,
-            None,
-            cursor,
-            MAX_RESERVATION_SCAN,
-            None,
-        )
-        .await?;
-        for (_, value) in rows {
-            held.push(
-                from_bytes::<ExecutionReservation>(&value).map_err(|error| error.to_string())?,
-            );
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return Ok(held),
-        }
-    }
-}
-
-/// The reservation of one job's accepted execution, so the local attempt can
-/// bind the exact ExecutionId the receipt named.
-pub async fn job_reservation(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<ExecutionReservation>, String> {
-    Ok(held_reservations(context)
-        .await?
-        .into_iter()
-        .find(|row| row.job_id == job_id))
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReserveExecutionConfig {
     pub realm_id: RealmId,
@@ -142,7 +100,7 @@ pub struct ReserveExecutionConfig {
 pub struct ReserveExecutionOperation {
     config: ReserveExecutionConfig,
     view: Option<FamilyView>,
-    held: Vec<ExecutionReservation>,
+    held: Vec<JobReservationRecord>,
     cursor: Option<Key>,
     cache: Option<ProjectionCache>,
     state: ReserveState,
@@ -201,15 +159,6 @@ impl ReserveExecutionOperation {
             key: target.storage_key(),
             txn_id: None,
         })]
-    }
-
-    fn keep_view(&mut self, value: Option<Value>) -> Result<(), LifecycleError> {
-        let Some(value) = value else {
-            return Err(LifecycleError::RealmConfigMissing);
-        };
-        let config = RealmConfigDocument::from_bytes(&value)?;
-        self.view = FamilyView::resolve(&config, self.config.realm_id, self.family());
-        Ok(())
     }
 
     fn scan(&mut self, txn_id: TxnId) -> Effects {
@@ -280,7 +229,7 @@ impl ReserveExecutionOperation {
                 JOB_RESERVATION_KEYSPACE.to_string(),
                 reservation_key(self.config.execution_id),
                 Value::from(
-                    to_bytes(&ExecutionReservation {
+                    to_bytes(&JobReservationRecord {
                         execution_id: self.config.execution_id,
                         job_id: self.config.job_id,
                         logical_job_id: self.config.logical_job_id,
@@ -364,13 +313,8 @@ impl ReserveExecutionOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(LifecycleError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(LifecycleError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -386,8 +330,9 @@ impl Operation for ReserveExecutionOperation {
         match self.state {
             ReserveState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Err(error) = self.keep_view(value) {
-                        return self.fail(error);
+                    match stored_view(value, self.config.realm_id, self.family()) {
+                        Ok(view) => self.view = view,
+                        Err(error) => return self.fail(error),
                     }
                     self.state = ReserveState::Begin;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -395,12 +340,12 @@ impl Operation for ReserveExecutionOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", format!("{other:?}")),
+                other => self.unexpected("realm config read", other.label()),
             },
             ReserveState::Begin => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.scan(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
+                other => self.unexpected("transaction start", other.label()),
             },
             ReserveState::Scan { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -408,7 +353,7 @@ impl Operation for ReserveExecutionOperation {
                     next_start_after,
                 }) => {
                     for (_, value) in values {
-                        match from_bytes::<ExecutionReservation>(&value) {
+                        match from_bytes::<JobReservationRecord>(&value) {
                             Ok(reservation) => self.held.push(reservation),
                             Err(error) => {
                                 self.outcome = Some(Err(error.into()));
@@ -425,7 +370,7 @@ impl Operation for ReserveExecutionOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("reservation scan", format!("{other:?}")),
+                other => self.unexpected("reservation scan", other.label()),
             },
             ReserveState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -438,7 +383,7 @@ impl Operation for ReserveExecutionOperation {
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", format!("{other:?}")),
+                other => self.unexpected("projection cache read", other.label()),
             },
             ReserveState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -447,19 +392,21 @@ impl Operation for ReserveExecutionOperation {
                     self.commit(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("reservation write", format!("{other:?}")),
+                other => self.unexpected("reservation write", other.label()),
             },
             ReserveState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
+                other => self.unexpected("transaction commit", other.label()),
             },
             ReserveState::Cancel { .. } => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", format!("{other:?}")),
+                other => self.unexpected("transaction abort", other.label()),
             },
-            ReserveState::Init | ReserveState::Finish | ReserveState::Error => smallvec![],
+            ReserveState::Init | ReserveState::Finish | ReserveState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 
@@ -545,12 +492,8 @@ impl ReleaseExecutionOperation {
         smallvec![]
     }
 
-    fn unexpected(&self, expected: &'static str, got: String) -> LifecycleError {
-        LifecycleError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        }
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> LifecycleError {
+        LifecycleError::unexpected(&self.state, expected, got)
     }
 }
 
@@ -578,7 +521,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction start", format!("{other:?}"));
+                    let error = self.unexpected("transaction start", other.label());
                     self.fail(error)
                 }
             },
@@ -598,7 +541,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
                 other => {
-                    let error = self.unexpected("reservation read result", format!("{other:?}"));
+                    let error = self.unexpected("reservation read result", other.label());
                     self.cancel(txn_id, error)
                 }
             },
@@ -610,7 +553,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
                 other => {
-                    let error = self.unexpected("reservation delete result", format!("{other:?}"));
+                    let error = self.unexpected("reservation delete result", other.label());
                     self.cancel(txn_id, error)
                 }
             },
@@ -621,7 +564,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction commit", format!("{other:?}"));
+                    let error = self.unexpected("transaction commit", other.label());
                     self.fail(error)
                 }
             },
@@ -635,11 +578,14 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction abort", format!("{other:?}"));
+                    let error = self.unexpected("transaction abort", other.label());
                     self.fail(error)
                 }
             },
-            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => smallvec![],
+            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => {
+                let error = self.unexpected("no event", event.label());
+                self.fail(error)
+            }
         }
     }
 

@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_blob::blob::BlobHandler;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
+use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -29,7 +30,7 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::GroupId;
+use aruna_core::types::{Effects, GroupId};
 use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
@@ -50,8 +51,8 @@ use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio::time::{MissedTickBehavior, sleep};
 use topology::{
-    BoxError, TestNode, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
-    run_writers, scaffold_payload, shutdown_nodes,
+    BoxError, TestNode, WriterSettings, build_realm_nodes, init_logging, make_runtime,
+    mixed_payload, node_targets, run_writers, scaffold_payload, shutdown_nodes,
 };
 use ulid::Ulid;
 
@@ -78,6 +79,8 @@ const READ_BATCH: usize = 100;
 const OBJECT_COUNT: usize = 500;
 const OBJECT_BYTES: usize = 4096;
 const BUCKET: &str = "measure";
+const RUNNER_RUNS: usize = 20_000;
+const RUNNER_READS: usize = 16;
 
 /// The single node of the storage and object workloads, kept alive with its folder.
 struct Node {
@@ -88,7 +91,7 @@ struct Node {
 
 /// Workloads in run order; each runs in its own child process, so the nodes, stores and
 /// background tasks of one workload cannot slow down or starve the next one.
-const WORKLOADS: [&str; 9] = [
+const WORKLOADS: [&str; 10] = [
     "create-1",
     "create-8",
     "create-32",
@@ -98,6 +101,7 @@ const WORKLOADS: [&str; 9] = [
     "tail",
     "outbox",
     "single",
+    "runner",
 ];
 
 fn main() -> Result<(), BoxError> {
@@ -142,6 +146,7 @@ async fn run_workload(workload: &str) -> Result<(), BoxError> {
         "converge" => measure_drain().await,
         "tail" => measure_tail().await,
         "outbox" => measure_outbox().await,
+        "runner" => measure_runner().await,
         "single" => {
             let single = spawn_single().await?;
             let result = match measure_reads(&single.context).await {
@@ -179,14 +184,16 @@ async fn measure_creates(seed: u8, writers: usize) -> Result<(), BoxError> {
     let per_writer = TOTAL_CREATES / writers;
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "measure",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "measure".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         writers,
         per_writer,
         &targets,
-        None,
-        mixed_payload,
     )
     .await;
     let seconds = started.elapsed().as_secs_f64();
@@ -206,14 +213,16 @@ async fn measure_spread() -> Result<(), BoxError> {
     let nodes = build_realm_nodes(&realm_id, REALM_NODES).await?;
     let targets = node_targets(&nodes);
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "spread",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "spread".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         SPREAD_WRITERS,
         SPREAD_DOCS,
         &targets,
-        None,
-        mixed_payload,
     )
     .await;
     let mut created = match created {
@@ -261,14 +270,16 @@ async fn converge_all(realm_id: RealmId, nodes: &[TestNode]) -> Result<(usize, f
     let targets = node_targets(nodes);
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "drain",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "drain".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         DRAIN_WRITERS,
         DRAIN_DOCS,
         &targets,
-        None,
-        mixed_payload,
     )
     .await?;
     let pairs = pairs_of(&created);
@@ -302,14 +313,16 @@ async fn sample_tail(realm_id: RealmId, nodes: &[TestNode]) -> Result<(), BoxErr
     ));
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        group_id,
-        "tail",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "tail".to_string(),
+            period: Some(TAIL_PERIOD),
+            payload: mixed_payload,
+        },
         TAIL_WRITERS,
         TAIL_DOCS,
         &targets,
-        Some(TAIL_PERIOD),
-        mixed_payload,
     )
     .await;
     let ingest_seconds = started.elapsed().as_secs_f64();
@@ -712,4 +725,134 @@ async fn spawn_single() -> Result<Node, BoxError> {
         net,
         context,
     })
+}
+
+/// Reads `reads` stored rows, one after another or as one effect group.
+#[derive(Debug, PartialEq)]
+struct ReadRows {
+    reads: usize,
+    grouped: bool,
+    answered: usize,
+    failed: bool,
+}
+
+fn runner_read(index: usize) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: API_STATE_KEYSPACE.to_string(),
+        key: format!("runner/{index:04}").into_bytes().into(),
+        txn_id: None,
+    })
+}
+
+impl Operation for ReadRows {
+    type Output = ();
+    type Error = ();
+
+    fn start(&mut self) -> Effects {
+        let effect = match self.grouped {
+            true => Effect::Group(EffectGroup {
+                members: (0..self.reads).map(runner_read).collect(),
+                limit: self.reads,
+                form: GroupForm::All { deadline: None },
+            }),
+            false => runner_read(0),
+        };
+        smallvec::smallvec![effect]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) if !self.grouped => {
+                self.answered += 1;
+            }
+            Event::Group(GroupEvent::Finished { results }) if self.grouped => {
+                self.answered = results
+                    .iter()
+                    .filter(|result| matches!(result, GroupResult::Done(_)))
+                    .count();
+                self.failed = self.answered < self.reads;
+            }
+            _ => self.failed = true,
+        }
+        match self.is_complete() {
+            true => Effects::new(),
+            false => smallvec::smallvec![runner_read(self.answered)],
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.failed || self.answered >= self.reads
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.failed {
+            true => Err(()),
+            false => Ok(()),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        self.failed = true;
+        Effects::new()
+    }
+}
+
+/// Times the runner on a storage-only node: a one-read operation, RUNNER_READS reads one after
+/// another, and the same reads as one effect group.
+async fn measure_runner() -> Result<(), BoxError> {
+    let dir = tempfile::tempdir()?;
+    let storage = FjallStorage::open(dir.path().to_str().ok_or("invalid storage path")?)?;
+    let writes = (0..RUNNER_READS)
+        .map(|index| {
+            let key = format!("runner/{index:04}").into_bytes();
+            (
+                API_STATE_KEYSPACE.to_string(),
+                key.into(),
+                vec![7u8; 64].into(),
+            )
+        })
+        .collect();
+    let effect = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    match storage.send_effect(Effect::Storage(effect)).await {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        other => return Err(format!("unexpected batch write event: {other:?}").into()),
+    }
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+    for (detail, reads, grouped) in [
+        ("short", 1, false),
+        ("sequence", RUNNER_READS, false),
+        ("group", RUNNER_READS, true),
+    ] {
+        let started = Instant::now();
+        for _ in 0..RUNNER_RUNS {
+            let operation = ReadRows {
+                reads,
+                grouped,
+                answered: 0,
+                failed: false,
+            };
+            drive(operation, &context)
+                .await
+                .map_err(|()| format!("runner {detail} failed"))?;
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        report(
+            "runner",
+            &format!("{detail} reads={reads}"),
+            RUNNER_RUNS,
+            seconds,
+        );
+    }
+    Ok(())
 }

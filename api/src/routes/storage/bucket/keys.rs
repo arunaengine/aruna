@@ -10,7 +10,6 @@ use super::super::encryption::{
 };
 use super::super::routing::ensure_group_admin;
 use crate::auth::UnrestrictedAuth;
-use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
@@ -21,8 +20,9 @@ use aruna_core::structs::storage::encryption::{BucketKeyRef, HolderOrigin, Unloc
 use aruna_core::structs::storage::holders::{
     HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::holders::lookup_keys;
 use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
 use aruna_operations::s3::bucket::key_grant::{GrantError, GrantHolderOperation, GrantInput};
@@ -36,10 +36,10 @@ use aruna_operations::s3::bucket::key_unlock::{
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
 use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
@@ -255,7 +255,7 @@ fn unlock_key(body: Bytes) -> ServerResult<SharedSecret> {
 }
 
 fn status_view(status: &UnlockStatus) -> UnlockView {
-    unlock_view(Some(status), now_ms())
+    unlock_view(Some(status), unix_timestamp_millis())
 }
 
 #[utoipa::path(
@@ -290,13 +290,12 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
 )]
 pub async fn unlock_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<UnlockQuery>,
     body: Bytes,
 ) -> ServerResult<Json<UnlockView>> {
     let private_key = unlock_key(body)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = UnlockInput {
@@ -307,7 +306,7 @@ pub async fn unlock_bucket(
         caller: auth.user_id,
         key: BucketKeyRef::new(bucket_id, query.generation),
         duration: query.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let operation = UnlockBucketOperation::new(input, private_key);
     let origin = (state.get_realm_id(), state.get_node_id());
@@ -415,7 +414,7 @@ pub async fn extend_unlock(
         generation: request.generation,
         session_id,
         duration: request.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let status = drive(ExtendBucketOperation::new(input), &state.get_ctx())
         .await
@@ -456,7 +455,7 @@ pub async fn lock_bucket(
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<UnlockView>> {
     let group_id = bucket_info(&state, &bucket).await?.group_id;
-    let now_ms = now_ms();
+    let now_ms = unix_timestamp_millis();
     let input = LockInput {
         bucket,
         group_id,
@@ -588,7 +587,7 @@ pub async fn grant_holder(
         user_id,
         granted_by: auth.user_id,
         lookup,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let result = drive(GrantHolderOperation::new(input), &state.get_ctx())
         .await
@@ -677,7 +676,7 @@ pub async fn remove_holder(
         revision,
         confirm_recovery: query.confirm_recovery,
         lookups,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     drive(RemoveHolderOperation::new(input), &state.get_ctx())
         .await

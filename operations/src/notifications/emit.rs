@@ -77,7 +77,7 @@ impl EmitNotificationsOperation {
             Event::Storage(StorageEvent::Error { error }) => EmitNotificationsError::Storage(error),
             other => EmitNotificationsError::UnexpectedEvent {
                 state: self.state.name(),
-                got: format!("{other:?}"),
+                got: other.label().to_string(),
             },
         };
         warn!(%error, "Dropping notification emission");

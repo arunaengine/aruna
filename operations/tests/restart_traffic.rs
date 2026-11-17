@@ -26,8 +26,8 @@ use crate::convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{
-    BoxError, TestNode, install_default_config, make_runtime, respawn_with_retry, run_writer,
-    shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
+    BoxError, TestNode, WriterSettings, install_default_config, make_runtime, respawn_with_retry,
+    run_writer, shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
 };
 use convergence::{
     HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_for_visibility, wait_storage_released,
@@ -129,14 +129,16 @@ async fn finish_restart(
     // A fresh write after the restart converges to all nodes.
     let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let fresh = run_writer(
-        realm_id,
-        group_id,
-        "fresh",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "fresh".to_string(),
+            period: None,
+            payload: restart_payload,
+        },
         0,
         1,
         targets,
-        None,
-        restart_payload,
     )
     .await?;
     let fresh: Vec<(GroupId, Ulid)> = fresh.into_iter().map(|(g, d, _)| (g, d)).collect();
@@ -203,14 +205,16 @@ async fn seed_restart_documents(
     let group_id = Ulid::generate();
     let targets = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let created = run_writer(
-        realm_id,
-        group_id,
-        "seed",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "seed".to_string(),
+            period: None,
+            payload: restart_payload,
+        },
         0,
         SEED_DOCUMENTS,
         targets,
-        None,
-        restart_payload,
     )
     .await?;
     let created: Vec<(GroupId, Ulid)> = created.into_iter().map(|(g, d, _)| (g, d)).collect();

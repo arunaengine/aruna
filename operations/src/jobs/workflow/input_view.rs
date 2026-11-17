@@ -8,6 +8,7 @@ use std::ops::Range;
 
 use aruna_core::NodeId;
 use aruna_core::compute::CACHE_MANIFEST_KEY;
+use aruna_core::cursor;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::{
@@ -17,19 +18,18 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::key_wake::read_row;
-use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read};
+use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::visible::SCAN_BUDGET;
 use crate::staging::native_source::{body_stream, granted_read};
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;
@@ -201,7 +201,7 @@ async fn manifest_for(
 }
 
 /// The KubeDAL file list of the cached entries, each checked against its BLAKE3 and size.
-pub fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
+fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
     let files = entries
         .iter()
         .filter(|entry| cached.contains(&entry.key))
@@ -318,12 +318,12 @@ fn is_prefix(marker: &str, delimiter: Option<&str>) -> bool {
 
 /// An opaque continuation token bound to one view bucket.
 pub fn encode_token(bucket: &str, marker: &str) -> String {
-    URL_SAFE_NO_PAD.encode(format!("{bucket}\0{marker}"))
+    cursor::encode(format!("{bucket}\0{marker}"))
 }
 
 /// The marker a token of this view bucket names; a token of another bucket names none.
 pub fn decode_token(bucket: &str, token: &str) -> Option<String> {
-    let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
+    let bytes = cursor::decode(token).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     let (owner, marker) = text.split_once('\0')?;
     (owner == bucket).then(|| marker.to_string())
@@ -757,7 +757,7 @@ mod tests {
         use aruna_core::structs::storage::format::Compression;
 
         let (_directory, storage) = crate::tests::s3::test_storage();
-        let context = crate::tests::s3::test_context(storage);
+        let context = crate::testing::test_context(storage);
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(2, 2);
         let local = entry("a").captured.source_node_id;

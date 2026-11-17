@@ -40,12 +40,12 @@ use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
-use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 pub use aruna_core::metadata::{AuthToken, AuthTokenError};
@@ -643,7 +643,7 @@ pub enum MetadataTransportMessage {
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
     ResolveJobInputs {
         auth_token: AuthToken,
-        request: Box<crate::jobs::lifecycle::ingress::InputResolveRequest>,
+        request: Box<aruna_core::jobs::InputResolveRequest>,
     },
     ResolvedJobInputs {
         result: Result<
@@ -651,7 +651,7 @@ pub enum MetadataTransportMessage {
                 aruna_core::structs::execution::job::InputSelection,
                 aruna_core::structs::execution::job::CapturedInput,
             )>,
-            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+            aruna_core::jobs::SubmissionRefusal,
         >,
     },
     /// Release membership or release files of some ranges, asked of their coordinator with the
@@ -682,7 +682,7 @@ pub enum MetadataTransportMessage {
     },
     /// One chunk of a plugin artifact a management node hands another to keep before publishing.
     StoreArtifact {
-        chunk: crate::plugins::copies::Chunk,
+        chunk: aruna_core::plugins::Chunk,
     },
     /// `true` once the receiver holds the whole artifact and it checked out.
     ArtifactStored {
@@ -694,7 +694,7 @@ pub enum MetadataTransportMessage {
         index: u32,
     },
     FetchedArtifact {
-        result: Result<crate::plugins::copies::Chunk, MetadataReadError>,
+        result: Result<aruna_core::plugins::Chunk, MetadataReadError>,
     },
     /// The clock of an infrastructure node, asked to map an install's activation time.
     ProbeClock,
@@ -703,17 +703,17 @@ pub enum MetadataTransportMessage {
     },
     /// Matched plugin events and gap counts for the install's receiver to decide.
     ForwardEvents {
-        batch: crate::plugins::forward::EventBatch,
+        batch: aruna_core::plugin_runs::EventBatch,
     },
     EventsDecided {
-        result: Result<crate::plugins::forward::Decisions, MetadataReadError>,
+        result: Result<aruna_core::plugin_runs::Decisions, MetadataReadError>,
     },
     /// A plugin install's receiver asks for the secret bound to one of its slots.
     ReleaseSecret {
-        request: crate::plugins::release::ReleaseRequest,
+        request: aruna_core::plugins::ReleaseRequest,
     },
     SecretReleased {
-        result: Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError>,
+        result: Result<aruna_core::plugins::Released, aruna_core::plugins::ReleaseError>,
     },
     /// A server node asks an install's receiver whether it holds a node secret of a kind, and
     /// which header the secret checks; never its value.
@@ -722,7 +722,7 @@ pub enum MetadataTransportMessage {
         kind: aruna_core::secrets::SecretKind,
     },
     NodeSecretChecked {
-        result: Result<Option<String>, crate::plugins::bound::NodeCheckError>,
+        result: Result<Option<String>, aruna_core::plugins::NodeCheckError>,
     },
     /// A forwarded update refused, without an effect, because the holder's graph has not applied
     /// its expected revision yet; the caller retries.

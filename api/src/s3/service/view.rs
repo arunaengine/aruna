@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::execution::job::{JobId, JobRecord};
-use aruna_operations::jobs::store::read_job_record;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
     list_shown, names_manifest, read_entry, read_manifest, view_bucket, view_entries,

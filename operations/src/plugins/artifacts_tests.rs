@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::runs::tests::opened;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
-use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 
@@ -37,20 +37,6 @@ fn realm_config() -> RealmConfigDocument {
     config.ensure_node(node(4), RealmNodeKind::User { owner });
     config.plugins.push(published(FIXTURE));
     config
-}
-
-fn context() -> (TempDir, DriverContext) {
-    let dir = tempdir().unwrap();
-    let ctx = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    };
-    (dir, ctx)
 }
 
 #[test]
@@ -114,7 +100,7 @@ fn exact_bytes() {
 
 #[tokio::test]
 async fn fetch_checks_copy() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let config = realm_config();
     let digest = ArtifactDigest::of(FIXTURE).to_string();
     let missing = fetch_artifact(&ctx, &config, &digest).await;

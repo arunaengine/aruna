@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::{Component, Path};
 
 use crate::s3::object::get::leased;
+use aruna_core::archive_path::{KeyLayout, StorageKey, safe_zip_path, synthesized_path};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, BlobError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -26,7 +26,7 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobVersion, BucketInfo, HashIndex, ManagedCopyKey, VersionKey,
-    ensure_confined_path, object_permission_path,
+    object_permission_path,
 };
 use aruna_core::structs::storage::data::identity::{DataIdentity, content_id};
 use aruna_core::structs::storage::encryption::{
@@ -47,7 +47,6 @@ use oxttl::NQuadsParser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use ulid::Ulid;
-use unicode_normalization::UnicodeNormalization;
 use url::Url;
 
 use super::executor::{JobContext, JobRunOutcome};
@@ -79,8 +78,8 @@ use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget
 use aruna_core::jobs::WaitTarget;
 use aruna_core::structs::identity::auth::AuthContext;
 
-mod archive;
-pub(crate) use archive::*;
+pub(crate) mod archive;
+use archive::*;
 
 const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
 const REPORT_PATH: &str = aruna_core::repository::rules::CRATE_FILES[1];
@@ -205,14 +204,6 @@ impl ExportCheckpoint {
             files: self.repository_files.clone(),
         })
     }
-}
-
-/// The bucket and key an entity was authored against, used to lay the archive
-/// out like the source prefix instead of by content hash.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct StorageKey {
-    pub(crate) bucket: String,
-    pub(crate) key: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1529,7 +1520,8 @@ async fn start_read_txn(ctx: &DriverContext) -> Result<TxnId, ExportFailure> {
             Err(ExportFailure::Retryable(error.to_string()))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected storage transaction event: {event:?}"
+            "unexpected storage transaction event: {}",
+            event.label()
         ))),
     }
 }
@@ -1548,7 +1540,8 @@ async fn commit_read_txn(ctx: &DriverContext, txn_id: TxnId) -> Result<(), Expor
         event => {
             abort_read_txn(ctx, txn_id).await;
             Err(ExportFailure::Retryable(format!(
-                "unexpected storage commit event: {event:?}"
+                "unexpected storage commit event: {}",
+                event.label()
             )))
         }
     }
@@ -1693,7 +1686,8 @@ async fn storage_value(
             Err(ExportFailure::Retryable(error.to_string()))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected storage read event: {event:?}"
+            "unexpected storage read event: {}",
+            event.label()
         ))),
     }
 }
@@ -2096,7 +2090,8 @@ async fn open_local_txn(
         }
         Event::Blob(BlobEvent::Error(_)) => Ok(CandidateOpen::Status(OpenStatus::Offline)),
         event => Err(ExportFailure::Retryable(format!(
-            "unexpected local blob read event: {event:?}"
+            "unexpected local blob read event: {}",
+            event.label()
         ))),
     }
 }
@@ -2127,7 +2122,8 @@ async fn read_admission(
             Ok(Err(key))
         }
         event => Err(ExportFailure::Retryable(format!(
-            "read admission failed: {event:?}"
+            "read admission failed: {}",
+            event.label()
         ))),
     }
 }

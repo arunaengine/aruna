@@ -12,9 +12,7 @@ use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
 use crate::server::state::ServerState;
-use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
-};
+use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_storage};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
@@ -26,6 +24,8 @@ use aruna_operations::metadata::api::{
     ApiQueryMode, MetadataApiError, MetadataQueryRequest, MetadataSearchRequest, load_realm_nodes,
     query_metadata as run_query_metadata, search_metadata as run_search_metadata,
 };
+use aruna_operations::testing::sign_token;
+use aruna_operations::testing::test_context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -74,9 +74,6 @@ use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;
@@ -3161,9 +3158,8 @@ async fn setup_access_state() -> DistributedAccessState {
     .await;
     drain_metadata_background(remote.state.as_ref()).await;
 
-    let valid_bearer_token =
-        sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
-    let denied_bearer_token = sign_test_token(
+    let valid_bearer_token = sign_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+    let denied_bearer_token = sign_token(
         &realm_signing_key,
         &test_token_claims(realm_id, denied_user_id),
     );
@@ -4268,16 +4264,6 @@ fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenCla
         via: None,
         auth_time: None,
     }
-}
-
-fn sign_test_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
-    let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
-    )
-    .unwrap()
 }
 
 pub(crate) async fn setup_state() -> TestState {

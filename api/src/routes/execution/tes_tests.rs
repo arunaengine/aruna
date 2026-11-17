@@ -22,7 +22,7 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::insert_job;
+use aruna_operations::jobs::store::query::insert_job;
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
 
@@ -1052,7 +1052,7 @@ fn view_projections() {
 }
 
 /// The replicated family behind one succeeded distributed task.
-fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
+fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
     use aruna_core::structs::execution::job::{
         EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
@@ -1060,7 +1060,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::jobs::lifecycle::FamilyReport;
+    use aruna_operations::jobs::lifecycle::report::FamilyReport;
 
     let realm_id = RealmId([1u8; 32]);
     let created_by = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -1277,7 +1277,7 @@ fn derives_family_tags() {
     // Placement details are stamped at read time, so a task that was never
     // placed carries the job id and logical state and nothing more.
     use aruna_core::compute::ExecutionTargetId;
-    use aruna_operations::jobs::lifecycle::PlanEstimate;
+    use aruna_operations::jobs::lifecycle::report::PlanEstimate;
 
     let mut report = family_fixture();
     let unplaced = project_task(

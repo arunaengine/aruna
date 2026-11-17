@@ -406,7 +406,7 @@ mod tests {
         );
         assert!(!present(&context, PENDING_LOCATION_KEYSPACE, row.clone()).await);
         assert!(!present(&context, PENDING_RECLAIM_KEYSPACE, row).await);
-        let (queued, _) = crate::jobs::store::iter_prefix_page(
+        let (queued, _) = crate::jobs::store::query::iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
             None,

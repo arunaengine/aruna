@@ -220,7 +220,8 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
     use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::link_store::change_link;
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -409,7 +410,8 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
     use aruna_core::repository::{LinkPatch, LinkReview};
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::link_store::change_link;
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -549,10 +551,10 @@ async fn complete(
         return Ok(());
     };
     let storage = &fixture.context.storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, ctx.job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, ctx.job_id, None)
         .await?
         .ok_or("job missing")?;
-    aruna_operations::jobs::store::complete_job(
+    aruna_operations::jobs::store::state::complete_job(
         storage,
         ctx.job_id,
         ctx.claim_token,
@@ -730,7 +732,8 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::repository::link_queue::drain_links;
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::repository::link_store::{change_link, list_links};
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -838,7 +841,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
     .await??;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job, None)
         .await?
         .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {

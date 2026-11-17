@@ -75,7 +75,10 @@ pub enum OwnerSecretError {
     #[error(transparent)]
     Vault(#[from] RealmVaultError),
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("this secret cannot be read back")]
     NotReadable,
     #[error("operation did not finish")]
@@ -184,7 +187,7 @@ impl EntryReader {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (_, other) => Err(OwnerSecretError::UnexpectedEvent {
                 state: "EntryReader",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         }
     }
@@ -576,7 +579,7 @@ impl Operation for OwnerSecretOperation {
             }
             (State::Init | State::Done, _) => smallvec![],
             (_, event) => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 self.fail(OwnerSecretError::UnexpectedEvent {
                     state: "OwnerSecret",
                     got,
@@ -762,7 +765,7 @@ impl Operation for OwnerSecretsOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (_, other) => Err(OwnerSecretError::UnexpectedEvent {
                 state: "OwnerSecrets",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         };
         if let Err(error) = result {
@@ -858,7 +861,7 @@ impl Operation for ReadbackOperation {
             (Some(_), Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (Some(_), other) => Err(OwnerSecretError::UnexpectedEvent {
                 state: "Readback",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         };
         self.output = Some(result);

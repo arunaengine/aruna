@@ -243,7 +243,7 @@ pub(super) fn recognize_entities(
     Ok(entities)
 }
 
-pub(super) fn raw_entity_ids(
+fn raw_entity_ids(
     document: &JsonValue,
     keywords: &JsonLdKeywords,
 ) -> Result<Vec<(String, String, Option<String>)>, ExportFailure> {
@@ -290,7 +290,7 @@ pub(super) fn raw_entity_ids(
     Ok(entities)
 }
 
-pub(super) fn raw_local_path(
+fn raw_local_path(
     object: &serde_json::Map<String, JsonValue>,
     keywords: &JsonLdKeywords,
 ) -> Option<String> {
@@ -320,37 +320,12 @@ pub(super) fn expanded_id(id: &str) -> Result<String, ExportFailure> {
         .map_err(|error| ExportFailure::Permanent(error.to_string()))
 }
 
-pub(super) fn term_value(term: &Term) -> Option<String> {
+fn term_value(term: &Term) -> Option<String> {
     match term {
         Term::NamedNode(value) => Some(value.as_str().to_string()),
         Term::Literal(value) => Some(value.value().to_string()),
         _ => None,
     }
-}
-
-pub(crate) fn safe_zip_path(value: &str) -> Option<String> {
-    let mut value = value;
-    while let Some(stripped) = value.strip_prefix("./") {
-        value = stripped;
-    }
-    let normalized = value.nfc().collect::<String>();
-    let lower = normalized.to_ascii_lowercase();
-    if normalized.is_empty()
-        || normalized.ends_with('/')
-        || normalized.contains('\\')
-        || lower.contains("%2f")
-        || lower.contains("%5c")
-        || normalized
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || ensure_confined_path(Path::new(&normalized)).is_err()
-        || Path::new(&normalized)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(normalized)
 }
 
 pub(super) fn jsonld_path(path: &str) -> String {
@@ -365,11 +340,6 @@ pub(super) fn jsonld_path(path: &str) -> String {
         }
     }
     url.path().trim_start_matches('/').to_string()
-}
-
-pub(crate) fn synthesized_path(hash: [u8; 32], entity_id: &str) -> String {
-    let suffix = blake3::hash(entity_id.as_bytes()).to_hex();
-    format!("data/{}-{}", hex::encode(hash), &suffix[..12])
 }
 
 /// The authored location wins over the resolved candidate: a content hash may
@@ -389,68 +359,6 @@ pub(super) fn source_key(entity: &ExportEntity, candidate_index: usize) -> Optio
         }),
         CandidateSource::RemoteHash { .. } => None,
     }
-}
-
-/// How keys become archive paths: one bucket drops the directory prefix every
-/// payload shares, several buckets keep the whole key under the bucket name.
-pub(crate) struct KeyLayout {
-    dropped: usize,
-    with_bucket: bool,
-}
-
-impl KeyLayout {
-    pub(crate) fn new(sources: &[Option<StorageKey>]) -> Self {
-        let mut buckets = BTreeSet::new();
-        let mut shared: Option<Vec<&str>> = None;
-        for source in sources.iter().flatten() {
-            buckets.insert(source.bucket.as_str());
-            let parents = key_parents(&source.key);
-            shared = Some(match shared {
-                Some(shared) => common_prefix(shared, &parents),
-                None => parents,
-            });
-        }
-        let single = buckets.len() == 1;
-        Self {
-            dropped: if single {
-                shared.map_or(0, |shared| shared.len())
-            } else {
-                0
-            },
-            with_bucket: !single,
-        }
-    }
-
-    pub(crate) fn path(&self, source: &StorageKey) -> Option<String> {
-        let relative = source
-            .key
-            .split('/')
-            .skip(self.dropped)
-            .collect::<Vec<_>>()
-            .join("/");
-        let candidate = if self.with_bucket {
-            format!("{}/{relative}", source.bucket)
-        } else {
-            relative
-        };
-        safe_zip_path(&candidate)
-    }
-}
-
-pub(super) fn key_parents(key: &str) -> Vec<&str> {
-    let mut parents = key.split('/').collect::<Vec<_>>();
-    parents.pop();
-    parents
-}
-
-pub(super) fn common_prefix<'a>(mut shared: Vec<&'a str>, parents: &[&str]) -> Vec<&'a str> {
-    let common = shared
-        .iter()
-        .zip(parents)
-        .take_while(|(left, right)| left == right)
-        .count();
-    shared.truncate(common);
-    shared
 }
 
 pub(super) fn scan_unrewritten(
@@ -495,7 +403,7 @@ pub(super) fn rewrite_ids(value: &mut JsonValue, replacements: &BTreeMap<String,
     rewrite_id_values(value, replacements, &keywords);
 }
 
-pub(super) fn rewrite_id_values(
+fn rewrite_id_values(
     value: &mut JsonValue,
     replacements: &BTreeMap<String, String>,
     keywords: &JsonLdKeywords,
@@ -583,7 +491,7 @@ pub(super) fn snapshot_moment(checkpoint: &ExportCheckpoint) -> Result<u64, Expo
         .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))
 }
 
-pub(super) fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
+fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
     let event_id = checkpoint
         .winning_event_id
         .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))?;
@@ -737,7 +645,7 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
     Ok(())
 }
 
-pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
+fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
     graph.iter().find_map(|entity| {
         let entity = entity.as_object()?;
         let (_, id) = keywords.object_id(entity)?;
@@ -756,7 +664,7 @@ pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> 
     })
 }
 
-pub(super) fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
+fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
     match value {
         JsonValue::String(value) => Some(value),
         JsonValue::Object(value) => keywords.object_id(value).map(|(_, id)| id),
@@ -767,7 +675,7 @@ pub(super) fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) 
     }
 }
 
-pub(super) fn property_key(
+fn property_key(
     object: &serde_json::Map<String, JsonValue>,
     keywords: &JsonLdKeywords,
     values: &[&str],
@@ -781,12 +689,7 @@ pub(super) fn property_key(
         .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
 }
 
-pub(super) fn safe_term(
-    keywords: &JsonLdKeywords,
-    compact: &str,
-    values: &[&str],
-    absolute: &str,
-) -> String {
+fn safe_term(keywords: &JsonLdKeywords, compact: &str, values: &[&str], absolute: &str) -> String {
     if keywords.term_matches(compact, values) {
         compact.to_string()
     } else {
@@ -952,7 +855,8 @@ pub(super) async fn assemble_export(
             Err(ExportFailure::Retryable(error.to_string()))
         }
         (event, _) => Err(ExportFailure::Retryable(format!(
-            "unexpected hidden artifact event: {event:?}"
+            "unexpected hidden artifact event: {}",
+            event.label()
         ))),
     }
 }
@@ -1115,7 +1019,7 @@ pub(super) fn zip_date(modified_ms: u64) -> ZipDateTime {
         .build()
 }
 
-pub(super) fn stream_status(error: &StreamError) -> OpenStatus {
+fn stream_status(error: &StreamError) -> OpenStatus {
     if matches!(
         error.0.downcast_ref::<BlobError>(),
         Some(BlobError::IntegrityCheckFailed(_))

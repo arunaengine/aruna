@@ -15,7 +15,7 @@ use super::{BulkRunRequest, BulkRunResponse, CoverageQuery, CoverageResponse};
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::lookup::map_guard_error;
-use crate::lookup::{RestForward, relay_get, relay_json};
+use crate::routes::storage::relay::{RestForward, relay_get, relay_json};
 use crate::server::state::ServerState;
 
 /// Where each coordinator's own pass stands; a coordinator in neither field starts from the start.

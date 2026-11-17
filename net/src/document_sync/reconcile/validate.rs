@@ -3,11 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::execution::setting::validate_setting;
-use aruna_core::user::validation::{
-    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
-    SERVICE_GROUP_ATTRIBUTE,
-};
+use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
 
 impl ConfigValidationCache {
     pub(in crate::document_sync) fn invalidate(&mut self) {
@@ -85,50 +81,6 @@ pub(in crate::document_sync) async fn read_realm_authorization(
     .map_err(|error| NetError::Bootstrap(error.to_string()))
 }
 
-/// Whether this origin already holds the per-origin bound a local mint obeys.
-/// Replacing its own entry stays allowed; the flooding origin is rejected rather
-/// than trimmed, so a valid revocation is never discarded to make room.
-pub(in crate::document_sync) fn revocation_origin_full(
-    state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    token_hash: &str,
-) -> bool {
-    let Some(state) = state else {
-        return false;
-    };
-    let index = state.revocation_index(state.revocation_floor.max(unix_timestamp_secs()));
-    index.origin(token_hash) != Some(event.origin_node_id)
-        && index.count(&event.origin_node_id) >= REVOCATIONS_PER_ORIGIN
-}
-
-pub(in crate::document_sync) fn revocation_origin_known(
-    config: Option<&RealmConfigDocument>,
-    state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    realm_id: RealmId,
-) -> bool {
-    if config.is_some_and(|config| {
-        config.realm_id == realm_id && origin_may_publish(config, &event.origin_node_id)
-    }) {
-        return true;
-    }
-
-    let Some(state) = state else {
-        return false;
-    };
-    let path = config_node_path(&event.origin_node_id);
-    state
-        .user_subject_ids
-        .get(&path)
-        .is_some_and(|version| event.observed.observes(&version.dot))
-        || state.conflicts.get(&path).is_some_and(|conflict| {
-            conflict
-                .values
-                .iter()
-                .any(|value| event.observed.observes(&value.dot))
-        })
-}
-
 /// Whether the transport publisher of a relayed admin event is a realm node
 /// allowed to relay. User nodes are never relays, so they never appear here.
 pub(in crate::document_sync) async fn relay_publisher_allowed(
@@ -145,28 +97,7 @@ pub(in crate::document_sync) async fn relay_publisher_allowed(
         .iter()
         .filter(|node| node.kind.is_sync_eligible())
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .any(|node_id| publisher == ::irokle::actor_id_for(topic_id, node_to_peer(&node_id))))
-}
-
-/// Publisher capability by node kind: a User node never originates a realm
-/// administrative event, whichever node relayed it.
-pub(in crate::document_sync) fn origin_may_publish(
-    config: &RealmConfigDocument,
-    origin_node_id: &NodeId,
-) -> bool {
-    configured_node_kind(config, origin_node_id).is_some_and(RealmNodeKind::is_sync_eligible)
-}
-
-pub(in crate::document_sync) fn configured_node_kind<'a>(
-    config: &'a RealmConfigDocument,
-    node_id: &NodeId,
-) -> Option<&'a RealmNodeKind> {
-    let node_id = node_id.to_string();
-    config
-        .nodes
-        .iter()
-        .find(|node| node.node_id == node_id)
-        .map(|node| &node.kind)
+        .any(|node_id| published_by(topic_id, publisher, &node_id)))
 }
 
 /// Resolves the plan a report names (stored config first, reduced state as
@@ -264,12 +195,8 @@ fn merge_handoff(
             reason: "current realm config is unavailable".to_string(),
         };
     };
-    let management = |node: &NodeId| {
-        matches!(
-            configured_node_kind(config, node),
-            Some(RealmNodeKind::Management)
-        )
-    };
+    let management =
+        |node: &NodeId| matches!(config.node_kind(node), Some(RealmNodeKind::Management));
     if !management(&event.origin_node_id) || !management(node_id) {
         return AdminEventValidation::Rejected(
             "a merge coordinator is named by and among management nodes".to_string(),
@@ -278,7 +205,8 @@ fn merge_handoff(
     let pinned = previous_state.and_then(AdminDocumentState::materialized_merge_coordinator);
     let left = |pinned: &NodeId| {
         previous_state.is_some_and(|state| state.removed_config_nodes().contains(pinned))
-            || configured_node_kind(config, pinned)
+            || config
+                .node_kind(pinned)
                 .is_some_and(|kind| *kind != RealmNodeKind::Management)
     };
     match pinned {
@@ -286,12 +214,10 @@ fn merge_handoff(
         Some(pinned) if pinned == event.origin_node_id || left(&pinned) => {
             AdminEventValidation::Accepted
         }
-        Some(pinned) if configured_node_kind(config, &pinned).is_none() => {
-            AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
-                reason: "the current merge coordinator is not known here yet".to_string(),
-            }
-        }
+        Some(pinned) if config.node_kind(&pinned).is_none() => AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
+            reason: "the current merge coordinator is not known here yet".to_string(),
+        },
         Some(_) => AdminEventValidation::Rejected(
             "only the current merge coordinator hands the role on".to_string(),
         ),
@@ -427,10 +353,7 @@ pub(in crate::document_sync) fn validate_config_authority(
         }
     }
     if let Some(config) = current_config {
-        let server_binding = match (
-            configured_node_kind(config, &event.origin_node_id),
-            &event.op,
-        ) {
+        let server_binding = match (config.node_kind(&event.origin_node_id), &event.op) {
             (
                 Some(RealmNodeKind::Server),
                 AdminDocumentOperation::PlacementBindingAppended { binding },
@@ -454,7 +377,7 @@ pub(in crate::document_sync) fn validate_config_authority(
                 if proof.holder == event.origin_node_id
         );
         if matches!(
-            configured_node_kind(config, &event.origin_node_id),
+            config.node_kind(&event.origin_node_id),
             Some(RealmNodeKind::Management)
         ) && matches!(
             &event.op,
@@ -470,7 +393,7 @@ pub(in crate::document_sync) fn validate_config_authority(
         }
         return Ok(
             if matches!(
-                configured_node_kind(config, &event.origin_node_id),
+                config.node_kind(&event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) || server_binding
                 || (self_report && origin_may_publish(config, &event.origin_node_id))
@@ -528,7 +451,7 @@ pub(in crate::document_sync) async fn validate_realm_authority(
         }
         return Ok(
             if matches!(
-                configured_node_kind(config, &event.origin_node_id),
+                config.node_kind(&event.origin_node_id),
                 Some(RealmNodeKind::Management)
             ) {
                 AdminEventValidation::Accepted
@@ -586,8 +509,9 @@ pub(in crate::document_sync) async fn validate_user_authority(
             "stored realm config has the wrong realm".to_string(),
         ));
     }
-    let Some(origin_kind) =
-        configured_node_kind(&config, &event.origin_node_id).filter(|kind| kind.is_sync_eligible())
+    let Some(origin_kind) = config
+        .node_kind(&event.origin_node_id)
+        .filter(|kind| kind.is_sync_eligible())
     else {
         return Ok(AdminEventValidation::Rejected(
             "user admin event origin is not a publisher-capable realm node".to_string(),
@@ -693,45 +617,6 @@ pub(in crate::document_sync) async fn validate_user_authority(
     }
 
     Ok(AdminEventValidation::Accepted)
-}
-
-/// The group whose administrators may apply this event to a service account: the owner named by
-/// the event creating a new account, else the stored owner for name and status changes.
-fn service_owner(
-    event: &AdminDocumentEvent,
-    previous_state: Option<&AdminDocumentState>,
-    current_user: Option<&User>,
-) -> Option<GroupId> {
-    let attributes = previous_state.map(AdminDocumentState::materialized_user_attributes);
-    let stored = current_user.and_then(User::service_group).or_else(|| {
-        attributes
-            .as_ref()
-            .and_then(|attributes| attributes.get(SERVICE_GROUP_ATTRIBUTE))
-            .and_then(|group| group.parse().ok())
-    });
-    match &event.op {
-        AdminDocumentOperation::UserAttributeSet { key, value }
-            if key == SERVICE_GROUP_ATTRIBUTE =>
-        {
-            let fresh =
-                current_user.is_none() && attributes.is_none_or(|attributes| attributes.is_empty());
-            fresh.then(|| value.parse().ok()).flatten()
-        }
-        // The install marker is set once, right after the owner, and never changed.
-        AdminDocumentOperation::UserAttributeSet { key, .. } if key == INSTALL_ATTRIBUTE => {
-            let marked = current_user.is_some_and(|user| user.install().is_some())
-                || (attributes.as_ref()).is_some_and(|map| map.contains_key(INSTALL_ATTRIBUTE));
-            stored.filter(|_| !marked)
-        }
-        AdminDocumentOperation::UserAttributeSet { key, .. }
-        | AdminDocumentOperation::UserAttributeRemoved { key }
-            if key == DEACTIVATED_ATTRIBUTE =>
-        {
-            stored
-        }
-        AdminDocumentOperation::UserNameSet { .. } => stored,
-        _ => None,
-    }
 }
 
 pub(in crate::document_sync) async fn validate_group_authority(
@@ -948,7 +833,7 @@ pub(in crate::document_sync) async fn validate_group_authority(
     // management node merges, after both accounts proved a fresh login.
     if let AdminDocumentOperation::GroupAssignmentAdded { role_id, .. } = &event.op
         && matches!(
-            configured_node_kind(&config, &event.origin_node_id),
+            config.node_kind(&event.origin_node_id),
             Some(RealmNodeKind::Management)
         )
         && group_auth
@@ -997,368 +882,6 @@ pub(in crate::document_sync) async fn validate_group_authority(
     } else {
         AdminEventValidation::Rejected("actor lacks current group write authority".to_string())
     })
-}
-
-pub(in crate::document_sync) fn has_write_permission<'a>(
-    user_id: UserId,
-    path: &str,
-    roles: impl IntoIterator<Item = &'a Role>,
-) -> bool {
-    !user_id.is_nil()
-        && aruna_core::structs::placement::policy::document::holds_admin_write(
-            user_id,
-            path,
-            roles.into_iter(),
-        )
-}
-
-/// Validates a replicated node-usage snapshot against its target: the payload
-/// must decode, embed its target's node, and derive a key attributing to it.
-/// The caller checks the publisher; zero-counter snapshots are valid.
-pub(in crate::document_sync) fn validate_usage_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-) -> std::result::Result<(), String> {
-    let DocumentTarget::NodeUsage { node_id, .. } = target else {
-        return Err("target is not a node usage snapshot".to_string());
-    };
-    let snapshot = NodeUsageSnapshot::from_bytes(bytes)
-        .map_err(|error| format!("undecodable node usage snapshot: {error}"))?;
-    if snapshot.node_id != *node_id {
-        return Err(format!(
-            "snapshot node id {} does not match target node id {node_id}",
-            snapshot.node_id
-        ));
-    }
-    let key = target.storage_key();
-    if usage_node_id(key.as_ref()) != Some(*node_id) {
-        return Err(format!(
-            "node usage storage key does not attribute to target node id {node_id}"
-        ));
-    }
-    Ok(())
-}
-
-/// Validates a replicated watch-interest digest against its target. The caller
-/// checks the publisher; empty digests are valid and clear a node's interest
-/// while preserving single-writer ownership.
-pub(in crate::document_sync) fn validate_watch_interest(
-    target: &DocumentTarget,
-    bytes: &[u8],
-) -> std::result::Result<(), String> {
-    if bytes.len() > INTEREST_BYTES_CAP {
-        return Err(format!(
-            "watch interest digest exceeds serialized byte cap {}",
-            INTEREST_BYTES_CAP
-        ));
-    }
-    let DocumentTarget::WatchInterest { realm_id, node_id } = target else {
-        return Err("target is not a watch interest digest".to_string());
-    };
-    let digest = WatchInterestDigest::from_bytes(bytes)
-        .map_err(|error| format!("undecodable watch interest digest: {error}"))?;
-    if digest.entries.len() > INTEREST_ENTRY_CAP {
-        return Err(format!(
-            "watch interest digest exceeds entry cap {}",
-            INTEREST_ENTRY_CAP
-        ));
-    }
-    if digest.node_id != *node_id {
-        return Err(format!(
-            "digest node id {} does not match target node id {node_id}",
-            digest.node_id
-        ));
-    }
-    let key = target.storage_key();
-    if interest_node_id(key.as_ref()) != Some(*node_id) {
-        return Err(format!(
-            "watch interest storage key does not attribute to target node id {node_id}"
-        ));
-    }
-    if interest_realm_id(key.as_ref()) != Some(*realm_id) {
-        return Err(format!(
-            "watch interest storage key does not attribute to target realm id {realm_id}"
-        ));
-    }
-    Ok(())
-}
-
-pub(in crate::document_sync) fn validate_watch_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    let DocumentTarget::WatchSubscription { owner, watch_id } = target else {
-        return Err("target is not a watch subscription".to_string());
-    };
-    validate_watch_target(*owner, *watch_id)?;
-    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
-        return Err(
-            "watch subscription upsert must carry generation 1 upsert revision".to_string(),
-        );
-    }
-    let subscription = WatchSubscription::from_bytes(bytes)
-        .map_err(|error| format!("undecodable watch subscription: {error}"))?;
-    if subscription.owner != *owner || subscription.watch_id != *watch_id {
-        return Err("watch subscription payload does not match its target".to_string());
-    }
-    if subscription.path_prefix.is_empty()
-        || subscription.path_prefix.starts_with('/')
-        || subscription.path_prefix.len() > MAX_PREFIX_LEN
-    {
-        return Err("watch subscription path prefix is invalid".to_string());
-    }
-    let known_mask = WatchEventMask::METADATA_CREATED
-        | WatchEventMask::DATA_UPLOADED
-        | WatchEventMask::SYNC_COMPLETED
-        | WatchEventMask::SYNC_FAILED;
-    if subscription.event_mask.is_empty() || subscription.event_mask.bits() & !known_mask != 0 {
-        return Err("watch subscription event mask is invalid".to_string());
-    }
-    Ok(())
-}
-
-/// A register write: a notification setting or an owner secret document.
-pub(in crate::document_sync) fn validate_register_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    match target {
-        DocumentTarget::OwnerSecret { .. } => validate_secret_upsert(target, bytes, change),
-        _ => validate_setting_upsert(target, bytes, change),
-    }
-}
-
-/// An owner secret syncs as one generation 1 upsert per immutable write, stamped by its actor.
-/// Whether the writer counts is decided at selection, never here, so every node stores alike.
-pub(in crate::document_sync) fn validate_secret_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
-        return Err("a secret write must carry a generation 1 upsert revision".to_string());
-    }
-    let DocumentTarget::OwnerSecret {
-        owner,
-        name,
-        part,
-        write_id,
-        ..
-    } = target
-    else {
-        return Err("the target is not an owner secret".to_string());
-    };
-    let document = aruna_core::secret_registers::SecretDocument::from_bytes(bytes)
-        .map_err(|error| format!("undecodable secret write: {error}"))?;
-    document.check()?;
-    let matches = document.owner == *owner
-        && document.name == *name
-        && document.part() == *part
-        && document.stamp.write_id == *write_id;
-    if !matches {
-        return Err("the secret write does not match its target".to_string());
-    }
-    match document.stamp.written_by(change.current.actor) {
-        true => Ok(()),
-        false => Err("the secret stamp names another node than its actor".to_string()),
-    }
-}
-
-/// A notification setting syncs as one generation 1 upsert per immutable version.
-pub(in crate::document_sync) fn validate_setting_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    if change.kind != DocumentChangeKind::Upsert || change.current.generation != 1 {
-        return Err("a setting upsert must carry a generation 1 upsert revision".to_string());
-    }
-    let head = validate_setting(target, bytes)?;
-    match head.stamp.written_by(change.current.actor) {
-        true => Ok(()),
-        false => Err("the setting stamp names another node than its actor".to_string()),
-    }
-}
-
-pub(in crate::document_sync) fn validate_watch_delete(
-    target: &DocumentTarget,
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    let DocumentTarget::WatchSubscription { owner, watch_id } = target else {
-        return Err("target is not a watch subscription".to_string());
-    };
-    validate_watch_target(*owner, *watch_id)?;
-    if change.kind != DocumentChangeKind::Delete || change.current.generation != 2 {
-        return Err(
-            "watch subscription delete must carry generation 2 delete revision".to_string(),
-        );
-    }
-    Ok(())
-}
-
-pub(in crate::document_sync) fn validate_watch_target(
-    owner: UserId,
-    watch_id: Ulid,
-) -> std::result::Result<(), String> {
-    if owner.is_nil() {
-        return Err("watch subscription owner must not be nil".to_string());
-    }
-    if watch_id.is_nil() {
-        return Err("watch subscription id must not be nil".to_string());
-    }
-    Ok(())
-}
-
-/// Validates a replicated node-info document against its target: the payload
-/// must decode within bounds, advertise only its own node's execution sites,
-/// and match the target's node. The caller checks the publisher.
-pub(in crate::document_sync) fn validate_node_upsert(
-    target: &DocumentTarget,
-    bytes: &[u8],
-) -> std::result::Result<NodeInfoDocument, String> {
-    let DocumentTarget::NodeInfo { node_id, .. } = target else {
-        return Err("target is not a node info document".to_string());
-    };
-    let document = NodeInfoDocument::from_bytes(bytes)
-        .map_err(|error| format!("invalid node info document: {error}"))?;
-    if document.node_id != *node_id {
-        return Err(format!(
-            "node info document node id {} does not match target node id {node_id}",
-            document.node_id
-        ));
-    }
-    Ok(document)
-}
-
-/// Whether an incoming advertisement replaces the stored one. Undecodable
-/// stored bytes are replaced; an equal or older epoch is not applied, so a
-/// delayed pre-rejoin advertisement cannot shadow the current one.
-pub(in crate::document_sync) fn node_info_supersedes(
-    incoming: &NodeInfoDocument,
-    stored: Option<&[u8]>,
-) -> bool {
-    match stored.and_then(|bytes| NodeInfoDocument::from_bytes(bytes).ok()) {
-        Some(current) => incoming.supersedes(&current),
-        None => true,
-    }
-}
-
-/// Structural gate for a replicated policy document: it must address this realm
-/// and target, carry a verifiable definition, and derive its own sync change,
-/// so a sender cannot restate a policy under someone else's revision.
-pub(in crate::document_sync) fn validate_policy_document(
-    policy_id: Ulid,
-    realm_id: RealmId,
-    document: &PlacementPolicyDocument,
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    if document.policy_id() != policy_id {
-        return Err(format!(
-            "policy {} does not match target policy {policy_id}",
-            document.policy_id()
-        ));
-    }
-    if document.realm_id != realm_id {
-        return Err(format!(
-            "policy realm {} does not match this realm",
-            document.realm_id
-        ));
-    }
-    if let Err(error) = document.verified() {
-        return Err(format!("policy definition is invalid: {error}"));
-    }
-    // Structural gate: bytes without an authentic publication are never a rule.
-    if let Err(error) = document.verify_publication() {
-        return Err(format!("policy publication is invalid: {error}"));
-    }
-    if change.kind != DocumentChangeKind::Upsert {
-        return Err("policy event is not an upsert".to_string());
-    }
-    if *change != placement_policy_change(document, change.placement) {
-        return Err("policy revision does not match its sync change".to_string());
-    }
-    Ok(())
-}
-
-/// Validates a replicated PID mapping against its target and change: the
-/// canonical PID, a consistent kind/status/provenance triple, and the derived
-/// change. The caller enforces publisher identity against the signed actor.
-pub(in crate::document_sync) fn validate_pid_mapping(
-    document_id: Ulid,
-    mapping: &PersistentIdMapping,
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    if mapping.target != document_id {
-        return Err(format!(
-            "mapping target {} does not match target document {document_id}",
-            mapping.target
-        ));
-    }
-    if mapping.pid != MetadataRegistryRecord::graph_iri_for(document_id)
-        && mapping.pid != PersistentIdMapping::profile_pid(document_id)
-    {
-        return Err(format!("mapping pid `{}` is not canonical", mapping.pid));
-    }
-    if !matches!(mapping.kind, PersistentIdKind::Conceptual) {
-        return Err("mapping kind is unsupported".to_string());
-    }
-    if !matches!(mapping.provider, PersistentIdProvider::W3id) {
-        return Err("mapping provider is unsupported".to_string());
-    }
-    if mapping.requested_at_ms.is_some() != mapping.requested_by.is_some() {
-        return Err("mapping request provenance is incomplete".to_string());
-    }
-    if mapping.minted_at_ms.is_some() != mapping.minted_by.is_some() {
-        return Err("mapping mint provenance is incomplete".to_string());
-    }
-    match mapping.status {
-        PersistentIdStatus::Active => {
-            if mapping.minted_at_ms.is_none() || mapping.withdrawn_at_ms.is_some() {
-                return Err("active mapping has inconsistent transition fields".to_string());
-            }
-        }
-        PersistentIdStatus::Requested | PersistentIdStatus::Processing => {
-            if mapping.requested_at_ms.is_none()
-                || mapping.minted_at_ms.is_some()
-                || mapping.withdrawn_at_ms.is_some()
-            {
-                return Err("pending mapping has inconsistent transition fields".to_string());
-            }
-        }
-        PersistentIdStatus::Failed => {
-            if mapping.requested_at_ms.is_none()
-                || mapping.failure.is_none()
-                || mapping.withdrawn_at_ms.is_some()
-            {
-                return Err("failed mapping has inconsistent transition fields".to_string());
-            }
-        }
-        PersistentIdStatus::AdminWithdrawn => {
-            if mapping.withdrawn_at_ms.is_none()
-                || mapping.withdrawn_by.is_none()
-                || mapping
-                    .withdrawal_reason
-                    .as_deref()
-                    .is_none_or(str::is_empty)
-            {
-                return Err("admin-withdrawn mapping lacks actor or reason".to_string());
-            }
-        }
-        PersistentIdStatus::Tombstoned => {
-            if mapping.withdrawn_at_ms.is_none() {
-                return Err("tombstoned mapping has no deletion timestamp".to_string());
-            }
-        }
-    }
-    if change.kind != DocumentChangeKind::Upsert {
-        return Err("mapping event is not an upsert".to_string());
-    }
-    if *change != persistent_id_change(mapping, change.placement) {
-        return Err("mapping revision does not match its sync change".to_string());
-    }
-    Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1426,8 +949,7 @@ async fn validate_admin_envelope(
     }
     // A relay hop must itself be a realm node allowed administrative traffic;
     // before config materializes only the origin may publish.
-    let self_published = authenticated_actor_id
-        == ::irokle::actor_id_for(topic_id, node_to_peer(&event.origin_node_id));
+    let self_published = published_by(topic_id, authenticated_actor_id, &event.origin_node_id);
     if !self_published
         && !relay_publisher_allowed(storage, topic_id, authenticated_actor_id, realm_id).await?
     {
@@ -1450,375 +972,6 @@ async fn validate_admin_envelope(
         return reject("event origin sequence does not follow its observed clock");
     }
     Ok(AdminEventValidation::Accepted)
-}
-
-/// A federated user acts through the reconciled realm only on group events, which the group
-/// authority check still decides, to revoke its own token, and through a set's publisher.
-fn foreign_actor_allowed(event: &AdminDocumentEvent, realm_id: RealmId) -> bool {
-    event.actor.realm_id == realm_id
-        && !event.actor.user_id.is_nil()
-        && match &event.op {
-            AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. } => {
-                *token_owner == event.actor.user_id
-            }
-            // The publisher accepted a federated admin's request; signature, realm and set
-            // are still checked by the distribution shape rules.
-            AdminDocumentOperation::DistributionPublished { snapshot } => {
-                matches!(event.target, AdminDocumentTarget::Distribution { .. })
-                    && snapshot.snapshot.root.publisher == event.origin_node_id
-            }
-            _ => matches!(event.target, AdminDocumentTarget::Group { .. }),
-        }
-}
-
-/// Whether the dispatched family agrees with both the sync target address and
-/// the payload's declared target.
-fn family_matches_targets(
-    family: AdminOperationFamily,
-    target: &DocumentTarget,
-    event_target: &AdminDocumentTarget,
-) -> bool {
-    matches!(
-        (family, target, event_target),
-        (
-            AdminOperationFamily::Group,
-            DocumentTarget::GroupAuthorization { group_id },
-            AdminDocumentTarget::Group { group_id: event_group_id }
-        ) if group_id == event_group_id
-    ) || matches!(
-        (family, target, event_target),
-        (
-            AdminOperationFamily::RealmAuthorization,
-            DocumentTarget::RealmAuthorization { realm_id },
-            AdminDocumentTarget::Realm { realm_id: event_realm_id }
-        ) if realm_id == event_realm_id
-    ) || matches!(
-        (family, target, event_target),
-        (
-            AdminOperationFamily::User,
-            DocumentTarget::User { user_id },
-            AdminDocumentTarget::User { user_id: event_user_id }
-        ) if user_id == event_user_id
-    ) || matches!(
-        (family, target, event_target),
-        (
-            AdminOperationFamily::RealmConfig,
-            DocumentTarget::RealmConfig { realm_id },
-            AdminDocumentTarget::RealmConfig { realm_id: event_realm_id }
-        ) if realm_id == event_realm_id
-    ) || matches!(
-        (family, target, event_target),
-        (
-            AdminOperationFamily::Distribution,
-            DocumentTarget::RealmConfig { realm_id },
-            AdminDocumentTarget::Distribution { realm_id: event_realm_id, .. }
-        ) if realm_id == event_realm_id
-    )
-}
-
-/// Whether a payload target realm and any realm-scoped placement binding agree
-/// with the event actor's realm.
-fn validate_event_scope(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
-    let target_realm = match &event.target {
-        AdminDocumentTarget::Realm { realm_id }
-        | AdminDocumentTarget::RealmConfig { realm_id }
-        | AdminDocumentTarget::Distribution { realm_id, .. } => Some(*realm_id),
-        AdminDocumentTarget::User { user_id } => Some(user_id.realm_id),
-        AdminDocumentTarget::Group { .. } => None,
-    };
-    if target_realm.is_some_and(|realm_id| realm_id != event.actor.realm_id) {
-        return Err("admin event target and actor realms do not match".to_string());
-    }
-    if matches!(
-        &event.op,
-        AdminDocumentOperation::PlacementBindingAppended { binding }
-            if matches!(
-                binding.scope,
-                aruna_core::structs::placement::record::PlacementScope::Realm(binding_realm_id)
-                    if binding_realm_id != event.actor.realm_id
-            )
-    ) {
-        return Err("placement binding realm does not match the admin event target".to_string());
-    }
-    Ok(())
-}
-
-/// Whether a role assignment names a user in the event actor's realm. Group roles may also
-/// name a federated user of another realm; realm roles stay local.
-fn validate_role_assignment(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
-    match &event.op {
-        AdminDocumentOperation::GroupAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::GroupAssignmentRemoved { user_id, .. }
-            if user_id.realm_id != event.actor.realm_id && user_id.is_nil() =>
-        {
-            Err("role assignment names another realm's public principal".to_string())
-        }
-        AdminDocumentOperation::RealmAssignmentAdded { user_id, .. }
-        | AdminDocumentOperation::RealmAssignmentRemoved { user_id, .. }
-            if user_id.realm_id != event.actor.realm_id =>
-        {
-            Err("role assignment user belongs to a different realm".to_string())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Payload-shape rules for the group family: creation identity, role subtree
-/// confinement, assignment realms, and policy well-formedness.
-fn validate_group_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
-    validate_role_assignment(event)?;
-    match &event.op {
-        AdminDocumentOperation::GroupDeleted { certificate } => {
-            let AdminDocumentTarget::Group { group_id } = event.target else {
-                return Err("deletion target must be a group".into());
-            };
-            if certificate.plan.group_id != group_id
-                || certificate.plan.realm_id != event.actor.realm_id
-                || certificate.plan.owner.realm_id != event.actor.realm_id
-                || certificate.plan.coordinator != event.origin_node_id
-                || certificate.plan.requested_by != event.actor.user_id
-                || certificate.plan.request_id.is_nil()
-                || !certificate.plan.nodes.contains(&event.origin_node_id)
-                || !certificate.verify()
-            {
-                return Err("group deletion certificate is invalid".into());
-            }
-        }
-        AdminDocumentOperation::GroupCreated {
-            realm_id, owner, ..
-        } => {
-            if *realm_id != event.actor.realm_id
-                || owner.realm_id != *realm_id
-                || *owner != event.actor.user_id
-                || owner.is_nil()
-            {
-                return Err("group creation realm and owner must match the actor".to_string());
-            }
-        }
-        AdminDocumentOperation::GroupRoleCreated { role } => {
-            // Distributed events must enforce the same subtree confinement as
-            // local issuance; the publisher is not trusted to have done so.
-            let AdminDocumentTarget::Group { group_id } = &event.target else {
-                return Err("group role event target must be a group".to_string());
-            };
-            let subtree_root =
-                aruna_core::permission_path::role_subtree_root(event.actor.realm_id, group_id);
-            if role.permissions.keys().any(|pattern| {
-                !aruna_core::permission_path::role_path_confined(pattern, &subtree_root)
-            }) {
-                return Err("group role grants outside its group subtree".to_string());
-            }
-        }
-        AdminDocumentOperation::GroupPoliciesSet { policies } => {
-            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
-                return Err(format!("invalid policy set: {error}"));
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Payload-shape rules for the realm-config family: compute, candidate maps,
-/// transitions, grants, labels, strategies, policies, and revocations.
-fn validate_config_shape(event: &AdminDocumentEvent) -> std::result::Result<(), String> {
-    match &event.op {
-        AdminDocumentOperation::ConfigComputeSet { compute } => {
-            // A malformed link or quota set would make every planner estimate
-            // meaningless, so it is refused before it reaches storage.
-            if compute.validate().is_err() {
-                return Err("realm compute configuration is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::ConfigFederationSet { settings } => {
-            // Only a holder of the realm key or its delegate can publish a descriptor.
-            if let AdminDocumentTarget::RealmConfig { realm_id } = &event.target
-                && let Err(error) = settings.validate(realm_id)
-            {
-                return Err(format!("realm federation settings rejected: {error}"));
-            }
-        }
-        AdminDocumentOperation::ConfigPortalSet { features } => {
-            if let Err(error) =
-                aruna_core::structs::identity::realm::validate_portal_features(features)
-            {
-                return Err(format!("realm portal features rejected: {error}"));
-            }
-        }
-        AdminDocumentOperation::NodeNameSet {
-            display_name: Some(name),
-            ..
-        } => {
-            let normalized = aruna_core::structs::identity::realm::normalize_node_name(name);
-            if normalized.as_ref() != Some(name) {
-                return Err("node display name is not a valid name".to_string());
-            }
-        }
-        AdminDocumentOperation::NodePlaceSet {
-            place: Some(place), ..
-        } => {
-            if !place.valid() {
-                return Err("node place is empty or not valid".to_string());
-            }
-        }
-        // The purpose tag is checked when the event decodes; management origin in the authority.
-        AdminDocumentOperation::ConfigVaultSet {
-            entry,
-            record: Some(record),
-        } => {
-            if record.entry != *entry || record.sealed.is_empty() {
-                return Err("realm vault record is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::ConfigEmailSet {
-            profile: Some(profile),
-        } => {
-            if !profile.valid() {
-                return Err("realm email profile is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::ConfigSecretSet {
-            name,
-            info: Some(info),
-        } => {
-            let scope = aruna_core::secrets::SecretScope::Realm;
-            if info.name != *name || info.check(scope).is_err() {
-                return Err("realm secret record is malformed".to_string());
-            }
-        }
-        // The artifact was checked on the publishing management node; origin is in the authority.
-        AdminDocumentOperation::ConfigPluginSet {
-            name,
-            version,
-            plugin,
-        } => {
-            let matching = plugin.as_ref().is_none_or(|plugin| {
-                plugin.valid() && plugin.name == *name && plugin.version == *version
-            });
-            if !matching || !aruna_core::plugins::valid_name(name) {
-                return Err("published plugin entry is malformed".to_string());
-            }
-        }
-        // The writing management node checked the admin, the grants and the published version.
-        AdminDocumentOperation::ConfigInstallSet {
-            install_id,
-            install,
-        } => {
-            let matching = install.as_ref().is_none_or(|install| {
-                install.valid()
-                    && install.install_id == *install_id
-                    && install.account.realm_id == event.actor.realm_id
-            });
-            if !matching || install_id.is_nil() {
-                return Err("plugin install record is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::CandidateMapPublished { map } => {
-            let mut seen = std::collections::BTreeSet::new();
-            if map.epoch == 0 || !map.nodes.iter().all(|node| seen.insert(node.node_id)) {
-                return Err("candidate placement map is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::ConfigActivationsInitialized {
-            candidate_map_epoch,
-            ..
-        } => {
-            if *candidate_map_epoch == 0 {
-                return Err("activation names no candidate map epoch".to_string());
-            }
-        }
-        AdminDocumentOperation::ConfigTransitionStarted { plan } => {
-            let mut seen = std::collections::BTreeSet::new();
-            let well_formed = plan.limits.max_incomplete_buckets >= 1
-                && plan.target_map_epoch > 0
-                && !plan.buckets.is_empty()
-                && plan
-                    .buckets
-                    .iter()
-                    .all(|bucket| seen.insert(bucket.bucket) && !bucket.target_holders.is_empty());
-            if !well_formed {
-                return Err("placement transition plan is malformed".to_string());
-            }
-        }
-        AdminDocumentOperation::TransitionBarrierReported {
-            reported_by,
-            frontier,
-            ..
-        } => {
-            if *reported_by != event.origin_node_id {
-                return Err("transition report does not come from the node it names".to_string());
-            }
-            if frontier.len() > aruna_core::structs::placement::transition::MAX_FRONTIER_BYTES {
-                return Err("transition barrier frontier exceeds its size bound".to_string());
-            }
-        }
-        AdminDocumentOperation::TransitionStallReported {
-            reported_by,
-            reason,
-            ..
-        } => {
-            if *reported_by != event.origin_node_id {
-                return Err("transition report does not come from the node it names".to_string());
-            }
-            if reason.len() > aruna_core::structs::placement::transition::MAX_STALL_BYTES {
-                return Err("transition stall reason exceeds its size bound".to_string());
-            }
-        }
-        AdminDocumentOperation::TransitionDrainReported { reported_by, .. } => {
-            if *reported_by != event.origin_node_id {
-                return Err("transition report does not come from the node it names".to_string());
-            }
-        }
-        AdminDocumentOperation::TransitionProofSubmitted {
-            transition_id,
-            strategy_id,
-            proof,
-        } => {
-            // Verified here as well as in the reducer: a forged proof must never
-            // reach storage, and the publisher binding already fixed the origin.
-            if proof.holder != event.origin_node_id
-                || !proof.verify(event.actor.realm_id, *transition_id, *strategy_id)
-            {
-                return Err("transition completion proof does not verify".to_string());
-            }
-        }
-        AdminDocumentOperation::NodePlacementSet { entry } => {
-            if let Some(label) = reserved_label(&entry.labels) {
-                return Err(format!(
-                    "placement entry must not set derived label {label}"
-                ));
-            }
-        }
-        AdminDocumentOperation::PlacementStrategyUpserted { strategy }
-            if strategy.replica_count == Some(0) =>
-        {
-            return Err("placement strategy replica count must be greater than zero".to_string());
-        }
-        AdminDocumentOperation::ConfigPoliciesSet { policies } => {
-            if let Err(error) = aruna_core::request_policy::validate_policy_set(policies) {
-                return Err(format!("invalid policy set: {error}"));
-            }
-        }
-        AdminDocumentOperation::ConfigTokenRevoked {
-            token_hash,
-            expires_at,
-            token_owner,
-            ..
-        } => {
-            if !aruna_core::auth::valid_token_hash(token_hash) {
-                return Err("revoked bearer token hash is malformed".to_string());
-            }
-            if !valid_revocation_expiry(*expires_at, unix_timestamp_secs()) {
-                return Err("revoked bearer token expiry exceeds the admission window".to_string());
-            }
-            // A token this realm issued may belong to a federated user of another realm.
-            if token_owner.is_nil() {
-                return Err("revoked bearer token owner is malformed".to_string());
-            }
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 /// Whether the reducer accepts the event; a rejected reduction is malformed
@@ -1869,79 +1022,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         return Ok(admission);
     }
 
-    // This match is deliberately exhaustive. Adding an operation requires an
-    // explicit inbound authorization decision here before it can reach storage.
-    let family = match &event.op {
-        AdminDocumentOperation::GroupRoleAdded { .. }
-        | AdminDocumentOperation::GroupAssignmentAdded { .. }
-        | AdminDocumentOperation::GroupAssignmentRemoved { .. }
-        | AdminDocumentOperation::GroupRoleCreated { .. }
-        | AdminDocumentOperation::GroupRoleRemoved { .. }
-        | AdminDocumentOperation::GroupCreated { .. }
-        | AdminDocumentOperation::GroupDeleted { .. }
-        | AdminDocumentOperation::DisplayNameSet { .. }
-        | AdminDocumentOperation::GroupLocationSet { .. }
-        | AdminDocumentOperation::GroupPoliciesSet { .. }
-        | AdminDocumentOperation::GroupJoinRequested { .. }
-        | AdminDocumentOperation::GroupJoinDecided { .. } => AdminOperationFamily::Group,
-        AdminDocumentOperation::RealmRoleAdded { .. }
-        | AdminDocumentOperation::RealmAssignmentAdded { .. }
-        | AdminDocumentOperation::RealmAssignmentRemoved { .. }
-        | AdminDocumentOperation::RealmRoleCreated { .. } => {
-            AdminOperationFamily::RealmAuthorization
-        }
-        AdminDocumentOperation::UserAttributeSet { .. }
-        | AdminDocumentOperation::UserAttributeRemoved { .. }
-        | AdminDocumentOperation::UserNameSet { .. }
-        | AdminDocumentOperation::SubjectIdAdded { .. }
-        | AdminDocumentOperation::SubjectIdRemoved { .. }
-        | AdminDocumentOperation::UserAliasAdded { .. }
-        | AdminDocumentOperation::UserAliasRemoved { .. } => AdminOperationFamily::User,
-        AdminDocumentOperation::ConfigNodeEnsured { .. }
-        | AdminDocumentOperation::ConfigNodeRemoved { .. }
-        | AdminDocumentOperation::OidcProviderUpserted { .. }
-        | AdminDocumentOperation::OidcProviderRemoved { .. }
-        | AdminDocumentOperation::ConfigSettingsSet { .. }
-        | AdminDocumentOperation::ConfigDescriptionSet { .. }
-        | AdminDocumentOperation::ConfigQuotaSet { .. }
-        | AdminDocumentOperation::NodePlacementSet { .. }
-        | AdminDocumentOperation::NodePlacementRemoved { .. }
-        | AdminDocumentOperation::PlacementStrategyUpserted { .. }
-        | AdminDocumentOperation::PlacementStrategyRemoved { .. }
-        | AdminDocumentOperation::ConfigStrategySet { .. }
-        | AdminDocumentOperation::JobFamilySet { .. }
-        | AdminDocumentOperation::StrategyBindingSet { .. }
-        | AdminDocumentOperation::StrategyBindingRemoved { .. }
-        | AdminDocumentOperation::PlacementOverrideSet { .. }
-        | AdminDocumentOperation::PlacementOverrideRemoved { .. }
-        | AdminDocumentOperation::PlacementBindingAppended { .. }
-        | AdminDocumentOperation::HandleRangeGranted { .. }
-        | AdminDocumentOperation::BandPoolAssigned { .. }
-        | AdminDocumentOperation::ConfigPoliciesSet { .. }
-        | AdminDocumentOperation::CandidateMapPublished { .. }
-        | AdminDocumentOperation::ConfigActivationsInitialized { .. }
-        | AdminDocumentOperation::ConfigTransitionStarted { .. }
-        | AdminDocumentOperation::TransitionBarrierReported { .. }
-        | AdminDocumentOperation::TransitionProofSubmitted { .. }
-        | AdminDocumentOperation::ConfigTransitionAborted { .. }
-        | AdminDocumentOperation::TransitionBucketForced { .. }
-        | AdminDocumentOperation::TransitionStallReported { .. }
-        | AdminDocumentOperation::TransitionDrainReported { .. }
-        | AdminDocumentOperation::ConfigComputeSet { .. }
-        | AdminDocumentOperation::ConfigFederationSet { .. }
-        | AdminDocumentOperation::ConfigPortalSet { .. }
-        | AdminDocumentOperation::ConfigReplicasSet { .. }
-        | AdminDocumentOperation::NodeNameSet { .. }
-        | AdminDocumentOperation::NodePlaceSet { .. }
-        | AdminDocumentOperation::MergeCoordinatorSet { .. }
-        | AdminDocumentOperation::ConfigVaultSet { .. }
-        | AdminDocumentOperation::ConfigEmailSet { .. }
-        | AdminDocumentOperation::ConfigSecretSet { .. }
-        | AdminDocumentOperation::ConfigPluginSet { .. }
-        | AdminDocumentOperation::ConfigInstallSet { .. }
-        | AdminDocumentOperation::ConfigTokenRevoked { .. } => AdminOperationFamily::RealmConfig,
-        AdminDocumentOperation::DistributionPublished { .. } => AdminOperationFamily::Distribution,
-    };
+    let family = AdminOperationFamily::of(&event.op);
 
     if !family_matches_targets(family, target, &event.target) {
         return reject("operation, sync target, and admin event target do not match");
@@ -1950,14 +1031,7 @@ pub(in crate::document_sync) async fn validate_admin_event(
         return reject(&reason);
     }
 
-    let shape = match family {
-        AdminOperationFamily::Group => validate_group_shape(event),
-        AdminOperationFamily::RealmAuthorization => validate_role_assignment(event),
-        AdminOperationFamily::RealmConfig => validate_config_shape(event),
-        AdminOperationFamily::User => Ok(()),
-        AdminOperationFamily::Distribution => validate_distribution_shape(event),
-    };
-    if let Err(reason) = shape {
+    if let Err(reason) = validate_shape(family, event) {
         return reject(&reason);
     }
 
@@ -2019,40 +1093,4 @@ enum ReportParticipation {
     Participant,
     UnknownPlan,
     Foreign,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::structs::identity::auth::Actor;
-    use aruna_core::structs::identity::realm::RealmId;
-    use ulid::Ulid;
-
-    #[test]
-    fn marker_set_once() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let group = Ulid::from_parts(1, 9);
-        let user_id = UserId::local(Ulid::from_parts(1, 7), realm_id);
-        let actor = Actor {
-            node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-            user_id: UserId::local(Ulid::from_parts(1, 3), realm_id),
-            realm_id,
-        };
-        let set = |key: &str, value: String| AdminDocumentOperation::UserAttributeSet {
-            key: key.to_string(),
-            value,
-        };
-        let mut state = AdminDocumentState::new(AdminDocumentTarget::User { user_id });
-        let owner = state.apply_operation(&actor, set(SERVICE_GROUP_ATTRIBUTE, group.to_string()));
-        assert_eq!(service_owner(&owner.unwrap(), None, None), Some(group));
-        let owned = state.clone();
-        let marker = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "a".into()));
-        assert_eq!(
-            service_owner(&marker.unwrap(), Some(&owned), None),
-            Some(group)
-        );
-        let marked = state.clone();
-        let again = state.apply_operation(&actor, set(INSTALL_ATTRIBUTE, "b".into()));
-        assert_eq!(service_owner(&again.unwrap(), Some(&marked), None), None);
-    }
 }

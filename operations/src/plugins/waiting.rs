@@ -5,58 +5,104 @@
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
-use aruna_core::plugin_runs::{GapReason, WAITING_EXPIRY_MS};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::plugin_runs::GapReason;
 
-use super::decide::{Verdict, WaitingRow, judge, local_gap, record};
-use super::forward::Outcome;
-use super::runs::{ADMISSIONS, RunError, admit_in};
-use super::store::{StoreError, Txn, decode, transact};
-use crate::driver::DriverContext;
+use super::decide::{GapCount, Verdict, WaitingRow, seen_row};
+use super::rows::{Answer, Ask, Plan, Row, StoreError, Turn, done};
+use super::runs::{Admission, RunError};
+use aruna_core::plugin_runs::Outcome;
 
-/// Decides each waiting event that is ready or expired; returns how many left the waiting set.
-pub async fn recheck_waiting(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
+/// Frees a waiting event's slot and decides it in one transaction, so the slot never counts
+/// twice: a ready run takes the slot, a denial is recorded, an expired event is counted as a gap.
+#[derive(Debug, PartialEq)]
+pub struct SettleWaiting {
+    key: Vec<u8>,
+    waiting: Box<WaitingRow>,
     now_ms: u64,
-) -> Result<usize, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
-    let rows = Txn::direct(ctx).scan(PLUGIN_WAITING_KEYSPACE, &[]).await?;
-    let mut left = 0;
-    for (key, value) in rows {
-        let waiting: WaitingRow = decode(&value)?;
-        let expired = now_ms > waiting.received_ms.saturating_add(WAITING_EXPIRY_MS);
-        let verdict = match expired {
-            true => None,
-            false => match judge(ctx, config, local, &waiting.row, now_ms).await? {
-                Verdict::Unready | Verdict::Unavailable => continue,
-                verdict => Some(verdict),
-            },
-        };
-        // The slot is freed and taken by the run in one transaction, so it never counts twice.
-        transact(ctx, async |txn: &Txn<'_>| {
-            txn.delete(PLUGIN_WAITING_KEYSPACE, vec![key.clone()])
-                .await?;
-            txn.delete(PLUGIN_QUEUE_KEYSPACE, vec![key.clone()]).await?;
-            let outcome = match &verdict {
-                Some(Verdict::Run(run)) => match admit_in(txn, run).await {
-                    Ok(()) => Outcome::Queued,
-                    Err(RunError::Store(error)) => return Err(error),
-                    Err(error) => return Err(StoreError(error.to_string())),
-                },
-                Some(Verdict::Denied(reason)) => Outcome::Denied(reason.clone()),
-                _ => {
-                    local_gap(txn, local, &waiting.row, GapReason::Waited).await?;
-                    Outcome::Expired
-                }
-            };
-            record(txn, &waiting.row, &outcome, now_ms).await
-        })
-        .await?;
-        left += 1;
+    phase: SettlePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum SettlePhase {
+    Freeing(Box<Option<Verdict>>, GapCount),
+    Admitting(Admission),
+    Counting(GapCount),
+    Writing,
+}
+
+impl SettleWaiting {
+    pub(crate) fn new(
+        key: Vec<u8>,
+        waiting: WaitingRow,
+        verdict: Option<Verdict>,
+        (local, now_ms): (NodeId, u64),
+    ) -> Self {
+        let gap = GapCount::new(local, &waiting.row, GapReason::Waited);
+        Self {
+            key,
+            waiting: Box::new(waiting),
+            now_ms,
+            phase: SettlePhase::Freeing(Box::new(verdict), gap),
+        }
     }
-    Ok(left)
+
+    fn record(&mut self, outcome: Outcome, mut rows: Vec<Row>) -> Result<Turn<()>, StoreError> {
+        rows.push(seen_row(&self.waiting.row, &outcome, self.now_ms)?);
+        self.phase = SettlePhase::Writing;
+        Ok(Turn::Ask(Ask::Write(rows)))
+    }
+}
+
+impl Plan for SettleWaiting {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(Ask::Delete(vec![
+            (PLUGIN_WAITING_KEYSPACE, self.key.clone()),
+            (PLUGIN_QUEUE_KEYSPACE, self.key.clone()),
+        ])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        match std::mem::replace(&mut self.phase, SettlePhase::Writing) {
+            SettlePhase::Freeing(verdict, gap) => {
+                done(answer)?;
+                match *verdict {
+                    Some(Verdict::Run(run)) => {
+                        let admission = Admission::new(*run);
+                        let ask = admission.ask();
+                        self.phase = SettlePhase::Admitting(admission);
+                        Ok(Turn::Ask(ask))
+                    }
+                    Some(Verdict::Denied(reason)) => self.record(Outcome::Denied(reason), vec![]),
+                    _ => {
+                        let ask = gap.ask();
+                        self.phase = SettlePhase::Counting(gap);
+                        Ok(Turn::Ask(ask))
+                    }
+                }
+            }
+            SettlePhase::Admitting(mut admission) => match admission.take(answer) {
+                Ok(None) => {
+                    let ask = admission.ask();
+                    self.phase = SettlePhase::Admitting(admission);
+                    Ok(Turn::Ask(ask))
+                }
+                Ok(Some(rows)) => self.record(Outcome::Queued, rows),
+                Err(RunError::Store(error)) => Err(error),
+                Err(error) => Err(StoreError(error.to_string())),
+            },
+            SettlePhase::Counting(mut gap) => {
+                let counted = gap.take(answer)?;
+                self.record(Outcome::Expired, counted.into_iter().collect())
+            }
+            SettlePhase::Writing => {
+                done(answer)?;
+                Ok(Turn::Finish(()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

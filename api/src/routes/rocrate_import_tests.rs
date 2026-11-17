@@ -26,7 +26,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::import::write_rocrate_upload;
+use aruna_operations::jobs::import::upload_store::write_rocrate_upload;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;

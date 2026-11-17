@@ -34,10 +34,11 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::import::{UploadClaimError, claim_upload, upload_key};
-use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
+use super::import::upload::{UploadClaimError, claim_upload};
 use crate::groups::imports::cron::is_running;
 use crate::harvest::repository::source_key;
+use aruna_core::structs::execution::job::upload_key;
+use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -537,7 +538,7 @@ impl SubmitJobOperation {
                 "import run check without a rule".to_string(),
             ));
         };
-        match value.map(decode_job_record).transpose() {
+        match value.map(JobRecord::from_bytes).transpose() {
             Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::ImportRunning),
             Ok(_) => self.claim_import(txn_id, rule),
             Err(error) => self.fail(error.into()),
@@ -585,7 +586,7 @@ impl SubmitJobOperation {
                 "source run check without a source".to_string(),
             ));
         };
-        match value.map(decode_job_record).transpose() {
+        match value.map(JobRecord::from_bytes).transpose() {
             Ok(Some(last)) if is_running(last.state) => self.fail(SubmitJobError::SourceRunning),
             Ok(_) => self.claim_source(txn_id, source),
             Err(error) => self.fail(error.into()),
@@ -707,13 +708,15 @@ impl Operation for SubmitJobOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            SubmitState::Init => self.begin(),
+            SubmitState::Init => {
+                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
+            }
             SubmitState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.read_dedup(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::GroupFence { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -728,7 +731,7 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadDedup { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult {
@@ -747,7 +750,7 @@ impl Operation for SubmitJobOperation {
                     self.check_active(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::VerifyDedup {
                 txn_id,
@@ -756,7 +759,7 @@ impl Operation for SubmitJobOperation {
             } => match event {
                 Event::Storage(StorageEvent::ReadResult {
                     value: Some(value), ..
-                }) => match decode_job_record(&value) {
+                }) => match JobRecord::from_bytes(&value) {
                     Ok(_) if digest_matches => self.finish_existing(txn_id, job_id),
                     Ok(_) => self.fail(SubmitJobError::JobPlanConflict {
                         existing_job_id: job_id,
@@ -771,7 +774,7 @@ impl Operation for SubmitJobOperation {
                     self.check_active(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckActive { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -783,7 +786,7 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ClaimUpload { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -798,42 +801,42 @@ impl Operation for SubmitJobOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadImport { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.import_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckImportRun { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.import_run_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadSource { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.source_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CheckSourceRun { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.source_run_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadBucket { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.bucket_read(txn_id, value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ReadRecord {
                 txn_id,
@@ -844,7 +847,7 @@ impl Operation for SubmitJobOperation {
                     self.record_read(txn_id, (set_id, member_id), value.as_deref())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::WriteJob { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => match txn_id {
@@ -855,7 +858,7 @@ impl Operation for SubmitJobOperation {
                     None => self.after_write(),
                 },
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.after_write(),
@@ -863,7 +866,7 @@ impl Operation for SubmitJobOperation {
                     error: StorageError::TransactionConflict,
                 }) => self.start_transaction(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(SubmitJobError::UnexpectedEvent(format!("{other:?}"))),
+                other => self.fail(SubmitJobError::UnexpectedEvent(other.label().to_string())),
             },
             SubmitState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_created(),
@@ -877,7 +880,7 @@ impl Operation for SubmitJobOperation {
                 }
             },
             SubmitState::Finish | SubmitState::Error => {
-                self.fail(SubmitJobError::UnexpectedEvent(format!("{event:?}")))
+                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
             }
         }
     }
@@ -919,7 +922,7 @@ impl Operation for SubmitJobOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::jobs::store::read_job_record;
+    use crate::jobs::store::state::read_job_record;
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
     use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::execution::job::{
@@ -961,6 +964,15 @@ mod tests {
         )
         .unwrap();
         SubmitJobOperation::new(spec, job_id)
+    }
+
+    // An event before `start` is refused instead of starting the submission.
+    #[test]
+    fn rejects_unstarted_event() {
+        use aruna_core::operation_check::{rejects_events, sample_events};
+        let fresh = || operation(spec(None));
+        let refusals = rejects_events(fresh, sample_events, |_| false);
+        assert_eq!(refusals.len(), sample_events().len());
     }
 
     fn spec(dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
@@ -1049,8 +1061,9 @@ mod tests {
         };
         let upload_id = Ulid::from_bytes([seed; 16]);
         import.source = ImportRoCrateSource::Upload { upload_id };
-        let record = crate::jobs::import::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::write_rocrate_upload(storage, &record)
+        let record =
+            crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
+        crate::jobs::import::upload_store::write_rocrate_upload(storage, &record)
             .await
             .unwrap();
         upload_id
@@ -1073,7 +1086,7 @@ mod tests {
     }
 
     async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
-        crate::jobs::store::iter_prefix_page(storage, key_space, None, None, 64, None)
+        crate::jobs::store::query::iter_prefix_page(storage, key_space, None, None, 64, None)
             .await
             .expect("scan")
             .0
@@ -1338,18 +1351,18 @@ mod tests {
             Err(SubmitJobError::ActiveJobLimit { limit: 1 })
         );
 
-        let crate::jobs::store::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+        let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
+            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1368,10 +1381,11 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored = crate::jobs::import::read_rocrate_upload(&storage, upload_id).await;
+        let stored =
+            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
-        let reclaimed = crate::jobs::import::claim_rocrate_upload(
+        let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(
             &storage,
             upload_id,
             owner,
@@ -1406,18 +1420,18 @@ mod tests {
         assert!(!second.created);
         assert_eq!(second.job_id, first.job_id);
 
-        let crate::jobs::store::ClaimOutcome::Claimed(claimed) =
-            crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+        let crate::jobs::store::state::ClaimOutcome::Claimed(claimed) =
+            crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
                 .await
                 .unwrap()
         else {
             panic!("job must be claimed");
         };
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
             .await
             .unwrap();
 
@@ -1525,7 +1539,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1556,7 +1570,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1592,7 +1606,7 @@ mod tests {
         assert!(result.created);
         assert_ne!(result.job_id, ghost);
         assert_eq!(
-            crate::jobs::store::find_dedup_job(&storage, created_by, b"k", None)
+            crate::jobs::store::query::find_dedup_job(&storage, created_by, b"k", None)
                 .await
                 .unwrap(),
             Some(result.job_id)
@@ -1609,7 +1623,7 @@ mod tests {
             .await
             .unwrap();
         // Take the job through claim + terminal so the dedup entry is cleared.
-        crate::jobs::store::claim_job(&storage, first.job_id, node_id(3), 2_000)
+        crate::jobs::store::state::claim_job(&storage, first.job_id, node_id(3), 2_000)
             .await
             .unwrap();
         let claimed = read_job_record(&storage, first.job_id, None)
@@ -1617,10 +1631,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let token = claimed.claim.unwrap().claim_token;
-        crate::jobs::store::transition_to_running(&storage, first.job_id, token, 2_100)
+        crate::jobs::store::state::transition_to_running(&storage, first.job_id, token, 2_100)
             .await
             .unwrap();
-        crate::jobs::store::cancel_running_job(&storage, first.job_id, token, 2_200)
+        crate::jobs::store::state::cancel_running_job(&storage, first.job_id, token, 2_200)
             .await
             .unwrap();
 

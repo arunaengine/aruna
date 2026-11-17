@@ -7,11 +7,12 @@ mod blob;
 mod metadata;
 mod net;
 pub mod routing;
+mod session;
 mod storage;
 mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use aruna_core::outbound::{OutboundEffect, OutboundError, OutboundEvent};
 use tracing::{debug, trace, warn};
 
@@ -60,11 +61,6 @@ pub(crate) async fn dispatch_effect_until(
             blob::dispatch_local_file(local_file_effect, context).await
         }
         Effect::Storage(storage_effect) => storage::dispatch_storage(storage_effect, context).await,
-        // Job-control routing runs its frame I/O here, where the runner holds
-        // the context; the net crate never sees this effect.
-        Effect::Net(NetEffect::JobControl(job_control)) => {
-            Box::pin(net::dispatch_job_control(*job_control, context)).await
-        }
         // Audit fan-out runs its frame I/O here for the same reason.
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
@@ -100,11 +96,28 @@ pub(crate) async fn dispatch_effect_until(
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
         Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
-            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_record(
+                context, *record,
+            ))
+            .await,
         )),
         Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
-            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_offer(
+                context, *offer,
+            ))
+            .await,
         )),
+        // A plugin artifact chunk travels over the metadata transport, which the runner holds.
+        Effect::Net(NetEffect::ArtifactStore(store)) => {
+            let stored = match context.metadata_handle.as_ref() {
+                Some(handle) => (handle
+                    .request_store_artifact(store.node_id, store.chunk)
+                    .await)
+                    .map_err(|error| format!("{error:?}")),
+                None => Err("no metadata transport on this node".to_string()),
+            };
+            Event::Net(NetEvent::ArtifactStored(stored))
+        }
         // Notification frames and inbox wakes need the net handle the runner holds.
         Effect::Net(NetEffect::Notification(request)) => {
             Event::Net(NetEvent::Notification(match context.net_handle.as_ref() {
@@ -158,19 +171,28 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        // The effect loop runs groups itself; a group never reaches a single dispatch.
+        Effect::Group(group) => {
+            warn!(depth, "Effect group reached a single dispatch");
+            let results = group.members.iter().map(|_| GroupResult::Refused).collect();
+            Event::Group(GroupEvent::Finished { results })
+        }
+        Effect::Session(effect) => {
+            Event::Session(Box::new(session::dispatch_session(*effect, context).await))
+        }
     };
 
     trace!(
         event = "operation.effect.result",
         depth,
         effect = effect_name,
-        result = event_kind(&event),
+        result = event.label(),
         "Received operation event"
     );
     if depth == 0 {
         debug!(
             effect = effect_name,
-            result = event_kind(&event),
+            result = event.label(),
             "Received top-level operation event"
         );
     }
@@ -190,6 +212,8 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
         Effect::Outbound(_) => "outbound",
     }
 }
@@ -200,21 +224,5 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
     match effect {
         OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
-    }
-}
-
-fn event_kind(event: &Event) -> &'static str {
-    match event {
-        Event::Blob(_) => "blob",
-        Event::StagingSource(_) => "staging_source",
-        Event::LocalFile(_) => "local_file",
-        Event::Storage(_) => "storage",
-        Event::Net(_) => "net",
-        Event::Metadata(_) => "metadata",
-        Event::SubOperation(_) => "suboperation",
-        Event::Task(_) => "task",
-        Event::Search() => "search",
-        Event::Stream() => "stream",
-        Event::Outbound(_) => "outbound",
     }
 }

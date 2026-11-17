@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{hook_key, hook_time_key};
 use aruna_core::secrets::{Delivery, SecretName, SecretScope};
@@ -11,7 +12,9 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, SecretAudit, 
 use super::*;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::store::encode;
+use crate::plugins::rows::encode;
+use crate::plugins::store::Txn;
+use crate::plugins::worker::prune_audit;
 
 const DAY: u64 = 24 * 3600 * 1000;
 const NOW: u64 = 100 * DAY;
@@ -68,10 +71,10 @@ async fn prunes_old_uses() {
     write(&fixture, &[kept]).await;
     write(&fixture, &uses).await;
     // One page checks the kept row and the first use; a restart goes on from its cursor.
-    assert_eq!(prune_page(&fixture.ctx, NOW, 2).await, Ok((1, true)));
+    assert_eq!(drive(prune_uses(NOW, 2), &fixture.ctx).await, Ok((1, true)));
     assert_eq!(ids(&fixture, AuditIndex::Realm).await.len(), 4);
-    assert_eq!(prune_uses(&fixture.ctx, NOW).await, Ok(2));
-    assert_eq!(prune_uses(&fixture.ctx, NOW).await, Ok(0));
+    assert_eq!(prune_audit(&fixture.ctx, NOW).await, Ok(2));
+    assert_eq!(prune_audit(&fixture.ctx, NOW).await, Ok(0));
     let left = [DAY, 90 * DAY];
     assert_eq!(ids(&fixture, AuditIndex::Realm).await, left);
     assert_eq!(
@@ -102,7 +105,7 @@ async fn prunes_old_hooks() {
     let txn = Txn::direct(&fixture.ctx);
     txn.write(PLUGIN_HOOKS_KEYSPACE, rows).await.unwrap();
     let held = config(&fixture).await;
-    assert_eq!(prune_hooks(&fixture.ctx, &held, NOW).await, Ok(1));
+    assert_eq!(drive(prune_hooks(&held, NOW), &fixture.ctx).await, Ok(1));
     let left = txn.scan(PLUGIN_HOOKS_KEYSPACE, &[]).await.unwrap();
     let keys: Vec<Vec<u8>> = left.into_iter().map(|(key, _)| key).collect();
     assert_eq!(
@@ -115,11 +118,40 @@ async fn prunes_old_hooks() {
     })
     .await;
     let removing = config(&fixture).await;
-    assert_eq!(prune_hooks(&fixture.ctx, &removing, NOW).await, Ok(1));
+    assert_eq!(
+        drive(prune_hooks(&removing, NOW), &fixture.ctx).await,
+        Ok(1)
+    );
     assert!(
         txn.scan(PLUGIN_HOOKS_KEYSPACE, &[])
             .await
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn old_hooks_go() {
+    let install = Ulid::from_parts(1, 1);
+    let mut plan = PruneHooks {
+        cutoff: 100,
+        removing: Vec::new(),
+        phase: HooksPhase::Times,
+        pruned: 0,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let (old, young) = (
+        hook_time_key(50, install, "d1"),
+        hook_time_key(150, install, "d2"),
+    );
+    let page = vec![(old.clone(), Vec::new()), (young, Vec::new())];
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(page, None)).unwrap() else {
+        panic!("the old delivery id and its time row go");
+    };
+    let expected = vec![
+        (PLUGIN_HOOKS_KEYSPACE, hook_key(install, "d1")),
+        (PLUGIN_HOOKS_KEYSPACE, old),
+    ];
+    assert_eq!(keys, expected);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
 }

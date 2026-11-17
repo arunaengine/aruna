@@ -13,8 +13,6 @@ use aruna_operations::distribution::routing::{copies_interval, lists_interval, l
 use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
 use aruna_operations::s3::object::pages::{self, ListRequest, ObjectPage};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::Method;
 use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use s3s::dto::{CommonPrefix, ETag, Object, Owner, Timestamp, TimestampFormat};
@@ -86,8 +84,7 @@ pub(in crate::s3::service) fn encode_bound(
                 query: query_digest(prefix, delimiter),
                 position: position.clone(),
             };
-            postcard::to_allocvec(&token)
-                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            aruna_core::cursor::encode_value(&token)
                 .map_err(|error| s3_error!(InternalError, "{error}"))
         })
         .transpose()
@@ -102,8 +99,8 @@ pub(in crate::s3::service) fn decode_bound(
     let invalid = || s3_error!(InvalidArgument, "Invalid continuation token");
     token
         .map(|token| {
-            let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
-            let token: BoundToken = postcard::from_bytes(&bytes).map_err(|_| invalid())?;
+            let token: BoundToken =
+                aruna_core::cursor::decode_value(token).map_err(|_| invalid())?;
             match token.set_id == set_id && token.query == query_digest(prefix, delimiter) {
                 true => Ok(token.position),
                 false => Err(invalid()),

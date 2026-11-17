@@ -13,7 +13,7 @@ use aruna_api::https::certificate::CertificateStore;
 use aruna_api::https::listener::{CombinedListener, HttpsHandle, RoutedListener};
 use aruna_api::https::{HostCheck, HostRoute, HostRoutes};
 use aruna_api::s3::server::{S3Server, S3ServerHandle};
-use aruna_core::shutdown::Shutdown;
+use aruna_tasks::shutdown::Shutdown;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;

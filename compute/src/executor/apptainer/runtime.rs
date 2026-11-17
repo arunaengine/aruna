@@ -16,7 +16,7 @@ use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
 use super::state::{
     ControlRecord, LaunchRecord, PayloadRecord, ProcessRecord, StatusRecord, read_json, write_json,
 };
-use crate::executor::now_ms;
+use aruna_core::time::unix_timestamp_millis;
 
 const LOG_FILE_LIMIT: u64 = 64 * 1024 * 1024;
 
@@ -60,7 +60,7 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
     }
     // Recorded before the launcher is released so a poll can report the start
     // without waiting for the terminal status record.
-    let started_at_ms = now_ms();
+    let started_at_ms = unix_timestamp_millis();
     write_json(
         &attempt_dir.join("payload.json"),
         &PayloadRecord {
@@ -129,7 +129,7 @@ pub fn supervisor(attempt_dir: &Path) -> Result<(), BackendError> {
         &StatusRecord {
             phase,
             started_at_ms: Some(started_at_ms),
-            finished_at_ms: now_ms(),
+            finished_at_ms: unix_timestamp_millis(),
         },
     )?;
     remove_socket(&socket_path)
@@ -226,7 +226,11 @@ pub fn cgroup_empty(cgroup: &Path) -> Result<bool, BackendError> {
 
 pub fn probe_cgroup(root: &Path) -> Result<(), BackendError> {
     std::fs::create_dir_all(root).map_err(io_error)?;
-    let probe = root.join(format!("aruna-health-{}-{}", std::process::id(), now_ms()));
+    let probe = root.join(format!(
+        "aruna-health-{}-{}",
+        std::process::id(),
+        unix_timestamp_millis()
+    ));
     std::fs::create_dir(&probe).map_err(io_error)?;
     let result = (|| {
         let kill = OpenOptions::new()

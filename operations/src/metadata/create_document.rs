@@ -53,7 +53,7 @@ use crate::placement::{
     resolve_shard_holders, strategy_for_target,
 };
 use crate::sync::shard_placement::sort_node_ids;
-use crate::tasks::queue_backoff::conflict_backoff;
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -646,7 +646,9 @@ impl CreateDocumentOperation {
             );
             job.workspace_mode = WorkspaceMode::None;
             job.retention_ms = RETENTION_MS;
-            writes.extend(crate::jobs::store::job_insert_entries(&job)?);
+            writes.extend(aruna_core::structs::execution::job::job_insert_entries(
+                &job,
+            )?);
 
             let route = mapping_route_for(
                 realm_config,

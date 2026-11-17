@@ -91,7 +91,7 @@ pub enum ReserveSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -241,7 +241,7 @@ impl Operation for ReserveSecretOperation {
 
         match self.state.clone() {
             ReserveSecretState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -269,7 +269,7 @@ impl Operation for ReserveSecretOperation {
                 })]
             }
             ReserveSecretState::ReadRecords { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return fail(
                         self,
@@ -286,7 +286,7 @@ impl Operation for ReserveSecretOperation {
                         ReserveSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "record and state batch read result",
-                            got: format!("{values:?}"),
+                            got: "a batch of another length",
                         },
                     );
                 };
@@ -319,7 +319,7 @@ impl Operation for ReserveSecretOperation {
                 record,
                 owner,
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
@@ -370,7 +370,7 @@ impl Operation for ReserveSecretOperation {
                 enrolled,
                 pending,
             } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -411,7 +411,7 @@ impl Operation for ReserveSecretOperation {
                 }
             }
             ReserveSecretState::WriteReserved { txn_id, record } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
@@ -429,7 +429,7 @@ impl Operation for ReserveSecretOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             ReserveSecretState::CommitTransaction { record } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,

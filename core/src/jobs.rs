@@ -11,8 +11,8 @@ use ulid::Ulid;
 use crate::UserId;
 use crate::metadata::AuthToken;
 use crate::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
-    StagingJobCheckpoint, WorkspaceMode,
+    InputSelection, JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload,
+    JobState, KeyWait, LogicalJobState, StagingJobCheckpoint, SubmissionId, WorkspaceMode,
 };
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
@@ -400,4 +400,41 @@ pub enum JobResponse {
     /// Keys still locked on the answering node; empty means every content is readable.
     KeysLocked(Vec<KeyWait>),
     KeyWakeAcked,
+}
+
+/// The holder's answer to a forwarded submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionAck {
+    pub job_id: JobId,
+    pub created: bool,
+    pub state: LogicalJobState,
+}
+
+/// Why a holder did not accept a forwarded submission. Only a definitive
+/// refusal ends the ingress; anything else lets it try the next holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubmissionRefusal {
+    Unauthorized,
+    /// This node does not hold the family in its own unconflicted view.
+    NotHolder,
+    /// The recomputed identity or request digest differs from the forwarded one.
+    IdentityMismatch,
+    Conflict {
+        existing_job_id: JobId,
+    },
+    /// The holder read the request and refused it; the reason reaches the caller.
+    Invalid {
+        reason: String,
+    },
+    Unavailable,
+}
+
+/// The inputs an ingress asks their source node to resolve and grant for one caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputResolveRequest {
+    pub created_by: UserId,
+    pub submission_id: SubmissionId,
+    /// Unix seconds the grants end at, bounded by this node's job retention.
+    pub expires_at: u64,
+    pub inputs: Vec<InputSelection>,
 }

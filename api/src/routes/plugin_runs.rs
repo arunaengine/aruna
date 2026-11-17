@@ -12,10 +12,11 @@ use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRec
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
-use aruna_operations::jobs::store::read_job_record;
+use aruna_operations::driver::drive;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
-use aruna_operations::plugins::dispatch::{StartError, start_run};
-use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
+use aruna_operations::plugins::dispatch::{StartError, run_again, start_run};
+use aruna_operations::plugins::finished::{drop_completion, waits_for};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
@@ -298,9 +299,9 @@ async fn kept_group(
 ) -> Result<GroupId, Response> {
     let ctx = state.get_ctx();
     let kept = match run.map(parse_id) {
-        Some(Ok(run_id)) => read_run(&ctx, install_id, run_id).await.ok(),
+        Some(Ok(run_id)) => drive(read_run(install_id, run_id), &ctx).await.ok(),
         Some(Err(error)) => return Err(error.into_response()),
-        None => (list_runs(&ctx, install_id, None, 1).await.ok())
+        None => (drive(list_runs(install_id, None, 1), &ctx).await.ok())
             .and_then(|(runs, _)| runs.into_iter().next()),
     };
     kept.map(|run| run.group_id)
@@ -565,7 +566,7 @@ pub async fn list(
         Ok(after) => after,
         Err(error) => return error.into_response(),
     };
-    match list_runs(&state.get_ctx(), install_id, after, limit).await {
+    match drive(list_runs(install_id, after, limit), &state.get_ctx()).await {
         Ok((runs, next)) => {
             let runs = (runs.into_iter())
                 .map(|mut run| {
@@ -637,7 +638,7 @@ pub async fn list_work(
     };
     let ctx = state.get_ctx();
     let unavailable = |error: String| ServerError::ServiceUnavailableReason(error).into_response();
-    let (rows, next) = match list_work_rows(&ctx, install_id, after, limit).await {
+    let (rows, next) = match drive(list_work_rows(install_id, after, limit), &ctx).await {
         Ok(page) => page,
         Err(error) => return unavailable(error.to_string()),
     };
@@ -665,7 +666,7 @@ async fn work_view(
     };
     let run = match row.notified {
         true => None,
-        false => read_run(ctx, install_id, row.run_id).await.ok(),
+        false => drive(read_run(install_id, row.run_id), ctx).await.ok(),
     };
     Ok(WorkView {
         id: row.work_id.to_string(),
@@ -756,7 +757,7 @@ pub async fn get_run(
         Ok(run_id) => run_id,
         Err(error) => return error.into_response(),
     };
-    match read_run(&state.get_ctx(), install_id, run_id).await {
+    match drive(read_run(install_id, run_id), &state.get_ctx()).await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
@@ -815,7 +816,7 @@ pub async fn resolve(
             .into_response();
     };
     let ctx = state.get_ctx();
-    let kept = match read_run(&ctx, served.install_id, run_id).await {
+    let kept = match drive(read_run(served.install_id, run_id), &ctx).await {
         Ok(kept) => kept,
         Err(error) => return run_error(error),
     };
@@ -830,7 +831,13 @@ pub async fn resolve(
         }),
         ..AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, actor, target)
     };
-    match resolve_run(&ctx, served.install_id, run_id, parsed.done, &audit).await {
+    let ids = (served.install_id, run_id);
+    let resolve = resolve_run(ids, parsed.done, &audit, unix_timestamp_millis());
+    let resolved = match resolve {
+        Ok(resolve) => drive(resolve, &ctx).await,
+        Err(error) => Err(error),
+    };
+    match resolved {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
@@ -842,7 +849,7 @@ async fn run_audit(
     served: &Served,
     (run_id, action): (Ulid, AdminAuditAction),
 ) -> Result<AdminAuditRecord, Response> {
-    let kept = read_run(ctx, served.install_id, run_id).await;
+    let kept = drive(read_run(served.install_id, run_id), ctx).await;
     let kept = kept.map_err(run_error)?;
     let actor = served.auth.user_id;
     let target = served
@@ -918,7 +925,7 @@ pub async fn retry(
         Err(response) => return response,
     };
     let ids = (served.install_id, run_id);
-    match retry_run(&ctx, ids, &audit, unix_timestamp_millis()).await {
+    match run_again(&ctx, ids, &audit, unix_timestamp_millis()).await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
@@ -973,7 +980,7 @@ pub async fn drop_job(
     };
     let ctx = state.get_ctx();
     let unavailable = |error: String| ServerError::ServiceUnavailableReason(error).into_response();
-    let row = match read_work(&ctx, served.install_id, work_id).await {
+    let row = match drive(read_work(served.install_id, work_id), &ctx).await {
         Ok(Some(row)) => row,
         Ok(None) => return ServerError::NotFound.into_response(),
         Err(error) => return unavailable(error.to_string()),
@@ -983,7 +990,11 @@ pub async fn drop_job(
         Ok(audit) => audit,
         Err(response) => return response,
     };
-    match drop_completion(&ctx, (served.install_id, work_id), &audit).await {
+    let dropped = match drop_completion((served.install_id, work_id), &audit) {
+        Ok(drop) => drive(drop, &ctx).await,
+        Err(error) => Err(error),
+    };
+    match dropped {
         Ok(row) => match work_view(&ctx, served.install_id, row).await {
             Ok(view) => Json(view).into_response(),
             Err(error) => unavailable(error),
@@ -1067,7 +1078,7 @@ pub async fn delivery(
         Err(response) => return response,
     };
     let ctx = state.get_ctx();
-    let delivery = match event_delivery(&ctx, install.install_id).await {
+    let delivery = match drive(event_delivery(install.install_id), &ctx).await {
         Ok(delivery) => delivery,
         Err(error) => {
             return ServerError::ServiceUnavailableReason(error.to_string()).into_response();
@@ -1098,8 +1109,7 @@ mod tests {
     //! The runs of a removed install stay readable and resolvable for the group's admins.
     use super::*;
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
-        test_storage, write_doc,
+        seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
     };
     use aruna_core::UserId;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -1108,7 +1118,9 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_operations::driver::drive;
     use aruna_operations::plugins::runs::{admit, save_run};
+    use aruna_operations::testing::test_context;
 
     fn waiting_run(install_id: Ulid, group_id: GroupId) -> PluginRun {
         PluginRun {
@@ -1162,13 +1174,13 @@ mod tests {
         // The install is gone from the realm config; its run waits for a person on this node.
         let install_id = Ulid::from_parts(7, 7);
         let mut run = waiting_run(install_id, group_id);
-        admit(&ctx, &run).await.unwrap();
+        drive(admit(run.clone()), &ctx).await.unwrap();
         run.finish(
             RunState::NeedsAttention,
             Some("call 0 is unknown".into()),
             2,
         );
-        save_run(&ctx, &run).await.unwrap();
+        drive(save_run(&run).unwrap(), &ctx).await.unwrap();
 
         let auth = |user: UserId| AuthContext {
             user_id: user,
@@ -1200,7 +1212,7 @@ mod tests {
         let stranger = UserId::new(Ulid::from_bytes([8u8; 16]), realm_id);
         assert_eq!(resolve_as(stranger).await, StatusCode::FORBIDDEN);
         assert_eq!(resolve_as(admin).await, StatusCode::OK);
-        let resolved = read_run(&ctx, install_id, run.run_id).await.unwrap();
+        let resolved = drive(read_run(install_id, run.run_id), &ctx).await.unwrap();
         assert_eq!(resolved.state, RunState::Succeeded);
         assert_eq!(resolve_as(admin).await, StatusCode::CONFLICT);
         let missing = Ulid::from_parts(9, 9);
@@ -1295,8 +1307,11 @@ mod tests {
         };
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
-        use aruna_operations::jobs::store::insert_job;
-        use aruna_operations::plugins::work::{Identity, WorkRow, dispatched, reserve};
+        use aruna_operations::driver::drive;
+        use aruna_operations::jobs::store::query::insert_job;
+        use aruna_operations::plugins::work::{
+            Identity, WorkChange, WorkRow, reserve, update_work,
+        };
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
@@ -1356,9 +1371,8 @@ mod tests {
             run_id: work.run_id,
             ordinal: 0,
         };
-        reserve(&ctx, (&install, &identity), work.clone())
-            .await
-            .unwrap();
+        let reserved = reserve((&install, &identity), work.clone(), None).unwrap();
+        drive(reserved, &ctx).await.unwrap();
         let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
         let job = JobId::from_parts(2, handle, BucketId::new(0).unwrap(), 1).unwrap();
         let spec = PluginWorkSpec {
@@ -1384,9 +1398,12 @@ mod tests {
         );
         record.state = JobState::Running;
         insert_job(&ctx.storage_handle, &record).await.unwrap();
-        dispatched(&ctx, (install_id, work.work_id), job)
-            .await
-            .unwrap();
+        drive(
+            update_work((install_id, work.work_id), WorkChange::Dispatched(job)),
+            &ctx,
+        )
+        .await
+        .unwrap();
         let path = format!("/api/v1/plugin-installs/{install_id}/work");
         let list_as = |user: UserId, limit: Option<usize>| {
             let state = state.clone();

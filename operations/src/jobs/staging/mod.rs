@@ -347,7 +347,7 @@ pub(crate) async fn seed_checkpoint(
         aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
             ..
         }) => Ok(()),
-        other => Err(format!("staging checkpoint not seeded: {other:?}")),
+        other => Err(format!("staging checkpoint not seeded: {}", other.label())),
     }
 }
 
@@ -485,10 +485,7 @@ pub(super) async fn pinned_bucket(
     Ok(bucket_info)
 }
 
-pub(super) async fn load_live_bucket(
-    ctx: &JobContext,
-    bucket: &str,
-) -> Result<BucketInfo, ItemFailure> {
+async fn load_live_bucket(ctx: &JobContext, bucket: &str) -> Result<BucketInfo, ItemFailure> {
     match drive(GetBucketOperation::new(bucket.to_string()), &ctx.driver).await {
         Ok(bucket_info) => Ok(bucket_info),
         Err(GetBucketError::NotFound) => Err(ItemFailure::Stage(

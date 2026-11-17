@@ -1029,7 +1029,7 @@ async fn watch_requires_read() {
     let (_dir, state, net) = build_network_state(realm_id, [15u8; 32]).await;
     let holder = net.node_id();
     let metrics = NodeMetrics::new();
-    net.notification_watch_metrics().register(&metrics).await;
+    net.notification_watch_metrics().register(&metrics);
     install_holder_config(&state, realm_id, holder).await;
     let authorized = UserId::new(Ulid::generate(), realm_id);
     let unauthorized = UserId::new(Ulid::generate(), realm_id);
@@ -1049,7 +1049,7 @@ async fn watch_requires_read() {
     .await
     .expect_err("user without metadata READ must be rejected");
     assert!(matches!(error, ServerError::Forbidden));
-    assert!(metrics.render().await.contains(
+    assert!(metrics.render().contains(
         "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
     ));
 

@@ -459,7 +459,7 @@ async fn queue_recovers_create() -> Result<(), Box<dyn std::error::Error>> {
 
     schedule_projection_drain(test.context.as_ref(), Duration::ZERO).await?;
     let task_handle = TaskHandle::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         test.context.clone(),
         task_handle.clone(),

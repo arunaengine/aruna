@@ -290,6 +290,17 @@ class CratesTest(unittest.TestCase):
             allow = {"aruna-operations": ["aruna-storage", "aruna-graph"]}
             self.assertEqual(check_layers.crate_findings(root, allow), ([], ["aruna-operations -> aruna-graph"]))
 
+    def test_backend_dev(self):
+        files = {
+            "Cargo.toml": '[workspace]\nmembers = ["operations", "storage", "net"]\n',
+            "operations/Cargo.toml": MANIFEST + "\n[dev-dependencies]\naruna-net = { workspace = true }\n",
+            "storage/Cargo.toml": '[package]\nname = "aruna-storage"\n\n[dev-dependencies]\naruna-net = "1"\n',
+            "net/Cargo.toml": '[package]\nname = "aruna-net"\n\n[dependencies]\naruna-storage = "1"\n',
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            self.assertEqual(check_layers.crate_findings(root, {}), (["aruna-storage -> aruna-net"], []))
+
 
 class GuardTest(unittest.TestCase):
     def test_clean_await(self):

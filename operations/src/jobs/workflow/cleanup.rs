@@ -8,7 +8,8 @@ use aruna_core::structs::execution::job::{
 };
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
+use super::super::store::JobMutationError;
+use super::super::store::attempt::{authorize_cleanup, record_attempt_tombstone};
 use crate::driver::drive;
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
@@ -156,7 +157,8 @@ mod tests {
     use super::*;
     use crate::driver::DriverContext;
     use crate::jobs::executor::ProgressReporter;
-    use crate::jobs::store::{insert_job, record_attempt_intent};
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::record_attempt_intent;
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use crate::s3::bucket::get::GetBucketOperation;

@@ -8,6 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope};
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -133,18 +134,18 @@ impl EmptyCheck {
                 let owned = match space {
                     // A finished job only waits for its retention purge, so it does not block.
                     JOB_KEYSPACE => {
-                        let record = crate::jobs::store::decode_job_record(&value)?;
+                        let record = JobRecord::from_bytes(&value)?;
                         record.payload.owner_group() == Some(self.group_id)
                             && !record.state.is_terminal()
                     }
                     FAMILY_RECORD_KEYSPACE => {
                         let envelope: JobRecordEnvelope =
-                            crate::jobs::records::rows::from_bytes(&value)?;
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     FAMILY_PENDING_KEYSPACE => {
-                        let pending: crate::jobs::records::rows::PendingRecord =
-                            crate::jobs::records::rows::from_bytes(&value)?;
+                        let pending: aruna_core::structs::execution::job::record_rows::PendingRecord =
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,

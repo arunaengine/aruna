@@ -3,30 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::injection::{OutgoingRequest, inject_secret};
-use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_core::injection::OutgoingRequest;
+use aruna_core::secrets::header_name;
+use aruna_plugins::broker::{ErrorKind, Field, HostError, Response};
 use aruna_plugins::connection::{Method, relative_path};
 use aruna_plugins::manifest::Manifest;
+use base64::Engine;
 use serde_json::Value;
-use ulid::Ulid;
 use url::Url;
 
-use super::check::unavailable;
-use super::held::ask_release;
-use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest};
+use super::unavailable;
 use super::work::RequestContext;
-use crate::driver::DriverContext;
 
 /// Query or header pairs by name and value.
 type Pairs<'a> = &'a [(String, String)];
 
 /// The request a run asks for, with the connection's address resolved from the settings the run
 /// was admitted with; a work row keeps it, so its job needs no run. No credential header is kept.
-pub fn request_context(
+pub(crate) fn request_context(
     manifest: &Manifest,
     (connection, method): (&str, Method),
     settings: &str,
@@ -82,45 +76,6 @@ pub fn outgoing(
     Ok((outgoing, connection.auth.clone()))
 }
 
-/// The realm keys this node releases group and realm secrets with, if it holds them.
-pub fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
-    (ctx.metadata_handle.as_ref())
-        .map(|handle| ReleaseKeys {
-            seal: handle.realm_seal_key(),
-            vault: handle.realm_vault_key(),
-        })
-        .unwrap_or_default()
-}
-
-/// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
-/// to `outgoing`; answers the exposure the rule allows now and the fields it added.
-pub async fn release_into(
-    ctx: &DriverContext,
-    (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
-    (install, slot, run_id): (&PluginInstall, &str, Ulid),
-    outgoing: &mut OutgoingRequest,
-) -> Result<(ResponseExposure, SecretFields), HostError> {
-    let request = ReleaseRequest {
-        install_id: install.install_id,
-        slot: slot.to_string(),
-        delivery: Delivery::Inject,
-        target: Some((outgoing.method.clone(), outgoing.url.to_string())),
-        held: None,
-        run_id: Some(run_id),
-    };
-    let released = ask_release(ctx, config, (local, keys), request).await;
-    let mut released = released.map_err(|error| match error {
-        ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
-        ReleaseError::Unavailable(why) => unavailable(why),
-    })?;
-    let bytes = released.fields.take();
-    let bytes = bytes.ok_or_else(|| unavailable("the release answered no value"))?;
-    let fields = SecretFields::decode(&bytes).map_err(|error| unavailable(error.to_string()))?;
-    let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
-    injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
-    Ok((released.exposure, fields))
-}
-
 fn method_named(name: &str) -> Option<Method> {
     use Method::{Delete, Get, Head, Patch, Post, Put};
     [Get, Head, Post, Put, Patch, Delete]
@@ -132,6 +87,77 @@ fn method_named(name: &str) -> Option<Method> {
 fn guest_header(name: &str) -> bool {
     let credential = ["authorization", "cookie", "proxy-authorization"];
     header_name(name) && !credential.contains(&name.to_ascii_lowercase().as_str())
+}
+
+/// The manifest's name of a method the guest called.
+pub(crate) fn declared_method(
+    method: aruna_plugins::broker::Method,
+) -> aruna_plugins::connection::Method {
+    use aruna_plugins::broker::Method as Called;
+    use aruna_plugins::connection::Method;
+    match method {
+        Called::Get => Method::Get,
+        Called::Head => Method::Head,
+        Called::Post => Method::Post,
+        Called::Put => Method::Put,
+        Called::Patch => Method::Patch,
+        Called::Delete => Method::Delete,
+    }
+}
+
+/// The stored form of a whole answer, read back by [`stored_whole`].
+pub(crate) fn whole_text(reply: &Response) -> String {
+    let headers: Vec<(&str, &str)> = (reply.headers.iter())
+        .map(|field| (field.name.as_str(), field.value.as_str()))
+        .collect();
+    let body = base64::engine::general_purpose::STANDARD.encode(&reply.body);
+    serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
+}
+
+/// The stored reply of a sent request whose answer did not fit the call.
+pub(crate) fn too_large(status: u16) -> String {
+    serde_json::json!({ "status": status, "too_large": true }).to_string()
+}
+
+/// The refusal a stored too-large marker answers with, every time it is replayed.
+fn refuse_large(value: &Value) -> Result<(), HostError> {
+    if value.get("too_large").and_then(Value::as_bool) != Some(true) {
+        return Ok(());
+    }
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let message = format!("the answer with status {status} is larger than the call allows");
+    Err(HostError::new(ErrorKind::Limit, message))
+}
+
+/// A whole answer read back from its stored form; a stored too-large marker is refused.
+pub(crate) fn stored_whole(reply: &str) -> Result<Response, HostError> {
+    let broken = || unavailable("a stored whole answer does not decode");
+    let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
+    refuse_large(&value)?;
+    let status = value
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    let headers: Vec<(String, String)> =
+        serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
+            .map_err(|_| broken())?;
+    let body = value
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or_else(broken)?;
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .map_err(|_| broken())?;
+    Ok(Response {
+        status: status.ok_or_else(broken)?,
+        headers: (headers.into_iter())
+            .map(|(name, value)| Field { name, value })
+            .collect(),
+        body,
+    })
 }
 
 fn invalid(why: &str) -> HostError {

@@ -26,7 +26,7 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;

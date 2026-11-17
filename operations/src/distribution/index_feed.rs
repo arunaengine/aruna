@@ -16,7 +16,6 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, SEARCH_FEED_KEYSPACE,
     SEARCH_INDEX_KEYSPACE,
 };
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::table::search_terms;
 use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
 use aruna_core::structs::storage::distribution::accounting::{Charge, RangeAccount};
@@ -26,6 +25,7 @@ use aruna_core::structs::storage::distribution::inventory::{
 use aruna_core::structs::storage::distribution::search::{IndexState, decode_feed};
 use aruna_core::types::{Key, Value};
 use aruna_storage::storage::StorageHandle;
+use aruna_tasks::shutdown::Shutdown;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
