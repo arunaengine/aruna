@@ -3,15 +3,20 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::ConversionError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use smallvec::smallvec;
+use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::retry::RetryView;
@@ -272,12 +277,163 @@ pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     })
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum ClaimError {
+    #[error("unexpected {0} while claiming a queued draft")]
+    UnexpectedEvent(&'static str),
+    #[error("claiming a queued draft did not finish")]
+    NotFinished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaimStep {
+    Init,
+    Start,
+    Read,
+    Write,
+    Commit,
+    Abort,
+    Finish,
+}
+
+/// Stores `next` only while the entry still carries the state the scan read, and outputs
+/// whether that committed. A delete committed in between therefore wins instead of the entry
+/// coming back as `Publishing`.
+#[derive(Debug, PartialEq)]
+pub struct ClaimStateOperation {
+    entry: PublishEntry,
+    next: PublishState,
+    step: ClaimStep,
+    txn_id: Option<TxnId>,
+    output: Option<Result<bool, ClaimError>>,
+}
+
+impl ClaimStateOperation {
+    pub fn new(entry: PublishEntry, next: PublishState) -> Self {
+        Self {
+            entry,
+            next,
+            step: ClaimStep::Init,
+            txn_id: None,
+            output: None,
+        }
+    }
+
+    /// Ends with `output`, aborting the transaction first when one is open.
+    fn end(&mut self, output: Result<bool, ClaimError>) -> Effects {
+        self.output = Some(output);
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.step = ClaimStep::Abort;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => {
+                self.step = ClaimStep::Finish;
+                smallvec![]
+            }
+        }
+    }
+
+    fn write(&mut self, current: Option<PublishEntry>) -> Effects {
+        if !current.is_some_and(|current| current.state == self.entry.state) {
+            return self.end(Ok(false));
+        }
+        let claimed = entry_with_state(&self.entry, self.next.clone());
+        let Ok((key_space, key, value)) = publish_entry(&claimed) else {
+            warn!(draft_id = %self.entry.draft_id, "Failed to encode a queued draft");
+            return self.end(Ok(false));
+        };
+        self.step = ClaimStep::Write;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: self.txn_id,
+        })]
+    }
+}
+
+impl Operation for ClaimStateOperation {
+    type Output = bool;
+    type Error = ClaimError;
+
+    fn start(&mut self) -> Effects {
+        self.step = ClaimStep::Start;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let draft_id = self.entry.draft_id;
+        match (self.step, event) {
+            (ClaimStep::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn_id = Some(txn_id);
+                self.step = ClaimStep::Read;
+                smallvec![read_publish_entry(draft_id, Some(txn_id))]
+            }
+            (ClaimStep::Start, Event::Storage(StorageEvent::Error { .. })) => {
+                warn!(%draft_id, "Failed to open a transaction for a queued draft");
+                self.end(Ok(false))
+            }
+            (ClaimStep::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let current = value.and_then(|bytes| PublishEntry::from_bytes(&bytes).ok());
+                self.write(current)
+            }
+            (ClaimStep::Read | ClaimStep::Write, Event::Storage(StorageEvent::Error { .. })) => {
+                self.end(Ok(false))
+            }
+            (ClaimStep::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                let Some(txn_id) = self.txn_id.take() else {
+                    return self.end(Ok(false));
+                };
+                self.step = ClaimStep::Commit;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (ClaimStep::Commit, event) => {
+                let committed = matches!(
+                    event,
+                    Event::Storage(StorageEvent::TransactionCommitted { .. })
+                );
+                self.end(Ok(committed))
+            }
+            (ClaimStep::Abort, _) => {
+                self.step = ClaimStep::Finish;
+                smallvec![]
+            }
+            (_, event) => self.end(Err(ClaimError::UnexpectedEvent(event.label()))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.step == ClaimStep::Finish
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(ClaimError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
-    use super::{PublishEntry, PublishState, publish_key};
+    use super::{
+        ClaimError, ClaimStateOperation, PublishEntry, PublishState, entry_with_state,
+        publish_entry, publish_key, read_publish_entry,
+    };
     use crate::tests::device::record;
     use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
+    use aruna_core::operation::Operation;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
     use aruna_core::structs::identity::realm::RealmId;
     use craqle::VectorClock;
     use ulid::Ulid;
@@ -401,5 +557,109 @@ mod pure_tests {
                 attempts: 0,
             }) if retried == document_id
         ));
+    }
+
+    const TXN: Ulid = Ulid::from_bytes([9; 16]);
+
+    fn publishing() -> PublishState {
+        PublishState::Publishing {
+            document_id: Ulid::from_parts(4, 4),
+            due_at_ms: 0,
+            attempts: 1,
+        }
+    }
+
+    fn storage(event: StorageEvent) -> Event {
+        Event::Storage(event)
+    }
+
+    fn stored(entry: &PublishEntry) -> Event {
+        storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(entry.to_bytes().unwrap().into()),
+        })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    // An entry still in the scanned state is claimed in one transaction.
+    #[test]
+    fn claims_unchanged_entry() {
+        let entry = entry();
+        let (key_space, key, value) =
+            publish_entry(&entry_with_state(&entry, publishing())).unwrap();
+        let write = Effect::Storage(StorageEffect::Write {
+            key_space,
+            key: key.clone(),
+            value,
+            txn_id: Some(TXN),
+        });
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        check_trace(
+            &mut claim,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![read_publish_entry(entry.draft_id, Some(TXN))],
+                ),
+                (stored(&entry), vec![write]),
+                (
+                    storage(StorageEvent::WriteResult { key }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: TXN,
+                    })],
+                ),
+                (
+                    storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(claim.finalize(), Ok(true));
+    }
+
+    // An entry that moved on or went away is left alone and the transaction aborted.
+    #[test]
+    fn moved_entry_kept() {
+        let entry = entry();
+        let started = || storage(StorageEvent::TransactionStarted { txn_id: TXN });
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        claim.start();
+        claim.step(started());
+        check_abort(
+            &mut ClaimStateOperation {
+                txn_id: Some(TXN),
+                ..ClaimStateOperation::new(entry.clone(), publishing())
+            },
+            &[abort()],
+        );
+        let moved = entry_with_state(&entry, publishing());
+        assert_eq!(claim.step(stored(&moved)).into_vec(), vec![abort()]);
+        let aborted = storage(StorageEvent::TransactionAborted { txn_id: TXN });
+        assert!(claim.step(aborted).is_empty());
+        assert_eq!(claim.finalize(), Ok(false));
+
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        claim.start();
+        claim.step(storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(claim.finalize(), Ok(false));
+    }
+
+    // Unstarted claims refuse every event, abort nothing and never finish early.
+    #[test]
+    fn claim_rejects_unexpected() {
+        let fresh = || ClaimStateOperation::new(entry(), publishing());
+        let refused = rejects_events(fresh, sample_events, |_| false);
+        assert_eq!(refused.len(), sample_events().len());
+        assert!(matches!(refused[0].2, ClaimError::UnexpectedEvent(_)));
+        rejects_finalize(fresh());
+        assert!(fresh().abort().is_empty());
     }
 }
