@@ -29,6 +29,7 @@ use aruna_core::structs::storage::distribution::inventory::{
 };
 use aruna_core::structs::storage::distribution::search::{IndexState, decode_feed};
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
@@ -87,6 +88,16 @@ pub struct FeedCursors {
 pub struct FeedPass {
     pub busy: bool,
     pub cursors: FeedCursors,
+}
+
+/// How far this node's search index of one range is.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct IndexProgress {
+    pub ready: bool,
+    /// Keys in the index as of its last commit.
+    pub indexed: u64,
+    /// Keys of the range by this node's range counters; a split child counts its parent's too.
+    pub keys: u64,
 }
 
 /// The index state row of a range, keyed like its account row.

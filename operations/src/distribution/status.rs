@@ -23,7 +23,8 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::distribution::index_feed::{IndexProgress, range_progress};
+use crate::distribution::feed_walks::IndexProgress;
+use crate::distribution::index_feed::range_progress;
 use crate::driver::DriverContext;
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;

@@ -26,7 +26,8 @@ use super::{
     changed_until, finish_read, load_live, retain_matches, start_read,
 };
 use crate::auth::request_policy::PolicyEvaluator;
-use crate::distribution::index_feed::{range_progress, state_key};
+use crate::distribution::feed_walks::state_key;
+use crate::distribution::index_feed::range_progress;
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
 use aruna_core::key_index::{KeyPage, KeyQuery, MetaTerms};

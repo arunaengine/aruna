@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::request_policy::PolicyEnforcementError;
-use crate::distribution::index_feed::IndexProgress;
+use crate::distribution::feed_walks::IndexProgress;
 use aruna_core::NodeId;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::AuthContext;

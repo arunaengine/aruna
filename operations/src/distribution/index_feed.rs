@@ -15,11 +15,12 @@ use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::storage::distribution::search::IndexState;
 use aruna_core::types::Key;
 use aruna_storage::key_index::RangeIndexes;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use super::feed_walks::{FeedCursors, FeedError, FeedLimits, FeedPassOperation, state_key};
+use super::feed_walks::{
+    FeedCursors, FeedError, FeedLimits, FeedPassOperation, IndexProgress, state_key,
+};
 use super::usage::{held_ranges, sum_held};
 use crate::driver::{DriverContext, drive};
 
@@ -78,16 +79,6 @@ pub fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
             }
         }
     });
-}
-
-/// How far this node's search index of one range is.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct IndexProgress {
-    pub ready: bool,
-    /// Keys in the index as of its last commit.
-    pub indexed: u64,
-    /// Keys of the range by this node's range counters; a split child counts its parent's too.
-    pub keys: u64,
 }
 
 /// The search index progress of every range of `bucket` this node holds, while its set keeps
