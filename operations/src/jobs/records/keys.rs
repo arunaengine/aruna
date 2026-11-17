@@ -77,6 +77,10 @@ pub fn alias_key(job_id: JobId, family: &JobFamilyId) -> Key {
     Key::from(bytes.as_slice())
 }
 
+/// Families one alias may resolve to. Two families claiming one id is an
+/// anomaly that stays visible instead of rebinding the first one.
+pub const MAX_ALIAS_FAMILIES: usize = 8;
+
 pub fn alias_prefix(job_id: JobId) -> Key {
     Key::from(job_id.to_bytes().as_slice())
 }

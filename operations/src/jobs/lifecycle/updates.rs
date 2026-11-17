@@ -19,7 +19,7 @@ use ulid::Ulid;
 
 use super::held::HeldReservations;
 use super::reservation::ReleaseExecutionOperation;
-use super::routing::family_of_alias;
+use super::alias::AliasFamilyOperation;
 use super::witness::arm_family;
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
@@ -108,7 +108,7 @@ pub async fn chain_for(
     job_id: JobId,
     execution_id: Ulid,
 ) -> Option<ExecutionChain> {
-    let family = match family_of_alias(context, job_id).await {
+    let family = match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(Some(family)) => family,
         Ok(None) => {
             warn!(

@@ -61,7 +61,8 @@ use crate::metadata::repository::StorageReadError;
 
 use super::lifecycle::cancel::{self, cancel_family};
 use super::lifecycle::ids::session_of;
-use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
+use super::lifecycle::alias::AliasFamilyOperation;
+use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
 pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
@@ -1155,7 +1156,7 @@ pub async fn read_report_routed(
     auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let user_id = auth.user_id;
-    let job_id = if family_of_alias(context, job_id).await?.is_some() {
+    let job_id = if drive(AliasFamilyOperation::new(job_id), context).await?.is_some() {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
             Ok((_, Some(physical))) => physical,
             Ok((record, None)) => return Ok(JobReportLookup::Pending(record.state)),
@@ -1560,7 +1561,7 @@ pub async fn cancel_job_routed(
     // call; the local row of a receipted execution is stopped separately.
     if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
         if cancelled.is_ok() {
-            let family = match family_of_alias(context, job_id).await {
+            let family = match drive(AliasFamilyOperation::new(job_id), context).await {
                 Ok(Some(family)) => family,
                 Ok(None) => {
                     return Err(JobRouteError::Unavailable(
@@ -1573,7 +1574,7 @@ pub async fn cancel_job_routed(
                 .await
                 .map_err(|error| JobRouteError::Unavailable(error.to_string()))?
             {
-                if family_of_alias(context, reservation.logical_job_id).await? == Some(family) {
+                if drive(AliasFamilyOperation::new(reservation.logical_job_id), context).await? == Some(family) {
                     runtime.request_cancel(reservation.job_id);
                 }
             }

@@ -15,7 +15,8 @@ use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::routing::{family_of_alias, family_projection};
+use super::alias::AliasFamilyOperation;
+use super::routing::family_projection;
 use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::auth::request_authorization::authorize;
@@ -40,7 +41,7 @@ pub async fn cancel_family(
     job_id: JobId,
     auth_token: Option<AuthToken>,
 ) -> Option<Result<(), JobRouteError>> {
-    let family = match family_of_alias(context, job_id).await {
+    let family = match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(Some(family)) => family,
         Ok(None) => return None,
         Err(error) => return Some(Err(error)),

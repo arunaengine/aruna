@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::route::JobRouteError;
 use std::sync::Arc;
 
@@ -307,7 +308,7 @@ async fn owner_gate(
     job_id: JobId,
     local_node: Option<NodeId>,
 ) -> Option<PreparedResponse> {
-    match crate::jobs::lifecycle::routing::family_of_alias(context, job_id).await {
+    match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(Some(_)) => return None,
         Ok(None) => {}
         Err(error) => {
@@ -439,7 +440,7 @@ async fn prepare_cancel(
     auth_token: AuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
-    let requested_family = match crate::jobs::lifecycle::routing::family_of_alias(context, job_id)
+    let requested_family = match drive(AliasFamilyOperation::new(job_id), context)
         .await
     {
         Ok(family) => family,
@@ -630,10 +631,7 @@ async fn reservation_matches(
     reservation_alias: JobId,
 ) -> Result<bool, JobRouteError> {
     match requested_family {
-        Some(family) => Ok(crate::jobs::lifecycle::routing::family_of_alias(
-            context,
-            reservation_alias,
-        )
+        Some(family) => Ok(drive(AliasFamilyOperation::new(reservation_alias), context)
         .await?
             == Some(family)),
         None => Ok(requested_alias == reservation_alias),
