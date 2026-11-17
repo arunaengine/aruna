@@ -102,3 +102,51 @@ pub fn remove_deferred_topic(
     }
     deferred_topics.retain(|_, topics| !topics.is_empty());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn topic(seed: u8) -> TopicId {
+        TopicId::from_bytes([seed; 32])
+    }
+
+    #[test]
+    fn registry_bounds_topics() {
+        let dependency = DocumentSyncDependency::RealmConfig(RealmId::from_bytes([1; 32]));
+        let mut registry = BTreeMap::new();
+        assert_eq!(
+            register_deferred_topic(&mut registry, dependency, topic(1)),
+            DeferredRegistrationOutcome::Inserted
+        );
+        assert_eq!(
+            register_deferred_topic(&mut registry, dependency, topic(1)),
+            DeferredRegistrationOutcome::AlreadyRegistered
+        );
+        let full: BTreeSet<_> = (0..TOPICS_PER_DEPENDENCY)
+            .map(|index| {
+                let mut bytes = [7u8; 32];
+                bytes[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                TopicId::from_bytes(bytes)
+            })
+            .collect();
+        registry.insert(dependency, full);
+        assert_eq!(
+            register_deferred_topic(&mut registry, dependency, topic(2)),
+            DeferredRegistrationOutcome::CapacityExceeded
+        );
+    }
+
+    #[test]
+    fn removal_drops_empty() {
+        let first = DocumentSyncDependency::RealmConfig(RealmId::from_bytes([1; 32]));
+        let second = DocumentSyncDependency::RealmAuthorization(RealmId::from_bytes([1; 32]));
+        let mut registry = BTreeMap::new();
+        register_deferred_topic(&mut registry, first, topic(1));
+        register_deferred_topic(&mut registry, second, topic(1));
+        register_deferred_topic(&mut registry, second, topic(2));
+        remove_deferred_topic(&mut registry, topic(1));
+        assert!(!registry.contains_key(&first));
+        assert_eq!(registry.get(&second), Some(&BTreeSet::from([topic(2)])));
+    }
+}
