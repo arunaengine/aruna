@@ -81,6 +81,7 @@ fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Servic
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -398,6 +399,7 @@ async fn put_survives_queue() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -513,6 +515,7 @@ async fn build_watch_context(
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -750,6 +753,7 @@ async fn refresh_failure_hidden() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -855,6 +859,7 @@ fn setup_state() -> TestState {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -2439,6 +2444,7 @@ async fn setup_copy_authorization(
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -2626,6 +2632,7 @@ async fn source_policy_denied() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -2721,6 +2728,7 @@ async fn delete_uses_context() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -2895,6 +2903,7 @@ async fn delimiter_groups_results() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -2973,6 +2982,7 @@ async fn delimiter_paginates() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3126,6 +3136,7 @@ async fn prefix_page_complete() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3192,6 +3203,7 @@ async fn listing_counts_entries() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3313,6 +3325,7 @@ async fn large_group_collapses() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3397,6 +3410,7 @@ async fn reference_returns_metadata() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3580,6 +3594,7 @@ async fn zero_max_honored() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3645,6 +3660,7 @@ async fn start_after_prefixes() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3720,6 +3736,7 @@ async fn listing_requires_access() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3757,6 +3774,7 @@ async fn max_keys_validated() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3818,6 +3836,7 @@ async fn listing_applies_encoding() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -3893,6 +3912,7 @@ async fn fetch_owner_group() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });

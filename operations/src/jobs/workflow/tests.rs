@@ -264,6 +264,7 @@ fn context(storage: StorageHandle) -> Arc<DriverContext> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     })
@@ -851,6 +852,7 @@ async fn net_context(storage: StorageHandle) -> (Arc<DriverContext>, aruna_net::
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -1704,6 +1706,7 @@ fn compute_context(storage: StorageHandle) -> Arc<DriverContext> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: Some(Arc::new(registry)),
     })

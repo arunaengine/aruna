@@ -69,6 +69,7 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });

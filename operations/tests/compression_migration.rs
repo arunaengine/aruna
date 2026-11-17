@@ -134,6 +134,7 @@ async fn restart_resumes_migration() {
         net_handle: context.driver.net_handle.clone(),
         blob_handle: context.driver.blob_handle.clone(),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });

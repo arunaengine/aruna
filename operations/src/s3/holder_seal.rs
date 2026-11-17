@@ -183,6 +183,7 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: Some(blob),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };

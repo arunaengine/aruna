@@ -124,6 +124,7 @@ pub(crate) fn outbox_handler() -> (tempfile::TempDir, OperationsTaskHandler, Tas
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         }),
@@ -179,6 +180,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });

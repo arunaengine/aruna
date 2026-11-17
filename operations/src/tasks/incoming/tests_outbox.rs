@@ -203,6 +203,7 @@ async fn topic_page_blocks() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -301,6 +302,7 @@ async fn admin_page_blocks() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -751,6 +753,7 @@ async fn blocked_keeps_backoff() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -821,6 +824,7 @@ async fn deferred_head_paginates() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -975,6 +979,7 @@ async fn rotation_streak() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -1064,6 +1069,7 @@ async fn draining_a_topics() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -1163,6 +1169,7 @@ async fn retry_publishes_once() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
@@ -1286,6 +1293,7 @@ async fn config_setup() -> ConfigHarness {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -1347,6 +1355,7 @@ async fn pull_reaches_holder() {
         net_handle: Some(ex_holder.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     }));
@@ -1420,6 +1429,7 @@ async fn pull_reaches_holder() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
@@ -1548,6 +1558,7 @@ impl BoundaryHarness {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });

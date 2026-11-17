@@ -166,6 +166,7 @@ async fn corrupt_job_only() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -243,6 +244,7 @@ async fn corrupt_global_job() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -342,6 +344,7 @@ async fn orphan_global_job() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1660,6 +1663,7 @@ async fn late_merges_chain() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -2160,6 +2164,7 @@ async fn failing_apply_reschedules() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

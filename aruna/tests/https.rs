@@ -508,6 +508,7 @@ fn shutdown_sequence(
         jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
         net_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         blob_handle: None,
         storage_handle,
         ops: None,
@@ -527,6 +528,7 @@ async fn drained_stack(
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });

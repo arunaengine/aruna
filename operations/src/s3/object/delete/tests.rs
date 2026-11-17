@@ -706,6 +706,7 @@ async fn missing_version_rejected() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -759,6 +760,7 @@ async fn creates_tombstone() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -911,6 +913,7 @@ async fn deletes_version() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1285,6 +1288,7 @@ async fn pending_archive_shared() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1366,6 +1370,7 @@ async fn malformed_owner_aborts() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1415,6 +1420,7 @@ async fn removes_envelope_rows() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1481,6 +1487,7 @@ async fn removes_pending_copy() {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1750,6 +1757,7 @@ async fn bucket_rows_sum() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

@@ -116,6 +116,7 @@ async fn fixture(with_blob: bool) -> Fixture {
         net_handle,
         blob_handle,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });

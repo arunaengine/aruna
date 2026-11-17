@@ -187,6 +187,7 @@ async fn drain_keeps_timer() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     }))
@@ -217,6 +218,7 @@ async fn outbox_sync_retry() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -266,6 +268,7 @@ async fn retained_outbox_timer() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -318,6 +321,7 @@ async fn tombstones_are_return() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -381,6 +385,7 @@ async fn drain_reconcile_wakes() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -495,6 +500,7 @@ async fn drain_reconcile_summary() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -590,6 +596,7 @@ async fn drain_reconcile_config() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -670,6 +677,7 @@ async fn placement_storage_rearms() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle),
         compute_handle: None,
     });

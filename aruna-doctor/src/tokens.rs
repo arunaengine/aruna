@@ -101,6 +101,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     };
@@ -207,6 +208,7 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     };
@@ -481,6 +483,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -791,6 +794,7 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
         });

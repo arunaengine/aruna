@@ -49,6 +49,7 @@ async fn counts_owner_group() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -78,6 +79,7 @@ async fn reads_deleting_record() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

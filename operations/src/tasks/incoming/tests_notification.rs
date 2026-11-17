@@ -26,6 +26,7 @@ async fn notification_drain_holder() {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -58,6 +59,7 @@ async fn notification_drain_unresolvable() {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
@@ -132,6 +134,7 @@ async fn notification_delivers_holder() {
         net_handle: Some(net_b),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -142,6 +145,7 @@ async fn notification_delivers_holder() {
         net_handle: Some(net_a),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -178,6 +182,7 @@ async fn notification_drain_warn() {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -230,6 +235,7 @@ async fn drain_retries_queueing() {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -343,6 +349,7 @@ async fn device_skips_holders() {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });

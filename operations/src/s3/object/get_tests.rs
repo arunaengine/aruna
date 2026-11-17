@@ -670,6 +670,7 @@ pub async fn test_get_object() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -770,6 +771,7 @@ async fn routed_missing_blob() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -932,6 +934,7 @@ pub async fn hash_mismatch_rejected() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -996,6 +999,7 @@ async fn bound_connector_used() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1178,6 +1182,7 @@ async fn drift_creates_successor() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -2264,6 +2269,7 @@ async fn historical_drift_fails() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

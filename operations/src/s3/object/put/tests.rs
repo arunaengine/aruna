@@ -1037,6 +1037,7 @@ pub async fn test_put_object() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1292,6 +1293,7 @@ pub async fn deduplicates_blob() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -1475,6 +1477,7 @@ async fn setup_two_backends(temp_root: &str) -> (DriverContext, String, String) 
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         },
@@ -2077,6 +2080,7 @@ pub async fn overwrite_retains_index() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };
@@ -2261,6 +2265,7 @@ async fn mismatch_cleans_blob() {
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

@@ -58,6 +58,7 @@ async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<Server
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -100,6 +101,7 @@ async fn build_network_state(
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });

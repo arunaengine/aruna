@@ -44,6 +44,7 @@ fn node_context(dir: &Path, wrap: impl FnOnce(StorageHandle) -> StorageHandle) -
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     }
