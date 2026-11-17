@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
     DocumentSyncRevision, DocumentTarget,
@@ -48,6 +49,12 @@ pub enum WatchSubscriptionError {
     CapExceeded,
     #[error("{0}")]
     Storage(String),
+}
+
+impl From<IoError> for WatchSubscriptionError {
+    fn from(error: IoError) -> Self {
+        WatchSubscriptionError::Storage(error.to_string())
+    }
 }
 
 /// The revision and sync outbox record a holder writes with a watch change.
