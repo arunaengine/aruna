@@ -419,7 +419,10 @@ mod drain_tests {
         let flag = || IoResult::Values(vec![Some(Value::from(vec![1]))]);
         let unset = || IoResult::Values(vec![None]);
         let mut drain = SetDrainOperation::new(true);
-        assert_eq!(drain.first(), Ok(Next::Call(IoCall::Read(vec![drain_row()]))));
+        assert_eq!(
+            drain.first(),
+            Ok(Next::Call(IoCall::Read(vec![drain_row()])))
+        );
         let (space, key) = drain_row();
         let write = IoCall::Write(vec![(space, key, Value::from(vec![1]))]);
         assert_eq!(drain.next(unset()), Ok(Next::Call(write)));
@@ -428,7 +431,13 @@ mod drain_tests {
         let delete = IoCall::Delete(vec![drain_row()]);
         assert_eq!(release.next(flag()), Ok(Next::Call(delete)));
         assert_eq!(release.next(IoResult::Done), Ok(Next::Done(true)));
-        assert_eq!(SetDrainOperation::new(true).next(flag()), Ok(Next::Done(false)));
-        assert_eq!(SetDrainOperation::new(false).next(unset()), Ok(Next::Done(false)));
+        assert_eq!(
+            SetDrainOperation::new(true).next(flag()),
+            Ok(Next::Done(false))
+        );
+        assert_eq!(
+            SetDrainOperation::new(false).next(unset()),
+            Ok(Next::Done(false))
+        );
     }
 }

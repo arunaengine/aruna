@@ -192,6 +192,22 @@ impl IoResult {
         }
     }
 
+    /// The value of a read of exactly one row.
+    pub fn value(self) -> Result<Option<Value>, IoError> {
+        match self {
+            Self::Values(values) if values.len() == 1 => Ok(values.into_iter().next().flatten()),
+            other => Err(other.other("IoResult::Values with one value")),
+        }
+    }
+
+    /// The end of a write, a delete or a sync.
+    pub fn done(self) -> Result<(), IoError> {
+        match self {
+            Self::Done => Ok(()),
+            other => Err(other.other("IoResult::Done")),
+        }
+    }
+
     /// The rows of a page and the key to continue after.
     pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
         match self {

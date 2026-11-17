@@ -634,3 +634,48 @@ fn calls_after_commit() {
     assert!(operation.abort().is_empty());
     assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }
+
+#[test]
+fn reads_expected_answers() {
+    let value: crate::types::Value = b"v".to_vec().into();
+    let one = IoResult::Values(vec![Some(value.clone())]);
+    assert_eq!(one.value(), Ok(Some(value.clone())));
+    assert_eq!(IoResult::Values(vec![None]).value(), Ok(None));
+    assert_eq!(IoResult::Done.done(), Ok(()));
+    let page = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(page.page(), Ok((Vec::new(), None)));
+    assert_eq!(
+        IoResult::Event(Box::new(crate::events::Event::Delayed)).event(),
+        Ok(crate::events::Event::Delayed)
+    );
+}
+
+#[test]
+fn names_other_answers() {
+    let two = IoResult::Values(vec![None, None]);
+    assert_eq!(
+        two.value(),
+        Err(IoError::Unexpected {
+            expected: "IoResult::Values with one value",
+            got: "IoResult::Values",
+        })
+    );
+    assert_eq!(
+        IoResult::Woke.done(),
+        Err(IoError::Unexpected {
+            expected: "IoResult::Done",
+            got: "IoResult::Woke",
+        })
+    );
+    let event = IoResult::Event(Box::new(crate::events::Event::Delayed));
+    assert!(matches!(
+        event.values(),
+        Err(IoError::Unexpected {
+            expected: "IoResult::Values",
+            ..
+        })
+    ));
+}
