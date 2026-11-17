@@ -4,17 +4,20 @@
 
 use super::cron::parse_schedule;
 use super::{ImportRuleError, folders_overlap, validate_folder};
+use crate::distribution::inventory::{StagedCall, outside_answer};
 use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
 use crate::s3::bucket::storage_move::{check_movable, move_reads, move_record, move_rows};
+use crate::s3::object::put::abe::keyed;
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::{BackendImport, valid_pattern};
 use aruna_core::structs::storage::backends::ImportRoot;
@@ -27,8 +30,7 @@ use aruna_core::structs::storage::group_backend::{
 };
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
@@ -59,18 +61,16 @@ pub struct CreateImportInput {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreateState {
-    Init,
     Backends,
     /// The group's other rules, read before a provider bucket is created.
     Overlaps,
     Ensure,
-    Start,
     Read,
     Scan,
     Write,
-    Commit,
-    Finish,
 }
+
+type Turn = Result<Next<BackendImport>, ImportRuleError>;
 
 /// Checks the bucket, both backends and the group's other rules in one transaction, then
 /// writes the rule and, when it is missing, the routing rule that sends the folder's
@@ -79,7 +79,6 @@ enum CreateState {
 pub struct CreateImportOperation {
     input: CreateImportInput,
     state: CreateState,
-    txn_id: Option<TxnId>,
     /// The bucket record with the added routing rule; `None` keeps the stored one.
     routed: Option<BucketInfo>,
     /// Rule buckets on storages without a bucket, still to check.
@@ -92,42 +91,39 @@ pub struct CreateImportOperation {
     moving: Option<CompressionMigration>,
     /// Runs in a caller's transaction, which the caller commits or aborts.
     nested: bool,
-    output: Option<Result<BackendImport, ImportRuleError>>,
+    rule: Option<BackendImport>,
 }
 
 impl CreateImportOperation {
     pub fn new(input: CreateImportInput) -> Self {
         Self {
             input,
-            state: CreateState::Init,
-            txn_id: None,
+            state: CreateState::Backends,
             routed: None,
             pending: Vec::new(),
             checked: Vec::new(),
             backends: Vec::new(),
             moving: None,
             nested: false,
-            output: None,
+            rule: None,
         }
     }
 
-    /// Writes the rule in the open transaction `txn_id` and leaves its commit to the caller.
-    pub fn within(input: CreateImportInput, txn_id: TxnId) -> Self {
+    /// Writes the rule in the caller's transaction: the caller makes this operation's calls
+    /// among its own and commits them.
+    pub fn within(input: CreateImportInput) -> Self {
         Self {
-            txn_id: Some(txn_id),
             nested: true,
             ..Self::new(input)
         }
     }
 
-    fn fail(&mut self, error: ImportRuleError) -> Effects {
-        self.state = CreateState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn invalid(&mut self, reason: &str) -> Effects {
-        self.fail(ImportRuleError::Invalid(reason.to_string()))
+    /// A read before the transaction; a nested rule reads in its caller's transaction.
+    fn staged(&self, call: IoCall) -> IoCall {
+        match self.nested {
+            true => call,
+            false => StagedCall::Outside(call).into_call(),
+        }
     }
 
     fn validate(&self) -> Result<(), ImportRuleError> {
@@ -170,39 +166,30 @@ impl CreateImportOperation {
         }
     }
 
-    fn read_backends(&mut self) -> Effects {
+    fn read_backends(&mut self) -> Turn {
         self.state = CreateState::Backends;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.reads(),
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(self.staged(IoCall::Read(self.reads()))))
     }
 
     /// Checks the bucket, the group and both folders before any provider bucket is created,
     /// then queues the rule buckets of storages without a bucket.
-    fn backends_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (backend, write_backend) = match self.verify(values) {
-            Ok((_, backend, write_backend)) => (backend, write_backend),
-            Err(error) => return self.fail(error),
-        };
+    fn backends_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
+        let (_, backend, write_backend) = self.verify(values)?;
         if read_only(&write_backend, &self.input.import_roots) {
-            return self.invalid(
-                "This local folder is read-only. Name a writable write_backend_id for new files.",
-            );
+            return Err(ImportRuleError::Invalid(
+                "This local folder is read-only. Name a writable write_backend_id for new files."
+                    .to_string(),
+            ));
         }
         let folders = [
             (backend, self.input.backend_prefix.clone()),
             (write_backend, self.write_folder().to_string()),
         ];
         for (storage, folder) in folders {
-            match check_folder(&storage, &folder) {
-                Ok(Some(bucket))
-                    if !self.pending.contains(&(storage.backend_id, bucket.clone())) =>
-                {
-                    self.pending.push((storage.backend_id, bucket));
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error),
+            if let Some(bucket) = check_folder(&storage, &folder)?
+                && !self.pending.contains(&(storage.backend_id, bucket.clone()))
+            {
+                self.pending.push((storage.backend_id, bucket));
             }
         }
         if self.pending.is_empty() {
@@ -212,44 +199,34 @@ impl CreateImportOperation {
         self.scan(None)
     }
 
-    fn ensure_next(&mut self) -> Effects {
+    fn ensure_next(&mut self) -> Turn {
         let Some((backend_id, bucket)) = self.pending.first().cloned() else {
-            if let (true, Some(txn_id)) = (self.nested, self.txn_id) {
-                return self.read(txn_id);
-            }
-            self.state = CreateState::Start;
-            return smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })];
+            return self.read();
         };
         self.state = CreateState::Ensure;
-        smallvec![Effect::Blob(BlobEffect::EnsureBucket {
+        let ensure = Effect::Blob(BlobEffect::EnsureBucket {
             backend: BackendRef::Group(backend_id),
             bucket,
-        })]
+        });
+        Ok(Next::Call(ensure.into()))
     }
 
-    fn ensured(&mut self, event: Event) -> Effects {
+    fn ensured(&mut self, event: Event) -> Turn {
         match event {
             Event::Blob(BlobEvent::BucketReady { created }) if !self.pending.is_empty() => {
                 let (backend_id, bucket) = self.pending.remove(0);
                 self.checked.push((backend_id, bucket, created));
                 self.ensure_next()
             }
-            Event::Blob(BlobEvent::Error(error)) => {
-                self.fail(ImportRuleError::Invalid(error.reason()))
-            }
-            _ => self.fail(ImportRuleError::Unexpected("Ensure")),
+            Event::Blob(BlobEvent::Error(error)) => Err(ImportRuleError::Invalid(error.reason())),
+            _ => Err(ImportRuleError::Unexpected("Ensure")),
         }
     }
 
-    fn read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
+    /// The first read in the transaction, which opens it.
+    fn read(&mut self) -> Turn {
         self.state = CreateState::Read;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.reads(),
-            txn_id: Some(txn_id),
-        })]
+        Ok(Next::Call(IoCall::Read(self.reads())))
     }
 
     /// The bucket, its encryption, both storages, the group fence and any move rows.
@@ -300,16 +277,12 @@ impl CreateImportOperation {
         Ok(())
     }
 
-    fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        match self.verify(values) {
-            Ok((routed, backend, write_backend)) => {
-                self.backends = vec![backend, write_backend];
-                self.routed = routed;
-                self.state = CreateState::Scan;
-                self.scan(None)
-            }
-            Err(error) => self.fail(error),
-        }
+    fn checked(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
+        let (routed, backend, write_backend) = self.verify(values)?;
+        self.backends = vec![backend, write_backend];
+        self.routed = routed;
+        self.state = CreateState::Scan;
+        self.scan(None)
     }
 
     /// Checks the rows of `reads`; gives the bucket record with the added routing rule, if
@@ -422,32 +395,32 @@ impl CreateImportOperation {
     }
 
     /// Reads one page of the group's rules; the state says what follows the last page.
-    fn scan(&mut self, start_after: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            prefix: Some(self.input.group_id.to_bytes().to_vec().into()),
-            start: start_after.map(IterStart::After),
+    fn scan(&mut self, start_after: Option<Key>) -> Turn {
+        let page = IoCall::Page {
+            space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: self.input.group_id.to_bytes().to_vec().into(),
+            after: start_after,
             limit: SCAN_PAGE,
-            txn_id: self.txn_id,
-        })]
+        };
+        match self.state {
+            CreateState::Overlaps => Ok(Next::Call(self.staged(page))),
+            _ => Ok(Next::Call(page)),
+        }
     }
 
-    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
         for (_, value) in values {
-            let rule = match BackendImport::from_bytes(&value) {
-                Ok(rule) => rule,
-                Err(error) => return self.fail(error.into()),
-            };
+            let rule = BackendImport::from_bytes(&value)?;
             if rule.bucket == self.input.bucket
                 && folders_overlap(&rule.key_prefix, &self.input.key_prefix)
             {
-                return self.fail(ImportRuleError::Conflict(format!(
+                return Err(ImportRuleError::Conflict(format!(
                     "import {} already imports into this folder",
                     rule.import_id
                 )));
             }
             if self.shares_folder(&rule) {
-                return self.fail(ImportRuleError::Conflict(format!(
+                return Err(ImportRuleError::Conflict(format!(
                     "import {} reads or writes the same backend folder",
                     rule.import_id
                 )));
@@ -460,43 +433,46 @@ impl CreateImportOperation {
         }
     }
 
-    fn write(&mut self) -> Effects {
+    fn write(&mut self) -> Turn {
         let record = self.record();
-        let mut writes = Vec::new();
-        match record.to_bytes() {
-            Ok(value) => writes.push((
-                BACKEND_IMPORT_KEYSPACE.to_string(),
-                record.key(),
-                value.into(),
-            )),
-            Err(error) => return self.fail(error.into()),
-        }
+        let mut writes = vec![(
+            BACKEND_IMPORT_KEYSPACE.to_string(),
+            record.key(),
+            record.to_bytes()?.into(),
+        )];
         if let Some(bucket) = self.routed.take() {
-            match bucket.to_bytes() {
-                Ok(value) => writes.push((
-                    S3_BUCKET_KEYSPACE.to_string(),
-                    self.input.bucket.as_bytes().to_vec().into(),
-                    value.into(),
-                )),
-                Err(error) => return self.fail(error.into()),
-            }
+            writes.push((
+                S3_BUCKET_KEYSPACE.to_string(),
+                self.input.bucket.as_bytes().to_vec().into(),
+                bucket.to_bytes()?.into(),
+            ));
         }
-        match self.noted_backends() {
-            Ok(records) => writes.extend(records),
-            Err(error) => return self.fail(error),
-        }
+        writes.extend(self.noted_backends()?);
         if let Some(record) = self.moving.as_ref() {
-            match move_rows(&self.input.bucket, record) {
-                Ok(rows) => writes.extend(rows),
-                Err(error) => return self.fail(error.into()),
-            }
+            writes.extend(move_rows(&self.input.bucket, record)?);
         }
-        self.output = Some(Ok(record));
+        self.rule = Some(record);
         self.state = CreateState::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    /// A standalone rule that moves copies wakes the move once it committed.
+    fn written(&mut self) -> Turn {
+        let rule = self
+            .rule
+            .take()
+            .ok_or(ImportRuleError::Unexpected("Write"))?;
+        if self.nested || self.moving.is_none() {
+            return Ok(Next::Done(rule));
+        }
+        let wake = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: Duration::ZERO,
+        });
+        Ok(Next::Then {
+            output: rule,
+            calls: vec![wake.into()],
+        })
     }
 
     /// The storage records with the state of each checked bucket, for the bucket icons.
@@ -526,14 +502,6 @@ impl CreateImportOperation {
             writes.extend(record_writes(&record)?);
         }
         Ok(writes)
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ImportRuleError::Unexpected("Write"));
-        };
-        self.state = CreateState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
 
@@ -593,91 +561,56 @@ fn check_folder(storage: &GroupStorage, folder: &str) -> Result<Option<String>, 
     Ok(bucket.map(str::to_string))
 }
 
-impl EffectOperation for CreateImportOperation {
+impl Operation for CreateImportOperation {
     type Output = BackendImport;
     type Error = ImportRuleError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = self.validate() {
-            return self.fail(error);
-        }
+    fn first(&mut self) -> Turn {
+        self.validate()?;
         self.read_backends()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (CreateState::Backends, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.backends_read(values)
+    fn next(&mut self, result: IoResult) -> Turn {
+        match self.state {
+            CreateState::Backends => {
+                let values = outside_answer(result)?.values()?;
+                self.backends_read(keyed(&values))
             }
-            (CreateState::Ensure, event) => self.ensured(event),
-            (CreateState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.read(txn_id)
+            CreateState::Overlaps => {
+                let (rows, next) = outside_answer(result)?.page()?;
+                self.scanned(rows, next)
             }
-            (CreateState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.checked(values)
+            CreateState::Ensure => self.ensured(result.event()?),
+            CreateState::Read => self.checked(keyed(&result.values()?)),
+            CreateState::Scan => {
+                let (rows, next) = result.page()?;
+                self.scanned(rows, next)
             }
-            (
-                CreateState::Overlaps | CreateState::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.scanned(values, next_start_after),
-            (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
-                if self.nested =>
-            {
-                self.state = CreateState::Finish;
-                smallvec![]
+            CreateState::Write => {
+                result.done()?;
+                self.written()
             }
-            (CreateState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.commit()
-            }
-            (CreateState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = CreateState::Finish;
-                match self.moving.is_some() {
-                    true => smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                        key: TaskKey::MigrateCompression,
-                        after: Duration::ZERO,
-                    })],
-                    false => smallvec![],
-                }
-            }
-            _ => self.fail(ImportRuleError::Unexpected("CreateImport")),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == CreateState::Finish
-    }
-
-    fn finalize(self) -> Result<BackendImport, ImportRuleError> {
-        self.output
-            .unwrap_or(Err(ImportRuleError::Unexpected("Finish")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        if self.nested {
-            return smallvec![];
-        }
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::errors::BlobError;
+    use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::backend_import::DEFAULT_PATTERN;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
+    use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
+
+    type Stepper = crate::stepper::Stepper<BackendImport, ImportRuleError>;
 
     fn group() -> Ulid {
         Ulid::from_bytes([1u8; 16])
@@ -751,12 +684,8 @@ mod tests {
     }
 
     /// Runs the operation up to its reads and answers them with `bucket`.
-    fn after_reads(
-        input: CreateImportInput,
-        bucket: Option<Value>,
-    ) -> (CreateImportOperation, Effects) {
-        let mut operation = CreateImportOperation::new(input);
-        operation.start();
+    fn after_reads(input: CreateImportInput, bucket: Option<Value>) -> (Stepper, Effects) {
+        let (mut operation, _) = Stepper::new(CreateImportOperation::new(input));
         let effects = operation.step(values(first_reads(backend())));
         assert!(matches!(
             effects.as_slice(),
@@ -770,12 +699,8 @@ mod tests {
     }
 
     /// Answers the first read of a rule on a storage without a bucket.
-    fn on_split(
-        input: CreateImportInput,
-        record: &GroupStorage,
-    ) -> (CreateImportOperation, Effects) {
-        let mut operation = CreateImportOperation::new(input);
-        operation.start();
+    fn on_split(input: CreateImportInput, record: &GroupStorage) -> (Stepper, Effects) {
+        let (mut operation, _) = Stepper::new(CreateImportOperation::new(input));
         let record: Option<Value> = Some(record.to_bytes().unwrap().into());
         let effects = operation.step(values(first_reads(record)));
         // A rule bucket to check first reads the group's other rules; none overlap here.
@@ -797,8 +722,8 @@ mod tests {
     fn refuses_before_ensure() {
         // A missing Aruna bucket is refused before the provider bucket is created.
         let record = storage(&[("endpoint", "https://s3.lab")]);
-        let mut operation = CreateImportOperation::new(input("lab-raw/", "imported/"));
-        let effects = operation.start();
+        let (mut operation, effects) =
+            Stepper::new(CreateImportOperation::new(input("lab-raw/", "imported/")));
         let [Effect::Storage(StorageEffect::BatchRead { reads, txn_id })] = effects.as_slice()
         else {
             panic!("expected one read, got {effects:?}");
@@ -831,8 +756,8 @@ mod tests {
     fn overlap_skips_ensure() {
         // A rule into a linked folder is refused before its new provider bucket is created.
         let record = storage(&[("endpoint", "https://s3.lab")]);
-        let mut operation = CreateImportOperation::new(input("lab-new/", "data/new/"));
-        operation.start();
+        let (mut operation, _) =
+            Stepper::new(CreateImportOperation::new(input("lab-new/", "data/new/")));
         let stored: Option<Value> = Some(record.to_bytes().unwrap().into());
         let effects = operation.step(values(first_reads(stored)));
         assert!(
@@ -842,7 +767,7 @@ mod tests {
             ),
             "{effects:?}"
         );
-        let mut linked = operation.record();
+        let mut linked = CreateImportOperation::new(input("lab-new/", "data/new/")).record();
         (linked.key_prefix, linked.backend_prefix) = ("data/".to_string(), "lab-old/".to_string());
         let effects = scan_page(&mut operation, std::slice::from_ref(&linked));
         assert!(effects.is_empty(), "{effects:?}");
@@ -990,7 +915,7 @@ mod tests {
         );
     }
 
-    fn scan_page(operation: &mut CreateImportOperation, rules: &[BackendImport]) -> Effects {
+    fn scan_page(operation: &mut Stepper, rules: &[BackendImport]) -> Effects {
         let values = rules
             .iter()
             .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
@@ -1001,9 +926,9 @@ mod tests {
         }))
     }
 
-    fn failure(operation: CreateImportOperation) -> ImportRuleError {
+    fn failure(operation: Stepper) -> ImportRuleError {
         assert!(operation.is_complete());
-        operation.finalize().unwrap_err()
+        operation.finish().unwrap_err()
     }
 
     #[test]
@@ -1043,15 +968,14 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id: TxnId::default(),
         }));
-        assert_eq!(operation.finalize().unwrap(), rule);
+        assert_eq!(operation.finish().unwrap(), rule);
     }
 
     #[test]
     fn starts_folder_move() {
         let mut input = input("raw/", "imported/");
         input.move_existing = true;
-        let mut operation = CreateImportOperation::new(input);
-        operation.start();
+        let (mut operation, _) = Stepper::new(CreateImportOperation::new(input));
         operation.step(values([first_reads(backend()), vec![None, None]].concat()));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -1098,8 +1022,7 @@ mod tests {
         // An unfinished move of another folder fails the rule before anything is written.
         let mut input = input("raw/", "imported/");
         input.move_existing = true;
-        let mut operation = CreateImportOperation::new(input);
-        operation.start();
+        let (mut operation, _) = Stepper::new(CreateImportOperation::new(input));
         operation.step(values([first_reads(backend()), vec![None, None]].concat()));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
@@ -1165,7 +1088,7 @@ mod tests {
             input("", "imported/x/"),
             bucket(Vec::new(), Compression::Off),
         );
-        let mut other = operation.record();
+        let mut other = CreateImportOperation::new(input("", "imported/x/")).record();
         other.key_prefix = "imported/".to_string();
         scan_page(&mut operation, &[other]);
 
@@ -1188,8 +1111,8 @@ mod tests {
 
         let mut bad = input("raw", "");
         bad.schedule = Some("hourly please".to_string());
-        let mut operation = CreateImportOperation::new(bad);
-        assert!(operation.start().is_empty());
+        let (operation, effects) = Stepper::new(CreateImportOperation::new(bad));
+        assert!(effects.is_empty());
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
     }
 
@@ -1254,7 +1177,7 @@ mod tests {
             input("raw/x/", "imported/"),
             bucket(Vec::new(), Compression::Off),
         );
-        let mut other = operation.record();
+        let mut other = CreateImportOperation::new(input("raw/x/", "imported/")).record();
         other.key_prefix = "elsewhere/".to_string();
         other.backend_prefix = "raw/".to_string();
         let effects = scan_page(&mut operation, std::slice::from_ref(&other));
@@ -1274,8 +1197,8 @@ mod tests {
 
         let mut bad = input("raw/", "imported/");
         bad.write_pattern = "{dir}{id}".to_string();
-        let mut operation = CreateImportOperation::new(bad);
-        assert!(operation.start().is_empty());
+        let (operation, effects) = Stepper::new(CreateImportOperation::new(bad));
+        assert!(effects.is_empty());
         assert!(matches!(failure(operation), ImportRuleError::Invalid(_)));
     }
 }
