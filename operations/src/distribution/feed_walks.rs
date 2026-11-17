@@ -903,3 +903,463 @@ impl Operation for OpenWalk {
         smallvec![]
     }
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StateStep {
+    Init,
+    Rows,
+    Accounts,
+    Record,
+    PruneGone,
+    DeleteGone,
+    Outdated,
+    BuildPage,
+    BuildDescribe,
+    BuildApply,
+    BuildState,
+    BuildPrune,
+    Exists,
+    MarkBuilding,
+    PruneOld,
+    Finish,
+    Error,
+}
+
+/// The state row being looked at.
+#[derive(Debug, PartialEq)]
+struct Current {
+    key: Vec<u8>,
+    set_id: Ulid,
+    range_id: Ulid,
+    state: Value,
+    account: Option<RangeAccount>,
+}
+
+/// The building index being filled from inventory heads.
+#[derive(Debug, PartialEq)]
+struct Build {
+    generation: u64,
+    cursor: Option<Vec<u8>>,
+    lower: Vec<u8>,
+    end: Vec<u8>,
+    pages: usize,
+    changes: Vec<KeyChange>,
+    done: bool,
+}
+
+/// Drops the indexes of ranges without a live account or whose set keeps no search index, and
+/// builds the first building index of the page; the walk stays at that range until its index is
+/// ready. Outputs the count of changed ranges.
+#[derive(Debug, PartialEq)]
+pub(super) struct StateWalk {
+    limits: FeedLimits,
+    cursor: Option<Vec<u8>>,
+    next: Option<Vec<u8>>,
+    previous: Option<Vec<u8>>,
+    state: StateStep,
+    rows: Vec<(Key, Value)>,
+    pending: VecDeque<((Key, Value), Option<Value>)>,
+    current: Option<Current>,
+    build: Option<Build>,
+    describe: Option<Describe>,
+    searched: BTreeMap<Ulid, bool>,
+    changed: usize,
+    output: Option<Result<usize, FeedError>>,
+}
+
+impl StateWalk {
+    pub(super) fn new(limits: FeedLimits, cursor: Option<Vec<u8>>) -> Self {
+        Self {
+            limits,
+            cursor,
+            next: None,
+            previous: None,
+            state: StateStep::Init,
+            rows: Vec::new(),
+            pending: VecDeque::new(),
+            current: None,
+            build: None,
+            describe: None,
+            searched: BTreeMap::new(),
+            changed: 0,
+            output: None,
+        }
+    }
+
+    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+        self.cursor.clone()
+    }
+
+    fn finish(&mut self, output: Result<usize, FeedError>) -> Effects {
+        self.state = match output {
+            Ok(_) => StateStep::Finish,
+            Err(_) => StateStep::Error,
+        };
+        self.output = Some(output);
+        smallvec![]
+    }
+
+    fn next_range(&mut self) -> Effects {
+        if let Some(current) = self.current.take() {
+            self.previous = Some(current.key);
+        }
+        let Some(((key, state), account)) = self.pending.pop_front() else {
+            self.cursor = self.next.take();
+            let changed = self.changed;
+            return self.finish(Ok(changed));
+        };
+        let (set_id, range_id) = match split_key(&key) {
+            Ok(ids) => ids,
+            Err(error) => return self.finish(Err(error.into())),
+        };
+        let account = match account
+            .map(|value| RangeAccount::from_bytes(&value))
+            .transpose()
+        {
+            Ok(account) => {
+                account.filter(|account| !matches!(account.charge, Charge::Retired { .. }))
+            }
+            Err(error) => return self.finish(Err(error.into())),
+        };
+        let live = account.is_some();
+        self.current = Some(Current {
+            key: key.to_vec(),
+            set_id,
+            range_id,
+            state,
+            account,
+        });
+        match (live, self.searched.get(&set_id)) {
+            (true, None) => {
+                self.state = StateStep::Record;
+                record_read(set_id)
+            }
+            (true, Some(false)) => {
+                if let Some(current) = self.current.as_mut() {
+                    current.account = None;
+                }
+                self.decide()
+            }
+            _ => self.decide(),
+        }
+    }
+
+    fn decide(&mut self) -> Effects {
+        let Some(current) = self.current.as_ref() else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        let (set_id, range_id) = (current.set_id, current.range_id);
+        let state = match IndexState::from_bytes(&current.state) {
+            Ok(state) => state,
+            Err(error) => return self.finish(Err(error.into())),
+        };
+        match (current.account.is_some(), state) {
+            (false, _) => {
+                self.state = StateStep::PruneGone;
+                index(IndexEffect::Prune {
+                    set_id,
+                    range_id,
+                    keep: None,
+                })
+            }
+            (true, IndexState::Building { generation, cursor }) => {
+                self.build = Some(Build {
+                    generation,
+                    cursor,
+                    lower: Vec::new(),
+                    end: Vec::new(),
+                    pages: 0,
+                    changes: Vec::new(),
+                    done: false,
+                });
+                self.state = StateStep::Outdated;
+                index(IndexEffect::Outdated {
+                    set_id,
+                    range_id,
+                    generation,
+                })
+            }
+            (true, IndexState::Ready { generation }) => {
+                self.build = Some(Build {
+                    generation,
+                    cursor: None,
+                    lower: Vec::new(),
+                    end: Vec::new(),
+                    pages: 0,
+                    changes: Vec::new(),
+                    done: false,
+                });
+                self.state = StateStep::Exists;
+                index(IndexEffect::Exists {
+                    set_id,
+                    range_id,
+                    generation,
+                })
+            }
+        }
+    }
+
+    /// Reads the next inventory page of the range being built.
+    fn build_page(&mut self) -> Effects {
+        let Some(build) = self.build.as_ref() else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        let start = match &build.cursor {
+            Some(cursor) => IterStart::After(cursor.clone().into()),
+            None => IterStart::At(build.lower.clone().into()),
+        };
+        self.state = StateStep::BuildPage;
+        storage(StorageEffect::IterRange {
+            key_space: INVENTORY_KEYSPACE.to_string(),
+            start,
+            end: IterEnd::Before(build.end.clone().into()),
+            limit: self.limits.rebuild_rows,
+            max_bytes: self.limits.rebuild_bytes,
+            txn_id: None,
+        })
+    }
+
+    fn build_apply(&mut self, changes: Vec<KeyChange>) -> Effects {
+        let (Some(current), Some(build)) = (self.current.as_ref(), self.build.as_ref()) else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        self.state = StateStep::BuildApply;
+        index(IndexEffect::Apply {
+            set_id: current.set_id,
+            range_id: current.range_id,
+            generation: build.generation,
+            changes,
+        })
+    }
+
+    fn write_state(&mut self, next: StateStep, state: IndexState) -> Effects {
+        let Some(current) = self.current.as_ref() else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        let key = current.key.clone();
+        match state.to_bytes() {
+            Ok(value) => {
+                self.state = next;
+                put_row(SEARCH_INDEX_KEYSPACE, key, value)
+            }
+            Err(error) => self.finish(Err(error.into())),
+        }
+    }
+
+    fn prune_keep(&mut self, next: StateStep) -> Effects {
+        let (Some(current), Some(build)) = (self.current.as_ref(), self.build.as_ref()) else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        self.state = next;
+        index(IndexEffect::Prune {
+            set_id: current.set_id,
+            range_id: current.range_id,
+            keep: Some(build.generation),
+        })
+    }
+
+    fn step_inner(&mut self, event: Event) -> Result<Effects, FeedError> {
+        Ok(match (self.state, event) {
+            (
+                StateStep::Rows,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                self.next = next_start_after.map(|key| key.to_vec());
+                let keys: Vec<Vec<u8>> = values.iter().map(|(key, _)| key.to_vec()).collect();
+                self.rows = values;
+                if keys.is_empty() {
+                    return Ok(self.accounts(Vec::new()));
+                }
+                self.state = StateStep::Accounts;
+                batch_read(RANGE_ACCOUNT_KEYSPACE, keys)
+            }
+            (StateStep::Accounts, event) => {
+                let accounts = read_values(event, self.rows.len())?;
+                self.accounts(accounts)
+            }
+            (StateStep::Record, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let search = search_on(value)?;
+                let current = self.current.as_mut().ok_or(FeedError::NotFinished)?;
+                self.searched.insert(current.set_id, search);
+                if !search {
+                    current.account = None;
+                }
+                self.decide()
+            }
+            (StateStep::PruneGone, Event::Index(IndexEvent::Pruned)) => {
+                let current = self.current.as_ref().ok_or(FeedError::NotFinished)?;
+                self.state = StateStep::DeleteGone;
+                storage(StorageEffect::Delete {
+                    key_space: SEARCH_INDEX_KEYSPACE.to_string(),
+                    key: current.key.clone().into(),
+                    txn_id: None,
+                })
+            }
+            (StateStep::DeleteGone, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+                self.changed += 1;
+                self.next_range()
+            }
+            (StateStep::Outdated, Event::Index(IndexEvent::Outdated(outdated))) => {
+                let current = self.current.as_ref().ok_or(FeedError::NotFinished)?;
+                let account = current.account.as_ref().ok_or(FeedError::NotFinished)?;
+                let (lower, end) =
+                    range_interval(current.set_id, &account.lower, account.upper.as_deref());
+                let build = self.build.as_mut().ok_or(FeedError::NotFinished)?;
+                // A build begun with an older schema starts over in the next generation.
+                if outdated {
+                    build.generation += 1;
+                    build.cursor = None;
+                }
+                (build.lower, build.end) = (lower, end);
+                self.build_page()
+            }
+            (
+                StateStep::BuildPage,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                let pages = self.limits.rebuild_pages.max(1);
+                let build = self.build.as_mut().ok_or(FeedError::NotFinished)?;
+                for (key, value) in &values {
+                    let position = Position::decode(key)?;
+                    if position.entry == Entry::Head {
+                        let head = HeadEntry::from_bytes(value)?;
+                        build.changes.push(change_of(position.key, Some(head)));
+                    }
+                }
+                build.pages += 1;
+                match next_start_after {
+                    Some(truncated) => {
+                        build.cursor = Some(truncated.to_vec());
+                        if build.pages < pages {
+                            return Ok(self.build_page());
+                        }
+                    }
+                    None => build.done = true,
+                }
+                let changes = std::mem::take(&mut build.changes);
+                let set_id = self.current.as_ref().ok_or(FeedError::NotFinished)?.set_id;
+                match Describe::start(set_id, changes) {
+                    Ok((describe, effects)) => {
+                        self.describe = Some(describe);
+                        self.state = StateStep::BuildDescribe;
+                        effects
+                    }
+                    Err(changes) => self.build_apply(changes),
+                }
+            }
+            (StateStep::BuildDescribe, event) => {
+                let describe = self.describe.as_mut().ok_or(FeedError::NotFinished)?;
+                match describe.step(event)? {
+                    Ok(effects) => effects,
+                    Err(changes) => {
+                        self.describe = None;
+                        self.build_apply(changes)
+                    }
+                }
+            }
+            (StateStep::BuildApply, Event::Index(IndexEvent::Applied)) => {
+                // The cursor moves only after the commit, so a crash repeats pages, never skips.
+                let build = self.build.as_ref().ok_or(FeedError::NotFinished)?;
+                let state = match build.done {
+                    true => IndexState::Ready {
+                        generation: build.generation,
+                    },
+                    false => IndexState::Building {
+                        generation: build.generation,
+                        cursor: build.cursor.clone(),
+                    },
+                };
+                self.write_state(StateStep::BuildState, state)
+            }
+            (StateStep::BuildState, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                let done = self.build.as_ref().ok_or(FeedError::NotFinished)?.done;
+                if done {
+                    return Ok(self.prune_keep(StateStep::BuildPrune));
+                }
+                // The walk stays at this range until its index is ready.
+                self.cursor = self.previous.take();
+                let changed = self.changed + 1;
+                self.finish(Ok(changed))
+            }
+            (StateStep::BuildPrune, Event::Index(IndexEvent::Pruned)) => {
+                self.build = None;
+                self.changed += 1;
+                self.next_range()
+            }
+            (StateStep::Exists, Event::Index(IndexEvent::Exists(true))) => {
+                // Generations a crash or a failed prune left after a rebuild go now.
+                self.prune_keep(StateStep::PruneOld)
+            }
+            (StateStep::Exists, Event::Index(IndexEvent::Exists(false))) => {
+                // A lost index, or one of an older schema, is built again beside it; searches
+                // report the range incomplete until the new generation is ready.
+                let build = self.build.take().ok_or(FeedError::NotFinished)?;
+                let state = IndexState::Building {
+                    generation: build.generation + 1,
+                    cursor: None,
+                };
+                self.write_state(StateStep::MarkBuilding, state)
+            }
+            (StateStep::MarkBuilding, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.changed += 1;
+                self.next_range()
+            }
+            (StateStep::PruneOld, Event::Index(IndexEvent::Pruned)) => {
+                self.build = None;
+                self.next_range()
+            }
+            (_, Event::Index(IndexEvent::Error(error))) => return Err(error.into()),
+            (_, event) => return Err(storage_error(event)),
+        })
+    }
+
+    /// Pairs the state rows with their accounts and walks them; the walk cursor is held back
+    /// until the walk ends, so a failed walk starts over.
+    fn accounts(&mut self, accounts: Vec<Option<Value>>) -> Effects {
+        let rows = std::mem::take(&mut self.rows);
+        self.pending = rows.into_iter().zip(accounts).collect();
+        self.previous = self.cursor.take();
+        self.next_range()
+    }
+}
+
+impl Operation for StateWalk {
+    type Output = usize;
+    type Error = FeedError;
+
+    fn start(&mut self) -> Effects {
+        self.state = StateStep::Rows;
+        iter(
+            SEARCH_INDEX_KEYSPACE,
+            self.cursor.clone(),
+            self.limits.state_rows,
+        )
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.step_inner(event) {
+            Ok(effects) => effects,
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, StateStep::Finish | StateStep::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(FeedError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// One bounded pass over each walk, one after another; a failed walk is logged and the next
