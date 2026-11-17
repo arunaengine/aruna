@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent, StorageEvent};
 use aruna_core::keyspaces::{
@@ -466,10 +466,7 @@ impl Operation for AdmitOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 }
 

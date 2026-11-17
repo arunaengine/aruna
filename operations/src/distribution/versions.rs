@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, IndexEntry, Position, bound_position, head_position, index_key,
-    range_interval,
+    prefix_interval,
 };
 use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
@@ -126,14 +126,8 @@ impl InventoryVersionsOperation {
 
     /// The interval the page may read: the range, narrowed to the prefix.
     fn bounds(&mut self) {
-        let set_id = self.input.set_id;
-        let (lower, end) = range_interval(set_id, &self.input.lower, self.input.upper.as_deref());
-        let prefix = bound_position(set_id, self.prefix());
-        self.start = lower.max(prefix.clone());
-        self.end = match self.prefix().is_empty() {
-            true => end,
-            false => prefix_upper_bound(&prefix).map_or(end.clone(), |upper| upper.min(end)),
-        };
+        let (lower, upper) = (&self.input.lower, self.input.upper.as_deref());
+        (self.start, self.end) = prefix_interval(self.input.set_id, lower, upper, self.prefix());
     }
 
     /// Moves the start past `position` when it lies ahead of the current one.

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -167,10 +167,7 @@ impl RebuildOperation {
     fn finish(&mut self, outcome: Result<RebuildOutcome, RebuildError>) -> Effects {
         self.state = State::Done;
         self.outcome = Some(outcome);
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 
     fn fail(&mut self, error: impl Into<RebuildError>) -> Effects {
@@ -546,10 +543,7 @@ impl Operation for RebuildOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 }
 
