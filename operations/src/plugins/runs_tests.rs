@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};

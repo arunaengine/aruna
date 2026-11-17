@@ -9,6 +9,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::{list_runs, read_run};
 use crate::plugins::worker::tests::installed;
 use aruna_core::plugin_runs::RUNS_QUEUED;
+use aruna_core::plugin_runs::SourceKind;
 
 const HOUR: u64 = 3600 * 1000;
 

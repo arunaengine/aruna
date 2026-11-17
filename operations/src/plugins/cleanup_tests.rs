@@ -13,6 +13,7 @@ use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::encode;
+use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed, worker};
 
 async fn count(fixture: &Fixture, space: &str) -> usize {

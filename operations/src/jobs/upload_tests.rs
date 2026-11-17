@@ -17,6 +17,7 @@ use crate::driver::DriverContext;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{
     Identity, RequestContext, SendBoundary, WorkKind, read_work, reserve, update_work,
 };

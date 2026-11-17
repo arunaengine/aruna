@@ -7,7 +7,7 @@ use super::*;
 use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::{read_row, read_user};
+use crate::plugins::account::read_user;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
@@ -166,10 +166,8 @@ impl Fixture {
 
     async fn deliver(&self, other: &Fixture, rows: &[(String, Vec<u8>)]) {
         for (key_space, key) in rows {
-            let value = read_row(&self.ctx, key_space, key.clone())
-                .await
-                .unwrap()
-                .unwrap();
+            let read = crate::plugins::store::Txn::direct(&self.ctx).read(key_space, key);
+            let value = read.await.unwrap().unwrap();
             other.write_row(key_space, key.clone(), value).await;
         }
     }

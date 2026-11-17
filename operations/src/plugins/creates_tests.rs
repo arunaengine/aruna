@@ -13,6 +13,7 @@ use crate::metadata::create_document::CreateDocumentPayload;
 use crate::plugins::cleanup::sweep_events;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
+use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::installed;
 
 fn pinned(fixture: &Fixture, name: &str) -> PinnedCreate {

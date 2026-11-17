@@ -314,7 +314,8 @@ async fn narrowed_rule() {
     assert_eq!(kind, JobErrorKind::Permanent);
     assert_eq!(message, "this connection does not expose its whole answer");
     // The released token is in no row the work keeps.
-    let kept = crate::plugins::work::read_work(&fixture.ctx, install.install_id, row.work_id);
+    let kept = crate::plugins::work::read_work(install.install_id, row.work_id);
+    let kept = drive(kept, &fixture.ctx);
     let kept = kept.await.unwrap().unwrap();
     assert!(!format!("{kept:?}").contains(TOKEN));
 }

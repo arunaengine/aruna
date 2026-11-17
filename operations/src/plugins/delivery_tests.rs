@@ -200,7 +200,10 @@ async fn retry_delivers_once() {
         expected: held.pad,
         intent: Intent::new(9_001, &[b"free"]),
     };
-    let freed = remove_state(blob, Ulid::from_parts(77, 1), install.install_id, &free);
+    let freed = drive(
+        remove_state(Ulid::from_parts(77, 1), install.install_id, free),
+        blob,
+    );
     freed.await.unwrap();
     let action = audit(&fixture, AdminAuditAction::PluginRunRetried);
     let ids = (install.install_id, held.run_id);

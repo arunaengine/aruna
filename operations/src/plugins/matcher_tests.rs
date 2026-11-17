@@ -11,7 +11,11 @@ use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
+use crate::plugins::store::Txn;
+use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed, scoped, synced};
+use aruna_core::plugin_runs::EVENTS_QUEUED;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 
 /// Journals `event` on this node as a committing transaction would.
 pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {

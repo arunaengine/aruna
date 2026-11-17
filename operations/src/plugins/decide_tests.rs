@@ -14,6 +14,7 @@ use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, prune_runs, save_run, unfinished};
+use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
 
 /// A created dataset journaled now, and its forward row for `install`.
@@ -167,7 +168,7 @@ async fn newest_reports() {
     ];
     let mut acked = Vec::new();
     for (sender, report) in sent {
-        let kept = keep_reports(&fixture.ctx, senders[sender], vec![report]).await;
+        let kept = drive(keep_reports(senders[sender], vec![report]), &fixture.ctx).await;
         acked.push(kept.unwrap()[0].3);
     }
     assert_eq!(acked, [2, 2, 2, 1]);
@@ -261,7 +262,10 @@ async fn delivery_totals() {
         let mut row = GapRow::new(SourceKind::DataUploaded, GapReason::Full);
         (row.sequence, row.count, row.latest_ms) = (1, count, u64::from(seed));
         let sender = iroh::SecretKey::from_bytes(&[seed; 32]).public();
-        let kept = keep_reports(&fixture.ctx, sender, vec![(install.install_id, row)]);
+        let kept = drive(
+            keep_reports(sender, vec![(install.install_id, row)]),
+            &fixture.ctx,
+        );
         kept.await.unwrap();
     }
     let mut waiting = event(&install, "D0", unix_timestamp_millis()).1;

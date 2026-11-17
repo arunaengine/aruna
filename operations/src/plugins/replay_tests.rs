@@ -4,10 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::journal::JOURNAL_PAGE;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::rows::decode;
+use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
+use crate::plugins::worker::run_replays;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced,
 };
@@ -253,10 +256,10 @@ async fn unreadable_clock() {
         .unwrap();
     assert_eq!(forwarded(&fixture, &install).await, ["D0"]);
     let key = row_key(COVERAGE_ROW, install.install_id);
-    let row: CoverageRow = stored(&Txn::direct(&fixture.ctx), &key)
-        .await
-        .unwrap()
-        .unwrap();
+    let row = Txn::direct(&fixture.ctx)
+        .read(PLUGIN_REPLAYS_KEYSPACE, &key)
+        .await;
+    let row: CoverageRow = decode(&row.unwrap().unwrap()).unwrap();
     assert!(row.note.unwrap().contains(&other.to_string()));
 }
 

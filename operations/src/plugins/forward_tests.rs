@@ -12,8 +12,10 @@ use aruna_core::time::unix_timestamp_millis;
 use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
+use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed};
+use aruna_core::plugin_runs::EVENTS_QUEUED;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
 /// when `ack` is set.
@@ -300,7 +302,7 @@ async fn update_waits() {
         event,
         queued_ms: 1,
     };
-    let waits = async || unreadable(&fixture.ctx, &Txn::direct(&fixture.ctx), &row).await;
+    let waits = async || unreadable(&fixture.ctx, &row).await;
     let newer = (document, Ulid::from_parts(20, 1));
     materialization(&fixture, newer, State::Materialized).await;
     assert_eq!(waits().await, Ok(true));

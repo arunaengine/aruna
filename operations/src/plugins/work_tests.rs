@@ -13,7 +13,10 @@ use crate::driver::{DriverContext, drive};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::{retire_work, settle_work};
 use crate::plugins::rows::{read_rows, write_rows};
+use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::installed;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
 const TARGET: &str = "/realm/g/group/data/node/out/a.txt";
@@ -375,7 +378,7 @@ async fn prunes_settled_rows() {
         .await
         .unwrap();
     assert_eq!(drive(prune_work(late), ctx).await, Ok(1));
-    let read = |row: &WorkRow| read_work(ctx, install.install_id, row.work_id);
+    let read = |row: &WorkRow| drive(read_work(install.install_id, row.work_id), ctx);
     assert_eq!(read(&rows[0].1).await, Ok(None));
     let kept = read(&rows[1].1).await.unwrap().unwrap();
     let summary = kept.summary.unwrap();

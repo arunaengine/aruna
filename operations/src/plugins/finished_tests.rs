@@ -14,6 +14,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::{list_runs, prune_runs, save_run};
 use crate::plugins::submit::start_copy;
 use crate::plugins::submit::tests::{path, ready, request, scope};
+use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of, update_work};
 use crate::s3::object::copy::test::seed_bucket;
 
@@ -184,8 +185,9 @@ async fn drop_delivers_none() {
     assert_eq!(twice.map(drop), Err(RunError::NotHeld));
     assert_eq!(notify(&fixture).await, 0);
     assert!(finish_runs(&fixture, &install).await.is_empty());
-    let missing = drop_completion(&fixture.ctx, (install.install_id, Ulid::nil()), &dropped);
-    assert_eq!(missing.await.map(drop), Err(RunError::NotFound));
+    let missing = drop_completion((install.install_id, Ulid::nil()), &dropped).unwrap();
+    let missing = drive(missing, &fixture.ctx).await;
+    assert_eq!(missing.map(drop), Err(RunError::NotFound));
 }
 
 #[tokio::test]
@@ -206,8 +208,8 @@ async fn retry_redoes_undone() {
     drive(begin(run.run_id, settled.clone()), ctx)
         .await
         .unwrap();
-    let settled = settled_row(run.run_id, &settled, "7".into()).unwrap();
-    drive(write_rows(vec![settled]), ctx).await.unwrap();
+    let reply = settled_row(run.run_id, &settled, "7".into()).unwrap();
+    drive(write_rows(vec![reply]), ctx).await.unwrap();
     let unknown = unknown_row(run.run_id, &undone, "timed out").unwrap();
     drive(write_rows(vec![unknown]), ctx).await.unwrap();
     let intents = drive(scan_rows(intent_scan(run.run_id)), ctx)
