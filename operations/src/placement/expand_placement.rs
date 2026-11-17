@@ -11,8 +11,9 @@ use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
+use crate::placement::mutation::drive_placement_mutation;
 use crate::realm::mutate_placement::{
-    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
 };
 use aruna_core::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 

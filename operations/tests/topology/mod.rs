@@ -60,13 +60,12 @@ use aruna_operations::metadata::projector::{project_logged_events, replay_event_
 use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
+use aruna_operations::placement::mutation::drive_placement_mutation;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::get_nodes::GetNodesOperation;
-use aruna_operations::realm::mutate_placement::{
-    MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
-};
+use aruna_operations::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;

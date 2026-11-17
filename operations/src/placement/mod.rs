@@ -4,6 +4,7 @@
 
 pub mod allocate_handle;
 pub mod expand_placement;
+pub mod mutation;
 pub mod policy;
 pub mod process_placements;
 pub mod process_transitions;

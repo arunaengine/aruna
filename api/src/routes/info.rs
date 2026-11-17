@@ -37,12 +37,13 @@ use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::status::load_status;
 use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::mutation::drive_placement_mutation;
 use aruna_operations::placement::provision::provision_metadata_binding;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
 use aruna_operations::realm::mutate_placement::{
-    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
 };
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};

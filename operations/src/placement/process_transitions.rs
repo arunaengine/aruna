@@ -22,9 +22,10 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
+use crate::placement::mutation::drive_placement_mutation;
 use crate::realm::mutate_placement::{
     CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
-    RealmPlacementMutation, drive_placement_mutation, is_management,
+    RealmPlacementMutation, is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};

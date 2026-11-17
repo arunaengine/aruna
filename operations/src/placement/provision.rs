@@ -13,9 +13,8 @@ use ulid::Ulid;
 
 use super::allocate_handle::{AllocateHandleOperation, AllocatedHandle, HandleAllocationError};
 use crate::driver::DriverContext;
-use crate::realm::mutate_placement::{
-    MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
-};
+use crate::placement::mutation::drive_placement_mutation;
+use crate::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 
 /// Draws the next handle for `node_id` from its granted (non-conflicted) ranges,
 /// advancing and durably persisting the cursor before returning. Returns
