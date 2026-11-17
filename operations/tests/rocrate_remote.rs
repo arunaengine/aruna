@@ -314,6 +314,7 @@ async fn build_node(
         metadata_handle: metadata,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Node {
         _root: root,
@@ -607,7 +608,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     })
 }
 

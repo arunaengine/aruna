@@ -44,7 +44,6 @@ use super::{
     JOB_HEARTBEAT_MS,
 };
 use crate::driver::DriverContext;
-use crate::notifications::email::MailProfiles;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RETRY_AFTER_MS: u64 = 1_000;
@@ -96,7 +95,6 @@ pub struct JobsRuntime {
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
-    mail: Arc<MailProfiles>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -148,13 +146,7 @@ impl JobsRuntime {
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
-            mail: Arc::default(),
         })
-    }
-
-    /// Senders of the realm email profile; a realm config change refreshes them.
-    pub fn mail(&self) -> Arc<MailProfiles> {
-        self.mail.clone()
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, RuntimeState> {
@@ -314,7 +306,6 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         let turns = self.range_turns.clone();
-        let mail = self.mail();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -323,7 +314,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 (cancel, progress),
-                (shutdown, turns, mail),
+                (shutdown, turns),
             ))
             .catch_unwind()
             .await;
@@ -660,7 +651,7 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns, mail): (CancellationToken, RangeTurns, Arc<MailProfiles>),
+    (shutdown, range_turns): (CancellationToken, RangeTurns),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -730,7 +721,6 @@ async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
-        mail,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
@@ -1084,6 +1074,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         })
     }
 
@@ -1916,7 +1907,6 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
             range_turns: RangeTurns::default(),
-            mail: Default::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {

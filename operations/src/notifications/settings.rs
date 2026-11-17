@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -24,6 +22,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::TxnId;
+use aruna_outbound::Backoffs;
 use aruna_storage::StorageHandle;
 use thiserror::Error;
 use tracing::warn;
@@ -253,40 +252,12 @@ pub async fn local_setting(
     Ok(winner.filter(|(head, _)| head.on).map(|(_, bytes)| bytes))
 }
 
-/// Shared delays of deliveries while no management node opens a secret, per owner and channel.
-#[derive(Debug, Default)]
-pub struct Backoffs(Mutex<HashMap<(UserId, SettingChannel), Backoff>>);
-
-#[derive(Clone, Copy, Debug)]
-struct Backoff {
-    until_ms: u64,
-    delay_ms: u64,
-}
-
-impl Backoffs {
-    /// The end of a running backoff.
-    pub fn until(&self, owner: UserId, channel: SettingChannel, now_ms: u64) -> Option<u64> {
-        let map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let until = map.get(&(owner, channel)).map(|backoff| backoff.until_ms);
-        until.filter(|until| *until > now_ms)
-    }
-
-    /// Records a failed attempt and returns the end of the next delay.
-    pub fn fail(&self, owner: UserId, channel: SettingChannel, now_ms: u64) -> u64 {
-        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        let delay_ms = match map.get(&(owner, channel)) {
-            Some(backoff) => backoff.delay_ms.saturating_mul(2).min(BACKOFF_CAP_MS),
-            None => BACKOFF_START_MS,
-        };
-        let until_ms = now_ms.saturating_add(delay_ms);
-        map.insert((owner, channel), Backoff { until_ms, delay_ms });
-        until_ms
-    }
-
-    pub fn clear(&self, owner: UserId, channel: SettingChannel) {
-        let mut map = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        map.remove(&(owner, channel));
-    }
+/// The next delay while no management node opens a secret: it starts at `BACKOFF_START_MS` and
+/// doubles up to `BACKOFF_CAP_MS`.
+fn next_delay(previous_ms: Option<u64>) -> u64 {
+    previous_ms.map_or(BACKOFF_START_MS, |delay| {
+        delay.saturating_mul(2).min(BACKOFF_CAP_MS)
+    })
 }
 
 /// What a delivery attempt does.
@@ -327,7 +298,7 @@ pub async fn delivery_setting(
         Err(error) => {
             warn!(%error, "Reading the notification setting failed");
             return wait(
-                backoffs.fail(owner, channel, now_ms),
+                backoffs.fail(owner, channel, now_ms, next_delay),
                 "the setting read failed",
             );
         }
@@ -336,7 +307,7 @@ pub async fn delivery_setting(
         return wait(until_ms, "waiting for a management node");
     }
     let (Ok(head), Some(managers)) = (channel.head(&current), managers) else {
-        let until_ms = backoffs.fail(owner, channel, now_ms);
+        let until_ms = backoffs.fail(owner, channel, now_ms, next_delay);
         return wait(until_ms, "the realm configuration cannot be read now");
     };
     let target = channel.target(owner, head.id);
@@ -352,7 +323,7 @@ pub async fn delivery_setting(
             Err(error) => warn!(%node, ?error, "A management node did not open a setting"),
         }
     }
-    let until_ms = backoffs.fail(owner, channel, now_ms);
+    let until_ms = backoffs.fail(owner, channel, now_ms, next_delay);
     wait(until_ms, "no management node opened the setting secret")
 }
 

@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
@@ -12,14 +10,14 @@ use aruna_core::errors::ConversionError;
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::job::{
-    JobError, JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
+    JobPayload, JobResultPayload, WorkspaceMode, user_dedup_key,
 };
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
-    DELIVERY_HEADER, SIGNATURE_HEADER, URL_BYTES, WebhookDeliverySpec, WebhookSubscription,
-    sign_delivery, valid_url,
+    URL_BYTES, WebhookDeliverySpec, WebhookSubscription, valid_url,
 };
+use aruna_outbound::Backoffs;
 use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use ulid::Ulid;
@@ -28,15 +26,13 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
 use crate::jobs::submit::SubmitJobSpec;
-use crate::notifications::email::no_transport;
+use crate::notifications::email::{job_error, no_transport};
+use crate::notifications::send::SendOperation;
 use crate::notifications::settings::{
-    Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
+    Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
     managers, write_setting,
 };
 use crate::realm::get_config::GetConfigOperation;
-
-/// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
-const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WebhookError {
@@ -192,7 +188,8 @@ pub async fn enqueue_webhooks(
 /// other than 408 and 429 is permanent; while no management node opens the secret, the job
 /// waits without an attempt.
 pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
-    let Some(metadata) = ctx.driver.metadata_handle.as_ref() else {
+    let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
+    else {
         return no_transport();
     };
     let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
@@ -201,7 +198,7 @@ pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> Jo
         local,
     };
     let now_ms = unix_timestamp_millis();
-    deliver_webhook(ctx, spec, &peers, metadata.setting_backoffs(), now_ms).await
+    deliver_webhook(ctx, spec, &peers, outbound.backoffs(), now_ms).await
 }
 
 pub(crate) async fn deliver_webhook(
@@ -243,73 +240,18 @@ pub(crate) async fn deliver_webhook(
     else {
         return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
     };
-    match deliver(ctx, spec, &url, secret.expose()).await {
-        Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
-        Err(Failure::Cancelled) => JobRunOutcome::Cancelled,
-        Err(Failure::Interrupted) => JobRunOutcome::Interrupted,
-        Err(Failure::Job(error)) => JobRunOutcome::Failed(error),
-    }
-}
-
-enum Failure {
-    Cancelled,
-    Interrupted,
-    Job(JobError),
-}
-
-async fn deliver(
-    ctx: &JobContext,
-    spec: &WebhookDeliverySpec,
-    url: &str,
-    secret: &[u8],
-) -> Result<Option<u16>, Failure> {
-    let body = spec
-        .body()
-        .ok_or_else(|| permanent("only share upload notifications are delivered"))?;
-    let body = serde_json::to_vec(&body).map_err(|error| permanent(error.to_string()))?;
-    let url = url::Url::parse(url).map_err(|error| permanent(error.to_string()))?;
-    let blob = ctx
-        .driver
-        .blob_handle
-        .as_ref()
-        .ok_or_else(|| retryable("blob handle unavailable for webhook egress"))?;
-    let timestamp = unix_timestamp_millis() / 1000;
-    let request = blob
-        .repository_request(reqwest::Method::POST, url)
-        .map_err(|error| permanent(format!("egress screen: {error}")))?
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header(
-            DELIVERY_HEADER,
-            spec.notification.notification_id.to_string(),
-        )
-        .header(SIGNATURE_HEADER, sign_delivery(secret, timestamp, &body))
-        .body(body);
-    let response = tokio::select! {
+    let now_s = unix_timestamp_millis() / 1000;
+    let send = SendOperation::webhook(spec, &url, secret.expose(), now_s);
+    let sent = tokio::select! {
         biased;
-        () = ctx.cancel.cancelled() => return Err(Failure::Cancelled),
-        () = ctx.shutdown.cancelled() => return Err(Failure::Interrupted),
-        result = tokio::time::timeout(DELIVERY_DEADLINE, request.send()) => result,
+        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
+        sent = drive(send, &ctx.driver) => sent,
     };
-    let response = response
-        .map_err(|_| retryable("the webhook receiver did not answer in time"))?
-        .map_err(|error| retryable(format!("webhook request: {error}")))?;
-    let status = response.status();
-    if status.is_success() {
-        return Ok(Some(status.as_u16()));
+    match sent {
+        Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
+        Err(error) => JobRunOutcome::Failed(job_error(error)),
     }
-    let message = format!("the webhook receiver answered {status}");
-    match status.is_client_error() && !matches!(status.as_u16(), 408 | 429) {
-        true => Err(permanent(message)),
-        false => Err(retryable(message)),
-    }
-}
-
-fn retryable(message: impl Into<String>) -> Failure {
-    Failure::Job(JobError::retryable(message))
-}
-
-fn permanent(message: impl Into<String>) -> Failure {
-    Failure::Job(JobError::permanent(message))
 }
 
 #[cfg(test)]

@@ -137,6 +137,7 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
         metadata_handle,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     initialize_incoming_fixture(driver.clone());
     BaoNode {
@@ -863,7 +864,6 @@ fn job_context(driver: Arc<DriverContext>, owner_node_id: NodeId) -> JobContext 
             },
         ),
         range_turns: Default::default(),
-        mail: Default::default(),
     }
 }
 
@@ -1178,6 +1178,7 @@ async fn selection_skips_discovery() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let user = UserId::local(Ulid::from_bytes([150; 16]), RealmId::from_bytes([151; 32]));
     let ctx = job_context(

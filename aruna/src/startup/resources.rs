@@ -365,6 +365,7 @@ async fn fill(
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         aruna_operations::groups::deletion::install_onboarding(
             &context,
@@ -426,7 +427,6 @@ async fn fill(
         Some(net_handle.document_sync_database()),
         metadata_options,
     )?;
-    metadata_handle.share_mail(acquired.jobs_runtime.mail());
     acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
@@ -455,6 +455,7 @@ async fn fill(
     checkpoint(StartupStage::Compute)?;
     stopped(stop)?;
 
+    let (http, policy) = blob_handle.repository_client();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
         net_handle: Some(net_handle),
@@ -462,6 +463,7 @@ async fn fill(
         metadata_handle: Some(metadata_handle),
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),
+        outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
     });
     // The driver context and the monitoring refresher it feeds are owned before
     // the ops listener can fail to bind.
@@ -506,9 +508,7 @@ async fn fill(
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
-    let mail = acquired.jobs_runtime.mail();
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, Some(&mail))
-        .await;
+    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id).await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
     aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(
@@ -751,6 +751,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
