@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::calls::{IoError, IoResult, Next};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
@@ -77,6 +78,16 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
     }
 }
 
+/// Runs `$body` with the operation of each `TimerOperation` variant bound to `$operation`.
+macro_rules! each_timer {
+    ($self:expr, $operation:ident => $body:expr) => {
+        match $self {
+            TimerOperation::DrainNotificationOutbox($operation) => $body,
+            TimerOperation::PruneNotifications($operation) => $body,
+        }
+    };
+}
+
 /// The next call of a timer operation, or when its timer runs again.
 fn timer_turn<O: TimerRun>(
     turn: Result<Next<O::Output>, O::Error>,
@@ -92,38 +103,64 @@ fn timer_turn<O: TimerRun>(
     }
 }
 
+/// The conflict decision of a timer operation; an output it finishes with is rearmed.
+fn timer_conflict<O: TimerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Option<Duration>> {
+    match operation.on_conflict(attempt) {
+        AfterConflict::Rerun => AfterConflict::Rerun,
+        AfterConflict::Fail => AfterConflict::Fail,
+        AfterConflict::Finish(output) => match O::rearm(Ok(output)) {
+            Ok(after) => AfterConflict::Finish(after),
+            Err(_) => AfterConflict::Fail,
+        },
+    }
+}
+
 impl Operation for TimerOperation {
     type Output = Option<Duration>;
     type Error = TimerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => {
-                timer_turn::<DrainOutboxOperation>(operation.first())
-            }
-            TimerOperation::PruneNotifications(operation) => {
-                timer_turn::<PruneNotificationsOperation>(operation.first())
-            }
-        }
+        each_timer!(self, operation => timer_first(operation))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => {
-                timer_turn::<DrainOutboxOperation>(operation.next(result))
-            }
-            TimerOperation::PruneNotifications(operation) => {
-                timer_turn::<PruneNotificationsOperation>(operation.next(result))
-            }
-        }
+        each_timer!(self, operation => timer_next(operation, result))
     }
 
     fn transaction(&self) -> TransactionMode {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => operation.transaction(),
-            TimerOperation::PruneNotifications(operation) => operation.transaction(),
-        }
+        each_timer!(self, operation => operation.transaction())
     }
+
+    fn abort(&mut self) -> Vec<IoCall> {
+        each_timer!(self, operation => operation.abort())
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        each_timer!(self, operation => operation.stamp(now_ms))
+    }
+
+    fn after_commit(&mut self) -> Option<Effect> {
+        each_timer!(self, operation => operation.after_commit())
+    }
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        each_timer!(self, operation => operation.hold_scope())
+    }
+
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
+        each_timer!(self, operation => timer_conflict(operation, attempt))
+    }
+}
+
+fn timer_first<O: TimerRun>(operation: &mut O) -> Result<Next<Option<Duration>>, TimerFailure> {
+    timer_turn::<O>(operation.first())
+}
+
+fn timer_next<O: TimerRun>(
+    operation: &mut O,
+    result: IoResult,
+) -> Result<Next<Option<Duration>>, TimerFailure> {
+    timer_turn::<O>(operation.next(result))
 }
 
 impl TimerRun for DrainOutboxOperation {
@@ -238,6 +275,16 @@ impl PeerRun for RemoveWatchOperation {
     }
 }
 
+/// Runs `$body` with the operation of each `PeerOperation` variant bound to `$operation`.
+macro_rules! each_peer {
+    ($self:expr, $operation:ident => $body:expr) => {
+        match $self {
+            PeerOperation::DeliverNotifications($operation) => $body,
+            PeerOperation::RemoveWatch($operation) => $body,
+        }
+    };
+}
+
 /// The next call of a peer operation, or its answer frame body.
 fn peer_turn<O: PeerRun>(
     turn: Result<Next<O::Output>, O::Error>,
@@ -253,37 +300,63 @@ fn peer_turn<O: PeerRun>(
     }
 }
 
+/// The conflict decision of a peer operation; an output it finishes with is encoded.
+fn peer_conflict<O: PeerRun>(operation: &mut O, attempt: u32) -> AfterConflict<Vec<u8>> {
+    match operation.on_conflict(attempt) {
+        AfterConflict::Rerun => AfterConflict::Rerun,
+        AfterConflict::Fail => AfterConflict::Fail,
+        AfterConflict::Finish(output) => match O::answer(Ok(output)) {
+            Ok(answer) => AfterConflict::Finish(answer),
+            Err(_) => AfterConflict::Fail,
+        },
+    }
+}
+
+fn peer_first<O: PeerRun>(operation: &mut O) -> Result<Next<Vec<u8>>, PeerFailure> {
+    peer_turn::<O>(operation.first())
+}
+
+fn peer_next<O: PeerRun>(
+    operation: &mut O,
+    result: IoResult,
+) -> Result<Next<Vec<u8>>, PeerFailure> {
+    peer_turn::<O>(operation.next(result))
+}
+
 impl Operation for PeerOperation {
     type Output = Vec<u8>;
     type Error = PeerFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => {
-                peer_turn::<DeliverBatchOperation>(operation.first())
-            }
-            PeerOperation::RemoveWatch(operation) => {
-                peer_turn::<RemoveWatchOperation>(operation.first())
-            }
-        }
+        each_peer!(self, operation => peer_first(operation))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => {
-                peer_turn::<DeliverBatchOperation>(operation.next(result))
-            }
-            PeerOperation::RemoveWatch(operation) => {
-                peer_turn::<RemoveWatchOperation>(operation.next(result))
-            }
-        }
+        each_peer!(self, operation => peer_next(operation, result))
     }
 
     fn transaction(&self) -> TransactionMode {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => operation.transaction(),
-            PeerOperation::RemoveWatch(operation) => operation.transaction(),
-        }
+        each_peer!(self, operation => operation.transaction())
+    }
+
+    fn abort(&mut self) -> Vec<IoCall> {
+        each_peer!(self, operation => operation.abort())
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        each_peer!(self, operation => operation.stamp(now_ms))
+    }
+
+    fn after_commit(&mut self) -> Option<Effect> {
+        each_peer!(self, operation => operation.after_commit())
+    }
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        each_peer!(self, operation => operation.hold_scope())
+    }
+
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
+        each_peer!(self, operation => peer_conflict(operation, attempt))
     }
 }
 
@@ -330,6 +403,22 @@ mod tests {
             drain.unwrap().first(),
             Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
         );
+    }
+
+    /// The table keeps the wrapped operation's cleanup and conflict decisions.
+    #[test]
+    fn hooks_are_forwarded() {
+        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
+        assert!(operation.abort().is_empty());
+        assert_eq!(operation.on_conflict(1), AfterConflict::Rerun);
+        assert_eq!(operation.on_conflict(9), AfterConflict::Fail);
+        let frame = postcard::to_allocvec(&NotificationTransportMessage::DeliverBatch {
+            records: Vec::new(),
+        })
+        .unwrap();
+        let mut peer = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
+        assert_eq!(peer.on_conflict(1), AfterConflict::Rerun);
+        assert_eq!(peer.hold_scope(), None);
     }
 
     #[test]
