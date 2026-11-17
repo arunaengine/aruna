@@ -289,3 +289,15 @@ async fn pruned_journal() {
         assert_eq!((row.count, row.unknown), (0, true), "{kind:?}");
     }
 }
+
+#[test]
+fn replay_rows_read() {
+    let mut plan = ReplayRows(Ulid::from_parts(2, 2));
+    let Turn::Ask(Ask::Read(keys)) = plan.first().unwrap() else {
+        panic!("the replay rows are read together");
+    };
+    assert_eq!(keys.len(), 2);
+    let answer = plan.next(Answer::Values(vec![None, None])).unwrap();
+    assert_eq!(answer, Turn::Finish((None, None)));
+    assert!(plan.next(Answer::Values(vec![None])).is_err());
+}

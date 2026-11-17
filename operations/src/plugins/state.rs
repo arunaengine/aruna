@@ -544,4 +544,24 @@ mod tests {
             Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
     }
+
+    #[test]
+    fn read_state_entry() {
+        let mut plan = ReadState { key: b"k".to_vec() };
+        assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+        let row = StateRow {
+            version: 3,
+            value: b"v".to_vec(),
+        };
+        let stored = encode(&row).unwrap();
+        let entry = plan.next(Answer::Values(vec![Some(stored)])).unwrap();
+        let expected = StateEntry {
+            version: 3,
+            value: b"v".to_vec(),
+        };
+        assert_eq!(entry, Turn::Finish(Some(expected)));
+        let missing = plan.next(Answer::Values(vec![None])).unwrap();
+        assert_eq!(missing, Turn::Finish(None));
+        assert!(plan.next(Answer::Done).is_err());
+    }
 }
