@@ -6,10 +6,10 @@
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::rows::done;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -213,5 +213,28 @@ mod tests {
         let garbage = IoResult::Values(vec![Some(vec![0xFF].into())]);
         assert_eq!(operation.next(garbage), Ok(write(&contact)));
         assert!(operation.next(IoResult::Woke).is_err());
+    }
+
+    #[test]
+    fn windows_realm_contact() {
+        // A device that has not heard from its realm in two beats is offline,
+        // and a run that never finished stops blocking the next one.
+        let now = 1_000_000;
+        let state = DeviceSyncState {
+            last_contact_ms: Some(now - 1_000),
+            last_sync_ms: Some(now - 1_000),
+            run_started_ms: Some(now - 1_000),
+        };
+        assert!(state.realm_reachable(now));
+        assert!(state.run_active(now));
+
+        let stale = DeviceSyncState {
+            last_contact_ms: Some(now - REALM_CONTACT_WINDOW.as_millis() as u64 - 1),
+            run_started_ms: Some(now - SYNC_RUN_LIFETIME.as_millis() as u64 - 1),
+            ..state
+        };
+        assert!(!stale.realm_reachable(now));
+        assert!(!stale.run_active(now));
+        assert!(!DeviceSyncState::default().realm_reachable(now));
     }
 }

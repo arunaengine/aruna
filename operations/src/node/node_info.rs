@@ -47,8 +47,8 @@ use crate::placement::policy::{
 };
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::LoadCountersOperation;
-use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation, SetDrainOperation};
 use aruna_core::node_state::DEPARTURE_KEY;
+use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation, SetDrainOperation};
 use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
@@ -260,10 +260,8 @@ pub(crate) async fn refresh_info_heartbeat(
     };
     revise_node_info(ctx, node_id, realm_id, change).await?;
     publish_info(ctx, node_id, realm_id, true).await?;
-    let (Some(_), Some(stored)) = (
-        ctx.net_handle.as_ref(),
-        node_info_row(ctx, node_id).await?,
-    ) else {
+    let (Some(_), Some(stored)) = (ctx.net_handle.as_ref(), node_info_row(ctx, node_id).await?)
+    else {
         return Ok(());
     };
     if !node_kind(&config, node_id).is_some_and(|kind| kind.is_sync_eligible()) {
@@ -680,10 +678,9 @@ mod tests {
     };
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::execution::job::record_keys::kind_prefix;
-    use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
+    use aruna_core::structs::execution::job::record_rows::ProjectionCache;
     use aruna_core::structs::execution::job::{
         JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState,
-        SubmissionId,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::record::{
@@ -887,12 +884,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            node_info_row(&ctx, local)
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(node_info_row(&ctx, local).await.unwrap().is_some());
         assert!(read_outbox(&ctx).await.is_empty());
     }
 
@@ -1028,10 +1020,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let first = node_info_row(&ctx, local).await.unwrap().unwrap();
 
         config.placement_map[0].labels = BTreeMap::from([
             ("rack".to_string(), "r7".to_string()),
@@ -1043,10 +1032,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let second = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let second = node_info_row(&ctx, local).await.unwrap().unwrap();
 
         assert_eq!(second.labels, expected_labels);
         assert_eq!(second.labels.get("zone").unwrap(), "b");
@@ -1085,12 +1071,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        assert!(
-            node_info_row(&ctx, local)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(node_info_row(&ctx, local).await.unwrap().is_none());
     }
 
     fn sharded_config(realm_id: RealmId) -> RealmConfigDocument {
@@ -1398,10 +1379,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .expect("document");
+        let stored = node_info_row(&ctx, local).await.unwrap().expect("document");
         let group = stored.demand.group(&group_id).expect("group demand");
         assert_eq!(group.families.len(), 2);
         assert!(!group.truncated);
@@ -1548,10 +1526,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let before = node_info_row(&ctx, local).await.unwrap().unwrap();
 
         assert!(
             set_departure_state(&ctx, local, realm_id, true)
@@ -1559,10 +1534,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let after = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(after.leaving && after.compute_draining);
         assert!(!after.offers_compute(true));
         assert!(after.supersedes(&before));
@@ -1635,10 +1607,7 @@ mod tests {
             .await
             .expect("observation completes");
 
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .expect("document");
+        let stored = node_info_row(&ctx, local).await.unwrap().expect("document");
         assert!(stored.leaving && stored.compute_draining);
         assert!(!stored.offers_compute(false));
         // The receipted execution keeps its reservation and its audit trail.
@@ -1667,10 +1636,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, true)
             .await
             .unwrap();
-        let departed = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let departed = node_info_row(&ctx, local).await.unwrap().unwrap();
 
         assert!(
             set_departure_state(&ctx, local, realm_id, false)
@@ -1678,10 +1644,7 @@ mod tests {
                 .unwrap()
         );
 
-        let rejoined = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let rejoined = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(!rejoined.leaving && !rejoined.compute_draining);
         assert!(rejoined.offers_compute(true));
         assert!(rejoined.supersedes(&departed));
@@ -1713,10 +1676,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let drained = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let drained = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(drained.compute_draining && !drained.leaving);
 
         // A departure and its return leave the operator drain in place.
@@ -1726,10 +1686,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, false)
             .await
             .unwrap();
-        let observed = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let observed = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(!observed.leaving);
         assert!(observed.compute_draining, "the operator drain must survive");
 
@@ -1738,10 +1695,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let released = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let released = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(!released.compute_draining);
     }
 
@@ -1814,20 +1768,14 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let drained = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let drained = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(drained.compute_draining && !drained.leaving);
 
         drive(SetDrainOperation::new(false), &ctx).await.unwrap();
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let released = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let released = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(!released.compute_draining);
         assert!(released.supersedes(&drained));
     }
@@ -1858,10 +1806,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert!(stored.leaving && stored.compute_draining);
         assert!(!stored.offers_compute(true));
     }
@@ -1889,10 +1834,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert_eq!(stored.utilization.documents_held, Some(0));
         assert!(stored.utilization.load_permille.is_some());
     }
@@ -1917,10 +1859,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let seeded = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let seeded = node_info_row(&ctx, local).await.unwrap().unwrap();
         let queued = read_outbox(&ctx).await.len();
 
         assert_eq!(owed_row(&ctx).await, None);
@@ -1929,10 +1868,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued);
 
@@ -1949,10 +1885,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
-        let stored = node_info_row(&ctx, local)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = node_info_row(&ctx, local).await.unwrap().unwrap();
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
         assert_eq!(owed_row(&ctx).await, None);
