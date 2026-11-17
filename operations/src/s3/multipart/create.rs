@@ -2,43 +2,46 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::distribution::guard::{
-    GuardError, WriteAuthority, authority_reads, check_authority, record_authority, record_read,
+use crate::distribution::guard::write_authority;
+use crate::distribution::guard::{GuardError, WriteAuthority, authority_reads, check_authority};
+use crate::distribution::inventory::{
+    InventoryChange, InventoryError, InventoryUpdate, StagedCall, outside_answer,
 };
-use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
-use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::backends::{BackendFenceError, backend_key};
+use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::{
-    GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
+    GateContext, GatedBucket, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate,
 };
-use crate::s3::bucket::key::rows::settings_read;
-use crate::s3::object::put::abe::{abe_reads, parse_abe};
-use crate::s3::object::put::{owner_read, owns_path, same_name_path};
-use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
-use crate::s3::usage::count_upload;
+use crate::s3::object::put::abe::{abe_reads, keyed, parse_abe};
+use crate::s3::object::put::{owner_call, path_owned, same_name_path};
+use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
+use crate::s3::usage::upload_count;
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
-    ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, S3_BUCKET_KEYSPACE,
-    UPLOAD_KEYSPACE,
+    ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, PURGE_FENCE_KEYSPACE,
+    S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::abe::{AbeEffect, AbeEvent, EnvelopePlan, ObjectEnvelope};
 use aruna_core::structs::storage::backend_import::PlainPath;
-use aruna_core::structs::storage::blob::{BucketInfo, ResolvedBackend};
+use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRecord, SealPlan,
 };
+use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::multipart::{
     BackendUpload, MultipartChecksumHint, MultipartChecksumType, MultipartUpload,
     MultipartUploadStatus, UploadEncryption,
 };
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
-use aruna_core::types::{Effects, GroupId, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -46,7 +49,6 @@ use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateMultipartState {
-    Init,
     ReadGateBucket,
     ReadBucketKey,
     PolicyGate,
@@ -58,7 +60,6 @@ pub enum CreateMultipartState {
     OpenUpload,
     ReadAbe,
     CreateEnvelope,
-    StartTransaction,
     CheckPurgeFence,
     /// Rereads the binding, record and fence of a distributed bucket in the transaction.
     CheckAuthority,
@@ -70,10 +71,6 @@ pub enum CreateMultipartState {
     /// Opens the upload in the upload inventory of a distributed bucket.
     CountInventory,
     WritePending,
-    CommitTransaction,
-    AbortBackendUpload,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -86,8 +83,6 @@ pub enum CreateMultipartError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     Distribution(#[from] GuardError),
-    #[error("Transaction id missing")]
-    TransactionMissing,
     #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: CreateMultipartState,
@@ -110,10 +105,21 @@ pub enum CreateMultipartError {
     BucketKey(#[from] BucketKeyError),
     #[error("an encrypted upload cannot check a full-object {0} checksum")]
     UnsupportedChecksum(&'static str),
-    #[error("operation did not finish")]
-    NotFinished,
     #[error(transparent)]
     Inventory(#[from] InventoryError),
+}
+
+impl From<IoError> for CreateMultipartError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn = Result<Next<CreateMultipartResult>, CreateMultipartError>;
+
+/// A read before the transaction, which the upload record's transaction checks again.
+fn outside(call: IoCall) -> IoCall {
+    StagedCall::Outside(call).into_call()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,20 +145,20 @@ pub struct CreateMultipartOperation {
     /// Chosen before the provider upload opens, so its cleanup row can name the record.
     upload_id: Ulid,
     state: CreateMultipartState,
-    txn_id: Option<TxnId>,
     resolved: Option<ResolvedBackend>,
     record: Option<MultipartUpload>,
     metadata: HashMap<String, String>,
     /// Destination details of this node. Absent fails every governed upload
     /// closed and leaves the ungoverned path untouched.
     gate_context: Option<GateContext>,
-    gate: Option<PolicyGateOperation>,
     /// Refs and subject the gate admitted, stored on the upload record so every
     /// part and the completion inherit exactly what was evaluated here.
     stored_policies: Vec<PlacementPolicyRef>,
     stored_subject: u64,
     /// The provider upload opened for this record; aborted unless a commit may own it.
     backend_upload: Option<BackendUpload>,
+    /// The commit was sent: a failure from here on may still have committed the record.
+    committing: bool,
     /// The plain path and version id a same-name upload checks before it opens.
     plain: Option<PlainPath>,
     /// The file at the plain path may be replaced: the rule recorded it for this key.
@@ -162,14 +168,12 @@ pub struct CreateMultipartOperation {
     encryption: Option<UploadEncryption>,
     /// The pending envelope of an encrypted upload, stored beside its record.
     envelope: Option<ObjectEnvelope>,
-    pending_error: Option<CreateMultipartError>,
     /// The inventory update of a distributed bucket, opened with the upload record.
     inventory: Option<InventoryUpdate>,
     /// The bucket's distribution binding; only the key's coordinator opens an upload.
     binding: Option<aruna_core::structs::storage::distribution::DistributionBinding>,
     /// The coordinator authority read before the transaction, checked again inside it.
     authority: Option<WriteAuthority>,
-    output: Option<Result<CreateMultipartResult, CreateMultipartError>>,
 }
 
 impl CreateMultipartOperation {
@@ -177,26 +181,23 @@ impl CreateMultipartOperation {
         Self {
             input,
             upload_id: Ulid::generate(),
-            state: CreateMultipartState::Init,
-            txn_id: None,
+            state: CreateMultipartState::ReadGateBucket,
             resolved: None,
             record: None,
             metadata: HashMap::new(),
             gate_context: None,
-            gate: None,
             stored_policies: Vec::new(),
             stored_subject: 0,
             backend_upload: None,
+            committing: false,
             plain: None,
             plain_owned: false,
             settings: None,
             encryption: None,
             envelope: None,
-            pending_error: None,
             inventory: None,
             binding: None,
             authority: None,
-            output: None,
         }
     }
 
@@ -212,84 +213,70 @@ impl CreateMultipartOperation {
         self
     }
 
-    fn emit_error(&mut self, error: CreateMultipartError) -> Effects {
-        if let Some(backend_upload) = self.backend_upload.take() {
-            self.pending_error = Some(error);
-            self.state = CreateMultipartState::AbortBackendUpload;
-            let mut effects = self.abort();
-            effects.push(Effect::Blob(BlobEffect::AbortUpload {
-                backend_upload: Box::new(backend_upload),
-            }));
-            return effects;
-        }
-        self.state = CreateMultipartState::Error;
-        self.output = Some(Err(error));
-        self.abort()
+    fn call(&mut self, state: CreateMultipartState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    /// Waits out the transaction abort, then reports the error that started the cleanup.
-    fn backend_aborted(&mut self, event: Event) -> Effects {
-        if matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. })
-        ) {
-            return smallvec![];
+    fn unexpected(&self, expected: &'static str, event: Event) -> CreateMultipartError {
+        if let Event::Blob(BlobEvent::Error(error)) = event {
+            return error.into();
         }
-        let error = self
-            .pending_error
-            .take()
-            .unwrap_or(CreateMultipartError::CreateUploadFailed);
-        self.emit_error(error)
+        CreateMultipartError::InvalidStateEvent {
+            state: self.state.clone(),
+            expected,
+            received: event.label(),
+        }
+    }
+
+    fn resolved(&self) -> Result<ResolvedBackend, CreateMultipartError> {
+        self.resolved
+            .clone()
+            .ok_or(CreateMultipartError::CreateUploadFailed)
     }
 
     /// A fenced destination opens no provider upload; the transaction checks the fence again.
-    fn check_open_fence(&mut self) -> Effects {
+    fn check_open_fence(&mut self) -> Turn {
         if let Some(binding) = self.binding.as_ref() {
-            self.state = CreateMultipartState::ReadRecord;
-            return smallvec![record_read(binding)];
+            let reads = authority_reads(binding.set_id);
+            return self.call(
+                CreateMultipartState::ReadRecord,
+                outside(IoCall::Read(reads)),
+            );
         }
         self.read_open_fence()
     }
 
-    fn record_checked(&mut self, event: Event) -> Effects {
-        let Some(binding) = self.binding.as_ref() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        match record_authority(binding, &self.input.key, event) {
-            Ok(authority) => {
-                self.authority = Some(authority);
-                self.read_open_fence()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn record_checked(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let binding = self.binding.as_ref();
+        let binding = binding.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        let [record, fence] =
+            <[_; 2]>::try_from(values).map_err(|_| CreateMultipartError::CreateUploadFailed)?;
+        let key = &self.input.key;
+        let authority = write_authority(binding, key, record.as_deref(), fence.as_deref())?;
+        self.authority = Some(authority);
+        self.read_open_fence()
     }
 
-    fn read_open_fence(&mut self) -> Effects {
-        self.state = CreateMultipartState::CheckOpenFence;
-        smallvec![write_fence_read(&self.input.bucket, None)]
+    fn read_open_fence(&mut self) -> Turn {
+        let read = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.input.bucket));
+        self.call(CreateMultipartState::CheckOpenFence, outside(read))
     }
 
     /// S3 backends open the provider upload the parts stream into; others answer `None`.
-    fn open_upload(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
-            return self.emit_error(error.into());
-        }
+    fn open_upload(&mut self, fence: Option<Value>) -> Turn {
+        check_fence_row(fence.as_deref(), &self.input.bucket, &self.input.key)?;
         // Encrypted parts are sealed pieces of their own; completion composes them.
         if let Some(encryption) = self.encryption {
-            self.state = CreateMultipartState::ReadAbe;
-            return smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads: abe_reads(encryption.plan.key),
-                txn_id: None,
-            })];
+            let reads = abe_reads(encryption.plan.key);
+            return self.call(CreateMultipartState::ReadAbe, outside(IoCall::Read(reads)));
         }
-        let Some(resolved) = self.resolved.clone() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+        let resolved = self.resolved()?;
         // Under an import rule the provider upload ends at the plain path its version id names.
         let (bucket, key, id) = (&self.input.bucket, &self.input.key, Ulid::generate());
         // A folder object holds no bytes, so no upload can compose one.
         if key.ends_with('/') && self.input.routing.mapped(bucket) {
-            return self.emit_error(CreateMultipartError::Unmapped);
+            return Err(CreateMultipartError::Unmapped);
         }
         let Some(target) = self
             .input
@@ -298,7 +285,7 @@ impl CreateMultipartOperation {
             .filter(|target| target.backend == resolved.backend)
         else {
             if self.input.routing.mapped(bucket) {
-                return self.emit_error(CreateMultipartError::Unmapped);
+                return Err(CreateMultipartError::Unmapped);
             }
             return self.open_native(None);
         };
@@ -314,11 +301,8 @@ impl CreateMultipartOperation {
         }
         // A same-name upload picks its path as a single write does; completion checks it again.
         self.plain = Some(plain);
-        match owner_read(&target) {
-            Some(read) => {
-                self.state = CreateMultipartState::ReadPlainOwner;
-                smallvec![read]
-            }
+        match owner_call(&target) {
+            Some(read) => self.call(CreateMultipartState::ReadPlainOwner, outside(read)),
             None => {
                 // As at completion, only a record proves the path the upload's own.
                 self.plain_owned = false;
@@ -327,211 +311,132 @@ impl CreateMultipartOperation {
         }
     }
 
-    fn plain_owner(&mut self, event: Event) -> Effects {
-        match owns_path(event, &self.input.key) {
-            Ok(owned) => {
-                self.plain_owned = owned;
-                self.stat_plain()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn plain_owner(&mut self, value: Option<Value>) -> Turn {
+        self.plain_owned = path_owned(value.as_deref(), &self.input.key)?;
+        self.stat_plain()
     }
 
-    fn stat_plain(&mut self) -> Effects {
-        let (Some(plain), Some(resolved)) = (self.plain.as_ref(), self.resolved.as_ref()) else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+    fn stat_plain(&mut self) -> Turn {
+        let plain = self.plain.as_ref();
+        let path = plain
+            .ok_or(CreateMultipartError::CreateUploadFailed)?
+            .path
+            .clone();
         let stat = BlobEffect::StatPlain {
-            backend: resolved.backend.clone(),
-            path: plain.path.clone(),
+            backend: self.resolved()?.backend,
+            path,
         };
-        self.state = CreateMultipartState::StatPlain;
-        smallvec![Effect::Blob(stat)]
+        self.call(CreateMultipartState::StatPlain, Effect::Blob(stat).into())
     }
 
-    fn plain_stat(&mut self, event: Event) -> Effects {
-        let Some(plain) = self.plain.take() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+    fn plain_stat(&mut self, event: Event) -> Turn {
+        let plain = self.plain.take();
+        let plain = plain.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        let Event::Blob(BlobEvent::PlainStat { exists, version }) = event else {
+            return Err(self.unexpected("Event::Blob(BlobEvent::PlainStat)", event));
         };
-        match event {
-            Event::Blob(BlobEvent::PlainStat { exists, version }) => {
-                let replaces = version.is_some() && self.plain_owned;
-                let (path, if_not_exists) =
-                    same_name_path(&plain.path, plain.ulid, exists, replaces);
-                self.open_native(Some(PlainPath {
-                    path,
-                    if_not_exists,
-                    ..plain
-                }))
-            }
-            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
-            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::PlainStat)",
-                received: (event).label(),
-            }),
-        }
+        let replaces = version.is_some() && self.plain_owned;
+        let (path, if_not_exists) = same_name_path(&plain.path, plain.ulid, exists, replaces);
+        self.open_native(Some(PlainPath {
+            path,
+            if_not_exists,
+            ..plain
+        }))
     }
 
     /// Backends without a provider upload answer `None`; their parts are composed instead.
-    fn open_native(&mut self, plain: Option<PlainPath>) -> Effects {
-        let Some(resolved) = self.resolved.clone() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        self.state = CreateMultipartState::OpenUpload;
-        smallvec![Effect::Blob(BlobEffect::OpenUpload {
+    fn open_native(&mut self, plain: Option<PlainPath>) -> Turn {
+        let open = BlobEffect::OpenUpload {
             record_id: self.upload_id,
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
-            resolved,
+            resolved: self.resolved()?,
             created_by: self.input.created_by,
             plain,
-        })]
+        };
+        self.call(CreateMultipartState::OpenUpload, Effect::Blob(open).into())
     }
 
-    fn upload_opened(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::UploadOpened { backend_upload }) => {
-                self.backend_upload = backend_upload;
-                self.start_transaction()
-            }
-            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
-            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::UploadOpened)",
-                received: (event).label(),
-            }),
-        }
+    fn upload_opened(&mut self, event: Event) -> Turn {
+        let Event::Blob(BlobEvent::UploadOpened { backend_upload }) = event else {
+            return Err(self.unexpected("Event::Blob(BlobEvent::UploadOpened)", event));
+        };
+        self.backend_upload = backend_upload;
+        self.check_purge_fence()
     }
 
     /// Creates the object key and envelope now, so completion needs no private key.
-    fn abe_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let Some(plan) = self.encryption.map(|encryption| encryption.plan) else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+    fn abe_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
+        let plan = self.encryption.map(|encryption| encryption.plan);
+        let plan = plan.ok_or(CreateMultipartError::CreateUploadFailed)?;
         // A generation without admitted parameters keeps bucket-only pieces.
-        if values
-            .first()
-            .is_some_and(|(_, parameters)| parameters.is_none())
-        {
-            return self.start_transaction();
+        if (values.first()).is_some_and(|(_, parameters)| parameters.is_none()) {
+            return self.check_purge_fence();
         }
-        let (parameters, epoch) = match parse_abe(&values, plan.key) {
-            Ok(parsed) => parsed,
-            Err(error) => return self.emit_error(BlobError::from(error).into()),
+        let (parameters, epoch) =
+            parse_abe(&values, plan.key).map_err(|error| BlobError::from(error))?;
+        let envelope = AbeEffect::Envelope(EnvelopePlan {
+            parameters,
+            epoch,
+            write_id: Ulid::generate(),
+            object_key: self.input.key.clone(),
+            bucket_public: plan.public_key,
+        });
+        let create = Effect::Blob(BlobEffect::Abe(Box::new(envelope)));
+        self.call(CreateMultipartState::CreateEnvelope, create.into())
+    }
+
+    fn envelope_created(&mut self, event: Event) -> Turn {
+        let Event::Blob(BlobEvent::Abe(abe)) = event else {
+            return Err(self.unexpected("Event::Blob(BlobEvent::Abe)", event));
         };
-        self.state = CreateMultipartState::CreateEnvelope;
-        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
-            AbeEffect::Envelope(EnvelopePlan {
-                parameters,
-                epoch,
-                write_id: Ulid::generate(),
-                object_key: self.input.key.clone(),
-                bucket_public: plan.public_key,
-            })
-        )))]
-    }
-
-    fn envelope_created(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::Abe(event)) => match *event {
-                AbeEvent::Envelope(envelope) => {
-                    self.envelope = Some(envelope);
-                    self.start_transaction()
-                }
-                _ => self.emit_error(CreateMultipartError::CreateUploadFailed),
-            },
-            Event::Blob(BlobEvent::Error(error)) => self.emit_error(error.into()),
-            event => self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::Abe)",
-                received: (event).label(),
-            }),
-        }
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        // Routing is fallible, so it resolves before a transaction exists to
-        // abort.
-        let resolved =
-            match resolve_backend(&self.input.routing, &self.input.bucket, &self.input.key) {
-                Ok(resolved) => resolved,
-                Err(error) => return self.emit_error(error.into()),
-            };
-        self.resolved = Some(resolved);
-        // The destination default is read before the upload exists, so no part
-        // can ever be written under a rule this node was never admitted for.
-        self.state = CreateMultipartState::ReadGateBucket;
-        smallvec![settings_read(&self.input.bucket, None)]
+        let AbeEvent::Envelope(envelope) = *abe else {
+            return Err(CreateMultipartError::CreateUploadFailed);
+        };
+        self.envelope = Some(envelope);
+        self.check_purge_fence()
     }
 
     /// Reads the bucket and its encryption settings; an encrypted bucket also needs its key.
-    fn handle_gate_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let [(_, bucket), (_, settings)] = match <[_; 2]>::try_from(values) {
-            Ok(values) => values,
-            Err(_) => return self.emit_error(CreateMultipartError::CreateUploadFailed),
-        };
-        let parsed = bucket
+    fn handle_gate_bucket(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [bucket, settings] =
+            <[_; 2]>::try_from(values).map_err(|_| CreateMultipartError::CreateUploadFailed)?;
+        let bucket = bucket
             .as_ref()
             .map(|value| BucketInfo::from_bytes(value.as_ref()))
-            .transpose()
-            .and_then(|bucket| Ok((bucket, BucketEncryption::from_row(settings.as_deref())?)));
-        let (bucket, settings) = match parsed {
-            Ok(parsed) => parsed,
-            Err(error) => return self.emit_error(error.into()),
-        };
+            .transpose()?;
+        let settings = BucketEncryption::from_row(settings.as_deref())?;
         let Some(key) = settings.active_key() else {
             return self.gate_bucket(bucket);
         };
         self.settings = Some((bucket, settings));
-        self.state = CreateMultipartState::ReadBucketKey;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_KEY_KEYSPACE.to_string(),
-            key: key.key().into(),
-            txn_id: None,
-        })]
+        let read = read_row(BUCKET_KEY_KEYSPACE, key.key());
+        self.call(CreateMultipartState::ReadBucketKey, outside(read))
     }
 
     /// Captures the seal plan from the active key record, then gates the bucket.
-    fn handle_bucket_key(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let Some((bucket, settings)) = self.settings.take() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let Some(value) = value else {
-            return self.emit_error(BucketKeyError::Unsupported.into());
-        };
+    fn handle_bucket_key(&mut self, value: Option<Value>) -> Turn {
+        let settings = self.settings.take();
+        let (bucket, settings) = settings.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        let value = value.ok_or(BucketKeyError::Unsupported)?;
         let plan = BucketKeyRecord::from_bytes(value.as_ref())
             .map_err(CreateMultipartError::from)
             .and_then(|record| Ok(SealPlan::capture(&settings, &record)?));
         if let Some(algorithm) = self.input.checksum_hint.as_ref().and_then(full_digest) {
-            return self.emit_error(CreateMultipartError::UnsupportedChecksum(
+            return Err(CreateMultipartError::UnsupportedChecksum(
                 algorithm.s3_name(),
             ));
         }
-        match plan {
-            Ok(Some(plan)) => {
-                let compression = bucket.as_ref().map(|bucket| bucket.compression);
-                self.encryption = Some(UploadEncryption {
-                    plan,
-                    compression: compression.unwrap_or_default(),
-                });
-                self.gate_bucket(bucket)
-            }
-            Ok(None) => self.emit_error(BucketKeyError::Unsupported.into()),
-            Err(error) => self.emit_error(error),
-        }
+        let plan = plan?.ok_or(BucketKeyError::Unsupported)?;
+        let compression = bucket.as_ref().map(|bucket| bucket.compression);
+        self.encryption = Some(UploadEncryption {
+            plan,
+            compression: compression.unwrap_or_default(),
+        });
+        self.gate_bucket(bucket)
     }
 
-    fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Effects {
+    fn gate_bucket(&mut self, bucket: Option<BucketInfo>) -> Turn {
         self.stored_policies = GatedBucket::observe(bucket.as_ref()).policies;
         self.binding = bucket
             .as_ref()
@@ -549,107 +454,52 @@ impl CreateMultipartOperation {
         let group_id = bucket
             .as_ref()
             .map_or(self.input.group_id, |bucket| bucket.group_id);
-        match write_gate(
+        let gate = write_gate(
             self.gate_context.as_ref(),
             &self.stored_policies,
             Some(group_id),
-        ) {
-            Ok(None) => self.check_open_fence(),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
-                self.state = CreateMultipartState::PolicyGate;
-                match complete {
-                    true => self.finish_gate(),
-                    false => effects,
-                }
-            }
-            Err(error) => self.emit_error(error.into()),
+        )?;
+        match gate {
+            None => self.check_open_fence(),
+            Some(gate) => self.call(CreateMultipartState::PolicyGate, IoCall::child(gate)),
         }
     }
 
-    fn handle_policy_gate(&mut self, event: Event) -> Effects {
-        let Some(gate) = self.gate.as_mut() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let effects = gate.step(event);
-        match gate.is_complete() {
-            true => self.finish_gate(),
-            false => effects,
-        }
+    fn finish_gate(&mut self, result: IoResult) -> Turn {
+        let outcome = result.child::<PolicyGateOutcome, ReadPolicyError>()?;
+        gate_decision(outcome.map_err(PolicyGateError::from)?)?;
+        self.stored_subject = self
+            .gate_context
+            .as_ref()
+            .map_or(0, |context| context.subject.generation);
+        self.check_open_fence()
     }
 
-    fn finish_gate(&mut self) -> Effects {
-        let Some(gate) = self.gate.take() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let outcome = match gate.finalize() {
-            Ok(outcome) => outcome,
-            Err(error) => return self.emit_error(PolicyGateError::from(error).into()),
-        };
-        match gate_decision(outcome) {
-            Ok(()) => {
-                self.stored_subject = self
-                    .gate_context
-                    .as_ref()
-                    .map_or(0, |context| context.subject.generation);
-                self.check_open_fence()
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+    /// The first read of the transaction, which opens it.
+    fn check_purge_fence(&mut self) -> Turn {
+        let read = read_row(PURGE_FENCE_KEYSPACE, fence_key(&self.input.bucket));
+        self.call(CreateMultipartState::CheckPurgeFence, read)
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.state = CreateMultipartState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        self.state = CreateMultipartState::CheckPurgeFence;
-        smallvec![write_fence_read(&self.input.bucket, self.txn_id)]
-    }
-
-    fn fence_checked(&mut self, event: Event) -> Effects {
-        if let Err(error) = check_write_fence(event, &self.input.bucket, &self.input.key) {
-            return self.emit_error(error.into());
-        }
-        if let Some(authority) = self.authority.as_ref() {
-            // A fence, transfer or replaced bucket since the first check conflicts the commit.
-            let bucket = (
-                S3_BUCKET_KEYSPACE.to_string(),
-                self.input.bucket.as_bytes().into(),
-            );
-            let mut reads = vec![bucket];
-            reads.extend(authority_reads(authority.binding.set_id));
-            self.state = CreateMultipartState::CheckAuthority;
-            return smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: self.txn_id,
-            })];
-        }
-        self.fence_backend()
-    }
-
-    fn authority_checked(&mut self, event: Event) -> Effects {
+    fn fence_checked(&mut self, fence: Option<Value>) -> Turn {
+        check_fence_row(fence.as_deref(), &self.input.bucket, &self.input.key)?;
         let Some(authority) = self.authority.as_ref() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+            return self.fence_backend();
         };
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        let mut values = values.into_iter().map(|(_, value)| value);
+        // A fence, transfer or replaced bucket since the first check conflicts the commit.
+        let bucket = (
+            S3_BUCKET_KEYSPACE.to_string(),
+            self.input.bucket.as_bytes().into(),
+        );
+        let mut reads = vec![bucket];
+        reads.extend(authority_reads(authority.binding.set_id));
+        self.call(CreateMultipartState::CheckAuthority, IoCall::Read(reads))
+    }
+
+    fn authority_checked(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let authority = self.authority.as_ref();
+        let authority = authority.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        let mut values = values.into_iter();
         let (bucket, record, fence) = (
             values.next().flatten(),
             values.next().flatten(),
@@ -664,64 +514,52 @@ impl CreateMultipartOperation {
                     == (wanted.set_id, wanted.member_id, wanted.incarnation)
             });
         if !bound {
-            return self.emit_error(GuardError::Unbound(authority.binding.set_id).into());
+            return Err(GuardError::Unbound(authority.binding.set_id).into());
         }
         let key = &self.input.key;
-        match check_authority(authority, key, record.as_deref(), fence.as_deref()) {
-            Ok(()) => self.fence_backend(),
-            Err(error) => self.emit_error(error.into()),
-        }
+        check_authority(authority, key, record.as_deref(), fence.as_deref())?;
+        self.fence_backend()
     }
 
-    fn fence_backend(&mut self) -> Effects {
-        let Some(resolved) = self.resolved.as_ref() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
+    /// A group backend must still exist and be enabled when the record commits.
+    fn fence_backend(&mut self) -> Turn {
+        let BackendRef::Group(backend_id) = self.resolved()?.backend else {
+            return self.check_settings();
         };
-        match fence_backend(&resolved.backend, self.txn_id) {
-            Some(effect) => {
-                self.state = CreateMultipartState::FenceBackend;
-                smallvec![effect]
-            }
-            None => self.check_settings(),
-        }
+        let read = read_row(STORAGE_BACKEND_KEYSPACE, backend_key(backend_id));
+        self.call(CreateMultipartState::FenceBackend, read)
     }
 
-    fn handle_backend_fenced(&mut self, event: Event) -> Effects {
-        match check_fence(event) {
-            Ok(()) => self.check_settings(),
-            Err(error) => self.emit_error(error.into()),
+    fn backend_fenced(&mut self, value: Option<Value>) -> Turn {
+        let record = value
+            .map(|value| GroupStorage::from_bytes(&value))
+            .transpose()?;
+        if !record.is_some_and(|record| !record.disabled) {
+            return Err(BackendFenceError::Unavailable.into());
         }
+        self.check_settings()
     }
 
     /// Rereads the settings in the transaction, so a mode change or rotation that started
     /// meanwhile conflicts instead of leaving an upload with a stale plan.
-    fn check_settings(&mut self) -> Effects {
-        self.state = CreateMultipartState::CheckSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
+    fn check_settings(&mut self) -> Turn {
+        let read = read_row(
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.input.bucket.as_bytes().to_vec(),
+        );
+        self.call(CreateMultipartState::CheckSettings, read)
     }
 
-    fn settings_checked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+    fn settings_checked(&mut self, value: Option<Value>) -> Turn {
         let plan = self.encryption.map(|encryption| encryption.plan);
-        let current = BucketEncryption::from_row(value.as_deref())
-            .map_err(CreateMultipartError::from)
-            .and_then(|settings| Ok(storage_current(plan.as_ref(), &settings)?));
-        match current {
-            Ok(()) => self.write_upload(),
-            Err(error) => self.emit_error(error),
-        }
+        let settings = BucketEncryption::from_row(value.as_deref())?;
+        storage_current(plan.as_ref(), &settings)?;
+        self.write_upload()
     }
 
-    fn write_upload(&mut self) -> Effects {
-        let Some((txn_id, resolved)) = self.txn_id.zip(self.resolved.take()) else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
+    fn write_upload(&mut self) -> Turn {
+        let resolved = self.resolved.take();
+        let resolved = resolved.ok_or(CreateMultipartError::CreateUploadFailed)?;
         let record = MultipartUpload {
             backend: resolved.backend,
             storage_class: resolved.storage_class,
@@ -740,109 +578,61 @@ impl CreateMultipartOperation {
             backend_upload: self.backend_upload.clone(),
             encryption: self.encryption,
         };
-        let value = match record.to_bytes() {
-            Ok(value) => value,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
-        self.record = Some(record.clone());
-        self.state = CreateMultipartState::WriteUpload;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: record.upload_id.to_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
+        let row = (
+            UPLOAD_KEYSPACE.to_string(),
+            record.upload_id.to_bytes().to_vec().into(),
+            record.to_bytes()?.into(),
+        );
+        self.record = Some(record);
+        self.call(CreateMultipartState::WriteUpload, IoCall::Write(vec![row]))
     }
 
-    fn handle_record_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateMultipartError::TransactionMissing);
-        };
-        // The bucket counts the upload in the transaction that creates its record.
-        if self.state == CreateMultipartState::WriteUpload {
-            self.state = CreateMultipartState::CountUpload;
-            return smallvec![count_upload(&self.input.bucket, 1, txn_id)];
-        }
-        self.write_rest(txn_id)
+    /// The bucket counts the upload in the transaction that creates its record.
+    fn record_written(&mut self) -> Turn {
+        let count = upload_count(&self.input.bucket, 1);
+        self.call(CreateMultipartState::CountUpload, count)
     }
 
-    fn upload_counted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: (event).label(),
-            });
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateMultipartError::TransactionMissing);
-        };
-        match self.inventory.as_mut() {
-            Some(inventory) => {
-                self.state = CreateMultipartState::CountInventory;
-                inventory.start(txn_id)
-            }
-            None => self.write_rest(txn_id),
+    fn upload_counted(&mut self) -> Turn {
+        let call = self
+            .inventory
+            .as_mut()
+            .and_then(InventoryUpdate::start_calls);
+        match call {
+            Some(call) => self.call(CreateMultipartState::CountInventory, call.into_call()),
+            None => self.write_pending(),
         }
     }
 
-    fn inventory_counted(&mut self, event: Event) -> Effects {
-        let (Some(txn_id), Some(inventory)) = (self.txn_id, self.inventory.as_mut()) else {
-            return self.emit_error(CreateMultipartError::TransactionMissing);
-        };
-        match inventory.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.write_rest(txn_id),
-            Err(error) => self.emit_error(error.into()),
+    fn inventory_counted(&mut self, result: IoResult) -> Turn {
+        let inventory = self.inventory.as_mut();
+        let inventory = inventory.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        match inventory.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.write_pending(),
         }
     }
 
     /// Writes the pending envelope, if any, then commits.
-    fn write_rest(&mut self, txn_id: TxnId) -> Effects {
+    fn write_pending(&mut self) -> Turn {
         if let Some(envelope) = self.envelope.take() {
-            let value = match envelope.to_bytes() {
-                Ok(value) => value,
-                Err(error) => return self.emit_error(BlobError::from(error).into()),
-            };
-            self.state = CreateMultipartState::WritePending;
-            return smallvec![Effect::Storage(StorageEffect::Write {
-                key_space: ABE_PENDING_KEYSPACE.to_string(),
-                key: self.upload_id.to_bytes().to_vec().into(),
-                value: value.into(),
-                txn_id: Some(txn_id),
-            })];
+            let value = envelope.to_bytes().map_err(BlobError::from)?;
+            let row = (
+                ABE_PENDING_KEYSPACE.to_string(),
+                self.upload_id.to_bytes().to_vec().into(),
+                value.into(),
+            );
+            return self.call(CreateMultipartState::WritePending, IoCall::Write(vec![row]));
         }
-        self.state = CreateMultipartState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.created()
     }
 
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(CreateMultipartError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            });
-        };
-
-        // The committed record owns the provider upload from here on.
-        self.backend_upload = None;
-        let Some(record) = self.record.clone() else {
-            return self.emit_error(CreateMultipartError::CreateUploadFailed);
-        };
-        self.txn_id = None;
-        self.state = CreateMultipartState::Finish;
-        self.output = Some(Ok(CreateMultipartResult { record }));
-        smallvec![]
+    /// The committed record owns the provider upload from here on.
+    fn created(&mut self) -> Turn {
+        let record = self.record.clone();
+        let record = record.ok_or(CreateMultipartError::CreateUploadFailed)?;
+        self.committing = true;
+        Ok(Next::Done(CreateMultipartResult { record }))
     }
 }
 
@@ -871,82 +661,90 @@ fn full_digest(hint: &MultipartChecksumHint) -> Option<ChecksumAlgorithm> {
     (hint.checksum_type == MultipartChecksumType::FullObject && !crc).then_some(algorithm)
 }
 
-impl EffectOperation for CreateMultipartOperation {
+impl Operation for CreateMultipartOperation {
     type Output = CreateMultipartResult;
     type Error = CreateMultipartError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == CreateMultipartState::AbortBackendUpload {
-            return self.backend_aborted(event);
-        }
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            // A commit that may have landed leaves the provider upload to its record.
-            if self.state == CreateMultipartState::CommitTransaction && !error.proves_no_commit() {
-                self.backend_upload = None;
-            }
-            return self.emit_error(error.clone().into());
-        }
-        match self.state {
-            CreateMultipartState::Init => self.handle_init(),
-            CreateMultipartState::ReadGateBucket => self.handle_gate_bucket(event),
-            CreateMultipartState::ReadBucketKey => self.handle_bucket_key(event),
-            CreateMultipartState::ReadRecord => self.record_checked(event),
-            CreateMultipartState::PolicyGate => self.handle_policy_gate(event),
-            CreateMultipartState::CheckOpenFence => self.open_upload(event),
-            CreateMultipartState::ReadPlainOwner => self.plain_owner(event),
-            CreateMultipartState::StatPlain => self.plain_stat(event),
-            CreateMultipartState::OpenUpload => self.upload_opened(event),
-            CreateMultipartState::ReadAbe => self.abe_read(event),
-            CreateMultipartState::CreateEnvelope => self.envelope_created(event),
-            CreateMultipartState::StartTransaction => self.handle_transaction_started(event),
-            CreateMultipartState::CheckPurgeFence => self.fence_checked(event),
-            CreateMultipartState::CheckAuthority => self.authority_checked(event),
-            CreateMultipartState::FenceBackend => self.handle_backend_fenced(event),
-            CreateMultipartState::CheckSettings => self.settings_checked(event),
-            CreateMultipartState::WriteUpload | CreateMultipartState::WritePending => {
-                self.handle_record_written(event)
-            }
-            CreateMultipartState::CountUpload => self.upload_counted(event),
-            CreateMultipartState::CountInventory => self.inventory_counted(event),
-            CreateMultipartState::CommitTransaction => self.handle_transaction_committed(event),
-            CreateMultipartState::AbortBackendUpload => self.backend_aborted(event),
-            CreateMultipartState::Finish => smallvec![],
-            CreateMultipartState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateMultipartState::Finish | CreateMultipartState::Error
+    fn first(&mut self) -> Turn {
+        // Routing is fallible, so it resolves before a transaction exists to abort.
+        let routing = &self.input.routing;
+        self.resolved = Some(resolve_backend(
+            routing,
+            &self.input.bucket,
+            &self.input.key,
+        )?);
+        // The destination default is read before the upload exists, so no part
+        // can ever be written under a rule this node was never admitted for.
+        let key: Key = self.input.bucket.as_bytes().to_vec().into();
+        let reads = vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+        ];
+        self.call(
+            CreateMultipartState::ReadGateBucket,
+            outside(IoCall::Read(reads)),
         )
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(CreateMultipartError::NotFinished),
+    fn next(&mut self, result: IoResult) -> Turn {
+        match self.state {
+            CreateMultipartState::ReadGateBucket => {
+                self.handle_gate_bucket(outside_answer(result)?.values()?)
+            }
+            CreateMultipartState::ReadBucketKey => {
+                self.handle_bucket_key(outside_answer(result)?.value()?)
+            }
+            CreateMultipartState::PolicyGate => self.finish_gate(result),
+            CreateMultipartState::ReadRecord => {
+                self.record_checked(outside_answer(result)?.values()?)
+            }
+            CreateMultipartState::CheckOpenFence => {
+                self.open_upload(outside_answer(result)?.value()?)
+            }
+            CreateMultipartState::ReadPlainOwner => {
+                self.plain_owner(outside_answer(result)?.value()?)
+            }
+            CreateMultipartState::StatPlain => self.plain_stat(result.event()?),
+            CreateMultipartState::OpenUpload => self.upload_opened(result.event()?),
+            CreateMultipartState::ReadAbe => {
+                let values = outside_answer(result)?.values()?;
+                self.abe_read(keyed(&values))
+            }
+            CreateMultipartState::CreateEnvelope => self.envelope_created(result.event()?),
+            CreateMultipartState::CheckPurgeFence => self.fence_checked(result.value()?),
+            CreateMultipartState::CheckAuthority => self.authority_checked(result.values()?),
+            CreateMultipartState::FenceBackend => self.backend_fenced(result.value()?),
+            CreateMultipartState::CheckSettings => self.settings_checked(result.value()?),
+            CreateMultipartState::WriteUpload => {
+                result.done()?;
+                self.record_written()
+            }
+            CreateMultipartState::CountUpload => {
+                result.done()?;
+                self.upload_counted()
+            }
+            CreateMultipartState::CountInventory => self.inventory_counted(result),
+            CreateMultipartState::WritePending => {
+                result.done()?;
+                self.created()
+            }
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        let mut effects: Effects = self
-            .txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            });
-        if let Some(backend_upload) = self.backend_upload.take() {
-            effects.push(Effect::Blob(BlobEffect::AbortUpload {
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    /// An opened provider upload goes, unless a commit was sent that may own it.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let opened = self.backend_upload.take().filter(|_| !self.committing);
+        let calls = opened.map(|backend_upload| {
+            let abort = BlobEffect::AbortUpload {
                 backend_upload: Box::new(backend_upload),
-            }));
-        }
-        effects
+            };
+            IoCall::from(Effect::Blob(abort))
+        });
+        calls.into_iter().collect()
     }
 }
 
