@@ -44,7 +44,7 @@ async fn durable_rearm_loop(
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
         restore_watch_interest(&context, &task_handle).await;
-        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
         // Dead letters retry on a minute-scale backoff, so sweeping every rearm
@@ -288,7 +288,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
+        crate::node::node_info::restore_info_timer(&task_handle).await;
         if stopped() {
             return;
         }
