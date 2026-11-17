@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 use aruna_core::admin_documents::{AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::GraphLifecycleRecord;
+use aruna_core::reducer::reduced_admin_target;
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_storage::StorageHandle;
