@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::REALMS_LIST_KEY;
-use aruna_core::metadata::MetadataError;
+use aruna_core::metadata::{MetadataError, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -70,7 +70,6 @@ const GRAPH_SYNC_AFTER: Duration = Duration::from_millis(250);
 pub(crate) const QUERY_MAX_BYTES: usize = 64 * 1024;
 pub(crate) const METADATA_QUERY_DEADLINE: Duration = Duration::from_secs(10);
 const VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
-pub(crate) const REGISTRY_CANDIDATE_LIMIT: usize = 1024;
 
 fn sync_identity_matches(left: &SyncRelationship, right: &SyncRelationship) -> bool {
     left.id == right.id

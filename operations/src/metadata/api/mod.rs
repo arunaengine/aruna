@@ -11,15 +11,15 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataLifecycleRecord,
+    GraphLifecycleRecord, MetadataError, MetadataEventRecord,
     MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::storage_entries::{
-    document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
+    event_log_key, graph_lifecycle_key, pending_projection_target,
 };
 use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -34,7 +34,6 @@ use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifie
 use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
 use aruna_core::{MetaResourceId, NodeId};
-use aruna_storage::StorageHandle;
 use futures_util::future::BoxFuture;
 use futures_util::stream;
 use serde::{Deserialize, Serialize};
@@ -67,11 +66,11 @@ use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
 use self::preflight::discover_realm_nodes;
 use self::preflight::{reference_document_title, resolve_graph_reference};
 use self::read::ensure_record_materialized;
-use self::read::{can_read_record, ensure_record_readable, filter_live_records, load_live_record};
+use self::read::{can_read_record, ensure_record_readable, load_live_record};
 
 use self::read_types::metadata_read_request;
 use super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
-use super::handle::{QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT};
+use super::handle::QUERY_MAX_BYTES;
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
@@ -110,7 +109,7 @@ use crate::s3::object::search::{
 };
 use crate::s3::object::search_scan::search_local_objects;
 use aruna_core::metadata::AuthToken;
-use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS};
+use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
 
 mod bucket_page;
 mod distributed;

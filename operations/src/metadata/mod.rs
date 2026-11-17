@@ -23,6 +23,7 @@ pub mod id_mapping;
 pub mod identifier_lookup;
 mod iri_index;
 pub mod list_documents;
+pub(crate) mod live_records;
 pub mod materialization_queue;
 pub(crate) mod object_version;
 pub mod persistent_id;

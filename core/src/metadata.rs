@@ -329,6 +329,8 @@ pub struct MetadataMergedRevision {
     pub findings: u32,
 }
 
+/// Most registry records one metadata read may take as candidates.
+pub const REGISTRY_CANDIDATE_LIMIT: usize = 1024;
 /// Most solution rows one metadata query returns.
 pub const QUERY_MAX_ROWS: usize = 10_000;
 /// Most serialized bytes of one metadata query result.
