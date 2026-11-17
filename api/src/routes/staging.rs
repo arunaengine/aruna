@@ -50,7 +50,7 @@ use aruna_operations::staging::list_source::{
 };
 use aruna_operations::staging::read_source::ReadSourceError;
 use aruna_operations::staging::reference::{
-    MaterializeReferenceError, MaterializeReferenceInput, stage_reference_blob,
+    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
 };
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
@@ -1604,8 +1604,7 @@ async fn reference_blob(
     .await?;
     ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
-    let result = stage_reference_blob(
-        &state.get_ctx(),
+    let materialize = MaterializeReferenceOperation::new(
         MaterializeReferenceInput {
             job_id: None,
             group_id,
@@ -1621,9 +1620,12 @@ async fn reference_blob(
             restrictions: auth.path_restrictions.clone(),
             mirrors: Vec::new(),
         },
-    )
-    .await
-    .map_err(map_reference_error)?;
+        std::time::SystemTime::now(),
+        ulid::Ulid::generate(),
+    );
+    let result = drive(materialize, &state.get_ctx())
+        .await
+        .map_err(map_reference_error)?;
 
     queue_live_replication(
         &state,

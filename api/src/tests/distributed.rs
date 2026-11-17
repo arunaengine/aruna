@@ -168,7 +168,7 @@ pub(crate) async fn node_state() -> Node {
 pub(crate) async fn hidden_link(node: &Node, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
     let target = LinkTarget {
         arn: VersionedObjectArn {
             realm_id: node.owner.realm_id,
@@ -203,9 +203,12 @@ pub(crate) async fn hidden_link(node: &Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_operations::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBinding>) -> BucketInfo {

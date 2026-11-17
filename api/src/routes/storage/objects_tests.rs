@@ -334,7 +334,7 @@ async fn unanswered_range_fails() {
 
 /// Writes a link at `key` in the test bucket to `target`, as the owner.
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
     let write = ReferenceWrite {
         job_id: None,
         preassigned_version_id: None,
@@ -359,9 +359,12 @@ async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_operations::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

@@ -755,7 +755,7 @@ async fn listing_merges_ranges() {
 async fn hidden_link(members: &Members, on: usize, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
     let node = &members.nodes[on];
     let target = LinkTarget {
         arn: VersionedObjectArn {
@@ -791,7 +791,12 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.context, write).await.unwrap();
+    aruna_operations::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.context,
+    )
+    .await
+    .unwrap();
 }
 
 // A range that starts with more hidden entries than one request examines goes on from the

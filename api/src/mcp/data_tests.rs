@@ -415,7 +415,7 @@ mod distributed {
     async fn hidden_link(members: &Members, key: &str) {
         use aruna_core::structs::storage::link::LinkTarget;
         use aruna_core::structs::storage::replication::VersionedObjectArn;
-        use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+        use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
         let node = &members.nodes[0];
         let target = LinkTarget {
             arn: VersionedObjectArn {
@@ -451,7 +451,16 @@ mod distributed {
             restrictions: None,
             mirror_guards: Vec::new(),
         };
-        write_reference_version(&node.context, write).await.unwrap();
+        aruna_operations::driver::drive(
+            WriteReferenceOperation::new(
+                write,
+                std::time::SystemTime::now(),
+                ulid::Ulid::generate(),
+            ),
+            &node.context,
+        )
+        .await
+        .unwrap();
     }
 
     // A text write to a key this member coordinates is stored here as a new version, and the
@@ -628,7 +637,7 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::staging::reference::{ReferenceWrite, WriteReferenceOperation};
     let descriptor = PortableSourceDescriptor {
         kind: SourceConnectorKind::Http,
         public_config: HashMap::new(),
@@ -668,9 +677,12 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_operations::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 // READ that a public role grants on a prefix lists that prefix, external references included,
