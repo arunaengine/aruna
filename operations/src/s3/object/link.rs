@@ -354,7 +354,8 @@ mod tests {
 
     use super::*;
     use crate::tests::access::seed_access;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
 
     #[tokio::test]
     async fn head_asks_target() {

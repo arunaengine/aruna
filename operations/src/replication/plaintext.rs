@@ -268,7 +268,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn plaintext_needs_holder() {
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = crate::tests::s3::test_context(storage);
+        let context = crate::testing::test_context(storage);
         bucket(&context).await;
         let realm = RealmId::from_bytes([3; 32]);
         assert!(source_encrypted(&context, "sealed").await.unwrap());
@@ -321,7 +321,7 @@ pub(crate) mod tests {
     async fn foreign_explicit_holds() {
         // An explicit grant makes a user of another realm a holder; the creator's ULID does not.
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = crate::tests::s3::test_context(storage);
+        let context = crate::testing::test_context(storage);
         bucket(&context).await;
         let local = RealmId::from_bytes([3; 32]);
         let foreign =

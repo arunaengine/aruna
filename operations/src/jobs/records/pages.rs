@@ -297,7 +297,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
 
     fn submission() -> SubmissionId {
         SubmissionId([3; 32])

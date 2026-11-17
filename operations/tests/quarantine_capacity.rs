@@ -17,9 +17,8 @@ use aruna_core::structs::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
-use aruna_core::types::Value;
 use aruna_net::document_sync::DocumentSyncService;
-use aruna_operations::driver::DriverContext;
+use aruna_operations::testing::{test_context, write_entries};
 use aruna_operations::sync::sync_quarantine::{
     QuarantinePageRequest, acknowledge_quarantine_row, list_quarantine_records,
     prune_quarantine_records, read_quarantine_record, read_quarantine_usage,
@@ -28,36 +27,12 @@ use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use ulid::Ulid;
 
-fn context(storage: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
-}
-
-async fn write_batch(storage: &StorageHandle, writes: Vec<(String, ByteView, Value)>) {
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => panic!("unexpected storage event: {other:?}"),
-    }
-}
-
 /// Mirrors the applied-ops cursor key of the sync path: publishing marks its
 /// own ops applied, so a fresh peer's delivery has to be simulated.
 async fn reset_cursor(storage: &StorageHandle, topic: &[u8]) {
     let mut key = b"topic-cursor/".to_vec();
     key.extend_from_slice(topic);
-    write_batch(
+    write_entries(
         storage,
         vec![(
             APPLIED_OPS_KEYSPACE.to_string(),
@@ -107,11 +82,11 @@ async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
         usage.bytes += entry.2.len() as u64;
         writes.push(entry);
         if writes.len() == 512 {
-            write_batch(storage, std::mem::take(&mut writes)).await;
+            write_entries(storage, std::mem::take(&mut writes)).await;
         }
     }
     writes.push(quarantine_usage_entry(usage).expect("usage entry"));
-    write_batch(storage, writes).await;
+    write_entries(storage, writes).await;
     usage
 }
 
@@ -178,7 +153,7 @@ async fn capacity_blocks_releases() {
         realm_id,
     )
     .expect("document sync service opens");
-    let ctx = context(storage.clone());
+    let ctx = test_context(storage.clone());
     let local_node = iroh::SecretKey::from_bytes(&[31; 32]).public();
 
     let seeded = fill_store(&storage).await;

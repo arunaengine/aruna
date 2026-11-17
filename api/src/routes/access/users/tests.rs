@@ -2022,7 +2022,7 @@ async fn federated_profile_synthesized() {
     use axum::Extension;
     use axum::response::IntoResponse;
     let (_dir, storage) = crate::tests::routes::test_storage();
-    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let context = Arc::new(aruna_operations::testing::test_context(storage));
     let signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
     let node_id = iroh::SecretKey::generate().public();

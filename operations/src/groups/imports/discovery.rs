@@ -570,7 +570,8 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bucket_access() {
-        use crate::tests::s3::{test_context, test_storage};
+        use crate::testing::test_context;
+        use crate::tests::s3::test_storage;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
         let (_directory, storage) = test_storage();

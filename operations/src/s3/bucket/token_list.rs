@@ -198,7 +198,8 @@ impl Operation for ListTokensOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
     use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
     use aruna_core::structs::identity::realm::RealmId;

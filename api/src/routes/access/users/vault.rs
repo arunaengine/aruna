@@ -337,7 +337,8 @@ pub async fn delete_vault(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::tests::routes::{test_context, test_state, test_storage, write_doc};
+    use aruna_operations::testing::test_context;
+    use crate::tests::routes::{test_state, test_storage, write_doc};
     use crate::tests::users::{realm_auth, setup_state};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;

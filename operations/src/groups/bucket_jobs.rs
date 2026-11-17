@@ -354,7 +354,7 @@ mod tests {
         // A job row that cannot be read, such as one of an older layout, hides only that job.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let write = StorageEffect::Write {
             key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
             key: b"b".to_vec().into(),

@@ -394,7 +394,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 /// A device that is not the holder and knows the holder's address from its installation.
 async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router, String) {
     let (dir, storage) = test_storage();
-    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let context = Arc::new(aruna_operations::testing::test_context(storage));
     let node_id = iroh::SecretKey::generate().public();
     let owner = UserId::local(Ulid::generate(), realm_id);
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
