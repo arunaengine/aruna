@@ -42,7 +42,9 @@ impl From<IoError> for ReadAuthorizationError {
                 expected,
                 got,
             },
-            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
         }
     }
 }
