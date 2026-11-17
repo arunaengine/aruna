@@ -226,6 +226,7 @@ fn job_context(mut context: DriverContext, outbound: OutboundHandle) -> JobConte
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
         range_turns: Default::default(),
+        handlers: Default::default(),
     }
 }
 

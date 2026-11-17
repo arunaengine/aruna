@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::executor::{
-    JobContext, JobRunOutcome, ProgressReporter, RangeTurns, dispatch_payload, run_cleanup,
+    JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, dispatch_payload,
+    run_cleanup,
 };
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
@@ -97,6 +98,7 @@ pub struct JobsRuntime {
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
+    handlers: Mutex<Vec<Arc<dyn PayloadHandler>>>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -148,6 +150,7 @@ impl JobsRuntime {
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
+            handlers: Mutex::default(),
         })
     }
 
@@ -164,6 +167,21 @@ impl JobsRuntime {
 
     pub(crate) fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
         *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
+    }
+
+    /// Adds the runner of payload kinds another domain owns; the node wiring calls it at start.
+    pub fn register_handler(&self, handler: Arc<dyn PayloadHandler>) {
+        self.handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handler);
+    }
+
+    /// The registered runners of payload kinds other domains own.
+    pub fn handlers(&self) -> Vec<Arc<dyn PayloadHandler>> {
+        (self.handlers.lock())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn running_count(&self) -> usize {
@@ -308,6 +326,7 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         let turns = self.range_turns.clone();
+        let handlers = self.handlers();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -316,7 +335,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 (cancel, progress),
-                (shutdown, turns),
+                (shutdown, turns, handlers),
             ))
             .catch_unwind()
             .await;
@@ -653,7 +672,11 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns): (CancellationToken, RangeTurns),
+    (shutdown, range_turns, handlers): (
+        CancellationToken,
+        RangeTurns,
+        Vec<Arc<dyn PayloadHandler>>,
+    ),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -723,6 +746,7 @@ async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
+        handlers,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
@@ -1286,7 +1310,7 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         )
         .await;
 
@@ -1331,7 +1355,7 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         )
         .await;
 
@@ -1359,7 +1383,7 @@ mod tests {
             claimed,
             stale_token,
             (cancel.clone(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         ));
         for _ in 0..100 {
             if marker.exists() {
@@ -1901,6 +1925,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
             range_turns: RangeTurns::default(),
+            handlers: Default::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {
