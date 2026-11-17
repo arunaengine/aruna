@@ -20,8 +20,8 @@ use tracing::debug;
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
 use crate::jobs::records::keys::submission_prefix;
-use crate::metadata::api::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use crate::realm::load_config::load_realm_config;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PageReadError {

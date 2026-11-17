@@ -41,7 +41,7 @@ use crate::jobs::records::{
     load_kind_complete,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
-use crate::metadata::api::load_realm_config;
+use crate::realm::load_config::load_realm_config;
 
 /// Domain of the stable witness order.
 pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";

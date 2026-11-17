@@ -13,17 +13,16 @@ use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_HEAD_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, BTreeMap, BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, DISTRIBUTED_QUERY_DEADLINE, DriverContext, Event, GetBucketError,
-    GetBucketOperation, GetConfigOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key,
-    MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope,
-    MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry, MetadataReferencesRequest,
-    MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult, Permission,
-    REALM_DISCOVERY_TIMEOUT, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT,
-    RealmConfigDocument, RealmId, RealmNodeDiscovery, ResolvePathsOperation, SearchCursor,
-    SearchCursorError, SearchWatermark, StorageEffect, StorageEvent, Ulid, Value, VersionKey,
-    W3idIdentifier, bucket_permission_path, can_read_record, deduplicate_fanout_nodes, drive,
-    forwarded_bearer, load_pending_records, map_read_error, metadata_node_call,
-    object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
-    run_metadata_fanout, select_fanout_nodes, warn,
+    GetBucketOperation, GetNodesOperation, HashMap, HashSet, IterStart, Key, MAX_PAGINATION_DEPTH,
+    MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats,
+    MetadataNodeCall, MetadataReferenceEntry, MetadataReferencesRequest, MetadataRegistryRecord,
+    MetadataSearchHit, NodeId, NodeSearchResult, Permission, REALM_DISCOVERY_TIMEOUT,
+    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmConfigDocument, RealmId,
+    RealmNodeDiscovery, ResolvePathsOperation, SearchCursor, SearchCursorError, SearchWatermark,
+    StorageEffect, StorageEvent, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
+    can_read_record, deduplicate_fanout_nodes, drive, forwarded_bearer, load_pending_records,
+    map_read_error, metadata_node_call, object_permission_path, paginate, record_preflight_node,
+    resume_fetch_limit, run_metadata_fanout, select_fanout_nodes, warn,
 };
 
 use super::read::{ensure_permission, load_live_record};
@@ -678,19 +677,6 @@ pub(super) async fn reference_document_title(
     // Root subject "./" makes the fallback the document path, not the id tail.
     let title = aruna_core::search_enrichment::hit_title(&properties, &record.document_path, "./");
     (!title.is_empty()).then_some(title)
-}
-
-pub async fn load_realm_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Option<RealmConfigDocument> {
-    match drive(GetConfigOperation::new(realm_id), context).await {
-        Ok(config) => Some(config),
-        Err(error) => {
-            warn!(error = %error, "realm config unavailable; querying the local replica only");
-            None
-        }
-    }
 }
 
 pub async fn load_realm_nodes(

@@ -4,8 +4,8 @@
 
 use super::{GitError, records};
 use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use crate::realm::load_config::load_realm_config;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
 use aruna_core::UserId;

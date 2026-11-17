@@ -4,7 +4,6 @@
 
 use super::*;
 use crate::jobs::store::find_dedup_plan;
-use crate::metadata::api::load_realm_config;
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,
     list_watches_remote, mark_read_remote, send_notification_request, unread_count_remote,
@@ -13,6 +12,7 @@ use crate::notifications::inbox::upsert_inbox_records;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
+use crate::realm::load_config::load_realm_config;
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{

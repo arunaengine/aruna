@@ -14,9 +14,9 @@ use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NodeInfoDocume
 use rand::seq::SliceRandom;
 
 use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
 use crate::node::heartbeat::held_heartbeats;
 use crate::node::node_info::read_info_documents;
+use crate::realm::load_config::load_realm_config;
 
 /// A heartbeat older than this does not make a holder a candidate.
 pub const HEARTBEAT_STALE_MS: u64 = 180_000;

@@ -414,7 +414,7 @@ pub(super) async fn config_digest_matches(
     realm_id: RealmId,
     expected: &[u8; 32],
 ) -> bool {
-    super::super::api::load_realm_config(context, realm_id)
+    crate::realm::load_config::load_realm_config(context, realm_id)
         .await
         .and_then(|config| config.digest().ok())
         .as_ref()

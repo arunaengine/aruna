@@ -629,7 +629,7 @@ async fn holds_family(
         .net_handle
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("network handle unavailable".to_string()))?;
-    let config = crate::metadata::api::load_realm_config(context, *net.realm_id())
+    let config = crate::realm::load_config::load_realm_config(context, *net.realm_id())
         .await
         .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
     let view = crate::jobs::records::verify::FamilyView::resolve(&config, *net.realm_id(), family)

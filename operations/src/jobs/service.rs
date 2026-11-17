@@ -54,9 +54,9 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use crate::realm::load_config::load_realm_config;
 
 use super::lifecycle::cancel::{self, cancel_family};
 use super::lifecycle::ids::session_of;

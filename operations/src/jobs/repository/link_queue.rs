@@ -34,12 +34,12 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::read_job_record;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
 use crate::placement::holds_placement;
+use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;

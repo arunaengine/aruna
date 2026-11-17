@@ -52,9 +52,9 @@ use crate::jobs::source_read::{
     HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read, issue_grant, public_read,
 };
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
+use crate::realm::load_config::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};

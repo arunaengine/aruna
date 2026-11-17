@@ -18,9 +18,9 @@ use tokio::time::timeout_at;
 use tracing::warn;
 
 use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
+use crate::realm::load_config::load_realm_config;
 
 /// Asks each holder in turn for the document. A holder that answers without it
 /// contributes `NotFound`; only a complete absence of answers is `Unavailable`,

@@ -33,11 +33,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
 use crate::node::node_info::{read_info_document, write_info_document};
+use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
 
