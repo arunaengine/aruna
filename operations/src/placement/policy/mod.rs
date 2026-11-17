@@ -46,7 +46,7 @@ pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
     observe_placement, sync_subject,
 };
-pub(crate) use transport::serve_local_policy;
+pub use transport::ServePolicyOperation;
 
 use aruna_core::structs::placement::policy::PolicyResolution;
 use aruna_core::types::GroupId;

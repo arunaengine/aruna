@@ -885,10 +885,20 @@ impl MetadataHandle {
                 .await
             }
             MetadataTransportMessage::ForwardPlacementPolicy { policy_ref } => {
-                Box::pin(async {
-                    crate::placement::policy::serve_local_policy(context, peer, policy_ref).await
-                })
-                .await
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::placement::policy::ServePolicyOperation::new(
+                            *net.realm_id(),
+                            peer,
+                            policy_ref,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
+                MetadataTransportMessage::ForwardedPlacementPolicy { result }
             }
             forward @ MetadataTransportMessage::ForwardVaultChange { .. } => {
                 Box::pin(async {
