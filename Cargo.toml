@@ -9,6 +9,7 @@ members = [
     "blob",
     "compute",
     "core",
+    "graph",
     "kpabe",
     "kpabe/wasm",
     "storage",
@@ -46,6 +47,7 @@ aruna-blob = { path = "blob" }
 aruna-cli = { path = "cli" }
 aruna-compute = { path = "compute", default-features = false }
 aruna-core = { path = "core" }
+aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
 aruna-plugin = { path = "plugins/sdk" }

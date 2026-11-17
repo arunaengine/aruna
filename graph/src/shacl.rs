@@ -17,12 +17,10 @@ use oxrdf::{NamedNode, NamedOrBlankNode, Term};
 use oxttl::TurtleParser;
 use tracing::warn;
 
-/// Every candidate is prepared against one scratch graph that never exists, so
-/// the encoded crate root is the same constant for every document and shapes
-/// can bind it statically.
-pub(crate) const VALIDATION_GRAPH_IRI: &str = "https://craqle.invalid/validation/document";
-/// Base craqle resolves relative RO-Crate ids against while parsing JSON-LD.
-pub(crate) const CRAQLE_BASE_IRI: &str = "https://craqle.invalid/";
+use aruna_core::profile_shapes::{
+    CRAQLE_BASE_IRI, ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+};
+
 /// Legacy base the portal writes into generated Profile shapes.
 const PORTAL_BASE_IRI: &str = "arcp://name,aruna-portal/crate/";
 
@@ -46,40 +44,12 @@ const MAX_CACHED_PROFILES: usize = 64;
 
 type ShapeTriple = (EncodedTerm, EncodedTerm, EncodedTerm);
 
-/// One Profile revision and the Turtle shapes it publishes.
-#[derive(Clone, Debug)]
-pub(crate) struct ProfileShapes {
-    /// Graph the shapes are installed under, unique per Profile revision.
-    pub graph_iri: String,
-    pub sources: Vec<String>,
-}
-
-/// Structural RO-Crate findings and SHACL results for one candidate document.
-#[derive(Debug, Default)]
-pub(crate) struct ProfileShaclReport {
-    pub results: Vec<ShaclValidationResult>,
-    pub structural: Vec<CrateViolation>,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ProfileShaclError {
-    /// A permanent property of the registered Profile: fail closed.
-    #[error("{message}")]
-    Unsupported { rule: String, message: String },
-    #[error("{message}")]
-    Limit { message: String },
-    #[error("{message}")]
-    Unavailable { message: String },
-    #[error("{message}")]
-    InvalidInput { message: String },
-}
-
 struct CachedProfile {
     graph: GraphId,
     policies: Vec<(RoCrateVersion, CompiledRoCratePolicy)>,
 }
 
-pub(crate) struct ProfileShaclEngine {
+pub struct ProfileShaclEngine {
     node: CraqleNode,
     cached: Mutex<VecDeque<CachedProfile>>,
 }
@@ -87,7 +57,7 @@ pub(crate) struct ProfileShaclEngine {
 impl ProfileShaclEngine {
     /// Opens the validation store. Its contents are derived from registered
     /// Profiles, so a previous directory is discarded instead of recovered.
-    pub(crate) fn open(path: &Path) -> Result<Self, CraqleError> {
+    pub fn open(path: &Path) -> Result<Self, CraqleError> {
         if path.exists() {
             std::fs::remove_dir_all(path)?;
         }
@@ -101,14 +71,14 @@ impl ProfileShaclEngine {
     }
 
     /// Structural RO-Crate findings only, for a document with no Profile tag.
-    pub(crate) fn structural(
+    pub fn structural(
         &self,
         jsonld: &str,
     ) -> Result<Vec<CrateViolation>, ProfileShaclError> {
         Ok(self.prepare(jsonld)?.structural_findings().to_vec())
     }
 
-    pub(crate) fn evaluate(
+    pub fn evaluate(
         &self,
         profile: &ProfileShapes,
         jsonld: &str,
