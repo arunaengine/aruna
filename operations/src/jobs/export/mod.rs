@@ -79,8 +79,13 @@ use aruna_core::managed_copy::{
 };
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
+use resolve::{
+    CandidateSource, ExportCandidate, LocalSource, ResolveError, ResolveLocalOperation,
+    ResolveResult,
+};
 
 pub(crate) mod archive;
+mod resolve;
 use archive::*;
 
 const METADATA_PATH: &str = aruna_core::repository::rules::CRATE_FILES[0];
@@ -227,34 +232,6 @@ struct ExportEntity {
     content: Option<([u8; 32], u64)>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ExportCandidate {
-    source: CandidateSource,
-    report_source: ExportReportSource,
-    resolved_version: Option<Ulid>,
-    expected_blake3: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum CandidateSource {
-    Local {
-        location: BackendLocation,
-        group_id: GroupId,
-        permission_path: String,
-        node_id: NodeId,
-        bucket: String,
-        key: String,
-    },
-    RemoteExact {
-        node_id: NodeId,
-        target: VersionedObjectArn,
-    },
-    RemoteHash {
-        node_id: NodeId,
-        hash: [u8; 32],
-    },
-}
-
 #[derive(Debug)]
 struct ProbedEntry {
     entity_index: usize,
@@ -308,12 +285,6 @@ enum ExportFailure {
     },
     Cancelled,
     Interrupted,
-}
-
-enum ResolveResult {
-    Candidate(ExportCandidate),
-    Denied,
-    Missing { hash: Option<[u8; 32]> },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1245,98 +1216,22 @@ async fn resolve_exact(
     spec: &ExportRoCrateSpec,
     exact: &VersionedObjectArn,
 ) -> Result<ResolveResult, ExportFailure> {
-    let txn_id = start_read_txn(&ctx.driver).await?;
-    let result = resolve_exact_txn(ctx, spec, exact, txn_id).await;
-    match result {
-        Ok(result) => {
-            commit_read_txn(&ctx.driver, txn_id).await?;
-            Ok(result)
-        }
-        Err(error) => {
-            abort_read_txn(&ctx.driver, txn_id).await;
-            Err(error)
-        }
-    }
+    resolve_local(ctx, spec, LocalSource::Exact(exact.clone())).await
 }
 
-async fn resolve_exact_txn(
+/// Resolves one local source in its own read snapshot; see [`ResolveLocalOperation`].
+async fn resolve_local(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
-    exact: &VersionedObjectArn,
-    txn_id: TxnId,
+    source: LocalSource,
 ) -> Result<ResolveResult, ExportFailure> {
-    let Some(bucket) = storage_value(
-        &ctx.driver,
-        S3_BUCKET_KEYSPACE,
-        exact.bucket.as_bytes().to_vec().into(),
-        Some(txn_id),
-    )
-    .await?
-    else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let bucket = BucketInfo::from_bytes(bucket.as_ref())
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    let permission_path = object_permission_path(
-        spec.auth_context.realm_id,
-        bucket.group_id,
-        exact.node_id,
-        &exact.bucket,
-        &exact.key,
-    );
-    let evaluator = load_policy_txn(&ctx.driver, spec, bucket.group_id, txn_id).await?;
-    if !check_read_txn(&ctx.driver, spec, &permission_path, &evaluator, txn_id).await? {
-        return Ok(ResolveResult::Denied);
-    }
-    let key = VersionKey::new(exact.bucket.clone(), exact.key.clone(), exact.version)
-        .to_bytes()
-        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let Some(value) = storage_value(
-        &ctx.driver,
-        BLOB_VERSIONS_KEYSPACE,
-        key.into(),
-        Some(txn_id),
-    )
-    .await?
-    else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let version = BlobVersion::from_bytes(value.as_ref())
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    let Some(hash) = version.blob_hash().copied() else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let Some(location_key) = version.location_key() else {
-        return Ok(ResolveResult::Missing { hash: Some(hash) });
-    };
-    let Some(location) = storage_value(
-        &ctx.driver,
-        BLOB_LOCATIONS_KEYSPACE,
-        location_key.to_bytes().into(),
-        Some(txn_id),
-    )
-    .await?
-    else {
-        return Ok(ResolveResult::Missing { hash: Some(hash) });
-    };
-    let location = BackendLocation::from_bytes(location.as_ref())
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    if location.get_blake3() != Some(hash.as_slice()) {
-        return Ok(ResolveResult::Missing { hash: Some(hash) });
-    }
-    Ok(ResolveResult::Candidate(ExportCandidate {
-        source: CandidateSource::Local {
-            location,
-            group_id: bucket.group_id,
-            permission_path,
-            node_id: exact.node_id,
-            bucket: exact.bucket.clone(),
-            key: exact.key.clone(),
-        },
-        report_source: ExportReportSource::Local,
-        resolved_version: Some(exact.version),
-        expected_blake3: Some(hash),
-    }))
+    let operation = ResolveLocalOperation::new(spec.auth_context.clone(), source);
+    drive(operation, &ctx.driver)
+        .await
+        .map_err(|error| match error {
+            ResolveError::Retryable(message) => ExportFailure::Retryable(message),
+            ResolveError::Permanent(message) => ExportFailure::Permanent(message),
+        })
 }
 
 async fn resolve_alias(
@@ -1354,80 +1249,7 @@ async fn resolve_alias(
     if !is_allowed {
         return Ok(ResolveResult::Denied);
     }
-    let txn_id = start_read_txn(&ctx.driver).await?;
-    let result = resolve_alias_txn(ctx, spec, alias, txn_id, &permission_path).await;
-    match result {
-        Ok(result) => {
-            commit_read_txn(&ctx.driver, txn_id).await?;
-            Ok(result)
-        }
-        Err(error) => {
-            abort_read_txn(&ctx.driver, txn_id).await;
-            Err(error)
-        }
-    }
-}
-
-async fn resolve_alias_txn(
-    ctx: &JobContext,
-    spec: &ExportRoCrateSpec,
-    alias: &HashIndex,
-    txn_id: TxnId,
-    permission_path: &str,
-) -> Result<ResolveResult, ExportFailure> {
-    let evaluator = load_policy_txn(&ctx.driver, spec, alias.group_id, txn_id).await?;
-    if !check_read_txn(&ctx.driver, spec, permission_path, &evaluator, txn_id).await? {
-        return Ok(ResolveResult::Denied);
-    }
-    let key = VersionKey::new(alias.bucket.clone(), alias.key.clone(), alias.version_id)
-        .to_bytes()
-        .map_err(|error| ExportFailure::Permanent(error.to_string()))?;
-    let Some(value) = storage_value(
-        &ctx.driver,
-        BLOB_VERSIONS_KEYSPACE,
-        key.into(),
-        Some(txn_id),
-    )
-    .await?
-    else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let version = BlobVersion::from_bytes(value.as_ref())
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    if version.blob_hash() != Some(&alias.blake3_hash) {
-        return Ok(ResolveResult::Missing { hash: None });
-    }
-    let Some(location_key) = version.location_key() else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let Some(location) = storage_value(
-        &ctx.driver,
-        BLOB_LOCATIONS_KEYSPACE,
-        location_key.to_bytes().into(),
-        Some(txn_id),
-    )
-    .await?
-    else {
-        return Ok(ResolveResult::Missing { hash: None });
-    };
-    let location = BackendLocation::from_bytes(location.as_ref())
-        .map_err(|error| ExportFailure::Retryable(error.to_string()))?;
-    if location.get_blake3() != Some(alias.blake3_hash.as_slice()) {
-        return Ok(ResolveResult::Missing { hash: None });
-    }
-    Ok(ResolveResult::Candidate(ExportCandidate {
-        source: CandidateSource::Local {
-            location,
-            group_id: alias.group_id,
-            permission_path: permission_path.to_string(),
-            node_id: alias.node_id,
-            bucket: alias.bucket.clone(),
-            key: alias.key.clone(),
-        },
-        report_source: ExportReportSource::Hash,
-        resolved_version: Some(alias.version_id),
-        expected_blake3: Some(alias.blake3_hash),
-    }))
+    resolve_local(ctx, spec, LocalSource::Alias(alias.clone())).await
 }
 
 fn unexpected_view() -> ExportFailure {
