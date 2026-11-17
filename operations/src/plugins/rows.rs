@@ -219,8 +219,9 @@ impl<P: Plan> Operation for RowsOperation<P> {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        let Event::Storage(event) = event else {
-            return self.fail(StoreError(format!("{event:?}")));
+        let event = match event {
+            Event::Storage(event) => event,
+            other => return self.fail(StoreError(format!("{other:?}"))),
         };
         match (std::mem::replace(&mut self.state, State::Created), event) {
             (State::Starting(ask), StorageEvent::TransactionStarted { txn_id }) => {
