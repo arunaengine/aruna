@@ -1246,6 +1246,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let result = list_audit(
@@ -1302,6 +1303,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let node = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let operation = ListAuditOperation::new(
@@ -1691,6 +1693,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         });
         let realm_id = RealmId([8u8; 32]);
         let group_id = Ulid::from_bytes([9u8; 16]);
@@ -1868,6 +1871,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([9u8; 32]);
         let group_id = Ulid::from_bytes([3u8; 16]);

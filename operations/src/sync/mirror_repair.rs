@@ -1222,6 +1222,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let relationship = relationship();
         let realm_id = relationship.source.realm_id;
@@ -1315,6 +1316,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (tempdir, context)
     }
@@ -1521,6 +1523,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let relationship = relationship();
 
@@ -1559,6 +1562,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let relationship = relationship();
         drive(
@@ -1600,6 +1604,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut relationship = relationship();
         relationship.state = SyncState::Failed {
@@ -1724,6 +1729,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut relationship = relationship;
         stored(&context, &relationship).await;
@@ -1743,6 +1749,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut current = relationship();
         let stale = current.clone();
@@ -1820,6 +1827,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         clear_mirror_repair(&context, &stale, SyncMirrorIntent::Reconcile)
             .await
@@ -1856,6 +1864,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         clear_mirror_repair(&context, &stale, SyncMirrorIntent::Delete)
             .await

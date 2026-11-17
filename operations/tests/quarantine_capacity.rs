@@ -36,6 +36,7 @@ fn context(storage: StorageHandle) -> DriverContext {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 

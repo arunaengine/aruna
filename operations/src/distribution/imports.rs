@@ -743,6 +743,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         assert!(open_imports(&context, "spire").await.unwrap().is_empty());
     }
@@ -775,6 +776,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let open = open_imports(&context, "spire").await.unwrap();
@@ -802,6 +804,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let transfer_id = Ulid::from_bytes([8; 16]);
         keep_resume(&context, "spire", transfer_id).await.unwrap();

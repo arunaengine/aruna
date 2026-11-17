@@ -817,6 +817,7 @@ pub(super) async fn resolve_visibility_scope(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let permissions = GroupPermissionRules::collect(
         &context,

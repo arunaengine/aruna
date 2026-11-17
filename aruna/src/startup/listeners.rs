@@ -563,6 +563,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x46; 32]);
         let shutdown = Shutdown::new();
@@ -678,6 +679,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
 
         let error = match bind(
@@ -772,6 +774,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         match bind(
             config,
@@ -836,6 +839,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             CorsConfig::default(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
@@ -866,6 +870,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x44; 32]);
         let session = SessionS3 {
@@ -915,6 +920,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x45; 32]);
         let session = SessionS3 {

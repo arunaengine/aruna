@@ -70,6 +70,7 @@ async fn fixture() -> Fixture {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let owner = UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {

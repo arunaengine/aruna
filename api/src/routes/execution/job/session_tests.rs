@@ -214,6 +214,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
         metadata_handle: None,
         task_handle: None,
         compute_handle: Some(registry.clone()),
+        outbound_handle: None,
     });
     let job_id = JobId::from_bytes([3u8; 16]);
     let mut record = JobRecord::new(

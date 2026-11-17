@@ -193,6 +193,7 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
         metadata_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());

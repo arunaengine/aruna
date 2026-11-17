@@ -100,6 +100,7 @@ async fn restart_recovers_jobs() -> Result<(), Box<dyn std::error::Error>> {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     drive_until_terminal(&context, &runtime).await?;

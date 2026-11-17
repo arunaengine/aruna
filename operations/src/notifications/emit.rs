@@ -542,6 +542,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(

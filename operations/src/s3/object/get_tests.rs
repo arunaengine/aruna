@@ -672,6 +672,7 @@ pub async fn test_get_object() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -772,6 +773,7 @@ async fn routed_missing_blob() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let read = get_object_routed(
@@ -934,6 +936,7 @@ pub async fn hash_mismatch_rejected() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -998,6 +1001,7 @@ async fn bound_connector_used() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let bucket = "s3test".to_string();
@@ -1180,6 +1184,7 @@ async fn drift_creates_successor() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();
@@ -2266,6 +2271,7 @@ async fn historical_drift_fails() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();

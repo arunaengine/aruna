@@ -3210,6 +3210,7 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     initialize_incoming_fixture(context.clone());
     let state = Arc::new(
@@ -4481,6 +4482,7 @@ async fn setup_closed_storage() -> Arc<ServerState> {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,

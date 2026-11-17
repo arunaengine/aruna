@@ -46,6 +46,7 @@ async fn preflight_fanout_reports() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[61u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[62u8; 32]).public();

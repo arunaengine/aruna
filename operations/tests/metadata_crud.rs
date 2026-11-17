@@ -1003,6 +1003,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,
@@ -1041,6 +1042,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         metadata_handle: Some(metadata_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,

@@ -318,6 +318,7 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let unavailable = list_for_user(
         no_net.as_ref(),
@@ -521,6 +522,7 @@ async fn build_node(
         metadata_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();

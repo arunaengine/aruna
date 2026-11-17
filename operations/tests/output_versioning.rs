@@ -120,6 +120,7 @@ async fn setup() -> Harness {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         },
         realm_id,
         node_id,

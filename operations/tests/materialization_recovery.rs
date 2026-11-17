@@ -653,6 +653,7 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
         metadata_handle,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(TestContext {
         _storage_dir: storage_dir,

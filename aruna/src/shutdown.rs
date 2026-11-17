@@ -975,6 +975,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x58; 32]);
         let server = S3Server::new(

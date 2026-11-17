@@ -38,6 +38,7 @@ async fn preflight_discloses_cleanup() {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }),
         realm_id,
         local_node,

@@ -53,6 +53,7 @@ pub(super) fn context(path: &std::path::Path) -> DriverContext {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 

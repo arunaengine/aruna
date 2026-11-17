@@ -28,6 +28,7 @@ aruna-core = { workspace = true }
 aruna-net = { workspace = true }
 aruna-operations = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-outbound = { workspace = true }
 aruna-tasks = { workspace = true }
 irokle = { workspace = true }
 

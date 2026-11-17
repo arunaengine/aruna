@@ -86,6 +86,7 @@ async fn setup() -> Fixture {
                 metadata_handle: None,
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,

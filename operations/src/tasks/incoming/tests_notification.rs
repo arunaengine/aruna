@@ -28,6 +28,7 @@ async fn notification_drain_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
@@ -60,6 +61,7 @@ async fn notification_drain_unresolvable() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
@@ -134,6 +136,7 @@ async fn notification_delivers_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     crate::sync::incoming::initialize_incoming_fixture(context_b.clone());
 
@@ -144,6 +147,7 @@ async fn notification_delivers_holder() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context_a, JobsRuntime::new());
     handler.drain_notification_outbox().await;
@@ -180,6 +184,7 @@ async fn notification_drain_warn() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
@@ -232,6 +237,7 @@ async fn drain_retries_queueing() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
     handler.drain_notification_outbox().await;
@@ -345,6 +351,7 @@ async fn device_skips_holders() {
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());

@@ -3322,6 +3322,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = input.auth_context.realm_id;
         let group_id = Ulid::from_bytes([3u8; 16]);

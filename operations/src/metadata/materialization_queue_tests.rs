@@ -168,6 +168,7 @@ async fn corrupt_job_only() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -245,6 +246,7 @@ async fn corrupt_global_job() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -344,6 +346,7 @@ async fn orphan_global_job() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)
@@ -1662,6 +1665,7 @@ async fn late_merges_chain() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let document_id = Ulid::from_bytes([6u8; 16]);
     let newer = create_event(document_id, Ulid::from_parts(9, 1), "newer");
@@ -2162,6 +2166,7 @@ async fn failing_apply_reschedules() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = process_materialization_batch(&context)

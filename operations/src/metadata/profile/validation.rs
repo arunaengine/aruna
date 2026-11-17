@@ -1427,6 +1427,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let group_id = Ulid::from_parts(1, 1);

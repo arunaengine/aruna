@@ -303,6 +303,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: Some(task_handle.clone()),
                 compute_handle: None,
+                outbound_handle: None,
             });
             // No incoming loops are started: snapshot and restore are the
             // subject, and a background writer would conflict the fixture.

@@ -51,6 +51,7 @@ async fn counts_owner_group() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let (snapshot, bytes) = record(true);
     store_record(&context.storage_handle, snapshot.set_id(), bytes).await;
@@ -80,6 +81,7 @@ async fn reads_deleting_record() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let (mut snapshot, _) = record(true);
     snapshot.lifecycle.deletion = Some(Deletion {

@@ -184,6 +184,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let operation = GetAccessOperation::new(access_key_id.to_string());

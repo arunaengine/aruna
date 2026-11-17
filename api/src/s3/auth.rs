@@ -1217,6 +1217,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         AuthProvider {
             driver_ctx,

@@ -1511,6 +1511,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -1550,6 +1551,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -1586,6 +1588,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let marker_key = pending_projection_key(event.record.document_id, event.event_id);
 
@@ -1646,6 +1649,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = transactional_projection_write(
@@ -1699,6 +1703,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1743,6 +1748,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1779,6 +1785,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1865,6 +1872,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_event(&context, event.clone(), Some(event.node_id))
@@ -2081,6 +2089,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         for _ in 0..2 {
             project_create_event(&context, event.clone(), Some(local))
@@ -2126,6 +2135,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             };
             let other = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
             project_create_event(&context, event, Some(other))
@@ -2179,6 +2189,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_event(&context, event.clone(), Some(event.node_id))
@@ -2420,6 +2431,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = project_create_events(&context, vec![event], None)
@@ -2460,6 +2472,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = drain_projection_queue(&context)

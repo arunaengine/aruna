@@ -639,6 +639,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let blocked = Key::from(b"blocked".to_vec());
         let later = Key::from(b"later".to_vec());

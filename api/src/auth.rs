@@ -857,6 +857,7 @@ mod test {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
@@ -1097,6 +1098,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
         let realm_signing_key = generate_signing_key();
@@ -1521,6 +1523,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -1704,6 +1707,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -1809,6 +1813,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -2098,6 +2103,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -2156,6 +2162,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 

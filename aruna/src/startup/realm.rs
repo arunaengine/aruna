@@ -390,6 +390,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();

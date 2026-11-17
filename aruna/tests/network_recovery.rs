@@ -156,6 +156,7 @@ async fn rejoin_peer(
         metadata_handle: Some(metadata),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     initialize_incoming_fixture(context.clone());
     peer.add_peer_addr(seed.net.endpoint_addr()).await;

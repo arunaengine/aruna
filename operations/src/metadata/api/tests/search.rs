@@ -20,6 +20,7 @@ async fn bucket_fanout_partial() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[41u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
@@ -68,6 +69,7 @@ async fn object_fanout_reports() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[81u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[82u8; 32]).public();
@@ -116,6 +118,7 @@ async fn object_fanout_strict() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[84u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[85u8; 32]).public();
@@ -156,6 +159,7 @@ async fn bucket_denial_wins() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[49u8; 32]).public();
     let denied = iroh::SecretKey::from_bytes(&[50u8; 32]).public();
@@ -200,6 +204,7 @@ async fn fanout_missing_fails() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[47u8; 32]).public();
     let stale = iroh::SecretKey::from_bytes(&[48u8; 32]).public();
@@ -245,6 +250,7 @@ async fn search_deadline_partial() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let local = iroh::SecretKey::from_bytes(&[44u8; 32]).public();
     let healthy = iroh::SecretKey::from_bytes(&[45u8; 32]).public();
@@ -295,6 +301,7 @@ async fn capped_fanout_incomplete() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let nodes = (0..=QUERY_MAX_NODES)
         .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())
@@ -330,6 +337,7 @@ async fn names_capped_nodes() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let nodes = (0..=QUERY_MAX_NODES)
         .map(|index| iroh::SecretKey::from_bytes(&[60 + index as u8; 32]).public())

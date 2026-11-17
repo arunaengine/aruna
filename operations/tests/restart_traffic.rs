@@ -984,6 +984,7 @@ fn drain_context(node: &TestNode) -> Arc<DriverContext> {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     })
 }
 

@@ -103,6 +103,7 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
@@ -209,6 +210,7 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         metadata_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let mut secret_bytes = [0u8; 32];
@@ -483,6 +485,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let validation_state = DoctorValidationState::load(driver_ctx.as_ref()).await;
     let token_view = build_token_view(&token, &validation_state).await?;
@@ -793,6 +796,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
         let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
         let shutdown = aruna_core::shutdown::Shutdown::new();

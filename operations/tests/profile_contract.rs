@@ -1666,6 +1666,7 @@ async fn build_context(
         metadata_handle: Some(metadata),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(TestContext {
         _test_lock: test_lock,

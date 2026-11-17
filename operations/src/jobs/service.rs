@@ -1671,6 +1671,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1u8; 32]);
         let mut spec = ExecutionSpec {
@@ -1935,6 +1936,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let payload = JobPayload::Probe {
@@ -1992,6 +1994,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let job_id = JobId::from_bytes([3u8; 16]);
@@ -2030,6 +2033,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([1u8; 32]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -2087,6 +2091,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
         let runtime = JobsRuntime::new();

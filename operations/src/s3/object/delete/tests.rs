@@ -708,6 +708,7 @@ async fn missing_version_rejected() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = drive(
@@ -761,6 +762,7 @@ async fn creates_tombstone() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
@@ -913,6 +915,7 @@ async fn deletes_version() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
@@ -1287,6 +1290,7 @@ async fn pending_archive_shared() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     // Two versions of one key share the archive, as a same-bucket copy does.
     let (first, second) = (Ulid::generate(), Ulid::generate());
@@ -1368,6 +1372,7 @@ async fn malformed_owner_aborts() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1417,6 +1422,7 @@ async fn removes_envelope_rows() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1483,6 +1489,7 @@ async fn removes_pending_copy() {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let version_id = Ulid::generate();
         let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1752,6 +1759,7 @@ async fn bucket_rows_sum() {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);

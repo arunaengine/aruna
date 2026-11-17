@@ -286,6 +286,7 @@ async fn spawn_node(
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
     initialize_incoming_fixture(driver_ctx.clone());
     let shutdown = aruna_core::shutdown::Shutdown::new();

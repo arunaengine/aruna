@@ -1118,6 +1118,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);
@@ -1198,6 +1199,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = aruna_core::structs::identity::realm::RealmId([0u8; 32]);

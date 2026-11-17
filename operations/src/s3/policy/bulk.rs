@@ -1150,6 +1150,7 @@ mod tests {
             metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let actor = Actor {
             node_id: fixture.node_id,

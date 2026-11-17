@@ -92,6 +92,7 @@ pub async fn setup_on(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let group_id = Ulid::generate();
     let user_id = UserId::local(Ulid::generate(), realm_id());

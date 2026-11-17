@@ -705,6 +705,7 @@ async fn spawn_single() -> Result<Node, BoxError> {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Node {
         _dir: dir,

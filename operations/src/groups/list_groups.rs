@@ -277,6 +277,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let mut groups = Vec::new();

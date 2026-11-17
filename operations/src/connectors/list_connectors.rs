@@ -165,6 +165,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let group_id = ulid::Ulid::generate();
 

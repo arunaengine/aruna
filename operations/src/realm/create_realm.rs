@@ -1198,6 +1198,7 @@ mod test {
             metadata_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_signing_key: SigningKey = generate_signing_key();

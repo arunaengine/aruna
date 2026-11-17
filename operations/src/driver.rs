@@ -40,6 +40,8 @@ pub struct DriverContext {
     pub task_handle: Option<TaskHandle>,
     /// Enabled executor backends; `None` on nodes with no compute plane.
     pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
+    /// HTTP and mail clients; `None` where outbound calls answer as unavailable.
+    pub outbound_handle: Option<aruna_outbound::OutboundHandle>,
 }
 
 impl DriverContext {
@@ -83,6 +85,7 @@ impl std::fmt::Debug for DriverContext {
             .field("metadata_handle", &self.metadata_handle.is_some())
             .field("task_handle", &self.task_handle.is_some())
             .field("compute_handle", &self.compute_handle.is_some())
+            .field("outbound_handle", &self.outbound_handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1075,6 +1078,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (directory, context)
     }
@@ -1113,6 +1117,7 @@ mod test {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }
@@ -1268,6 +1273,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -1301,6 +1307,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -1403,6 +1410,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
@@ -1954,6 +1962,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let aborted = crate::driver::drive_until(
@@ -1995,6 +2004,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let operation = TestOperation::new();
@@ -2067,6 +2077,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
@@ -2162,6 +2173,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let observed = drive(StagingDispatchOperation::new(), &context)
@@ -2237,6 +2249,7 @@ mod test {
                         metadata_handle: None,
                         task_handle: None,
                         compute_handle: None,
+                        outbound_handle: None,
                     };
 
                     let event = drive(RecursiveSubOperation::new(), &context)
@@ -2266,6 +2279,7 @@ mod test {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
         .bulk();
         let read = StorageEffect::Read {

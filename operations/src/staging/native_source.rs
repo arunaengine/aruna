@@ -1010,6 +1010,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
         let source = iroh::SecretKey::from_bytes(&[3; 32]).public();

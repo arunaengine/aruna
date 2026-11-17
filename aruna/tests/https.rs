@@ -529,6 +529,7 @@ async fn drained_stack(
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let secret = iroh::SecretKey::from_bytes(&[0x61; 32]);
     let stack = tls_s3(

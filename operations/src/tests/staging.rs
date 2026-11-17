@@ -62,6 +62,7 @@ pub(crate) async fn setup_driver_context() -> StagingTestContext {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         },
     }
 }

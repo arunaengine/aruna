@@ -238,6 +238,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let txn_id = match storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -354,6 +355,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = *net_handle.realm_id();
         let actor = Actor {
@@ -407,6 +409,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let event = dispatch_storage(

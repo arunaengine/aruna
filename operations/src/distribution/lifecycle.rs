@@ -1219,6 +1219,7 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
         let key = [1u8; 16];
