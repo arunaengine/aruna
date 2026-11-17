@@ -9,12 +9,7 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
-};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::NetHandle;
 use aruna_core::alpn::Alpn;
@@ -28,15 +23,10 @@ use tokio::time::{Instant, timeout_at};
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::checks::{
-    message_realm, validate_inbound_batch, validate_watch_events, verify_batch_holder,
-    verify_node_origin, verify_recipient_holder,
-};
+use crate::notifications::checks::{message_realm, validate_watch_events, verify_recipient_holder};
 use crate::triggers::{PeerInput, peer_operation};
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
 use crate::notifications::mark_read::MARK_MAX_IDS;
-use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
-use crate::notifications::placement::resolve_inbox_holder;
 
 use crate::notifications::watch::authorization::{
     WatchAuthorization, authorize_forwarded_watch, list_authorized_subscriptions,

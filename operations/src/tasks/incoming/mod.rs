@@ -15,10 +15,8 @@ use aruna_core::document::{
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::{JobExecutionClass, RoCrateLimits};
-use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -89,7 +87,6 @@ use crate::metadata::prune_queue::{
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
-use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::watch::interest::{
     WATCH_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,

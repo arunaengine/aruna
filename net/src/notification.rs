@@ -49,14 +49,14 @@ pub async fn write_frame(stream: &mut BiStream, bytes: &[u8]) -> Result<(), Stri
         return Err("notification message exceeds maximum size".to_string());
     }
     let write = async {
-        stream.0.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-        stream.0.write_all(bytes).await?;
-        stream.0.flush().await
+        let length = (bytes.len() as u32).to_be_bytes();
+        stream.0.write_all(&length).await.map_err(|error| error.to_string())?;
+        stream.0.write_all(bytes).await.map_err(|error| error.to_string())?;
+        stream.0.flush().await.map_err(|error| error.to_string())
     };
     timeout(NOTIFICATION_IO_TIMEOUT, write)
         .await
         .map_err(|_| "timed out writing notification message".to_string())?
-        .map_err(|error| error.to_string())
 }
 
 /// Reads one length-prefixed frame body within the I/O timeout, at most the frame bound.
