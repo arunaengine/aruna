@@ -10,22 +10,22 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::FetchScope;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_tasks::shutdown::Shutdown;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::ArtifactBytes;
 use super::copies::{
-    Assembled, Chunk, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve,
-    store_chunk, store_local, sweep_copies,
+    Assembled, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve, store_chunk,
+    store_local, sweep_copies,
 };
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::plugins::{ArtifactBytes, Chunk};
 
 /// How often a node sweeps its copies, and a management node repairs missing copies and the
 /// accounts and roles of its installs.
@@ -46,7 +46,7 @@ pub enum ArtifactError {
 }
 
 /// Whether `bytes` are exactly the artifact `plugin` publishes: digest, size and manifest.
-pub fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
+pub(crate) fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), ArtifactError> {
     let digest = ArtifactDigest::of(bytes);
     if digest.as_str() != plugin.digest || bytes.len() as u64 != plugin.size {
         return Err(ArtifactError::Mismatch);
@@ -61,7 +61,7 @@ pub fn check_published(bytes: &[u8], plugin: &PublishedPlugin) -> Result<(), Art
 
 /// The published artifact with `digest`: this node's copy, else one from a management node,
 /// checked and kept here. The caller holds the bytes' memory reservation until it drops them.
-pub async fn fetch_artifact(
+pub(crate) async fn fetch_artifact(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
     digest: &str,
@@ -137,7 +137,7 @@ pub fn managers(config: &RealmConfigDocument) -> impl Iterator<Item = NodeId> + 
 }
 
 /// Who may hand this node a copy to keep: only another management node, to a management node.
-pub fn check_store(
+pub(crate) fn check_store(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -152,7 +152,7 @@ pub fn check_store(
 }
 
 /// Who may fetch a copy from this node: infrastructure nodes, and only published digests.
-pub fn check_fetch(
+pub(crate) fn check_fetch(
     config: &RealmConfigDocument,
     local: NodeId,
     peer: NodeId,
@@ -226,7 +226,7 @@ pub(crate) async fn local_config(
 }
 
 /// Copies published artifacts this management node lacks from the other management nodes.
-pub async fn repair_artifacts(ctx: &DriverContext) -> Result<usize, ArtifactError> {
+pub(crate) async fn repair_artifacts(ctx: &DriverContext) -> Result<usize, ArtifactError> {
     let (config, local) = local_config(ctx)
         .await
         .map_err(|_| ArtifactError::Unavailable("realm config unavailable".into()))?;

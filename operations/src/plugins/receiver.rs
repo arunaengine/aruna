@@ -11,13 +11,13 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
-use crate::realm::mutate_placement::node_kind;
-use aruna_core::placement::{
+use crate::placement::{
     PlacementResolutionContext, meta_bucket_subject, strategy_for_target, try_resolve_holders,
 };
+use crate::realm::mutate_placement::node_kind;
 
 /// The first eligible holder of the group's root metadata bucket, in holder order.
-pub fn pick_receiver(
+pub(crate) fn pick_receiver(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     group_id: GroupId,

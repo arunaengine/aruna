@@ -19,7 +19,7 @@ use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
 use crate::jobs::repository::TransferError;
 use crate::jobs::repository::link_queue::current_event;
-use crate::jobs::repository::links::read_secret;
+use crate::jobs::repository::link_store::read_secret;
 use crate::jobs::repository::push::creator_auth;
 
 /// Fails as remote changed when the lineage moved outside Aruna; returns a parent's latest version.

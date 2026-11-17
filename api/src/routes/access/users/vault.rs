@@ -338,7 +338,7 @@ pub async fn delete_vault(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::tests::routes::{test_context, test_state, test_storage, write_doc};
+    use crate::tests::routes::{test_state, test_storage, write_doc};
     use crate::tests::users::{realm_auth, setup_state};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -346,6 +346,7 @@ pub(super) mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_operations::testing::test_context;
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 

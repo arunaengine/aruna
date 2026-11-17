@@ -36,6 +36,7 @@ use super::export::ExportCheckpoint;
 pub mod check;
 pub mod invenio;
 pub mod link_queue;
+pub mod link_store;
 pub mod links;
 pub mod pull;
 pub(crate) mod push;

@@ -6,6 +6,7 @@ mod audit;
 mod blob;
 mod metadata;
 mod net;
+mod session;
 mod storage;
 mod task;
 
@@ -58,11 +59,6 @@ pub(crate) async fn dispatch_effect_until(
             blob::dispatch_local_file(local_file_effect, context).await
         }
         Effect::Storage(storage_effect) => storage::dispatch_storage(storage_effect, context).await,
-        // Job-control routing runs its frame I/O here, where the runner holds
-        // the context; the net crate never sees this effect.
-        Effect::Net(NetEffect::JobControl(job_control)) => {
-            Box::pin(net::dispatch_job_control(*job_control, context)).await
-        }
         // Audit fan-out runs its frame I/O here for the same reason.
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
@@ -83,11 +79,28 @@ pub(crate) async fn dispatch_effect_until(
         // Job-record replication and launch offers resolve their holders in the
         // operation and run only the holder round-trips here.
         Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
-            Box::pin(crate::jobs::records::dispatch_record(context, *record)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_record(
+                context, *record,
+            ))
+            .await,
         )),
         Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
-            Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
+            Box::pin(crate::jobs::records::transport::dispatch_offer(
+                context, *offer,
+            ))
+            .await,
         )),
+        // A plugin artifact chunk travels over the metadata transport, which the runner holds.
+        Effect::Net(NetEffect::ArtifactStore(store)) => {
+            let stored = match context.metadata_handle.as_ref() {
+                Some(handle) => (handle
+                    .request_store_artifact(store.node_id, store.chunk)
+                    .await)
+                    .map_err(|error| format!("{error:?}")),
+                None => Err("no metadata transport on this node".to_string()),
+            };
+            Event::Net(NetEvent::ArtifactStored(stored))
+        }
         // The metadata transport lives in the metadata handle the runner holds.
         Effect::Net(NetEffect::MetadataRequest(request)) => {
             Box::pin(metadata::dispatch_request(*request, context)).await
@@ -129,6 +142,9 @@ pub(crate) async fn dispatch_effect_until(
             let results = group.members.iter().map(|_| GroupResult::Refused).collect();
             Event::Group(GroupEvent::Finished { results })
         }
+        Effect::Session(effect) => {
+            Event::Session(Box::new(session::dispatch_session(*effect, context).await))
+        }
     };
 
     trace!(
@@ -162,5 +178,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Search() => "search",
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
     }
 }

@@ -8,7 +8,8 @@ use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::job::{
     ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportDetail, ImportReportRow,
     ImportRoCrateResult, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload,
-    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, parse_schedule_key, pid_dedup_key,
+    LEASE_INDEX_PREFIX, ReasonCode, RoCrateLimits, job_schedule_key, parse_schedule_key,
+    pid_dedup_key,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;

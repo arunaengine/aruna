@@ -76,7 +76,7 @@ pub async fn buckets(context: &mut Context<'_>, command: BucketsCommand) -> Resu
                 .map_err(s3_error);
             transfer::revoke_session(&node_api, &session).await;
             created?;
-            let node = session.issuer_node.node_id;
+            let node = session.token.issuer_node.node_id;
             match context.out.json {
                 true => context.out.json(&serde_json::json!({
                     "bucket": name, "group_id": group_id, "node_id": node,
@@ -202,36 +202,36 @@ pub async fn s3_env(
     if show_secret {
         eprintln!(
             "warning: anyone who sees these values can use your access until {}",
-            session.expires_at
+            session.token.expires_at
         );
     }
     if context.out.json {
         let mut value = serde_json::json!({
             "endpoint": session.endpoint,
             "region": S3_REGION,
-            "access_key_id": session.access_key_id,
-            "expires_at": session.expires_at,
-            "node_id": session.issuer_node.node_id,
+            "access_key_id": session.token.access_key_id,
+            "expires_at": session.token.expires_at,
+            "node_id": session.token.issuer_node.node_id,
             "group_id": group_id,
         });
         if show_secret {
-            value["secret_access_key"] = session.secret_access_key.clone().into();
-            value["session_token"] = session.session_token.clone().into();
+            value["secret_access_key"] = session.token.secret_access_key.clone().into();
+            value["session_token"] = session.token.session_token.clone().into();
         }
         return context.out.json(&value);
     }
     let lines = [
         format!(
             "# S3 session of group {group_id} on node {}",
-            session.issuer_node.node_id
+            session.token.issuer_node.node_id
         ),
         format!(
             "# valid until {}; path-style addressing",
-            session.expires_at
+            session.token.expires_at
         ),
         format!("export AWS_ENDPOINT_URL={}", session.endpoint),
         format!("export AWS_DEFAULT_REGION={S3_REGION}"),
-        format!("export AWS_ACCESS_KEY_ID={}", session.access_key_id),
+        format!("export AWS_ACCESS_KEY_ID={}", session.token.access_key_id),
     ];
     for line in lines {
         context.out.line(line)?;
@@ -240,11 +240,11 @@ pub async fn s3_env(
         true => {
             context.out.line(format!(
                 "export AWS_SECRET_ACCESS_KEY={}",
-                session.secret_access_key
+                session.token.secret_access_key
             ))?;
             context.out.line(format!(
                 "export AWS_SESSION_TOKEN={}",
-                session.session_token
+                session.token.session_token
             ))?;
         }
         false => context

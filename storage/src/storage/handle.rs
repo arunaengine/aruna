@@ -213,6 +213,12 @@ impl StorageHandle {
         let _ = self.realm_keys.set(keys);
     }
 
+    /// The realm keys this handle was given, for plugin releases that still open secrets in the
+    /// operation; `None` on nodes without them.
+    pub fn realm_keys(&self) -> Option<&RealmKeys> {
+        self.realm_keys.get()
+    }
+
     /// A handle whose effects dispatch on the bulk lane, served only when the
     /// foreground lane is idle.
     pub fn bulk(&self) -> StorageHandle {

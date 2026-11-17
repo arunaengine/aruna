@@ -315,7 +315,7 @@ mod tests {
     use super::{IMMUTABLE_CACHE, LegalSource, NO_CACHE, PortalConfig, serve_portal_request};
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
-    use crate::server::state::{PortalStatus, ServerState};
+    use crate::server::state::ServerState;
     use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
@@ -331,6 +331,7 @@ mod tests {
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_wire::info::PortalStatus;
     use axum::body::{Body, to_bytes};
     use axum::extract::Request;
     use axum::http::{Method, StatusCode, header};

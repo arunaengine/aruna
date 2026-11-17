@@ -7,18 +7,13 @@ pub(crate) mod archive;
 mod consortium;
 mod reader;
 pub(crate) mod rewrite;
-mod upload;
+pub mod upload;
+pub mod upload_store;
 
-#[cfg(test)]
-pub(crate) use upload::tests::upload_record;
-pub use upload::{
-    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, UploadClaimError,
-    claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, read_rocrate_upload,
-    write_rocrate_upload,
-};
-pub(crate) use upload::{claim_upload, upload_key, upload_stale};
+use upload::UploadClaimError;
+use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
 
-use crate::jobs::export::persist_checkpoint;
+use crate::jobs::export::archive::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::pin::Pin;
@@ -64,7 +59,8 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
-use super::store::{list_job_entries, put_job_entry, put_state, read_state};
+use super::store::query::list_job_entries;
+use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{drive, node_routing};
@@ -595,7 +591,8 @@ async fn spool_source(
         }
         Event::Blob(BlobEvent::Error(error)) => Err(classify_blob(error)),
         other => Err(ImportFailure::Retryable(format!(
-            "unexpected hidden spool event: {other:?}"
+            "unexpected hidden spool event: {}",
+            other.label()
         ))),
     }
 }
@@ -1884,7 +1881,8 @@ async fn read_report(
             Err(ImportFailure::Retryable(error.to_string()))
         }
         other => Err(ImportFailure::Retryable(format!(
-            "unexpected import report event: {other:?}"
+            "unexpected import report event: {}",
+            other.label()
         ))),
     }
 }

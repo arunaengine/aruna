@@ -22,7 +22,7 @@ pub enum SettingError {
 }
 
 /// Every setting with its value or default, as the JSON object an install stores.
-pub fn check_settings(
+pub(crate) fn check_settings(
     manifest: &Manifest,
     values: &Map<String, Value>,
 ) -> Result<String, SettingError> {
@@ -34,7 +34,7 @@ pub fn check_settings(
 }
 
 /// Every field with its value or default; unknown names and wrong values are refused.
-pub fn check_fields(
+pub(crate) fn check_fields(
     fields: &BTreeMap<String, Setting>,
     values: &Map<String, Value>,
 ) -> Result<Map<String, Value>, SettingError> {

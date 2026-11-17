@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;
@@ -61,7 +61,8 @@ pub(crate) async fn drop_trail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::delete_audit::{
         BlobAuditKind, BlobAuditRecord, BlobPurgeKind, trail_key,

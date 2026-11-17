@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::imports::map_error;
 use crate::auth::RealmAuth;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -13,7 +14,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::s3::imports::discovery::{
     FileOutcome, SetDiscoveryOperation, authorized_preview, bucket_access, read_discovery,
 };
-use aruna_operations::s3::imports::{ImportRuleError, read_import};
+use aruna_operations::s3::imports::read_import;
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
@@ -76,17 +77,6 @@ pub struct DiscoveryPreviewResponse {
     /// Pass as `after` for the next page; omitted on the last page. It names a listed file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
-}
-
-fn map_error(error: ImportRuleError) -> ServerError {
-    match error {
-        ImportRuleError::Invalid(message) => ServerError::BadRequestMessage(message),
-        ImportRuleError::Conflict(message) => ServerError::Conflict(message),
-        ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
-        ImportRuleError::NotFound => ServerError::NotFound,
-        ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.into()),
-    }
 }
 
 fn to_rules(rules: Vec<DiscoveryRuleBody>) -> Vec<DiscoveryRule> {

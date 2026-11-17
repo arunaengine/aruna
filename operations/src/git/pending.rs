@@ -5,7 +5,6 @@
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
-use crate::jobs::metadata_class::metadata_error_transient;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
@@ -14,9 +13,9 @@ use crate::metadata::update_document::{
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_tasks::shutdown::Shutdown;
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;
@@ -143,7 +142,7 @@ async fn apply_one(
                 error @ (MetadataError::InvalidInput(_)
                 | MetadataError::Validation(_)
                 | MetadataError::ProfileValidation(_)),
-            )) if !metadata_error_transient(&error) => {
+            )) if !error.is_transient() => {
                 return Err(GitError::Refused(error.to_string()));
             }
             Err(error) => {
@@ -174,11 +173,7 @@ pub fn spawn_drain(context: Arc<DriverContext>, shutdown: &Shutdown) {
 }
 
 async fn drain(context: &DriverContext) {
-    let Some(store) = context
-        .metadata_handle
-        .as_ref()
-        .and_then(|handle| handle.git())
-    else {
+    let Ok(store) = super::store(context) else {
         return;
     };
     let rows = match records::prefixed::<PendingMerge>(context, PENDING, Vec::new()).await {

@@ -6,7 +6,7 @@ use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::Permission;

@@ -11,7 +11,9 @@ use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{RoCrateUploadRecord, job_record_key, parse_dedup_value};
+use aruna_core::structs::execution::job::{
+    JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
+};
 use aruna_core::transfer::{ExportGrant, ImportIntent};
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::export::GrantRecord;
-use crate::jobs::import::{upload_key, upload_stale};
-use crate::jobs::store::decode_job_record;
+use aruna_core::structs::execution::job::{upload_key, upload_stale};
 
 const CONFLICT_RETRIES: u8 = 5;
 
@@ -345,7 +346,7 @@ impl Operation for RecordOperation {
             }
             // The stale upload is gone; it stays bound while an import job holds the key.
             (State::Job, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let held = value.is_some_and(|value| decode_job_record(value.as_ref()).is_ok());
+                let held = value.is_some_and(|value| JobRecord::from_bytes(value.as_ref()).is_ok());
                 match self.stale() {
                     Some(stale) => self.confirm(&stale, None, held),
                     None => self.fail(RecordError::Unexpected),
@@ -612,7 +613,7 @@ mod tests {
         // binding transaction or with its retired upload; the retry keeps the claimed upload.
         let old = Ulid::from_bytes([1; 16]);
         let owner = grant_record().principal;
-        let mut upload = crate::jobs::import::upload_record(owner, old, 10);
+        let mut upload = crate::jobs::import::upload::tests::upload_record(owner, old, 10);
         let mut operation = RecordOperation::new(binding(stale(old)));
         operation.start();
         operation.step(started(1));

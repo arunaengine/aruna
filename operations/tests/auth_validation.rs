@@ -10,12 +10,11 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_token};
 use aruna_operations::auth::error::ArunaBearerError;
+use aruna_operations::testing::sign_token;
 use async_trait::async_trait;
 use base64::Engine;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signer, SigningKey};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, errors::ErrorKind};
+use jsonwebtoken::errors::ErrorKind;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use ulid::Ulid;
@@ -254,16 +253,6 @@ fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
         via: None,
         auth_time: None,
     }
-}
-
-fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
-    let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
-    )
-    .unwrap()
 }
 
 fn public_key_base64(signing_key: &SigningKey) -> String {

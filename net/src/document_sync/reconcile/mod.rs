@@ -480,32 +480,6 @@ impl DocumentSyncService {
     }
 }
 
-pub(in crate::document_sync) fn satisfied_dependencies(
-    target: &DocumentTarget,
-    event: &AdminDocumentEvent,
-) -> Vec<DocumentSyncDependency> {
-    let mut dependencies = Vec::new();
-    match target {
-        DocumentTarget::RealmConfig { realm_id } => {
-            dependencies.push(DocumentSyncDependency::RealmConfig(*realm_id));
-            if let AdminDocumentOperation::PlacementStrategyUpserted { strategy } = &event.op {
-                dependencies.push(DocumentSyncDependency::PlacementStrategy {
-                    realm_id: *realm_id,
-                    strategy_id: strategy.strategy_id,
-                });
-            }
-        }
-        DocumentTarget::RealmAuthorization { realm_id } => {
-            dependencies.push(DocumentSyncDependency::RealmAuthorization(*realm_id));
-        }
-        DocumentTarget::GroupAuthorization { group_id } => {
-            dependencies.push(DocumentSyncDependency::GroupAuthorization(*group_id));
-        }
-        _ => {}
-    }
-    dependencies
-}
-
 pub(in crate::document_sync) async fn dependency_available(
     storage: &StorageHandle,
     dependency: DocumentSyncDependency,
@@ -529,40 +503,4 @@ pub(in crate::document_sync) async fn dependency_available(
             Ok(read_group_authorization(storage, group_id).await?.is_some())
         }
     }
-}
-
-pub(in crate::document_sync) fn register_deferred_topic(
-    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>>,
-    dependency: DocumentSyncDependency,
-    topic_id: ::irokle::TopicId,
-) -> DeferredRegistrationOutcome {
-    if deferred_topics
-        .get(&dependency)
-        .is_some_and(|topics| topics.contains(&topic_id))
-    {
-        return DeferredRegistrationOutcome::AlreadyRegistered;
-    }
-    let total_topics = deferred_topics.values().map(BTreeSet::len).sum::<usize>();
-    let dependency_topics = deferred_topics
-        .get(&dependency)
-        .map(BTreeSet::len)
-        .unwrap_or_default();
-    if total_topics >= MAX_DEFERRED_TOPICS || dependency_topics >= TOPICS_PER_DEPENDENCY {
-        return DeferredRegistrationOutcome::CapacityExceeded;
-    }
-    deferred_topics
-        .entry(dependency)
-        .or_default()
-        .insert(topic_id);
-    DeferredRegistrationOutcome::Inserted
-}
-
-pub(in crate::document_sync) fn remove_deferred_topic(
-    deferred_topics: &mut BTreeMap<DocumentSyncDependency, BTreeSet<::irokle::TopicId>>,
-    topic_id: ::irokle::TopicId,
-) {
-    for topics in deferred_topics.values_mut() {
-        topics.remove(&topic_id);
-    }
-    deferred_topics.retain(|_, topics| !topics.is_empty());
 }

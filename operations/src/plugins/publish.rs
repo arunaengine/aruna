@@ -3,14 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{
+    Event, GroupEvent, GroupResult, NetEvent, StorageEvent, SubOperationEvent,
+};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
+use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -106,8 +109,11 @@ pub async fn publish_plugin(
         return Ok(existing);
     }
     store_local(ctx, &config, digest.as_str(), &artifact, published_at).await?;
-    let digest = digest.to_string();
-    let mut copies = copy_to_managers(ctx, &config, actor.node_id, &digest, &artifact).await;
+    let peers = managers(&config)
+        .filter(|node| *node != actor.node_id)
+        .collect();
+    let copy = copy_artifact(peers, digest.to_string(), artifact);
+    let mut copies = drive(copy, ctx).await.unwrap_or_default();
     copies.insert(actor.node_id);
     let (stored, needed) = (copies.len(), copies_needed(managers(&config).count()));
     if stored < needed {
@@ -139,37 +145,141 @@ fn same_version(
     }
 }
 
-/// Sends the artifact to every other management node at once; returns the nodes that confirmed
-/// a complete, synced copy.
-async fn copy_to_managers(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: aruna_core::NodeId,
-    digest: &str,
-    artifact: &[u8],
-) -> BTreeSet<aruna_core::NodeId> {
-    let Some(metadata) = ctx.metadata_handle.as_ref() else {
-        return BTreeSet::new();
-    };
-    let peers = managers(config).filter(|node| *node != local);
-    let copies = peers.map(|node_id| async move {
-        // Chunks go one after another; the last answer says whether the copy is complete.
-        let mut complete = Ok(false);
-        for index in 0..chunk_count(artifact.len() as u64) {
-            complete = metadata
-                .request_store_artifact(node_id, chunk_of(digest, artifact, index))
-                .await;
-            if complete.is_err() {
-                break;
+/// Sends the artifact to every other management node at once, the chunks of one node one after
+/// another; answers the nodes that confirmed a complete, synced copy. A node that refuses or
+/// fails a chunk gets no more.
+pub(crate) fn copy_artifact(peers: Vec<NodeId>, digest: String, artifact: Vec<u8>) -> CopyArtifact {
+    CopyArtifact {
+        peers,
+        digest,
+        artifact,
+        members: Vec::new(),
+        confirmed: BTreeSet::new(),
+        state: CopyState::Created,
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CopyArtifact {
+    peers: Vec<NodeId>,
+    digest: String,
+    artifact: Vec<u8>,
+    /// The node and chunk of each window member, by member index.
+    members: Vec<(NodeId, u32)>,
+    confirmed: BTreeSet<NodeId>,
+    state: CopyState,
+}
+
+#[derive(Debug, PartialEq)]
+enum CopyState {
+    Created,
+    Copying,
+    Finished(Result<(), CopyError>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CopyError {
+    #[error("unexpected event while copying an artifact: {got}")]
+    Unexpected { got: &'static str },
+    #[error("the artifact copy did not finish")]
+    NotFinished,
+}
+
+impl CopyArtifact {
+    /// The effect that sends chunk `index` to `node_id`, as window member `members.len()`.
+    fn send(&mut self, node_id: NodeId, index: u32) -> Effect {
+        self.members.push((node_id, index));
+        let chunk = chunk_of(&self.digest, &self.artifact, index);
+        let store = ArtifactStore { node_id, chunk };
+        Effect::Net(NetEffect::ArtifactStore(Box::new(store)))
+    }
+
+    fn fail(&mut self, got: &'static str) -> Effects {
+        self.state = CopyState::Finished(Err(CopyError::Unexpected { got }));
+        smallvec![]
+    }
+
+    /// The next chunk for the node of window member `index`, or its outcome.
+    fn member(&mut self, index: usize, result: GroupResult) -> Effects {
+        let Some(&(node_id, chunk)) = self.members.get(index) else {
+            return self.fail("GroupEvent::Member");
+        };
+        let stored = match result {
+            GroupResult::Done(event) => match *event {
+                Event::Net(NetEvent::ArtifactStored(stored)) => stored,
+                other => return self.fail(other.label()),
+            },
+            GroupResult::Unfinished | GroupResult::Refused => Err("not run".to_string()),
+        };
+        match stored {
+            Ok(_) if chunk + 1 < chunk_count(self.artifact.len() as u64) => {
+                smallvec![self.send(node_id, chunk + 1)]
+            }
+            Ok(complete) => {
+                if complete {
+                    self.confirmed.insert(node_id);
+                }
+                smallvec![]
+            }
+            Err(error) => {
+                warn!(%node_id, %error, "A management node did not store a plugin artifact");
+                smallvec![]
             }
         }
-        if let Err(error) = &complete {
-            warn!(%node_id, ?error, "A management node did not store a plugin artifact");
+    }
+}
+
+impl Operation for CopyArtifact {
+    type Output = BTreeSet<NodeId>;
+    type Error = CopyError;
+
+    fn start(&mut self) -> Effects {
+        let peers = std::mem::take(&mut self.peers);
+        if peers.is_empty() || self.artifact.is_empty() {
+            self.state = CopyState::Finished(Ok(()));
+            return smallvec![];
         }
-        (complete == Ok(true)).then_some(node_id)
-    });
-    let results = futures_util::future::join_all(copies).await;
-    results.into_iter().flatten().collect()
+        let limit = peers.len();
+        let members = peers.into_iter().map(|node| self.send(node, 0)).collect();
+        self.state = CopyState::Copying;
+        let group = EffectGroup {
+            members,
+            limit,
+            form: GroupForm::Window,
+        };
+        smallvec![Effect::Group(group)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.state != CopyState::Copying {
+            return self.fail(event.label());
+        }
+        match event {
+            Event::Group(GroupEvent::Member { index, result }) => self.member(index, result),
+            Event::Group(GroupEvent::Closed) => {
+                self.state = CopyState::Finished(Ok(()));
+                smallvec![]
+            }
+            other => self.fail(other.label()),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, CopyState::Finished(_))
+    }
+
+    fn finalize(self) -> Result<BTreeSet<NodeId>, CopyError> {
+        match self.state {
+            CopyState::Finished(Ok(())) => Ok(self.confirmed),
+            CopyState::Finished(Err(error)) => Err(error),
+            _ => Err(CopyError::NotFinished),
+        }
+    }
+
+    /// Chunks already sent stay as an unfinished copy, which the copy sweep removes.
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -234,7 +344,7 @@ pub enum EntryError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -377,7 +487,7 @@ impl PublishEntryOperation {
         cleanup
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(EntryError::UnexpectedEvent {
             state,
@@ -425,20 +535,22 @@ impl Operation for PublishEntryOperation {
                         }
                     }
                 }
-                other => self.unexpected("authorization result", format!("{other:?}")),
+                other => self.unexpected("authorization result", other.label()),
             },
             EntryState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start result", format!("{other:?}")),
+                other => self.unexpected("transaction start result", other.label()),
             },
             EntryState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document), (_, state)] = values.as_slice() else {
-                        return self
-                            .unexpected("realm config and reducer state", format!("{values:?}"));
+                        return self.unexpected(
+                            "realm config and reducer state",
+                            "StorageEvent::BatchReadResult",
+                        );
                     };
                     match self.emit_write(document.clone(), state.clone()) {
                         Ok(effects) => effects,
@@ -446,7 +558,7 @@ impl Operation for PublishEntryOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch read result", format!("{other:?}")),
+                other => self.unexpected("storage batch read result", other.label()),
             },
             EntryState::WriteState { stale } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) if stale.is_empty() => {
@@ -463,12 +575,12 @@ impl Operation for PublishEntryOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch write result", format!("{other:?}")),
+                other => self.unexpected("storage batch write result", other.label()),
             },
             EntryState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected("storage batch delete result", other.label()),
             },
             EntryState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -480,7 +592,7 @@ impl Operation for PublishEntryOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected("transaction commit result", format!("{other:?}")),
+                other => self.unexpected("transaction commit result", other.label()),
             },
             EntryState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -492,7 +604,7 @@ impl Operation for PublishEntryOperation {
                     self.state = EntryState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected("outbox drain timer schedule", format!("{other:?}")),
+                other => self.unexpected("outbox drain timer schedule", other.label()),
             },
             EntryState::Finish | EntryState::Error | EntryState::Init => smallvec![],
         }

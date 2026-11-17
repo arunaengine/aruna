@@ -49,7 +49,8 @@ use crate::distribution::guard::{
 };
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::store::{batch_delete, iter_prefix_page, read_state};
+use crate::jobs::store::query::{batch_delete, iter_prefix_page};
+use crate::jobs::store::read_state;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,

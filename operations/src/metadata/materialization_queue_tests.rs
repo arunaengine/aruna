@@ -17,7 +17,9 @@ use std::collections::BTreeSet;
 use std::thread;
 use tempfile::tempdir;
 
-use crate::tests::metadata::{storage_key_exists, write_entries};
+use crate::testing::write_entries;
+
+use crate::tests::metadata::storage_key_exists;
 
 #[tokio::test]
 async fn delete_waits_fence() {

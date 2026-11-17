@@ -158,10 +158,8 @@ async fn pending_alias_shared() {
     let pointer = CurrentVersionPointer::from_bytes(&head).unwrap();
     assert_eq!(pointer.version_id, result.version_id);
     // The copy is a new version of the destination key, journaled with it.
-    let txn = crate::plugins::store::Txn::direct(&context);
-    let (rows, _) = crate::plugins::journal::journal_page(&txn, b'j', None, 10)
-        .await
-        .unwrap();
+    let page = crate::plugins::journal::journal_page(b'j', None, 10);
+    let (rows, _) = crate::driver::drive(page, &context).await.unwrap();
     assert_eq!(rows.len(), 1);
     let uploaded = &rows[0].1;
     assert_eq!(uploaded.revision, result.version_id.to_string());

@@ -25,7 +25,9 @@ use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 
 use super::IdentityError;
-use super::{BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus};
+use aruna_core::structs::identity::node_state::{
+    BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+};
 
 /// What this boot must do with the persisted identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

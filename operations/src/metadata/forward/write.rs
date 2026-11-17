@@ -68,7 +68,6 @@ use crate::forward::replay::create_record_matches;
 use crate::forward::replay::forwarded_create_replay;
 use crate::forward::replay::held_record;
 use crate::forward::replay::routed_record_matches;
-use crate::forward::replay::update_record_matches;
 use crate::forward::routing::create_forward_holders;
 use crate::forward::routing::distinct_holders;
 use crate::forward::routing::forward_to_holders;
@@ -538,7 +537,7 @@ pub async fn route_metadata_update(
             document_id,
             &placement,
             &response_record,
-        ) && record.is_none_or(|record| update_record_matches(record, &response_record))
+        ) && record.is_none_or(|record| record.same_identity(&response_record))
             && public.is_none_or(|public| response_record.public == public) =>
         {
             Ok(*response_record)

@@ -30,14 +30,16 @@ use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
+use crate::plugins::bound::ReleaseKeys;
 use crate::plugins::broker::local_object;
-use crate::plugins::broker::whole_text;
+use crate::plugins::broker::unmarked;
 use crate::plugins::check::{authorize_access, authorize_call, matching};
 use crate::plugins::grants::InstallScope;
+use crate::plugins::held::release_into;
 use crate::plugins::install::{pick_version, read_manifest};
-use crate::plugins::marks::unmarked;
-use crate::plugins::outgoing::{outgoing, release_into};
-use crate::plugins::work::{Send, WorkRow, begin_send, decided, record_sent, retried, update_work};
+use crate::plugins::outgoing::outgoing;
+use crate::plugins::outgoing::whole_text;
+use crate::plugins::work::{Send, WorkChange, WorkRow, begin_send, decided, retried, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
@@ -304,7 +306,7 @@ pub async fn upload_work(
     };
     let size = source.info.size;
     let ids = (spec.install_id, spec.work_id);
-    match begin_send(&ctx.driver, ids, again).await {
+    match drive(begin_send(ids, again), &ctx.driver).await {
         Ok(Some(send)) => {
             if let Some(outcome) = ended(send, again) {
                 return outcome;
@@ -349,7 +351,7 @@ pub async fn upload_work(
         Ok(response) => response,
         Err(error) if error.is_connect() => {
             // Nothing reached the service, so the boundary goes back and a later attempt sends.
-            let reopened = update_work(&ctx.driver, ids, |row| row.boundary = None);
+            let reopened = drive(update_work(ids, WorkChange::Reopened), &ctx.driver);
             if let Err(error) = reopened.await {
                 return retryable(error.0);
             }
@@ -392,7 +394,13 @@ pub async fn upload_work(
         };
         whole_text(&shown)
     });
-    if let Err(error) = record_sent(&ctx.driver, ids, (status, reply), (size, version)).await {
+    let answer = WorkChange::Sent {
+        status,
+        reply,
+        bytes: size,
+        version,
+    };
+    if let Err(error) = drive(update_work(ids, answer), &ctx.driver).await {
         return retryable(error.0);
     }
     sent(status, again, (size, version))

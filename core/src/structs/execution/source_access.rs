@@ -289,7 +289,7 @@ fn same_second(left: SystemTime, right: SystemTime) -> bool {
 
 /// Length-prefixed canonical encoding of an optional string field so distinct
 /// fields cannot collide across boundaries.
-fn write_fingerprint_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+pub(crate) fn write_fingerprint_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
     match value {
         Some(value) => {
             hasher.update(&[1]);

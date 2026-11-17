@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::jobs::JobRouteError;
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runs::{RunReadError, read_run};
 use aruna_operations::jobs::service::resolve_job_owner;
 use axum::extract::{Path, State};
@@ -21,7 +21,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::lookup::{node_directed, node_read};
+use crate::routes::storage::relay::{node_directed, node_read};
 use crate::server::state::ServerState;
 
 /// How long a run read relayed to the node that ran it may take, body included.

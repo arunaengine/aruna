@@ -20,13 +20,14 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, JobMutation, claim_job, insert_job, mutate_job, read_crate_status,
-    read_job_record,
-};
+use aruna_operations::jobs::store::attempt::read_crate_status;
+use aruna_operations::jobs::store::query::insert_job;
+use aruna_operations::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
+use aruna_operations::jobs::store::{JobMutation, mutate_job};
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::jobs::workflow::reconcile::ComputeReconciler;
 use aruna_operations::jobs::workflow::run_execution_job;
@@ -194,23 +195,23 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         JobPayload::Execution(spec),
         fixture.seed.user_id,
         node_id,
-        now_ms(),
-        now_ms(),
+        unix_timestamp_millis(),
+        unix_timestamp_millis(),
         None,
     );
     record.captured_inputs = captured_inputs;
     insert_job(&ctx.storage_handle, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, now_ms())
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(claimed) = claim_job(
+        &ctx.storage_handle,
+        job_id,
+        node_id,
+        unix_timestamp_millis(),
+    )
+    .await
+    .unwrap() else {
         panic!("claim failed");
     };
     (job_id, claimed)
-}
-
-fn now_ms() -> u64 {
-    aruna_core::time::unix_timestamp_millis()
 }
 
 /// The inputs admission captures before a run is claimed. Outputs inherit
@@ -588,10 +589,10 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
         Duration::from_secs(90),
     )
     .await;
-    aruna_operations::jobs::store::set_cancel_requested(
+    aruna_operations::jobs::store::attempt::set_cancel_requested(
         &fixture.compute_ctx.storage_handle,
         job_id,
-        now_ms(),
+        unix_timestamp_millis(),
     )
     .await
     .unwrap();

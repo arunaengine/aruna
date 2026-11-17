@@ -29,7 +29,6 @@ bytes = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = { workspace = true }
 chrono = { workspace = true }
-crc-fast = { workspace = true }
 futures = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
@@ -45,7 +44,6 @@ postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

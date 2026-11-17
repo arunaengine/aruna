@@ -8,8 +8,8 @@ use super::{
     server_error, tool_extras,
 };
 use crate::lookup::ObjectOutput;
-use crate::lookup::{relay_json, rest_target};
 use crate::routes::storage::objects::object_page;
+use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;

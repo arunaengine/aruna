@@ -758,7 +758,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::metadata::MetadataHandle;
-    use crate::tests::metadata::{storage_key_exists, write_entries};
+    use crate::testing::write_entries;
+    use crate::tests::metadata::storage_key_exists;
 
     fn lifecycle(graph_iri: &str) -> GraphLifecycleRecord {
         GraphLifecycleRecord::deleted(

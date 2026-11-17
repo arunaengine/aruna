@@ -443,7 +443,8 @@ async fn projection_pending(ctx: &JobContext, document_id: Ulid) -> Result<bool,
             "harvest pending projection scan: {error}"
         ))),
         other => Err(retryable(format!(
-            "harvest pending projection scan: unexpected {other:?}"
+            "harvest pending projection scan: unexpected {}",
+            other.label()
         ))),
     }
 }

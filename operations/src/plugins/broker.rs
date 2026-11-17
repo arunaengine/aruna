@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,13 +11,13 @@ use aruna_core::NodeId;
 use aruna_core::injection::{OutgoingRequest, expose_response, inject_secret, scrub};
 use aruna_core::metadata::{AuthToken, MetadataError};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{LogLine, PluginRun};
+use aruna_core::plugin_runs::{
+    CallIntent, LogLine, PluginRun, StateRefusal, StateRemoval, StateWrite,
+};
 use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_BLAKE3};
 use aruna_core::structs::execution::job::UploadForm;
-use aruna_core::structs::identity::auth::{
-    Actor, AuthContext, PathRestriction, Permission as Access,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::data::identity::DataIdentity;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -30,7 +29,6 @@ use aruna_plugins::broker::{
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
-use base64::Engine;
 use craqle::GraphId;
 use futures_util::StreamExt;
 use oxrdf::Term;
@@ -38,23 +36,33 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::check::{RunScope, authorize_call, check_call, matching, unavailable};
-use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
-use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
+use super::bound::ReleaseKeys;
+use super::check::{RunScope, authorize_call, check_call, matching};
+use super::creates::{
+    Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
+};
+use super::dataset::{
+    content_urls, dataset_change, dataset_crate, dataset_of, file_entities, file_entity,
+    parse_document, same_revision,
+};
+use super::grants::{install_scope, object_path, parse_grants, patterns_for, restricted_account};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
-use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, written};
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
-use super::marks::{is_marked, unmarked};
+use super::marks::{MARKED, is_marked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
-use super::outgoing::{outgoing, request_context};
+use super::outgoing::{
+    declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
+};
 use super::rate::take_call;
-use super::release::{ReleaseError, ReleaseRequest, Released};
-use super::state::{PutError, check_key, put_state, read_state, remove_state};
-use super::store::{StoreError, Txn, transact};
+use super::release::node_keys;
+use super::rows::{delete_rows, write_rows};
+use super::state::{MAX_STATE_KEY, PutError, put_state, read_state, remove_state};
 use super::submit::{
     CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
 };
+use super::unavailable;
 use super::work::RequestContext;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -73,8 +81,9 @@ use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
+use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 
 /// Entries of one metadata or object listing page.
 const PAGE: usize = 100;
@@ -84,6 +93,8 @@ pub struct RunBroker {
     ctx: Arc<DriverContext>,
     /// Sends connection requests; the node's screened egress client unless a test replaces it.
     outbound: Arc<dyn Outbound>,
+    /// The realm keys a management node releases group and realm secrets with.
+    keys: ReleaseKeys,
     /// The secrets this run holds, reused while their value is unchanged.
     held: tokio::sync::Mutex<HeldSecrets>,
     /// The values handed to the code, removed from the text the run keeps.
@@ -101,6 +112,7 @@ impl RunBroker {
         lines.log.clear();
         Self {
             outbound: Arc::new(Egress(ctx.blob_handle.clone())),
+            keys: node_keys(&ctx),
             held: tokio::sync::Mutex::default(),
             shown: Mutex::default(),
             ctx,
@@ -108,6 +120,12 @@ impl RunBroker {
             scope,
             changed: AtomicBool::new(false),
         }
+    }
+
+    /// The broker with other realm keys for releases.
+    pub fn with_keys(mut self, keys: ReleaseKeys) -> Self {
+        self.keys = keys;
+        self
     }
 
     /// The broker with another sender for connection requests.
@@ -155,7 +173,7 @@ impl RunBroker {
         let patterns = matching(&install, permission, target)?;
         Ok((
             install.clone(),
-            self.account(&install, &patterns, permission),
+            restricted_account((&install, self.scope.realm_id), &patterns, permission),
         ))
     }
 
@@ -169,33 +187,8 @@ impl RunBroker {
         let patterns = patterns_for(&grants, permission);
         Ok((
             install.clone(),
-            self.account(&install, &patterns, permission),
+            restricted_account((&install, self.scope.realm_id), &patterns, permission),
         ))
-    }
-
-    /// The account restricted to `patterns`, at the access `permission` needs.
-    fn account(
-        &self,
-        install: &PluginInstall,
-        patterns: &BTreeSet<String>,
-        permission: Permission,
-    ) -> AuthContext {
-        let access = match accesses(permission).contains(&Access::WRITE) {
-            true => Access::WRITE,
-            false => Access::READ,
-        };
-        let restrictions = (patterns.iter())
-            .map(|pattern| PathRestriction {
-                pattern: pattern.clone(),
-                permission: access.clone(),
-            })
-            .collect();
-        AuthContext {
-            user_id: install.account,
-            realm_id: self.scope.realm_id,
-            path_restrictions: Some(restrictions),
-            session: None,
-        }
     }
 
     /// The registry record and JSON-LD of a document the account may read.
@@ -251,7 +244,7 @@ impl RunBroker {
                 .await?;
         }
         let run_id = self.scope.run.run_id;
-        let earlier = written(&self.ctx, run_id, &change.intent).await;
+        let earlier = drive(written(run_id, &call_intent(&change.intent)), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -312,7 +305,7 @@ impl RunBroker {
         (install, key): (&PluginInstall, &str),
         minted: PinnedCreate,
     ) -> Result<String, Outcome> {
-        let stored = claim_key(&self.ctx, (install, key), minted).await;
+        let stored = drive(claim_key((install, key), minted), &self.ctx).await;
         let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
         let mut lookup = None;
         loop {
@@ -458,7 +451,7 @@ impl RunBroker {
 
     /// Closes an attempt of a create key. A failure only keeps the key's arguments fixed.
     async fn settle(&self, key: (&PluginInstall, &str), rejected: bool) {
-        if let Err(error) = settle_key(&self.ctx, key, rejected).await {
+        if let Err(error) = drive(settle_key(key, rejected), &self.ctx).await {
             warn!(%error, "A plugin create key could not record its attempt's outcome");
         }
     }
@@ -487,32 +480,47 @@ impl RunBroker {
         let run_id = self.scope.run.run_id;
         match outcome {
             Ok(reply) => {
-                let settle =
-                    async |txn: &Txn<'_>| settle_in(txn, run_id, intent, reply.clone()).await;
-                match transact(&self.ctx, settle).await {
+                let settled = settled_row(run_id, &call_intent(intent), reply.clone());
+                let written = match settled {
+                    Ok(row) => drive(write_rows(vec![row]), &self.ctx).await,
+                    Err(error) => Err(error),
+                };
+                match written {
                     Ok(()) => Ok(reply),
                     Err(error) => Err(self.unknown(intent, &error.0).await),
                 }
             }
             Err(Outcome::None(error)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
+                self.clear(intent).await?;
                 Err(error)
             }
             Err(Outcome::Maybe(reason)) => Err(self.unknown(intent, &reason).await),
         }
     }
 
+    /// Removes the intent of a call that ended without an effect, so it may be made again.
+    async fn clear(&self, intent: &Intent) -> Result<(), HostError> {
+        let call = call_intent(intent);
+        let clear = delete_rows(vec![intent_row_key(self.scope.run.run_id, &call)]);
+        (drive(clear, &self.ctx).await).map_err(|error| unavailable(error.0))
+    }
+
     async fn unknown(&self, intent: &Intent, reason: &str) -> HostError {
-        let _ = mark_unknown(&self.ctx, self.scope.run.run_id, intent, reason).await;
+        self.mark_unknown(intent, reason).await;
         HostError::new(ErrorKind::UnknownOutcome, reason)
+    }
+
+    /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
+    /// intent pending, which a later attempt reads as unknown as well.
+    async fn mark_unknown(&self, intent: &Intent, reason: &str) {
+        if let Ok(row) = unknown_row(self.scope.run.run_id, &call_intent(intent), reason) {
+            let _ = drive(write_rows(vec![row]), &self.ctx).await;
+        }
     }
 
     /// The intent's earlier outcome, or `None` when the effect may be dispatched now.
     async fn begun(&self, intent: &Intent) -> Result<Option<String>, HostError> {
-        let begun = begin(&self.ctx, self.scope.run.run_id, intent).await;
+        let begun = drive(begin(self.scope.run.run_id, call_intent(intent)), &self.ctx).await;
         match begun.map_err(|error| unavailable(error.0))? {
             Begun::Fresh => Ok(None),
             Begun::Settled(reply) => Ok(Some(reply)),
@@ -588,7 +596,10 @@ impl RunBroker {
         let Ok(version_id) = Ulid::from_string(version) else {
             return Ok(false);
         };
-        let marked = is_marked(&self.ctx, (bucket, key, version_id)).await;
+        let marked = match is_marked((bucket, key, version_id)) {
+            Ok(marked) => drive(marked, &self.ctx).await,
+            Err(error) => Err(error),
+        };
         marked.map_err(|error| unavailable(error.0))
     }
 
@@ -621,31 +632,31 @@ impl RunBroker {
     }
 }
 
-/// The full permission path of an object path a plugin gives: a path below the realm as it is,
-/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
-/// path the plugin did not mean is never checked.
-pub(crate) fn object_path(
-    (realm_id, local): (aruna_core::structs::identity::realm::RealmId, NodeId),
-    group: aruna_core::types::GroupId,
-    text: &str,
-) -> Result<String, HostError> {
-    if text.starts_with('/') {
-        return Ok(text.to_string());
+/// The core intent of a guest call.
+pub(crate) fn call_intent(intent: &Intent) -> CallIntent {
+    CallIntent {
+        ordinal: intent.ordinal,
+        digest: intent.digest,
     }
-    let invalid = || {
-        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
-        HostError::new(ErrorKind::Invalid, message)
-    };
-    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
-    let segments: Vec<&str> = key.split('/').collect();
-    let last = segments.len() - 1;
-    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
-        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
-    });
-    if matches!(bucket, "" | "." | "..") || !plain {
-        return Err(invalid());
+}
+
+/// The guest error kind of a refused state write.
+fn refused_kind(refusal: StateRefusal) -> ErrorKind {
+    match refusal {
+        StateRefusal::Limit => ErrorKind::Limit,
+        StateRefusal::Conflict => ErrorKind::Conflict,
     }
-    Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// A key the guest may use: not empty, within its bound.
+fn check_key(key: &str) -> Result<(), HostError> {
+    match key.is_empty() || key.len() > MAX_STATE_KEY {
+        true => Err(HostError::new(
+            ErrorKind::Invalid,
+            "a state key has 1 to 256 bytes",
+        )),
+        false => Ok(()),
+    }
 }
 
 /// The version id a plugin gave as text.
@@ -660,38 +671,6 @@ fn byte_size(bytes: usize) -> String {
         0 => format!("{} MiB", bytes >> 20),
         _ => format!("{bytes} bytes"),
     }
-}
-
-/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
-/// text stays as it is.
-pub(crate) fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
-    let realm = install.account.realm_id;
-    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
-    path.strip_prefix(&root).unwrap_or(path).to_string()
-}
-
-/// Refuses a `contentUrl` that names nothing readers can resolve, such as a short bucket path:
-/// it must be an absolute IRI such as an `s3://` address, an object path below the realm, or a
-/// reference inside the crate.
-fn content_urls(file: &Value) -> Result<(), HostError> {
-    let urls = match file.get("contentUrl") {
-        Some(Value::Array(urls)) => urls.iter().collect(),
-        Some(url) => vec![url],
-        None => Vec::new(),
-    };
-    for url in urls {
-        let text = (url.get("@id").unwrap_or(url).as_str()).unwrap_or_default();
-        let scheme = text
-            .split_once(':')
-            .is_some_and(|(scheme, _)| !scheme.is_empty() && !scheme.contains('/'));
-        if !(scheme || text.starts_with('/') || text.starts_with("./")) {
-            let message = format!(
-                "the contentUrl `{text}` names no object; use the object's s3:// address or path"
-            );
-            return Err(HostError::new(ErrorKind::Invalid, message));
-        }
-    }
-    Ok(())
 }
 
 /// The bucket and key on `local` of an object path below the install's group data; a bucket of
@@ -837,7 +816,7 @@ impl Broker for RunBroker {
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         // A new call starts only from the copy it expects; an earlier attempt's intent decides.
         let run_id = self.scope.run.run_id;
-        let earlier = written(&self.ctx, run_id, &patch.intent).await;
+        let earlier = drive(written(run_id, &call_intent(&patch.intent)), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -1226,8 +1205,12 @@ impl Broker for RunBroker {
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
         check_key(key)?;
         let install = self.admitted(None).await?;
-        let entry = read_state(&self.ctx, install.install_id, key).await;
-        entry.map_err(|error| unavailable(error.0))
+        let entry = drive(read_state(install.install_id, key), &self.ctx).await;
+        let entry = entry.map_err(|error| unavailable(error.0))?;
+        Ok(entry.map(|entry| Entry {
+            version: entry.version,
+            value: entry.value,
+        }))
     }
 
     async fn state_put(&self, _cx: &CallContext, put: StatePut) -> Result<u64, HostError> {
@@ -1239,16 +1222,20 @@ impl Broker for RunBroker {
                 .map_err(|_| unavailable("a stored reply is not a version"));
         }
         let run_id = self.scope.run.run_id;
-        match put_state(&self.ctx, run_id, install.install_id, &put).await {
+        let intent = put.intent.clone();
+        let write = StateWrite {
+            key: put.key,
+            value: put.value,
+            expected: put.expected,
+            intent: call_intent(&intent),
+        };
+        match drive(put_state(run_id, install.install_id, write), &self.ctx).await {
             Ok(version) => Ok(version),
-            Err(PutError::Refused(message, kind)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &put.intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
-                Err(HostError::new(kind, message))
+            Err(PutError::Refused(message, refusal)) => {
+                self.clear(&intent).await?;
+                Err(HostError::new(refused_kind(refusal), message))
             }
-            Err(PutError::Store(error)) => Err(self.unknown(&put.intent, &error.0).await),
+            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }
     }
 
@@ -1259,16 +1246,19 @@ impl Broker for RunBroker {
             return Ok(());
         }
         let run_id = self.scope.run.run_id;
-        match remove_state(&self.ctx, run_id, install.install_id, &remove).await {
+        let intent = remove.intent.clone();
+        let removal = StateRemoval {
+            key: remove.key,
+            expected: remove.expected,
+            intent: call_intent(&intent),
+        };
+        match drive(remove_state(run_id, install.install_id, removal), &self.ctx).await {
             Ok(()) => Ok(()),
-            Err(PutError::Refused(message, kind)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &remove.intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
-                Err(HostError::new(kind, message))
+            Err(PutError::Refused(message, refusal)) => {
+                self.clear(&intent).await?;
+                Err(HostError::new(refused_kind(refusal), message))
             }
-            Err(PutError::Store(error)) => Err(self.unknown(&remove.intent, &error.0).await),
+            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }
     }
 
@@ -1309,208 +1299,50 @@ impl Broker for RunBroker {
 
     async fn abandoned(&self, _cx: &CallContext, intent: &Intent) {
         let reason = "the call did not finish in time";
-        let _ = mark_unknown(&self.ctx, self.scope.run.run_id, intent, reason).await;
+        self.mark_unknown(intent, reason).await;
     }
 }
 
-/// The type a JSON literal comes back with from the stored graph.
-const JSON_LITERAL: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
-
-/// The dataset entity of a crate, the one its metadata descriptor is about.
-fn dataset_mut(crate_json: &mut Value) -> Result<&mut Value, HostError> {
-    let graph = (crate_json.get_mut("@graph").and_then(Value::as_array_mut))
-        .ok_or_else(|| unavailable("the stored crate has no graph"))?;
-    let id_of = |entity: &Value| {
-        entity
-            .get("@id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
+/// when it is marked; `None` when there is no such object, so nothing is read either.
+pub(crate) async fn unmarked(
+    ctx: &DriverContext,
+    (bucket, key): (&str, &str),
+    version: Option<Ulid>,
+) -> Result<Option<Ulid>, HostError> {
+    let head = HeadObjectInput {
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        version_id: version,
     };
-    let root = (graph.iter())
-        .find(|entity| id_of(entity).as_deref() == Some("ro-crate-metadata.json"))
-        .and_then(|descriptor| {
-            descriptor
-                .get("about")?
-                .get("@id")?
-                .as_str()
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| "./".to_string());
-    (graph.iter_mut())
-        .find(|entity| id_of(entity).as_deref() == Some(root.as_str()))
-        .ok_or_else(|| HostError::new(ErrorKind::Invalid, "the crate has no dataset entity"))
-}
-
-/// The fields of a crate's dataset entity, as a plugin reads and patches them.
-pub(crate) fn dataset_of(jsonld: &str) -> Result<String, HostError> {
-    let mut crate_json: Value =
-        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
-    let dataset = dataset_mut(&mut crate_json)?;
-    plain_objects(dataset);
-    Ok(dataset.to_string())
-}
-
-/// The change a patch makes to a crate's dataset entity: its id, types and name, and each
-/// patched field with its value after a JSON merge patch, `null` removing one. Other fields and
-/// other entities are not part of it, so they stay as they are.
-pub(crate) fn dataset_change(jsonld: &str, patch: &str) -> Result<String, HostError> {
-    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
-    let patch: Value = serde_json::from_str(patch).map_err(|_| invalid("the patch is not JSON"))?;
-    let Value::Object(changes) = patch else {
-        return Err(invalid("the patch is not a JSON object"));
+    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
+        Ok(head) => head.resolved_version_id.or(version),
+        Err(error) if absent(&error) => return Ok(None),
+        Err(error) => return Err(unavailable(error.to_string())),
     };
-    if changes.contains_key("@id") {
-        return Err(invalid("a patch cannot change the dataset's @id"));
+    let Some(resolved) = resolved else {
+        return Ok(None);
+    };
+    let marked = is_marked((bucket, key, resolved)).map_err(|error| unavailable(error.0))?;
+    match drive(marked, ctx).await {
+        Ok(false) => Ok(Some(resolved)),
+        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
+        Err(error) => Err(unavailable(error.0)),
     }
-    let mut crate_json: Value =
-        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored crate is not JSON"))?;
-    let dataset = dataset_mut(&mut crate_json)?;
-    plain_objects(dataset);
-    let mut merged = dataset.clone();
-    let fields: Vec<String> = changes.keys().cloned().collect();
-    merge_into(&mut merged, Value::Object(changes));
-    let mut change = serde_json::Map::new();
-    for field in ["@id", "@type", "name"]
-        .map(str::to_string)
-        .into_iter()
-        .chain(fields)
-    {
-        let value = merged.get(&field).cloned().unwrap_or(Value::Null);
-        change.insert(field, value);
-    }
-    let mut change = Value::Object(change);
-    literal_objects(&mut change);
-    Ok(change.to_string())
+}
+
+pub(crate) fn absent(error: &HeadObjectError) -> bool {
+    matches!(
+        error,
+        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
+    )
 }
 
 /// File entities one page asks for; a page over the byte bound comes back smaller.
 const FILE_PAGE: usize = 100;
 
-/// The `File` entities of an exported page, each as the plain JSON object a plugin writes.
-fn file_entities(jsonld: &str) -> Result<Vec<String>, HostError> {
-    let page: Value =
-        serde_json::from_str(jsonld).map_err(|_| unavailable("the stored page is not JSON"))?;
-    let graph = (page.get("@graph").and_then(Value::as_array))
-        .ok_or_else(|| unavailable("the stored page has no graph"))?;
-    // RO-Crate's `File` is `schema:MediaObject`; an export may name it by either term.
-    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
-    let file = |entity: &&Value| match entity.get("@type") {
-        Some(Value::Array(kinds)) => kinds.iter().any(named),
-        Some(kind) => named(kind),
-        None => false,
-    };
-    let files = graph.iter().filter(file).cloned().map(|mut entity| {
-        plain_objects(&mut entity);
-        entity.to_string()
-    });
-    Ok(files.collect())
-}
-
-/// A file entity as a change stores it: one object with an `@id` that is neither the root nor
-/// the descriptor, typed `File`, naming other entities by `@id` alone.
-fn file_entity(file: &str) -> Result<String, HostError> {
-    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
-    let file: Value = serde_json::from_str(file).map_err(|_| invalid("the file is not JSON"))?;
-    let Value::Object(fields) = &file else {
-        return Err(invalid("the file is not a JSON object"));
-    };
-    let id = fields
-        .get("@id")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if matches!(id, "" | "./" | "ro-crate-metadata.json") {
-        return Err(invalid("the file needs its own @id"));
-    }
-    let named = |kind: &Value| kind == "File" || kind == "MediaObject";
-    let typed = match fields.get("@type") {
-        Some(Value::Array(kinds)) => kinds.iter().any(named),
-        Some(kind) => named(kind),
-        None => false,
-    };
-    if !typed || fields.contains_key("@graph") || nested_entity(fields) {
-        return Err(invalid("the file is one File entity naming others by @id"));
-    }
-    let mut file = file;
-    literal_objects(&mut file);
-    Ok(file.to_string())
-}
-
-/// Whether a field holds an entity of its own rather than a reference by `@id` alone.
-fn nested_entity(fields: &serde_json::Map<String, Value>) -> bool {
-    let entity = |value: &Value| {
-        (value.as_object()).is_some_and(|object| {
-            let reference = object.len() == 1 && object.contains_key("@id");
-            object.keys().any(|key| key.starts_with('@')) && !reference
-        })
-    };
-    fields.values().any(|value| match value {
-        Value::Array(entries) => entries.iter().any(entity),
-        value => entity(value),
-    })
-}
-
-/// The crate a plugin create stores: the metadata descriptor and the dataset entity as its root.
-/// Plain object values become JSON literals as in a patch; nested entities are refused.
-pub(crate) fn dataset_crate(dataset: &str) -> Result<String, HostError> {
-    let invalid = |message: &str| HostError::new(ErrorKind::Invalid, message);
-    let dataset: Value =
-        serde_json::from_str(dataset).map_err(|_| invalid("the dataset is not JSON"))?;
-    let Value::Object(mut fields) = dataset else {
-        return Err(invalid("the dataset is not a JSON object"));
-    };
-    if fields.get("@id").is_some_and(|id| id != "./") || fields.contains_key("@graph") {
-        return Err(invalid("the dataset is one root entity without @graph"));
-    }
-    let kinds = fields
-        .get("@type")
-        .cloned()
-        .unwrap_or(Value::from("Dataset"));
-    let dataset_kind = match &kinds {
-        Value::String(kind) => kind == "Dataset",
-        Value::Array(kinds) => kinds.iter().any(|kind| kind == "Dataset"),
-        _ => false,
-    };
-    if !dataset_kind {
-        return Err(invalid("the dataset's @type is not Dataset"));
-    }
-    if nested_entity(&fields) {
-        return Err(invalid("the dataset names other entities only by @id"));
-    }
-    fields.insert("@id".to_string(), Value::from("./"));
-    fields.insert("@type".to_string(), kinds);
-    let mut dataset = Value::Object(fields);
-    literal_objects(&mut dataset);
-    let descriptor = serde_json::json!({
-        "@id": "ro-crate-metadata.json",
-        "@type": "CreativeWork",
-        "about": {"@id": "./"},
-        "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"},
-    });
-    let graph = serde_json::json!({
-        "@context": "https://w3id.org/ro/crate/1.2/context",
-        "@graph": [descriptor, dataset],
-    });
-    let graph = graph.to_string();
-    craqle::validate_rocrate_jsonld(&graph).map_err(|error| invalid(&error.to_string()))?;
-    Ok(graph)
-}
-
 /// Bytes of a create key at most.
 const MAX_KEY: usize = 256;
-
-/// The intent reply of a create: the document id and its establishing revision.
-fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
-    format!("{document_id} {revision}")
-}
-
-fn stored_created(reply: &str) -> Result<Created, HostError> {
-    let (resource, revision) = (reply.split_once(' '))
-        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
-    Ok(Created {
-        resource: resource.to_string(),
-        revision: revision.to_string(),
-    })
-}
 
 /// Whether a failed create had no effect, or may have had one.
 fn create_outcome(error: CreateAuthorizedError) -> Outcome {
@@ -1537,92 +1369,8 @@ fn create_outcome(error: CreateAuthorizedError) -> Outcome {
     }
 }
 
-/// Turns the dataset's JSON literals back into the objects a plugin wrote.
-fn plain_objects(dataset: &mut Value) {
-    let Value::Object(fields) = dataset else {
-        return;
-    };
-    for value in fields.values_mut() {
-        let literal = (value.get("@type").and_then(Value::as_str))
-            .is_some_and(|kind| kind == "@json" || kind == JSON_LITERAL);
-        let inner = value.get("@value").cloned();
-        if let (true, Some(inner)) = (literal, inner) {
-            *value = match inner {
-                Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
-                other => other,
-            };
-        }
-    }
-}
-
-/// Applies a JSON merge patch to `target`.
-fn merge_into(target: &mut Value, patch: Value) {
-    let Value::Object(changes) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = Value::Object(Default::default());
-    }
-    let Value::Object(fields) = target else {
-        return;
-    };
-    for (key, value) in changes {
-        match value {
-            Value::Null => drop(fields.remove(&key)),
-            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
-        }
-    }
-}
-
-/// Stores each plain object value of the change, one without JSON-LD keywords, as a JSON
-/// literal, so it stays one value instead of becoming an untyped node.
-fn literal_objects(change: &mut Value) {
-    let Value::Object(fields) = change else {
-        return;
-    };
-    let plain = |value: &Value| {
-        (value.as_object()).is_some_and(|object| !object.keys().any(|key| key.starts_with('@')))
-    };
-    let literal =
-        |value: &Value| serde_json::json!({ "@type": JSON_LITERAL, "@value": value.to_string() });
-    for value in fields.values_mut() {
-        match value {
-            Value::Array(entries) => {
-                for entry in entries.iter_mut().filter(|entry| plain(entry)) {
-                    *entry = literal(entry);
-                }
-            }
-            entry if plain(entry) => *entry = literal(entry),
-            _ => {}
-        }
-    }
-}
-
 /// Refuses a copy at another revision than the patch expects: one behind it is retryable,
 /// one ahead of it is a conflict the plugin resolves by reading again.
-fn same_revision(exported: Ulid, expected: Ulid) -> Result<(), HostError> {
-    match exported.cmp(&expected) {
-        std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Less => Err(unavailable(format!(
-            "the copy read is at {exported}, before the expected {expected}; try again"
-        ))),
-        std::cmp::Ordering::Greater => Err(HostError::new(
-            ErrorKind::Conflict,
-            format!("the document is at {exported}, not at the expected {expected}"),
-        )),
-    }
-}
-
-fn parse_document(resource: &str) -> Result<Ulid, HostError> {
-    Ulid::from_string(resource).map_err(|_| {
-        HostError::new(
-            ErrorKind::Invalid,
-            format!("{resource} is not a document id"),
-        )
-    })
-}
-
 /// A read error as the guest sees it; an unreachable or not yet visible document is retryable.
 fn api_error(error: MetadataApiError) -> HostError {
     match error {
@@ -1814,8 +1562,8 @@ impl RunBroker {
             held: None,
             run_id: Some(self.scope.run.run_id),
         };
-        let local = self.scope.local;
-        let ask = |request| ask_release(&self.ctx, config, local, request);
+        let place = (self.scope.local, &self.keys);
+        let ask = |request| ask_release(&self.ctx, config, place, request);
         let mut held = self.held.lock().await;
         held.obtain(request, ask)
             .await
@@ -1841,16 +1589,6 @@ impl RunBroker {
     }
 }
 
-/// The scope of an install, for its generated grant paths.
-fn install_scope(install: &PluginInstall) -> InstallScope {
-    InstallScope {
-        realm_id: install.account.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    }
-}
-
-/// The manifest's name of a method the guest called.
 /// The expected digests of a download: a known algorithm and a hex digest of its length.
 fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostError> {
     use ChecksumAlgorithm::{Crc32, Crc32c, Md5, Sha1, Sha256};
@@ -1877,19 +1615,6 @@ fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostE
     Ok(found)
 }
 
-fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
-    use aruna_plugins::broker::Method as Called;
-    use aruna_plugins::connection::Method;
-    match method {
-        Called::Get => Method::Get,
-        Called::Head => Method::Head,
-        Called::Post => Method::Post,
-        Called::Put => Method::Put,
-        Called::Patch => Method::Patch,
-        Called::Delete => Method::Delete,
-    }
-}
-
 /// The whole answer as the code may see it, with echoes of the secret removed.
 fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     let shown = expose_response(
@@ -1908,65 +1633,12 @@ fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     }
 }
 
-pub(crate) fn whole_text(reply: &Response) -> String {
-    let headers: Vec<(&str, &str)> = (reply.headers.iter())
-        .map(|field| (field.name.as_str(), field.value.as_str()))
-        .collect();
-    let body = base64::engine::general_purpose::STANDARD.encode(&reply.body);
-    serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
-}
-
-/// The stored reply of a sent request whose answer did not fit the call.
-fn too_large(status: u16) -> String {
-    serde_json::json!({ "status": status, "too_large": true }).to_string()
-}
-
-/// The refusal a stored too-large marker answers with, every time it is replayed.
-fn refuse_large(value: &Value) -> Result<(), HostError> {
-    if value.get("too_large").and_then(Value::as_bool) != Some(true) {
-        return Ok(());
-    }
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let message = format!("the answer with status {status} is larger than the call allows");
-    Err(HostError::new(ErrorKind::Limit, message))
-}
-
 /// A send that has no stored intent: an answer that does not fit is a limit, others unavailable.
 fn send_refusal(error: SendError) -> HostError {
     match error {
         SendError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
         error => unavailable(error.to_string()),
     }
-}
-
-fn stored_whole(reply: &str) -> Result<Response, HostError> {
-    let broken = || unavailable("a stored whole answer does not decode");
-    let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
-    refuse_large(&value)?;
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .and_then(|s| u16::try_from(s).ok());
-    let headers: Vec<(String, String)> =
-        serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
-            .map_err(|_| broken())?;
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(broken)?;
-    let body = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .map_err(|_| broken())?;
-    Ok(Response {
-        status: status.ok_or_else(broken)?,
-        headers: (headers.into_iter())
-            .map(|(name, value)| Field { name, value })
-            .collect(),
-        body,
-    })
 }
 
 #[cfg(test)]

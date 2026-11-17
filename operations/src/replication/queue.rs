@@ -58,9 +58,10 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::QuotaOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::placement::policy::GateOperation;
-use crate::plugins::store::{StoreError, Txn, transact};
+use crate::plugins::rows::StoreError;
+use crate::plugins::store::{Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 
 const REPLICATION_PAGE_SIZE: usize = 512;
@@ -1448,11 +1449,11 @@ async fn store_relationship(
     context: &DriverContext,
     relationship: SyncRelationship,
 ) -> Result<bool, String> {
-    let stored = store_sync_status(context, &relationship)
+    let stored = drive(StoreStatusOperation::new(relationship.clone()), context)
         .await
         .map_err(|error| error.to_string())?;
     if stored {
-        kick_mirror_repair(context).await;
+        let _ = drive(KickRepairOperation::new(), context).await;
     }
     Ok(stored)
 }
@@ -3817,14 +3818,7 @@ mod tests {
 
     /// The plugin journal rows this node has not matched yet.
     async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
-        let txn = Txn::direct(context);
-        let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
-        page.unwrap()
-            .0
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect()
+        crate::plugins::journal::pending_events(context).await
     }
 
     #[tokio::test]
@@ -4217,7 +4211,11 @@ mod tests {
         relationship.state = SyncState::Failed {
             reason: "access_denied".to_string(),
         };
-        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        assert!(
+            drive(StoreStatusOperation::new(relationship.clone()), &context)
+                .await
+                .unwrap()
+        );
         assert_eq!(journaled(&context).await.len(), 1);
 
         let result = process_blob_batch(&context).await.expect("drain succeeds");

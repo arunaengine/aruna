@@ -47,7 +47,7 @@ pub use sync_quarantine::{
     QUARANTINE_MAX_BYTES, QUARANTINE_MAX_RECORDS, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity,
     SyncQuarantineError, SyncQuarantineEvidence, SyncQuarantineFamily, SyncQuarantineIdentity,
     SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncQuarantineWrite,
-    build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
+    SyncRejection, build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
     quarantine_usage_entry, sync_quarantine_key,
 };
 pub use sync_relationship::{

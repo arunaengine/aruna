@@ -4,6 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
+use crate::plugins::broker::call_intent;
+use crate::plugins::worker::prune_runs;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
@@ -52,25 +56,28 @@ async fn bounded_queue() {
     let (_dir, ctx) = opened();
     let (install, other) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
     for seq in 0..RUNS_QUEUED as u64 {
-        admit(&ctx, &queued(install, seq + 10)).await.unwrap();
+        drive(admit(queued(install, seq + 10)), &ctx).await.unwrap();
     }
-    let refused = admit(&ctx, &queued(install, 500)).await;
+    let refused = drive(admit(queued(install, 500)), &ctx).await;
     assert_eq!(refused, Err(RunError::Full(RUNS_QUEUED)));
     assert_eq!(
-        read_run(&ctx, install, Ulid::from_parts(500, 1)).await,
+        drive(read_run(install, Ulid::from_parts(500, 1)), &ctx).await,
         Err(RunError::NotFound)
     );
-    admit(&ctx, &queued(other, 600)).await.unwrap();
+    drive(admit(queued(other, 600)), &ctx).await.unwrap();
 
     // A run that ended frees its place, and stays readable.
-    let mut done = read_run(&ctx, install, Ulid::from_parts(10, 1))
+    let mut done = drive(read_run(install, Ulid::from_parts(10, 1)), &ctx)
         .await
         .unwrap();
     done.finish(RunState::Succeeded, None, 700);
-    save_run(&ctx, &done).await.unwrap();
-    assert_eq!(read_run(&ctx, install, done.run_id).await.unwrap(), done);
-    assert_eq!(unfinished(&ctx).await.unwrap().len(), RUNS_QUEUED);
-    admit(&ctx, &queued(install, 501)).await.unwrap();
+    drive(save_run(&done).unwrap(), &ctx).await.unwrap();
+    assert_eq!(
+        drive(read_run(install, done.run_id), &ctx).await.unwrap(),
+        done
+    );
+    assert_eq!(drive(unfinished(), &ctx).await.unwrap().len(), RUNS_QUEUED);
+    drive(admit(queued(install, 501)), &ctx).await.unwrap();
 }
 
 #[tokio::test]
@@ -78,22 +85,23 @@ async fn paged_runs() {
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     for seq in [30, 10, 20] {
-        admit(&ctx, &queued(install, seq)).await.unwrap();
+        drive(admit(queued(install, seq)), &ctx).await.unwrap();
     }
-    admit(&ctx, &queued(Ulid::from_parts(1, 2), 15))
+    drive(admit(queued(Ulid::from_parts(1, 2), 15)), &ctx)
         .await
         .unwrap();
-    let (first, next) = list_runs(&ctx, install, None, 2).await.unwrap();
+    let (first, next) = drive(list_runs(install, None, 2), &ctx).await.unwrap();
     let ids: Vec<_> = first.iter().map(|run| run.due_ms).collect();
     assert_eq!(ids, [10, 20]);
-    let (rest, last) = list_runs(&ctx, install, next, 2).await.unwrap();
+    let (rest, last) = drive(list_runs(install, next, 2), &ctx).await.unwrap();
     assert_eq!(rest.iter().map(|run| run.due_ms).collect::<Vec<_>>(), [30]);
     assert_eq!(last, None);
 }
 
 #[tokio::test]
 async fn pruned_runs() {
-    use crate::plugins::intents::{begin, open_intent, settle_in};
+    use crate::plugins::intents::{begin, open_intent, settled_row};
+    use crate::plugins::rows::write_rows;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_plugins::broker::Intent;
     let (_dir, ctx) = opened();
@@ -105,27 +113,32 @@ async fn pruned_runs() {
         (3, RunState::Failed),
     ] {
         let mut run = queued(install, seq);
-        admit(&ctx, &run).await.unwrap();
+        drive(admit(run.clone()), &ctx).await.unwrap();
         let finished = if seq == 3 { 50 * RUN_RETENTION_MS } else { 10 };
         run.finish(state, None, finished);
-        save_run(&ctx, &run).await.unwrap();
+        drive(save_run(&run).unwrap(), &ctx).await.unwrap();
         let intent = Intent::new(0, &[b"x"]);
-        begin(&ctx, run.run_id, &intent).await.unwrap();
-        let settle = async |txn: &Txn<'_>| settle_in(txn, run.run_id, &intent, "r".into()).await;
-        transact(&ctx, settle).await.unwrap();
+        drive(begin(run.run_id, call_intent(&intent)), &ctx)
+            .await
+            .unwrap();
+        let settled = settled_row(run.run_id, &call_intent(&intent), "r".into()).unwrap();
+        drive(write_rows(vec![settled]), &ctx).await.unwrap();
         ended.push(run);
     }
     let waiting = queued(install, 4);
-    admit(&ctx, &waiting).await.unwrap();
+    drive(admit(waiting.clone()), &ctx).await.unwrap();
     let now = 10 + RUN_RETENTION_MS;
     assert_eq!(prune_runs(&ctx, now).await.unwrap(), 1);
     assert_eq!(
-        read_run(&ctx, install, ended[0].run_id).await,
+        drive(read_run(install, ended[0].run_id), &ctx).await,
         Err(RunError::NotFound)
     );
-    assert_eq!(open_intent(&ctx, ended[0].run_id).await.unwrap(), None);
+    assert_eq!(
+        drive(open_intent(ended[0].run_id), &ctx).await.unwrap(),
+        None
+    );
     for kept in [&ended[1], &ended[2], &waiting] {
-        assert!(read_run(&ctx, install, kept.run_id).await.is_ok());
+        assert!(drive(read_run(install, kept.run_id), &ctx).await.is_ok());
     }
 }
 
@@ -137,42 +150,71 @@ async fn resolved_runs() {
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
-    admit(&ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    let early = resolve_run(&ctx, install, run.run_id, true, &audit).await;
+    let early = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await;
     assert_eq!(early, Err(RunError::NotWaiting("queued")));
     run.finish(
         RunState::NeedsAttention,
         Some("call 0 is unknown".into()),
         5,
     );
-    save_run(&ctx, &run).await.unwrap();
-    let resolved = resolve_run(&ctx, install, run.run_id, true, &audit)
-        .await
-        .unwrap();
+    drive(save_run(&run).unwrap(), &ctx).await.unwrap();
+    let resolved = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert_eq!(resolved.state, RunState::Succeeded);
     assert!(resolved.message.unwrap_or_default().ends_with("as done"));
-    let again = resolve_run(&ctx, install, run.run_id, false, &audit).await;
+    let again = drive(
+        resolve_run(
+            (install, run.run_id),
+            false,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await;
     assert_eq!(again, Err(RunError::NotWaiting("succeeded")));
 }
 
 #[tokio::test]
 async fn keeps_open_calls() {
-    use crate::plugins::intents::mark_unknown;
+    use crate::plugins::intents::unknown_row;
+    use crate::plugins::rows::write_rows;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_plugins::broker::Intent;
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
-    admit(&ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &ctx).await.unwrap();
     run.finish(RunState::Failed, None, 10);
-    save_run(&ctx, &run).await.unwrap();
-    mark_unknown(&ctx, run.run_id, &Intent::new(0, &[b"x"]), "lost")
-        .await
-        .unwrap();
+    drive(save_run(&run).unwrap(), &ctx).await.unwrap();
+    let unknown = unknown_row(run.run_id, &call_intent(&Intent::new(0, &[b"x"])), "lost").unwrap();
+    drive(write_rows(vec![unknown]), &ctx).await.unwrap();
     assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
-    assert!(read_run(&ctx, install, run.run_id).await.is_ok());
+    assert!(drive(read_run(install, run.run_id), &ctx).await.is_ok());
 }
 
 #[tokio::test]
@@ -184,33 +226,43 @@ async fn unresolved_count() {
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut waiting = queued(install, 1);
-    admit(&ctx, &waiting).await.unwrap();
+    drive(admit(waiting.clone()), &ctx).await.unwrap();
     waiting.finish(
         RunState::NeedsAttention,
         Some("call 0 is unknown".into()),
         5,
     );
-    save_run(&ctx, &waiting).await.unwrap();
+    drive(save_run(&waiting).unwrap(), &ctx).await.unwrap();
     for seq in 2..=RUNS_QUEUED as u64 {
-        admit(&ctx, &queued(install, seq)).await.unwrap();
+        drive(admit(queued(install, seq)), &ctx).await.unwrap();
     }
-    let refused = admit(&ctx, &queued(install, 500)).await;
+    let refused = drive(admit(queued(install, 500)), &ctx).await;
     assert_eq!(refused, Err(RunError::Full(RUNS_QUEUED)));
-    let running = unfinished(&ctx).await.unwrap();
+    let running = drive(unfinished(), &ctx).await.unwrap();
     assert_eq!(running.len(), RUNS_QUEUED - 1);
     assert!(!running.contains(&(install, waiting.run_id)));
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    resolve_run(&ctx, install, waiting.run_id, false, &audit)
-        .await
-        .unwrap();
-    admit(&ctx, &queued(install, 500)).await.unwrap();
+    drive(
+        resolve_run(
+            (install, waiting.run_id),
+            false,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    drive(admit(queued(install, 500)), &ctx).await.unwrap();
 }
 
 #[tokio::test]
 async fn resolved_expire() {
     // A resolved run and its intents leave with the retention like any finished run.
-    use crate::plugins::intents::{mark_unknown, open_intent, written};
+    use crate::plugins::intents::{open_intent, unknown_row, written};
+    use crate::plugins::rows::write_rows;
     use aruna_core::UserId;
     use aruna_core::plugin_runs::RUN_RETENTION_MS;
     use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
@@ -219,28 +271,203 @@ async fn resolved_expire() {
     let (_dir, ctx) = opened();
     let install = Ulid::from_parts(1, 1);
     let mut run = queued(install, 1);
-    admit(&ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &ctx).await.unwrap();
     let intent = Intent::new(0, &[b"x"]);
-    mark_unknown(&ctx, run.run_id, &intent, "lost")
-        .await
-        .unwrap();
+    let unknown = unknown_row(run.run_id, &call_intent(&intent), "lost").unwrap();
+    drive(write_rows(vec![unknown]), &ctx).await.unwrap();
     run.finish(
         RunState::NeedsAttention,
         Some("call 0 is unknown".into()),
         5,
     );
-    save_run(&ctx, &run).await.unwrap();
+    drive(save_run(&run).unwrap(), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    let resolved = resolve_run(&ctx, install, run.run_id, true, &audit)
-        .await
-        .unwrap();
-    assert_eq!(open_intent(&ctx, run.run_id).await.unwrap(), None);
+    let resolved = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(drive(open_intent(run.run_id), &ctx).await.unwrap(), None);
     let later = resolved.finished_ms.unwrap() + RUN_RETENTION_MS;
     assert_eq!(prune_runs(&ctx, later).await.unwrap(), 1);
     assert_eq!(
-        read_run(&ctx, install, run.run_id).await,
+        drive(read_run(install, run.run_id), &ctx).await,
         Err(RunError::NotFound)
     );
-    assert!(!written(&ctx, run.run_id, &intent).await.unwrap());
+    assert!(
+        !drive(written(run.run_id, &call_intent(&intent)), &ctx)
+            .await
+            .unwrap()
+    );
+}
+
+/// A page answer of `count` queue rows.
+fn queue_page(count: usize) -> Answer {
+    let rows = (0..count)
+        .map(|seq| (vec![seq as u8], Vec::new()))
+        .collect();
+    Answer::Page(rows, None)
+}
+
+#[test]
+fn admission_bound() {
+    let install = Ulid::from_parts(1, 1);
+    let run = queued(install, 1);
+    let mut admission = Admission::new(run.clone());
+    let Ask::Page { space, prefix, .. } = admission.ask() else {
+        panic!("an admission counts the install's queue");
+    };
+    assert_eq!(
+        (space, prefix),
+        (PLUGIN_QUEUE_KEYSPACE, install.to_bytes().to_vec())
+    );
+    let rows = admission
+        .take(queue_page(RUNS_QUEUED - 1))
+        .unwrap()
+        .unwrap();
+    let keys: Vec<_> = rows
+        .iter()
+        .map(|(space, key, _)| (space.clone(), key.to_vec()))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            (
+                PLUGIN_QUEUE_KEYSPACE.to_string(),
+                queue_key(install, run.run_id)
+            ),
+            (
+                PLUGIN_RUNS_KEYSPACE.to_string(),
+                run_key(install, run.run_id)
+            ),
+        ]
+    );
+    let mut full = Admission::new(run);
+    assert_eq!(
+        full.take(queue_page(RUNS_QUEUED)),
+        Err(RunError::Full(RUNS_QUEUED))
+    );
+    assert!(full.take(Answer::Done).is_err());
+}
+
+#[test]
+fn resolve_decisions() {
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
+    let install = Ulid::from_parts(1, 1);
+    let mut waiting = queued(install, 1);
+    waiting.state = RunState::NeedsAttention;
+    let audit = AdminAuditRecord::new(
+        aruna_core::structs::identity::admin_audit::AdminAuditAction::PluginRunResolved,
+        UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1; 32])),
+        UserId::local(Ulid::from_parts(2, 3), RealmId::from_bytes([1; 32])),
+    );
+    let ids = (install, waiting.run_id);
+    let mut resolve = resolve_run(ids, false, &audit, 50).unwrap();
+    assert_eq!(resolve.start().len(), 1);
+    let mut plan = ResolveRun {
+        key: run_key(install, waiting.run_id),
+        done: false,
+        message: "a resolved it as not done".into(),
+        now_ms: 50,
+        audit: Vec::new(),
+        phase: ResolvePhase::Reading,
+    };
+    // A run that does not wait for a person is refused.
+    let running = Answer::Values(vec![Some(encode(&queued(install, 1)).unwrap())]);
+    assert_eq!(plan.next(running), Err(RunError::NotWaiting("queued")));
+    plan.phase = ResolvePhase::Reading;
+    assert_eq!(
+        plan.next(Answer::Values(vec![None])),
+        Err(RunError::NotFound)
+    );
+    plan.phase = ResolvePhase::Reading;
+    let stored = Answer::Values(vec![Some(encode(&waiting).unwrap())]);
+    assert!(matches!(
+        plan.next(stored).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the resolved run is written");
+    };
+    let saved: PluginRun = decode(&rows[0].2).unwrap();
+    assert_eq!(
+        (saved.state, saved.finished_ms),
+        (RunState::Failed, Some(50))
+    );
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
+        panic!("an ended run leaves the queue");
+    };
+    assert_eq!(
+        keys,
+        [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]
+    );
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(saved));
+}
+
+#[test]
+fn drop_deletes_intents() {
+    let install = Ulid::from_parts(1, 1);
+    let run = queued(install, 1);
+    let mut plan = DropRun {
+        key: run_key(install, run.run_id),
+        intents: intent_scan(run.run_id),
+        phase: DropPhase::Run,
+    };
+    let first = plan.first().unwrap();
+    assert_eq!(
+        first,
+        Turn::Ask(Ask::Delete(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            run_key(install, run.run_id)
+        )]))
+    );
+    assert!(matches!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let intents = vec![(b"i1".to_vec(), Vec::new())];
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(intents, None)).unwrap() else {
+        panic!("the run's intents are deleted");
+    };
+    assert_eq!(keys.len(), 1);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+}
+
+#[test]
+fn expired_runs_listed() {
+    let install = Ulid::from_parts(1, 1);
+    let mut ended = queued(install, 1);
+    ended.finish(RunState::Succeeded, None, 1);
+    let mut waiting = queued(install, 2);
+    waiting.finish(RunState::NeedsAttention, None, 1);
+    let mut plan = ExpiredRuns {
+        now_ms: 1 + RUN_RETENTION_MS,
+        phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
+        prunable: Vec::new(),
+    };
+    plan.first().unwrap();
+    let rows = vec![
+        (b"r1".to_vec(), encode(&ended).unwrap()),
+        (b"r2".to_vec(), encode(&waiting).unwrap()),
+    ];
+    // The work rows hold no completion, so the ended run's intents are read next.
+    assert!(matches!(
+        plan.next(Answer::Page(rows, None)).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    assert!(matches!(
+        plan.next(Answer::Page(Vec::new(), None)).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let done = plan.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(done, Turn::Finish(vec![(install, ended.run_id)]));
 }

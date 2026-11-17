@@ -22,12 +22,13 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read};
+use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::staging::native_source::{body_stream, delegated_read};
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LinkError {
@@ -355,8 +356,9 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
 
     use super::*;
+    use crate::testing::test_context;
     use crate::tests::access::seed_access;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::tests::s3::test_storage;
 
     #[tokio::test]
     async fn head_asks_target() {

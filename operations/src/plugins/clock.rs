@@ -26,7 +26,7 @@ pub struct ClockReading {
 
 /// The earliest local time that can hold an event at or after `boundary_ms` on the clock a
 /// reading came from, less the margin; `None` without a reading or with a slow round trip.
-pub fn local_start(boundary_ms: u64, reading: Option<ClockReading>) -> Option<u64> {
+pub(crate) fn local_start(boundary_ms: u64, reading: Option<ClockReading>) -> Option<u64> {
     let reading = reading?;
     let trip = reading.received_ms.checked_sub(reading.sent_ms)?;
     if trip > PROBE_LIMIT_MS {
@@ -52,7 +52,7 @@ pub(crate) async fn serve_clock(
 }
 
 /// One reading of `node`'s clock over the metadata transport.
-pub async fn probe_clock(ctx: &DriverContext, node: NodeId) -> Option<ClockReading> {
+pub(crate) async fn probe_clock(ctx: &DriverContext, node: NodeId) -> Option<ClockReading> {
     let handle = ctx.metadata_handle.as_ref()?;
     let sent_ms = unix_timestamp_millis();
     let remote_ms = handle.request_clock(node).await.ok()?;

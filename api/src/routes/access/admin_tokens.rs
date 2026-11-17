@@ -25,8 +25,6 @@ use aruna_operations::users::revoke_all::{RevokeAllConfig, RevokeAllError, Revok
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
@@ -77,8 +75,7 @@ pub(crate) const TOKEN_PAGE: (u32, u32) = (100, 1_000);
 fn parse_cursor(cursor: Option<&str>) -> ServerResult<Option<TokenCursor>> {
     cursor
         .map(|cursor| {
-            URL_SAFE_NO_PAD
-                .decode(cursor)
+            aruna_core::cursor::decode(cursor)
                 .ok()
                 .and_then(|bytes| TokenCursor::from_bytes(&bytes))
                 .ok_or_else(|| ServerError::BadRequestReason("invalid cursor".to_string()))
@@ -258,7 +255,7 @@ pub async fn list_group_tokens(
             tokens: page.tokens.into_iter().map(token_response).collect(),
             next_cursor: page
                 .next
-                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.to_bytes())),
+                .map(|cursor| aruna_core::cursor::encode(cursor.to_bytes())),
         }),
     ))
 }

@@ -534,7 +534,7 @@ fn refused_member(effect: &Effect) -> bool {
             | StorageEffect::VaultWrite { txn_id, .. }
             | StorageEffect::VaultRead { txn_id, .. }
             | StorageEffect::VaultDelete { txn_id, .. } => txn_id.is_some(),
-            StorageEffect::SyncAll => false,
+            StorageEffect::SyncAll | StorageEffect::RealmOpen(_) => false,
         },
         _ => false,
     }

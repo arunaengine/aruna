@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::state::{AttemptRecord, BindMount, StateRoot, read_json, read_optional, write_json};
 use super::{
-    declared_outputs, host_path, io_error, list_workspace, process_identity, read_log,
+    attempt_logs, declared_outputs, host_path, io_error, list_workspace, process_identity,
     remove_staging_temps, remove_tree, stage_files, stream_file, validate_control, validate_spec,
 };
 use crate::executor::channel::ChannelStream;
@@ -102,13 +102,13 @@ impl SlurmBackend {
                 },
                 backend_ref,
                 started_at_ms: None,
-                finished_at_ms: Some(crate::executor::now_ms()),
+                finished_at_ms: Some(aruna_core::time::unix_timestamp_millis()),
                 detail: None,
             });
         };
         let phase = job_phase(&job, cancel_requested);
         let finished_at_ms = (phase.is_terminal())
-            .then(|| (job.finished_at_ms).unwrap_or_else(crate::executor::now_ms));
+            .then(|| (job.finished_at_ms).unwrap_or_else(aruna_core::time::unix_timestamp_millis));
         Ok(AttemptStatus {
             phase,
             backend_ref,
@@ -346,18 +346,7 @@ impl ExecutorBackend for SlurmBackend {
         context: &FenceContext,
         limits: &LogLimits,
     ) -> Result<LogTails, BackendError> {
-        validate_control(self.state.read(context)?, context)?;
-        let logs = self.state.attempt_dir(context).join("logs");
-        let stdout = read_log(&logs.join("stdout"), limits).await?;
-        let stderr = read_log(&logs.join("stderr"), limits).await?;
-        Ok(LogTails {
-            stdout: stdout.0,
-            stderr: stderr.0,
-            stdout_total: stdout.1,
-            stderr_total: stderr.1,
-            stdout_truncated: stdout.2,
-            stderr_truncated: stderr.2,
-        })
+        attempt_logs(&self.state, context, limits).await
     }
 
     async fn fetch_output(

@@ -822,14 +822,12 @@ pub async fn get_renames(
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
     use aruna_operations::blob::migration::misplaced::{DEFAULT_PAGE, MAX_PAGE, rename_page};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
     let bad = || ServerError::BadRequestMessage("`after` is not a cursor".to_string());
     let after = match page.after.as_deref() {
-        Some(after) => Some(URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?),
+        Some(after) => Some(aruna_core::cursor::decode(after).map_err(|_| bad())?),
         None => None,
     };
     if !(1..=MAX_PAGE).contains(&limit) {
@@ -879,7 +877,7 @@ pub async fn get_renames(
         files: files
             .map(|(from, to, writable)| RenameFileResponse { from, to, writable })
             .collect(),
-        next: found.next.map(|key| URL_SAFE_NO_PAD.encode(key)),
+        next: found.next.map(aruna_core::cursor::encode),
         progress: last.map(Into::into),
     }))
 }

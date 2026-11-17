@@ -43,8 +43,8 @@ use crate::s3::object::search::SearchObjectsInput;
 use crate::s3::object::search_scan::search_local_objects;
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
+    DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
+    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 
 impl MetadataHandle {
@@ -267,7 +267,7 @@ async fn delete_mirror(
     // Retain the peer's readable reference records when detaching an outgoing mirror.
     let removed = match direction {
         SyncRelationshipDirection::Outgoing => {
-            remove_outgoing_relationship(context.as_ref(), stored).await
+            drive(RemoveOutgoingOperation::new(stored), context.as_ref()).await
         }
         SyncRelationshipDirection::Incoming => {
             drive(
@@ -917,13 +917,14 @@ impl MetadataHandle {
             record @ (MetadataTransportMessage::ForwardJobRecord { .. }
             | MetadataTransportMessage::ForwardRecordPage { .. }) => {
                 Box::pin(async {
-                    crate::jobs::records::serve_job_record(context, peer, record).await
+                    crate::jobs::records::transport::serve_job_record(context, peer, record).await
                 })
                 .await
             }
             MetadataTransportMessage::ForwardLaunchOffer { launch } => {
                 Box::pin(async {
-                    crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+                    crate::jobs::records::transport::serve_launch_offer(context, peer, *launch)
+                        .await
                 })
                 .await
             }
@@ -1260,12 +1261,14 @@ impl MetadataHandle {
                 (MetadataTransportMessage::ClockProbed { result }, None)
             }
             MetadataTransportMessage::ForwardEvents { batch } => {
-                let decided = crate::plugins::decide::serve_events(context, peer, batch);
+                let decided = crate::plugins::worker::serve_events(context, peer, batch);
                 let result = Box::pin(decided).await;
                 (MetadataTransportMessage::EventsDecided { result }, None)
             }
             MetadataTransportMessage::ReleaseSecret { request } => {
-                let released = crate::plugins::release::serve_release(context, peer, request);
+                let keys = crate::plugins::release::node_keys(context);
+                let keys = (keys.seal, keys.vault);
+                let released = crate::plugins::release::serve_release(context, keys, peer, request);
                 let result = Box::pin(released).await;
                 (MetadataTransportMessage::SecretReleased { result }, None)
             }

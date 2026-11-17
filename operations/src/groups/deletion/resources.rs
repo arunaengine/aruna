@@ -9,7 +9,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecord, JobRecordEnvelope};
+use aruna_core::structs::execution::job::JobRecord;
+use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope};
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
@@ -140,12 +141,12 @@ impl EmptyCheck {
                     }
                     FAMILY_RECORD_KEYSPACE => {
                         let envelope: JobRecordEnvelope =
-                            postcard::from_bytes(&value).map_err(ConversionError::from)?;
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     FAMILY_PENDING_KEYSPACE => {
-                        let pending: crate::jobs::records::rows::PendingRecord =
-                            postcard::from_bytes(&value).map_err(ConversionError::from)?;
+                        let pending: aruna_core::structs::execution::job::record_rows::PendingRecord =
+                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
                         matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
                     }
                     S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,

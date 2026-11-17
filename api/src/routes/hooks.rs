@@ -10,8 +10,10 @@ use aruna_core::NodeId;
 use aruna_core::plugin_runs::HookRequest;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::distribution::delegate::node_urls;
-use aruna_operations::plugins::hooks::{HookError, admit_hook, checks_authorization};
+use aruna_operations::plugins::dispatch::{admit_hook, checks_authorization};
+use aruna_operations::plugins::hooks::HookError;
 use aruna_operations::plugins::install::read_config;
+use aruna_operations::plugins::release::node_keys;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -22,8 +24,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError};
-use crate::lookup::{capped_body, relay_url};
 use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_hops};
+use crate::routes::storage::relay::{capped_body, relay_url};
 use crate::server::state::ServerState;
 
 /// Bounds of a webhook request, checked before its body is read or relayed.
@@ -119,6 +121,7 @@ pub async fn receive(
         return ServerError::NotFound.into_response();
     };
     let ctx = state.get_ctx();
+    let keys = node_keys(&ctx);
     let request = HookRequest {
         delivery_id: None,
         method: method.to_string(),
@@ -128,16 +131,9 @@ pub async fn receive(
             .collect(),
         body: body.to_vec(),
     };
+    let place = (state.get_node_id(), &keys);
     let ids = (state.get_realm_id(), install_id);
-    match admit_hook(
-        &ctx,
-        state.get_node_id(),
-        ids,
-        request,
-        unix_timestamp_millis(),
-    )
-    .await
-    {
+    match admit_hook(&ctx, place, ids, request, unix_timestamp_millis()).await {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(HookError::Elsewhere(receiver)) => {
             let path = match query {

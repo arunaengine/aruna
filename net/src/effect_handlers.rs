@@ -206,12 +206,19 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
+            aruna_core::DocumentEffect::ReconcileTopics { .. } => {
+                NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
+                    target: None,
+                    error: "topic reconcile must be dispatched by the operations runner"
+                        .to_string(),
+                })
+            }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
-        // Job-control and audit effects are executed by the operations runner,
-        // which holds the driver context; they never reach this handler.
+        // The net handle runs job-control round trips itself; the operations
+        // runner executes audit effects. Neither reaches this handler.
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
-            "job-control effect must be dispatched by the operations runner".to_string(),
+            "job-control effect must be sent through the net handle".to_string(),
         )),
         NetEffect::AuditPage(audit) => {
             NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
@@ -237,6 +244,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             "statement signing must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
+        NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
+            "artifact copies must be dispatched by the operations runner".to_string(),
+        )),
         // Metadata requests ride the metadata transport the runner holds.
         NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
             peer: request.peer,
@@ -525,6 +535,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
+        NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
     }
 }

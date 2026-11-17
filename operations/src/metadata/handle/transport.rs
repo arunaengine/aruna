@@ -756,14 +756,14 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: AuthToken,
-        request: crate::jobs::lifecycle::ingress::InputResolveRequest,
+        request: aruna_core::jobs::InputResolveRequest,
     ) -> Result<
         Result<
             Vec<(
                 aruna_core::structs::execution::job::InputSelection,
                 aruna_core::structs::execution::job::CapturedInput,
             )>,
-            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+            aruna_core::jobs::SubmissionRefusal,
         >,
         String,
     > {
@@ -805,7 +805,7 @@ impl MetadataHandle {
     pub async fn request_store_artifact(
         &self,
         node_id: NodeId,
-        chunk: crate::plugins::copies::Chunk,
+        chunk: aruna_core::plugins::Chunk,
     ) -> Result<bool, MetadataReadError> {
         let request = MetadataTransportMessage::StoreArtifact { chunk };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
@@ -823,7 +823,7 @@ impl MetadataHandle {
         node_id: NodeId,
         digest: String,
         index: u32,
-    ) -> Result<crate::plugins::copies::Chunk, MetadataReadError> {
+    ) -> Result<aruna_core::plugins::Chunk, MetadataReadError> {
         let request = MetadataTransportMessage::FetchArtifact { digest, index };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
@@ -850,8 +850,8 @@ impl MetadataHandle {
     pub async fn request_forward(
         &self,
         node_id: NodeId,
-        batch: crate::plugins::forward::EventBatch,
-    ) -> Result<crate::plugins::forward::Decisions, MetadataReadError> {
+        batch: aruna_core::plugin_runs::EventBatch,
+    ) -> Result<aruna_core::plugin_runs::Decisions, MetadataReadError> {
         let request = MetadataTransportMessage::ForwardEvents { batch };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await
@@ -869,8 +869,8 @@ impl MetadataHandle {
         node_id: NodeId,
         name: aruna_core::secrets::SecretName,
         kind: aruna_core::secrets::SecretKind,
-    ) -> Result<Option<String>, crate::plugins::bound::NodeCheckError> {
-        use crate::plugins::bound::NodeCheckError;
+    ) -> Result<Option<String>, aruna_core::plugins::NodeCheckError> {
+        use aruna_core::plugins::NodeCheckError;
         let request = MetadataTransportMessage::CheckNodeSecret { name, kind };
         match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
             Ok(MetadataTransportMessage::NodeSecretChecked { result }) => result,
@@ -882,9 +882,9 @@ impl MetadataHandle {
     pub async fn request_release(
         &self,
         node_id: NodeId,
-        request: crate::plugins::release::ReleaseRequest,
-    ) -> Result<crate::plugins::release::Released, crate::plugins::release::ReleaseError> {
-        use crate::plugins::release::ReleaseError;
+        request: aruna_core::plugins::ReleaseRequest,
+    ) -> Result<aruna_core::plugins::Released, aruna_core::plugins::ReleaseError> {
+        use aruna_core::plugins::ReleaseError;
         let request = MetadataTransportMessage::ReleaseSecret { request };
         let unavailable = || ReleaseError::Unavailable(format!("node {node_id} did not answer"));
         match send_remote_request(&self.inner, &Span::current(), node_id, request).await {

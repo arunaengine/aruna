@@ -13,12 +13,12 @@ use aruna_api::s3::server::{S3Server, S3ServerHandle, S3ServerTimeouts};
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -287,6 +287,12 @@ async fn bind_all(
         }
         false => None,
     };
+    if let Some(metadata) = &driver_ctx.metadata_handle {
+        metadata.install_git(aruna_blob::git::GitStore::new(
+            std::path::Path::new(&config.storage_path).join("git"),
+            std::env::current_exe()?,
+        ));
+    }
     let mut state = ServerState::new(
         driver_ctx.clone(),
         config.realm_id,
@@ -297,10 +303,6 @@ async fn bind_all(
         jobs_runtime,
     )
     .await
-    .with_git(
-        std::path::Path::new(&config.storage_path).join("git"),
-        std::env::current_exe()?,
-    )
     .with_metrics(metrics.clone())
     .with_rocrate_limits(config.rocrate_limits.clone())
     .with_assistant_proxy(config.assistant_proxy)
@@ -547,9 +549,9 @@ mod tests {
     #[tokio::test]
     async fn session_exit_reports() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::execution::job::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
+        use aruna_tasks::shutdown::Shutdown;
 
         // A real session listener that stopped on its shutdown token is
         // reported, never treated as a node failure.
@@ -642,8 +644,8 @@ mod tests {
     #[tokio::test]
     async fn bind_failure_releases() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::shutdown::Shutdown;
         use aruna_operations::jobs::runtime::JobsRuntime;
+        use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupied port");
@@ -779,7 +781,7 @@ mod tests {
             driver_ctx,
             aruna_operations::jobs::runtime::JobsRuntime::new_paused(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
-            &aruna_core::shutdown::Shutdown::new(),
+            &aruna_tasks::shutdown::Shutdown::new(),
         )
         .await
         {
@@ -840,7 +842,7 @@ mod tests {
             CorsConfig::default(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
             S3ServerTimeouts::default(),
-            &aruna_core::shutdown::Shutdown::new(),
+            &aruna_tasks::shutdown::Shutdown::new(),
         )
         .await;
 
@@ -852,9 +854,9 @@ mod tests {
     #[tokio::test]
     async fn session_listener_completes() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::execution::job::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
+        use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
@@ -901,9 +903,9 @@ mod tests {
     #[tokio::test]
     async fn abort_awaits_children() {
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::shutdown::Shutdown;
         use aruna_core::structs::execution::job::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
+        use aruna_tasks::shutdown::Shutdown;
 
         let temp = tempfile::tempdir().expect("temp dir");
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))

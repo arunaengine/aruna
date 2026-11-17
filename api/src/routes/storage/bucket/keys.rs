@@ -10,7 +10,6 @@ use super::super::encryption::{
 };
 use super::super::routing::ensure_group_admin;
 use crate::auth::UnrestrictedAuth;
-use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
@@ -37,10 +36,10 @@ use aruna_operations::s3::bucket::key_unlock::{
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
 use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
@@ -291,13 +290,12 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
 )]
 pub async fn unlock_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<UnlockQuery>,
     body: Bytes,
 ) -> ServerResult<Json<UnlockView>> {
     let private_key = unlock_key(body)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = UnlockInput {

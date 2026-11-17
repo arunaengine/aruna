@@ -592,12 +592,7 @@ impl RealmPlacementMutation {
 
 /// The configured kind of `node_id`, or `None` when the realm does not know it.
 pub(crate) fn node_kind(document: &RealmConfigDocument, node_id: NodeId) -> Option<RealmNodeKind> {
-    let node_id = node_id.to_string();
-    document
-        .nodes
-        .iter()
-        .find(|node| node.node_id == node_id)
-        .map(|node| node.kind.clone())
+    document.node_kind(&node_id).cloned()
 }
 
 /// Only a management node's realm-config mutation passes inbound admission;

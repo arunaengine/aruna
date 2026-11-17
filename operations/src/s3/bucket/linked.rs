@@ -438,7 +438,7 @@ pub async fn process_linked(context: &DriverContext) -> Result<Option<Duration>,
     let mut next = None::<Duration>;
     let mut after = None;
     loop {
-        let (rows, more) = crate::jobs::store::iter_prefix_page(
+        let (rows, more) = crate::jobs::store::query::iter_prefix_page(
             &context.storage_handle,
             LINKED_JOB_KEYSPACE,
             None,

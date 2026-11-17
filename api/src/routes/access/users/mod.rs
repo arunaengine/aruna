@@ -11,7 +11,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
 use crate::auth::{RealmAuth, TokenAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::onboarding::authorize_onboarding_admin;
+use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
@@ -32,15 +32,11 @@ use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::onboarding::consume_secret::{
-    ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
-};
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
-use aruna_operations::onboarding::inspect_secret::{
-    InspectSecretError, InspectSecretInput, InspectSecretOperation,
-};
+use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
@@ -56,6 +52,7 @@ use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
@@ -85,25 +82,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(vault::router())
         .merge(keys::router())
         .merge(merge::router())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserRequest {
-    pub onboarding_secret: Option<String>,
-    /// Create a new account although an account with this email or name exists.
-    #[serde(default)]
-    pub create_new: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserResponse {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GetTokenResponse {
-    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -311,35 +289,6 @@ fn preferences_from_attributes(attributes: &HashMap<String, String>) -> UserPref
             .map(|value| value.trim())
             .filter(|value| matches!(*value, "personal" | "realm"))
             .map(ToOwned::to_owned),
-    }
-}
-
-impl From<User> for RegisterUserResponse {
-    fn from(value: User) -> Self {
-        RegisterUserResponse {
-            name: value.name,
-            id: value.user_id.to_string(),
-        }
-    }
-}
-
-fn map_consume_error(error: ConsumeSecretError) -> ServerError {
-    match error {
-        ConsumeSecretError::NotFound
-        | ConsumeSecretError::Expired
-        | ConsumeSecretError::AlreadyClaimed
-        | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
-    }
-}
-
-fn map_inspect_error(error: InspectSecretError) -> ServerError {
-    match error {
-        InspectSecretError::NotFound
-        | InspectSecretError::Expired
-        | InspectSecretError::AlreadyClaimed
-        | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
     }
 }
 

@@ -5,12 +5,15 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::plugin_installs::{PluginInstall, SecretBinding};
-use aruna_core::plugin_runs::PluginRun;
+use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding};
+use aruna_core::plugin_runs::{HookRequest, PluginRun, RunTrigger};
 use serde_json::json;
 
 use super::*;
-use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
+use crate::driver::drive;
+use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hook_secret, keys};
+use crate::plugins::dispatch::{admit_hook, checks_authorization};
+use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::outbound::tests::leaks;
 use crate::plugins::runs::list_runs;
@@ -60,7 +63,7 @@ fn request(signature: &str, delivery: Option<&str>) -> HookRequest {
 }
 
 async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
-    let listed = list_runs(&fixture.ctx, install.install_id, None, 100).await;
+    let listed = drive(list_runs(install.install_id, None, 100), &fixture.ctx).await;
     listed.unwrap().0
 }
 
@@ -68,9 +71,9 @@ async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
 async fn admits_verified() {
     let fixture = Fixture::keyed().await;
     let install = hooked(&fixture).await;
-    hold_keys(&fixture.ctx);
+    let keys = keys();
     let ids = (fixture.actor.realm_id, install.install_id);
-    let admit = |request| admit_hook(&fixture.ctx, install.receiver, ids, request, 10);
+    let admit = |request| admit_hook(&fixture.ctx, (install.receiver, &keys), ids, request, 10);
     // Without a delivery id every request is a run; one id starts one run.
     assert_eq!(admit(request(TOKEN, None)).await, Ok(true));
     assert_eq!(admit(request(TOKEN, None)).await, Ok(true));
@@ -111,8 +114,8 @@ async fn admits_verified() {
 async fn refusals_start_nothing() {
     let fixture = Fixture::keyed().await;
     let install = hooked(&fixture).await;
-    hold_keys(&fixture.ctx);
-    let place = install.receiver;
+    let keys = keys();
+    let place = (install.receiver, &keys);
     let realm_id = fixture.actor.realm_id;
     let admit = |install_id| {
         let ctx = &fixture.ctx;
@@ -156,7 +159,6 @@ async fn refusals_start_nothing() {
 
 /// Writes the node secret `hook-key` of kind `header` on this node, checking `checked`.
 async fn node_secret(fixture: &Fixture, checked: &str, round: u64) {
-    use crate::driver::drive;
     use crate::secrets::SecretChange;
     use crate::secrets::node::{NodeChange, NodeSecretOperation};
     use aruna_core::compute::Secret;
@@ -220,4 +222,32 @@ async fn node_checks_relay() {
     // A relaying node that cannot reach the receiver cannot tell either.
     let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
     assert_eq!(relay(elsewhere).await, None);
+}
+
+#[test]
+fn delivery_admitted_once() {
+    let run = crate::plugins::runs::tests::queued(Ulid::from_parts(1, 1), 1);
+    let ids = (run.install_id, Some("d1".to_string()));
+    let mut plan = AdmitHook::new(run.clone(), ids.clone(), 9).unwrap();
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    // A delivery id the receiver admitted before starts nothing.
+    let seen = Answer::Values(vec![Some(encode(&9u64).unwrap())]);
+    assert_eq!(plan.next(seen).unwrap(), Turn::Finish(false));
+    let mut fresh = AdmitHook::new(run.clone(), ids, 9).unwrap();
+    fresh.first().unwrap();
+    assert!(matches!(
+        fresh.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let Turn::Ask(Ask::Write(rows)) = fresh.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the delivery and the run are written");
+    };
+    assert_eq!(rows.len(), 4);
+    assert_eq!(fresh.next(Answer::Done).unwrap(), Turn::Finish(true));
+    // Without a delivery id the run is admitted at once.
+    let mut plain = AdmitHook::new(run.clone(), (run.install_id, None), 9).unwrap();
+    assert!(matches!(
+        plain.first().unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
 }

@@ -127,13 +127,20 @@ pub async fn repository(
     Ok((document, repository))
 }
 
+/// The node's Git store, which startup installs on the metadata handle.
+pub(crate) fn store(context: &DriverContext) -> Result<&GitStore, GitError> {
+    (context.metadata_handle.as_ref())
+        .and_then(|handle| handle.git())
+        .ok_or(GitError::Unavailable)
+}
+
 /// Serves Git over HTTP after bringing the local cache up to date from the records.
 pub async fn transport(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     request: GitRequest,
 ) -> Result<GitEvent, GitError> {
+    let store = store(context)?;
     let permission =
         if request.action == "git-receive-pack" || request.query == "service=git-receive-pack" {
             Permission::WRITE

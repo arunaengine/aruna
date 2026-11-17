@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -13,8 +14,10 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
+use crate::plugins::dataset::merge_into;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
+use crate::plugins::store::Txn;
 
 /// Runs the projection and graph work a write queued.
 async fn project(ctx: &DriverContext) {
@@ -486,7 +489,7 @@ async fn expected_revision() {
         .await;
     assert_eq!(ahead.unwrap_err().kind, ErrorKind::Conflict);
     assert_eq!(
-        open_intent(&broker.ctx, broker.scope.run.run_id)
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx)
             .await
             .unwrap(),
         None
@@ -517,7 +520,7 @@ async fn invalid_patches() {
         assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
     }
     assert_eq!(
-        open_intent(&broker.ctx, broker.scope.run.run_id)
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx)
             .await
             .unwrap(),
         None
@@ -527,13 +530,12 @@ async fn invalid_patches() {
 #[tokio::test]
 async fn secret_values_granted() {
     use crate::plugins::account::{Identity, ensure_role, guard_of};
-    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
+    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, keys, secret};
     use crate::plugins::grants::role_paths;
     use crate::plugins::rules::ensure_rules;
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;
-    hold_keys(&fixture.ctx);
     let broker = |install: &PluginInstall| {
         let mut run = queued(install.install_id, 1);
         run.digest = install.digest.clone();
@@ -542,7 +544,7 @@ async fn secret_values_granted() {
             local: fixture.actor.node_id,
             run,
         };
-        RunBroker::new(Arc::new(fixture.ctx.clone()), scope)
+        RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys())
     };
     let kind = async |install: &PluginInstall| {
         let refused = broker(install).secret_value(&cx(), "api_key").await;
@@ -630,9 +632,8 @@ async fn keyed_creates() {
     );
     // A lost reply leaves the call unknown in its run; the next run recovers by the key.
     let lost = "the reply was lost";
-    mark_unknown(&broker.ctx, scope.run.run_id, &first.intent, lost)
-        .await
-        .unwrap();
+    let unknown = unknown_row(scope.run.run_id, &call_intent(&first.intent), lost).unwrap();
+    drive(write_rows(vec![unknown]), &broker.ctx).await.unwrap();
     let unknown = creator.metadata_create(&cx(), first).await.unwrap_err();
     assert_eq!(unknown.kind, ErrorKind::UnknownOutcome);
 
@@ -1580,7 +1581,7 @@ async fn unprojected_event_refused() {
     let txn = Txn::direct(&broker.ctx);
     let logged = (
         event_log_key(document, event.event_id).to_vec(),
-        crate::plugins::store::encode(&event).unwrap(),
+        crate::plugins::rows::encode(&event).unwrap(),
     );
     txn.write(EVENT_LOG_KEYSPACE, vec![logged]).await.unwrap();
     let marker = (

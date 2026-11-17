@@ -70,21 +70,6 @@ pub(crate) fn create_record_matches(
         && record.public == config.public
 }
 
-pub(crate) fn update_record_matches(
-    expected: &MetadataRegistryRecord,
-    actual: &MetadataRegistryRecord,
-) -> bool {
-    expected.realm_id == actual.realm_id
-        && expected.group_id == actual.group_id
-        && expected.document_id == actual.document_id
-        && expected.document_path == actual.document_path
-        && expected.graph_iri == actual.graph_iri
-        && expected.permission_path == actual.permission_path
-        && expected.placement == actual.placement
-        && expected.created_at_ms == actual.created_at_ms
-        && expected.establishing_event_id == actual.establishing_event_id
-}
-
 pub(crate) async fn forwarded_create_replay(
     context: &Arc<DriverContext>,
     config: &CreateDocumentConfig,

@@ -6,6 +6,7 @@
 use std::future::Future;
 
 use aruna_core::NodeId;
+use aruna_core::cursor;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -15,8 +16,6 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionMember, KeyRange,
 };
 use aruna_core::structs::storage::link::LinkTarget;
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -167,15 +166,11 @@ pub enum Resume {
 }
 
 pub fn encode_resume<E>(resume: &Resume) -> Result<String, PageError<E>> {
-    let bytes = postcard::to_allocvec(resume).map_err(PageError::internal)?;
-    Ok(URL_SAFE_NO_PAD.encode(bytes))
+    cursor::encode_value(resume).map_err(PageError::internal)
 }
 
 pub fn decode_resume<E>(cursor: &str) -> Result<Resume, PageError<E>> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|_| PageError::Cursor)?;
-    postcard::from_bytes(&bytes).map_err(|_| PageError::Cursor)
+    cursor::decode_value(cursor).map_err(|_| PageError::Cursor)
 }
 
 /// The token that resumes a local listing after `key`, or past the whole `group`.

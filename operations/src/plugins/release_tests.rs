@@ -10,10 +10,13 @@ use aruna_core::secrets::{SecretFields, UseRule};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
+use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::store::Txn;
 use crate::secrets::SecretChange;
+use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use ulid::Ulid;
 
 fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {
     ReleaseRequest {
@@ -35,8 +38,7 @@ async fn released(
         .await
         .unwrap();
     let local = fixture.actor.node_id;
-    hold_keys(&fixture.ctx);
-    release(&fixture.ctx, (&config, local, peer), request).await
+    release(&fixture.ctx, &keys(), (&config, local, peer), request).await
 }
 
 /// The use audit actions this node recorded, oldest first.
@@ -186,13 +188,18 @@ async fn node_secrets_local() {
     let asked = request(&install, &format!("{ORIGIN}/api/records"));
     let receiver = install.receiver;
     let mine = (&config, receiver, receiver);
-    let answer = release(&fixture.ctx, mine, &asked).await;
+    let answer = release(&fixture.ctx, &ReleaseKeys::default(), mine, &asked).await;
     let fields = SecretFields::decode(answer.unwrap().fields.as_ref().unwrap()).unwrap();
     assert_eq!(fields.get("token"), Some(TOKEN));
     // A management node never serves another node's secret.
     let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
-    hold_keys(&fixture.ctx);
-    let served = release(&fixture.ctx, (&config, elsewhere, receiver), &asked).await;
+    let served = release(
+        &fixture.ctx,
+        &keys(),
+        (&config, elsewhere, receiver),
+        &asked,
+    )
+    .await;
     assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
 }
 

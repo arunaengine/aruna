@@ -992,7 +992,7 @@ mod authorization_tests {
     use super::*;
     use crate::server::state::ServerState;
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+        seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{
@@ -1006,6 +1006,7 @@ mod authorization_tests {
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
+    use aruna_operations::testing::test_context;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
     use rmcp::handler::server::tool::Extension;

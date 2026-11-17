@@ -18,7 +18,7 @@ use aruna_core::storage_entries::{profile_validation_entry, profile_validation_k
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
-use craqle::{CrateViolation, ShaclValidationResult};
+use craqle::ShaclValidationResult;
 use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad, Term};
 use oxttl::NQuadsParser;
 use ulid::Ulid;
@@ -272,7 +272,10 @@ async fn assess_write(
             .map_err(|error| shacl_failure(error, None))?;
         return Ok(MetadataProfilePreview {
             status: not_profiled_status(document_id),
-            structural_violations: structural.into_iter().map(structural_violation).collect(),
+            structural_violations: structural
+                .into_iter()
+                .map(MetadataValidationViolation::from)
+                .collect(),
         });
     };
     evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await
@@ -423,7 +426,7 @@ fn shacl_assessment(report: ProfileShaclReport, profile_revision: &str) -> Profi
         structural: report
             .structural
             .into_iter()
-            .map(structural_violation)
+            .map(MetadataValidationViolation::from)
             .collect(),
     }
 }
@@ -485,15 +488,6 @@ fn crate_local(term: &str) -> String {
         "./".to_string()
     } else {
         decoded
-    }
-}
-
-fn structural_violation(violation: CrateViolation) -> MetadataValidationViolation {
-    MetadataValidationViolation {
-        code: violation.code.to_string(),
-        message: violation.message,
-        pointer: violation.pointer,
-        entity_id: violation.entity_id,
     }
 }
 

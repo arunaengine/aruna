@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::RealmAuth;
-use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
+use crate::auth::{parse_group_id, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
@@ -20,8 +20,8 @@ use aruna_operations::s3::bucket::bucket_jobs::{ActiveJob, JobKind};
 use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -742,13 +742,12 @@ pub async fn put_group_routing(
 )]
 pub async fn list_group_buckets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
     use aruna_operations::s3::bucket::bucket_storage::list_bucket_storage;
     use aruna_operations::s3::bucket::list::bucket_cursor;
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let limit = page.limit.unwrap_or(200);

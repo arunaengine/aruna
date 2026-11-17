@@ -7,8 +7,8 @@ use crate::auth::ValidatedBearer;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
 use crate::metadata::forwarded_auth_token;
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -1255,10 +1255,16 @@ pub async fn mint_object_placement(
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     // In a distributed bucket the coordinator of the key's range mints the successor.
-    let forward = crate::lookup::rest_target(&state, &info, &request.key, &headers);
+    let forward = crate::routes::storage::relay::rest_target(&state, &info, &request.key, &headers);
     if let Some(forward) = forward.await? {
         let path = format!("/data/buckets/{bucket}/placement/objects");
-        let relayed = crate::lookup::relay_json(&state, &forward, &path, bearer.as_ref(), &request);
+        let relayed = crate::routes::storage::relay::relay_json(
+            &state,
+            &forward,
+            &path,
+            bearer.as_ref(),
+            &request,
+        );
         return Ok(Json(relayed.await?.1));
     }
     let subject = local_subject(&state, auth.realm_id).await?;
@@ -1410,7 +1416,7 @@ pub async fn run_bucket_placement(
 ) -> ServerResult<Json<BulkRunResponse>> {
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let info = bucket_info(&state, &bucket).await?;
-    crate::lookup::relayed_set(&info, &headers)?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
     Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
     let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
     let answer = match info.distribution.as_ref().filter(|_| !relayed) {
@@ -1579,7 +1585,7 @@ pub async fn get_placement_coverage(
     )
     .await?;
     let info = bucket_info(&state, &bucket).await?;
-    crate::lookup::relayed_set(&info, &headers)?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
     let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
     let answer = match info.distribution.as_ref().filter(|_| !relayed) {
         Some(binding) => {

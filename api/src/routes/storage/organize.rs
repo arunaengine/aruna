@@ -25,8 +25,6 @@ use aruna_operations::s3::imports::last_run;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -275,12 +273,11 @@ fn page_of(page: &PageRequest) -> ServerResult<(Option<String>, usize)> {
 
 /// Cursors name a key the caller may read; they are encoded so clients pass them back as is.
 fn encode_cursor(key: String) -> String {
-    URL_SAFE_NO_PAD.encode(key)
+    aruna_core::cursor::encode(key)
 }
 
 fn decode_cursor(cursor: &str) -> ServerResult<String> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
+    let bytes = aruna_core::cursor::decode(cursor)
         .map_err(|_| ServerError::BadRequestMessage("`after` is not a cursor".to_string()))?;
     String::from_utf8(bytes)
         .map_err(|_| ServerError::BadRequestMessage("`after` is not a cursor".to_string()))
@@ -841,7 +838,7 @@ async fn file_keys(
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
-    let intents = aruna_operations::jobs::store::iter_prefix_page(
+    let intents = aruna_operations::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(
@@ -864,7 +861,7 @@ async fn file_keys(
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
-    let intents = aruna_operations::jobs::store::iter_prefix_page(
+    let intents = aruna_operations::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(

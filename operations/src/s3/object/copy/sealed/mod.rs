@@ -17,7 +17,6 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::plugins::journal::journaled;
 use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::abe_rekey::RekeyProgress;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
@@ -34,6 +33,7 @@ use aruna_core::keyspaces::{
 use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};

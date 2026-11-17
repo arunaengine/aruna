@@ -9,6 +9,7 @@ use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
+use aruna_core::metadata::CRATE_PROFILE_IRI;
 use aruna_core::structs::ORIGIN_DEVICE_TAG;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
@@ -32,16 +33,16 @@ use ulid::Ulid;
 const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
-pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
 const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
 use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{
-    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
-    read_launch_record, read_run_link,
+use super::super::store::attempt::{
+    put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_launch_record,
+    read_run_link,
 };
+use super::super::store::state::read_job_record;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
@@ -989,7 +990,7 @@ fn build_crate_jsonld(
             "description": run_description,
             "datePublished": rfc3339(record.created_at_ms),
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
-            "conformsTo": {"@id": PROCESS_PROFILE},
+            "conformsTo": {"@id": CRATE_PROFILE_IRI},
             "hasPart": has_part,
             "mentions": {"@id": action_id}
         }),
@@ -1002,7 +1003,7 @@ fn build_crate_jsonld(
         software,
         container,
         json!({
-            "@id": PROCESS_PROFILE,
+            "@id": CRATE_PROFILE_IRI,
             "@type": ["CreativeWork", "http://www.w3.org/ns/dx/prof/Profile"],
             "name": "Process Run Crate",
             "version": "0.5"
@@ -1292,8 +1293,8 @@ mod pure_tests {
         assert_eq!(descriptor["conformsTo"]["@id"], CRATE_PROFILE);
         let root_id = descriptor["about"]["@id"].as_str().unwrap().to_string();
         let root = by_id(&root_id);
-        assert_eq!(root["conformsTo"]["@id"], PROCESS_PROFILE);
-        let profile = by_id(PROCESS_PROFILE);
+        assert_eq!(root["conformsTo"]["@id"], CRATE_PROFILE_IRI);
+        let profile = by_id(CRATE_PROFILE_IRI);
         assert_eq!(profile["@type"][0], "CreativeWork");
         assert_eq!(profile["@type"][1], "http://www.w3.org/ns/dx/prof/Profile");
         assert_eq!(profile["name"], "Process Run Crate");
@@ -1934,7 +1935,7 @@ mod tests {
             _ => false,
         };
         let root = by_id(&root_id);
-        assert_eq!(entity_id(&root["conformsTo"]), Some(PROCESS_PROFILE));
+        assert_eq!(entity_id(&root["conformsTo"]), Some(CRATE_PROFILE_IRI));
         let action = graph
             .iter()
             .find(|entity| has_type(entity, "CreateAction"))
@@ -1954,7 +1955,7 @@ mod tests {
         ));
         assert_eq!(container["registry"], "docker.io");
         assert_eq!(container["sha256"], "a".repeat(64));
-        let profile = by_id(PROCESS_PROFILE);
+        let profile = by_id(CRATE_PROFILE_IRI);
         assert!(has_type(profile, "http://www.w3.org/ns/dx/prof/Profile"));
         assert!(graph.iter().any(|entity| {
             entity["propertyID"] == WORKSPACE_PROPERTY && entity["value"] == "workspace-sample-one"
@@ -2088,8 +2089,8 @@ mod tests {
         let report = engine
             .evaluate(
                 &ProfileShapes {
-                    graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
-                    sources: builtin_shapes(PROCESS_PROFILE)
+                    graph_iri: format!("{CRATE_PROFILE_IRI}#shapes/{BUILTIN_REVISION}"),
+                    sources: builtin_shapes(CRATE_PROFILE_IRI)
                         .unwrap()
                         .iter()
                         .map(|shapes| shapes.to_string())

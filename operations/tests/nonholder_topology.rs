@@ -22,14 +22,14 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::jobs::JobRouteError;
 use aruna_operations::jobs::drain::{JobClassBudget, drain_job_batch};
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, read_job_routed, read_owned_job, read_record_routed,
     submit_execution_job, submit_rocrate_import,
 };
-use aruna_operations::jobs::store::find_dedup_job;
+use aruna_operations::jobs::store::query::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
 use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::{
@@ -301,7 +301,7 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         claimed_by: None,
     };
     let storage = &node.context.storage_handle;
-    aruna_operations::jobs::import::write_rocrate_upload(storage, &record).await?;
+    aruna_operations::jobs::import::upload_store::write_rocrate_upload(storage, &record).await?;
     Ok(())
 }
 

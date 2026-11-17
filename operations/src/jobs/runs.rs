@@ -14,7 +14,7 @@ use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
-use crate::jobs::store::{read_crate_status, read_run_link};
+use crate::jobs::store::attempt::{read_crate_status, read_run_link};
 
 #[derive(Debug, Error)]
 pub enum RunReadError {

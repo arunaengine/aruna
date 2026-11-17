@@ -7,15 +7,20 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
-use aruna_core::plugin_installs::BoundScope;
-use aruna_core::secrets::SecretFields;
+use aruna_core::injection::{OutgoingRequest, inject_secret};
+use aruna_core::plugin_installs::{BoundScope, PluginInstall};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_plugins::broker::{ErrorKind, HostError};
 use ulid::Ulid;
 
 use super::artifacts::managers;
-use super::release::{ReleaseError, ReleaseRequest, Released, release};
+use super::bound::ReleaseKeys;
+use super::release::release;
+use super::unavailable;
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::is_management;
+use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 
 /// The fields one run holds, by slot, with the value write id they belong to. They are reused
 /// only when a fresh check answers that this value is still current.
@@ -54,17 +59,17 @@ impl HeldSecrets {
 }
 
 /// One release for a run on `local`. A refusal ends the search; an unavailable node is skipped.
-pub async fn ask_release(
+pub(crate) async fn ask_release(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
-    local: NodeId,
+    (local, keys): (NodeId, &ReleaseKeys),
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let install = (config.installs.iter()).find(|install| install.install_id == request.install_id);
     let binding = install.and_then(|install| install.secrets.get(&request.slot));
     let node_bound = binding.is_some_and(|binding| binding.scope == BoundScope::Node);
     if node_bound || is_management(config, local) {
-        let here = release(ctx, (config, local, local), &request).await;
+        let here = release(ctx, keys, (config, local, local), &request).await;
         if node_bound || !matches!(here, Err(ReleaseError::Unavailable(_))) {
             return here;
         }
@@ -80,6 +85,35 @@ pub async fn ask_release(
         }
     }
     Err(last)
+}
+
+/// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
+/// to `outgoing`; answers the exposure the rule allows now and the fields it added.
+pub(crate) async fn release_into(
+    ctx: &DriverContext,
+    (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
+    (install, slot, run_id): (&PluginInstall, &str, Ulid),
+    outgoing: &mut OutgoingRequest,
+) -> Result<(ResponseExposure, SecretFields), HostError> {
+    let request = ReleaseRequest {
+        install_id: install.install_id,
+        slot: slot.to_string(),
+        delivery: Delivery::Inject,
+        target: Some((outgoing.method.clone(), outgoing.url.to_string())),
+        held: None,
+        run_id: Some(run_id),
+    };
+    let released = ask_release(ctx, config, (local, keys), request).await;
+    let mut released = released.map_err(|error| match error {
+        ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
+        ReleaseError::Unavailable(why) => unavailable(why),
+    })?;
+    let bytes = released.fields.take();
+    let bytes = bytes.ok_or_else(|| unavailable("the release answered no value"))?;
+    let fields = SecretFields::decode(&bytes).map_err(|error| unavailable(error.to_string()))?;
+    let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
+    injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
+    Ok((released.exposure, fields))
 }
 
 #[cfg(test)]

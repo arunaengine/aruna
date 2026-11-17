@@ -1,4 +1,4 @@
-//! Writes storage entries and checks key presence for the metadata tests.
+//! Checks key presence for the metadata tests.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,22 +6,6 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-
-pub(crate) async fn write_entries(
-    storage: &StorageHandle,
-    writes: Vec<(String, ByteView, ByteView)>,
-) {
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => panic!("unexpected storage event: {other:?}"),
-    }
-}
 
 pub(crate) async fn storage_key_exists(
     storage: &StorageHandle,
