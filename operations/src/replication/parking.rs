@@ -9,6 +9,7 @@ use super::queue::{BlobQueueError, schedule_blob_drain};
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -16,17 +17,15 @@ use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
 };
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
-use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
-use tracing::warn;
 use ulid::Ulid;
 
 /// How long a job that no longer waits for a key, and an idle drain, wait before the next look.
@@ -651,17 +650,8 @@ impl EffectOperation for WakeJobOperation {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum ParkedState {
-    Init,
-    ReadWaits,
-    Wake,
-    Schedule,
-    Finish,
-    Error,
-}
-
-/// Makes every job parked for `key` due now and schedules a drain. Answers how many woke.
+/// Makes every job parked for `key` due now and schedules a drain once one woke. Answers how
+/// many woke.
 #[derive(Debug, PartialEq)]
 pub struct WakeParkedOperation {
     key: BucketKeyRef,
@@ -669,9 +659,11 @@ pub struct WakeParkedOperation {
     rows: VecDeque<Vec<u8>>,
     after: Option<Key>,
     woken: usize,
-    state: ParkedState,
-    error: Option<BlobQueueError>,
+    /// Whether a wake runs; otherwise a page of wait rows is read.
+    waking: bool,
 }
+
+type CountStep = Result<Next<usize>, BlobQueueError>;
 
 impl WakeParkedOperation {
     pub fn new(key: BucketKeyRef, now_ms: u64) -> Self {
@@ -681,23 +673,21 @@ impl WakeParkedOperation {
             rows: VecDeque::new(),
             after: None,
             woken: 0,
-            state: ParkedState::Init,
-            error: None,
+            waking: false,
         }
     }
 
-    fn read_waits(&mut self, after: Option<Key>) -> Effects {
-        self.state = ParkedState::ReadWaits;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: COPY_WAIT_KEYSPACE.to_string(),
-            prefix: Some(self.key.key().into()),
-            start: after.map(IterStart::After),
+    fn read_waits(&mut self, after: Option<Key>) -> Next<usize> {
+        self.waking = false;
+        Next::Call(IoCall::Page {
+            space: COPY_WAIT_KEYSPACE.to_string(),
+            prefix: self.key.key().into(),
+            after,
             limit: WAIT_PAGE,
-            txn_id: None,
-        })]
+        })
     }
 
-    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> Next<usize> {
         // A full page may have more rows behind it; a short one is the last.
         self.after = (values.len() == WAIT_PAGE)
             .then(|| values.last().map(|(row, _)| row.clone()))
@@ -706,98 +696,41 @@ impl WakeParkedOperation {
         self.wake_next()
     }
 
-    fn wake_next(&mut self) -> Effects {
+    /// The drain runs the woken jobs; a failed schedule is logged by the runner.
+    fn wake_next(&mut self) -> Next<usize> {
         let Some(row) = self.rows.pop_front() else {
             return match self.after.take() {
                 Some(after) => self.read_waits(Some(after)),
-                None if self.woken > 0 => {
-                    self.state = ParkedState::Schedule;
-                    smallvec![schedule_blob_drain()]
-                }
-                None => self.finish(),
+                None if self.woken > 0 => Next::Then {
+                    output: self.woken,
+                    calls: vec![IoCall::Effect(Box::new(schedule_blob_drain()))],
+                },
+                None => Next::Done(0),
             };
         };
-        self.state = ParkedState::Wake;
-        let wake = WakeJobOperation::new(row, self.now_ms);
-        smallvec![Effect::SubOperation(boxed_suboperation(wake, |result| {
-            Event::SubOperation(SubOperationEvent::CopyWoken {
-                result: result.map_err(|error| error.to_string()),
-            })
-        }))]
-    }
-
-    fn finish(&mut self) -> Effects {
-        self.state = ParkedState::Finish;
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: BlobQueueError) -> Effects {
-        self.state = ParkedState::Error;
-        self.error = Some(error);
-        smallvec![]
+        self.waking = true;
+        Next::Call(IoCall::child(WakeJobOperation::new(row, self.now_ms)))
     }
 }
 
-impl EffectOperation for WakeParkedOperation {
+impl Operation for WakeParkedOperation {
     type Output = usize;
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
-        self.read_waits(None)
+    fn first(&mut self) -> CountStep {
+        Ok(self.read_waits(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (ParkedState::ReadWaits, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(error.into())
-            }
-            (ParkedState::ReadWaits, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.waits_read(values)
-            }
-            (ParkedState::Wake, Event::SubOperation(SubOperationEvent::CopyWoken { result })) => {
-                match result {
-                    Ok(woke) => {
-                        self.woken += usize::from(woke);
-                        self.wake_next()
-                    }
-                    Err(error) => self.fail(BlobQueueError::Wake(error)),
-                }
-            }
-            (ParkedState::Schedule, Event::Task(TaskEvent::Error { message, .. })) => {
-                warn!(message = %message, "Failed to schedule the drain of woken copy jobs");
-                self.finish()
-            }
-            (ParkedState::Schedule, Event::Task(_)) => self.finish(),
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
+    fn next(&mut self, result: IoResult) -> CountStep {
+        if !self.waking {
+            let (values, _) = result.page()?;
+            return Ok(self.waits_read(values));
         }
+        let woke = result.child::<bool, BlobQueueError>()?;
+        let woke = woke.map_err(|error| BlobQueueError::Wake(error.to_string()))?;
+        self.woken += usize::from(woke);
+        Ok(self.wake_next())
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ParkedState::Finish | ParkedState::Error)
-    }
-
-    fn finalize(self) -> Result<usize, BlobQueueError> {
-        match (self.state, self.error) {
-            (ParkedState::Finish, _) => Ok(self.woken),
-            (_, Some(error)) => Err(error),
-            _ => Err(BlobQueueError::UnexpectedEvent(
-                "wake did not finish".into(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum AwaitingState {
-    Init,
-    ReadWaits,
-    ReadJobs,
-    Finish,
-    Error,
 }
 
 /// Copy jobs of a relationship that wait for a source key now.
@@ -805,9 +738,8 @@ enum AwaitingState {
 pub struct AwaitingJobsOperation {
     relationship_id: Ulid,
     jobs: BTreeSet<Vec<u8>>,
-    parked: usize,
-    state: AwaitingState,
-    error: Option<BlobQueueError>,
+    /// Whether the job rows were asked for; otherwise a page of wait rows is read.
+    reading_jobs: bool,
 }
 
 impl AwaitingJobsOperation {
@@ -815,24 +747,20 @@ impl AwaitingJobsOperation {
         Self {
             relationship_id,
             jobs: BTreeSet::new(),
-            parked: 0,
-            state: AwaitingState::Init,
-            error: None,
+            reading_jobs: false,
         }
     }
 
-    fn read_waits(&mut self, after: Option<Key>) -> Effects {
-        self.state = AwaitingState::ReadWaits;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: COPY_WAIT_KEYSPACE.to_string(),
-            prefix: None,
-            start: after.map(IterStart::After),
+    fn read_waits(&self, after: Option<Key>) -> Next<usize> {
+        Next::Call(IoCall::Page {
+            space: COPY_WAIT_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: WAIT_PAGE,
-            txn_id: None,
-        })]
+        })
     }
 
-    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> Result<Effects, BlobQueueError> {
+    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> CountStep {
         let after = (values.len() == WAIT_PAGE)
             .then(|| values.last().map(|(row, _)| row.clone()))
             .flatten();
@@ -846,77 +774,41 @@ impl AwaitingJobsOperation {
             return Ok(self.read_waits(after));
         }
         if self.jobs.is_empty() {
-            self.state = AwaitingState::Finish;
-            return Ok(smallvec![]);
+            return Ok(Next::Done(0));
         }
         // All jobs of the relationship are read in one batch instead of one read each.
-        self.state = AwaitingState::ReadJobs;
+        self.reading_jobs = true;
         let reads = (self.jobs.iter())
             .map(|job_key| (REPLICATION_JOB_KEYSPACE.to_string(), job_key.clone().into()))
             .collect();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn jobs_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, BlobQueueError> {
-        for (_, value) in values {
+    fn jobs_read(&self, values: Vec<Option<Value>>) -> CountStep {
+        let mut parked = 0;
+        for value in values {
             let job = value
                 .map(|value| BlobJobRecord::from_bytes(&value))
                 .transpose()?;
-            self.parked += usize::from(job.is_some_and(|job| job.due_at_ms == PARKED_DUE));
+            parked += usize::from(job.is_some_and(|job| job.due_at_ms == PARKED_DUE));
         }
-        self.state = AwaitingState::Finish;
-        Ok(smallvec![])
+        Ok(Next::Done(parked))
     }
 }
 
-impl EffectOperation for AwaitingJobsOperation {
+impl Operation for AwaitingJobsOperation {
     type Output = usize;
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
-        self.read_waits(None)
+    fn first(&mut self) -> CountStep {
+        Ok(self.read_waits(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (&self.state, event) {
-            (
-                AwaitingState::ReadWaits | AwaitingState::ReadJobs,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => Err(error.into()),
-            (AwaitingState::ReadWaits, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.waits_read(values)
-            }
-            (AwaitingState::ReadJobs, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.jobs_read(values)
-            }
-            (_, event) => Err(BlobQueueError::UnexpectedEvent(event.label().to_string())),
-        };
-        result.unwrap_or_else(|error| {
-            self.state = AwaitingState::Error;
-            self.error = Some(error);
-            smallvec![]
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AwaitingState::Finish | AwaitingState::Error)
-    }
-
-    fn finalize(self) -> Result<usize, BlobQueueError> {
-        match (self.state, self.error) {
-            (AwaitingState::Finish, _) => Ok(self.parked),
-            (_, Some(error)) => Err(error),
-            _ => Err(BlobQueueError::UnexpectedEvent(
-                "count did not finish".into(),
-            )),
+    fn next(&mut self, result: IoResult) -> CountStep {
+        match self.reading_jobs {
+            true => self.jobs_read(result.values()?),
+            false => self.waits_read(result.page()?.0),
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -1958,6 +1850,7 @@ mod tests {
 
     mod transitions {
         use super::*;
+        use aruna_core::calls::ChildOutcome;
         use aruna_core::operation_check::{
             check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
         };
@@ -2107,93 +2000,78 @@ mod tests {
             rejects_finalize(open);
         }
 
-        fn waits(rows: usize) -> Event {
-            Event::Storage(StorageEvent::IterResult {
-                values: (0..rows)
+        fn waits(rows: usize) -> IoResult {
+            IoResult::Page {
+                rows: (0..rows)
                     .map(|index| (wait_row(key(), &[index as u8; 4]).into(), Vec::new().into()))
                     .collect(),
-                next_start_after: None,
-            })
+                next: None,
+            }
         }
 
-        fn woken(result: Result<bool, String>) -> Event {
-            Event::SubOperation(SubOperationEvent::CopyWoken { result })
+        fn woken(result: Result<bool, BlobQueueError>) -> IoResult {
+            IoResult::Child(ChildOutcome::new(result))
+        }
+
+        fn wakes_job(step: &Result<Next<usize>, BlobQueueError>) -> bool {
+            matches!(step, Ok(Next::Call(IoCall::Child(_))))
         }
 
         #[test]
         fn wakes_then_schedules() {
             let mut operation = WakeParkedOperation::new(key(), 5);
-            assert_eq!(operation.start().len(), 1);
             assert!(matches!(
-                operation.step(waits(2)).as_slice(),
-                [Effect::SubOperation(_)]
+                operation.first(),
+                Ok(Next::Call(IoCall::Page { .. }))
             ));
-            assert!(matches!(
-                operation.step(woken(Ok(true))).as_slice(),
-                [Effect::SubOperation(_)]
-            ));
+            assert!(wakes_job(&operation.next(waits(2))));
+            assert!(wakes_job(&operation.next(woken(Ok(true)))));
+            let drain = IoCall::Effect(Box::new(schedule_blob_drain()));
             assert_eq!(
-                operation.step(woken(Ok(false))).as_slice(),
-                [schedule_blob_drain()]
+                operation.next(woken(Ok(false))),
+                Ok(Next::Then {
+                    output: 1,
+                    calls: vec![drain],
+                })
             );
-            let scheduled = Event::Task(TaskEvent::Error {
-                key: None,
-                message: "no task runtime".to_string(),
-            });
-            assert!(operation.step(scheduled).is_empty());
-            assert_eq!(operation.finalize(), Ok(1));
             // Nothing woken schedules nothing.
             let mut quiet = WakeParkedOperation::new(key(), 5);
-            quiet.start();
-            assert!(quiet.step(waits(0)).is_empty());
-            assert_eq!(quiet.finalize(), Ok(0));
+            let _ = quiet.first();
+            assert_eq!(quiet.next(waits(0)), Ok(Next::Done(0)));
         }
 
         #[test]
         fn full_page_continues() {
             let mut operation = WakeParkedOperation::new(key(), 5);
-            operation.start();
-            let page = waits(WAIT_PAGE);
-            operation.step(page);
+            let _ = operation.first();
+            let _ = operation.next(waits(WAIT_PAGE));
             for _ in 1..WAIT_PAGE {
-                operation.step(woken(Ok(false)));
+                let _ = operation.next(woken(Ok(false)));
             }
-            let effects = operation.step(woken(Ok(false)));
+            let next = operation.next(woken(Ok(false)));
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::Iter { start: Some(_), .. })]
+                next,
+                Ok(Next::Call(IoCall::Page { after: Some(_), .. }))
             ));
         }
 
         #[test]
         fn parked_contract() {
             let mut failed = WakeParkedOperation::new(key(), 5);
-            failed.start();
-            failed.step(waits(1));
-            failed.step(woken(Err("busy".to_string())));
+            let _ = failed.first();
+            let _ = failed.next(waits(1));
+            let busy = BlobQueueError::Wake("busy".to_string());
+            let reason = busy.to_string();
             assert_eq!(
-                failed.finalize(),
-                Err(BlobQueueError::Wake("busy".to_string()))
+                failed.next(woken(Err(busy))),
+                Err(BlobQueueError::Wake(reason))
             );
-            let reading = || {
-                let mut operation = WakeParkedOperation::new(key(), 5);
-                operation.start();
-                operation
-            };
-            assert!(
-                !rejects_events(reading, sample_events, |event| {
-                    matches!(
-                        event,
-                        Event::Storage(
-                            StorageEvent::IterResult { .. } | StorageEvent::Error { .. }
-                        )
-                    )
-                })
-                .is_empty()
-            );
-            let mut open = reading();
-            check_abort(&mut open, &[]);
-            rejects_finalize(open);
+            let mut reading = WakeParkedOperation::new(key(), 5);
+            let _ = reading.first();
+            assert!(matches!(
+                reading.next(IoResult::Done),
+                Err(BlobQueueError::Io(_))
+            ));
         }
 
         #[test]
@@ -2202,60 +2080,35 @@ mod tests {
             let owner = postcard::to_allocvec(&Some(relationship)).unwrap();
             let other = postcard::to_allocvec(&Some(Ulid::from_parts(2, 2))).unwrap();
             let mut operation = AwaitingJobsOperation::new(relationship);
-            operation.start();
-            let page = Event::Storage(StorageEvent::IterResult {
-                values: vec![
+            let _ = operation.first();
+            let page = IoResult::Page {
+                rows: vec![
                     (wait_row(key(), b"one").into(), owner.clone().into()),
                     (wait_row(key(), b"two").into(), owner.into()),
                     (wait_row(key(), b"three").into(), other.into()),
                 ],
-                next_start_after: None,
-            });
-            let batch = Effect::Storage(StorageEffect::BatchRead {
-                reads: vec![
-                    (REPLICATION_JOB_KEYSPACE.to_string(), b"one".to_vec().into()),
-                    (REPLICATION_JOB_KEYSPACE.to_string(), b"two".to_vec().into()),
-                ],
-                txn_id: None,
-            });
-            assert_eq!(operation.step(page).as_slice(), [batch]);
-            let jobs = Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (
-                        b"one".to_vec().into(),
-                        Some(parked().to_bytes().unwrap().into()),
-                    ),
-                    (b"two".to_vec().into(), None),
-                ],
-            });
-            assert!(operation.step(jobs).is_empty());
-            assert_eq!(operation.finalize(), Ok(1));
+                next: None,
+            };
+            let batch = IoCall::Read(vec![
+                (REPLICATION_JOB_KEYSPACE.to_string(), b"one".to_vec().into()),
+                (REPLICATION_JOB_KEYSPACE.to_string(), b"two".to_vec().into()),
+            ]);
+            assert_eq!(operation.next(page), Ok(Next::Call(batch)));
+            let jobs = IoResult::Values(vec![Some(parked().to_bytes().unwrap().into()), None]);
+            assert_eq!(operation.next(jobs), Ok(Next::Done(1)));
         }
 
         #[test]
         fn awaiting_contract() {
-            let reading = || {
-                let mut operation = AwaitingJobsOperation::new(Ulid::from_parts(1, 1));
-                operation.start();
-                operation
-            };
-            assert!(
-                !rejects_events(reading, sample_events, |event| {
-                    matches!(
-                        event,
-                        Event::Storage(
-                            StorageEvent::IterResult { .. } | StorageEvent::Error { .. }
-                        )
-                    )
-                })
-                .is_empty()
-            );
-            let mut open = reading();
-            check_abort(&mut open, &[]);
-            rejects_finalize(open);
-            let mut empty = reading();
-            assert!(empty.step(waits(0)).is_empty());
-            assert_eq!(empty.finalize(), Ok(0));
+            let mut reading = AwaitingJobsOperation::new(Ulid::from_parts(1, 1));
+            let _ = reading.first();
+            assert!(matches!(
+                reading.next(IoResult::Done),
+                Err(BlobQueueError::Io(_))
+            ));
+            let mut empty = AwaitingJobsOperation::new(Ulid::from_parts(1, 1));
+            let _ = empty.first();
+            assert_eq!(empty.next(waits(0)), Ok(Next::Done(0)));
         }
 
         fn park(keys: Vec<BucketKeyRef>) -> ParkJobOperation {
