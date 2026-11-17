@@ -454,3 +454,435 @@ fn policy_effect(
     }
 }
 
+fn export_effect(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    effect: MetadataEffect,
+) -> Result<MetadataEvent, CraqleError> {
+    match effect {
+        MetadataEffect::ExportRoCrate { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                jsonld_len = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.export_rocrate(auth, &GraphId::new(&graph_iri)))
+                .map(|jsonld| {
+                    call_span.record("jsonld_len", jsonld.len() as u64);
+                    MetadataEvent::RoCrateExportResult {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ExportVersioned { graph_iri } => {
+            // The version only counts when no dot landed during the export.
+            let graph = GraphId::new(&graph_iri);
+            for _ in 0..8 {
+                let before = node.vector_clock(&graph)?;
+                let jsonld = node.export_rocrate(auth, &graph)?;
+                if node.vector_clock(&graph)? == before {
+                    return Ok(MetadataEvent::VersionedExport {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                        version: aruna_core::metadata::graph_version(&before),
+                    });
+                }
+            }
+            Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+                "metadata graph `{graph_iri}` kept changing while exporting"
+            ))))
+        }
+        MetadataEffect::ExportRoCrateSummary { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate_summary",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                jsonld_len = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.export_rocrate_summary(auth, &GraphId::new(&graph_iri)))
+                .map(|jsonld| {
+                    call_span.record("jsonld_len", jsonld.len() as u64);
+                    MetadataEvent::RoCrateSummaryResult {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate_summary",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ExportRoCratePage {
+            graph_iri,
+            offset,
+            after,
+            limit,
+        } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate_page",
+                graph_iri = %graph_iri,
+                offset = offset.unwrap_or(0) as u64,
+                after_present = after.is_some(),
+                limit = limit as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                returned_data_entities = field::Empty,
+                total_data_entities = field::Empty,
+            );
+            let started = Instant::now();
+            let graph = GraphId::new(&graph_iri);
+            let page = call_span.in_scope(|| {
+                if let Some(after) = after.as_deref() {
+                    node.export_rocrate_page_after(auth, &graph, Some(after), limit)
+                } else {
+                    node.export_rocrate_page(auth, &graph, offset.unwrap_or(0), limit)
+                }
+            });
+            let result = page.map(|page| {
+                call_span.record("returned_data_entities", page.returned_data_entities as u64);
+                call_span.record("total_data_entities", page.total_data_entities as u64);
+                MetadataEvent::RoCratePageResult {
+                    graph_iri: graph_iri.clone(),
+                    page: page_from_craqle(page),
+                }
+            });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate_page",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        _ => unreachable!("effect family routed incorrectly"),
+    }
+}
+
+fn graph_effect(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    effect: MetadataEffect,
+) -> Result<MetadataEvent, CraqleError> {
+    match effect {
+        MetadataEffect::DeleteGraph { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.delete_graph",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.delete_graph(auth, &GraphId::new(&graph_iri)))
+                .map(|_| MetadataEvent::GraphDeleted {
+                    graph_iri: graph_iri.clone(),
+                });
+            record_metadata_result(
+                &call_span,
+                "delete_graph",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ListGraphs => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.list_graphs",
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                graph_count = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span.in_scope(|| node.graphs()).map(|graphs| {
+                call_span.record("graph_count", graphs.len() as u64);
+                MetadataEvent::GraphListResult {
+                    graph_iris: graphs
+                        .into_iter()
+                        .map(|graph| graph.as_str().to_string())
+                        .collect(),
+                }
+            });
+            record_metadata_result(&call_span, "list_graphs", None, started, &result);
+            result
+        }
+        MetadataEffect::ContainsGraph { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.contains_graph",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                exists = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.contains_graph(&GraphId::new(&graph_iri)))
+                .map(|exists| {
+                    call_span.record("exists", exists);
+                    MetadataEvent::ContainsGraphResult {
+                        graph_iri: graph_iri.clone(),
+                        exists,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "contains_graph",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ContainsDot {
+            graph_iri,
+            actor,
+            counter,
+        } => {
+            let graph = GraphId::new(&graph_iri);
+            let dot = craqle::Dot {
+                actor: craqle::ActorId::from_bytes(actor),
+                counter,
+            };
+            let contains = match node.contains_graph(&graph) {
+                Ok(true) => node.vector_clock(&graph).map(|clock| clock.contains(&dot)),
+                other => other,
+            };
+            contains.map(|contains| MetadataEvent::ContainsDotResult {
+                graph_iri: graph_iri.clone(),
+                contains,
+            })
+        }
+        _ => unreachable!("effect family routed incorrectly"),
+    }
+}
+
+fn sync_effect(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    effect: MetadataEffect,
+) -> Result<MetadataEvent, CraqleError> {
+    match effect {
+        // Device replicas
+        MetadataEffect::GraphSnapshot { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.graph_snapshot",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                quad_count = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.graph_snapshot(&GraphId::new(&graph_iri)))
+                .map(|snapshot| {
+                    call_span.record("quad_count", snapshot.quads.len() as u64);
+                    MetadataEvent::GraphSnapshotResult {
+                        graph_iri: graph_iri.clone(),
+                        snapshot: Box::new(snapshot),
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "graph_snapshot",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::InstallSnapshot {
+            graph_iri,
+            snapshot,
+        } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.install_snapshot",
+                graph_iri = %graph_iri,
+                quad_count = snapshot.quads.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                applied = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.install_graph_snapshot(&snapshot))
+                .map(|merged| {
+                    call_span.record("applied", merged.applied);
+                    MetadataEvent::SnapshotInstalled {
+                        graph_iri: graph_iri.clone(),
+                        applied: merged.applied,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "install_snapshot",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        // OR-Set metadata graphs
+        MetadataEffect::PlanBatch {
+            graph_iri,
+            actor,
+            counter,
+            source,
+        } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.plan_batch",
+                graph_iri = %graph_iri,
+                jsonld_len = source.jsonld().len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| plan_batch(node, auth, &graph_iri, (actor, counter), &source))
+                .map(|batch| {
+                    call_span.record("batch_ops", batch.ops.len() as u64);
+                    MetadataEvent::BatchPlanned {
+                        graph_iri: graph_iri.clone(),
+                        batch,
+                    }
+                });
+            record_metadata_result(&call_span, "plan_batch", Some(&graph_iri), started, &result);
+            result
+        }
+        MetadataEffect::MergeBatch { graph_iri, batch } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.merge_batch",
+                graph_iri = %graph_iri,
+                batch_ops = batch.ops.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                applied = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| to_craqle_batch(&batch).and_then(|batch| node.merge_batch(&batch)))
+                .map(|merged| {
+                    call_span.record("applied", merged.applied);
+                    MetadataEvent::BatchMerged {
+                        graph_iri: graph_iri.clone(),
+                        applied: merged.applied,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "merge_batch",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        _ => unreachable!("effect family routed incorrectly"),
+    }
+}
+
+fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEvent {
+    let effect_name = effect.kind();
+    let auth = AllowAllAuthorizer;
+    let graph_iri = effect.graph_iri();
+    let needs_existing_graph = matches!(
+        effect,
+        MetadataEffect::ExportRoCrate { .. }
+            | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportRoCratePage { .. }
+            | MetadataEffect::PlanBatch { .. }
+    );
+    let persist_sync_success = effect_persists_sync(&effect);
+    let deferred_persist_success = effect_defers_persist(&effect);
+    let node = inner.node.clone();
+    let effect_span = debug_span!(
+        "metadata.backend.effect",
+        effect = effect_name,
+        graph_iri = graph_iri.as_deref().unwrap_or("<none>"),
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    );
+    let effect_started = Instant::now();
+
+    let result = effect_span.in_scope(|| match effect {
+        effect @ (MetadataEffect::ValidateCreateCrate { .. }
+        | MetadataEffect::ValidateRoCrate { .. }) => validate_effect(&node, &auth, effect),
+        effect @ (MetadataEffect::CreateCrate { .. } | MetadataEffect::ApplyRoCrate { .. }) => {
+            crate_effect(&node, &auth, effect)
+        }
+        effect @ (MetadataEffect::UpsertDataEntity { .. }
+        | MetadataEffect::UpsertContextualEntity { .. }) => entity_effect(&node, &auth, effect),
+        effect @ (MetadataEffect::SetGraphPolicy { .. }
+        | MetadataEffect::AddGraphPeer { .. }
+        | MetadataEffect::GetGraphPolicy { .. }) => policy_effect(&node, &auth, effect),
+        effect @ (MetadataEffect::ExportRoCrate { .. }
+        | MetadataEffect::ExportRoCrateSummary { .. }
+        | MetadataEffect::ExportRoCratePage { .. }
+        | MetadataEffect::ExportVersioned { .. }) => export_effect(&node, &auth, effect),
+        MetadataEffect::SearchGraphs { .. }
+        | MetadataEffect::QueryGraphs { .. }
+        | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
+        effect @ (MetadataEffect::DeleteGraph { .. }
+        | MetadataEffect::ListGraphs
+        | MetadataEffect::ContainsGraph { .. }
+        | MetadataEffect::ContainsDot { .. }) => graph_effect(&node, &auth, effect),
+        effect @ (MetadataEffect::GraphSnapshot { .. }
+        | MetadataEffect::InstallSnapshot { .. }
+        | MetadataEffect::PlanBatch { .. }
+        | MetadataEffect::MergeBatch { .. }) => sync_effect(&node, &auth, effect),
+    });
+
+    let persist_error = if persist_sync_success && result.is_ok() {
+        flush_sync_journal(&inner, effect_name, graph_iri.as_deref()).err()
+    } else {
+        None
+    };
+    if result.is_ok() && persist_error.is_none() && deferred_persist_success {
+        schedule_deferred_persist(inner.clone(), effect_name, graph_iri.clone());
+    }
+    record_elapsed_ms(&effect_span, "elapsed_ms", effect_started);
+    let event = match (result, persist_error) {
+        (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
+        (Ok(event), None) => event,
+        (Err(error), None) => {
+            // Craqle has no typed missing-graph error, so probe existence to tell
+            // an unmaterialized graph (retryable, 503) from a backend failure.
+            let error = if needs_existing_graph
+                && graph_iri
+                    .as_deref()
+                    .is_some_and(|iri| matches!(node.contains_graph(&GraphId::new(iri)), Ok(false)))
+            {
+                MetadataError::GraphNotFound
+            } else {
+                error_from_craqle(error)
+            };
+            MetadataEvent::Error { graph_iri, error }
+        }
+    };
+    effect_span.record("result", event.kind());
+    if let MetadataEvent::Error { error, .. } = &event {
+        record_error(&effect_span, &error.to_string());
+    }
+    event
+}
