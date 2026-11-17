@@ -32,10 +32,9 @@ fn install_at(key: &[u8], at: usize) -> Ulid {
     )
 }
 
-/// Deletes the rows this node no longer needs; returns how many. Only this node matched the
-/// installs of its replay rows, so an absent install was removed; a receiver may not have an
-/// install record yet, so its waiting and reported rows go only while the install is removing.
-/// Create keys are written only for installs this receiver ran, so an absent one was removed.
+/// Deletes the rows this node no longer needs; returns how many. Replay and create key rows go
+/// once their install is absent or removing, as only this node wrote them; waiting and reported
+/// rows go only while it is removing, as a receiver may not have the install record yet.
 pub fn sweep_events(config: &RealmConfigDocument, now_ms: u64) -> RowsOperation<SweepEvents> {
     let installs = (config.installs.iter())
         .map(|install| {

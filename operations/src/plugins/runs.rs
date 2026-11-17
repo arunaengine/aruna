@@ -325,10 +325,9 @@ impl Plan for ResolveRun {
     }
 }
 
-/// Removes runs that ended longer than `RUN_RETENTION_MS` ago, with their intents and stored
-/// replies. A run that needs attention stays until a person resolves it, a run whose job's
-/// end is not delivered yet stays for its retry, and a run whose calls may have had effects,
-/// or cannot be read, keeps its record. Each run goes with its intents in one batch.
+/// Removes runs that ended longer than `RUN_RETENTION_MS` ago, each with its intents in one batch.
+/// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
+/// be read stays.
 pub fn prune_runs(now_ms: u64) -> RowsOperation<PruneRuns> {
     RowsOperation::direct(PruneRuns {
         now_ms,

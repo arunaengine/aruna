@@ -694,7 +694,7 @@ fn send_boundary_decides() {
 }
 
 #[test]
-fn reserve_adopts_or_conflicts() {
+fn reserve_decisions() {
     let install = sample_install(Ulid::from_parts(1, 1));
     let row = proposed(&install, 1);
     let reserve_with = |row: WorkRow| reserve((&install, &call(0)), row, None).unwrap();

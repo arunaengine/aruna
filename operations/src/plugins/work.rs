@@ -221,10 +221,9 @@ pub(super) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
     .concat()
 }
 
-/// Writes `proposed` for `identity` in one transaction, or adopts the row an earlier call with
-/// the same digest wrote; another digest is a conflict. A former install's row is replaced. With
-/// `marked`, the version the work writes at that bucket and key is marked in the same
-/// transaction when it writes the row, so the version is marked before any byte of it exists.
+/// Writes `proposed` for `identity` in one transaction, or adopts the row an earlier call with the
+/// same digest wrote; another digest conflicts, a former install's row is replaced. `marked` marks
+/// the version the work writes there with the row, before any byte of it exists.
 pub fn reserve(
     (install, identity): (&PluginInstall, &Identity),
     proposed: WorkRow,
