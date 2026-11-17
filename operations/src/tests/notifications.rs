@@ -5,11 +5,8 @@
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::metadata::protocol::MetadataReadError;
 use crate::notifications::inbox::UpsertInboxOperation;
-use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;
-use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -67,39 +64,6 @@ pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]
     let upsert = UpsertInboxOperation::new(records.to_vec());
     let outcome = drive(upsert, &context(storage)).await;
     assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
-}
-
-/// Management nodes that open every setting with a fixed secret and count the requests. A node
-/// without a secret is unreachable.
-#[derive(Default)]
-pub(crate) struct CannedPeers {
-    pub secrets: std::collections::HashMap<aruna_core::NodeId, SecretBytes>,
-    pub opens: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl SettingPeers for CannedPeers {
-    async fn open(
-        &self,
-        node: aruna_core::NodeId,
-        _target: DocumentTarget,
-        _bytes: Vec<u8>,
-    ) -> Result<SecretBytes, MetadataReadError> {
-        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.secrets
-            .get(&node)
-            .cloned()
-            .ok_or(MetadataReadError::Unavailable)
-    }
-}
-
-/// Peers where every manager opens settings with `secret`.
-pub(crate) fn opening(secret: &[u8]) -> CannedPeers {
-    let secret = SecretBytes::new(secret.to_vec());
-    CannedPeers {
-        secrets: managers().map(|node| (node, secret.clone())).into(),
-        ..Default::default()
-    }
 }
 
 /// Stores one register write of a setting on this node, as a local write or sync would.
