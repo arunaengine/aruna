@@ -50,8 +50,9 @@ pub enum WatchSubscriptionError {
     Storage(String),
 }
 
-#[derive(Clone)]
-pub(crate) struct WatchReplication {
+/// The revision and sync outbox record a holder writes with a watch change.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WatchReplication {
     pub(crate) revision: DocumentChange,
     pub(crate) outbox: DocumentOutboxRecord,
 }
