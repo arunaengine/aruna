@@ -50,6 +50,19 @@ async fn fixture() -> Fixture {
     }
 }
 
+async fn put(handle: &StorageHandle, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
+    let write = StorageEffect::Write {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        value: value.into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        send(handle, Effect::Storage(write)).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
 async fn state(handle: &StorageHandle) -> Option<IndexState> {
     let value = get(handle, SEARCH_INDEX_KEYSPACE, state_key(set(), range_id())).await;
     value.map(|value| IndexState::from_bytes(&value).unwrap())
@@ -231,14 +244,13 @@ async fn drops_gone_ranges() {
     let gone = Ulid::from_bytes([9; 16]);
     let state = IndexState::Ready { generation: 1 };
     let key = state_key(set(), gone);
-    put_row(
-        &handle.bulk(),
+    put(
+        handle,
         SEARCH_INDEX_KEYSPACE,
         key.clone(),
         state.to_bytes().unwrap(),
     )
-    .await
-    .unwrap();
+    .await;
     let changes = vec![KeyChange::Remove("k".to_string())];
     fixture
         .indexes
@@ -384,16 +396,7 @@ async fn described(handle: &StorageHandle, key: &str, seed: u8, organism: &str) 
     .with_metadata(metadata);
     let version_key = VersionKey::new("spire", key, Ulid::from_bytes([seed; 16]));
     let row = (version_key.to_bytes().unwrap(), version.to_bytes().unwrap());
-    let write = StorageEffect::Write {
-        key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-        key: row.0.into(),
-        value: row.1.into(),
-        txn_id: None,
-    };
-    assert!(matches!(
-        send(handle, Effect::Storage(write)).await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
+    put(handle, BLOB_VERSIONS_KEYSPACE, row.0, row.1).await;
 }
 
 async fn matching(indexes: &Arc<RangeIndexes>, text: &str, exact: &str) -> Vec<String> {
