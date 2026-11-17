@@ -21,8 +21,8 @@ use aruna_core::types::{TxnId, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
-pub const QUARANTINE_PAGE_DEFAULT: usize = 50;
-pub const QUARANTINE_PAGE_MAX: usize = 200;
+const QUARANTINE_PAGE_DEFAULT: usize = 50;
+const QUARANTINE_PAGE_MAX: usize = 200;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum QuarantineAdminError {
