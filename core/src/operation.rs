@@ -8,7 +8,7 @@ use smallvec::smallvec;
 
 use crate::backoff::conflict_backoff;
 use crate::calls::{CallRun, IoCall, IoError, IoResult, Next};
-use crate::{events::Event, types::Effects};
+use crate::{effects::Effect, events::Event, types::Effects};
 
 /// A backend scope at most one operation holds at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
