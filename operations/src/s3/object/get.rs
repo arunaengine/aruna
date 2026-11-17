@@ -155,11 +155,11 @@ pub enum GetObjectError {
         current: GetObjectState,
         expected: GetObjectState,
     },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: GetObjectState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -514,7 +514,7 @@ impl GetObjectOperation {
             LookupError::InvalidEvent(received) => GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected,
-                received,
+                received: received.label(),
             },
             LookupError::Missing => GetObjectError::GetObjectFailed,
         }
@@ -578,7 +578,7 @@ impl GetObjectOperation {
             self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             })
         }
     }
@@ -588,7 +588,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -617,7 +617,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -787,7 +787,7 @@ impl GetObjectOperation {
                 return self.emit_error(GetObjectError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::StagingSource(StagingSourceEvent::HealthResult)",
-                    received: other,
+                    received: (other).label(),
                 });
             }
         };
@@ -881,7 +881,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let binding = value
@@ -910,7 +910,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let size = self
@@ -961,7 +961,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(held) = self.held.take() else {
@@ -1046,7 +1046,7 @@ impl GetObjectOperation {
                 return self.emit_error(GetObjectError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                    received: other,
+                    received: (other).label(),
                 });
             }
         };
@@ -1094,7 +1094,7 @@ impl GetObjectOperation {
                 return self.emit_error(GetObjectError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                    received: other,
+                    received: (other).label(),
                 });
             }
         };
@@ -1251,7 +1251,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let settings = match BucketEncryption::from_row(value.as_deref()) {
@@ -1301,7 +1301,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1332,7 +1332,7 @@ impl GetObjectOperation {
                 return self.emit_error(GetObjectError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                    received: other,
+                    received: (other).label(),
                 });
             }
         };
@@ -1375,7 +1375,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let settings = match BucketEncryption::from_row(value.as_deref()) {
@@ -1412,7 +1412,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1442,7 +1442,7 @@ impl GetObjectOperation {
             self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             })
         }
     }
@@ -1562,7 +1562,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1613,7 +1613,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.txn_id = Some(txn_id);
@@ -1632,7 +1632,7 @@ impl GetObjectOperation {
             return self.abort_with_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let bucket = match value
@@ -1669,7 +1669,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1679,7 +1679,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(value) = value else {
@@ -1716,7 +1716,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(value) = value else {
@@ -1841,7 +1841,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(txn_id) = self.txn_id else {
@@ -1907,7 +1907,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1943,7 +1943,7 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)",
-                received: event,
+                received: (event).label(),
             });
         };
         // The committed obligation is what repair replays, so a failed enqueue
@@ -1983,7 +1983,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -2069,7 +2069,7 @@ impl GetObjectOperation {
             self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::ReadFinished)",
-                received: event,
+                received: (event).label(),
             })
         }
     }
@@ -2120,7 +2120,7 @@ impl GetObjectOperation {
             other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }

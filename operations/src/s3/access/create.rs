@@ -79,11 +79,11 @@ pub enum CreateUserError {
     RestrictionLimit(#[from] RestrictionLimitError),
     #[error(transparent)]
     Encryption(#[from] EncryptionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: CreateUserState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No user access found")]
     NotFound,
@@ -263,7 +263,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let caller = self.config.user_identity;
@@ -328,7 +328,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.txn_id = Some(txn_id);
@@ -389,7 +389,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         if values.len() != index.len() + usize::from(!replace) {
@@ -467,7 +467,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.scan_stale_tokens(index)
@@ -496,7 +496,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let (Some(txn_id), Some(access_key)) = (self.txn_id, self.stale_tokens.0.last()) else {
@@ -527,7 +527,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         // The last page of this credential leaves no cursor; the next credential follows.
@@ -589,7 +589,7 @@ impl CreateUserOperation {
             return self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -623,7 +623,7 @@ impl CreateUserOperation {
             other => self.handle_error(CreateUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }

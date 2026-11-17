@@ -89,10 +89,10 @@ pub enum RewriteError {
     ContentMismatch,
     #[error("version rewrite did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state:?}: {received:?}")]
+    #[error("unexpected event in state {state:?}: {received}")]
     InvalidStateEvent {
         state: RewriteState,
-        received: Box<Event>,
+        received: &'static str,
     },
 }
 
@@ -193,7 +193,7 @@ impl RewriteVersionOperation {
         let state = self.state;
         self.fail(RewriteError::InvalidStateEvent {
             state,
-            received: Box::new(received),
+            received: received.label(),
         })
     }
 

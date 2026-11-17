@@ -27,11 +27,11 @@ pub enum RestartNoticeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the restart notice did not finish")]
     NotFinished,
@@ -224,7 +224,7 @@ impl Operation for RestartNoticeOperation {
             (state, received) => self.fail(RestartNoticeError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

@@ -35,11 +35,11 @@ pub enum ListUploadsError {
     ConversionError(#[from] ConversionError),
     #[error("multipart upload scan budget exhausted")]
     ScanBudgetExceeded,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListUploadsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -160,7 +160,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -201,7 +201,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -307,7 +307,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: event.label(),
             });
         };
 

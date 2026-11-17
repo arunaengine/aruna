@@ -40,11 +40,11 @@ pub enum KeyStatusError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Blob(#[from] BlobError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the status read did not finish")]
     NotFinished,
@@ -282,7 +282,7 @@ impl Operation for KeyStatusOperation {
             (state, received) => self.fail(KeyStatusError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -394,7 +394,7 @@ impl Operation for AuditPageOperation {
             received => Err(KeyStatusError::InvalidStateEvent {
                 state: "ReadAudit".to_string(),
                 expected: "IterResult",
-                received,
+                received: received.label(),
             }),
         });
         smallvec![]

@@ -48,11 +48,11 @@ pub enum InstallError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("installing the key did not finish")]
     NotFinished,
@@ -360,7 +360,7 @@ impl Operation for InstallKeyOperation {
             (state, received) => self.fail(InstallError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

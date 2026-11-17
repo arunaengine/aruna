@@ -97,10 +97,10 @@ pub enum ChangeError {
     /// Replacing an unfinished transition would strand the copies it still has to move.
     #[error("the bucket's stored copies are still moving to a new encryption")]
     TransitionRunning,
-    #[error("unexpected event in state {state:?}: {received:?}")]
+    #[error("unexpected event in state {state:?}: {received}")]
     InvalidStateEvent {
         state: ChangeState,
-        received: Box<Event>,
+        received: &'static str,
     },
     #[error("the encryption change did not finish")]
     NotFinished,
@@ -549,7 +549,7 @@ impl Operation for ChangeEncryptionOperation {
             (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
             (state, received) => self.fail(ChangeError::InvalidStateEvent {
                 state,
-                received: Box::new(received),
+                received: received.label(),
             }),
         }
     }

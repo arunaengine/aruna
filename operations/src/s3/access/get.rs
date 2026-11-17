@@ -31,11 +31,11 @@ pub enum GetAccessError {
         current: GetAccessState,
         expected: GetAccessState,
     },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: GetAccessState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No user access found")]
     NotFound,
@@ -88,7 +88,7 @@ impl GetAccessOperation {
             self.emit_error(GetAccessError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             })
         }
     }

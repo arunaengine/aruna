@@ -137,10 +137,10 @@ pub enum MigrateVersionError {
     ContentMismatch,
     #[error("version migration did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state:?}: {received:?}")]
+    #[error("unexpected event in state {state:?}: {received}")]
     InvalidStateEvent {
         state: MigrateState,
-        received: Box<Event>,
+        received: &'static str,
     },
 }
 
@@ -271,7 +271,7 @@ impl MigrateVersionOperation {
     fn unexpected(&mut self, received: Event) -> Effects {
         let error = MigrateVersionError::InvalidStateEvent {
             state: self.state,
-            received: Box::new(received),
+            received: received.label(),
         };
         self.fail(error)
     }

@@ -75,7 +75,7 @@ impl GetS3Operation {
             received => self.fail(S3SessionError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "StorageEvent::ReadResult",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -96,7 +96,7 @@ impl Operation for GetS3Operation {
                 self.fail(S3SessionError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "StorageEvent::ReadResult",
-                    received: event,
+                    received: event.label(),
                 })
             }
         }

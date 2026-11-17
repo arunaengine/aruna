@@ -28,11 +28,11 @@ pub enum GetBucketError {
     ConversionError(#[from] ConversionError),
     #[error("Bucket not found")]
     NotFound,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: GetBucketState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("GetBucketInfo has no result yet")]
     Incomplete,
@@ -74,7 +74,7 @@ impl GetBucketOperation {
             return self.emit_error(GetBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -104,7 +104,7 @@ impl Operation for GetBucketOperation {
             (_, event) => self.emit_error(GetBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "no event",
-                received: event,
+                received: (event).label(),
             }),
         }
     }

@@ -92,7 +92,7 @@ impl ReclaimPendingOperation {
         self.fail(ReclaimBlobError::InvalidStateEvent {
             state,
             expected: "the storage result of the last effect",
-            received: event,
+            received: event.label(),
         })
     }
 

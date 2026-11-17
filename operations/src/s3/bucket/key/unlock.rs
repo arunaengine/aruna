@@ -68,11 +68,11 @@ pub enum UnlockError {
     /// The caller is a holder, but no copy of this generation was sealed to them yet.
     #[error("the caller holds no sealed copy of this key generation")]
     NoCopy,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the unlock did not finish")]
     NotFinished,
@@ -461,7 +461,7 @@ impl Operation for UnlockBucketOperation {
             (state, received) => self.fail(UnlockError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

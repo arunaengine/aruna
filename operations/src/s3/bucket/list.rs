@@ -27,11 +27,11 @@ pub enum ListBucketsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListBucketsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("ListBuckets failed")]
     ListBucketsFailed,
@@ -132,7 +132,7 @@ impl ListBucketsOperation {
             return self.emit_error(ListBucketsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 

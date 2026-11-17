@@ -56,11 +56,11 @@ pub enum PromoteError {
     NoKey,
     #[error("verified read returned no BLAKE3 or a different size")]
     BadHashes,
-    #[error("State [{state}] invalid: expected [{expected}] - received [{received:?}]")]
+    #[error("State [{state}] invalid: expected [{expected}] - received [{received}]")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("could not drop a version with a mismatched content hash: {0}")]
     Dropped(String),
@@ -206,7 +206,7 @@ impl PromotePendingOperation {
         self.finish(Err(PromoteError::InvalidStateEvent {
             state,
             expected,
-            received: event,
+            received: (event).label(),
         }))
     }
 
@@ -1107,7 +1107,7 @@ impl RejectOwnersOperation {
             (_, received) => Err(PromoteError::InvalidStateEvent {
                 state: "RejectOwners",
                 expected: "the storage result of the last effect",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -1176,7 +1176,7 @@ async fn read_value(
         other => Err(PromoteError::InvalidStateEvent {
             state: "Drop",
             expected: "ReadResult",
-            received: other,
+            received: (other).label(),
         }),
     }
 }

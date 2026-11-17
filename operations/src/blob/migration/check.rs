@@ -49,10 +49,10 @@ pub enum CheckVersionError {
     Blob(#[from] BlobError),
     #[error("version check did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state:?}: {received:?}")]
+    #[error("unexpected event in state {state:?}: {received}")]
     InvalidStateEvent {
         state: &'static str,
-        received: Box<Event>,
+        received: &'static str,
     },
 }
 
@@ -87,7 +87,7 @@ impl CheckVersionOperation {
     }
 
     fn unexpected(&mut self, state: &'static str, received: Event) -> Effects {
-        let received = Box::new(received);
+        let received = received.label();
         self.fail(CheckVersionError::InvalidStateEvent { state, received })
     }
 

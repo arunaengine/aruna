@@ -57,11 +57,11 @@ pub enum ExtendError {
     NotEncrypted,
     #[error("the caller holds no key of this bucket")]
     NotHolder,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the extension did not finish")]
     NotFinished,
@@ -384,7 +384,7 @@ impl Operation for ExtendBucketOperation {
             (state, received) => self.fail(ExtendError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

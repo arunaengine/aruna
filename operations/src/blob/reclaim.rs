@@ -427,11 +427,11 @@ pub enum ReclaimBlobError {
     Failed,
     #[error("indexed blob version is missing")]
     MissingOwner,
-    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received}]")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -494,7 +494,7 @@ impl ReclaimBlobOperation {
         self.fail(ReclaimBlobError::InvalidStateEvent {
             state,
             expected,
-            received: event,
+            received: (event).label(),
         })
     }
 

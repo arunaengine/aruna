@@ -38,11 +38,11 @@ enum StartupStep {
 pub enum StartupError {
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("opening the managed keys did not finish")]
     NotFinished,
@@ -271,7 +271,7 @@ impl Operation for OpenManagedOperation {
             (state, received) => self.fail(StartupError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

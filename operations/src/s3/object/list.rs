@@ -47,11 +47,11 @@ pub enum ListBucketError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListBucketState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -256,7 +256,7 @@ impl ListBucketOperation {
             return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -441,7 +441,7 @@ impl ListBucketOperation {
             return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -515,7 +515,7 @@ impl ListBucketOperation {
             return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -671,7 +671,7 @@ impl ListBucketOperation {
             return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -747,7 +747,7 @@ impl ListBucketOperation {
             return self.emit_error(ListBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             });
         };
 

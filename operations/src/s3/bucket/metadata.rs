@@ -55,11 +55,11 @@ pub enum PutMetadataError {
     Changed,
     #[error("PutBucketMetadata did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -124,7 +124,7 @@ impl PutMetadataOperation {
         }
     }
 
-    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, received: &'static str) -> Effects {
         let state = match self.state {
             PutMetadataState::StartTransaction => "StartTransaction",
             PutMetadataState::ReadBucket => "ReadBucket",
@@ -137,7 +137,7 @@ impl PutMetadataOperation {
         self.fail(PutMetadataError::InvalidStateEvent {
             state,
             expected,
-            received,
+            received: received.label(),
         })
     }
 
