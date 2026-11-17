@@ -871,6 +871,14 @@ impl Operation for LoadCountersOperation {
     }
 }
 
+/// Whether a snapshot of `node_id` counts: with a realm config, only its sync-eligible nodes do.
+pub(crate) fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option<NodeId>) -> bool {
+    match (active_node_ids, node_id) {
+        (Some(active_node_ids), Some(node_id)) => active_node_ids.contains(&node_id),
+        _ => true,
+    }
+}
+
 /// One batch read of every global counter shard, inside `txn_id` when given.
 pub(crate) fn global_shard_read(txn_id: Option<TxnId>) -> StorageEffect {
     let reads = global_shard_keys()

@@ -20,7 +20,7 @@ use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::s3::usage::{global_shard_read, global_sum};
+use crate::s3::usage::{counted, global_shard_read, global_sum};
 
 /// Snapshot rows one page reads.
 const PAGE_LIMIT: usize = 1_000;
@@ -224,11 +224,7 @@ impl RealmUsageOperation {
         for (key, value) in values {
             let key_node_id = usage_node_id(key.as_ref());
             let local = key_node_id == Some(self.local_node_id);
-            let counted = match (&self.active, key_node_id) {
-                (Some(active), Some(node_id)) => active.contains(&node_id),
-                _ => true,
-            };
-            if !local && !counted {
+            if !local && !counted(self.active.as_ref(), key_node_id) {
                 continue;
             }
             let snapshot = NodeUsageSnapshot::from_bytes(value.as_ref())?;
