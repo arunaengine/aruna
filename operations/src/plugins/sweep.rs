@@ -219,4 +219,28 @@ mod tests {
             0
         );
     }
+
+    #[test]
+    fn accounts_page_through() {
+        let mut plan = PluginAccounts {
+            after: None,
+            accounts: Vec::new(),
+        };
+        assert!(matches!(
+            plan.first().unwrap(),
+            Turn::Ask(Ask::Page { after: None, .. })
+        ));
+        let rows = vec![(b"u1".to_vec(), Vec::new())];
+        let Turn::Ask(Ask::Page { after, .. }) =
+            plan.next(Answer::Page(rows, Some(b"u1".to_vec()))).unwrap()
+        else {
+            panic!("a next key reads the next page");
+        };
+        assert_eq!(after, Some(b"u1".to_vec()));
+        let Turn::Finish(accounts) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+            panic!("the last page ends the listing");
+        };
+        assert!(accounts.is_empty());
+        assert!(plan.next(Answer::Done).is_err());
+    }
 }
