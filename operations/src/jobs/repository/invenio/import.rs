@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use aruna_blob::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_blob::invenio::InvenioClient;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;

@@ -7,7 +7,7 @@
 
 use super::BlobHandler;
 use super::runtime::SPOOL_BUDGET_MIB;
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -522,7 +522,7 @@ mod tests {
         parse_completion_checksum, parse_upload_checksum, validate_delete_checksum,
         validate_part_count, validate_trailer_headers, verify_trailer_stream,
     };
-    use aruna_blob::hash::Hasher;
+    use aruna_core::structs::checksum::Hasher;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;

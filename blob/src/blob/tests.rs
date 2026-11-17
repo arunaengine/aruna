@@ -10,7 +10,7 @@ use super::{
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
 use aruna_core::alpn::Alpn;

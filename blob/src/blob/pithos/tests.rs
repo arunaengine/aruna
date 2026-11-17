@@ -4,7 +4,7 @@
 
 use super::{TestContext, failing_close, setup_two_backends, stream_from_bytes, test_user_id};
 use crate::blob::pithos::{OBJECT_PATH, read};
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;

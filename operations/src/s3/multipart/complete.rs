@@ -29,7 +29,7 @@ use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
 };
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
-use aruna_blob::hash::{Hasher, combine_crcs};
+use aruna_core::structs::checksum::{Hasher, combine_crcs};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

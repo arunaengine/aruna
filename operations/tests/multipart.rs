@@ -1910,7 +1910,7 @@ async fn s3_provider_flow() {
     assert_eq!(result.location.blob_size, expected.len() as u64);
     assert_eq!(
         result.location.hashes,
-        aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map()
+        aruna_core::structs::checksum::Hasher::new_with_bytes(&expected).to_map()
     );
     assert!(result.location.same_object(&backend_upload.location));
     drain_cleanup(&context).await;
@@ -2170,7 +2170,7 @@ async fn s3_framed_completion() {
         }
     };
 
-    let hashes = aruna_blob::hash::Hasher::new_with_bytes(&expected).to_map();
+    let hashes = aruna_core::structs::checksum::Hasher::new_with_bytes(&expected).to_map();
     // Opened in a compressed bucket: the provider object holds the frames and is published.
     set_compression(&context, "bucket", group_id, zstd).await;
     let upload = create_upload(&context, "bucket", "framed.bin", group_id, created_by).await;

@@ -358,7 +358,7 @@ mod test {
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
-    use aruna_blob::hash::Hasher;
+    use aruna_core::structs::checksum::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};

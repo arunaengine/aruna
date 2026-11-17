@@ -202,7 +202,7 @@ enum Content {
 impl Content {
     fn sha256(&self) -> String {
         match self {
-            Self::Blob(bytes) => aruna_blob::hash::Hasher::new_with_bytes(bytes)
+            Self::Blob(bytes) => aruna_core::structs::checksum::Hasher::new_with_bytes(bytes)
                 .to_map()
                 .get("sha256")
                 .map(hex::encode)

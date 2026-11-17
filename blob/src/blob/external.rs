@@ -4,7 +4,7 @@
 
 use super::BlobHandler;
 use super::io::backend_version;
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use crate::s3::RESERVATION;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;

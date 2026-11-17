@@ -222,7 +222,7 @@ pub fn describe_pack(pack: &Bytes) -> Result<GitPack, GitError> {
             MAX_PACK_BYTES >> 20
         )));
     }
-    let hashes = aruna_blob::hash::Hasher::new_with_bytes(pack).to_map();
+    let hashes = aruna_core::structs::checksum::Hasher::new_with_bytes(pack).to_map();
     let sha256 = hashes
         .get("sha256")
         .map(hex::encode)

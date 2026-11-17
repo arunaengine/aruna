@@ -11,7 +11,7 @@ use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
 use super::plain::Held;
 use crate::codec::{FrameEncoder, Guard};
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
 use aruna_core::UserId;

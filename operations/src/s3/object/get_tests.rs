@@ -14,7 +14,7 @@ use crate::s3::object::get::{
     get_object_routed, promote_leased, routed_info, slice_blob,
 };
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;

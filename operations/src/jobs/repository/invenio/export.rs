@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use aruna_blob::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_blob::invenio::{InvenioClient, InvenioError};
 use aruna_core::repository::invenio::{
     export_fields, missing_fields, record_id, record_identifiers, validate_id,

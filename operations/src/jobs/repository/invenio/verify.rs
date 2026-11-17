@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_blob::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_blob::invenio::InvenioClient;
 use aruna_core::repository::RepositoryRecord;
 use aruna_core::repository::invenio::normalize_metadata;

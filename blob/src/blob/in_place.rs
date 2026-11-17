@@ -7,7 +7,7 @@ use super::backend::{build_backend_path, intent_key};
 use super::framed_parts::{Finished, part_level, streams_now};
 use super::io::{backend_version, reader_at};
 use crate::codec::Guard;
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use crate::part_chain::{PartAttempt, PartChain};
 use crate::s3::{NativeMultipart, multipart_etag};
 use aruna_core::UserId;

@@ -10,7 +10,7 @@ use super::{
 use crate::blob::BlobHandler;
 use crate::blob::backend::build_part_path;
 use crate::blob::io::compose_chunk;
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
