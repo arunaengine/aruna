@@ -190,7 +190,7 @@ pub(super) fn lasting_head(error: &HeadSourceError) -> bool {
     match error {
         HeadSourceError::Resolve(error) => lasting_resolution(error),
         HeadSourceError::Staging(error) => lasting_source(error),
-        HeadSourceError::UnexpectedEvent { .. } | HeadSourceError::HeadSourceFailed => false,
+        HeadSourceError::Io(_) | HeadSourceError::UnexpectedEvent(_) => false,
     }
 }
 
