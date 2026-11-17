@@ -3,16 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::oidc_subject_key;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, TxnId};
 use aruna_core::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,35 +19,23 @@ pub struct GetOidcInput {
     pub subject_id: String,
 }
 
+/// What the lookup reads next.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Subject,
+    User,
+    /// Follows a merged account's pointers to the root of its merges.
+    Merge,
+}
+
+/// Reads the subject index and the user in one snapshot, following merges to their root.
 #[derive(Debug, PartialEq)]
 pub struct GetOidcOperation {
     input: GetOidcInput,
-    state: GetOidcState,
-    output: Option<Result<User, GetOidcError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum GetOidcState {
-    Init,
-    StartTransaction,
-    ReadSubjectIndex {
-        txn_id: TxnId,
-    },
-    ReadExistingUser {
-        txn_id: TxnId,
-    },
-    /// Follows a merged account's pointers to the root of its merges.
-    FollowMerge {
-        txn_id: TxnId,
-        start: User,
-        current: User,
-        seen: Vec<UserId>,
-    },
-    CommitTransaction {
-        user: User,
-    },
-    Finish,
-    Error,
+    stage: Stage,
+    start: Option<User>,
+    current: Option<User>,
+    seen: Vec<UserId>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -72,12 +58,35 @@ pub enum GetOidcError {
     UserNotFound,
 }
 
+impl From<IoError> for GetOidcError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "GetOidc".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type OidcTurn = Result<Next<User>, GetOidcError>;
+
+fn user_read(user_id: UserId) -> IoCall {
+    let key = ByteView::from(user_id.to_storage_key());
+    IoCall::Read(vec![(USER_KEYSPACE.to_string(), key)])
+}
+
 impl GetOidcOperation {
     pub fn new(input: GetOidcInput) -> Self {
         Self {
             input,
-            state: GetOidcState::Init,
-            output: None,
+            stage: Stage::Subject,
+            start: None,
+            current: None,
+            seen: Vec::new(),
         }
     }
 
@@ -88,236 +97,65 @@ impl GetOidcOperation {
         )?)
     }
 
-    fn fail(&mut self, error: GetOidcError) -> Effects {
-        let cleanup = self.abort();
-        self.state = GetOidcState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(GetOidcError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn handle_start_txn(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
-                got,
-            );
-        };
-
-        match self.read_subject(txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn read_subject(&mut self, txn_id: TxnId) -> Result<Effects, GetOidcError> {
-        self.state = GetOidcState::ReadSubjectIndex { txn_id };
-        let key = ByteView::from(self.subject_key()?.into_bytes());
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: SUBJECT_INDEX_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn accept_subject(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::ReadResult { key, value })",
-                got,
-            );
-        };
-
-        match self.read_existing(txn_id, value) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn read_existing(
-        &mut self,
-        txn_id: TxnId,
-        value: Option<ByteView>,
-    ) -> Result<Effects, GetOidcError> {
-        let key = value.ok_or_else(|| GetOidcError::UserNotFound)?;
-        let user_id = UserId::from_storage_key(&key)?;
-        self.state = GetOidcState::ReadExistingUser { txn_id };
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_storage_key()),
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn accept_existing(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::ReadResult { key, value })",
-                got,
-            );
-        };
-
-        match self.emit_commit_txn(txn_id, value) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_commit_txn(
-        &mut self,
-        txn_id: TxnId,
-        value: Option<ByteView>,
-    ) -> Result<Effects, GetOidcError> {
-        let user = User::from_bytes(&value.ok_or_else(|| GetOidcError::UserNotFound)?)?;
-        Ok(self.follow(txn_id, user.clone(), user, vec![]))
-    }
-
     /// A sign-in that still names a merged account opens the root of its merges, once that root
     /// lists the account; otherwise the account itself, which then refuses as deactivated.
-    fn follow(
-        &mut self,
-        txn_id: TxnId,
-        start: User,
-        current: User,
-        mut seen: Vec<UserId>,
-    ) -> Effects {
+    fn follow(&mut self) -> OidcTurn {
+        let start = self.start.clone().ok_or(GetOidcError::NotFinished)?;
+        let current = self.current.clone().ok_or(GetOidcError::NotFinished)?;
         if let Some(next) = current.merged_into()
             && next.realm_id == start.user_id.realm_id
             && next != start.user_id
-            && !seen.contains(&next)
+            && !self.seen.contains(&next)
         {
-            seen.push(next);
-            self.state = GetOidcState::FollowMerge {
-                txn_id,
-                start,
-                current,
-                seen,
-            };
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USER_KEYSPACE.to_string(),
-                key: ByteView::from(next.to_storage_key()),
-                txn_id: Some(txn_id),
-            })];
+            self.seen.push(next);
+            self.stage = Stage::Merge;
+            return Ok(Next::Call(user_read(next)));
         }
         let root =
             current.merged_into().is_none() && current.merged_user_ids().contains(&start.user_id);
-        let user = if root { current } else { start };
-        self.state = GetOidcState::CommitTransaction { user };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn accept_primary(
-        &mut self,
-        event: Event,
-        (txn_id, start, current, seen): (TxnId, User, User, Vec<UserId>),
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
-        };
-        let expected = current.merged_into();
-        match value.map(|bytes| User::from_bytes(&bytes)).transpose() {
-            Ok(Some(next)) if Some(next.user_id) == expected => {
-                self.follow(txn_id, start, next, seen)
-            }
-            Ok(_) => self.follow(txn_id, start.clone(), start, seen),
-            Err(error) => self.fail(error.into()),
-        }
-    }
-
-    fn handle_commit_transaction(&mut self, event: Event, user: User) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self
-                .unexpected_event("Event::Storage(StorageEvent::TransactionCommitted)", got);
-        };
-        self.state = GetOidcState::Finish;
-        self.output = Some(Ok(user));
-        smallvec![]
+        Ok(Next::Done(if root { current } else { start }))
     }
 }
 
-impl EffectOperation for GetOidcOperation {
+impl Operation for GetOidcOperation {
     type Output = User;
     type Error = GetOidcError;
 
-    fn start(&mut self) -> Effects {
-        self.state = GetOidcState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-        match &self.state {
-            GetOidcState::StartTransaction => self.handle_start_txn(event),
-            GetOidcState::ReadSubjectIndex { txn_id } => {
-                let txn_id = txn_id.clone();
-                self.accept_subject(event, txn_id)
-            }
-            GetOidcState::ReadExistingUser { txn_id } => {
-                let txn_id = txn_id.clone();
-                self.accept_existing(event, txn_id)
-            }
-            GetOidcState::FollowMerge {
-                txn_id,
-                start,
-                current,
-                seen,
-            } => {
-                let txn_id = txn_id.clone();
-                let start = start.clone();
-                let current = current.clone();
-                let seen = seen.clone();
-                self.accept_primary(event, (txn_id, start, current, seen))
-            }
-            GetOidcState::CommitTransaction { user } => {
-                let user = user.clone();
-                self.handle_commit_transaction(event, user)
-            }
-            GetOidcState::Init | GetOidcState::Finish | GetOidcState::Error => {
-                smallvec![]
-            }
-        }
+    fn first(&mut self) -> OidcTurn {
+        let key = ByteView::from(self.subject_key()?.into_bytes());
+        Ok(Next::Call(IoCall::Read(vec![(
+            SUBJECT_INDEX_KEYSPACE.to_string(),
+            key,
+        )])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetOidcState::Finish | GetOidcState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(GetOidcError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            GetOidcState::ReadSubjectIndex { txn_id }
-            | GetOidcState::ReadExistingUser { txn_id }
-            | GetOidcState::FollowMerge { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> OidcTurn {
+        let [value] = values::<1>(result)?;
+        match self.stage {
+            Stage::Subject => {
+                let key = value.ok_or(GetOidcError::UserNotFound)?;
+                self.stage = Stage::User;
+                Ok(Next::Call(user_read(UserId::from_storage_key(&key)?)))
             }
-            _ => smallvec![],
+            Stage::User => {
+                let user = User::from_bytes(&value.ok_or(GetOidcError::UserNotFound)?)?;
+                self.start = Some(user.clone());
+                self.current = Some(user);
+                self.follow()
+            }
+            Stage::Merge => {
+                let expected = self.current.as_ref().and_then(User::merged_into);
+                let next = value.map(|bytes| User::from_bytes(&bytes)).transpose()?;
+                self.current = match next {
+                    Some(next) if Some(next.user_id) == expected => Some(next),
+                    _ => self.start.clone(),
+                };
+                self.follow()
+            }
         }
     }
 }
@@ -326,12 +164,11 @@ impl EffectOperation for GetOidcOperation {
 mod tests {
     use super::{GetOidcInput, GetOidcOperation};
     use aruna_core::UserId;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
-    use aruna_core::types::TxnId;
     use aruna_core::user::validation::{MERGED_INTO_ATTRIBUTE, MERGED_PREFIX};
     use byteview::ByteView;
     use ulid::Ulid;
@@ -346,16 +183,13 @@ mod tests {
         }
     }
 
-    fn read(user: &User) -> Event {
+    fn read(user: &User) -> IoResult {
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: user.user_id,
             realm_id: user.user_id.realm_id,
         };
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(user.to_bytes(&actor).unwrap().into()),
-        })
+        IoResult::Values(vec![Some(user.to_bytes(&actor).unwrap().into())])
     }
 
     /// Signs in with a subject indexed to `merged` and returns the account the login opens.
@@ -364,19 +198,18 @@ mod tests {
             issuer: "https://issuer.example".to_string(),
             subject_id: "subject".to_string(),
         });
-        let txn_id = TxnId::generate();
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(merged.user_id.to_storage_key().into()),
-        }));
-        operation.step(read(merged));
-        operation.step(read(primary));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        operation.finalize().unwrap().user_id
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+        operation.first().unwrap();
+        let index = ByteView::from(merged.user_id.to_storage_key());
+        operation.next(IoResult::Values(vec![Some(index)])).unwrap();
+        let mut turn = operation.next(read(merged));
+        if matches!(turn, Ok(Next::Call(_))) {
+            turn = operation.next(read(primary));
+        }
+        match turn {
+            Ok(Next::Done(user)) => user.user_id,
+            _ => panic!("expected the account the login opens"),
+        }
     }
 
     #[test]
