@@ -65,13 +65,11 @@ pub enum ProviderStoreError {
     IndexInconsistent,
     #[error("provider changed concurrently")]
     Stale,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for ProviderStoreError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
