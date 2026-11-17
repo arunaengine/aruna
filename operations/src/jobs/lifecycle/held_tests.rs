@@ -1,15 +1,11 @@
-//! State and event tests of the held reservation read.
+//! Call and result tests of the held reservation read.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{
-    check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{EffectiveResources, JobId};
 use aruna_core::types::{Key, Value};
 use ulid::Ulid;
@@ -17,7 +13,6 @@ use ulid::Ulid;
 use super::HeldReservations;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::MAX_RESERVATION_SCAN;
-use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn row(seed: u8) -> JobReservationRecord {
@@ -43,113 +38,58 @@ fn entry(seed: u8) -> (Key, Value) {
     (Key::from(vec![seed]), Value::from(bytes.as_slice()))
 }
 
-fn scan(start_after: Option<u8>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: JOB_RESERVATION_KEYSPACE.to_string(),
-        prefix: None,
-        start: start_after.map(|key| IterStart::After(Key::from(vec![key]))),
+fn scan(after: Option<u8>) -> Next<Vec<JobReservationRecord>> {
+    Next::Call(IoCall::Page {
+        space: JOB_RESERVATION_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after: after.map(|key| Key::from(vec![key])),
         limit: MAX_RESERVATION_SCAN,
-        txn_id: None,
     })
 }
 
-fn page(values: Vec<(Key, Value)>, next: Option<u8>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after: next.map(|key| Key::from(vec![key])),
-    })
+fn page(rows: Vec<(Key, Value)>, next: Option<u8>) -> IoResult {
+    IoResult::Page {
+        rows,
+        next: next.map(|key| Key::from(vec![key])),
+    }
 }
 
 #[test]
 fn reads_every_page() {
     let mut held = HeldReservations::all();
-    check_trace(
-        &mut held,
-        &[scan(None)],
-        vec![
-            (page(vec![entry(1)], Some(1)), vec![scan(Some(1))]),
-            (page(vec![entry(2)], None), Vec::new()),
-        ],
+    assert_eq!(held.first(), Ok(scan(None)));
+    assert_eq!(held.next(page(vec![entry(1)], Some(1))), Ok(scan(Some(1))));
+    assert_eq!(
+        held.next(page(vec![entry(2)], None)),
+        Ok(Next::Done(vec![row(1), row(2)]))
     );
-    assert!(held.is_complete());
-    assert_eq!(held.finalize().expect("held rows"), vec![row(1), row(2)]);
 }
 
 #[test]
 fn keeps_one_job() {
     let mut held = HeldReservations::of_job(JobId::from_bytes([2; 16]));
-    check_trace(
-        &mut held,
-        &[scan(None)],
-        vec![(page(vec![entry(1), entry(2), entry(3)], None), Vec::new())],
-    );
-    assert_eq!(held.finalize().expect("held rows"), vec![row(2)]);
-}
-
-#[test]
-fn reports_storage_error() {
-    let mut held = HeldReservations::all();
-    held.start();
-    let error = StorageError::Timeout;
-    assert!(
-        held.step(Event::Storage(StorageEvent::Error {
-            error: error.clone()
-        }))
-        .is_empty()
-    );
-    assert_eq!(held.finalize(), Err(LifecycleError::Storage(error)));
+    held.first().expect("first page");
+    let rows = vec![entry(1), entry(2), entry(3)];
+    assert_eq!(held.next(page(rows, None)), Ok(Next::Done(vec![row(2)])));
 }
 
 #[test]
 fn rejects_corrupt_row() {
     let mut held = HeldReservations::all();
-    held.start();
+    held.first().expect("first page");
     let corrupt = (Key::from(vec![1]), Value::from(&[0xff][..]));
-    assert!(held.step(page(vec![corrupt], None)).is_empty());
     assert!(matches!(
-        held.finalize(),
+        held.next(page(vec![corrupt], None)),
         Err(LifecycleError::Conversion(_))
     ));
 }
 
 #[test]
-fn rejects_unfit_events() {
-    let started = || {
-        let mut held = HeldReservations::all();
-        held.start();
-        held
-    };
-    let refusals = rejects_events(started, sample_events, |event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-        )
-    });
-    assert!(!refusals.is_empty());
-    for (label, effects, error) in refusals {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert!(
-            matches!(error, LifecycleError::UnexpectedEvent { .. }),
-            "{label} gave {error:?}"
-        );
-    }
-    // Before `start` no event fits.
-    let refusals = rejects_events(HeldReservations::all, sample_events, |_| false);
-    assert_eq!(refusals.len(), sample_events().len());
-}
-
-#[test]
-fn aborts_without_cleanup() {
+fn rejects_unfit_result() {
     let mut held = HeldReservations::all();
-    check_abort(&mut held, &[]);
-    held.start();
-    check_abort(&mut held, &[]);
-}
-
-#[test]
-fn rejects_early_finalize() {
-    rejects_finalize(HeldReservations::all());
-    let mut held = HeldReservations::all();
-    held.start();
-    rejects_finalize(held);
+    held.first().expect("first page");
+    assert!(matches!(
+        held.next(IoResult::Done),
+        Err(LifecycleError::UnexpectedEvent { .. })
+    ));
 }
