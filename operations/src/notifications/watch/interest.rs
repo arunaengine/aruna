@@ -36,7 +36,7 @@ use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_subscriptions,
 };
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 

@@ -37,7 +37,7 @@ use aruna_operations::onboarding::inspect_secret::{
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

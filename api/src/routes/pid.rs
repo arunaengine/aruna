@@ -37,7 +37,7 @@ use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};

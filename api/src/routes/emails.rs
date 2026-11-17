@@ -10,7 +10,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{self, EmailError, read_email, remove_email};
 use aruna_operations::notifications::settings::SettingError;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;

@@ -23,6 +23,7 @@ use ulid::Ulid;
 
 use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
 use crate::driver::{DriverContext, drive};
+use crate::document_repository::GetConfigOperation;
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
@@ -30,7 +31,6 @@ use crate::jobs::store::iter_prefix_page;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
-use crate::placement::process_placements::load_realm_config;
 use aruna_core::placement::{holds_placement, target_placement_ref};
 
 /// Saves one holder attempt makes when its transaction loses to a concurrent save.
@@ -177,8 +177,8 @@ async fn vault_caller(
             WritePeerError::Unavailable(_) => MetadataReadError::Unavailable,
         })?;
     let realm_id = *net_handle.realm_id();
-    let config = load_realm_config(context, realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(realm_id), context)
+        .await.ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if auth.realm_id != realm_id
         || auth.path_restrictions.is_some()
@@ -282,8 +282,8 @@ async fn local_records(
         .net_handle
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
-    let config = load_realm_config(context, *net_handle.realm_id())
-        .await
+    let config = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
+        .await.ok()
         .ok_or(MetadataReadError::Unavailable)?;
     let (target, key_space, limit) = match query {
         VaultQuery::Heads { auth_token } => {

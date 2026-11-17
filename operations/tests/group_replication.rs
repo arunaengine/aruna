@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{PlacementRef, shard_for_subject};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_core::placement::{PlacementResolutionContext, resolve_shard_holders, target_placement_ref};
 use ulid::Ulid;
 

@@ -26,7 +26,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::publish_watch_interest;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::sync::document_outbox::read_outbox_records;
 use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::tasks::incoming::OutboxDrainer;

@@ -24,7 +24,7 @@ use aruna_operations::metadata::create_document::{
 };
 use aruna_operations::node::node_info::{read_info_document, seed_info_document};
 use aruna_core::placement::{build_view, resolve_holders, resolve_shard_holders};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };

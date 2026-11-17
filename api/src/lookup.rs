@@ -24,7 +24,7 @@ use aruna_operations::distribution::routing::{route_read, route_write};
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::{is_user_origin, origin_holds_document};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::list::ListedObject;
 use axum::body::Body;

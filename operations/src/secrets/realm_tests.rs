@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::secrets::tests::{create, name, token};
 use aruna_core::UserId;
 use aruna_core::secrets::SecretFields;

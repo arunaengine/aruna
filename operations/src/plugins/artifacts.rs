@@ -24,7 +24,7 @@ use super::copies::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
 /// How often a node sweeps its copies, and a management node repairs missing copies and the

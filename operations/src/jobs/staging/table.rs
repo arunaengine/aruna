@@ -42,7 +42,7 @@ use crate::jobs::executor::JobContext;
 use crate::node::usage_stats::QuotaGateError;
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{

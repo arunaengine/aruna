@@ -33,7 +33,7 @@ use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::remove_member::{
     RemoveFromError, RemoveFromInput, RemoveFromOperation,
@@ -46,7 +46,7 @@ use aruna_operations::groups::update_group::{
 };
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;

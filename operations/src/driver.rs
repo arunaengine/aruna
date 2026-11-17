@@ -9,6 +9,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -23,7 +24,16 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
 
-pub use effect_adapters::routing::node_routing;
+
+/// Node-local routing inputs for a caller assembling an operation config.
+/// Pure in-memory state: operations never fetch this from inside a step.
+pub fn node_routing(context: &DriverContext) -> NodeRouting {
+    context
+        .blob_handle
+        .as_ref()
+        .map(|handle| handle.routing())
+        .unwrap_or_default()
+}
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is
 /// required; an absent plane keeps its adapter's explicit outcome, and governed

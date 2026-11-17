@@ -24,7 +24,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
 /// Cache rows read per page while pruning.

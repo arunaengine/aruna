@@ -25,7 +25,7 @@ use super::cache::PolicyCacheStats;
 use super::foreign_owner;
 use super::read::ReadPolicyError;
 use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation};
-use crate::storage_read::{StorageReadError, parse_storage_read};
+use crate::groups::backends::{RecordReadError, parse_read};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyGateConfig {
@@ -197,7 +197,7 @@ pub struct GateContext {
 #[derive(Debug, Error, PartialEq)]
 pub enum GateContextError {
     #[error("node placement subject unavailable: {0}")]
-    NodeSubject(#[source] StorageReadError),
+    NodeSubject(#[source] RecordReadError),
     #[error("the gate context read never completed")]
     Incomplete,
 }
@@ -242,7 +242,7 @@ impl Operation for GateOperation {
             self.output = Some(Err(GateContextError::Incomplete));
             return smallvec![];
         }
-        let record = parse_storage_read(event, NodeSubjectRecord::from_bytes);
+        let record = parse_read(event, NodeSubjectRecord::from_bytes);
         self.output = Some(match record {
             Ok(record) => Ok(record.map(|record| GateContext {
                 realm_id: self.realm_id,

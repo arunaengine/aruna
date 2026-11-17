@@ -29,7 +29,7 @@ use crate::jobs::executor::JobRunOutcome;
 use crate::jobs::store::{read_crate_status, read_job_record, read_local_crate};
 use crate::jobs::workflow::run_crate::record_crate;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 
 /// One publish at a time, so a repeated request cannot mint a second crate.
 static PUBLISHING: Mutex<()> = Mutex::const_new(());

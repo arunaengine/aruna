@@ -10,7 +10,9 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation, authorization_event,
+};
 use crate::users::service_account::check::{
     ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation,
 };
@@ -53,11 +55,6 @@ impl AdminCheckOperation {
         self.output = Some(result);
         smallvec![]
     }
-}
-
-/// Maps any authorization sub-operation onto the shared result event.
-pub fn authorization_event(allowed: Result<bool, AuthorizationError>) -> Event {
-    Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
 }
 
 impl Operation for AdminCheckOperation {

@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::RevokeTokenOperation;
-use crate::groups::admin_check::authorization_event;
-use crate::session::revoke::owner_cutoff;
+use crate::auth::check_permissions::authorization_event;
+use crate::auth::revoke_token::owner_cutoff;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RevokeAllConfig {

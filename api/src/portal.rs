@@ -8,7 +8,7 @@ use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -328,7 +328,7 @@ mod tests {
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
+    use aruna_operations::document_repository::GetConfigOperation;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::body::{Body, to_bytes};

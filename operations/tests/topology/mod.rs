@@ -59,7 +59,7 @@ use aruna_core::placement::{PlacementResolutionContext, bucket_membership, choos
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,

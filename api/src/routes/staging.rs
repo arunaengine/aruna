@@ -38,7 +38,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::jobs::submit::SubmitJobError;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,

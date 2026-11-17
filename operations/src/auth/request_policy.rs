@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::groups::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,

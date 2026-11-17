@@ -871,7 +871,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardTokenRevocation { .. } => {
                 Box::pin(async {
-                    crate::auth::forward::apply_token_revoke(context, peer, forward).await
+                    crate::forward::token::apply_token_revoke(context, peer, forward).await
                 })
                 .await
             }
@@ -1003,7 +1003,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardAdminEvent { .. } => {
                 Box::pin(async {
-                    crate::realm::forward::apply_admin_relay(context, peer, forward).await
+                    crate::forward::realm::apply_admin_relay(context, peer, forward).await
                 })
                 .await
             }

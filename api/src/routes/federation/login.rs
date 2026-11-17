@@ -15,7 +15,7 @@ use aruna_operations::federation::login::{
     FederatedLoginConfig, FederatedLoginError, FederatedLoginOperation, IssueHandoffConfig,
     IssueHandoffError, IssueHandoffOperation,
 };
-use aruna_operations::realm::get_config::GetConfigError;
+use aruna_operations::document_repository::GetConfigError;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -350,7 +350,7 @@ mod tests {
         ArunaBearerError, ArunaValidationState, validate_bearer_claims,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
+    use aruna_operations::document_repository::GetConfigOperation;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;

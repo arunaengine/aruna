@@ -425,7 +425,7 @@ fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &Adm
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
+    use crate::document_repository::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::document::DocumentTarget;

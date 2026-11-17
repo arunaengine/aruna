@@ -19,7 +19,7 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;

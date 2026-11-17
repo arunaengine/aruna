@@ -22,7 +22,7 @@ use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::placement::policy::GateOperation;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::get::{

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::effect_adapters::routing::node_routing;
+use crate::driver::node_routing;
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::bucket_jobs::{ActiveJob, active_job};
 use crate::groups::storage_routing::GroupInputsOperation;

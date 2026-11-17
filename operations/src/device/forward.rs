@@ -4,8 +4,8 @@
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::groups::get_group::GetGroupConfig;
-use crate::groups::get_group::GetGroupOperation;
+use crate::document_repository::GetGroupConfig;
+use crate::document_repository::GetGroupOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;

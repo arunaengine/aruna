@@ -47,7 +47,7 @@ use crate::placement::policy::GateOperation;
 use aruna_core::time::unix_timestamp_millis;
 use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataReadError};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{

@@ -46,7 +46,7 @@ use crate::notifications::settings::{
     BACKOFF_START_MS, Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
     delivery_setting, local_setting, managers, write_setting,
 };
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm_vault::{prune_secret_cache, read_realm_secret};
 use crate::storage_read::{StorageReadError, parse_storage_read};
 

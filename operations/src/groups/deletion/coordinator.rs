@@ -24,9 +24,9 @@ use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::document_repository::GetConfigOperation;
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
-use crate::placement::process_placements::load_realm_config;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
@@ -186,8 +186,8 @@ pub async fn delete_group(
     if auth.realm_id != *net.realm_id() {
         return Err(GroupDeletionError::Unauthorized);
     }
-    let config = load_realm_config(context, auth.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(auth.realm_id), context)
+        .await.ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     let (group, record) = load_group(context, group_id).await?;
     authorize(context, &auth, group_id, record.as_ref(), group.is_some()).await?;
@@ -362,8 +362,8 @@ async fn cancel_plan(
         context.as_ref(),
     )
     .await?;
-    let config = load_realm_config(context, plan.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(plan.realm_id), context)
+        .await.ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     let mut failure = None;
     for node in &plan.nodes {
@@ -410,8 +410,8 @@ async fn publish_decision(
         .net_handle
         .as_ref()
         .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
-    let config = load_realm_config(context, plan.realm_id)
-        .await
+    let config = drive(GetConfigOperation::new(plan.realm_id), context)
+        .await.ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     for node in &plan.nodes {
         if *node != net.node_id()

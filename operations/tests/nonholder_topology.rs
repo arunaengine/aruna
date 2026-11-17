@@ -47,7 +47,7 @@ use aruna_operations::metadata::get_document::{
     GetDocumentError, GetDocumentOperation, load_document_record,
 };
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;

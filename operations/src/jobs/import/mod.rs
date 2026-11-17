@@ -78,7 +78,7 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::{route_metadata_create, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::{BucketScope, MembershipQuery};

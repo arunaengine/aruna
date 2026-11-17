@@ -23,8 +23,8 @@ use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSe
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_tasks::TaskHandle;
 use async_trait::async_trait;

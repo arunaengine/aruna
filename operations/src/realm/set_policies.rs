@@ -245,7 +245,7 @@ impl SetPoliciesOperation {
             return self.fail(SetPoliciesError::MissingTransaction);
         };
         self.state = SetPoliciesState::CommitTransaction { document };
-        smallvec![crate::abe::mark_due(None, txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(None, txn_id)]
     }
 
     /// Opens a transaction that reads, validates and applies the change from the start.
@@ -296,7 +296,7 @@ impl Operation for SetPoliciesOperation {
     fn step(&mut self, event: Event) -> Effects {
         if let (SetPoliciesState::CommitTransaction { .. }, Some(txn_id)) =
             (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
@@ -443,7 +443,7 @@ mod tests {
     use super::{SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation};
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::GetConfigOperation;
+    use crate::document_repository::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::{Effect, StorageEffect};

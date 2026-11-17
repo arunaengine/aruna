@@ -429,7 +429,7 @@ impl GroupJoinOperation {
         };
         self.state = State::Commit;
         if self.deny {
-            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -524,7 +524,7 @@ impl Operation for GroupJoinOperation {
                 event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
             ) if self.deny => {
                 self.deny = false;
-                match self.txn_id.and_then(|id| crate::abe::marked(&event, id)) {
+                match self.txn_id.and_then(|id| crate::auth::epoch_due::marked(&event, id)) {
                     Some(Ok(effects)) => effects,
                     Some(Err(error)) => self.fail(error.into()),
                     None => self.fail(GroupJoinError::UnexpectedEvent),

@@ -5,7 +5,8 @@
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::auth::{
-    revocation_live, revocation_retained, valid_revocation_expiry, valid_token_hash,
+    revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
+    valid_revocation_expiry, valid_token_hash,
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -57,6 +58,18 @@ pub struct RevokeTokenConfig {
     pub admission: RevokeTokenAdmission,
     /// Current unix seconds, used to prune revocations that expired.
     pub now: u64,
+}
+
+/// Moves `owner`'s token cutoff past `issued_at` on behalf of `actor`.
+pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> RevokeTokenConfig {
+    RevokeTokenConfig {
+        token_hash: user_cutoff_hash(&owner),
+        expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
+        token_owner: owner,
+        admission: RevokeTokenAdmission::Privileged,
+        actor,
+        now,
+    }
 }
 
 /// Appends one bearer token hash to the realm's revocation set. Rides the admin
@@ -587,7 +600,7 @@ impl RevokeTokenOperation {
         }
         self.state = RevokeTokenState::CommitTransaction { document };
         if self.cutoff_raised {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -626,7 +639,7 @@ impl Operation for RevokeTokenOperation {
     fn step(&mut self, event: Event) -> Effects {
         if let (RevokeTokenState::CommitTransaction { .. }, Some(txn_id)) =
             (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
@@ -906,7 +919,7 @@ mod tests {
     };
     use crate::driver::{DriverContext, drive};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::realm::get_config::GetConfigOperation;
+    use crate::document_repository::GetConfigOperation;
     use crate::sync::outbox_record::admin_outbox_prefix;
     use aruna_core::UserId;
     use aruna_core::admin_documents::AdminDocumentOperation;

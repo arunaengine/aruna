@@ -45,7 +45,7 @@ use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{READ_OPERATION, SourceReadError, authorize_read};
 use crate::jobs::store::reserve_output_commits;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,

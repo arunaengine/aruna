@@ -14,7 +14,7 @@ use aruna_operations::auth::bearer_token::{
 };
 use aruna_operations::auth::request_authorization::AuthorizeError;
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use axum::Extension;
 use axum::extract::{FromRequestParts, Request};
 use axum::middleware::Next;

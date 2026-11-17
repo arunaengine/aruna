@@ -33,7 +33,7 @@ use aruna_operations::distribution::delegate::{DelegateError, accept_delegation}
 use aruna_operations::distribution::routing::{delegated_range, delegated_read};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::workflow::input_view::view_job;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

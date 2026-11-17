@@ -296,7 +296,7 @@ impl SetGroupOperation {
             return self.fail(SetGroupError::MissingTransaction);
         };
         self.state = SetGroupState::CommitTransaction { document };
-        smallvec![crate::abe::mark_due(Some(self.config.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(Some(self.config.group_id), txn_id)]
     }
 
     fn fail(&mut self, error: SetGroupError) -> Effects {
@@ -337,7 +337,7 @@ impl Operation for SetGroupOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if let (SetGroupState::CommitTransaction { .. }, Some(txn_id)) = (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
@@ -507,7 +507,7 @@ mod tests {
     use super::{SetGroupConfig, SetGroupError, SetGroupOperation, SetGroupState};
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::{AuthorizationError, StorageError};

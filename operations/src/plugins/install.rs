@@ -39,7 +39,7 @@ use super::settings::{SettingError, check_settings};
 use crate::auth::permission_rules::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, enforce_policies, policy_request_with};
 use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::is_management;
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
 

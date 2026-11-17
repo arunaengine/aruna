@@ -27,7 +27,7 @@ use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::bootstrap::wake_bootstrap;

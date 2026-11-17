@@ -16,7 +16,7 @@ use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::node_info::{
     departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
 };
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
 };

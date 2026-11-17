@@ -18,7 +18,7 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::locations::LocationSummaryOperation;
 use crate::replication::protocol::LocationSummaryRequest;
 

@@ -23,7 +23,7 @@ use aruna_operations::groups::tokens::list::{GroupTokensConfig, ListTokensOperat
 use aruna_operations::groups::tokens::{GroupTokensError, TokenStatus};
 use aruna_operations::jobs::recent::RecentJobsOperation;
 use aruna_operations::node::usage_stats::RealmUsageScope;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

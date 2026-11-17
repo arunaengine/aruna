@@ -20,7 +20,8 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::document_repository::GetConfigOperation;
 use crate::node::startup::apply_restored_reconcile;
 use aruna_core::placement::resolve_shard_holders;
 use crate::shard::client::fetch_shard_manifest;
@@ -66,7 +67,7 @@ pub async fn verify_held_shards(
     realm_id: RealmId,
 ) -> ShardVerificationSummary {
     let mut summary = ShardVerificationSummary::default();
-    let Some(config) = load_realm_config(context, realm_id).await else {
+    let Some(config) = drive(GetConfigOperation::new(realm_id), context).await.ok() else {
         return summary;
     };
     let Some(net_handle) = context.net_handle.clone() else {
@@ -414,26 +415,6 @@ async fn mark_verified(
 
 fn verification_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
     placement_key(realm_id, placement)
-}
-
-async fn load_realm_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Option<RealmConfigDocument> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: aruna_core::keyspaces::REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.and_then(|bytes| RealmConfigDocument::from_bytes(&bytes).ok())
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

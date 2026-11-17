@@ -33,7 +33,7 @@ use crate::notifications::settings::{
     Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
     managers, write_setting,
 };
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 
 /// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);

@@ -506,7 +506,7 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
+    use crate::document_repository::GetConfigOperation;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;
     use aruna_core::events::StorageEvent;

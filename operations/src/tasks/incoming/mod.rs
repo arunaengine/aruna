@@ -514,7 +514,7 @@ impl OperationsTaskHandler {
         if holders.is_empty() {
             return false;
         }
-        match crate::realm::forward::relay_admin_event(
+        match crate::forward::realm::relay_admin_event(
             &self.context,
             &holders,
             record.target.clone(),

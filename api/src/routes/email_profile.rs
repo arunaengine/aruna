@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::email::{SmtpMailer, SmtpSettings, refresh_mail};
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };

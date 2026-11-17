@@ -101,7 +101,7 @@ use aruna_core::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
 };
 use aruna_core::placement::{holds_placement, meta_bucket_subject, registry_placement, registry_placement_for, registry_strategy, resolve_holders_limit, resolve_shard_holders};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::search::{

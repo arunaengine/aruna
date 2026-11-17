@@ -252,7 +252,7 @@ impl SetAdminOperation {
         };
         self.state = SetAdminState::CommitTransaction;
         if self.narrowed {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -320,7 +320,7 @@ impl Operation for SetAdminOperation {
         }
         if self.state == SetAdminState::CommitTransaction
             && let Some(txn_id) = self.txn_id
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }

@@ -29,7 +29,7 @@ use aruna_operations::device::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
@@ -41,7 +41,7 @@ use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };

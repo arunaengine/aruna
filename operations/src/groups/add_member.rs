@@ -508,7 +508,7 @@ impl AddUserOperation {
             newly_added,
         };
         if deny {
-            return smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -718,7 +718,7 @@ impl Operation for AddUserOperation {
             Err(effects) => return effects,
         };
         if let AddUserState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }

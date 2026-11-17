@@ -25,7 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::realm::get_config::GetConfigError;
+use crate::document_repository::GetConfigError;
 use crate::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
@@ -208,7 +208,7 @@ pub async fn allocate_handle(
 ) -> Result<AllocatedHandle, HandleAllocationError> {
     let _guard = allocation_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_config::GetConfigOperation::new(realm_id),
+        crate::document_repository::GetConfigOperation::new(realm_id),
         context,
     )
     .await?;
@@ -267,7 +267,7 @@ pub async fn provision_metadata_binding(
 ) -> Result<PlacementBinding, HandleAllocationError> {
     let _guard = provision_lock().lock().await;
     let config = crate::driver::drive(
-        crate::realm::get_config::GetConfigOperation::new(actor.realm_id),
+        crate::document_repository::GetConfigOperation::new(actor.realm_id),
         context,
     )
     .await?;

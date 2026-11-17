@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsError, ListUploadsInput, ListUploadsOperation};

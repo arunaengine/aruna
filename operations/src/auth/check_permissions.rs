@@ -3,12 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::Event;
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, TxnId};
 
 use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
+
+/// Maps any authorization sub-operation onto the shared result event.
+pub fn authorization_event(allowed: Result<bool, AuthorizationError>) -> Event {
+    Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckPermissionsConfig {

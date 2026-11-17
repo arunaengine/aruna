@@ -510,7 +510,7 @@ impl RemoveFromOperation {
             admin_outbox_written,
             was_member,
         };
-        smallvec![crate::abe::mark_due(Some(self.input.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)]
     }
 
     fn handle_commit_transaction(
@@ -690,7 +690,7 @@ impl Operation for RemoveFromOperation {
             Err(effects) => return effects,
         };
         if let RemoveFromState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
+            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
@@ -885,7 +885,7 @@ pub mod test {
     use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::remove_member::{
         RemoveFromError, RemoveFromInput, RemoveFromOperation, RemoveFromState,
     };

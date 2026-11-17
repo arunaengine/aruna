@@ -34,7 +34,7 @@ use aruna_operations::onboarding::issue_ticket::{
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;

@@ -7,7 +7,7 @@ use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
 use aruna_core::time::unix_timestamp_millis;
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};

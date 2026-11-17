@@ -34,7 +34,7 @@ use aruna_operations::notifications::settings::{Delivery, MetadataPeers, deliver
 use aruna_operations::notifications::webhook::{
     WebhookOutcome, read_webhook, remove_webhook, set_webhook,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{drain_notification_outbox, start_task_queues};
 use aruna_storage::{FjallStorage, StorageHandle};

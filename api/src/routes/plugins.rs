@@ -12,7 +12,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::plugins::artifacts::ArtifactError;
 use aruna_operations::plugins::copies::{MemoryPermit, reserve};
 use aruna_operations::plugins::publish::{EntryError, PublishError, publish_plugin};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{StatusCode, header};

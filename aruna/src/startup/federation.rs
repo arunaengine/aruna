@@ -15,7 +15,7 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::federation::publish::is_reporting;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };

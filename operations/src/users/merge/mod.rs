@@ -583,7 +583,7 @@ impl MergeUsersOperation {
     /// The merged account loses READ everywhere, so encrypted buckets are marked for a new epoch.
     fn commit(&mut self, txn_id: TxnId) -> Effects {
         self.state = MergeState::Commit { txn_id };
-        smallvec![crate::abe::mark_due(None, txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(None, txn_id)]
     }
 
     /// Cuts off every credential of the merged account issued before the merge, on every node.
@@ -690,7 +690,7 @@ impl MergeUsersOperation {
             (
                 MergeState::Commit { txn_id },
                 event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
-            ) => crate::abe::marked(&event, txn_id)
+            ) => crate::auth::epoch_due::marked(&event, txn_id)
                 .unwrap_or(Err(StorageError::WriteError("epoch marking".to_string())))
                 .map_err(MergeError::from),
             (

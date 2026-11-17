@@ -49,7 +49,7 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use aruna_core::placement::{build_view, held_buckets};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
@@ -941,7 +941,7 @@ async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
 
 /// The bytes this node's backends may store, from their quotas.
 fn storage_capacity(ctx: &DriverContext) -> Option<u64> {
-    crate::effect_adapters::routing::node_routing(ctx)
+    crate::driver::node_routing(ctx)
         .catalog
         .capacity()
 }

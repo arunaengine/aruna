@@ -17,7 +17,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{CENTRAL_PROVIDER_ID, SESSION_HEADER};
 use aruna_operations::device::realm_documents::installed_management_urls;
 use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::users::merge::{Coordinator, coordinator as merge_coordinator};
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};

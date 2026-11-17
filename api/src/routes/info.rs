@@ -38,7 +38,7 @@ use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
 use aruna_core::placement::transition::transition_health;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -1285,7 +1285,7 @@ pub(crate) async fn run_realm_info(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1733,7 +1733,7 @@ pub async fn get_realm_placement(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1907,7 +1907,7 @@ pub async fn mutate_realm_placement(
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+                    aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
                     other => ServerError::InternalError(other.into()),
@@ -1930,7 +1930,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_operations::realm::get_config::GetConfigError::DocumentNotFound,
+            aruna_operations::document_repository::GetConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())

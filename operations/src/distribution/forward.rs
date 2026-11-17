@@ -27,7 +27,7 @@ use ulid::Ulid;
 use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
 use super::publish::{PublishConfig, PublishError, PublishOperation};
 use crate::driver::{DriverContext, drive};
-use crate::effect_adapters::routing::node_routing;
+use crate::driver::node_routing;
 use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};

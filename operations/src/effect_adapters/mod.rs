@@ -6,7 +6,6 @@ mod audit;
 mod blob;
 mod metadata;
 mod net;
-pub mod routing;
 mod storage;
 mod task;
 

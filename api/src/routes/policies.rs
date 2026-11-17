@@ -14,9 +14,9 @@ use aruna_core::request_policy::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::drive;
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::set_policies::{SetGroupConfig, SetGroupError, SetGroupOperation};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
@@ -286,7 +286,7 @@ async fn realm_policies(
     .await
     {
         Ok(config) => Ok(config.request_policies),
-        Err(aruna_operations::realm::get_config::GetConfigError::DocumentNotFound) => {
+        Err(aruna_operations::document_repository::GetConfigError::DocumentNotFound) => {
             Ok(Vec::new())
         }
         Err(error) => Err(ServerError::InternalError(error.into())),
@@ -307,8 +307,8 @@ async fn group_policies(
     {
         Ok((_, auth_doc)) => Ok(auth_doc.policies),
         Err(
-            aruna_operations::groups::get_group::GetGroupError::GroupNotFound
-            | aruna_operations::groups::get_group::GetGroupError::DocNotFound,
+            aruna_operations::document_repository::GetGroupError::GroupNotFound
+            | aruna_operations::document_repository::GetGroupError::DocNotFound,
         ) => Ok(Vec::new()),
         Err(error) => Err(ServerError::InternalError(error.into())),
     }

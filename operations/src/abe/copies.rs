@@ -5,7 +5,7 @@
 use crate::driver::{DriverContext, drive};
 use crate::jobs::store::iter_prefix_page;
 use crate::node::usage_stats::{QuotaGate, RowChange, UsageCounterUpdate};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
