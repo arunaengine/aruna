@@ -17,7 +17,8 @@ use aruna_operations::metadata::api::{
     references_metadata, search_metadata,
 };
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::{export_rocrate_routed, route_metadata_update};
+use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::forward::write::route_metadata_update;
 use aruna_operations::metadata::profile::validation::preview_submission;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use rmcp::Json;

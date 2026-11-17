@@ -26,7 +26,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::metadata::api::ExportMetadataResult;
 use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
+use crate::metadata::forward::read::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
 use aruna_core::profile_shapes::{

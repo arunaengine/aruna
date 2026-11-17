@@ -75,7 +75,7 @@ pub(crate) use self::read::{
 pub use self::read::{query_metadata, query_metadata_document, references_metadata};
 pub(crate) use self::read_types::metadata_read_request;
 use super::AuthToken;
-use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
+use super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT};
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,

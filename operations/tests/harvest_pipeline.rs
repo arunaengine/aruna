@@ -36,7 +36,7 @@ use aruna_operations::harvest::repository::{
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::run_harvest_job;
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::forward::route_metadata_delete;
+use aruna_operations::metadata::forward::write::route_metadata_delete;
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;

@@ -28,9 +28,8 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_local_document,
 };
-use aruna_operations::metadata::forward::{
-    admits_profile_peer, export_profile_local, route_metadata_create,
-};
+use aruna_operations::metadata::forward::read::{admits_profile_peer, export_profile_local};
+use aruna_operations::metadata::forward::write::route_metadata_create;
 use aruna_operations::metadata::profile::validation::{
     check_profile, current_validation_status, load_validation_status, preview_submission,
     profile_public_iri, revalidate_current,

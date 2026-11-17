@@ -524,7 +524,7 @@ mod tests {
     // fails, while a plain edit of the same read copy still queues.
     #[tokio::test]
     async fn forwards_visibility_change() {
-        use crate::metadata::forward::route_metadata_update;
+        use crate::metadata::forward::write::route_metadata_update;
         use aruna_core::document::DocumentTarget;
         use aruna_core::structs::identity::auth::Actor;
         use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};

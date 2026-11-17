@@ -27,7 +27,7 @@ use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_delete};
+use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_delete};
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::persistent_id::forward::{
     mint_pid_routed, resolve_pid_routed, withdraw_pid_routed,

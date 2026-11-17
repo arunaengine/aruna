@@ -72,7 +72,7 @@ use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::{route_metadata_create, route_metadata_update};
+use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;

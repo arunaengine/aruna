@@ -23,7 +23,7 @@ use aruna_operations::harvest::oai_pmh::request::format_from;
 use aruna_operations::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use aruna_operations::metadata::forward::export_rocrate_routed;
+use aruna_operations::metadata::forward::read::export_rocrate_routed;
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::visibility_index::{
     VisibilityError, earliest_visible, effective_datestamp, visible_page,

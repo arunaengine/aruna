@@ -65,9 +65,9 @@ use crate::metadata::api::{
     MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
 };
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::{
-    CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
-    get_metadata_routed, route_metadata_update,
+use crate::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
+use crate::metadata::forward::write::{
+    CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;

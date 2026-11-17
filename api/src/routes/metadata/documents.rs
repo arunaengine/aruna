@@ -21,10 +21,8 @@ use aruna_operations::metadata::api::{
     GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,
 };
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::{
-    get_metadata_routed as run_get_visible_metadata_document,
-    route_metadata_delete as run_delete_metadata_document,
-};
+use aruna_operations::metadata::forward::read::get_metadata_routed as run_get_visible_metadata_document;
+use aruna_operations::metadata::forward::write::route_metadata_delete as run_delete_metadata_document;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

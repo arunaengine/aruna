@@ -73,7 +73,7 @@ use crate::metadata::AuthToken;
 use crate::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
 };
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::forward::read::export_rocrate_routed;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::jobs::WaitTarget;

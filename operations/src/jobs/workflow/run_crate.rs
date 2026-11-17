@@ -49,7 +49,7 @@ use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
 };
-use crate::metadata::forward::route_metadata_create;
+use crate::metadata::forward::write::route_metadata_create;
 use crate::metadata::get_document::load_document_record;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;

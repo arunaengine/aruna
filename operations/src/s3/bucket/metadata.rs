@@ -27,7 +27,7 @@ use crate::metadata::AuthToken;
 use crate::metadata::api::{
     ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
 };
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::forward::read::export_rocrate_routed;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PutMetadataState {

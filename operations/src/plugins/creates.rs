@@ -12,7 +12,7 @@ use ulid::Ulid;
 
 use super::store::{StoreError, Txn, decode, encode, transact};
 use crate::driver::DriverContext;
-use crate::metadata::forward::PinnedCreate;
+use crate::metadata::forward::write::PinnedCreate;
 
 /// How the key row of a create was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

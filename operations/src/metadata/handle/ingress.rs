@@ -663,7 +663,8 @@ impl MetadataHandle {
             query @ MetadataTransportMessage::QueryDocument { .. } => {
                 Box::pin(async {
                     let result =
-                        super::super::forward::apply_document_query(context, peer, query).await;
+                        super::super::forward::read::apply_document_query(context, peer, query)
+                            .await;
                     MetadataTransportMessage::DocumentQueryResults { result }
                 })
                 .await
@@ -791,7 +792,7 @@ impl MetadataHandle {
         let response = match message {
             forward @ MetadataTransportMessage::ForwardExportDocument { .. } => {
                 Box::pin(async {
-                    match super::super::forward::apply_forwarded_export(
+                    match super::super::forward::read::apply_forwarded_export(
                         context,
                         peer,
                         forward,
@@ -824,7 +825,7 @@ impl MetadataHandle {
             }
             forward @ MetadataTransportMessage::ForwardExportProfile { .. } => {
                 Box::pin(async {
-                    match super::super::forward::apply_forwarded_profile(
+                    match super::super::forward::read::apply_forwarded_profile(
                         context,
                         peer,
                         forward,
@@ -874,7 +875,8 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardReadDocument { .. }
             | MetadataTransportMessage::ForwardValidationStatus { .. }) => {
                 Box::pin(async {
-                    super::super::forward::apply_forwarded_write(context, peer, forward).await
+                    super::super::forward::write::apply_forwarded_write(context, peer, forward)
+                        .await
                 })
                 .await
             }

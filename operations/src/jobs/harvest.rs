@@ -48,7 +48,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_job_document,
 };
-use crate::metadata::forward::{
+use crate::metadata::forward::write::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };
 use crate::metadata::get_document::load_document_record;
