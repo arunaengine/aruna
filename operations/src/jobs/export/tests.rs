@@ -123,11 +123,13 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
     )
     .await
     .unwrap();
+    let path = tempdir.path().join("metadata");
     let metadata_handle = metadata.then(|| {
-        let path = tempdir.path().join("metadata");
-        let node_id = net.node_id();
         let net = Some(net.clone());
-        crate::metadata::MetadataHandle::new(path, node_id, storage.clone(), net, None, None)
+        crate::metadata::MetadataHandle::new(&path, storage.clone(), net, Default::default())
+    });
+    let graph_handle = metadata.then(|| {
+        aruna_graph::GraphHandle::open(&path, net.node_id(), None, None, Default::default())
             .unwrap()
     });
     let driver = Arc::new(DriverContext {
@@ -135,6 +137,7 @@ async fn node_with(realm_id: RealmId, metadata: bool) -> BaoNode {
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle,
+        graph_handle,
         task_handle: None,
         compute_handle: None,
     });
@@ -1176,6 +1179,7 @@ async fn selection_skips_discovery() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     };

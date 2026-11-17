@@ -105,20 +105,21 @@ async fn setup_fixture() -> Fixture {
     )
     .await
     .unwrap();
-    let metadata = MetadataHandle::new(
-        root.path().join("metadata"),
-        node_id,
-        storage.clone(),
-        None,
-        None,
-        None,
-    )
+    let graph = aruna_graph::GraphHandle::open(
+root.path().join("metadata"),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata = MetadataHandle::new(root.path().join("metadata"), storage.clone(), None, Default::default());
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });

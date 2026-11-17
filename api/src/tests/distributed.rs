@@ -94,20 +94,21 @@ pub(crate) async fn node_state() -> Node {
     let blob = BlobHandler::new(backend, storage.clone(), net.clone())
         .await
         .unwrap();
-    let metadata = aruna_operations::metadata::MetadataHandle::new(
-        dir.path().join("metadata"),
-        node_id(LOCAL),
-        storage.clone(),
-        Some(net.clone()),
-        None,
-        None,
-    )
+    let graph = aruna_graph::GraphHandle::open(
+dir.path().join("metadata"),
+node_id(LOCAL),
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata = aruna_operations::metadata::MetadataHandle::new(dir.path().join("metadata"), storage.clone(), Some(net.clone()), Default::default());
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: None,
         compute_handle: None,
     });

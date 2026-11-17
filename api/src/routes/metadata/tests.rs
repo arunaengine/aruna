@@ -60,6 +60,7 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
+use aruna_graph::GraphHandle;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{
@@ -120,11 +121,8 @@ async fn write_status(state: &ServerState, status: &MaterializationStatusRecord)
     }
 }
 
-fn installed_metadata_handle(context: &DriverContext) -> &MetadataHandle {
-    let DriverContext {
-        metadata_handle, ..
-    } = context;
-    metadata_handle.as_ref().expect("metadata handle installed")
+fn installed_graph_handle(context: &DriverContext) -> &GraphHandle {
+    context.graph_handle.as_ref().expect("graph handle installed")
 }
 
 #[tokio::test]
@@ -279,10 +277,12 @@ async fn public_routes_work() {
     assert_eq!(raw.context_digest.len(), 64);
     assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
     assert!(raw.projected_event_id.is_none());
-    let projected_jsonld = installed_metadata_handle(test.state.get_ctx().as_ref())
-        .export_rocrate_jsonld(created.summary.graph_iri.clone())
-        .await
-        .unwrap();
+    let projected_jsonld = aruna_operations::metadata::export_rocrate_jsonld(
+        test.state.get_ctx().as_ref(),
+        created.summary.graph_iri.clone(),
+    )
+    .await
+    .unwrap();
     assert!(!projected_jsonld.contains("file-2.txt"));
     let failed_event_id = Ulid::from_string(&raw.winning_event_id).unwrap();
     let mut failed_status = MaterializationStatusRecord {
@@ -441,7 +441,7 @@ async fn public_routes_work() {
     assert_eq!(result.nodes_failed, 0);
 
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -863,7 +863,7 @@ async fn export_here_copy() {
 async fn list_uses_registry() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
@@ -885,7 +885,7 @@ async fn list_uses_registry() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
 
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
 
     let (_, Json(listed)) = list_metadata_documents(
         State(test.state.clone()),
@@ -923,7 +923,7 @@ async fn list_uses_registry() {
 async fn tombstone_hides_listing() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
@@ -2201,7 +2201,7 @@ async fn missing_config_fails() {
 async fn search_without_token() {
     let test = setup_access_state().await;
     let ctx = test.remote.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2242,7 +2242,7 @@ async fn run_search_route(
 
 async fn flush_node_search(node: &DistributedMetadataNode) {
     let ctx = node.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2548,7 +2548,7 @@ async fn discovery_failure_partial() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2606,7 +2606,7 @@ async fn invalid_cursor_rejected() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2700,7 +2700,7 @@ async fn cursor_suppresses_churn() {
     }
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2742,7 +2742,7 @@ async fn cursor_suppresses_churn() {
     .await
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2839,7 +2839,7 @@ async fn page_size_clamped() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2962,7 +2962,7 @@ async fn group_filter_scopes() {
     .await;
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -3010,7 +3010,7 @@ async fn cursor_binds_filter() {
     }
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -3194,20 +3194,21 @@ async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
     )
     .await
     .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        node_dir.path().join("metadata"),
-        net.node_id(),
-        storage_handle.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )
+    let graph_handle = aruna_graph::GraphHandle::open(
+node_dir.path().join("metadata"),
+net.node_id(),
+Some(net.document_sync_node()),
+Some(net.document_sync_database()),
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata_handle = MetadataHandle::new(node_dir.path().join("metadata"), storage_handle.clone(), Some(net.clone()), Default::default());
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
@@ -4290,18 +4291,19 @@ pub(crate) async fn setup_state() -> TestState {
         user_id,
         realm_id,
     };
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-    )
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.metadata_handle = Some(metadata_handle);
+    context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
     let group_id = Ulid::generate();
@@ -4377,19 +4379,20 @@ pub(crate) async fn setup_network_state() -> TestState {
         user_id,
         realm_id,
     };
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-    )
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.net_handle = Some(net.clone());
     context.metadata_handle = Some(metadata_handle);
+    context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
     // Single-node realm config so the holder proxy serves mutations locally.
@@ -4479,6 +4482,7 @@ async fn setup_closed_storage() -> Arc<ServerState> {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
             }),

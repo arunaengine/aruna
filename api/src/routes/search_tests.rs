@@ -191,20 +191,21 @@ async fn setup() -> Fixture {
         user_id,
         realm_id: realm,
     };
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-    )
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
     .unwrap();
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
@@ -343,7 +344,7 @@ async fn drain_projection(state: &ServerState) {
 
 async fn flush_search(state: &ServerState) {
     let ctx = state.get_ctx();
-    ctx.metadata_handle
+    ctx.graph_handle
         .as_ref()
         .unwrap()
         .flush_search_updates()
