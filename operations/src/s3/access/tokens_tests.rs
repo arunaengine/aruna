@@ -384,7 +384,7 @@ async fn pages_cover_all() {
 #[test]
 fn budget_returns_cursor() {
     use super::TokenScan;
-    use aruna_core::effects::{Effect, IterStart};
+    use aruna_core::calls::{IoCall, IoResult};
     use aruna_core::types::{Key, Value};
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let (group_a, group_b) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
@@ -403,19 +403,11 @@ fn budget_returns_cursor() {
         let key = access.access_key.as_bytes().to_vec();
         (key.into(), access.to_bytes().unwrap().into())
     };
-    let page = |values: Vec<(Key, Value)>, more: bool| {
-        let next_start_after = values.last().filter(|_| more).map(|(key, _)| key.clone());
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })
+    let page = |rows: Vec<(Key, Value)>, more: bool| {
+        let next = rows.last().filter(|_| more).map(|(key, _)| key.clone());
+        IoResult::Page { rows, next }
     };
-    let config = || {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        })
-    };
+    let config = || IoResult::Values(vec![None]);
 
     let mut scan = TokenScan::new((realm_id, group_a), 0, None, 1);
     scan.start();
@@ -434,14 +426,11 @@ fn budget_returns_cursor() {
     let cursor = TokenCursor::from_bytes(&next.to_bytes());
     let mut scan = TokenScan::new((realm_id, group_a), 0, cursor, 1);
     scan.start();
-    let effects = scan.step(config()).unwrap().unwrap();
+    let call = scan.step(config()).unwrap().unwrap();
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter {
-            key_space,
-            start: Some(IterStart::After(after)),
-            ..
-        })] if key_space == USER_ACCESS_KEYSPACE && *after == last
+        call,
+        IoCall::Page { space, after: Some(after), .. }
+            if space == USER_ACCESS_KEYSPACE && after == last
     ));
     let (key, value) = credential(20, group_a);
     assert!(

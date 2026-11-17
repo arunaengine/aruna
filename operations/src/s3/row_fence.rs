@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -48,18 +49,15 @@ impl RowFence {
         }
     }
 
-    /// The next effect in transaction `txn_id`, or `None` once the fence is done.
-    pub(crate) fn next(&mut self, txn_id: Ulid, version_id: Ulid) -> Option<Effect> {
+    /// The next call in the caller's transaction, or `None` once the fence is done.
+    pub(crate) fn next_call(&mut self, version_id: Ulid) -> Option<IoCall> {
         if self.step == FenceStep::Unread {
             self.step = FenceStep::Checked;
             if !self.guards.is_empty() {
                 self.step = FenceStep::Reading;
                 let reads = self.guards.iter();
                 let reads = reads.map(|(space, key, _)| (space.clone(), key.clone()));
-                return Some(Effect::Storage(StorageEffect::BatchRead {
-                    reads: reads.collect(),
-                    txn_id: Some(txn_id),
-                }));
+                return Some(IoCall::Read(reads.collect()));
             }
         }
         if self.step == FenceStep::Checked {
@@ -69,32 +67,65 @@ impl RowFence {
                 let value: Value = version_id.to_bytes().to_vec().into();
                 let writes = self.receipts.iter();
                 let writes = writes.map(|(space, key)| (space.clone(), key.clone(), value.clone()));
-                return Some(Effect::Storage(StorageEffect::BatchWrite {
-                    writes: writes.collect(),
-                    txn_id: Some(txn_id),
-                }));
+                return Some(IoCall::Write(writes.collect()));
             }
         }
         None
     }
 
-    /// Takes the answer to the effect `next` returned.
-    pub(crate) fn answer(&mut self, event: Event) -> Result<(), FenceError> {
-        match (self.step, event) {
-            (FenceStep::Reading, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+    /// Takes the result of the call `next_call` returned.
+    pub(crate) fn answer_call(&mut self, result: IoResult) -> Result<(), FenceError> {
+        let storage = |error: IoError| FenceError::Storage(error.into());
+        match self.step {
+            FenceStep::Reading => {
+                let values = result.values().map_err(storage)?;
                 let expected = self.guards.iter().map(|(_, _, value)| value);
-                let seen = values.iter().map(|(_, value)| value);
-                if values.len() != self.guards.len() || !seen.eq(expected) {
+                if values.len() != self.guards.len() || !values.iter().eq(expected) {
                     return Err(FenceError::Taken);
                 }
                 self.step = FenceStep::Checked;
                 Ok(())
             }
-            (FenceStep::Writing, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+            FenceStep::Writing => {
+                result.done().map_err(storage)?;
                 self.step = FenceStep::Done;
                 Ok(())
             }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(FenceError::Storage(error)),
+            FenceStep::Unread | FenceStep::Checked | FenceStep::Done => Err(FenceError::Unexpected),
+        }
+    }
+
+    /// The next effect in transaction `txn_id`, or `None` once the fence is done.
+    pub(crate) fn next(&mut self, txn_id: Ulid, version_id: Ulid) -> Option<Effect> {
+        let txn_id = Some(txn_id);
+        match self.next_call(version_id)? {
+            IoCall::Read(reads) => {
+                Some(Effect::Storage(StorageEffect::BatchRead { reads, txn_id }))
+            }
+            IoCall::Write(writes) => Some(Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id,
+            })),
+            _ => None,
+        }
+    }
+
+    /// Takes the answer to the effect `next` returned.
+    pub(crate) fn answer(&mut self, event: Event) -> Result<(), FenceError> {
+        let result = match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+            }
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => IoResult::Done,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(FenceError::Storage(error));
+            }
+            _ => return Err(FenceError::Unexpected),
+        };
+        match (self.step, &result) {
+            (FenceStep::Reading, IoResult::Values(_)) | (FenceStep::Writing, IoResult::Done) => {
+                self.answer_call(result)
+            }
             _ => Err(FenceError::Unexpected),
         }
     }

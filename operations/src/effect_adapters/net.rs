@@ -7,8 +7,8 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{
-    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, SnapshotSignEvent,
-    StatementSignEvent, VaultSignEvent,
+    Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
+    SnapshotSignEvent, StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
@@ -154,6 +154,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             )),
             NetEffect::StatementSign(_) => Event::Net(NetEvent::StatementSign(
                 StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::ExecutionSign(_) => Event::Net(NetEvent::ExecutionSign(
+                ExecutionSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::JobControl(_) => {
                 Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(

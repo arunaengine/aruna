@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -11,7 +12,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, VERSION_INDEX_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
 use aruna_core::request_policy::{CompiledPolicySet, PolicyDecision};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;
@@ -85,6 +86,8 @@ pub enum BaoReadError {
     Unexpected { state: &'static str, event: String },
     #[error("bao read did not finish")]
     NotFinished,
+    #[error("bao read failed: {0}")]
+    Io(IoError),
     #[error(transparent)]
     ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     /// The requester must resolve these rules and ask again.
@@ -104,30 +107,45 @@ pub enum BaoReadError {
     GovernedUnavailable,
 }
 
+/// A run cut off at its deadline or hang limit is a read that did not finish.
+impl From<IoError> for BaoReadError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            other => Self::Io(other),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BaoReadState {
-    Init,
     Open,
     Send,
     ReadResponse,
     Receive,
     CloseMetadata,
-    Close,
-    Finish,
-    Error,
 }
 
+type ReadStep = Result<Next<BaoReadOutput>, BaoReadError>;
+
+/// Reads blob bytes or their metadata from a peer over one stream. A refusal or failure ends
+/// with the error; the runner's abort then closes the stream.
 #[derive(Debug, PartialEq)]
 pub struct BaoReadOperation {
     node_id: NodeId,
     request: BaoReadRequest,
+    /// The open stream; `None` before it opens and once it closed or the bytes took it over.
     stream_id: Option<Ulid>,
     state: BaoReadState,
-    output: Option<Result<BaoReadOutput, BaoReadError>>,
-    close_error: Option<BaoReadError>,
+    /// The metadata answer, given once its stream is closed.
+    metadata: Option<BaoReadOutput>,
     accepted_blake3: Option<[u8; 32]>,
     accepted_etag: Option<String>,
     accepted_hashes: HashMap<String, Vec<u8>>,
+}
+
+fn blob_call(effect: BlobEffect) -> Next<BaoReadOutput> {
+    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
 }
 
 impl BaoReadOperation {
@@ -136,210 +154,145 @@ impl BaoReadOperation {
             node_id,
             request,
             stream_id: None,
-            state: BaoReadState::Init,
-            output: None,
-            close_error: None,
+            state: BaoReadState::Open,
+            metadata: None,
             accepted_blake3: None,
             accepted_etag: None,
             accepted_hashes: HashMap::new(),
         }
     }
 
-    fn fail(&mut self, error: BaoReadError) -> Effects {
-        let Some(stream_id) = self.stream_id else {
-            self.state = BaoReadState::Error;
-            self.output = Some(Err(error));
-            return smallvec![];
-        };
-        self.state = BaoReadState::Close;
-        self.close_error = Some(error);
-        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        self.fail(BaoReadError::Unexpected {
-            state: self.state_name(),
-            event: event.label().to_string(),
-        })
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            BaoReadState::Init => "init",
+    fn unexpected(&self, event: &Event) -> BaoReadError {
+        let state = match self.state {
             BaoReadState::Open => "open",
             BaoReadState::Send => "send",
             BaoReadState::ReadResponse => "read_response",
             BaoReadState::Receive => "receive",
             BaoReadState::CloseMetadata => "close_metadata",
-            BaoReadState::Close => "close",
-            BaoReadState::Finish => "finish",
-            BaoReadState::Error => "error",
+        };
+        BaoReadError::Unexpected {
+            state,
+            event: event.label().to_string(),
         }
+    }
+
+    fn response(&mut self, stream_id: Ulid, payload: &[u8]) -> ReadStep {
+        let (size, blake3, etag, hashes) = match VersionReplicationMessage::from_bytes(payload)? {
+            VersionReplicationMessage::BaoReadAccepted {
+                size,
+                blake3,
+                etag,
+                hashes,
+            } => (size, blake3, etag, hashes),
+            VersionReplicationMessage::BaoReadRefused(reason) => {
+                return Err(BaoReadError::Refused(reason));
+            }
+            // The source teaches the rule before bytes: the caller
+            // resolves it, caches it, and retries only when compliant.
+            VersionReplicationMessage::PlacementPolicyRequired { refs } => {
+                return Err(BaoReadError::PolicyRequired { refs });
+            }
+            VersionReplicationMessage::PlacementPolicyDenied { policy_ids } => {
+                return Err(BaoReadError::PolicyDenied { policy_ids });
+            }
+            _ => {
+                return Err(BaoReadError::Unexpected {
+                    state: "read_response",
+                    event: "unexpected bao read response".to_string(),
+                });
+            }
+        };
+        if (self.request.expected_blake3).is_some_and(|expected| expected != blake3) {
+            return Err(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
+        }
+        if !range_fits(self.request.range.as_ref(), size) {
+            return Err(BaoReadError::Refused(BaoReadRefusal::InvalidTarget));
+        }
+        if self.request.metadata_only {
+            self.metadata = Some(BaoReadOutput::Metadata {
+                size,
+                blake3,
+                etag,
+                hashes: hashes.into_iter().collect(),
+            });
+            self.state = BaoReadState::CloseMetadata;
+            return Ok(blob_call(BlobEffect::CloseConnection { stream_id }));
+        }
+        self.accepted_blake3 = Some(blake3);
+        self.accepted_etag = etag;
+        self.accepted_hashes = hashes.into_iter().collect();
+        self.state = BaoReadState::Receive;
+        Ok(blob_call(BlobEffect::ReceiveRead {
+            stream_id,
+            size,
+            expected_blake3: blake3,
+            range: self.request.range.clone(),
+        }))
     }
 }
 
-impl EffectOperation for BaoReadOperation {
+impl Operation for BaoReadOperation {
     type Output = BaoReadOutput;
     type Error = BaoReadError;
 
-    fn start(&mut self) -> Effects {
-        self.state = BaoReadState::Open;
-        smallvec![Effect::Blob(BlobEffect::OpenConnection {
+    fn first(&mut self) -> ReadStep {
+        Ok(blob_call(BlobEffect::OpenConnection {
             node_id: self.node_id,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
-            event => event,
-        };
-
-        match self.state {
-            BaoReadState::Open => {
-                let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
+    fn next(&mut self, result: IoResult) -> ReadStep {
+        let event = result.event()?;
+        if let Event::Blob(BlobEvent::Error(error)) = event {
+            return Err(error.into());
+        }
+        match (self.state, event) {
+            (BaoReadState::Open, Event::Blob(BlobEvent::ConnectionEstablished { stream_id })) => {
                 self.stream_id = Some(stream_id);
                 self.state = BaoReadState::Send;
-                let payload = match VersionReplicationMessage::BaoReadRequest(self.request.clone())
-                    .to_bytes()
-                {
-                    Ok(payload) => payload,
-                    Err(error) => return self.fail(error.into()),
-                };
-                smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
+                let message = VersionReplicationMessage::BaoReadRequest(self.request.clone());
+                let payload = message.to_bytes()?;
+                Ok(blob_call(BlobEffect::SendMessage { stream_id, payload }))
             }
-            BaoReadState::Send => {
-                let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
+            (BaoReadState::Send, Event::Blob(BlobEvent::MessageSent { stream_id })) => {
                 self.state = BaoReadState::ReadResponse;
-                smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
+                Ok(blob_call(BlobEffect::ReadMessage { stream_id }))
             }
-            BaoReadState::ReadResponse => {
-                let Event::Blob(BlobEvent::MessageReceived { stream_id, payload }) = event else {
-                    return self.unexpected(event);
-                };
-                match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(VersionReplicationMessage::BaoReadAccepted {
-                        size,
-                        blake3,
-                        etag,
-                        hashes,
-                    }) => {
-                        if self
-                            .request
-                            .expected_blake3
-                            .is_some_and(|expected| expected != blake3)
-                        {
-                            return self.fail(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
-                        }
-                        if !range_fits(self.request.range.as_ref(), size) {
-                            return self.fail(BaoReadError::Refused(BaoReadRefusal::InvalidTarget));
-                        }
-                        if self.request.metadata_only {
-                            self.output = Some(Ok(BaoReadOutput::Metadata {
-                                size,
-                                blake3,
-                                etag,
-                                hashes: hashes.into_iter().collect(),
-                            }));
-                            self.state = BaoReadState::CloseMetadata;
-                            return smallvec![Effect::Blob(BlobEffect::CloseConnection {
-                                stream_id,
-                            })];
-                        }
-                        self.accepted_blake3 = Some(blake3);
-                        self.accepted_etag = etag;
-                        self.accepted_hashes = hashes.into_iter().collect();
-                        self.state = BaoReadState::Receive;
-                        smallvec![Effect::Blob(BlobEffect::ReceiveRead {
-                            stream_id,
-                            size,
-                            expected_blake3: blake3,
-                            range: self.request.range.clone(),
-                        })]
-                    }
-                    Ok(VersionReplicationMessage::BaoReadRefused(reason)) => {
-                        self.fail(BaoReadError::Refused(reason))
-                    }
-                    // The source teaches the rule before bytes: the caller
-                    // resolves it, caches it, and retries only when compliant.
-                    Ok(VersionReplicationMessage::PlacementPolicyRequired { refs }) => {
-                        self.fail(BaoReadError::PolicyRequired { refs })
-                    }
-                    Ok(VersionReplicationMessage::PlacementPolicyDenied { policy_ids }) => {
-                        self.fail(BaoReadError::PolicyDenied { policy_ids })
-                    }
-                    Ok(_) => self.fail(BaoReadError::Unexpected {
-                        state: self.state_name(),
-                        event: "unexpected bao read response".to_string(),
-                    }),
-                    Err(error) => self.fail(error.into()),
-                }
-            }
-            BaoReadState::Receive => {
-                let Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) = event else {
-                    return self.unexpected(event);
-                };
-                let Some(blake3) = self.accepted_blake3.take() else {
-                    return self.fail(BaoReadError::NotFinished);
-                };
-                self.output = Some(Ok(BaoReadOutput::Stream {
+            (
+                BaoReadState::ReadResponse,
+                Event::Blob(BlobEvent::MessageReceived { stream_id, payload }),
+            ) => self.response(stream_id, &payload),
+            (BaoReadState::Receive, Event::Blob(BlobEvent::ReadFinished { blob, stream_size })) => {
+                // The byte stream owns the connection now.
+                self.stream_id = None;
+                let blake3 = self
+                    .accepted_blake3
+                    .take()
+                    .ok_or(BaoReadError::NotFinished)?;
+                Ok(Next::Done(BaoReadOutput::Stream {
                     blob,
                     size: stream_size,
                     blake3,
                     etag: self.accepted_etag.take(),
                     hashes: std::mem::take(&mut self.accepted_hashes),
-                }));
-                self.state = BaoReadState::Finish;
-                smallvec![]
+                }))
             }
-            BaoReadState::CloseMetadata => {
-                let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                self.state = BaoReadState::Finish;
-                smallvec![]
+            (BaoReadState::CloseMetadata, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+                self.stream_id = None;
+                let metadata = self.metadata.take().ok_or(BaoReadError::NotFinished)?;
+                Ok(Next::Done(metadata))
             }
-            BaoReadState::Close => {
-                let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-                    return self.unexpected(event);
-                };
-                self.output = Some(Err(self
-                    .close_error
-                    .take()
-                    .unwrap_or(BaoReadError::NotFinished)));
-                self.state = BaoReadState::Error;
-                smallvec![]
-            }
-            BaoReadState::Init => self.unexpected(event),
-            BaoReadState::Finish | BaoReadState::Error => smallvec![],
+            (_, event) => Err(self.unexpected(&event)),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, BaoReadState::Finish | BaoReadState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(BaoReadError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.stream_id {
-            Some(stream_id) => {
-                self.state = BaoReadState::Close;
-                self.close_error = Some(BaoReadError::NotFinished);
-                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-            }
-            None => {
-                self.state = BaoReadState::Error;
-                self.output = Some(Err(BaoReadError::NotFinished));
-                smallvec![]
-            }
-        }
+    /// A deadline or failure must release the stream; only `CloseConnection` unregisters it.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let close = |stream_id| {
+            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            IoCall::Effect(Box::new(close))
+        };
+        self.stream_id.take().map(close).into_iter().collect()
     }
 }
 
@@ -1710,9 +1663,10 @@ mod pure_tests {
     use std::time::SystemTime;
 
     use aruna_core::UserId;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{EffectOperation, Operation};
     use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -2015,9 +1969,9 @@ mod pure_tests {
         request.metadata_only = true;
         let mut operation = BaoReadOperation::new(remote_node, request);
 
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        let _ = operation.first();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
         let payload = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
             blake3: hash,
@@ -2026,42 +1980,55 @@ mod pure_tests {
         }
         .to_bytes()
         .unwrap();
-        let effects = operation.step(Event::Blob(BlobEvent::MessageReceived {
-            stream_id,
-            payload,
-        }));
+        let close = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::CloseConnection { stream_id: id })] if *id == stream_id
+            blob_effect(&close),
+            Some(BlobEffect::CloseConnection { stream_id: id }) if *id == stream_id
         ));
-        operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+        let done = operation.next(blob(BlobEvent::ConnectionClosed { stream_id }));
+        assert!(operation.abort().is_empty());
 
         assert_eq!(
-            operation.finalize().unwrap(),
-            BaoReadOutput::Metadata {
+            done.unwrap(),
+            Next::Done(BaoReadOutput::Metadata {
                 size: 42,
                 blake3: hash,
                 etag: Some("etag-1".to_string()),
                 hashes: HashMap::from([("md5".to_string(), vec![3u8; 16])]),
-            }
+            })
         );
     }
 
-    /// Drives a requester read to the response frame and returns its effects.
-    fn respond(message: VersionReplicationMessage) -> BaoReadOperation {
+    fn blob(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    /// The blob effect a requester step asks for, if it asks for one.
+    fn blob_effect(step: &Result<Next<BaoReadOutput>, BaoReadError>) -> Option<&BlobEffect> {
+        let Ok(Next::Call(IoCall::Effect(effect))) = step else {
+            return None;
+        };
+        match effect.as_ref() {
+            Effect::Blob(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Drives a requester read to the response frame and returns its outcome there; the
+    /// runner's abort then closes the open stream.
+    fn respond(message: VersionReplicationMessage) -> Result<Next<BaoReadOutput>, BaoReadError> {
         let remote_node = node_from_seed(1);
         let stream_id = Ulid::from(9u128);
         let mut operation =
             BaoReadOperation::new(remote_node, read_request(remote_node, [4u8; 32]));
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageReceived {
-            stream_id,
-            payload: message.to_bytes().unwrap(),
-        }));
-        operation.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-        operation
+        let _ = operation.first();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
+        let payload = message.to_bytes().unwrap();
+        let answer = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
+        let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+        assert_eq!(operation.abort(), vec![IoCall::Effect(Box::new(close))]);
+        answer
     }
 
     // A range outside the announced object is refused before any byte is received.
@@ -2072,36 +2039,32 @@ mod pure_tests {
         let mut request = read_request(remote_node, [4u8; 32]);
         request.range = Some(40..43);
         let mut operation = BaoReadOperation::new(remote_node, request.clone());
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        let _ = operation.first();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
         let accepted = VersionReplicationMessage::BaoReadAccepted {
             size: 42,
             blake3: [4u8; 32],
             etag: None,
             hashes: Default::default(),
         };
-        let effects = operation.step(Event::Blob(BlobEvent::MessageReceived {
-            stream_id,
-            payload: accepted.to_bytes().unwrap(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::CloseConnection { .. })]
-        ));
+        let payload = accepted.to_bytes().unwrap();
+        let refused = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
+        assert_eq!(
+            refused,
+            Err(BaoReadError::Refused(BaoReadRefusal::InvalidTarget))
+        );
 
         request.range = Some(2..10);
         let mut operation = BaoReadOperation::new(remote_node, request);
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
-        operation.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        let effects = operation.step(Event::Blob(BlobEvent::MessageReceived {
-            stream_id,
-            payload: accepted.to_bytes().unwrap(),
-        }));
+        let _ = operation.first();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
+        let payload = accepted.to_bytes().unwrap();
+        let receive = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReceiveRead { size: 42, range: Some(range), .. })]
+            blob_effect(&receive),
+            Some(BlobEffect::ReceiveRead { size: 42, range: Some(range), .. })
                 if *range == (2..10)
         ));
     }
@@ -2114,11 +2077,11 @@ mod pure_tests {
             policy_id: Ulid::from(3u128),
             digest: [2u8; 32],
         };
-        let operation = respond(VersionReplicationMessage::PlacementPolicyRequired {
+        let answer = respond(VersionReplicationMessage::PlacementPolicyRequired {
             refs: vec![policy_ref],
         });
         assert_eq!(
-            operation.finalize(),
+            answer,
             Err(BaoReadError::PolicyRequired {
                 refs: vec![policy_ref]
             })
@@ -2127,11 +2090,11 @@ mod pure_tests {
 
     #[test]
     fn denied_never_streams() {
-        let operation = respond(VersionReplicationMessage::PlacementPolicyDenied {
+        let answer = respond(VersionReplicationMessage::PlacementPolicyDenied {
             policy_ids: vec![Ulid::from(3u128)],
         });
         assert_eq!(
-            operation.finalize(),
+            answer,
             Err(BaoReadError::PolicyDenied {
                 policy_ids: vec![Ulid::from(3u128)]
             })

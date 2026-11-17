@@ -111,13 +111,12 @@ async fn enqueue_always_queues() {
     drive(enqueue(), context).await.unwrap();
     let key = format!("webhook/{}", records[0].notification_id);
     let key = user_dedup_key(user(), &key);
-    let storage = &context.storage_handle;
-    let first = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    let first = find_dedup_plan(&context, user(), &key, None).await.unwrap();
     assert!(
         first.is_some(),
         "the upload is queued without a subscription"
     );
     drive(enqueue(), context).await.unwrap();
-    let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
+    let again = find_dedup_plan(&context, user(), &key, None).await.unwrap();
     assert_eq!(again, first);
 }

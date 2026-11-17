@@ -11,10 +11,10 @@ use aruna_core::compute::quota::{
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
 };
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{NodeHeartbeat, RunningJobs};
+use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
@@ -27,9 +27,11 @@ use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, CLASS_LABEL_PREFIX, NodeInfoDocument, NodeUrls, NodeUtilization,
 };
 use aruna_core::structs::storage::routing::BackendCatalog;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
+use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -647,6 +649,21 @@ pub async fn node_urls(ctx: &DriverContext, node_id: NodeId) -> Option<NodeUrls>
         .map(|document| document.urls)
 }
 
+/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
+/// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
+/// forward past the handler's own post-run re-arm.
+pub(crate) async fn restore_info_timer(task_handle: &TaskHandle) {
+    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle
+        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishNodeInfo,
+            after: INFO_PUBLISH_INTERVAL,
+        }))
+        .await
+    {
+        warn!(message = %message, "Failed to arm node info heartbeat timer");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,7 +692,6 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_storage::FjallStorage;
-    use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {

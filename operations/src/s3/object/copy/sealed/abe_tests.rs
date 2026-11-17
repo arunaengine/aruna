@@ -12,7 +12,7 @@ use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BUCKET_KEY_KEYSPACE,
 };
-use aruna_core::operation::Runnable;
+use aruna_core::operation::{EffectOperation, Runnable, SubOperation};
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
@@ -131,12 +131,15 @@ async fn sealed(storage: &StorageHandle) -> (Sealed, Ulid, ObjectEnvelope) {
 }
 
 /// Runs storage effects on `storage` and answers copy envelopes as an unlocked or locked node.
-async fn run<O: EffectOperation>(
-    mut operation: O,
+/// Runs an operation of either kind as the runner's effect machine against storage and a
+/// stand-in for the ABE crypto.
+async fn run<O: Runnable<K>, K>(
+    operation: O,
     storage: &StorageHandle,
     unlocked: Option<&Sealed>,
     race: Race,
 ) -> Result<O::Output, O::Error> {
+    let mut operation = operation.into_machine();
     let mut effects: Vec<Effect> = operation.start().into_iter().collect();
     while !operation.is_complete() {
         let effect = effects.remove(0);
@@ -178,6 +181,18 @@ async fn run<O: EffectOperation>(
                         Err(error) => BlobEvent::Error(error.into()),
                     },
                 })
+            }
+            // A read outside the transaction runs as its own child.
+            Effect::SubOperation(mut child) => {
+                let mut asked: Vec<Effect> = child.start().into_iter().collect();
+                while !child.is_complete() {
+                    let Effect::Storage(effect) = asked.remove(0) else {
+                        panic!("unexpected child effect")
+                    };
+                    let event = storage.send_storage_effect(effect).await;
+                    asked.extend(child.step(event));
+                }
+                child.finalize()
             }
             effect => panic!("unexpected effect {effect:?}"),
         };

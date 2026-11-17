@@ -1,24 +1,14 @@
-//! Publication of a rewritten copy: its rows, the old owner and usage, and the commit.
+//! Publication of a rewritten copy: its rows, the old owner and the usage update.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
 
 impl RewriteVersionOperation {
-    pub(super) fn handle_target(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
-        match self.rows(value.map(|value| value.to_vec())) {
-            Ok(writes) => {
-                self.state = RewriteState::WriteRows;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            Err(error) => self.fail(error),
-        }
+    pub(super) fn handle_target(&mut self, value: Option<Value>) -> Step {
+        let writes = self.rows(value.map(|value| value.to_vec()))?;
+        self.state = RewriteState::WriteRows;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     /// An existing plain copy in the target class is adopted; otherwise the new copy owns its
@@ -107,10 +97,7 @@ impl RewriteVersionOperation {
     }
 
     /// The old archive loses this version as owner, so reclaim may free it once unpinned.
-    pub(super) fn handle_rows(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected(event);
-        };
+    pub(super) fn handle_rows(&mut self) -> Step {
         let sealed = self
             .old
             .as_ref()
@@ -118,60 +105,29 @@ impl RewriteVersionOperation {
         let Some(old) = sealed else {
             return self.drop_envelope();
         };
-        let owner = CopyOwner::new(ArchiveKey::of(old), self.version_key.clone());
-        match owner_delete_effect(&owner, self.txn_id) {
-            Ok(effect) => {
-                self.state = RewriteState::DropOwner;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let owner = CopyOwner::new(ArchiveKey::of(old), self.version_key.clone()).key()?;
+        self.state = RewriteState::DropOwner;
+        let delete = (COPY_OWNER_KEYSPACE.to_string(), owner.into());
+        Ok(Next::Call(IoCall::Delete(vec![delete])))
     }
 
-    pub(super) fn update_usage(&mut self) -> Effects {
-        if let (Some(txn_id), Some(gate)) = (self.txn_id, self.gate.as_mut()) {
+    pub(super) fn update_usage(&mut self) -> Step {
+        if let Some(gate) = self.gate.as_mut() {
             self.state = RewriteState::Quota;
-            return gate.start(txn_id);
+            return Ok(Next::Call(gate.start_calls()));
         }
-        let usage = self.usage.as_mut().filter(|usage| !usage.is_noop());
-        let (Some(txn_id), Some(usage)) = (self.txn_id, usage) else {
-            return self.commit();
+        let Some(usage) = self.usage.as_mut().filter(|usage| !usage.is_noop()) else {
+            return self.end(RewriteOutcome::Moved);
         };
         self.state = RewriteState::UpdateUsage;
-        usage.start(txn_id)
+        Ok(Next::Call(usage.start_calls().into_call()))
     }
 
-    pub(super) fn handle_usage(&mut self, event: Event) -> Effects {
-        let (Some(txn_id), Some(usage)) = (self.txn_id, self.usage.as_mut()) else {
-            return self.fail(RewriteError::NotFinished);
-        };
-        match usage.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.commit(),
-            Err(error) => self.fail(error.into()),
-        }
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RewriteError::NotFinished);
-        };
-        self.state = RewriteState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    pub(super) fn handle_commit(&mut self, event: Event) -> Effects {
-        self.txn_id = None;
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.output = Some(Ok(RewriteOutcome::Moved));
-                self.release()
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.owns_row = false;
-                self.fail(error.into())
-            }
-            other => self.unexpected(other),
+    pub(super) fn handle_usage(&mut self, result: IoResult) -> Step {
+        let usage = self.usage.as_mut().ok_or(RewriteError::NotFinished)?;
+        match usage.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.end(RewriteOutcome::Moved),
         }
     }
 }

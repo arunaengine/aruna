@@ -23,11 +23,11 @@ pub async fn kick(context: &DriverContext) {
 /// Re-arms the replication and witness queues after a restart. Both queues are
 /// durable rows, so the timers only have to be brought back, never the work.
 pub async fn restore_lifecycle_timers(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     task_handle: &aruna_tasks::TaskHandle,
 ) {
     let pending = crate::storage_read::iter_prefix_page(
-        storage,
+        &context.storage_handle,
         aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
         None,
         None,

@@ -5,6 +5,7 @@
 use super::*;
 use aruna_core::UserId;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, user_cutoff_expiry, user_cutoff_hash};
+use aruna_core::calls::ChildOutcome;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::TokenRevocation;
@@ -102,8 +103,8 @@ fn deletes_cut_off() {
         "exactly one credential is cut off"
     );
 
-    let revoked = SubOperationEvent::TokenRevoked { result: Ok(()) };
-    let next = operation.next(IoResult::Event(Box::new(Event::SubOperation(revoked))));
+    let revoked: Result<UserAccess, RevokeUserError> = Ok(doomed.clone());
+    let next = operation.next(IoResult::Child(ChildOutcome::new(revoked)));
     let Ok(Next::Call(IoCall::Page { after, .. })) = next else {
         panic!("expected the next page, got {next:?}");
     };
@@ -133,8 +134,8 @@ fn missing_config_finishes() {
 
     // A result that does not fit the state fails the sweep instead of being ignored.
     let mut operation = sweep(CUTOFF);
-    let revoked = SubOperationEvent::TokenRevoked { result: Ok(()) };
-    let wrong = IoResult::Event(Box::new(Event::SubOperation(revoked)));
+    let revoked: Result<UserAccess, RevokeUserError> = Err(RevokeUserError::NotFound);
+    let wrong = IoResult::Child(ChildOutcome::new(revoked));
     assert!(matches!(
         operation.next(wrong),
         Err(CutoffSweepError::Io(IoError::Unexpected { .. }))

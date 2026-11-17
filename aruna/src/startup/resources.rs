@@ -21,6 +21,7 @@ use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::recovery::RecoveryStatus;
 use aruna_operations::node::usage_publish::publish_refresh_snapshots;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
+use aruna_operations::plugins::plugin_work::PluginWorkHandler;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
@@ -87,10 +88,12 @@ struct Acquired {
 
 impl Acquired {
     fn new(storage_handle: aruna_storage::StorageHandle, task_handle: TaskHandle) -> Self {
+        let jobs_runtime = JobsRuntime::new_paused();
+        jobs_runtime.register_handler(Arc::new(PluginWorkHandler));
         Self {
             storage_handle,
             task_handle,
-            jobs_runtime: JobsRuntime::new_paused(),
+            jobs_runtime,
             shutdown: Shutdown::new(),
             metrics: Arc::new(NodeMetrics::new()),
             readiness: Readiness::new(),

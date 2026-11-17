@@ -37,7 +37,6 @@ use super::held::{HeldElsewhere, PullRequest, admitted};
 use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
-use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
 use crate::replication::managed_read::managed_read;

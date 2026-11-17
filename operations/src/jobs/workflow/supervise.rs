@@ -35,12 +35,11 @@ pub async fn supervise_and_finalize(
     bucket: String,
     cancel: CancellationToken,
 ) {
-    let storage = context.storage_handle.clone();
     let walltime_ms = spec
         .resources
         .max_walltime_ms
         .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
-    let started_at_ms = Box::pin(walltime_anchor(&storage, job_id, token)).await;
+    let started_at_ms = Box::pin(walltime_anchor(&context, job_id, token)).await;
     let walltime_left = Duration::from_millis(
         started_at_ms
             .saturating_add(walltime_ms)
@@ -78,7 +77,7 @@ pub async fn supervise_and_finalize(
                     };
                     session.end(reason);
                     Box::pin(write_session_report(
-                        &context.storage_handle,
+                        &context,
                         job_id,
                         token,
                         Some(session),
@@ -95,7 +94,7 @@ pub async fn supervise_and_finalize(
                 if let Some(session) = &session {
                     session.end(EndReason::Walltime);
                     Box::pin(write_session_report(
-                        &context.storage_handle,
+                        &context,
                         job_id,
                         token,
                         Some(session),
@@ -124,7 +123,7 @@ pub async fn supervise_and_finalize(
         }
     };
     let superseded = with_execution_heartbeat(
-        storage,
+        context.as_ref().clone(),
         job_id,
         token,
         cancel.clone(),
@@ -152,11 +151,11 @@ pub async fn supervise_and_finalize(
 /// first supervision pass persists the one it derives, so a restarted
 /// supervisor cannot hand the attempt a fresh window.
 pub(super) async fn walltime_anchor(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
 ) -> u64 {
-    if let Some(started_at_ms) = read_job_record(storage, job_id, None)
+    if let Some(started_at_ms) = read_job_record(context, job_id, None)
         .await
         .ok()
         .flatten()
@@ -165,7 +164,7 @@ pub(super) async fn walltime_anchor(
         return started_at_ms;
     }
     let anchor = unix_timestamp_millis();
-    match record_attempt_started(storage, job_id, token, anchor).await {
+    match record_attempt_started(context, job_id, token, anchor).await {
         Ok(record) => record.started_at_ms.unwrap_or(anchor),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Walltime anchor write failed");
@@ -181,7 +180,7 @@ enum SessionOutcome {
     Stopped(EndReason),
 }
 pub(super) async fn with_execution_heartbeat<T>(
-    storage: aruna_storage::StorageHandle,
+    context: DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     cancel: CancellationToken,
@@ -189,7 +188,7 @@ pub(super) async fn with_execution_heartbeat<T>(
 ) -> Option<T> {
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
-        storage,
+        context.clone(),
         job_id,
         token,
         cancel,
@@ -210,7 +209,7 @@ pub(super) async fn with_execution_heartbeat<T>(
 /// Renew the lease and surface `cancel_requested`. Returns on a lost token so the
 /// supervisor treats it as a takeover.
 pub(super) async fn execution_heartbeat(
-    storage: aruna_storage::StorageHandle,
+    context: DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     cancel: CancellationToken,
@@ -222,7 +221,7 @@ pub(super) async fn execution_heartbeat(
         tokio::select! {
             _ = stop.cancelled() => return,
             _ = interval.tick() => {
-                match renew_lease(&storage, job_id, token, unix_timestamp_millis(), None).await {
+                match renew_lease(&context, job_id, token, unix_timestamp_millis(), None).await {
                     Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
                     Err(JobMutationError::TokenMismatch) => return,
                     Err(error) => warn!(job_id = %job_id, error = %error, "Execution lease renew failed"),

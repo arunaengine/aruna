@@ -447,7 +447,7 @@ async fn seed_upload(
         expires_at_ms,
         claimed_by: None,
     };
-    write_rocrate_upload(&state.get_ctx().storage_handle, &record)
+    write_rocrate_upload(&state.get_ctx(), &record)
         .await
         .unwrap();
 }

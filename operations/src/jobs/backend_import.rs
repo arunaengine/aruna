@@ -169,7 +169,7 @@ pub async fn read_checkpoint(
     job_id: JobId,
 ) -> Result<Option<BackendImportCheckpoint>, String> {
     read_state(
-        &context.storage_handle,
+        context,
         JOB_STATE_KEYSPACE,
         checkpoint_key(job_id),
         "backend import checkpoint read",
@@ -181,7 +181,7 @@ async fn persist(ctx: &JobContext, checkpoint: &BackendImportCheckpoint) -> Resu
     ctx.progress
         .set_current(checkpoint.imported + checkpoint.skipped + checkpoint.failed);
     put_state(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         ctx.job_id,
         ctx.claim_token,
         JOB_STATE_KEYSPACE,
@@ -2168,7 +2168,9 @@ mod tests {
         let mut request = BlobRequest::new(listing());
         assert_eq!(
             request.first(),
-            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(listing())))))
+            Ok(Next::Call(IoCall::Effect(Box::new(
+                Effect::Blob(listing())
+            ))))
         );
         assert!(matches!(
             request.next(listed()),

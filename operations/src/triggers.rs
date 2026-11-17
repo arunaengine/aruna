@@ -149,10 +149,6 @@ impl Operation for TimerOperation {
         each_timer!(self, operation => operation.stamp(now_ms))
     }
 
-    fn after_commit(&mut self) -> Option<Effect> {
-        each_timer!(self, operation => operation.after_commit())
-    }
-
     fn hold_scope(&self) -> Option<HoldScope> {
         each_timer!(self, operation => operation.hold_scope())
     }
@@ -446,10 +442,6 @@ impl Operation for PeerOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         each_peer!(self, operation => operation.stamp(now_ms))
-    }
-
-    fn after_commit(&mut self) -> Option<Effect> {
-        each_peer!(self, operation => operation.after_commit())
     }
 
     fn hold_scope(&self) -> Option<HoldScope> {

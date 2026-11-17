@@ -417,7 +417,7 @@ impl Operation for CacheUsageOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, ReplicaScanError> {
         let Some(counted) = self.graphs else {
             return Ok(match self.replicas.next(result)? {
-                Next::Done(replicas) => {
+                Next::Done(replicas) | Next::Then { output: replicas, .. } => {
                     self.graphs = Some(replicas.iter().map(replica_size).sum());
                     Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, None))
                 }

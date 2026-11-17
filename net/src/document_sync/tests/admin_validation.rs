@@ -63,7 +63,7 @@ fn outsider_reports_rejected() {
     let rejected = |event: &AdminDocumentEvent| {
         matches!(
             validate_config_authority(Some(&config), event, None),
-            Ok(AdminEventValidation::Rejected(_))
+            AdminEventValidation::Rejected(_)
         )
     };
     assert!(rejected(&barrier(3)), "a User node is never a participant");
@@ -71,7 +71,7 @@ fn outsider_reports_rejected() {
     assert!(
         matches!(
             validate_config_authority(Some(&config), &barrier(1), None),
-            Ok(AdminEventValidation::Accepted)
+            AdminEventValidation::Accepted
         ),
         "the planned old holder's own barrier is accepted"
     );
@@ -123,10 +123,10 @@ fn outsider_reports_rejected() {
     };
     assert!(matches!(
         validate_config_authority(Some(&config), &unknown, None),
-        Ok(AdminEventValidation::Deferred {
+        AdminEventValidation::Deferred {
             dependency: None,
             ..
-        })
+        }
     ));
 }
 
@@ -163,12 +163,12 @@ fn removal_needs_management() {
 
     assert!(matches!(
         validate_config_authority(Some(&config), &removal(1), None),
-        Ok(AdminEventValidation::Accepted)
+        AdminEventValidation::Accepted
     ));
     for origin in [2, 3] {
         assert!(matches!(
             validate_config_authority(Some(&config), &removal(origin), None),
-            Ok(AdminEventValidation::Rejected(_))
+            AdminEventValidation::Rejected(_)
         ));
     }
 }
@@ -194,7 +194,7 @@ fn secrets_need_management() {
             1,
             op,
         );
-        validate_config_authority(Some(&config), &event, None).expect("validation runs")
+        validate_config_authority(Some(&config), &event, None)
     };
     let vault = AdminDocumentOperation::ConfigVaultSet {
         entry,

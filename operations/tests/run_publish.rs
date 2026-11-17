@@ -292,6 +292,7 @@ async fn crate_stays_local() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        handlers: Default::default(),
     };
 
     assert!(matches!(
@@ -429,6 +430,7 @@ async fn crate_redrive_links() -> TestResult<()> {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&record.progress),
         range_turns: Default::default(),
+        handlers: Default::default(),
     };
     let JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource }) =
         write_run_crate(&context(), job_id).await
@@ -443,7 +445,7 @@ async fn crate_redrive_links() -> TestResult<()> {
     assert_eq!((link.group_id, link.created_by), (group_id, realm.user_id));
 
     // The node prunes on its own schedule; a run inside its retention survives a pass.
-    prune_job_batch(server.context.as_ref()).await?;
+    prune_job_batch(server.context.as_ref(), &[]).await?;
     put_crate_status(storage, job_id, &RunCrateStatus::Minted { document_id }).await?;
     storage
         .send_storage_effect(StorageEffect::Delete {

@@ -320,7 +320,7 @@ async fn skips_without_profile() {
     let enqueue = EnqueueDeliveriesOperation::new(node(), Some(&config), &records, NOW_MS);
     drive(enqueue, context).await.unwrap();
     let key = user_dedup_key(user(), &format!("email/{}", records[0].notification_id));
-    let queued = find_dedup_plan(&context.storage_handle, user(), &key, None).await;
+    let queued = find_dedup_plan(&context, user(), &key, None).await;
     assert_eq!(
         queued.unwrap(),
         None,
@@ -345,17 +345,16 @@ async fn enqueue_always_queues() {
     let enqueue = || EnqueueDeliveriesOperation::new(node(), Some(&config), &records, NOW_MS);
     drive(enqueue(), context).await.unwrap();
     let key = |id: Ulid| user_dedup_key(user(), &format!("email/{id}"));
-    let storage = &context.storage_handle;
-    let first = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
+    let first = find_dedup_plan(&context, user(), &key(records[0].notification_id), None)
         .await
         .unwrap()
         .expect("the notice is queued without an opt-in");
     drive(enqueue(), context).await.unwrap();
-    let again = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
+    let again = find_dedup_plan(&context, user(), &key(records[0].notification_id), None)
         .await
         .unwrap();
     assert_eq!(again.map(|(job_id, _)| job_id), Some(first.0));
-    let skipped = find_dedup_plan(storage, user(), &key(records[1].notification_id), None)
+    let skipped = find_dedup_plan(&context, user(), &key(records[1].notification_id), None)
         .await
         .unwrap();
     assert_eq!(

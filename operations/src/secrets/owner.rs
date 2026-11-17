@@ -34,11 +34,8 @@ use aruna_core::{NodeId, UserId};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{ChangeError, Managers, SecretChange, widening_notices};
-use crate::notifications::outbox_record::schedule_drain_effect as notice_drain_effect;
-use crate::sync::outbox_record::{
-    new_identified_record, outbox_write_entry, schedule_drain_effect,
-};
+use super::{ChangeError, Managers, SecretChange, drains, widening_notices};
+use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
 
 /// Register documents read per page.
 const PAGE: usize = 256;
@@ -79,13 +76,11 @@ pub enum OwnerSecretError {
     NotReadable,
     #[error("operation did not finish")]
     NotFinished,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for OwnerSecretError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 
@@ -216,8 +211,6 @@ pub struct OwnerSecretOperation {
     input: OwnerChange,
     reader: EntryReader,
     stage: Stage,
-    /// Whether the outbox drain and the notice drain still wait for the commit.
-    drain: bool,
     notices: bool,
     result: Option<Option<SecretEntry>>,
 }
@@ -229,7 +222,6 @@ impl OwnerSecretOperation {
             input,
             reader,
             stage: Stage::Reading,
-            drain: false,
             notices: false,
             result: None,
         }
@@ -467,7 +459,6 @@ impl OwnerSecretOperation {
         self.reader.documents.extend(documents);
         self.result = Some(self.reader.entry());
         self.stage = Stage::Write;
-        self.drain = true;
         Ok(Next::Call(IoCall::Write(writes)))
     }
 }
@@ -500,21 +491,16 @@ impl Operation for OwnerSecretOperation {
             Stage::Managers => self.write(rows::value(result)?.as_deref()),
             Stage::Write => {
                 rows::done(result)?;
-                Ok(Next::Done(self.result.take().flatten()))
+                Ok(Next::Then {
+                    output: self.result.take().flatten(),
+                    calls: drains(self.notices),
+                })
             }
         }
     }
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
-    }
-
-    /// The outbox drain, then the notice drain; a missed timer leaves the rows to the next drain.
-    fn after_commit(&mut self) -> Option<Effect> {
-        if std::mem::take(&mut self.drain) {
-            return Some(schedule_drain_effect());
-        }
-        std::mem::take(&mut self.notices).then(notice_drain_effect)
     }
 }
 

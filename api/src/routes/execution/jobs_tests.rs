@@ -458,26 +458,25 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
 
 async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8; 32] {
     let context = state.get_ctx();
-    let storage = &context.storage_handle;
-    insert_job(storage, &import_job(job_id, owner))
+    insert_job(&context, &import_job(job_id, owner))
         .await
         .unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(storage, job_id, node_id(), 2_000).await.unwrap()
+    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(), 2_000).await.unwrap()
     else {
         panic!("job was not claimed")
     };
     let token = record.claim.unwrap().claim_token;
-    put_job_entry(storage, job_id, token, b"b", &report_row("b"))
+    put_job_entry(&context, job_id, token, b"b", &report_row("b"))
         .await
         .unwrap();
-    put_job_entry(storage, job_id, token, b"a", &report_row("a"))
+    put_job_entry(&context, job_id, token, b"a", &report_row("a"))
         .await
         .unwrap();
-    transition_to_running(storage, job_id, token, 2_500)
+    transition_to_running(&context, job_id, token, 2_500)
         .await
         .unwrap();
     complete_job(
-        storage,
+        &context,
         job_id,
         token,
         JobResultPayload::ImportRoCrate(ImportRoCrateResult {
@@ -515,7 +514,7 @@ async fn list_newest_first() {
     let owner = user(2);
     for seq in 1..=3u64 {
         insert_job(
-            &state.get_ctx().storage_handle,
+            &state.get_ctx(),
             &job_for(job_id(seq), owner, seq * 1000),
         )
         .await
@@ -629,7 +628,7 @@ async fn report_pending_typed() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([10u8; 16]);
-    insert_job(&state.get_ctx().storage_handle, &import_job(job_id, owner))
+    insert_job(&state.get_ctx(), &import_job(job_id, owner))
         .await
         .unwrap();
 
@@ -691,7 +690,7 @@ async fn artifact_head_headers() {
     let owner = user(2);
     let job_id = JobId::from_bytes([11u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &export_job(
             job_id,
             owner,
@@ -739,7 +738,7 @@ async fn artifact_expiry_gone() {
     let owner = user(2);
     let job_id = JobId::from_bytes([12u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &export_job(job_id, owner, 1),
     )
     .await
@@ -825,7 +824,7 @@ async fn names_owner_url() {
     let owner = user(2);
     let job_id = JobId::from_bytes([14u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &job_for(job_id, owner, 1000),
     )
     .await
@@ -905,7 +904,7 @@ async fn foreign_not_found() {
     let (_dir, state) = build_state().await;
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &job_for(job_id, user(2), 1000),
     )
     .await
@@ -927,7 +926,6 @@ async fn delete_job_rules() {
     // second delete answers 404.
     let (_dir, state) = build_state().await;
     let owner = user(2);
-    let storage = &state.get_ctx().storage_handle;
     let finished = JobId::from_bytes([0xA1; 16]);
     let running = JobId::from_bytes([0xA2; 16]);
     let mut record = job_for(finished, owner, 1000);
@@ -951,12 +949,12 @@ async fn delete_job_rules() {
     });
     record.state = JobState::Succeeded;
     record.finished_at_ms = Some(2000);
-    insert_job(storage, &record).await.unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
     let mut live = record.clone();
     live.job_id = running;
     live.state = JobState::Running;
     live.finished_at_ms = None;
-    insert_job(storage, &live).await.unwrap();
+    insert_job(&state.get_ctx(), &live).await.unwrap();
 
     let call = |who: UserId, id: JobId| {
         delete_job(
@@ -1000,9 +998,8 @@ async fn exhausted_job_removable() {
     record.locally_exhausted = true;
     let mut running = job_for(live, owner, 1000);
     running.state = JobState::Running;
-    let storage = &state.get_ctx().storage_handle;
-    insert_job(storage, &record).await.unwrap();
-    insert_job(storage, &running).await.unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
+    insert_job(&state.get_ctx(), &running).await.unwrap();
     let delete = |id: JobId| {
         delete_job(
             State(state.clone()),
@@ -1029,7 +1026,7 @@ async fn exhausted_job_removable() {
     assert!(reason.contains("running"), "{reason}");
     // A job still waiting in the queue is cancelled and deleted in one call.
     let waiting = JobId::from_bytes([0x63; 16]);
-    insert_job(storage, &job_for(waiting, owner, 1000))
+    insert_job(&state.get_ctx(), &job_for(waiting, owner, 1000))
         .await
         .unwrap();
     assert_eq!(delete(waiting).await.unwrap(), StatusCode::NO_CONTENT);
@@ -1044,7 +1041,7 @@ async fn cancel_is_idempotent() {
     // A prior run keeps repeated cancellation on the live, cancel-requested path.
     let mut record = job_for(job_id, owner, 1000);
     record.has_run = true;
-    insert_job(&state.get_ctx().storage_handle, &record)
+    insert_job(&state.get_ctx(), &record)
         .await
         .unwrap();
 
@@ -1079,7 +1076,7 @@ async fn cancel_terminal_noop() {
     let mut record = job_for(job_id, owner, 1000);
     record.state = JobState::Succeeded;
     record.finished_at_ms = Some(2000);
-    insert_job(&state.get_ctx().storage_handle, &record)
+    insert_job(&state.get_ctx(), &record)
         .await
         .unwrap();
 
@@ -1126,7 +1123,7 @@ async fn restricted_token_rejected() {
     let owner = user(2);
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &job_for(job_id, owner, 1000),
     )
     .await

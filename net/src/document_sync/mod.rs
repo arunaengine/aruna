@@ -25,12 +25,13 @@ use aruna_core::UserId;
 use aruna_core::admin_checks::{
     AdminOperationFamily, coalescible_config_op, config_mutation_allowed, family_matches_targets,
     foreign_actor_allowed, has_write_permission, origin_may_publish, revocation_origin_full,
-    revocation_origin_known, service_owner, validate_config_actor, validate_config_target,
-    validate_event_scope, validate_revocation_snapshot, validate_shape,
+    service_owner, validate_config_actor, validate_config_target, validate_event_scope,
+    validate_revocation_snapshot, validate_shape,
 };
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::config_authority::{AdminEventValidation, validate_config_authority};
 use aruna_core::deferred_topics::{
     DeferredRegistrationOutcome, DocumentSyncDependency, register_deferred_topic,
     remove_deferred_topic, satisfied_dependencies,
@@ -58,7 +59,7 @@ use aruna_core::reducer::{
     AdminApplyStatus, AdminDocumentState, RevocationIndex, config_node_path, decode_reducer_state,
     materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
     materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_state,
-    overlay_placement, overlay_realm_config, reduced_admin_target,
+    overlay_realm_config, reduced_admin_target,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, create_acceptance_entry, create_acceptance_key,
@@ -79,10 +80,7 @@ use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change, placement_policy_target,
     verify_policy_authority,
 };
-use aruna_core::structs::placement::record::{
-    DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PlacementRef, PlacementScope,
-    PoolAdmission, admit_band_pool, coordinator_spans,
-};
+use aruna_core::structs::placement::record::{DocumentClass, PlacementRef, PlacementScope};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::{
     PersistentIdMapping, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,

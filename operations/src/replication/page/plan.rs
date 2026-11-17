@@ -8,6 +8,7 @@ use aruna_core::time::unix_timestamp_millis;
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
@@ -73,13 +74,25 @@ pub enum PageError {
     },
     #[error("operation did not finish")]
     NotFinished,
+    #[error("page storage failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for PageError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl PageError {
     /// Whether the same page may pass later, after a conflict or a newer record.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::Storage(_) | Self::Usage(_) | Self::RecordMissing => true,
+            Self::Storage(_) | Self::Usage(_) | Self::RecordMissing | Self::Io(_) => true,
             Self::Admission(error) => error.retryable(),
             Self::Purge(error) => matches!(error, PurgeFenceError::Suspended),
             Self::Conversion(_)

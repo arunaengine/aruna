@@ -351,7 +351,7 @@ fn share_upload(from: &Node, recipient: UserId, bucket: &str, at: u64) -> Notifi
 async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
     let key = format!("webhook/{}", record.notification_id);
     let key = user_dedup_key(record.recipient, &key);
-    find_dedup_plan(&node.context.storage_handle, record.recipient, &key, None)
+    find_dedup_plan(&node.context, record.recipient, &key, None)
         .await
         .expect("dedup read")
         .is_some()

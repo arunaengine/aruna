@@ -43,7 +43,7 @@ pub(super) async fn start_session(
     let node_id = net.node_id();
     // The credential was minted while the task was prepared; this reads the
     // same one back, so the client sees when it really expires.
-    let credential_expires_ms = match read_job_record(&context.storage_handle, job_id, None).await {
+    let credential_expires_ms = match read_job_record(context, job_id, None).await {
         Ok(Some(record)) => Box::pin(mint_workspace_credential(
             context,
             spec,
@@ -91,15 +91,15 @@ async fn realm_session_idle(context: &DriverContext) -> u64 {
 }
 
 /// The stored record of a queued copy, when its id parses and it is readable.
-async fn finished_copy(storage: &aruna_storage::StorageHandle, job_id: &str) -> Option<JobRecord> {
+async fn finished_copy(context: &DriverContext, job_id: &str) -> Option<JobRecord> {
     let job_id = JobId::from_str(job_id).ok()?;
-    read_job_record(storage, job_id, None).await.ok().flatten()
+    read_job_record(context, job_id, None).await.ok().flatten()
 }
 
 /// Lists what the session brought into its workspace bucket and why it stopped.
 /// Cell traffic is never recorded: the family log is capped per family.
 pub(super) async fn write_session_report(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     session: Option<&Arc<Session>>,
@@ -124,7 +124,7 @@ pub(super) async fn write_session_report(
         // A queued copy that finished counts like an inline one. One still
         // running never reached the kernel, so it is left out.
         for pending in session.pending() {
-            let Some(record) = finished_copy(storage, &pending.job_id).await else {
+            let Some(record) = finished_copy(context, &pending.job_id).await else {
                 continue;
             };
             let Some(JobResultPayload::CopyObject {
@@ -166,7 +166,7 @@ pub(super) async fn write_session_report(
     });
     for row in rows {
         if let Err(error) =
-            put_job_entry(storage, job_id, token, row.entry_key.as_bytes(), &row).await
+            put_job_entry(context, job_id, token, row.entry_key.as_bytes(), &row).await
         {
             warn!(job_id = %job_id, error = %error, "Session report write failed");
             return;

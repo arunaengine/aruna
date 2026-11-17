@@ -4,36 +4,34 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::groups::backends::backend_key;
+use crate::groups::fence::group_fence_key;
 use crate::groups::storage_routing::routing_key;
 use crate::s3::imports::ImportRuleError;
 use crate::s3::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::group::Group;
+use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::backend_import::PLAIN_PATTERN;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::group_backend::{GroupStorage, template_bucket, valid_bucket};
 use aruna_core::structs::storage::routing::{GroupStorageRouting, RoutingTarget};
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateBucketState {
-    Init,
-    StartTransaction,
     CheckExists,
     ReadRouting,
     ReadStorage,
@@ -41,9 +39,6 @@ pub enum CreateBucketState {
     CreateBucket,
     UpdateUsage,
     Link,
-    CommitTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -58,40 +53,32 @@ pub enum CreateBucketError {
     BucketAlreadyExists,
     #[error("the provider bucket could not be linked: {0}")]
     ProviderBucket(ImportRuleError),
-    #[error("No transaction found")]
-    NoTransactionFound,
-    #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
-    InvalidState {
-        current: CreateBucketState,
-        expected: CreateBucketState,
-    },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: CreateBucketState,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
     #[error("CreateBucket failed")]
     CreateBucketFailed,
-    #[error("operation did not finish")]
-    NotFinished,
 }
+
+impl From<IoError> for CreateBucketError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn = Result<Next<BucketInfo>, CreateBucketError>;
 
 #[derive(Debug, PartialEq)]
 pub struct CreateBucketOperation {
     bucket: String,
     bucket_info: BucketInfo,
     state: CreateBucketState,
-    txn_id: Option<ulid::Ulid>,
     usage_update: Option<UsageCounterUpdate>,
     /// Looks for a provider bucket to link; only user creates opt in, never mirrors.
     mapped: bool,
+    /// The automatic link, whose calls join this transaction.
     link: Option<CreateImportOperation>,
     /// The group storage and provider bucket of the automatic link.
     provider: Option<(ulid::Ulid, String)>,
-    output: Option<Result<BucketInfo, CreateBucketError>>,
 }
 
 /// Rules one scan page of the automatic link check reads.
@@ -102,13 +89,11 @@ impl CreateBucketOperation {
         Self {
             bucket,
             bucket_info,
-            state: CreateBucketState::Init,
-            txn_id: None,
+            state: CreateBucketState::CheckExists,
             usage_update: None,
             mapped: false,
             link: None,
             provider: None,
-            output: None,
         }
     }
 
@@ -119,123 +104,48 @@ impl CreateBucketOperation {
         self
     }
 
-    fn emit_error(&mut self, error: CreateBucketError) -> Effects {
-        self.state = CreateBucketState::Error;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        if self.state != CreateBucketState::Init {
-            return self.emit_error(CreateBucketError::InvalidState {
-                current: self.state.clone(),
-                expected: CreateBucketState::Init,
-            });
-        }
-
-        self.state = CreateBucketState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        self.state = CreateBucketState::CheckExists;
-        smallvec![crate::groups::fence::read_group_record(
-            self.bucket_info.group_id,
-            S3_BUCKET_KEYSPACE,
-            self.bucket.as_bytes().into(),
-            txn_id,
-        )]
-    }
-
-    fn handle_bucket_checked(&mut self, event: Event) -> Effects {
-        let value = match crate::groups::fence::parse_group_record(event) {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-
+    fn handle_bucket_checked(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [value, fence] = <[_; 2]>::try_from(values).map_err(|_| {
+            aruna_core::structs::identity::group_delete::GroupWriteError::Unexpected
+        })?;
+        check_group_write(fence.as_deref())?;
         if value.is_some() {
-            return self.emit_error(CreateBucketError::BucketAlreadyExists);
+            return Err(CreateBucketError::BucketAlreadyExists);
         }
         if self.mapped {
             self.state = CreateBucketState::ReadRouting;
             let key = routing_key(self.bucket_info.group_id);
-            return self.read(STORAGE_ROUTING_KEYSPACE, key);
+            return Ok(Next::Call(read_row(STORAGE_ROUTING_KEYSPACE, key)));
         }
         self.write_bucket()
     }
 
-    fn read(&self, key_space: &str, key: aruna_core::types::Key) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn read_value(&mut self, event: Event) -> Result<Option<Value>, CreateBucketError> {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-            received => Err(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: received.label(),
-            }),
-        }
-    }
-
-    fn routing_read(&mut self, event: Event) -> Effects {
-        let routing = self.read_value(event).and_then(|value| {
-            let routing = value.map(|value| GroupStorageRouting::from_bytes(&value));
-            Ok(routing.transpose()?)
-        });
-        match routing.map(|routing| routing.and_then(|routing| routing.default_target)) {
-            Ok(Some(RoutingTarget::Backend(BackendRef::Group(backend_id)))) => {
+    fn routing_read(&mut self, value: Option<Value>) -> Turn {
+        let routing = value
+            .map(|value| GroupStorageRouting::from_bytes(&value))
+            .transpose()?;
+        match routing.and_then(|routing| routing.default_target) {
+            Some(RoutingTarget::Backend(BackendRef::Group(backend_id))) => {
                 self.state = CreateBucketState::ReadStorage;
                 let group = self.bucket_info.group_id.to_bytes().to_vec().into();
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            STORAGE_BACKEND_KEYSPACE.to_string(),
-                            backend_key(backend_id)
-                        ),
-                        (GROUP_KEYSPACE.to_string(), group),
-                    ],
-                    txn_id: self.txn_id,
-                })]
+                Ok(Next::Call(IoCall::Read(vec![
+                    (
+                        STORAGE_BACKEND_KEYSPACE.to_string(),
+                        backend_key(backend_id),
+                    ),
+                    (GROUP_KEYSPACE.to_string(), group),
+                ])))
             }
-            Ok(_) => self.write_bucket(),
-            Err(error) => self.emit_error(error),
+            _ => self.write_bucket(),
         }
     }
 
-    fn storage_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: (event).label(),
-            });
-        };
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn storage_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let mut values = values.into_iter();
         let (storage, group) = (values.next().flatten(), values.next().flatten());
         let storage = storage.map(|value| GroupStorage::from_bytes(&value));
         let group = group.map(|value| Group::from_bytes(&value));
-        let (storage, group) = match (storage.transpose(), group.transpose()) {
-            (Ok(storage), Ok(group)) => (storage, group),
-            (Err(error), _) | (_, Err(error)) => return self.emit_error(error.into()),
-        };
-        let (Some(storage), Some(txn_id)) = (storage, self.txn_id) else {
+        let (Some(storage), group) = (storage.transpose()?, group.transpose()?) else {
             return self.write_bucket();
         };
         let name = group.map(|group| group.display_name).unwrap_or_default();
@@ -248,9 +158,9 @@ impl CreateBucketOperation {
             // The whole name must be one S3 bucket; a group name with `/` or `_` is refused.
             if !valid_bucket(&provider) {
                 let reason = format!("the bucket template gives `{provider}`, no S3 bucket name");
-                return self.emit_error(CreateBucketError::ProviderBucket(
-                    ImportRuleError::Invalid(reason),
-                ));
+                return Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
+                    reason,
+                )));
             }
             let input = CreateImportInput {
                 group_id: storage.group_id,
@@ -267,7 +177,7 @@ impl CreateBucketOperation {
                 move_existing: false,
                 import_roots: Default::default(),
             };
-            self.link = Some(CreateImportOperation::within(input, txn_id));
+            self.link = Some(CreateImportOperation::within(input));
             self.provider = Some((storage.backend_id, provider));
             return self.scan_links(None);
         }
@@ -275,92 +185,57 @@ impl CreateBucketOperation {
     }
 
     /// Reads the group's rules, so no automatic link takes a provider bucket a rule uses.
-    fn scan_links(&mut self, start: Option<aruna_core::types::Key>) -> Effects {
+    fn scan_links(&mut self, start: Option<Key>) -> Turn {
         self.state = CreateBucketState::ScanLinks;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_IMPORT_KEYSPACE.to_string(),
-            prefix: Some(self.bucket_info.group_id.to_bytes().to_vec().into()),
-            start: start.map(aruna_core::effects::IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: BACKEND_IMPORT_KEYSPACE.to_string(),
+            prefix: self.bucket_info.group_id.to_bytes().to_vec().into(),
+            after: start,
             limit: LINK_PAGE,
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
-    fn links_scanned(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-        let Some((backend_id, provider)) = self.provider.clone() else {
-            return self.emit_error(CreateBucketError::CreateBucketFailed);
-        };
+    fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        let (backend_id, provider) = self
+            .provider
+            .clone()
+            .ok_or(CreateBucketError::CreateBucketFailed)?;
         for (_, value) in values {
-            match BackendImport::from_bytes(&value) {
-                Ok(rule) if rule.uses_bucket(backend_id, &provider) => {
-                    let reason = format!(
-                        "provider bucket `{provider}` is linked to `{}`",
-                        rule.bucket
-                    );
-                    return self.emit_error(CreateBucketError::ProviderBucket(
-                        ImportRuleError::Conflict(reason),
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) => return self.emit_error(error.into()),
+            let rule = BackendImport::from_bytes(&value)?;
+            if rule.uses_bucket(backend_id, &provider) {
+                let reason = format!(
+                    "provider bucket `{provider}` is linked to `{}`",
+                    rule.bucket
+                );
+                return Err(CreateBucketError::ProviderBucket(
+                    ImportRuleError::Conflict(reason),
+                ));
             }
         }
-        match next_start_after {
+        match next {
             Some(next) => self.scan_links(Some(next)),
             None => self.write_bucket(),
         }
     }
 
-    fn write_bucket(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateBucketError::NoTransactionFound);
-        };
+    fn write_bucket(&mut self) -> Turn {
         // Every creation, a replicated one too, gets a fresh id for its delete trail.
         let creation = ulid::Ulid::generate().to_bytes();
         if let Some(binding) = self.bucket_info.distribution.as_mut() {
             // A member binds this exact incarnation, so a later bucket of the name never passes.
             binding.incarnation = u128::from_be_bytes(creation);
         }
-        let bytes = match self.bucket_info.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(err) => return self.emit_error(err.into()),
-        };
-
+        let bytes = self.bucket_info.to_bytes()?;
         self.state = CreateBucketState::CreateBucket;
-        let key: aruna_core::types::Key = self.bucket.as_bytes().into();
+        let key: Key = self.bucket.as_bytes().into();
         let creation = creation.to_vec();
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (S3_BUCKET_KEYSPACE.to_string(), key.clone(), bytes.into()),
-                (BUCKET_CREATION_KEYSPACE.to_string(), key, creation.into()),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        Ok(Next::Call(IoCall::Write(vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key.clone(), bytes.into()),
+            (BUCKET_CREATION_KEYSPACE.to_string(), key, creation.into()),
+        ])))
     }
 
-    fn handle_bucket_created(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateBucketError::NoTransactionFound);
-        };
+    fn handle_bucket_created(&mut self) -> Turn {
         let mut update = UsageCounterUpdate::for_group(
             self.bucket_info.group_id,
             UsageDelta {
@@ -370,117 +245,85 @@ impl CreateBucketOperation {
         )
         .in_bucket(&self.bucket, RowChange::Kept);
         self.state = CreateBucketState::UpdateUsage;
-        let effects = update.start(txn_id);
+        let call = update.start_calls().into_call();
         self.usage_update = Some(update);
-        effects
+        Ok(Next::Call(call))
     }
 
-    fn handle_usage_update(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(CreateBucketError::NoTransactionFound);
-        };
-        let Some(update) = self.usage_update.as_mut() else {
-            return self.emit_error(CreateBucketError::CreateBucketFailed);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => match self.link.as_mut() {
-                Some(link) => {
-                    self.state = CreateBucketState::Link;
-                    let effects = link.start();
-                    self.linked(effects)
-                }
-                None => self.commit(txn_id),
-            },
-            Err(err) => self.emit_error(err.into()),
+    fn handle_usage_update(&mut self, result: IoResult) -> Turn {
+        let update = self.usage_update.as_mut();
+        let update = update.ok_or(CreateBucketError::CreateBucketFailed)?;
+        if let Some(call) = update.step_calls(result)? {
+            return Ok(Next::Call(call.into_call()));
+        }
+        match self.link.as_mut() {
+            Some(link) => {
+                self.state = CreateBucketState::Link;
+                let turn = link.first();
+                self.linked(turn)
+            }
+            None => self.created(Vec::new()),
         }
     }
 
-    fn commit(&mut self, txn_id: ulid::Ulid) -> Effects {
-        self.state = CreateBucketState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    /// Passes the link's effects on until it is done; its failure aborts the whole create.
-    fn linked(&mut self, effects: Effects) -> Effects {
-        let (Some(link), Some(txn_id)) =
-            (self.link.take_if(|link| link.is_complete()), self.txn_id)
-        else {
-            return effects;
-        };
-        match link.finalize() {
-            Ok(_) => self.commit(txn_id),
-            Err(error) => self.emit_error(CreateBucketError::ProviderBucket(error)),
+    /// Makes the link's calls in this transaction until it is done; its failure aborts the
+    /// whole create.
+    fn linked(&mut self, turn: Result<Next<BackendImport>, ImportRuleError>) -> Turn {
+        match turn.map_err(CreateBucketError::ProviderBucket)? {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Wait => Ok(Next::Wait),
+            Next::Done(_) => self.created(Vec::new()),
+            Next::Then { calls, .. } => self.created(calls),
         }
     }
 
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(CreateBucketError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = None;
-        self.state = CreateBucketState::Finish;
-        self.output = Some(Ok(self.bucket_info.clone()));
-        smallvec![schedule_snapshot_publish()]
+    fn created(&mut self, mut calls: Vec<IoCall>) -> Turn {
+        calls.push(schedule_snapshot_publish().into());
+        Ok(Next::Then {
+            output: self.bucket_info.clone(),
+            calls,
+        })
     }
 }
 
-impl EffectOperation for CreateBucketOperation {
+impl Operation for CreateBucketOperation {
     type Output = BucketInfo;
     type Error = CreateBucketError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Turn {
+        self.state = CreateBucketState::CheckExists;
+        let key: Key = self.bucket.as_bytes().into();
+        Ok(Next::Call(IoCall::Read(vec![
+            (S3_BUCKET_KEYSPACE.to_string(), key),
+            group_fence_key(self.bucket_info.group_id),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
+    fn next(&mut self, result: IoResult) -> Turn {
         match self.state {
-            CreateBucketState::Init => self.handle_init(),
-            CreateBucketState::StartTransaction => self.handle_transaction_started(event),
-            CreateBucketState::CheckExists => self.handle_bucket_checked(event),
-            CreateBucketState::ReadRouting => self.routing_read(event),
-            CreateBucketState::ReadStorage => self.storage_read(event),
-            CreateBucketState::ScanLinks => self.links_scanned(event),
-            CreateBucketState::CreateBucket => self.handle_bucket_created(event),
-            CreateBucketState::UpdateUsage => self.handle_usage_update(event),
-            CreateBucketState::Link => match self.link.as_mut() {
-                Some(link) => {
-                    let effects = link.step(event);
-                    self.linked(effects)
-                }
-                None => self.emit_error(CreateBucketError::CreateBucketFailed),
-            },
-            CreateBucketState::CommitTransaction => self.handle_transaction_committed(event),
-            CreateBucketState::Finish => smallvec![],
-            CreateBucketState::Error => self.abort(),
+            CreateBucketState::CheckExists => self.handle_bucket_checked(result.values()?),
+            CreateBucketState::ReadRouting => self.routing_read(result.value()?),
+            CreateBucketState::ReadStorage => self.storage_read(result.values()?),
+            CreateBucketState::ScanLinks => {
+                let (rows, next) = result.page()?;
+                self.links_scanned(rows, next)
+            }
+            CreateBucketState::CreateBucket => {
+                result.done()?;
+                self.handle_bucket_created()
+            }
+            CreateBucketState::UpdateUsage => self.handle_usage_update(result),
+            CreateBucketState::Link => {
+                let link = self.link.as_mut();
+                let link = link.ok_or(CreateBucketError::CreateBucketFailed)?;
+                let turn = link.next(result);
+                self.linked(turn)
+            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateBucketState::Finish | CreateBucketState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(CreateBucketError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -489,17 +332,21 @@ mod mapped_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::effects::BlobEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::BlobError;
-    use aruna_core::events::BlobEvent;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
     use aruna_core::keyspaces::BACKEND_IMPORT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::BackendImport;
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
-    use aruna_core::types::{Key, TxnId};
+    use aruna_core::task::{TaskEvent, TaskKey};
+    use aruna_core::types::{Effects, TxnId};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    type Stepper = crate::stepper::Stepper<BucketInfo, CreateBucketError>;
 
     const GROUP: Ulid = Ulid::from_parts(1, 1);
     const BACKEND: Ulid = Ulid::from_parts(2, 2);
@@ -553,13 +400,6 @@ mod mapped_tests {
         routing.to_bytes().unwrap().into()
     }
 
-    fn read(value: Option<Value>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value,
-        })
-    }
-
     fn batch(values: Vec<Option<Value>>) -> Event {
         let values = values
             .into_iter()
@@ -586,16 +426,16 @@ mod mapped_tests {
     }
 
     /// Runs a mapped create up to the ensure of the provider bucket.
-    fn until_ensure(txn_id: TxnId) -> (CreateBucketOperation, Effects) {
+    fn until_ensure(txn_id: TxnId) -> (Stepper, Effects) {
         until_ensure_on(txn_id, storage())
     }
 
-    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (CreateBucketOperation, Effects) {
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (Stepper, Effects) {
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         operation.step(batch(vec![Some(storage.clone()), Some(group())]));
         operation.step(Event::Storage(StorageEvent::IterResult {
             values: Vec::new(),
@@ -678,10 +518,15 @@ mod mapped_tests {
             effects.as_slice(),
             [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
         );
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
             txn_id,
         }));
-        assert_eq!(operation.finalize(), Ok(info()));
+        assert_eq!(effects.as_slice(), [schedule_snapshot_publish()]);
+        operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishUsageSnapshots,
+            after: std::time::Duration::ZERO,
+        }));
+        assert_eq!(operation.finish(), Ok(info()));
     }
 
     #[test]
@@ -703,30 +548,30 @@ mod mapped_tests {
         let template = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
         let mut odd = Group::from_bytes(&group()).unwrap();
         odd.display_name = "lab/sub".to_string();
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         let odd = postcard::to_allocvec(&odd).unwrap().into();
         operation.step(batch(vec![Some(template.clone()), Some(odd)]));
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
                 _
             )))
         ));
 
         // A provider bucket another rule uses is never linked again.
-        let mut operation = CreateBucketOperation::new("x".to_string(), info()).mapped();
-        operation.start();
+        let (mut operation, _) =
+            Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
         operation.step(batch(vec![None, None]));
-        operation.step(read(Some(routing())));
+        operation.step(batch(vec![Some(routing())]));
         operation.step(batch(vec![Some(template), Some(group())]));
         let rule = BackendImport {
             import_id: Ulid::from_parts(5, 5),
@@ -750,7 +595,7 @@ mod mapped_tests {
             next_start_after: None,
         }));
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(
                 ImportRuleError::Conflict(_)
             ))
@@ -769,7 +614,7 @@ mod mapped_tests {
         );
         assert!(operation.is_complete());
         assert!(matches!(
-            operation.finalize(),
+            operation.finish(),
             Err(CreateBucketError::ProviderBucket(ImportRuleError::Invalid(
                 _
             )))
@@ -778,8 +623,7 @@ mod mapped_tests {
 
     #[test]
     fn mirrors_skip_mapping() {
-        let mut operation = CreateBucketOperation::new("x".to_string(), info());
-        operation.start();
+        let (mut operation, _) = Stepper::new(CreateBucketOperation::new("x".to_string(), info()));
         let txn_id = TxnId::default();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(batch(vec![None, None]));
@@ -795,6 +639,8 @@ mod mapped_tests {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::storage::format::Compression;
     use aruna_storage::storage;
     use std::time::SystemTime;

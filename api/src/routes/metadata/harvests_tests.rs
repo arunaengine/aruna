@@ -169,7 +169,7 @@ async fn submit_reuses_source() {
     assert!(matches!(running, Err(ServerError::Conflict(_))));
     let job_id = first.job_id.parse().unwrap();
     let context = setup.state.get_ctx();
-    mutate_job(&context.storage_handle, job_id, |record| {
+    mutate_job(&context, job_id, |record| {
         record.state = JobState::Cancelled;
         Ok(JobMutation::Persist)
     })

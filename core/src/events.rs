@@ -500,6 +500,7 @@ pub enum NetEvent {
     VaultSign(VaultSignEvent),
     SnapshotSign(SnapshotSignEvent),
     StatementSign(StatementSignEvent),
+    ExecutionSign(ExecutionSignEvent),
     Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
     /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
@@ -511,7 +512,7 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
-    /// The local net state took a watch metric or a watch interest change.
+    /// A local signal or change was taken; nothing is read back.
     Recorded,
 }
 
@@ -577,6 +578,14 @@ pub enum SnapshotSignEvent {
 #[derive(Debug, PartialEq)]
 pub enum StatementSignEvent {
     Signed(Box<crate::structs::storage::distribution::SignedStatement>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::ExecutionSign`]. The adapter signs only a claim
+/// that names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum ExecutionSignEvent {
+    Signed(Box<crate::structs::execution::job::JobRecordEnvelope>),
     Unavailable(String),
 }
 
@@ -915,6 +924,7 @@ impl Event {
                     VaultSign,
                     SnapshotSign,
                     StatementSign,
+                    ExecutionSign,
                     Release,
                     Error,
                     ArtifactStored,
