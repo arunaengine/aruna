@@ -40,7 +40,6 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::routes::rocrate_import::map_head_error;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -48,6 +47,7 @@ use crate::jobs::owned_session_job;
 use crate::jobs::{JobStatusResponse, job_status_response};
 use crate::lookup::bucket_info;
 use crate::routes::execution::jobs::{coded_response, map_submit_error};
+use crate::routes::rocrate_import::map_head_error;
 use crate::routes::staging::queue_live_replication;
 use crate::server::state::ServerState;
 

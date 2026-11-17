@@ -89,7 +89,9 @@ use aruna_operations::auth::check_permissions::{
 };
 use aruna_operations::auth::request_authorization::{AuthorizeError, BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, drive_until, gate_context, routing_snapshot};
+use aruna_operations::driver::{
+    DriverContext, bucket_snapshot, drive, drive_until, gate_context, routing_snapshot,
+};
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;

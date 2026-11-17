@@ -6,9 +6,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::NodeId;
+use aruna_core::cursor;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
-use aruna_core::cursor;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

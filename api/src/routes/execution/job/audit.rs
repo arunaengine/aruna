@@ -11,9 +11,9 @@ use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, J
 use aruna_operations::jobs::lifecycle::{
     AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
@@ -370,10 +370,7 @@ pub async fn get_job_audit(
             scope: scope.to_string(),
             records,
             conflicts,
-            next_cursor: page
-                .next
-                .as_ref()
-                .map(aruna_core::cursor::encode),
+            next_cursor: page.next.as_ref().map(aruna_core::cursor::encode),
             projection_digest: hex32(&report.digest),
             responder_node_id: report.responder.map(|node| node.to_string()),
             partial: report.partial,

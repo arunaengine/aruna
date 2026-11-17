@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::structs::execution::source_access::write_fingerprint_field;
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::cost::InputRoute;
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
 use crate::structs::execution::job::InputContent;
+use crate::structs::execution::source_access::write_fingerprint_field;
 
 pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v1";
 

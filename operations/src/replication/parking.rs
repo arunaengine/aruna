@@ -415,11 +415,11 @@ async fn abort(storage: &StorageHandle, txn_id: TxnId) {
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::test_context;
     use super::*;
     use crate::replication::protocol::ReplicationMode;
     use crate::replication::queue::{blob_job_key, next_blob_timer};
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
@@ -1094,8 +1094,9 @@ mod tests {
 
         for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
-            let mut context =
-                test_context(aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap());
+            let mut context = test_context(
+                aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+            );
             let tasks = aruna_tasks::TaskHandle::new();
             let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();
             tasks

@@ -353,8 +353,8 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
 
     use super::*;
-    use crate::tests::access::seed_access;
     use crate::testing::test_context;
+    use crate::tests::access::seed_access;
     use crate::tests::s3::test_storage;
 
     #[tokio::test]

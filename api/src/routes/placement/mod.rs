@@ -7,8 +7,8 @@ use crate::auth::ValidatedBearer;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::metadata::forwarded_auth_token;
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -1254,7 +1254,13 @@ pub async fn mint_object_placement(
     let forward = crate::routes::storage::relay::rest_target(&state, &info, &request.key, &headers);
     if let Some(forward) = forward.await? {
         let path = format!("/data/buckets/{bucket}/placement/objects");
-        let relayed = crate::routes::storage::relay::relay_json(&state, &forward, &path, bearer.as_ref(), &request);
+        let relayed = crate::routes::storage::relay::relay_json(
+            &state,
+            &forward,
+            &path,
+            bearer.as_ref(),
+            &request,
+        );
         return Ok(Json(relayed.await?.1));
     }
     let subject = local_subject(&state, auth.realm_id).await?;

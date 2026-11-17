@@ -1333,8 +1333,8 @@ async fn schedule_materialization_drain(
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::write_entries;
     use super::*;
+    use crate::testing::write_entries;
     use aruna_core::UserId;
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};

@@ -25,7 +25,9 @@ use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
+use crate::routes::storage::relay::{
+    copy_miss, query_path, read_holders, relay_json, relay_read, rest_target,
+};
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

@@ -12,8 +12,8 @@ use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility};
 use crate::topology::{
-    BoxError, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
-    WriterSettings, run_writers, shutdown_nodes,
+    BoxError, WriterSettings, build_realm_nodes, init_logging, make_runtime, mixed_payload,
+    node_targets, run_writers, shutdown_nodes,
 };
 
 const WRITERS: usize = 24;

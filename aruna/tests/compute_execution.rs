@@ -10,7 +10,6 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_core::time::unix_timestamp_millis;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::id::NodeId;
@@ -21,6 +20,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::reconcile::ExternalReconciler;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -201,10 +201,14 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
     );
     record.captured_inputs = captured_inputs;
     insert_job(&ctx.storage_handle, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, unix_timestamp_millis())
-        .await
-        .unwrap()
-    else {
+    let ClaimOutcome::Claimed(claimed) = claim_job(
+        &ctx.storage_handle,
+        job_id,
+        node_id,
+        unix_timestamp_millis(),
+    )
+    .await
+    .unwrap() else {
         panic!("claim failed");
     };
     (job_id, claimed)

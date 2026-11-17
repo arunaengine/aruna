@@ -40,7 +40,6 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::testing::read_value;
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::subscriptions::create_local_watch;
@@ -51,6 +50,7 @@ use aruna_operations::s3::object::metadata::{
     QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
 };
 use aruna_operations::s3::object::put::PutObjectResult;
+use aruna_operations::testing::read_value;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
 use http::Extensions;

@@ -26,8 +26,8 @@ use crate::convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{
-    BoxError, TestNode, install_default_config, make_runtime, respawn_with_retry, WriterSettings, run_writer,
-    shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
+    BoxError, TestNode, WriterSettings, install_default_config, make_runtime, respawn_with_retry,
+    run_writer, shutdown_nodes, spawn_load_node, spawn_node_with, stop_node, wait_node_convergence,
 };
 use convergence::{
     HANG_CAP, NO_PROGRESS_TIMEOUT, wait_for_convergence, wait_for_visibility, wait_storage_released,

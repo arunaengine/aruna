@@ -27,8 +27,8 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
+use crate::routes::storage::relay::{RestForward, relay_get};
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

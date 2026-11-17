@@ -12,8 +12,6 @@ use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::metadata::*;
 use crate::server::state::ServerState;
-use aruna_operations::testing::sign_token;
-use aruna_operations::testing::test_context;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_storage};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
@@ -26,6 +24,8 @@ use aruna_operations::metadata::api::{
     ApiQueryMode, MetadataApiError, MetadataQueryRequest, MetadataSearchRequest, load_realm_nodes,
     query_metadata as run_query_metadata, search_metadata as run_search_metadata,
 };
+use aruna_operations::testing::sign_token;
+use aruna_operations::testing::test_context;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -3158,8 +3158,7 @@ async fn setup_access_state() -> DistributedAccessState {
     .await;
     drain_metadata_background(remote.state.as_ref()).await;
 
-    let valid_bearer_token =
-        sign_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
+    let valid_bearer_token = sign_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
     let denied_bearer_token = sign_token(
         &realm_signing_key,
         &test_token_claims(realm_id, denied_user_id),

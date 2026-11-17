@@ -221,12 +221,12 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
 
 #[cfg(test)]
 mod tests {
-    use crate::testing::test_context;
     use super::*;
     use crate::jobs::JOB_RETENTION_MS;
     use crate::jobs::store::{
         ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
     };
+    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
@@ -339,7 +339,9 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
         assert_eq!(count(&storage, JOB_INDEX_KEYSPACE).await, 0);
@@ -374,7 +376,9 @@ mod tests {
             })
             .await;
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, STAGING_QUEUE_KEYSPACE).await, 0);
@@ -393,7 +397,9 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
         assert_eq!(outcome.pruned, 0);
         assert!(outcome.next_due_after.is_some());
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 1);
@@ -414,7 +420,9 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, ARTIFACT_TOMBSTONE_KEYSPACE).await, 0);
@@ -500,7 +508,9 @@ mod tests {
         .unwrap();
         assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 1);
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
         assert_eq!(outcome.pruned, 1);
         assert_eq!(count(&storage, JOB_KEYSPACE).await, 0);
         assert_eq!(count(&storage, JOB_ENTRY_KEYSPACE).await, 0);
@@ -519,7 +529,9 @@ mod tests {
             .unwrap();
         insert_job(&storage, &cleanup_record(job_id)).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.pruned, 0);
         assert!(!outcome.has_more, "a retained row must not re-arm at zero");
@@ -546,7 +558,9 @@ mod tests {
         cleanup.finished_at_ms = Some(finished);
         insert_job(&storage, &cleanup).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone())).await.unwrap();
+        let outcome = prune_job_batch(&test_context(storage.clone()))
+            .await
+            .unwrap();
 
         assert_eq!(outcome.pruned, 2, "parent and cleanup both expired");
         assert!(

@@ -27,10 +27,9 @@ use aruna_core::structs::storage::multipart::{
     MultipartUploadStatus,
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::testing::read_value;
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -41,6 +40,7 @@ use aruna_operations::s3::multipart::create::{CreateMultipartInput, CreateMultip
 use aruna_operations::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
 use aruna_operations::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::testing::read_value;
 use aruna_storage::storage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
@@ -341,9 +341,13 @@ async fn completion_persists_parts() {
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
     let location_key =
         BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
-    let blob_location = read_value(&context.driver.storage_handle, BLOB_LOCATIONS_KEYSPACE, location_key)
-        .await
-        .expect("missing blob location entry");
+    let blob_location = read_value(
+        &context.driver.storage_handle,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key,
+    )
+    .await
+    .expect("missing blob location entry");
     assert_eq!(
         aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
             .unwrap(),
@@ -900,9 +904,13 @@ async fn completion_deduplicates_multipart() {
         .unwrap();
     let location_key =
         BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
-    let blob_location = read_value(&context.driver.storage_handle, BLOB_LOCATIONS_KEYSPACE, location_key)
-        .await
-        .expect("missing blob location entry");
+    let blob_location = read_value(
+        &context.driver.storage_handle,
+        BLOB_LOCATIONS_KEYSPACE,
+        location_key,
+    )
+    .await
+    .expect("missing blob location entry");
     assert_eq!(
         aruna_core::structs::storage::blob::BackendLocation::from_bytes(blob_location.as_ref())
             .unwrap(),

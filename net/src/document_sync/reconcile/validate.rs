@@ -154,7 +154,9 @@ pub(in crate::document_sync) fn origin_may_publish(
     config: &RealmConfigDocument,
     origin_node_id: &NodeId,
 ) -> bool {
-    config.node_kind(*origin_node_id).is_some_and(RealmNodeKind::is_sync_eligible)
+    config
+        .node_kind(*origin_node_id)
+        .is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
 /// Resolves the plan a report names (stored config first, reduced state as
@@ -252,12 +254,8 @@ fn merge_handoff(
             reason: "current realm config is unavailable".to_string(),
         };
     };
-    let management = |node: &NodeId| {
-        matches!(
-            config.node_kind(*node),
-            Some(RealmNodeKind::Management)
-        )
-    };
+    let management =
+        |node: &NodeId| matches!(config.node_kind(*node), Some(RealmNodeKind::Management));
     if !management(&event.origin_node_id) || !management(node_id) {
         return AdminEventValidation::Rejected(
             "a merge coordinator is named by and among management nodes".to_string(),
@@ -266,7 +264,8 @@ fn merge_handoff(
     let pinned = previous_state.and_then(AdminDocumentState::materialized_merge_coordinator);
     let left = |pinned: &NodeId| {
         previous_state.is_some_and(|state| state.removed_config_nodes().contains(pinned))
-            || config.node_kind(*pinned)
+            || config
+                .node_kind(*pinned)
                 .is_some_and(|kind| *kind != RealmNodeKind::Management)
     };
     match pinned {
@@ -274,12 +273,10 @@ fn merge_handoff(
         Some(pinned) if pinned == event.origin_node_id || left(&pinned) => {
             AdminEventValidation::Accepted
         }
-        Some(pinned) if config.node_kind(pinned).is_none() => {
-            AdminEventValidation::Deferred {
-                dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
-                reason: "the current merge coordinator is not known here yet".to_string(),
-            }
-        }
+        Some(pinned) if config.node_kind(pinned).is_none() => AdminEventValidation::Deferred {
+            dependency: Some(DocumentSyncDependency::RealmConfig(config_realm(event))),
+            reason: "the current merge coordinator is not known here yet".to_string(),
+        },
         Some(_) => AdminEventValidation::Rejected(
             "only the current merge coordinator hands the role on".to_string(),
         ),
@@ -415,10 +412,7 @@ pub(in crate::document_sync) fn validate_config_authority(
         }
     }
     if let Some(config) = current_config {
-        let server_binding = match (
-            config.node_kind(event.origin_node_id),
-            &event.op,
-        ) {
+        let server_binding = match (config.node_kind(event.origin_node_id), &event.op) {
             (
                 Some(RealmNodeKind::Server),
                 AdminDocumentOperation::PlacementBindingAppended { binding },
@@ -574,8 +568,9 @@ pub(in crate::document_sync) async fn validate_user_authority(
             "stored realm config has the wrong realm".to_string(),
         ));
     }
-    let Some(origin_kind) =
-        config.node_kind(event.origin_node_id).filter(|kind| kind.is_sync_eligible())
+    let Some(origin_kind) = config
+        .node_kind(event.origin_node_id)
+        .filter(|kind| kind.is_sync_eligible())
     else {
         return Ok(AdminEventValidation::Rejected(
             "user admin event origin is not a publisher-capable realm node".to_string(),

@@ -724,7 +724,12 @@ pub async fn control_job(
         "abort" => LinkedAction::Abort,
         _ => return Err(ServerError::BadRequestMessage("unknown action".to_string())),
     };
-    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, unix_timestamp_millis());
+    let operation = BucketJobOperation::new(
+        rule.bucket.clone(),
+        rule.group_id,
+        action,
+        unix_timestamp_millis(),
+    );
     let context = state.get_ctx();
     let job = drive(operation, &context).await.map_err(job_error)?;
     Ok(Json(shown(&context, &rule.bucket, job).await?))

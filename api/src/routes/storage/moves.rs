@@ -216,7 +216,8 @@ pub async fn start_bucket_move(
         .unwrap_or_default();
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis());
+    let operation =
+        StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis());
     let record: CompressionMigration = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;

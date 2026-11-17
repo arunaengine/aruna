@@ -976,9 +976,10 @@ pub async fn start_renames(
     }
     // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis())
-        .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
-        .with_guards(guards);
+    let operation =
+        StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis())
+            .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
+            .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;

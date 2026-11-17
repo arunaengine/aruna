@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::UnrestrictedAuth;
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::assistant::{setup_state, spawn_mock};
 use axum::Router;
 use axum::routing::post;

@@ -50,8 +50,8 @@ use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio::time::{MissedTickBehavior, sleep};
 use topology::{
-    BoxError, TestNode, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
-    WriterSettings, run_writers, scaffold_payload, shutdown_nodes,
+    BoxError, TestNode, WriterSettings, build_realm_nodes, init_logging, make_runtime,
+    mixed_payload, node_targets, run_writers, scaffold_payload, shutdown_nodes,
 };
 use ulid::Ulid;
 

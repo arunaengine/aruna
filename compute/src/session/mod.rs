@@ -444,7 +444,12 @@ impl Session {
                 })
                 .collect();
             for cell_id in dropped {
-                inner.set_cell(&cell_id, CellPhase::Interrupted, None, unix_timestamp_millis());
+                inner.set_cell(
+                    &cell_id,
+                    CellPhase::Interrupted,
+                    None,
+                    unix_timestamp_millis(),
+                );
                 let event = inner.ring.push(
                     EventKind::Cell,
                     &CellFrame {

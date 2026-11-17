@@ -20,8 +20,8 @@ use aruna_operations::groups::storage_routing::{
 use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
-use axum::extract::{Path, State};
 use axum::Json;
+use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;

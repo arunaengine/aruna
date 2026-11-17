@@ -226,7 +226,11 @@ pub fn cgroup_empty(cgroup: &Path) -> Result<bool, BackendError> {
 
 pub fn probe_cgroup(root: &Path) -> Result<(), BackendError> {
     std::fs::create_dir_all(root).map_err(io_error)?;
-    let probe = root.join(format!("aruna-health-{}-{}", std::process::id(), unix_timestamp_millis()));
+    let probe = root.join(format!(
+        "aruna-health-{}-{}",
+        std::process::id(),
+        unix_timestamp_millis()
+    ));
     std::fs::create_dir(&probe).map_err(io_error)?;
     let result = (|| {
         let kill = OpenOptions::new()

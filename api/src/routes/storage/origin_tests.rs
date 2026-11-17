@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::auth::RealmAuth;
-use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::mcp::data::{WriteObjectInput, store_text};
+use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate, write,

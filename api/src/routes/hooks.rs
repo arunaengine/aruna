@@ -23,8 +23,8 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError};
-use crate::routes::storage::relay::{capped_body, relay_url};
 use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_hops};
+use crate::routes::storage::relay::{capped_body, relay_url};
 use crate::server::state::ServerState;
 
 /// Bounds of a webhook request, checked before its body is read or relayed.

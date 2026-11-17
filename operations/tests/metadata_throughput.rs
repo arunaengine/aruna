@@ -15,9 +15,9 @@ use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility, wait_storage_released};
 use crate::topology::{
-    BoxError, build_realm_nodes, init_logging, install_default_config, make_runtime, mesh,
-    mixed_payload, node_targets, respawn_with_retry, WriterSettings, run_writer, run_writers, shutdown_nodes,
-    spawn_load_node, spawn_node_with, wait_node_convergence,
+    BoxError, WriterSettings, build_realm_nodes, init_logging, install_default_config,
+    make_runtime, mesh, mixed_payload, node_targets, respawn_with_retry, run_writer, run_writers,
+    shutdown_nodes, spawn_load_node, spawn_node_with, wait_node_convergence,
 };
 
 const TOTAL_CREATES: usize = 2000;

@@ -5,7 +5,6 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::extract;
-use aruna_operations::testing::test_context;
 use crate::tests::routes::{test_state, test_storage};
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
@@ -16,6 +15,7 @@ use aruna_core::structs::{
     MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_operations::testing::test_context;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use tempfile::TempDir;

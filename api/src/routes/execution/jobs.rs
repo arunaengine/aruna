@@ -447,9 +447,7 @@ struct ReportCursor {
 
 fn decode_report_cursor(cursor: Option<&str>) -> ServerResult<Option<ReportCursor>> {
     cursor
-        .map(|cursor| {
-            aruna_core::cursor::decode_value(cursor).map_err(|_| ServerError::BadRequest)
-        })
+        .map(|cursor| aruna_core::cursor::decode_value(cursor).map_err(|_| ServerError::BadRequest))
         .transpose()
 }
 

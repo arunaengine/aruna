@@ -283,8 +283,12 @@ pub async fn put_bucket_compression(
     ensure_group_admin(&state, &auth, group_id).await?;
     let mut attempts = 1;
     let migration = loop {
-        let operation =
-            PutCompressionOperation::new(bucket.clone(), group_id, compression, unix_timestamp_millis());
+        let operation = PutCompressionOperation::new(
+            bucket.clone(),
+            group_id,
+            compression,
+            unix_timestamp_millis(),
+        );
         match drive(operation, &state.get_ctx()).await {
             // A refused commit wrote nothing, so the save runs again.
             Err(PutCompressionError::StorageError(StorageError::TransactionConflict))

@@ -963,8 +963,12 @@ async fn notify_owner(
         key: key.to_string(),
         size_bytes: size,
     };
-    let record =
-        NotificationRecord::new(link.created_by, NotificationClass::Direct, kind, unix_timestamp_millis());
+    let record = NotificationRecord::new(
+        link.created_by,
+        NotificationClass::Direct,
+        kind,
+        unix_timestamp_millis(),
+    );
     let operation = EmitNotificationsOperation::new(EmitNotificationsInput {
         records: vec![record],
     });
