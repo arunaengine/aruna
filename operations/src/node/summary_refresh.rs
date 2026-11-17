@@ -64,7 +64,7 @@ impl Stage {
 /// first clears the summary and marks local distributed bucket groups for a publish, since a
 /// new coordinator moves replica shares; a failed step is logged and skipped.
 #[derive(Debug, PartialEq)]
-pub struct RefreshUsageOperation {
+pub(crate) struct RefreshUsageOperation {
     local_node_id: NodeId,
     realm_id: Option<RealmId>,
     include_global: bool,

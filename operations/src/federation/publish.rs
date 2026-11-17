@@ -25,7 +25,7 @@ use url::Url;
 use crate::document_repository::read_effect;
 
 /// How often the reporting node renews its registration.
-pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+pub(crate) const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
@@ -173,7 +173,7 @@ enum PublishState {
 /// Decides the publication and records the attempt before any request is sent, so a crash
 /// cannot repeat withdrawals beyond the bound.
 #[derive(Debug, PartialEq)]
-pub struct PublishOperation {
+pub(crate) struct PublishOperation {
     realm_id: RealmId,
     node_id: NodeId,
     state: PublishState,
@@ -321,7 +321,7 @@ enum SoonState {
 /// Moves the registry publication up on the reporting node after replicated realm settings
 /// materialize here, also when another management node served the change. True when armed.
 #[derive(Debug, PartialEq)]
-pub struct PublishSoonOperation {
+pub(crate) struct PublishSoonOperation {
     realm_id: RealmId,
     node_id: NodeId,
     state: SoonState,
