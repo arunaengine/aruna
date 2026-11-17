@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use super::*;
 use aruna_core::UserId;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
@@ -183,7 +184,7 @@ fn store_error_mapping() {
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_store_error(ProviderStoreError::NotFinished),
+        map_store_error(ProviderStoreError::Io(IoError::Unfinished)),
         ServerError::InternalError(_)
     ));
 }
