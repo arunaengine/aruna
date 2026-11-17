@@ -201,7 +201,10 @@ fn fresh_holders_qualify() {
         now_ms: 5,
     };
     let request = Effect::Net(NetEffect::Heartbeat(Box::new(request)));
-    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Effect(Box::new(request)))));
+    assert_eq!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(Box::new(request))))
+    );
     let held = vec![held(1, 1_000, slots(6, 0)), held(2, 1_000, slots(6, 0))];
     let answer = operation.next(facts(held, vec![node(2)]));
     assert_eq!(answer, Ok(reads(&[1, 2, 3, 4])));
@@ -223,7 +226,9 @@ fn fresh_holders_qualify() {
 fn failures_leave_none() {
     // No network or an unreadable advertisement leave no candidate.
     let mut offline = chooser(&[1]);
-    let closed = IoResult::Event(Box::new(Event::Net(NetEvent::Error(NetError::ChannelClosed))));
+    let closed = IoResult::Event(Box::new(Event::Net(NetEvent::Error(
+        NetError::ChannelClosed,
+    ))));
     assert_eq!(offline.next(closed), Ok(Next::Done(Vec::new())));
     let mut garbled = chooser(&[1]);
     garbled
