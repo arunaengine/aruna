@@ -19,7 +19,7 @@ use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
 use crate::jobs::lifecycle::target::commit_receipt;
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::{read_job_record};
+use crate::jobs::store::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use crate::tests::records::{Family, REALM, context};
 

@@ -29,7 +29,7 @@ use crate::driver::DriverContext;
 use crate::jobs::records::keys::{family_prefix, record_key};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::jobs::store::{job_insert_entries};
+use crate::jobs::store::job_insert_entries;
 use crate::storage_read::iter_prefix_page;
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent

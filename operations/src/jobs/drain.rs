@@ -27,8 +27,8 @@ use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
     read_job_record, requeue_job,
 };
-use crate::storage_read::iter_prefix_page;
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
+use crate::storage_read::iter_prefix_page;
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.
