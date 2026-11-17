@@ -149,16 +149,16 @@ pub struct SearchBucketsOperation {
 }
 
 impl SearchBucketsOperation {
-    const MAX_LIMIT: usize = 50;
+    pub(super) const MAX_LIMIT: usize = 50;
     const SCAN_LIMIT: usize = 1_000;
-    const MAX_SCAN_ROWS: usize = 1_024;
+    pub(super) const MAX_SCAN_ROWS: usize = 1_024;
 
     #[cfg(test)]
     fn new(input: SearchBucketsInput) -> Self {
         Self::with_budget(input, Self::MAX_SCAN_ROWS)
     }
 
-    fn with_budget(mut input: SearchBucketsInput, max_scan_rows: usize) -> Self {
+    pub(super) fn with_budget(mut input: SearchBucketsInput, max_scan_rows: usize) -> Self {
         input.limit = input.limit.clamp(1, Self::MAX_LIMIT);
         input.query = input.query.to_lowercase();
         let next_start_after = input.start_after.clone();
