@@ -621,10 +621,28 @@ fn stored_time(value: Option<&Value>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::notifications::{record, temp_storage, user};
+    use crate::driver::drive;
+    use crate::tests::notifications::{context, record, temp_storage, user};
+    use aruna_core::handle::Handle;
+    use aruna_storage::StorageHandle;
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
+
+    async fn upsert_with_report(
+        storage: &StorageHandle,
+        records: &[NotificationRecord],
+    ) -> Result<InboxWriteOutcome, InboxError> {
+        let upsert = UpsertInboxOperation::new(records.to_vec());
+        drive(upsert, &context(storage)).await
+    }
+
+    async fn upsert_inbox_records(
+        storage: &StorageHandle,
+        records: &[NotificationRecord],
+    ) -> Result<usize, InboxError> {
+        upsert_with_report(storage, records).await.map(|outcome| outcome.written)
+    }
 
     fn make_record() -> NotificationRecord {
         record(user(1, 2), NotificationClass::Direct, 1_000)
@@ -904,7 +922,7 @@ mod tests {
         let error = upsert_inbox_records(&storage, &[transient_record()])
             .await
             .expect_err("transient cap must reject extra records");
-        assert!(error.contains("exceeds cap"));
+        assert!(matches!(error, InboxError::TransientCap(_)));
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
             TRANSIENT_USER_CAP

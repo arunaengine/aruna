@@ -5,7 +5,8 @@
 
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataReadError;
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::driver::drive;
+use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::settings::SettingPeers;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
@@ -32,6 +33,7 @@ pub(crate) fn context(storage: &StorageHandle) -> DriverContext {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -61,10 +63,9 @@ pub(crate) fn record(
 }
 
 pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-    assert_eq!(
-        upsert_inbox_records(storage, records).await,
-        Ok(records.len())
-    );
+    let upsert = UpsertInboxOperation::new(records.to_vec());
+    let outcome = drive(upsert, &context(storage)).await;
+    assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
 /// Management nodes that open every setting with a fixed secret and count the requests. A node

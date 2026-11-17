@@ -18,7 +18,8 @@ use aruna_core::types::{Key, KeySpace, TxnId};
 use tracing::warn;
 
 use crate::driver::DriverContext;
-use crate::notifications::inbox::{InboxWriteOutcome, UpsertFailure, upsert_transactionally};
+use crate::driver::drive;
+use crate::notifications::inbox::{InboxError, InboxWriteOutcome, UpsertInboxOperation};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
     EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, EXPANSION_WORK_CAP,
@@ -636,9 +637,11 @@ async fn stage_watch_expansion(
     if records.is_empty() {
         return Ok((InboxWriteOutcome::default(), dropped));
     }
-    upsert_transactionally(&context.storage_handle, &records, txn_id)
-        .await
-        .map(|outcome| (outcome, dropped))
+    match drive(UpsertInboxOperation::within(records, txn_id), context).await {
+        Ok(outcome) => Ok((outcome, dropped)),
+        Err(InboxError::Conflict) => Err(UpsertFailure::Conflict),
+        Err(error) => Err(UpsertFailure::Fatal(error.to_string())),
+    }
 }
 
 async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, UpsertFailure> {
@@ -653,6 +656,12 @@ async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, Upser
             "unexpected storage event: {other:?}"
         ))),
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum UpsertFailure {
+    Conflict,
+    Fatal(String),
 }
 
 fn classify_storage_error(error: StorageError) -> UpsertFailure {
@@ -746,6 +755,7 @@ mod tests {
                 metadata_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }

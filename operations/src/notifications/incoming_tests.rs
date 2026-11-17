@@ -9,7 +9,8 @@ use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,
     list_watches_remote, mark_read_remote, send_notification_request, unread_count_remote,
 };
-use crate::notifications::inbox::upsert_inbox_records;
+use crate::driver::drive;
+use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
 };
@@ -71,6 +72,7 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         metadata_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     initialize_incoming_fixture(context.clone());
     Node {
@@ -778,10 +780,9 @@ async fn user_peer_rejected() {
 }
 
 async fn seed_inbox(node: &Node, records: &[NotificationRecord]) {
-    assert_eq!(
-        upsert_inbox_records(&node.context.storage_handle, records).await,
-        Ok(records.len())
-    );
+    let upsert = UpsertInboxOperation::new(records.to_vec());
+    let outcome = drive(upsert, &node.context).await;
+    assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
 #[tokio::test]
