@@ -140,3 +140,47 @@ fn trigger_indexes_kept() {
         assert_eq!(event_trigger(kind).as_str(), kind.name());
     }
 }
+
+#[test]
+fn timer_occurrences() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let plan = |now_ms| EnqueueTimer {
+        install: Box::new(install.clone()),
+        handler: "every".into(),
+        interval_ms: 10,
+        now_ms,
+        key: timer_key(install.install_id),
+        phase: TimerPhase::Reading,
+    };
+    // Before the first interval since activation nothing is due.
+    let mut early = plan(14);
+    assert!(matches!(early.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert_eq!(
+        early.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Finish(false)
+    );
+    // Missed occurrences collapse into the latest; a full queue skips it.
+    let mut due = plan(37);
+    due.first().unwrap();
+    assert!(matches!(
+        due.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let full = (0..RUNS_QUEUED)
+        .map(|seq| (vec![seq as u8], Vec::new()))
+        .collect();
+    let Turn::Ask(Ask::Write(rows)) = due.next(Answer::Page(full, None)).unwrap() else {
+        panic!("the timer row is written");
+    };
+    let row: TimerRow = decode(&rows[0].2).unwrap();
+    assert_eq!((row.last_due_ms, row.skipped), (35, 1));
+    assert_eq!(due.next(Answer::Done).unwrap(), Turn::Finish(false));
+    let mut queued = plan(37);
+    queued.first().unwrap();
+    queued.next(Answer::Values(vec![None])).unwrap();
+    let Turn::Ask(Ask::Write(rows)) = queued.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the run and the timer row are written");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(queued.next(Answer::Done).unwrap(), Turn::Finish(true));
+}

@@ -741,7 +741,7 @@ fn reserve_decisions() {
     );
 }
 
-fn sample_install(install_id: Ulid) -> PluginInstall {
+pub(crate) fn sample_install(install_id: Ulid) -> PluginInstall {
     let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
     let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
     PluginInstall {
