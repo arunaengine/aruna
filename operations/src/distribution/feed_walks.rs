@@ -719,3 +719,187 @@ impl Operation for FeedWalk {
     fn abort(&mut self) -> Effects {
         abort_effects(&mut self.txn_id)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OpenState {
+    Init,
+    Rows,
+    States,
+    Record,
+    Prune,
+    Write,
+    Finish,
+    Error,
+}
+
+/// Opens a building index for every live range of a page of account rows without one, in sets
+/// that keep a search index. Outputs the opened count.
+#[derive(Debug, PartialEq)]
+pub(super) struct OpenWalk {
+    limit: usize,
+    cursor: Option<Vec<u8>>,
+    state: OpenState,
+    live: Vec<Vec<u8>>,
+    unopened: VecDeque<Vec<u8>>,
+    current: Option<(Vec<u8>, Ulid, Ulid)>,
+    searched: BTreeMap<Ulid, bool>,
+    opened: usize,
+    output: Option<Result<usize, FeedError>>,
+}
+
+impl OpenWalk {
+    pub(super) fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
+        Self {
+            limit,
+            cursor,
+            state: OpenState::Init,
+            live: Vec::new(),
+            unopened: VecDeque::new(),
+            current: None,
+            searched: BTreeMap::new(),
+            opened: 0,
+            output: None,
+        }
+    }
+
+    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+        self.cursor.clone()
+    }
+
+    fn finish(&mut self, output: Result<usize, FeedError>) -> Effects {
+        self.state = match output {
+            Ok(_) => OpenState::Finish,
+            Err(_) => OpenState::Error,
+        };
+        self.output = Some(output);
+        smallvec![]
+    }
+
+    fn next_key(&mut self) -> Effects {
+        while let Some(key) = self.unopened.pop_front() {
+            let (set_id, range_id) = match split_key(&key) {
+                Ok(ids) => ids,
+                Err(error) => return self.finish(Err(error.into())),
+            };
+            self.current = Some((key, set_id, range_id));
+            match self.searched.get(&set_id) {
+                Some(true) => return self.prune(),
+                Some(false) => continue,
+                None => {
+                    self.state = OpenState::Record;
+                    return record_read(set_id);
+                }
+            }
+        }
+        let opened = self.opened;
+        self.finish(Ok(opened))
+    }
+
+    /// Leftovers of an earlier index of the range would hold stale keys.
+    fn prune(&mut self) -> Effects {
+        let Some((_, set_id, range_id)) = self.current else {
+            return self.finish(Err(FeedError::NotFinished));
+        };
+        self.state = OpenState::Prune;
+        index(IndexEffect::Prune {
+            set_id,
+            range_id,
+            keep: None,
+        })
+    }
+}
+
+impl Operation for OpenWalk {
+    type Output = usize;
+    type Error = FeedError;
+
+    fn start(&mut self) -> Effects {
+        self.state = OpenState::Rows;
+        iter(RANGE_ACCOUNT_KEYSPACE, self.cursor.clone(), self.limit)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, event) {
+            (
+                OpenState::Rows,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                self.cursor = next_start_after.map(|key| key.to_vec());
+                for (key, value) in values {
+                    match RangeAccount::from_bytes(&value) {
+                        Ok(account) if matches!(account.charge, Charge::Retired { .. }) => {}
+                        Ok(_) => self.live.push(key.to_vec()),
+                        Err(error) => return self.finish(Err(error.into())),
+                    }
+                }
+                if self.live.is_empty() {
+                    return self.finish(Ok(0));
+                }
+                self.state = OpenState::States;
+                batch_read(SEARCH_INDEX_KEYSPACE, self.live.clone())
+            }
+            (OpenState::States, event) => match read_values(event, self.live.len()) {
+                Ok(states) => {
+                    let live = std::mem::take(&mut self.live).into_iter().zip(states);
+                    let unopened = live.filter(|(_, state)| state.is_none());
+                    self.unopened = unopened.map(|(key, _)| key).collect();
+                    self.next_key()
+                }
+                Err(error) => self.finish(Err(error)),
+            },
+            (OpenState::Record, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                let Some((_, set_id, _)) = self.current else {
+                    return self.finish(Err(FeedError::NotFinished));
+                };
+                match search_on(value) {
+                    Ok(search) => {
+                        self.searched.insert(set_id, search);
+                        match search {
+                            true => self.prune(),
+                            false => self.next_key(),
+                        }
+                    }
+                    Err(error) => self.finish(Err(error)),
+                }
+            }
+            (OpenState::Prune, Event::Index(IndexEvent::Pruned)) => {
+                let Some((key, _, _)) = self.current.take() else {
+                    return self.finish(Err(FeedError::NotFinished));
+                };
+                let state = IndexState::Building {
+                    generation: 1,
+                    cursor: None,
+                };
+                match state.to_bytes() {
+                    Ok(value) => {
+                        self.state = OpenState::Write;
+                        put_row(SEARCH_INDEX_KEYSPACE, key, value)
+                    }
+                    Err(error) => self.finish(Err(error.into())),
+                }
+            }
+            (OpenState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.opened += 1;
+                self.next_key()
+            }
+            (_, Event::Index(IndexEvent::Error(error))) => self.finish(Err(error.into())),
+            (_, event) => self.finish(Err(storage_error(event))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, OpenState::Finish | OpenState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(FeedError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
