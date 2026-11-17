@@ -18,6 +18,7 @@ mod effect_handlers;
 pub mod error;
 mod eviction;
 mod heartbeat;
+pub mod notification;
 pub mod streams;
 mod tasks;
 mod telemetry;

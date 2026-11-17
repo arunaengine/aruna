@@ -52,6 +52,7 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    Outbound(crate::outbound::OutboundEffect),
 }
 
 #[derive(Debug, PartialEq)]
@@ -729,6 +730,10 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    /// Sends one notification request frame to a holder and reads its answer frame.
+    Notification(Box<crate::structs::execution::notification_transport::NotificationRequest>),
+    /// Wakes the live inbox streams of these local recipients.
+    WakeInbox(Vec<crate::UserId>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

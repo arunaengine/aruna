@@ -6,6 +6,7 @@ pub mod email;
 pub mod harvest;
 pub mod job;
 pub mod notification;
+pub mod notification_transport;
 pub mod notification_watch;
 pub mod offered_directory;
 pub mod setting;

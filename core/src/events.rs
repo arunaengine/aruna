@@ -52,6 +52,7 @@ pub enum Event {
     Task(TaskEvent),
     Search(),
     Stream(),
+    Outbound(crate::outbound::OutboundEvent),
 }
 
 #[derive(Debug, PartialEq)]
@@ -445,6 +446,14 @@ pub enum NetEvent {
     StatementSign(StatementSignEvent),
     Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
+    /// The holder's answer frame, or why none came.
+    Notification(
+        Result<
+            Box<crate::structs::execution::notification_transport::NotificationTransportMessage>,
+            String,
+        >,
+    ),
+    InboxWoken,
 }
 
 /// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only

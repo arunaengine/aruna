@@ -242,6 +242,11 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             "statement signing must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
+        // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::Notification(_) => NetEvent::Notification(Err(
+            "notification requests must be dispatched by the operations runner".to_string(),
+        )),
+        NetEffect::WakeInbox(_) => NetEvent::Error(NetError::InvalidEffect),
     }
 }
 
@@ -524,6 +529,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
+        NetEffect::Notification(_) => "notification",
+        NetEffect::WakeInbox(_) => "wake_inbox",
     }
 }
 
