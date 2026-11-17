@@ -19,6 +19,7 @@ pub(super) type FetchedFamily = (Option<NodeId>, Vec<JobRecordFrame>);
 #[derive(Debug, PartialEq)]
 pub(super) struct FetchFamilyOperation {
     effect: Option<JobRecordEffect>,
+    sent: bool,
     outcome: Option<Result<FetchedFamily, LifecycleError>>,
 }
 
@@ -26,6 +27,7 @@ impl FetchFamilyOperation {
     pub(super) fn new(effect: JobRecordEffect) -> Self {
         Self {
             effect: Some(effect),
+            sent: false,
             outcome: None,
         }
     }
@@ -37,7 +39,10 @@ impl Operation for FetchFamilyOperation {
 
     fn start(&mut self) -> Effects {
         match self.effect.take() {
-            Some(effect) => smallvec![Effect::Net(NetEffect::JobRecord(Box::new(effect)))],
+            Some(effect) => {
+                self.sent = true;
+                smallvec![Effect::Net(NetEffect::JobRecord(Box::new(effect)))]
+            }
             None => {
                 self.outcome = Some(Err(LifecycleError::NotFinished));
                 smallvec![]
@@ -46,6 +51,14 @@ impl Operation for FetchFamilyOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if !std::mem::take(&mut self.sent) {
+            self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
+                state: "Settled".to_string(),
+                expected: "no further event",
+                got: event.label(),
+            }));
+            return smallvec![];
+        }
         self.outcome = Some(match event {
             Event::Net(NetEvent::JobRecord(JobRecordEvent::Fetched {
                 holder, records, ..
