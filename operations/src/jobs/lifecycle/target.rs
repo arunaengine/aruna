@@ -8,13 +8,12 @@ use std::sync::Arc;
 use aruna_compute::ExecutorRegistry;
 use aruna_core::compute::{ExecutorCapability, ExecutorKind, NetworkAccess, ResourceEnvelope};
 use aruna_core::effects::{
-    Effect, HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS,
-    NetEffect, PageLimit, ReceiptFrame,
+    HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS, PageLimit,
+    ReceiptFrame,
 };
 use aruna_core::errors::StorageError;
-use aruna_core::events::{DeclinedPolicy, Event, JobRecordEvent, LaunchDecline, NetEvent};
+use aruna_core::events::{DeclinedPolicy, LaunchDecline};
 use aruna_core::id::NodeId;
-use aruna_core::operation::Operation;
 use aruna_core::scheduling::PlannedInput;
 use aruna_core::structs::execution::job::{
     CapturedInput, ExecutionReceipt, InputSource, JobFamilyId, JobFamilyRecord, JobPayload,
@@ -28,8 +27,6 @@ use aruna_core::structs::placement::policy::{
 };
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::Duration;
@@ -38,6 +35,7 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::cancel::cancel_local_run;
+use super::fetch::FetchFamilyOperation;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
@@ -863,70 +861,6 @@ async fn fetch_family(
     let origin = source.map_or(RecordOrigin::Local, RecordOrigin::Peer);
     for frame in records {
         let _ = append_record(context, realm_id, local, frame.into_inner(), origin).await;
-    }
-}
-
-/// Reads one bounded page of a family from its current holders, with the holder
-/// that answered, so the records keep their real relay in the audit.
-type FetchedFamily = (Option<NodeId>, Vec<JobRecordFrame>);
-
-#[derive(Debug, PartialEq)]
-struct FetchFamilyOperation {
-    effect: Option<JobRecordEffect>,
-    outcome: Option<Result<FetchedFamily, LifecycleError>>,
-}
-
-impl FetchFamilyOperation {
-    fn new(effect: JobRecordEffect) -> Self {
-        Self {
-            effect: Some(effect),
-            outcome: None,
-        }
-    }
-}
-
-impl Operation for FetchFamilyOperation {
-    type Output = FetchedFamily;
-    type Error = LifecycleError;
-
-    fn start(&mut self) -> Effects {
-        match self.effect.take() {
-            Some(effect) => smallvec![Effect::Net(NetEffect::JobRecord(Box::new(effect)))],
-            None => {
-                self.outcome = Some(Err(LifecycleError::NotFinished));
-                smallvec![]
-            }
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        self.outcome = Some(match event {
-            Event::Net(NetEvent::JobRecord(JobRecordEvent::Fetched {
-                holder, records, ..
-            })) => Ok((Some(holder), records.into_inner())),
-            Event::Net(NetEvent::JobRecord(JobRecordEvent::Unavailable(message))) => {
-                debug!(message, "No family holder answered the record fetch");
-                Ok((None, Vec::new()))
-            }
-            other => Err(LifecycleError::UnexpectedEvent {
-                state: "Fetch".to_string(),
-                expected: "job record page",
-                got: other.label(),
-            }),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

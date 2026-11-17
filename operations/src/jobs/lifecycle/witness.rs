@@ -7,14 +7,13 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect, NetEffect};
-use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect};
+use aruna_core::events::{Event, LaunchDecline};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -23,14 +22,14 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Key, TxnId};
 use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::build_plan;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
@@ -1199,91 +1198,4 @@ async fn write_row<T: Serialize>(
     row: &T,
 ) -> Result<(), LifecycleError> {
     write_row_txn(context, key_space, key, row, None).await
-}
-
-/// What a target answered to one offer.
-#[derive(Debug, PartialEq)]
-pub enum OfferOutcome {
-    Accepted(JobRecordFrame),
-    Declined(LaunchDecline),
-    /// The target never answered; it may still have accepted the launch.
-    Unavailable,
-}
-
-/// Offers one durable launch to its target and returns the answer verbatim.
-#[derive(Debug, PartialEq)]
-pub struct OfferLaunchOperation {
-    effect: Option<LaunchOfferEffect>,
-    outcome: Option<Result<OfferOutcome, LifecycleError>>,
-    sent: bool,
-}
-
-impl OfferLaunchOperation {
-    pub fn new(effect: LaunchOfferEffect) -> Self {
-        Self {
-            effect: Some(effect),
-            outcome: None,
-            sent: false,
-        }
-    }
-}
-
-impl Operation for OfferLaunchOperation {
-    type Output = OfferOutcome;
-    type Error = LifecycleError;
-
-    fn start(&mut self) -> Effects {
-        let Some(effect) = self.effect.take() else {
-            self.outcome = Some(Err(LifecycleError::NotFinished));
-            return smallvec![];
-        };
-        self.sent = true;
-        smallvec![Effect::Net(NetEffect::LaunchOffer(Box::new(effect)))]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if !self.sent {
-            self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-                state: "Settled".to_string(),
-                expected: "no further event",
-                got: event.label(),
-            }));
-            return smallvec![];
-        }
-        self.outcome = Some(match event {
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Accepted { receipt, .. })) => {
-                match JobRecordFrame::new(receipt.into_inner()) {
-                    Ok(frame) => Ok(OfferOutcome::Accepted(frame)),
-                    Err(error) => Err(LifecycleError::Store(error.into())),
-                }
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Declined { target, reason })) => {
-                debug!(peer = %target, reason = ?reason, "Execution target declined a launch");
-                Ok(OfferOutcome::Declined(reason))
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(message))) => {
-                debug!(message, "Execution target did not answer the offer");
-                Ok(OfferOutcome::Unavailable)
-            }
-            other => Err(LifecycleError::UnexpectedEvent {
-                state: "Offer".to_string(),
-                expected: "launch offer result",
-                got: other.label(),
-            }),
-        });
-        self.sent = false;
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
 }
