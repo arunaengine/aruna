@@ -16,12 +16,12 @@ use aruna_core::metadata::{
 };
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
-    ForwardRow, GapReason, GapRow, SEND_EXPIRY_MS, SENDER_GAP, SourceKind, gap_key,
+    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, SENDER_GAP,
+    SourceKind, gap_key,
 };
 use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, materialization_status_key};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::matcher::Outbox;
@@ -38,32 +38,6 @@ const BATCH: usize = 100;
 /// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
 const REQUEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
-
-/// Matched events and unacknowledged gap counts for one receiver.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventBatch {
-    pub events: Vec<ForwardRow>,
-    pub gaps: Vec<(Ulid, GapRow)>,
-}
-
-/// How the receiver decided one event.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Outcome {
-    Queued,
-    Waiting,
-    Denied(String),
-    Expired,
-    /// The install's queue is full: the sender keeps the row and sends it again later.
-    Busy,
-}
-
-/// The receiver's answer: an outcome per event by install and source id, and the gap sequence
-/// it holds per install, kind and reason.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Decisions {
-    pub events: Vec<(Ulid, String, Outcome)>,
-    pub gaps: Vec<(Ulid, SourceKind, GapReason, u64)>,
-}
 
 /// When each receiver is tried again after a failed or busy send.
 #[derive(Debug, Default)]

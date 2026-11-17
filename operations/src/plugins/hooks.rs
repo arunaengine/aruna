@@ -22,10 +22,11 @@ use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::rate::take_hook;
 use super::receiver::lost_reason;
-use super::release::{ReleaseKeys, ReleaseRequest};
+use super::release::ReleaseKeys;
 use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, encode, row, values};
 use super::runs::{ADMISSIONS, Admission, RunError};
 use crate::driver::{DriverContext, drive};
+use aruna_core::plugins::ReleaseRequest;
 
 /// Headers removed before a request is stored: hop-by-hop ones and the relay mark. The check
 /// itself removes the credential headers.

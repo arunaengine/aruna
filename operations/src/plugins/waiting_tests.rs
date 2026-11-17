@@ -12,12 +12,12 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::plugins::decide::{SeenRow, decide_batch, seen_key};
-use crate::plugins::forward::EventBatch;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed};
+use aruna_core::plugin_runs::EventBatch;
 
 /// An event decided as waiting because the account's writes are gone; returns the event and
 /// the account's state row, which arrives again later.

@@ -6,49 +6,24 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::compute::SecretBytes;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
+use aruna_core::plugins::{Refusal, ReleaseError, ReleaseRequest, Released};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secrets::{
-    Delivery, ResponseExposure, SecretConsumer, SecretKind, SecretName, SecretScope,
-    SecretSettings, UseRequest, check_use,
+    Delivery, SecretConsumer, SecretName, SecretScope, UseRequest, check_use,
 };
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, SecretAudit, SecretUse};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use url::Url;
 
 use super::account::{owned, read_user};
-pub use super::bound::{Refusal, ReleaseError, ReleaseKeys};
+use super::bound::ReleaseKeys;
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
 use super::rows::write_rows;
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
-
-/// What a run asks of the secret bound to one slot.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReleaseRequest {
-    pub install_id: Ulid,
-    pub slot: String,
-    pub delivery: Delivery,
-    /// The method and URL of the outgoing request, for `inject`.
-    pub target: Option<(String, String)>,
-    /// The value write id the receiver holds already; its fields are not sent again.
-    pub held: Option<Ulid>,
-    pub run_id: Option<Ulid>,
-}
-
-/// A released secret; `fields` is absent when the receiver holds this value already.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Released {
-    pub kind: SecretKind,
-    pub settings: SecretSettings,
-    pub exposure: ResponseExposure,
-    pub value_id: Ulid,
-    pub fields: Option<SecretBytes>,
-}
 
 pub fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {

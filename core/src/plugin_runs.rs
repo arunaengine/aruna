@@ -459,6 +459,32 @@ pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, Conversi
     }
 }
 
+/// Matched events and unacknowledged gap counts for one receiver.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventBatch {
+    pub events: Vec<ForwardRow>,
+    pub gaps: Vec<(Ulid, GapRow)>,
+}
+
+/// How the receiver decided one event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Queued,
+    Waiting,
+    Denied(String),
+    Expired,
+    /// The install's queue is full: the sender keeps the row and sends it again later.
+    Busy,
+}
+
+/// The receiver's answer: an outcome per event by install and source id, and the gap sequence
+/// it holds per install, kind and reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decisions {
+    pub events: Vec<(Ulid, String, Outcome)>,
+    pub gaps: Vec<(Ulid, SourceKind, GapReason, u64)>,
+}
+
 /// Forward rows of one install a node keeps at most; matching beyond records a gap.
 pub const EVENTS_QUEUED: usize = 10_000;
 /// How long a forward row is sent before it is dropped as a gap.

@@ -12,12 +12,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
+use aruna_core::plugins::{NodeCheckError, Refusal, ReleaseError};
 use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, RealmVaultRecord};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_plugins::trigger::TriggerKind;
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::entry::ReadEntry;
@@ -27,38 +27,6 @@ use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::open_value;
-
-/// The step of the use check that refused a release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Refusal {
-    Peer,
-    Binding,
-    Entry,
-    Rule,
-    Authority,
-    Policy,
-}
-
-impl Refusal {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Peer => "peer",
-            Self::Binding => "binding",
-            Self::Entry => "entry",
-            Self::Rule => "rule",
-            Self::Authority => "authority",
-            Self::Policy => "policy",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum ReleaseError {
-    #[error("the use of the secret was refused at the {} check", .0.as_str())]
-    Refused(Refusal),
-    #[error("the secret cannot be released now: {0}")]
-    Unavailable(String),
-}
 
 /// The realm keys a management node opens group and realm secrets with.
 #[derive(Clone, Default)]
@@ -329,19 +297,6 @@ pub enum BindError {
     Invalid(String),
     #[error("{0}")]
     Unavailable(String),
-}
-
-/// Why a node binding does not fit its slot on the install's receiver.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum NodeCheckError {
-    #[error("the receiver has no node secret of this name")]
-    Missing,
-    #[error("the node secret has another kind than the slot")]
-    OtherKind,
-    #[error("only a server node of the realm may ask")]
-    Forbidden,
-    #[error("the receiver did not answer")]
-    Unavailable,
 }
 
 /// Whether this node holds the node secret `name` with `kind`; answers the header its `header`
