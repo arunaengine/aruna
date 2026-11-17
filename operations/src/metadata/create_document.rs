@@ -40,7 +40,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::validation::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
@@ -53,7 +53,6 @@ use crate::placement::{
     resolve_shard_holders, strategy_for_target,
 };
 use crate::sync::shard_placement::sort_node_ids;
-use aruna_core::backoff::conflict_backoff;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -770,8 +769,6 @@ pub fn resolve_metadata_id(
     })
 }
 
-const CREATE_CONFLICT_RETRIES: usize = 3;
-
 pub async fn create_metadata_document(
     mut template: CreateDocumentOperation,
     context: Arc<DriverContext>,
@@ -793,23 +790,8 @@ pub async fn create_metadata_document(
         }
         CreateDocumentPayload::Scaffold { .. } => not_profiled_status(template.config.document_id),
     });
-    let mut attempt = 0usize;
-    let created = loop {
-        match drive(template.fresh_copy(), context.as_ref()).await {
-            Ok(created) => break created,
-            Err(CreateDocumentError::StorageError(StorageError::TransactionConflict))
-                if attempt < CREATE_CONFLICT_RETRIES =>
-            {
-                tokio::time::sleep(conflict_backoff(
-                    attempt,
-                    &template.config.document_id.to_bytes(),
-                ))
-                .await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let seed = template.config.document_id.to_bytes();
+    let created = drive_retry(|| template.fresh_copy(), context.as_ref(), &seed).await?;
     schedule_projection_drain(context.as_ref(), std::time::Duration::ZERO)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
@@ -1000,12 +982,20 @@ async fn load_create_config(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(CreateDocumentError::PlacementBindingUnavailable(format!(
-            "unexpected storage event reading realm config: {other:?}"
+            "unexpected storage event reading realm config: {}",
+            other.label()
         ))),
     }
 }
 
 impl Operation for CreateDocumentOperation {
+    fn is_conflict(error: &CreateDocumentError) -> bool {
+        matches!(
+            error,
+            CreateDocumentError::StorageError(StorageError::TransactionConflict)
+        )
+    }
+
     type Output = CreateDocumentResult;
     type Error = CreateDocumentError;
 
@@ -1032,7 +1022,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("metadata validation result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("metadata validation result", other.label().to_string())
+                }
             },
             CreateDocumentState::CheckExisting => {
                 match crate::metadata::repository::parse_registry_read(event) {
@@ -1055,7 +1047,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("transaction start result", other.label().to_string())
+                }
             },
             CreateDocumentState::ReadCreateFence => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -1082,7 +1076,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("create fence read result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("create fence read result", other.label().to_string())
+                }
             },
             CreateDocumentState::ReadPidFence => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -1109,7 +1105,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("persistent id fence read", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("persistent id fence read", other.label().to_string())
+                }
             },
             CreateDocumentState::AppendCreateEvent => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -1119,7 +1117,7 @@ impl Operation for CreateDocumentOperation {
                     self.fail_without_cleanup(error.into())
                 }
                 other => {
-                    self.unexpected_event("metadata create event append", format!("{other:?}"))
+                    self.unexpected_event("metadata create event append", other.label().to_string())
                 }
             },
             CreateDocumentState::CommitTransaction => match event {
@@ -1154,7 +1152,9 @@ impl Operation for CreateDocumentOperation {
                     self.txn_id = None;
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("transaction commit result", other.label().to_string())
+                }
             },
             CreateDocumentState::Finish
             | CreateDocumentState::Error

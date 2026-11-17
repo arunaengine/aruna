@@ -30,7 +30,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::persistent_id::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
@@ -44,7 +44,6 @@ use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_transaction_effect,
 };
-use aruna_core::backoff::conflict_backoff;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDocumentOperation {
@@ -453,7 +452,7 @@ impl DeleteDocumentOperation {
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("realm config read result", format!("{other:?}")),
+            other => self.unexpected_event("realm config read result", other.label().to_string()),
         }
     }
 
@@ -469,7 +468,7 @@ impl DeleteDocumentOperation {
                 )]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            other => self.unexpected_event("transaction start result", other.label().to_string()),
         }
     }
 
@@ -521,7 +520,7 @@ impl DeleteDocumentOperation {
                 self.write_graph_lifecycle()
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
+            other => self.unexpected_event("bucket fence read result", other.label().to_string()),
         }
     }
 
@@ -541,7 +540,9 @@ impl DeleteDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("graph lifecycle write result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("graph lifecycle write result", other.label().to_string())
+            }
         }
     }
 
@@ -567,7 +568,9 @@ impl DeleteDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("graph prune job write result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("graph prune job write result", other.label().to_string())
+            }
         }
     }
 
@@ -585,7 +588,9 @@ impl DeleteDocumentOperation {
                 )]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("document lifecycle write result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("document lifecycle write result", other.label().to_string())
+            }
         }
     }
 
@@ -599,7 +604,7 @@ impl DeleteDocumentOperation {
                 smallvec![delete_index_effect(self.document_id, Some(txn_id))]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("registry delete result", format!("{other:?}")),
+            other => self.unexpected_event("registry delete result", other.label().to_string()),
         }
     }
 
@@ -617,7 +622,9 @@ impl DeleteDocumentOperation {
                 )]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("document index delete result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("document index delete result", other.label().to_string())
+            }
         }
     }
 
@@ -634,7 +641,7 @@ impl DeleteDocumentOperation {
                 smallvec![delete_updated_index(record, Some(txn_id))]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("holders delete result", format!("{other:?}")),
+            other => self.unexpected_event("holders delete result", other.label().to_string()),
         }
     }
 
@@ -660,7 +667,9 @@ impl DeleteDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("updated index delete result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("updated index delete result", other.label().to_string())
+            }
         }
     }
 
@@ -680,7 +689,7 @@ impl DeleteDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("audit write result", format!("{other:?}")),
+            other => self.unexpected_event("audit write result", other.label().to_string()),
         }
     }
 
@@ -707,7 +716,7 @@ impl DeleteDocumentOperation {
             }
             other => self.unexpected_event(
                 "document lifecycle outbox write result",
-                format!("{other:?}"),
+                other.label().to_string(),
             ),
         }
     }
@@ -732,9 +741,10 @@ impl DeleteDocumentOperation {
                     "metadata graph tombstone outbox write failed: {error}"
                 )))
             }
-            other => {
-                self.unexpected_event("graph lifecycle outbox write result", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "graph lifecycle outbox write result",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -752,9 +762,10 @@ impl DeleteDocumentOperation {
                     "metadata registry delete outbox write failed: {error}"
                 )))
             }
-            other => {
-                self.unexpected_event("document delete outbox write result", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "document delete outbox write result",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -820,9 +831,10 @@ impl DeleteDocumentOperation {
                     "persistent id tombstone write failed: {error}"
                 )))
             }
-            other => {
-                self.unexpected_event("persistent id tombstone write result", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "persistent id tombstone write result",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -840,9 +852,10 @@ impl DeleteDocumentOperation {
                     "persistent id index delete failed: {error}"
                 )))
             }
-            other => {
-                self.unexpected_event("persistent id index delete result", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "persistent id index delete result",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -857,7 +870,7 @@ impl DeleteDocumentOperation {
                 self.txn_id = None;
                 self.fail(error.into())
             }
-            other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            other => self.unexpected_event("transaction commit result", other.label().to_string()),
         }
     }
 
@@ -882,9 +895,10 @@ impl DeleteDocumentOperation {
                     graph_iri: record.graph_iri,
                 })]
             }
-            other => {
-                self.unexpected_event("metadata graph prune timer schedule", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "metadata graph prune timer schedule",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -911,7 +925,9 @@ impl DeleteDocumentOperation {
                     Err(error) => self.fail(error),
                 }
             }
-            other => self.unexpected_event("metadata graph prune result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("metadata graph prune result", other.label().to_string())
+            }
         }
     }
 
@@ -929,9 +945,10 @@ impl DeleteDocumentOperation {
                     "durable metadata graph sync scheduling failed: {message}"
                 )))
             }
-            other => {
-                self.unexpected_event("metadata graph sync timer schedule", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "metadata graph sync timer schedule",
+                other.label().to_string(),
+            ),
         }
     }
 
@@ -947,9 +964,10 @@ impl DeleteDocumentOperation {
                     "durable metadata delete sync scheduling failed: {message}"
                 )))
             }
-            other => {
-                self.unexpected_event("metadata delete sync timer schedule", format!("{other:?}"))
-            }
+            other => self.unexpected_event(
+                "metadata delete sync timer schedule",
+                other.label().to_string(),
+            ),
         }
     }
 }
@@ -965,26 +983,12 @@ fn delete_updated_index(record: &MetadataRegistryRecord, txn_id: Option<Ulid>) -
     })
 }
 
-const DELETE_CONFLICT_RETRIES: usize = 3;
-
 pub async fn delete_metadata_document(
     operation: DeleteDocumentOperation,
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<(), DeleteDocumentError> {
-    let mut attempt = 0usize;
-    loop {
-        match drive(operation.fresh_copy(), context).await {
-            Ok(()) => break,
-            Err(DeleteDocumentError::StorageError(StorageError::TransactionConflict))
-                if attempt < DELETE_CONFLICT_RETRIES =>
-            {
-                tokio::time::sleep(conflict_backoff(attempt, &document_id.to_bytes())).await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
+    drive_retry(|| operation.fresh_copy(), context, &document_id.to_bytes()).await?;
     if let Some(metadata_handle) = context.metadata_handle.as_ref() {
         metadata_handle.remove_cached_record(document_id);
     }
@@ -992,6 +996,13 @@ pub async fn delete_metadata_document(
 }
 
 impl Operation for DeleteDocumentOperation {
+    fn is_conflict(error: &DeleteDocumentError) -> bool {
+        matches!(
+            error,
+            DeleteDocumentError::StorageError(StorageError::TransactionConflict)
+        )
+    }
+
     type Output = ();
     type Error = DeleteDocumentError;
 
@@ -1030,7 +1041,7 @@ impl Operation for DeleteDocumentOperation {
             DeleteDocumentState::Finish
             | DeleteDocumentState::Error
             | DeleteDocumentState::Init => {
-                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
+                self.unexpected_event("no event in a terminal state", event.label().to_string())
             }
         }
     }
