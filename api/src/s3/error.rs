@@ -1171,7 +1171,7 @@ mod tests {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
             aruna_operations::blob::usage::UsageUpdateError::UnexpectedEvent(
-                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished),
+                "BlobEvent::DeleteFinished",
             ),
         )
         .into_s3_error();
@@ -1336,7 +1336,7 @@ mod tests {
         let accounting = S3ErrorCode::Custom("UsageAccountingFailed".into());
         let other = UsageUpdateError::Inventory(InventoryError::Storage(StorageError::KeyNotFound));
         assert_eq!(*usage_update_error(&other).code(), accounting);
-        let event = UsageUpdateError::UnexpectedEvent(aruna_core::events::Event::Search());
+        let event = UsageUpdateError::UnexpectedEvent("Event::Search");
         assert_eq!(*usage_update_error(&event).code(), accounting);
         let deleted = DeleteObjectError::UsageUpdateError(UsageUpdateError::Inventory(
             InventoryError::Collision(set_id),
