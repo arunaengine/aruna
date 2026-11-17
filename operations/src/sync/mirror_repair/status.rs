@@ -149,11 +149,14 @@ impl StoreStatusOperation {
     fn journal(&mut self, mut writes: Writes, value: Option<Value>, txn_id: TxnId) -> Effects {
         if let Some(value) = value {
             let entries = BucketInfo::from_bytes(&value)
-                .map(|info| failure_event(&self.relationship, &info))
-                .and_then(|event| journal_entries(&event));
+                .map_err(SyncMirrorError::from)
+                .and_then(|info| {
+                    let event = failure_event(&self.relationship, &info);
+                    journal_entries(&event).map_err(SyncMirrorError::from)
+                });
             match entries {
                 Ok(entries) => writes.extend(entries),
-                Err(error) => return self.finish(Err(error.into())),
+                Err(error) => return self.finish(Err(error)),
             }
         }
         self.write(writes, txn_id)
