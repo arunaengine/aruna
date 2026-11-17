@@ -4,6 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::Operation;
 use std::collections::BTreeMap;
 
 use aruna_core::keyspaces::{
@@ -19,8 +21,8 @@ use ulid::Ulid;
 
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
 use super::rows::{
-    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
-    row as row_of, unexpected, values,
+    Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    read_call, row as row_of, unexpected, values,
 };
 use super::runs::{Admission, RunError};
 use aruna_core::plugin_runs::Outcome;
@@ -60,29 +62,29 @@ pub(crate) fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<
 }
 
 /// The outcome an earlier decision recorded for the event.
-pub(crate) fn seen_outcome(row: &ForwardRow) -> RowsOperation<SeenOutcome> {
+pub(crate) fn seen_outcome(row: &ForwardRow) -> SeenOutcome {
     let seen = seen_key(row.install_id, row.event.kind, &row.event.source);
-    RowsOperation::direct(SeenOutcome(seen))
+    SeenOutcome(seen)
 }
 
 #[derive(Debug, PartialEq)]
 pub struct SeenOutcome(Vec<u8>);
 
-impl Plan for SeenOutcome {
+impl Operation for SeenOutcome {
     type Output = Option<Outcome>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_SEEN_KEYSPACE,
             self.0.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         let [found] = values::<1>(answer)?;
         let seen = found.map(|bytes| decode::<SeenRow>(&bytes)).transpose()?;
-        Ok(Turn::Finish(seen.map(|seen| seen.outcome)))
+        Ok(Next::Done(seen.map(|seen| seen.outcome)))
     }
 }
 
@@ -90,18 +92,22 @@ impl Plan for SeenOutcome {
 #[derive(Debug, PartialEq)]
 pub struct LateEvent(pub(crate) GapCount);
 
-impl Plan for LateEvent {
+impl Operation for LateEvent {
     type Output = ();
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        Ok(Turn::Ask(self.0.ask()))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+    fn first(&mut self) -> Result<Next<()>, StoreError> {
+        Ok(Next::Call(self.0.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         match self.0.take(answer)? {
-            Some(row) => Ok(Turn::Ask(Ask::Write(vec![row]))),
-            None => Ok(Turn::Finish(())),
+            Some(row) => Ok(Next::Call(IoCall::Write(vec![row]))),
+            None => Ok(Next::Done(())),
         }
     }
 }
@@ -112,18 +118,18 @@ pub(crate) fn decide_event(
     verdict: Verdict,
     row: &ForwardRow,
     now_ms: u64,
-) -> Result<RowsOperation<DecideEvent>, StoreError> {
+) -> Result<DecideEvent, StoreError> {
     let phase = match verdict {
         Verdict::Unavailable => DecidePhase::Busy,
         Verdict::Run(run) => DecidePhase::Admitting(Admission::new(*run)),
         Verdict::Unready => DecidePhase::Holding(Hold::new(row, now_ms)?),
         Verdict::Denied(reason) => DecidePhase::Denying(reason),
     };
-    Ok(RowsOperation::transaction(DecideEvent {
+    Ok(DecideEvent {
         row: Box::new(row.clone()),
         now_ms,
         phase,
-    }))
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -148,59 +154,63 @@ impl DecideEvent {
         &mut self,
         outcome: Outcome,
         mut rows: Vec<Row>,
-    ) -> Result<Turn<Outcome>, StoreError> {
+    ) -> Result<Next<Outcome>, StoreError> {
         rows.push(seen_row(&self.row, &outcome, self.now_ms)?);
         self.phase = DecidePhase::Writing(outcome);
-        Ok(Turn::Ask(Ask::Write(rows)))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
-impl Plan for DecideEvent {
+impl Operation for DecideEvent {
     type Output = Outcome;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Outcome>, StoreError> {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Outcome>, StoreError> {
         match std::mem::replace(&mut self.phase, DecidePhase::Busy) {
-            DecidePhase::Busy => Ok(Turn::Finish(Outcome::Busy)),
+            DecidePhase::Busy => Ok(Next::Done(Outcome::Busy)),
             DecidePhase::Admitting(admission) => {
                 let ask = admission.ask();
                 self.phase = DecidePhase::Admitting(admission);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             DecidePhase::Holding(hold) => {
                 let ask = hold.ask();
                 self.phase = DecidePhase::Holding(hold);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             DecidePhase::Denying(reason) => self.decided(Outcome::Denied(reason), Vec::new()),
             DecidePhase::Writing(_) => Err(StoreError("decided twice".into())),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Outcome>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Outcome>, StoreError> {
         match std::mem::replace(&mut self.phase, DecidePhase::Busy) {
             DecidePhase::Admitting(mut admission) => match admission.take(answer) {
                 Ok(None) => {
                     let ask = admission.ask();
                     self.phase = DecidePhase::Admitting(admission);
-                    Ok(Turn::Ask(ask))
+                    Ok(Next::Call(ask))
                 }
                 Ok(Some(rows)) => self.decided(Outcome::Queued, rows),
-                Err(RunError::Full(_)) => Ok(Turn::Finish(Outcome::Busy)),
+                Err(RunError::Full(_)) => Ok(Next::Done(Outcome::Busy)),
                 Err(RunError::Store(error)) => Err(error),
                 Err(error) => Err(StoreError(error.to_string())),
             },
             DecidePhase::Holding(mut hold) => match hold.take(answer)? {
                 Slot::More(ask) => {
                     self.phase = DecidePhase::Holding(hold);
-                    Ok(Turn::Ask(ask))
+                    Ok(Next::Call(ask))
                 }
-                Slot::Full => Ok(Turn::Finish(Outcome::Busy)),
+                Slot::Full => Ok(Next::Done(Outcome::Busy)),
                 Slot::Taken(rows) => self.decided(Outcome::Waiting, rows),
             },
             DecidePhase::Writing(outcome) => {
                 done(answer)?;
-                Ok(Turn::Finish(outcome))
+                Ok(Next::Done(outcome))
             }
             DecidePhase::Busy | DecidePhase::Denying(_) => Err(unexpected(answer)),
         }
@@ -229,12 +239,12 @@ impl GapCount {
         }
     }
 
-    pub fn ask(&self) -> Ask {
-        Ask::Read(vec![(PLUGIN_GAPS_KEYSPACE, self.key.clone())])
+    pub fn ask(&self) -> IoCall {
+        read_call(vec![(PLUGIN_GAPS_KEYSPACE, self.key.clone())])
     }
 
     /// The counted gap row after its read, or `None` once its write was answered.
-    pub fn take(&mut self, answer: Answer) -> Result<Option<Row>, StoreError> {
+    pub fn take(&mut self, answer: IoResult) -> Result<Option<Row>, StoreError> {
         if self.counted {
             return done(answer).map(|()| None);
         }
@@ -254,13 +264,13 @@ impl GapCount {
 }
 
 /// Deletes the dedup records past their retention; returns how many.
-pub(crate) fn prune_seen(now_ms: u64) -> RowsOperation<PruneSeen> {
-    RowsOperation::direct(PruneSeen {
+pub(crate) fn prune_seen(now_ms: u64) -> PruneSeen {
+    PruneSeen {
         now_ms,
         after: None,
         deleting: None,
         pruned: 0,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -273,38 +283,31 @@ pub struct PruneSeen {
 }
 
 impl PruneSeen {
-    fn page(&self) -> Ask {
-        Ask::Page {
-            space: PLUGIN_SEEN_KEYSPACE,
-            prefix: Vec::new(),
-            after: self.after.clone(),
-            limit: 1_000,
-        }
+    fn page(&self) -> IoCall {
+        page_call(PLUGIN_SEEN_KEYSPACE, Vec::new(), self.after.clone(), 1_000)
     }
 }
 
-impl Plan for PruneSeen {
+impl Operation for PruneSeen {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
-        Ok(Turn::Ask(self.page()))
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         if let Some(next) = self.deleting.take() {
             done(answer)?;
             return Ok(match next {
                 Some(key) => {
                     self.after = Some(key);
-                    Turn::Ask(self.page())
+                    Next::Call(self.page())
                 }
-                None => Turn::Finish(self.pruned),
+                None => Next::Done(self.pruned),
             });
         }
-        let Answer::Page(rows, next) = answer else {
-            return Err(unexpected(answer));
-        };
+        let (rows, next) = page_of(answer)?;
         let old: Vec<_> = (rows.into_iter())
             .filter(|(_, value)| {
                 decode::<SeenRow>(value).is_ok_and(|seen| {
@@ -315,7 +318,7 @@ impl Plan for PruneSeen {
             .collect();
         self.pruned += old.len();
         self.deleting = Some(next);
-        Ok(Turn::Ask(Ask::Delete(old)))
+        Ok(Next::Call(delete_call(old)))
     }
 }
 
@@ -345,7 +348,7 @@ pub struct Hold {
 /// What a hold needs next, or whether it took the slot.
 #[derive(Debug, PartialEq)]
 pub enum Slot {
-    More(Ask),
+    More(IoCall),
     Full,
     /// The rows of the slot and its waiting event.
     Taken(Vec<Row>),
@@ -364,11 +367,11 @@ impl Hold {
         })
     }
 
-    pub fn ask(&self) -> Ask {
+    pub fn ask(&self) -> IoCall {
         self.queued.ask()
     }
 
-    pub fn take(&mut self, answer: Answer) -> Result<Slot, StoreError> {
+    pub fn take(&mut self, answer: IoResult) -> Result<Slot, StoreError> {
         let Some(queued) = self.queued.take(answer)? else {
             return Ok(Slot::More(self.queued.ask()));
         };
@@ -391,15 +394,12 @@ impl Hold {
 }
 
 /// Keeps each report from `sender` that is newer than the one kept; answers the sequence kept.
-pub(crate) fn keep_reports(
-    sender: NodeId,
-    reports: Vec<(Ulid, GapRow)>,
-) -> RowsOperation<KeepReports> {
-    RowsOperation::transaction(KeepReports {
+pub(crate) fn keep_reports(sender: NodeId, reports: Vec<(Ulid, GapRow)>) -> KeepReports {
+    KeepReports {
         sender,
         reports,
         acked: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -409,28 +409,30 @@ pub struct KeepReports {
     acked: Option<Vec<(Ulid, SourceKind, GapReason, u64)>>,
 }
 
-impl Plan for KeepReports {
+impl Operation for KeepReports {
     type Output = Vec<(Ulid, SourceKind, GapReason, u64)>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
         let reads = (self.reports.iter())
             .map(|(install_id, report)| {
                 let key = reported_key(self.sender, *install_id, report.kind, report.reason);
                 (PLUGIN_GAPS_KEYSPACE, key)
             })
             .collect();
-        Ok(Turn::Ask(Ask::Read(reads)))
+        Ok(Next::Call(read_call(reads)))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         if let Some(acked) = self.acked.take() {
             done(answer)?;
-            return Ok(Turn::Finish(acked));
+            return Ok(Next::Done(acked));
         }
-        let Answer::Values(kept) = answer else {
-            return Err(unexpected(answer));
-        };
+        let kept = all_values(answer)?;
         let (mut acked, mut writes) = (Vec::new(), Vec::new());
         for ((install_id, report), kept) in std::mem::take(&mut self.reports).into_iter().zip(kept)
         {
@@ -444,7 +446,7 @@ impl Plan for KeepReports {
             }
         }
         self.acked = Some(acked);
-        Ok(Turn::Ask(Ask::Write(writes)))
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -460,13 +462,13 @@ pub struct Delivery {
 }
 
 /// The install's waiting events, gap totals and replay note on this receiver.
-pub fn event_delivery(install_id: Ulid) -> RowsOperation<EventDelivery> {
+pub fn event_delivery(install_id: Ulid) -> EventDelivery {
     let prefix = install_id.to_bytes().to_vec();
-    RowsOperation::direct(EventDelivery {
+    EventDelivery {
         install_id,
         phase: DeliveryPhase::Waiting(Scan::new(PLUGIN_WAITING_KEYSPACE, prefix)),
         delivery: Delivery::default(),
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -483,24 +485,24 @@ enum DeliveryPhase {
     Coverage,
 }
 
-impl Plan for EventDelivery {
+impl Operation for EventDelivery {
     type Output = Delivery;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Delivery>, StoreError> {
+    fn first(&mut self) -> Result<Next<Delivery>, StoreError> {
         match &self.phase {
-            DeliveryPhase::Waiting(scan) => Ok(Turn::Ask(scan.ask())),
+            DeliveryPhase::Waiting(scan) => Ok(Next::Call(scan.ask())),
             _ => Err(StoreError("read twice".into())),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Delivery>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Delivery>, StoreError> {
         match std::mem::replace(&mut self.phase, DeliveryPhase::Coverage) {
             DeliveryPhase::Waiting(mut scan) => {
                 let Some(waiting) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = DeliveryPhase::Waiting(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 let received = (waiting.iter())
                     .filter_map(|(_, value)| decode::<WaitingRow>(value).ok())
@@ -510,17 +512,17 @@ impl Plan for EventDelivery {
                 let scan = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![RECEIVER_GAP]);
                 let ask = scan.ask();
                 self.phase = DeliveryPhase::Gaps(scan);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             DeliveryPhase::Gaps(mut scan) => {
                 let Some(gaps) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = DeliveryPhase::Gaps(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 self.delivery.gaps = gap_totals(self.install_id, gaps)?;
                 let coverage = row_key(COVERAGE_ROW, self.install_id);
-                Ok(Turn::Ask(Ask::Read(vec![(
+                Ok(Next::Call(read_call(vec![(
                     PLUGIN_REPLAYS_KEYSPACE,
                     coverage,
                 )])))
@@ -529,7 +531,7 @@ impl Plan for EventDelivery {
                 let [coverage] = values::<1>(answer)?;
                 let coverage = coverage.and_then(|bytes| decode::<CoverageRow>(&bytes).ok());
                 self.delivery.note = coverage.and_then(|row| row.note);
-                Ok(Turn::Finish(std::mem::take(&mut self.delivery)))
+                Ok(Next::Done(std::mem::take(&mut self.delivery)))
             }
         }
     }

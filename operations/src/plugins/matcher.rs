@@ -6,7 +6,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{
     ForwardRow, GapReason, GapRow, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
     SourceKind, gap_key, outbox_key, source_key,
@@ -18,8 +20,8 @@ use ulid::Ulid;
 use super::grants::covers;
 use super::journal::JOURNAL_PAGE;
 use super::rows::{
-    Answer, Ask, Plan, Row, Rows, RowsOperation, StoreError, Turn, decode, done, encode,
-    row as row_of, unexpected,
+    Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    read_call, row as row_of, unexpected,
 };
 
 /// An active install with event triggers, as the matcher sees it.
@@ -67,14 +69,14 @@ pub(crate) fn match_page(
     (targets, keep): (&[Target], bool),
     now_ms: u64,
     bound: usize,
-) -> RowsOperation<MatchPage> {
-    RowsOperation::transaction(MatchPage {
+) -> MatchPage {
+    MatchPage {
         targets: targets.to_vec(),
         keep,
         now_ms,
         bound,
         phase: MatchPhase::Reading,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -101,7 +103,7 @@ impl MatchPage {
         &mut self,
         rows: Rows,
         queued: BTreeMap<Ulid, usize>,
-    ) -> Result<Turn<usize>, StoreError> {
+    ) -> Result<Next<usize>, StoreError> {
         let stale = self.now_ms.saturating_sub(JOURNAL_RETENTION_MS);
         let (mut done, mut outbox) = (Vec::new(), Outbox::new(self.now_ms, queued));
         let read = rows.len();
@@ -130,31 +132,33 @@ impl MatchPage {
         }
         let ask = outbox.gap_ask();
         self.phase = MatchPhase::Gaps(Box::new(outbox), done, read);
-        Ok(Turn::Ask(ask))
+        Ok(Next::Call(ask))
     }
 }
 
-impl Plan for MatchPage {
+impl Operation for MatchPage {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
-        Ok(Turn::Ask(Ask::Page {
-            space: EVENT_JOURNAL_KEYSPACE,
-            prefix: vec![PENDING_ROW],
-            after: None,
-            limit: JOURNAL_PAGE,
-        }))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(page_call(
+            EVENT_JOURNAL_KEYSPACE,
+            vec![PENDING_ROW],
+            None,
+            JOURNAL_PAGE,
+        )))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, MatchPhase::Deleting(0)) {
             MatchPhase::Reading => {
-                let Answer::Page(rows, _) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, _) = page_of(answer)?;
                 if rows.is_empty() {
-                    return Ok(Turn::Finish(0));
+                    return Ok(Next::Done(0));
                 }
                 let installs = (rows.iter())
                     .filter_map(|(_, value)| SourceEvent::from_bytes(value).ok())
@@ -169,7 +173,7 @@ impl Plan for MatchPage {
                 match counting.ask() {
                     Some(ask) => {
                         self.phase = MatchPhase::Counting(rows, counting);
-                        Ok(Turn::Ask(ask))
+                        Ok(Next::Call(ask))
                     }
                     None => self.matched(rows, BTreeMap::new()),
                 }
@@ -179,26 +183,24 @@ impl Plan for MatchPage {
                 match counting.ask() {
                     Some(ask) => {
                         self.phase = MatchPhase::Counting(rows, counting);
-                        Ok(Turn::Ask(ask))
+                        Ok(Next::Call(ask))
                     }
                     None => self.matched(rows, counting.counted()),
                 }
             }
             MatchPhase::Gaps(outbox, done, read) => {
-                let Answer::Values(values) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let values = all_values(answer)?;
                 self.phase = MatchPhase::Writing(done, read);
-                Ok(Turn::Ask(Ask::Write(outbox.rows(values)?)))
+                Ok(Next::Call(IoCall::Write(outbox.rows(values)?)))
             }
             MatchPhase::Writing(done_keys, read) => {
                 done(answer)?;
                 self.phase = MatchPhase::Deleting(read);
-                Ok(Turn::Ask(Ask::Delete(done_keys)))
+                Ok(Next::Call(delete_call(done_keys)))
             }
             MatchPhase::Deleting(read) => {
                 done(answer)?;
-                Ok(Turn::Finish(read))
+                Ok(Next::Done(read))
             }
         }
     }
@@ -222,21 +224,19 @@ impl Counting {
     }
 
     /// The page of the next install to count, or `None` once every install is counted.
-    pub(crate) fn ask(&self) -> Option<Ask> {
+    pub(crate) fn ask(&self) -> Option<IoCall> {
         let install_id = self.left.last()?;
-        Some(Ask::Page {
-            space: PLUGIN_OUTBOX_KEYSPACE,
-            prefix: install_id.to_bytes().to_vec(),
-            after: None,
-            limit: self.bound,
-        })
+        Some(page_call(
+            PLUGIN_OUTBOX_KEYSPACE,
+            install_id.to_bytes().to_vec(),
+            None,
+            self.bound,
+        ))
     }
 
-    pub(crate) fn take(&mut self, answer: Answer) -> Result<(), StoreError> {
-        let Answer::Page(rows, _) = answer else {
-            return Err(unexpected(answer));
-        };
-        let install_id = self.left.pop().ok_or_else(|| unexpected(Answer::Done))?;
+    pub(crate) fn take(&mut self, answer: IoResult) -> Result<(), StoreError> {
+        let (rows, _) = page_of(answer)?;
+        let install_id = self.left.pop().ok_or_else(|| unexpected(IoResult::Done))?;
         self.counted.insert(install_id, rows.len());
         Ok(())
     }
@@ -330,9 +330,9 @@ impl Outbox {
     }
 
     /// The read of every gap row the outbox counts in, each once.
-    pub(crate) fn gap_ask(&self) -> Ask {
+    pub(crate) fn gap_ask(&self) -> IoCall {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
-        Ask::Read(
+        read_call(
             keys.into_iter()
                 .map(|key| (PLUGIN_GAPS_KEYSPACE, key))
                 .collect(),

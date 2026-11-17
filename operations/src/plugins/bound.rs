@@ -1,10 +1,9 @@
 //! Selects the secret a plugin install binds to a slot in this node's own view, and opens it
-//! with the realm keys a management node holds.
+//! through the storage backend, which holds the realm keys on a management node.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
@@ -13,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NODE_SECRETS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
 use aruna_core::plugins::{NodeCheckError, Refusal, ReleaseError};
-use aruna_core::realm_vault::{RealmSealKey, RealmSecretRef, RealmVaultKey, RealmVaultRecord};
+use aruna_core::realm_vault::{RealmSealed, RealmSecretRef, RealmVaultRecord};
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretKind, SecretName, SecretRecord, SecretSettings, UseRule};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -26,14 +25,7 @@ use super::rows::read_rows;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::open_value;
-
-/// The realm keys a management node opens group and realm secrets with.
-#[derive(Clone, Default)]
-pub struct ReleaseKeys {
-    pub seal: Option<Arc<RealmSealKey>>,
-    pub vault: Option<Arc<RealmVaultKey>>,
-}
+use crate::secrets::owner::sealed_value;
 
 /// The current entry of a bound secret in the serving node's view.
 pub struct Selected {
@@ -145,36 +137,39 @@ pub(crate) async fn read_entry(
 
 pub async fn open(
     ctx: &DriverContext,
-    keys: &ReleaseKeys,
     realm_id: RealmId,
     sealed: &Sealed,
 ) -> Result<SecretBytes, ReleaseError> {
-    let missing = || ReleaseError::Unavailable("this node holds no realm key".into());
     let failed = |error: String| ReleaseError::Unavailable(error);
-    match sealed {
+    let sealed = match sealed {
         Sealed::Owner(entry) => {
-            let key = keys.seal.as_ref().ok_or_else(missing)?;
-            open_value(key, &realm_id, entry).map_err(|error| failed(error.to_string()))
+            sealed_value(realm_id, entry).map_err(|error| failed(error.to_string()))?
         }
-        Sealed::Realm(record) => {
-            let key = keys.vault.as_ref().ok_or_else(missing)?;
-            key.open(&realm_id, record)
-                .map_err(|error| failed(error.to_string()))
-        }
+        Sealed::Realm(record) => RealmSealed::Record {
+            realm_id,
+            record: record.clone(),
+        },
         Sealed::Node(value_id) => {
             let entry = value_entry(*value_id);
             let read = StorageEffect::VaultRead {
                 entry,
                 txn_id: None,
             };
-            match ctx.storage_handle.send_storage_effect(read).await {
+            return match ctx.storage_handle.send_storage_effect(read).await {
                 Event::Storage(StorageEvent::VaultResult {
                     secret: Some(secret),
                     ..
                 }) => Ok(secret),
                 other => Err(failed(format!("the node vault answered {}", other.label()))),
-            }
+            };
         }
+    };
+    let open = StorageEffect::RealmOpen(Box::new(sealed));
+    match ctx.storage_handle.send_storage_effect(open).await {
+        Event::Storage(StorageEvent::RealmOpened { result }) => {
+            result.map_err(|error| failed(error.to_string()))
+        }
+        other => Err(failed(format!("the realm keys answered {}", other.label()))),
     }
 }
 

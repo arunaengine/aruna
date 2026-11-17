@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use aruna_core::backoff::capped_backoff;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::Operation;
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
@@ -26,8 +28,8 @@ use ulid::Ulid;
 
 use super::matcher::Outbox;
 use super::rows::{
-    Answer, Ask, Plan, Rows, RowsOperation, StoreError, Turn, decode, done, encode, row as row_of,
-    unexpected, values,
+    Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of, read_call,
+    row as row_of, values,
 };
 
 /// Forward rows of one install read for sending in one pass at most.
@@ -97,44 +99,42 @@ pub(crate) fn receiver_requests(
 }
 
 /// The next install after `after` with forward rows on this node.
-pub(crate) fn next_install(after: Option<Ulid>) -> RowsOperation<NextInstall> {
+pub(crate) fn next_install(after: Option<Ulid>) -> NextInstall {
     // A forward key is the install id, then 24 bytes of journal time and event id.
     let start = after.map(|id| [&id.to_bytes()[..], &[0xff; 24]].concat());
-    RowsOperation::direct(NextInstall(start))
+    NextInstall(start)
 }
 
 #[derive(Debug, PartialEq)]
 pub struct NextInstall(Option<Vec<u8>>);
 
-impl Plan for NextInstall {
+impl Operation for NextInstall {
     type Output = Option<Ulid>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Page {
-            space: PLUGIN_OUTBOX_KEYSPACE,
-            prefix: Vec::new(),
-            after: self.0.take(),
-            limit: 1,
-        }))
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(page_call(
+            PLUGIN_OUTBOX_KEYSPACE,
+            Vec::new(),
+            self.0.take(),
+            1,
+        )))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
-        let Answer::Page(rows, _) = answer else {
-            return Err(unexpected(answer));
-        };
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let (rows, _) = page_of(answer)?;
         let first = (rows.first()).and_then(|(key, _)| key.get(..16)?.try_into().ok());
-        Ok(Turn::Finish(first.map(Ulid::from_bytes)))
+        Ok(Next::Done(first.map(Ulid::from_bytes)))
     }
 }
 
 /// Deletes every row below `prefix`, a page at a time.
-pub(crate) fn drop_rows(space: &'static str, prefix: Vec<u8>) -> RowsOperation<DropRows> {
-    RowsOperation::direct(DropRows {
+pub(crate) fn drop_rows(space: &'static str, prefix: Vec<u8>) -> DropRows {
+    DropRows {
         space,
         prefix,
         deleting: false,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -145,49 +145,42 @@ pub struct DropRows {
 }
 
 impl DropRows {
-    fn page(&self) -> Ask {
-        Ask::Page {
-            space: self.space,
-            prefix: self.prefix.clone(),
-            after: None,
-            limit: 1_000,
-        }
+    fn page(&self) -> IoCall {
+        page_call(self.space, self.prefix.clone(), None, 1_000)
     }
 }
 
-impl Plan for DropRows {
+impl Operation for DropRows {
     type Output = ();
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        Ok(Turn::Ask(self.page()))
+    fn first(&mut self) -> Result<Next<()>, StoreError> {
+        Ok(Next::Call(self.page()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         if std::mem::take(&mut self.deleting) {
             done(answer)?;
-            return Ok(Turn::Ask(self.page()));
+            return Ok(Next::Call(self.page()));
         }
-        let Answer::Page(rows, _) = answer else {
-            return Err(unexpected(answer));
-        };
+        let (rows, _) = page_of(answer)?;
         if rows.is_empty() {
-            return Ok(Turn::Finish(()));
+            return Ok(Next::Done(()));
         }
         self.deleting = true;
         let keys = rows.into_iter().map(|(key, _)| (self.space, key));
-        Ok(Turn::Ask(Ask::Delete(keys.collect())))
+        Ok(Next::Call(delete_call(keys.collect())))
     }
 }
 
 /// Counts the install's first rows past their send expiry as gaps and deletes them in one
 /// transaction; answers the other rows.
-pub(crate) fn expire_rows(install_id: Ulid, now_ms: u64) -> RowsOperation<ExpireRows> {
-    RowsOperation::transaction(ExpireRows {
+pub(crate) fn expire_rows(install_id: Ulid, now_ms: u64) -> ExpireRows {
+    ExpireRows {
         install_id,
         now_ms,
         phase: ExpirePhase::Reading,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -205,25 +198,27 @@ enum ExpirePhase {
     Deleting(Rows),
 }
 
-impl Plan for ExpireRows {
+impl Operation for ExpireRows {
     type Output = Rows;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Rows>, StoreError> {
-        Ok(Turn::Ask(Ask::Page {
-            space: PLUGIN_OUTBOX_KEYSPACE,
-            prefix: self.install_id.to_bytes().to_vec(),
-            after: None,
-            limit: BATCH,
-        }))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Rows>, StoreError> {
+    fn first(&mut self) -> Result<Next<Rows>, StoreError> {
+        Ok(Next::Call(page_call(
+            PLUGIN_OUTBOX_KEYSPACE,
+            self.install_id.to_bytes().to_vec(),
+            None,
+            BATCH,
+        )))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Rows>, StoreError> {
         match std::mem::replace(&mut self.phase, ExpirePhase::Deleting(Vec::new())) {
             ExpirePhase::Reading => {
-                let Answer::Page(rows, _) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, _) = page_of(answer)?;
                 let mut outbox = Outbox::new(self.now_ms, BTreeMap::new());
                 let (mut kept, mut expired) = (Vec::new(), Vec::new());
                 for (key, value) in rows {
@@ -238,23 +233,21 @@ impl Plan for ExpireRows {
                 }
                 let ask = outbox.gap_ask();
                 self.phase = ExpirePhase::Gaps(Box::new(outbox), kept, expired);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             ExpirePhase::Gaps(outbox, kept, expired) => {
-                let Answer::Values(values) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let values = all_values(answer)?;
                 self.phase = ExpirePhase::Writing(kept, expired);
-                Ok(Turn::Ask(Ask::Write(outbox.rows(values)?)))
+                Ok(Next::Call(IoCall::Write(outbox.rows(values)?)))
             }
             ExpirePhase::Writing(kept, expired) => {
                 done(answer)?;
                 self.phase = ExpirePhase::Deleting(kept);
-                Ok(Turn::Ask(Ask::Delete(expired)))
+                Ok(Next::Call(delete_call(expired)))
             }
             ExpirePhase::Deleting(kept) => {
                 done(answer)?;
-                Ok(Turn::Finish(kept))
+                Ok(Next::Done(kept))
             }
         }
     }
@@ -262,16 +255,12 @@ impl Plan for ExpireRows {
 
 /// What this node holds about a dataset event: the document's status, the event's own record
 /// and whether the document is deleted.
-pub(crate) fn dataset_facts(
-    document: Ulid,
-    event_id: Ulid,
-    updated: bool,
-) -> RowsOperation<DatasetFacts> {
-    RowsOperation::direct(DatasetFacts {
+pub(crate) fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> DatasetFacts {
+    DatasetFacts {
         document,
         event_id,
         updated,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -302,13 +291,13 @@ impl Facts {
     }
 }
 
-impl Plan for DatasetFacts {
+impl Operation for DatasetFacts {
     type Output = Facts;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Facts>, StoreError> {
+    fn first(&mut self) -> Result<Next<Facts>, StoreError> {
         let graph = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(self.document));
-        Ok(Turn::Ask(Ask::Read(vec![
+        Ok(Next::Call(read_call(vec![
             (
                 MATERIALIZATION_STATUS_KEYSPACE,
                 materialization_status_key(self.document).to_vec(),
@@ -321,7 +310,7 @@ impl Plan for DatasetFacts {
         ])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Facts>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Facts>, StoreError> {
         let [status, logged, lifecycle] = values::<3>(answer)?;
         let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
         let logged = logged.filter(|_| self.updated);
@@ -335,7 +324,7 @@ impl Plan for DatasetFacts {
             _ => None,
         });
         let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
-        Ok(Turn::Finish(Facts {
+        Ok(Next::Done(Facts {
             status,
             logged: logged.is_some(),
             batch,
@@ -346,10 +335,7 @@ impl Plan for DatasetFacts {
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;
 /// returns how many rows were decided and whether any was busy.
-pub(crate) fn apply(
-    keys: &BTreeMap<(Ulid, String), Vec<u8>>,
-    decisions: Decisions,
-) -> RowsOperation<Apply> {
+pub(crate) fn apply(keys: &BTreeMap<(Ulid, String), Vec<u8>>, decisions: Decisions) -> Apply {
     let busy = (decisions.events.iter()).any(|(.., outcome)| *outcome == Outcome::Busy);
     let decided: Vec<_> = (decisions.events.into_iter())
         .filter(|(.., outcome)| *outcome != Outcome::Busy)
@@ -359,13 +345,13 @@ pub(crate) fn apply(
     let acked = (decisions.gaps.into_iter())
         .map(|(install_id, kind, reason, sequence)| (gap_key(install_id, kind, reason), sequence))
         .collect();
-    RowsOperation::transaction(Apply {
+    Apply {
         count: decided.len(),
         busy,
         decided: Some(decided),
         acked,
         phase: ApplyPhase::Deleting,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -384,28 +370,30 @@ enum ApplyPhase {
     Writing,
 }
 
-impl Plan for Apply {
+impl Operation for Apply {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Delete(
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(delete_call(
             self.decided.take().unwrap_or_default(),
         )))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         match self.phase {
             ApplyPhase::Deleting => {
                 done(answer)?;
                 self.phase = ApplyPhase::Reading;
                 let reads = (self.acked.iter()).map(|(key, _)| (PLUGIN_GAPS_KEYSPACE, key.clone()));
-                Ok(Turn::Ask(Ask::Read(reads.collect())))
+                Ok(Next::Call(read_call(reads.collect())))
             }
             ApplyPhase::Reading => {
-                let Answer::Values(values) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let values = all_values(answer)?;
                 let mut rows = Vec::new();
                 for ((key, sequence), value) in
                     std::mem::take(&mut self.acked).into_iter().zip(values)
@@ -418,11 +406,11 @@ impl Plan for Apply {
                     rows.push(row_of(PLUGIN_GAPS_KEYSPACE, key, encode(&row)?));
                 }
                 self.phase = ApplyPhase::Writing;
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             ApplyPhase::Writing => {
                 done(answer)?;
-                Ok(Turn::Finish((self.count, self.busy)))
+                Ok(Next::Done((self.count, self.busy)))
             }
         }
     }
