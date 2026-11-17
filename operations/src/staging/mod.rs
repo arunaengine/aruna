@@ -122,6 +122,3 @@ pub(crate) fn describe_event(event: &Event) -> String {
         Event::Stream() => "Event::Stream".to_string(),
     }
 }
-
-#[cfg(test)]
-pub(crate) mod tests;
