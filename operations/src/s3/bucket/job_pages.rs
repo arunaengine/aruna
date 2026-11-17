@@ -6,26 +6,25 @@
 use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{LINKED_JOB_KEYSPACE, RENAME_TOTAL_KEYSPACE};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask};
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::GroupId;
 use tracing::warn;
 
+use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
 use super::linked::{BucketJob, reads};
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive_retry};
 use crate::s3::bucket::remap::{RemapScope, job_page};
 
 /// Delay between pages of a running job, and before a waiting job tries again.
 const CONTINUE: Duration = Duration::from_secs(1);
 const WAIT: Duration = Duration::from_secs(30);
 const JOB_PAGE: usize = 64;
-const STORE_TRIES: usize = 3;
 
 /// The job of a bucket as stored: the running one, else the one started last.
 pub async fn read_bucket_job(
@@ -100,17 +99,6 @@ pub async fn rename_total(
     let row = value.as_deref().map(RenameTotal::from_bytes).transpose();
     let row = row.map_err(|error| error.to_string())?;
     Ok(row.and_then(|row| row.for_move(started_at_ms)))
-}
-
-/// What one job page did; a waiting page keeps its cursor.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct JobStep {
-    pub cursor: Option<String>,
-    pub done: u64,
-    pub skipped: u64,
-    pub failed: u64,
-    pub finished: bool,
-    pub waiting: Option<String>,
 }
 
 /// Runs one page of every running linked job; answers when the worker must run again.
@@ -276,98 +264,16 @@ async fn store(
     step: JobStep,
     state: Option<LinkedState>,
 ) -> Result<(), String> {
-    for _ in 0..STORE_TRIES {
-        if store_once(context, bucket, job, step.clone(), state).await? {
-            return Ok(());
+    let build = || {
+        let now_ms = crate::effect_adapters::routing::now_ms();
+        StoreProgressOperation::new(bucket, job.id, step.clone(), state, now_ms)
+    };
+    match drive_retry(build, context, bucket.as_bytes()).await {
+        Ok(()) => Ok(()),
+        Err(StoreProgressError::Conflict) => {
+            warn!(bucket, "The progress of a bucket job could not be stored");
+            Ok(())
         }
-    }
-    warn!(bucket, "The progress of a bucket job could not be stored");
-    Ok(())
-}
-
-/// One try of `store`; `false` when a change of the job committed first.
-async fn store_once(
-    context: &DriverContext,
-    bucket: &str,
-    job: &LinkedJob,
-    step: JobStep,
-    state: Option<LinkedState>,
-) -> Result<bool, String> {
-    let storage = &context.storage_handle;
-    let key: Key = bucket.as_bytes().to_vec().into();
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => {
-            return Err(format!(
-                "could not start a job transaction: {}",
-                other.label()
-            ));
-        }
-    };
-    let read = StorageEffect::Read {
-        key_space: LINKED_JOB_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: Some(txn_id),
-    };
-    let stored = match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("could not read the job: {}", other.label()));
-        }
-    };
-    let stored = stored.as_deref().map(LinkedJob::from_bytes).transpose();
-    let mut current = match stored {
-        Ok(Some(current)) if current.id == job.id => current,
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return other.map(|_| true).map_err(|error| error.to_string());
-        }
-    };
-    let now = crate::effect_adapters::routing::now_ms();
-    current.cursor = step.cursor;
-    current.done += step.done;
-    current.skipped += step.skipped;
-    current.failed += step.failed;
-    current.waiting = step.waiting;
-    current.updated_at_ms = now;
-    let next = state.or((step.finished).then_some(LinkedState::Finished));
-    if let (LinkedState::Running, Some(next)) = (current.state, next) {
-        current.state = next;
-        current.finished_at_ms = Some(now);
-    }
-    let value = current.to_bytes().map_err(|error| error.to_string())?;
-    let write = StorageEffect::Write {
-        key_space: LINKED_JOB_KEYSPACE.to_string(),
-        key,
-        value: value.into(),
-        txn_id: Some(txn_id),
-    };
-    if !matches!(
-        storage.send_storage_effect(write).await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ) {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Err("could not write the job".to_string());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        // A pause or an abort committed first; the progress goes onto it on the next try.
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(false),
-        other => Err(format!("could not store the job: {}", other.label())),
+        Err(error) => Err(error.to_string()),
     }
 }
