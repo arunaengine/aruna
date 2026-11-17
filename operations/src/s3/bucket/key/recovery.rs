@@ -6,7 +6,7 @@
 use crate::driver::{DriverContext, drive};
 use crate::notifications::outbox_record::{new_outbox_record, schedule_drain_effect};
 use crate::s3::bucket::holders::LookupKeysOperation;
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::rows::{SettingsError, authority_read, full_scan, parse_authority};
 use crate::s3::key_status::KeyStatusOperation;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -134,13 +134,7 @@ impl RecoveryNoticeOperation {
 
     fn scan(&mut self, step: RecoveryStep, key_space: &str, prefix: Vec<u8>) -> Effects {
         self.step = step;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
+        smallvec![full_scan(key_space, Some(prefix.into()), self.txn_id)]
     }
 
     /// Only a vault-locked bucket depends on its holders to recover the key.

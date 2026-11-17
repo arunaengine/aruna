@@ -6,8 +6,8 @@
 use crate::blob::migration::queue::encrypt_rows;
 use crate::groups::imports::LinkScan;
 use crate::s3::bucket::key::rows::{
-    SettingsError, audit_row, authority_read, copy_targets, generation_rows, group_bucket_key,
-    parse_authority, uploads_open,
+    SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
+    group_bucket_key, parse_authority, uploads_open,
 };
 use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::compute::SharedSecret;
@@ -225,20 +225,10 @@ impl EnableEncryptionOperation {
             Ok(None) if links.linked => self.fail(EnableError::Mapped),
             Ok(None) => {
                 self.state = EnableState::CheckUploads;
-                self.scan(UPLOAD_KEYSPACE, None)
+                smallvec![full_scan(UPLOAD_KEYSPACE, None, self.txn_id)]
             }
             Err(error) => self.fail(error),
         }
-    }
-
-    fn scan(&self, key_space: &str, prefix: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
     }
 
     fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
@@ -332,10 +322,11 @@ impl EnableEncryptionOperation {
             return self.generate();
         };
         self.state = EnableState::ReadGrants;
-        self.scan(
+        smallvec![full_scan(
             BUCKET_HOLDER_KEYSPACE,
             Some(bucket_id.to_bytes().to_vec().into()),
-        )
+            self.txn_id
+        )]
     }
 
     fn generate(&mut self) -> Effects {

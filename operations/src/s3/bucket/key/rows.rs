@@ -187,6 +187,17 @@ pub fn parse_settings(
     Ok((info, BucketEncryption::from_row(settings.as_deref())?))
 }
 
+/// Reads every row of `key_space` under `prefix` in one page, inside `txn_id`.
+pub(crate) fn full_scan(key_space: &str, prefix: Option<Key>, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix,
+        start: None,
+        limit: u64::MAX as usize,
+        txn_id,
+    })
+}
+
 /// Whether a multipart upload of `bucket` is open; it captured the stored format of its start.
 pub fn uploads_open(uploads: &[(Key, Value)], bucket: &str) -> bool {
     uploads.iter().any(|(_, value)| {
