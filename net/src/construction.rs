@@ -448,6 +448,7 @@ impl BackgroundRuntime {
             presence: effect_handlers::RealmPresenceCache::default(),
             tasks: inbound_tasks.clone(),
             shutdown: runtime.shutdown.clone(),
+            secret_key: runtime.endpoint.secret_key().clone(),
             #[cfg(test)]
             refresh_probe: None,
         });

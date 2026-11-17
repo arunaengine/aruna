@@ -73,15 +73,8 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
             Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
         )),
-        // Publication signing needs this node's key, which only the handle holds.
-        Effect::Net(NetEffect::PolicySign(claim)) => Event::Net(NetEvent::PolicySign(
-            crate::placement::policy::sign_publication(context, *claim),
-        )),
         Effect::Net(NetEffect::VaultFetch(fetch)) => Event::Net(NetEvent::VaultFetch(
             Box::pin(crate::users::vault_route::fetch_vault(context, *fetch)).await,
-        )),
-        Effect::Net(NetEffect::VaultSign(records)) => Event::Net(NetEvent::VaultSign(
-            crate::users::vault_route::sign_records(context, *records),
         )),
         Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
             crate::distribution::sign_snapshot(context, *claim),

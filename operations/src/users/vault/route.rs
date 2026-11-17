@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{VaultFetchEffect, VaultQuery};
-use aruna_core::events::{VaultFetchEvent, VaultSignEvent};
+use aruna_core::events::VaultFetchEvent;
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::user::vault::{
@@ -187,31 +187,6 @@ async fn vault_caller(
         return Err(MetadataReadError::Forbidden);
     }
     Ok(auth.user_id)
-}
-
-/// Signs records this node publishes. A record naming another node stays unsigned and fails
-/// the whole batch, so no operation can sign for another origin.
-pub(crate) fn sign_records(context: &DriverContext, mut records: VaultRecords) -> VaultSignEvent {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return VaultSignEvent::Unavailable("net transport unavailable".to_string());
-    };
-    let node_id = net_handle.node_id();
-    let signed = match &mut records {
-        VaultRecords::Heads(heads) => heads.iter_mut().try_for_each(|head| {
-            (head.node_id == node_id).then_some(())?;
-            head.signature = Some(net_handle.sign(&head.signing_bytes().ok()?));
-            Some(())
-        }),
-        VaultRecords::Keys(keys) => keys.iter_mut().try_for_each(|key| {
-            (key.node_id == node_id).then_some(())?;
-            key.signature = Some(net_handle.sign(&key.signing_bytes().ok()?));
-            Some(())
-        }),
-    };
-    match signed {
-        Some(()) => VaultSignEvent::Signed(Box::new(records)),
-        None => VaultSignEvent::Unavailable("record names another publisher".to_string()),
-    }
 }
 
 /// Asks each holder in turn. A holder answering without records is a miss;

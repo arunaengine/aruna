@@ -12,8 +12,7 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, PolicySignEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent,
-    VaultFetchEvent, VaultSignEvent,
+    PolicyFetchEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent, VaultFetchEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
@@ -46,6 +45,8 @@ pub struct NetEffectContext {
     pub presence: RealmPresenceCache,
     pub tasks: TaskTracker,
     pub shutdown: CancellationToken,
+    /// This node's key, for the sign effects only the key holder may carry out.
+    pub secret_key: iroh::SecretKey,
     #[cfg(test)]
     pub(crate) refresh_probe: Option<Arc<RefreshProbe>>,
 }
@@ -226,15 +227,15 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::LaunchOffer(_) => NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(
             "launch offer must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::PolicySign(_) => NetEvent::PolicySign(PolicySignEvent::Unavailable(
-            "policy publication signing must be dispatched by the operations runner".to_string(),
-        )),
+        NetEffect::PolicySign(claim) => {
+            NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
+        }
         NetEffect::VaultFetch(_) => NetEvent::VaultFetch(VaultFetchEvent::Unavailable(
             "vault fetch must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::VaultSign(_) => NetEvent::VaultSign(VaultSignEvent::Unavailable(
-            "vault signing must be dispatched by the operations runner".to_string(),
-        )),
+        NetEffect::VaultSign(records) => {
+            NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
+        }
         NetEffect::SnapshotSign(_) => NetEvent::SnapshotSign(SnapshotSignEvent::Unavailable(
             "snapshot signing must be dispatched by the operations runner".to_string(),
         )),
@@ -577,6 +578,7 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
+            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (handle, context, directory, realm_id)
@@ -644,6 +646,7 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
+            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (

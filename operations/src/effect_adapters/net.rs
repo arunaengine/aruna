@@ -4,11 +4,15 @@
 
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
-use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
+use aruna_core::events::{
+    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, VaultSignEvent,
+};
 use aruna_core::handle::Handle;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 
 use crate::driver::DriverContext;
+
+const NO_TRANSPORT: &str = "net transport unavailable";
 
 /// Executes a job-control request by opening the frame stream and reading the
 /// owner's reply; an unreachable owner is reported so the routing operation can
@@ -37,6 +41,13 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
+            // Sign effects keep their own unavailable answer, as when the runner signed them.
+            NetEffect::PolicySign(_) => Event::Net(NetEvent::PolicySign(
+                PolicySignEvent::Unavailable(NO_TRANSPORT.to_string()),
+            )),
+            NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(VaultSignEvent::Unavailable(
+                NO_TRANSPORT.to_string(),
+            ))),
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }

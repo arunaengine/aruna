@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, PolicyFetchEffect, StorageEffect};
-use aruna_core::events::{Event, PolicyFetchEvent, PolicySignEvent, StorageEvent};
+use aruna_core::events::{Event, PolicyFetchEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
-    PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_target,
+    PlacementPolicyDocument, placement_policy_target,
 };
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
 use tokio::time::timeout_at;
@@ -76,23 +76,6 @@ pub(crate) async fn fetch_policy(
         return PolicyFetchEvent::NotFound;
     }
     PolicyFetchEvent::Unavailable("no policy holder answered".to_string())
-}
-
-/// Signs one publication claim with this node's key. A claim naming another
-/// publisher is refused, so no operation can mint provenance for a peer.
-pub(crate) fn sign_publication(
-    context: &DriverContext,
-    claim: PolicyPublicationClaim,
-) -> PolicySignEvent {
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return PolicySignEvent::Unavailable("net transport unavailable".to_string());
-    };
-    if claim.publisher != net_handle.node_id() {
-        return PolicySignEvent::Unavailable("claim names another publisher".to_string());
-    }
-    PolicySignEvent::Signed(Box::new(
-        claim.signed_with(|message| net_handle.sign(message)),
-    ))
 }
 
 /// Serves one policy document to a peer. The peer must be a sync-eligible node
