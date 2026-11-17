@@ -437,4 +437,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejects_terminal_event() {
+        // A publish that settled, or never started, refuses an event instead of ignoring it.
+        let fixture = Family::new([9u8; 32]);
+        let envelope = fixture.sign(
+            &fixture.holder,
+            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(fixture.spec())),
+        );
+        let key = envelope.key();
+        let config = PublishRecordConfig {
+            realm_id: fixture.config.realm_id,
+            placement: fixture.placement,
+            holders: vec![node(10)],
+            record: Box::new(JobRecordFrame::new(envelope).expect("record frame")),
+            key,
+        };
+        let gone = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: record_key(&key),
+                value: None,
+            })
+        };
+
+        let mut early = PublishRecordOperation::new(config.clone());
+        assert!(early.step(gone()).is_empty());
+        assert!(matches!(
+            early.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+
+        let mut settled = PublishRecordOperation::new(config);
+        let _ = settled.start();
+        assert!(settled.step(gone()).is_empty());
+        assert!(settled.is_complete());
+        assert!(settled.step(gone()).is_empty());
+        assert!(matches!(
+            settled.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+    }
 }
