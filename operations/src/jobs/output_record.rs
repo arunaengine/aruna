@@ -10,7 +10,7 @@ use aruna_core::structs::execution::job::{
 };
 use tracing::{debug, warn};
 
-use super::lifecycle::updates::chain_of_attempt;
+use super::lifecycle::chain::ExecutionChainOperation;
 use super::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
 };
@@ -37,7 +37,8 @@ pub async fn store_outputs(
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
     // A replay re-appends an idempotent record and a previously unavailable family
     // may resolve now; a receipted execution binds the real chain, else locals.
-    let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
+    let chain = ExecutionChainOperation::of_attempt(record.job_id, control.execution_id);
+    let chain = drive(chain, context).await.ok().flatten();
     let receipted = chain.is_some();
     if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
         .await?

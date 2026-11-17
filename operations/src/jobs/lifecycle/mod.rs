@@ -16,6 +16,7 @@ use super::records::verify::FamilyView;
 pub mod admit;
 pub mod alias;
 pub mod cancel;
+pub mod chain;
 pub mod held;
 pub mod ids;
 pub mod ingress;

@@ -23,7 +23,7 @@ use crate::jobs::lifecycle::reservation::{
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
-use crate::jobs::lifecycle::updates::chain_for;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
@@ -297,8 +297,9 @@ async fn output_binds_receipt() {
         .await
         .expect("offer is admitted");
 
-    let chain = chain_for(&ctx, spec.job_id, execution_id)
+    let chain = drive(ExecutionChainOperation::of_execution(spec.job_id, execution_id), &ctx)
         .await
+        .expect("chain read")
         .expect("chain resolves");
     let receipt = family.receipt(&launch, 1);
     assert_eq!(chain.family, family.family());

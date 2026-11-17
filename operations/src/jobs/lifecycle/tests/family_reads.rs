@@ -12,7 +12,7 @@ use aruna_core::types::Value;
 
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::updates::chain_for;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::{
     AppendRecordConfig, AppendRecordOperation, RecordOrigin,
@@ -208,8 +208,9 @@ async fn undecodable_blocks_chain() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (spec, receipt) = seed(&ctx, &family).await;
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
+        drive(ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id), &ctx)
             .await
+            .expect("chain read")
             .is_some()
     );
 
@@ -224,8 +225,9 @@ async fn undecodable_blocks_chain() {
         Err(FamilyReadError::Decode(_))
     ));
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
+        drive(ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id), &ctx)
             .await
+            .expect("chain read")
             .is_none()
     );
 }
