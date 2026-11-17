@@ -30,9 +30,6 @@ use crate::node::drain_state::OPERATOR_DRAIN_KEY;
 /// transaction as that revision, so a failure after the commit only delays the publish.
 pub(crate) const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 
-/// Node-info revisions one publisher retries after another committed first.
-const ATTEMPTS: usize = 3;
-
 #[derive(Debug, Error, PartialEq)]
 pub enum InfoWriteError {
     #[error(transparent)]
@@ -41,8 +38,8 @@ pub enum InfoWriteError {
     Document(String),
     #[error("node info seed conflicted with another revision")]
     SeedConflict,
-    #[error("node info revision exhausted conflict retries")]
-    Exhausted,
+    #[error("node info revision lost a transaction conflict")]
+    Conflict,
     #[error("unexpected event while {0}")]
     UnexpectedEvent(&'static str),
     #[error("the node info write has not finished")]
@@ -143,15 +140,14 @@ impl Phase {
 }
 
 /// Writes the info row and its owed revision marker together. A revision re-reads the row and
-/// the operator drain inside its transaction, so no publisher carries a stale drain forward,
-/// and retries a commit conflict. True when a row was written.
+/// the operator drain inside its transaction, so no publisher carries a stale drain forward;
+/// its lost conflict is retried by the runner. True when a row was written.
 #[derive(Debug, PartialEq)]
 pub(crate) struct InfoWriteOperation {
     realm_id: RealmId,
     write: Write,
     now_ms: u64,
     generation: u64,
-    attempts: usize,
     phase: Phase,
 }
 
@@ -175,13 +171,11 @@ impl InfoWriteOperation {
             write,
             now_ms,
             generation: 0,
-            attempts: 0,
             phase: Phase::Idle,
         }
     }
 
     fn begin(&mut self) -> Effects {
-        self.attempts += 1;
         self.phase = Phase::Begin;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -295,8 +289,7 @@ impl InfoWriteOperation {
             None => Ok(true),
             Some(StorageError::TransactionConflict) => match self.write {
                 Write::Seed(_) => Err(InfoWriteError::SeedConflict),
-                Write::Revise { .. } if self.attempts < ATTEMPTS => return self.begin(),
-                Write::Revise { .. } => Err(InfoWriteError::Exhausted),
+                Write::Revise { .. } => Err(InfoWriteError::Conflict),
             },
             Some(error) => Err(error.into()),
         };
@@ -413,6 +406,10 @@ impl Operation for InfoWriteOperation {
             Phase::Done(result) => result,
             _ => Err(InfoWriteError::Unfinished),
         }
+    }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        *error == InfoWriteError::Conflict
     }
 
     fn abort(&mut self) -> Effects {
@@ -652,18 +649,16 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn conflicts_retry_bounded() {
+    fn conflict_left_to_runner() {
+        // A lost revision conflict ends the run for the runner's retry; a seed conflict is final.
         let mut operation = reading(leaving());
         operation.step(rows(Some(&document(1)), false));
         operation.step(written());
-        for _ in 1..ATTEMPTS {
-            assert_eq!(operation.step(conflict()).to_vec(), vec![begin()]);
-            operation.step(started());
-            operation.step(rows(Some(&document(1)), false));
-            operation.step(written());
-        }
         assert!(operation.step(conflict()).is_empty());
-        assert_eq!(operation.finalize(), Err(InfoWriteError::Exhausted));
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error, InfoWriteError::Conflict);
+        assert!(InfoWriteOperation::is_conflict(&error));
+        assert!(!InfoWriteOperation::is_conflict(&InfoWriteError::SeedConflict));
     }
 
     #[test]

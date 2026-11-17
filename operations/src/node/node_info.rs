@@ -42,7 +42,7 @@ use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
@@ -497,8 +497,8 @@ pub(crate) async fn refresh_info_heartbeat(
     Ok(())
 }
 
-/// Applies `change` to the stored node-info row in one write transaction, which also stamps
-/// the next epoch and re-reads the drain. `Ok(false)` means no row or no durable change.
+/// Applies `change` to the stored node-info row in one write transaction, retried after a lost
+/// conflict; it stamps the next epoch and re-reads the drain. `Ok(false)`: no row or no change.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
@@ -506,12 +506,10 @@ async fn revise_node_info(
     change: InfoChange,
 ) -> Result<bool, String> {
     let now = unix_timestamp_millis();
-    drive(
-        InfoWriteOperation::revise(realm_id, node_id, change, now),
-        ctx,
-    )
-    .await
-    .map_err(|error| error.to_string())
+    let revise = || InfoWriteOperation::revise(realm_id, node_id, change.clone(), now);
+    drive_retry(revise, ctx, node_id.as_bytes())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
