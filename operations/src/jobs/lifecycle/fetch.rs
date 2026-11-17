@@ -75,3 +75,57 @@ impl Operation for FetchFamilyOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use std::time::Duration;
+
+    use aruna_core::effects::{HolderList, JobRecordEffect, PageLimit};
+    use aruna_core::events::{Event, JobRecordEvent, NetEvent};
+    use aruna_core::operation::Operation;
+
+    use super::FetchFamilyOperation;
+    use crate::jobs::lifecycle::LifecycleError;
+    use crate::tests::records::{Family, REALM, node};
+
+    fn fetch() -> FetchFamilyOperation {
+        let family = Family::new([3u8; 32]);
+        FetchFamilyOperation::new(JobRecordEffect::Fetch {
+            realm_id: REALM,
+            placement: family.placement,
+            holders: HolderList::new(vec![node(2)]).expect("one holder"),
+            submission_id: family.submission_id,
+            request_digest: Some(family.request_digest),
+            cursor: None,
+            limit: PageLimit::default(),
+            deadline: Duration::from_secs(1),
+        })
+    }
+
+    fn unavailable() -> Event {
+        Event::Net(NetEvent::JobRecord(JobRecordEvent::Unavailable(
+            "offline".to_string(),
+        )))
+    }
+
+    // An answer before the request was sent, or after the fetch settled, is refused.
+    #[test]
+    fn rejects_unsent_answer() {
+        let mut early = fetch();
+        assert!(early.step(unavailable()).is_empty());
+        assert!(matches!(
+            early.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+
+        let mut settled = fetch();
+        settled.start();
+        settled.step(unavailable());
+        assert!(settled.is_complete());
+        settled.step(unavailable());
+        assert!(matches!(
+            settled.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
+    }
+}
