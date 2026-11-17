@@ -11,11 +11,11 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::compression::{
     MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
 };
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::key_status::bucket_settings;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -209,10 +209,12 @@ pub async fn get_bucket_compression(
     .await
     .map_err(|error| ServerError::InternalError(error.into()))?;
     let migration = migration.filter(|migration| migration.target == info.compression);
-    let encrypted = bucket_settings(&state.get_ctx(), &bucket)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .is_encrypted();
+    let encrypted = drive(
+        EncryptionCheckOperation::new(&bucket, false),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut response = BucketCompressionResponse::new(bucket, info.compression, migration);
     response.effective_level = info.compression.pithos_level().filter(|_| encrypted);
     Ok(Json(response))
