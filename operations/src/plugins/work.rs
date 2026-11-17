@@ -416,9 +416,15 @@ impl Operation for HoldsJob {
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
+        let holds = |row: Option<WorkRow>| row.is_some_and(|row| row.state != WorkState::Settled);
         Ok(match self.0.next(answer)? {
             Next::Call(ask) => Next::Call(ask),
-            Next::Done(row) => Next::Done(row.is_some_and(|row| row.state != WorkState::Settled)),
+            Next::Done(row) => Next::Done(holds(row)),
+            Next::Wait => Next::Wait,
+            Next::Then { output, calls } => Next::Then {
+                output: holds(output),
+                calls,
+            },
         })
     }
 }

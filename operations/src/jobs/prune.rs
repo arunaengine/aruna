@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::effects::{BlobEffect, Effect};
@@ -20,12 +21,12 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::JOB_PRUNE_PAGE;
+use super::executor::PayloadHandler;
 use super::store::query::{
     batch_delete, first_schedule_entry, job_entry_deletes, staging_row_deletes,
 };
 use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
-use crate::driver::{DriverContext, drive};
-use crate::plugins::work::holds_job;
+use crate::driver::DriverContext;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::prune_delete_entries;
 
@@ -36,12 +37,16 @@ pub struct JobPruneOutcome {
     pub next_due_after: Option<Duration>,
 }
 
-pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome, String> {
-    prune_job_page(context, JOB_PRUNE_PAGE).await
+pub async fn prune_job_batch(
+    context: &DriverContext,
+    handlers: &[Arc<dyn PayloadHandler>],
+) -> Result<JobPruneOutcome, String> {
+    prune_job_page(context, handlers, JOB_PRUNE_PAGE).await
 }
 
 async fn prune_job_page(
     context: &DriverContext,
+    handlers: &[Arc<dyn PayloadHandler>],
     page_size: usize,
 ) -> Result<JobPruneOutcome, String> {
     let storage = &context.storage_handle;
@@ -91,10 +96,12 @@ async fn prune_job_page(
                     if cleanup_pending(context, &record).await? {
                         continue;
                     }
-                    // A plugin work keeps its job until its row holds the summary.
-                    if let JobPayload::PluginWork(spec) = &record.payload
-                        && (drive(holds_job(spec), context).await).map_err(|error| error.0)?
-                    {
+                    // The domain that owns the payload may keep its job longer.
+                    let mut keep = false;
+                    for handler in handlers {
+                        keep = keep || handler.keeps_job(context, &record.payload).await?;
+                    }
+                    if keep {
                         continue;
                     }
                     let remaining = deletion_cap.saturating_sub(deletes.len()).max(1);
@@ -341,7 +348,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -379,7 +386,7 @@ mod tests {
             })
             .await;
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
 
@@ -401,7 +408,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 0);
@@ -425,7 +432,7 @@ mod tests {
         .await
         .unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
 
@@ -514,7 +521,7 @@ mod tests {
         .unwrap();
         assert_eq!(count(&context, JOB_ENTRY_KEYSPACE).await, 1);
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
         assert_eq!(outcome.pruned, 1);
@@ -536,7 +543,7 @@ mod tests {
             .unwrap();
         insert_job(&context, &cleanup_record(job_id)).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
 
@@ -566,7 +573,7 @@ mod tests {
         cleanup.finished_at_ms = Some(finished);
         insert_job(&context, &cleanup).await.unwrap();
 
-        let outcome = prune_job_batch(&test_context(storage.clone()))
+        let outcome = prune_job_batch(&test_context(storage.clone()), &[])
             .await
             .unwrap();
 

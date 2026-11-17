@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::task::TaskKey;
 
 use super::*;
 use crate::plugins::work::tests::sample_install;
@@ -29,8 +29,7 @@ fn config(expected: Option<u64>) -> InstallEntryConfig {
 }
 
 fn allowed(allowed: Result<bool, AuthorizationError>) -> IoResult {
-    let event = Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed });
-    IoResult::Event(Box::new(event))
+    IoResult::Child(ChildOutcome::new(allowed))
 }
 
 #[test]
@@ -70,14 +69,16 @@ fn conflict_stays_storage() {
 }
 
 #[test]
-fn wakes_drain() {
-    let mut wake = WakeDrain;
-    assert!(matches!(wake.first(), Ok(Next::Call(IoCall::Effect(_)))));
-    let scheduled = Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainSyncOutbox,
-        after: std::time::Duration::ZERO,
-    });
-    let answer = IoResult::Event(Box::new(scheduled));
-    assert_eq!(wake.next(answer), Ok(Next::Done(())));
-    assert!(wake.next(IoResult::Done).is_err());
+fn drains_after_commit() {
+    let config = config(None);
+    let install = config.install.clone();
+    let drain = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+    let finish = InstallEntryOperation::new(config).finish();
+    assert_eq!(
+        finish,
+        Next::Then {
+            output: install,
+            calls: drain
+        }
+    );
 }

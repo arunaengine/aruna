@@ -809,7 +809,8 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn prune_jobs(&self) {
-        let after = match prune_job_batch(&self.context).await {
+        let handlers = self.jobs_runtime.handlers();
+        let after = match prune_job_batch(&self.context, &handlers).await {
             Ok(outcome) if outcome.has_more => Duration::ZERO,
             Ok(outcome) => outcome
                 .next_due_after
