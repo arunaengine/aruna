@@ -120,3 +120,14 @@ pub(crate) async fn delete_local_watch(
         crate::notifications::watch::store::StoreWatchOperation::delete(owner, watch_id, None);
     drive(store, &context(storage)).await.map(|_| ())
 }
+
+/// A delivery from `node_id(2)` to `node_id(1)`, which holds the inbox of `user(1, 2)`.
+pub(crate) fn peer_input() -> crate::notifications::deliver::DeliverInput {
+    use crate::tests::locations::node_id;
+    crate::notifications::deliver::DeliverInput {
+        peer: node_id(2),
+        local: node_id(1),
+        local_realm: user(1, 2).realm_id,
+        now_ms: 1_000,
+    }
+}

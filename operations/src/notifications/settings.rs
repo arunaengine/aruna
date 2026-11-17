@@ -104,10 +104,9 @@ enum DeliveryState {
     Clear { secret: SecretBytes },
 }
 
-/// Decides one delivery from this node's current setting. When it is on, the management nodes
-/// are asked in config order to open its secret and the first answer is used. `managers` is
-/// `None` when the realm config could not be read, which counts as no answer. While no
-/// management node answers, the delay of the outbound backend grows per owner and channel.
+/// Decides one delivery from this node's current setting: when it is on, the managers are asked
+/// in config order to open its secret. `managers` is `None` when the realm config could not be
+/// read, which counts as no answer; while none answers, the stored delay grows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DeliveryOperation {
     record: NotificationRecord,

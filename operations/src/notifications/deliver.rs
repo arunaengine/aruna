@@ -179,19 +179,9 @@ impl Operation for DeliverBatchOperation {
 #[cfg(test)]
 mod call_tests {
     use super::*;
-    use crate::tests::locations::node_id;
-    use crate::tests::notifications::{record, user};
+    use crate::tests::notifications::{peer_input, record, user};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::notification::NotificationClass;
-
-    fn input() -> DeliverInput {
-        DeliverInput {
-            peer: node_id(2),
-            local: node_id(1),
-            local_realm: user(1, 2).realm_id,
-            now_ms: 1_000,
-        }
-    }
 
     fn batch() -> Vec<NotificationRecord> {
         vec![record(user(1, 2), NotificationClass::Direct, 1_000)]
@@ -206,8 +196,8 @@ mod call_tests {
 
     #[test]
     fn reads_realm_config() {
-        let mut deliver = DeliverBatchOperation::new(input(), batch());
-        let key = input().local_realm.as_bytes().to_vec();
+        let mut deliver = DeliverBatchOperation::new(peer_input(), batch());
+        let key = peer_input().local_realm.as_bytes().to_vec();
         assert_eq!(
             deliver.first(),
             Ok(Next::Call(read_row(REALM_CONFIG_KEYSPACE, key)))
@@ -218,11 +208,11 @@ mod call_tests {
 
     #[test]
     fn stray_batches_rejected() {
-        let mut empty = DeliverBatchOperation::new(input(), Vec::new());
+        let mut empty = DeliverBatchOperation::new(peer_input(), Vec::new());
         assert_eq!(rejected(empty.first()), "empty batch");
         let foreign = DeliverInput {
             local_realm: user(9, 2).realm_id,
-            ..input()
+            ..peer_input()
         };
         let mut deliver = DeliverBatchOperation::new(foreign, batch());
         assert!(rejected(deliver.first()).contains("foreign realm"));
@@ -240,7 +230,7 @@ mod call_tests {
     #[test]
     fn upsert_outcomes_answered() {
         let config = Box::new(RealmConfigDocument::new(user(1, 2).realm_id, Vec::new(), 3));
-        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        let mut deliver = DeliverBatchOperation::new(peer_input(), batch());
         deliver.state = DeliverState::Upsert(config.clone());
         let failed = child::<InboxWriteOutcome, _>(Err(InboxError::Conflict));
         assert_eq!(
@@ -248,7 +238,7 @@ mod call_tests {
             InboxError::Conflict.to_string()
         );
 
-        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        let mut deliver = DeliverBatchOperation::new(peer_input(), batch());
         deliver.state = DeliverState::Upsert(config);
         let outcome = InboxWriteOutcome {
             written: 1,
@@ -274,7 +264,7 @@ mod call_tests {
 
     #[test]
     fn unexpected_results_fail() {
-        let mut deliver = DeliverBatchOperation::new(input(), batch());
+        let mut deliver = DeliverBatchOperation::new(peer_input(), batch());
         deliver.first().unwrap();
         assert!(matches!(
             deliver.next(IoResult::Done),

@@ -105,21 +105,11 @@ impl Operation for RemoveWatchOperation {
 mod call_tests {
     use super::*;
     use crate::notifications::watch::digest::InterestError;
-    use crate::tests::locations::node_id;
-    use crate::tests::notifications::user;
+    use crate::tests::notifications::{peer_input, user};
     use aruna_core::calls::ChildOutcome;
 
-    fn input() -> DeliverInput {
-        DeliverInput {
-            peer: node_id(2),
-            local: node_id(1),
-            local_realm: user(1, 2).realm_id,
-            now_ms: 1_000,
-        }
-    }
-
     fn remove() -> RemoveWatchOperation {
-        RemoveWatchOperation::new(input(), user(1, 2), Ulid::from_parts(5, 5))
+        RemoveWatchOperation::new(peer_input(), user(1, 2), Ulid::from_parts(5, 5))
     }
 
     fn rejected(turn: AnswerTurn) -> String {
@@ -146,7 +136,8 @@ mod call_tests {
 
     #[test]
     fn foreign_realm_rejected() {
-        let mut operation = RemoveWatchOperation::new(input(), user(9, 2), Ulid::from_parts(5, 5));
+        let mut operation =
+            RemoveWatchOperation::new(peer_input(), user(9, 2), Ulid::from_parts(5, 5));
         assert!(rejected(operation.first()).contains("foreign realm"));
         let mut failed = remove();
         failed.first().unwrap();

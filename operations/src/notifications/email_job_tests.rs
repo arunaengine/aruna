@@ -158,7 +158,7 @@ fn unreadable_config_defers() {
 }
 
 #[test]
-fn off_or_excluded_skips() {
+fn unwanted_skips() {
     assert_eq!(
         decided(Some(profile(false)), Delivery::Skip).1,
         unsent_turn()
