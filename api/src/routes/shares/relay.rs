@@ -20,7 +20,7 @@ use s3s::dto::StreamingBlob;
 
 use super::visit::{range_unavailable, unavailable};
 use crate::error::{ServerError, ServerResult};
-use crate::mcp::data::ObjectOutput;
+use crate::lookup::ObjectOutput;
 use crate::s3::service::ArunaS3Service;
 use crate::server::state::ServerState;
 

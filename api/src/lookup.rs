@@ -11,8 +11,10 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::data::identity::content_id;
 use aruna_core::structs::storage::distribution::{ReadRoute, RouteError, WriteRoute};
 use aruna_operations::distribution::delegate::node_urls;
 use aruna_operations::distribution::guard::{
@@ -22,11 +24,13 @@ use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_operations::s3::object::list::ListedObject;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use serde::Serialize;
+use rmcp::schemars;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -521,6 +525,88 @@ pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
         GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
         GuardError::Conversion(error) => ServerError::InternalError(error.into()),
     }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
+pub struct ObjectOutput {
+    pub key: String,
+    /// The current version, so a selection can pin exactly what was listed.
+    pub version_id: String,
+    pub size: Option<u64>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+    pub referenced: bool,
+    /// Content address `https://w3id.org/aruna/data/<blake3>` to use as a File entity `@id`.
+    /// Absent for a reference whose bytes were never read.
+    pub content_id: Option<String>,
+    /// A link's binding, kept to check its target before the entry is shown; never sent.
+    #[serde(skip)]
+    pub link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
+}
+
+/// One listed object as the listing tools and the REST object listing show it.
+pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
+    let size = entry_size(object);
+    let etag = object
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_MD5))
+        .map(hex::encode)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.etag.clone())
+        });
+    let content_type = object
+        .source_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.content_type.clone());
+    let content_id = object
+        .location
+        .as_ref()
+        .and_then(|location| location.hashes.get(HASH_BLAKE3))
+        .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
+        .map(content_id);
+    let last_modified =
+        entry_time(object).map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+    ObjectOutput {
+        key: object.head.key.clone(),
+        version_id: object.version_id.to_string(),
+        size,
+        etag,
+        last_modified,
+        content_type,
+        referenced: object.referenced,
+        content_id,
+        link: object.link.clone(),
+    }
+}
+
+fn entry_size(object: &ListedObject) -> Option<u64> {
+    object
+        .location
+        .as_ref()
+        .map(|location| location.blob_size)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length)
+        })
+}
+
+fn entry_time(object: &ListedObject) -> Option<std::time::SystemTime> {
+    object
+        .version_created_at
+        .or(object.last_refresh)
+        .or_else(|| {
+            object
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_modified)
+        })
 }
 
 #[cfg(test)]
