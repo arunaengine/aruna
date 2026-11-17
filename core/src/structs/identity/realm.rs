@@ -838,6 +838,14 @@ impl RealmConfigDocument {
         self.nodes.iter().any(|node| node.node_id == node_id)
     }
 
+    /// The kind of `node_id` in this configuration; `None` when it is no member.
+    pub fn node_kind(&self, node_id: NodeId) -> Option<&RealmNodeKind> {
+        let node_id = node_id.to_string();
+        (self.nodes.iter())
+            .find(|node| node.node_id == node_id)
+            .map(|node| &node.kind)
+    }
+
     pub fn node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
         self.nodes
             .iter()

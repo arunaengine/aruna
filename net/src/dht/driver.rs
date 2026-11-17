@@ -21,7 +21,7 @@ use aruna_storage::storage::TransactionOwner;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::{RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -51,8 +51,8 @@ use super::storage::{
 };
 use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
-    current_trace_context, duration_ms, extract_trace_context, record_duration_ms, warn_iroh_phase,
-    warn_iroh_request,
+    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
+    record_selected_path, warn_iroh_phase, warn_iroh_request,
 };
 use aruna_core::time::unix_timestamp_secs;
 
@@ -2829,19 +2829,6 @@ fn validate_response(response: &DhtResponse) -> Result<(), DhtIoError> {
         }
         _ => Ok(()),
     }
-}
-
-fn record_selected_path(span: &Span, conn: &Connection) {
-    let paths = conn.paths();
-    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
-        return;
-    };
-
-    span.record(
-        "iroh.selected_address",
-        field::display(format!("{:?}", path.remote_addr())),
-    );
-    span.record("iroh.rtt_ms", duration_ms(path.rtt()));
 }
 
 async fn read_stream_request(

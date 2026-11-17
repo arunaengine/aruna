@@ -69,7 +69,7 @@ impl AdminDocumentState {
                 let value = (record.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
-                self.apply_node_value(event, vault_entry_path(entry), value);
+                self.apply_value(event, vault_entry_path(entry), value);
             }
             AdminDocumentOperation::ConfigSecretSet { name, info } => {
                 if info.as_ref().is_some_and(|info| info.name != *name) {
@@ -78,7 +78,7 @@ impl AdminDocumentState {
                 let value = (info.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
-                self.apply_node_value(event, secret_info_path(name), value);
+                self.apply_value(event, secret_info_path(name), value);
             }
             AdminDocumentOperation::ConfigPluginSet {
                 name,
@@ -94,7 +94,7 @@ impl AdminDocumentState {
                 let value = (plugin.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidPlugin)?;
-                self.apply_node_value(event, plugin_entry_path(name, version), value);
+                self.apply_value(event, plugin_entry_path(name, version), value);
             }
             AdminDocumentOperation::ConfigInstallSet {
                 install_id,
@@ -109,7 +109,7 @@ impl AdminDocumentState {
                 let value = (install.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidInstall)?;
-                self.apply_node_value(event, plugin_install_path(install_id), value);
+                self.apply_value(event, plugin_install_path(install_id), value);
             }
             AdminDocumentOperation::ConfigEmailSet { profile } => {
                 if profile.as_ref().is_some_and(|profile| !profile.valid()) {
@@ -118,7 +118,7 @@ impl AdminDocumentState {
                 let value = (profile.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidEmailProfile)?;
-                self.apply_node_value(event, CONFIG_EMAIL_PATH.to_string(), value);
+                self.apply_value(event, CONFIG_EMAIL_PATH.to_string(), value);
             }
             AdminDocumentOperation::ConfigReplicasSet { replicas } => {
                 let value = replicas_value(replicas);
@@ -127,7 +127,7 @@ impl AdminDocumentState {
             AdminDocumentOperation::NodeNameSet {
                 node_id,
                 display_name,
-            } => self.apply_node_value(event, node_name_path(node_id), display_name.clone()),
+            } => self.apply_value(event, node_name_path(node_id), display_name.clone()),
             AdminDocumentOperation::NodePlaceSet { node_id, place } => {
                 if place.as_ref().is_some_and(|place| !place.valid()) {
                     return Err(AdminDocumentError::InvalidNodePlace);
@@ -135,7 +135,7 @@ impl AdminDocumentState {
                 let value = (place.as_ref().map(serde_json::to_string))
                     .transpose()
                     .map_err(|_| AdminDocumentError::InvalidNodePlace)?;
-                self.apply_node_value(event, node_place_path(node_id), value);
+                self.apply_value(event, node_place_path(node_id), value);
             }
             AdminDocumentOperation::ConfigPoliciesSet { policies } => {
                 self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
