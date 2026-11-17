@@ -5,11 +5,7 @@
 
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, JobRecordFrame};
 use aruna_core::structs::execution::job::{
-    ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
-    JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
@@ -18,12 +14,8 @@ use tracing::{debug, warn};
 use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::reservation::ReleaseExecutionOperation;
-use super::witness::arm_family;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
-use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::store::state::read_job_record;
 
 /// Spacing between retries of a terminal publication that stayed pending.
 pub const SETTLE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -55,9 +47,6 @@ fn chain_tip(updates: &[&ExecutionUpdate], root: [u8; 32]) -> Option<(u64, [u8; 
     Some((next, previous))
 }
 
-/// Publishes one state of the local execution. The sequence and the previous
-/// digest are derived from the records already stored, so a replay of the same
-/// state is idempotent and a lost publication never breaks the chain.
 pub async fn publish_state(
     context: &DriverContext,
     chain: &ExecutionChain,
@@ -65,156 +54,6 @@ pub async fn publish_state(
     result: Option<PhysicalExecutionResult>,
     observed_at_ms: u64,
 ) -> bool {
-    let Some(net) = context.net_handle.as_ref() else {
-        warn!(
-            job_id = %chain.job_id,
-            execution_id = %chain.execution_id,
-            "Execution update needs a net handle; publication abandoned"
-        );
-        return false;
-    };
-    let local = net.node_id();
-    if chain.executor_node_id != local {
-        warn!(
-            job_id = %chain.job_id,
-            execution_id = %chain.execution_id,
-            executor = %chain.executor_node_id,
-            "Only the receipted executor may publish this execution"
-        );
-        return false;
-    }
-    // The chain is extended only from evidence proven complete: the receipt
-    // that authorized it, plus every stored update of this execution.
-    let receipts = drive(
-        LoadFamilyOperation::kind(chain.family, JobRecordKind::Receipt),
-        context,
-    )
-    .await
-    .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
-    .ok();
-    let receipt = receipts.and_then(|records| receipt_in(&records, chain.execution_id));
-    let Some(receipt) = receipt else {
-        warn!(
-            job_id = %chain.job_id,
-            execution_id = %chain.execution_id,
-            "Execution receipt is no longer readable; publication deferred"
-        );
-        return false;
-    };
-    let Ok(root) = receipt.digest() else {
-        warn!(execution_id = %chain.execution_id, "Execution receipt digest failed");
-        return false;
-    };
-    let records = match drive(
-        LoadFamilyOperation::kind(chain.family, JobRecordKind::Update),
-        context,
-    )
-    .await
-    {
-        Ok(records) => records,
-        Err(error) => {
-            warn!(error = %error, "Execution update read is incomplete; publication deferred");
-            return false;
-        }
-    };
-    let mine: Vec<&ExecutionUpdate> = records
-        .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Update(update) if update.execution_id == chain.execution_id => {
-                Some(update.as_ref())
-            }
-            _ => None,
-        })
-        .collect();
-    if mine.iter().any(|update| update.state == state) {
-        return true;
-    }
-    let Some((sequence, previous)) = chain_tip(&mine, root) else {
-        warn!(
-            job_id = %chain.job_id,
-            execution_id = %chain.execution_id,
-            "Execution update chain is not contiguous"
-        );
-        return false;
-    };
-    let update = ExecutionUpdate {
-        execution_id: chain.execution_id,
-        submission_id: chain.family.submission_id,
-        request_digest: chain.family.request_digest,
-        executor_node_id: local,
-        sequence,
-        previous_digest: previous,
-        state,
-        observed_at_ms,
-        result,
-    };
-    let envelope = match JobRecordEnvelope::signed_with(
-        *net.realm_id(),
-        JobFamilyRecord::Update(Box::new(update)),
-        local,
-        |message| net.sign(message),
-    ) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            warn!(error = %error, "Execution update signing failed");
-            return false;
-        }
-    };
-    let Ok(frame) = JobRecordFrame::new(envelope) else {
-        warn!(execution_id = %chain.execution_id, "Execution update exceeds the record bounds");
-        return false;
-    };
-    let appended = drive(
-        AppendRecordOperation::new(AppendRecordConfig {
-            realm_id: *net.realm_id(),
-            local_node_id: local,
-            record: frame,
-            local: None,
-            origin: RecordOrigin::Local,
-            now_ms: unix_timestamp_millis(),
-        }),
-        context,
-    )
-    .await;
-    match appended {
-        Ok(outcome)
-            if matches!(
-                outcome.admission,
-                Admission::Authentic | Admission::Duplicate
-            ) =>
-        {
-            debug!(state = state.name(), "Execution update published");
-            // A duplicate is a retry of a stored state; only a new record is a change.
-            if matches!(outcome.admission, Admission::Authentic) {
-                context.notify_dashboard_change();
-            }
-            // An infrastructure error ends this execution without deciding the
-            // job, so the family must be planned again from here too.
-            if state == PhysicalExecutionState::Error {
-                arm_family(context, chain.family, unix_timestamp_millis()).await;
-            }
-            super::outbox::timers::kick(context).await;
-            true
-        }
-        Ok(outcome) => {
-            warn!(
-                job_id = %chain.job_id,
-                execution_id = %chain.execution_id,
-                admission = ?outcome.admission,
-                "Execution update was not admitted"
-            );
-            false
-        }
-        Err(error) => {
-            warn!(
-                job_id = %chain.job_id,
-                execution_id = %chain.execution_id,
-                error = %error,
-                "Execution update append failed"
-            );
-            false
-        }
-    }
 }
 
 /// Publishes a non-terminal state of a receipted execution. A job with no
@@ -230,79 +69,15 @@ pub async fn publish_progress(
     publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
 }
 
-/// Publishes the terminal state of a receipted execution and releases its
-/// reservation. Success names the digest of the output record stored before it,
-/// so a success can never be projected without its exact outputs.
 pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
-    let Some(state) = terminal_state(record) else {
-        return true;
-    };
-    let held = drive(HeldReservations::of_job(record.job_id), context).await;
-    let reservation = match held.map(|held| held.into_iter().next()) {
-        Ok(Some(reservation)) => reservation,
-        // No reservation is a purely local execution: it owes nothing here.
-        Ok(None) => return true,
-        Err(error) => {
-            warn!(
-                job_id = %record.job_id,
-                error = %error,
-                "Execution reservation read failed; terminal publication deferred"
-            );
-            return false;
-        }
-    };
-    let chain =
-        ExecutionChainOperation::of_execution(reservation.logical_job_id, reservation.execution_id);
-    let Ok(Some(chain)) = drive(chain, context).await else {
-        warn!(
-            job_id = %record.job_id,
-            execution_id = %reservation.execution_id,
-            "Terminal publication deferred: the receipt chain is unresolved"
-        );
-        return false;
-    };
-    let (stdout, stderr) = log_tails(record.result.as_ref());
-    let result = PhysicalExecutionResult {
-        exit_code: exit_code(record.result.as_ref()),
-        output_digest: output_digest(record.result.as_ref()),
-        message: record
-            .last_error
-            .as_ref()
-            .and_then(|error| ResultMessage::new(error.message.clone()).ok()),
-        stdout,
-        stderr,
-    };
-    let observed_at_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-    if !publish_state(context, &chain, state, Some(result), observed_at_ms).await {
-        return false;
-    }
-    if let Err(error) = drive(ReleaseExecutionOperation::new(chain.execution_id), context).await {
-        warn!(error = %error, "Execution reservation release failed");
-        return false;
-    }
-    true
 }
 
 /// Retries terminal publication and capacity release for every durable local
 /// terminal execution that still has a reservation. `true` means at least one
 /// obligation stayed pending, so the caller must run this again.
 pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
-    let mut pending = false;
-    let held = drive(HeldReservations::all(), context).await;
-    for reservation in held.map_err(|error| error.to_string())? {
-        let Some(record) = read_job_record(context, reservation.job_id, None).await? else {
-            continue;
-        };
-        if record.is_settled() && !publish_terminal(context, &record).await {
-            warn!(
-                job_id = %reservation.job_id,
-                execution_id = %reservation.execution_id,
-                "Terminal obligation remains pending; the reservation stays held"
-            );
-            pending = true;
         }
     }
-    Ok(pending)
 }
 
 fn terminal_state(record: &JobRecord) -> Option<PhysicalExecutionState> {
