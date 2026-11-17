@@ -66,7 +66,7 @@ use crate::device::sync::{
 };
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::groups::backends::remove::remove_drained_backends;
+use crate::groups::backends::drain::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::{OUTBOX_RETRY_AFTER, drain_family_outbox};
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};

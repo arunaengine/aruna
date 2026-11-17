@@ -4,6 +4,7 @@
 
 pub mod create;
 pub mod disable;
+pub mod drain;
 pub mod query;
 pub mod remove;
 pub mod replace;
