@@ -9,7 +9,7 @@ use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEff
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::operation::{HoldScope, Operation, SubOperation};
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -948,6 +948,17 @@ pub(crate) fn drive_suboperation<'a>(
     })
 }
 
+/// Waits for the backend hold of `scope`; the run keeps it until it returns or is dropped. A
+/// node without the backend that owns the scope has nothing to exclude.
+async fn take_hold(
+    context: &DriverContext,
+    scope: Option<HoldScope>,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    match scope? {
+        HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+    }
+}
+
 /// Drives an operation under one wall-clock deadline. Cleanup after expiry is
 /// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
@@ -961,6 +972,15 @@ pub async fn drive_until<O: Operation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
+    let hold = take_hold(context, operation.hold_scope());
+    let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
+        warn!(
+            operation = %type_name::<O>(),
+            "Operation deadline expired while it waited for its backend hold"
+        );
+        let _ = operation.abort();
+        return operation.finalize();
+    };
     let mut run = ParentRun(&mut operation);
     let mut state = drive_effects(
         &mut run,
@@ -1026,6 +1046,7 @@ pub async fn drive<O: Operation>(
         "Starting operation"
     );
 
+    let _hold = take_hold(context, operation.hold_scope()).await;
     let mut run = ParentRun(&mut operation);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.

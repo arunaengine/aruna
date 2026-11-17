@@ -6,6 +6,14 @@ use std::any::Any;
 
 use crate::{events::Event, types::Effects};
 
+/// A backend scope at most one operation holds at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldScope {
+    /// The document reconcile of `net`, which also excludes its shard membership changes and
+    /// topic evictions.
+    DocumentReconcile,
+}
+
 /// One driven operation: `start` returns the first effects, `step` consumes each
 /// dispatched event, `is_complete` ends the stream, `finalize` reads the outcome,
 /// `abort` requests cleanup. Effects are requests the runner dispatches.
@@ -33,6 +41,12 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         Self: Sized,
     {
         false
+    }
+
+    /// The backend scope this operation holds from before its first effect until it ends, so
+    /// no two operations with the same scope overlap. Only a top-level drive takes it.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        None
     }
 
     /// Whether an error is a lost transaction conflict that a fresh run of the operation may
