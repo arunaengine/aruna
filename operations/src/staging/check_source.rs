@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{Event, StagingSourceEvent};
@@ -28,7 +27,7 @@ pub enum CheckSourceError {
     UnexpectedEvent {
         state: CheckSourceState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("Check staging source failed")]
     CheckFailed,
@@ -84,7 +83,7 @@ impl Operation for CheckSourceOperation {
             (_, event) => self.emit_error(CheckSourceError::UnexpectedEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::CheckResult)",
-                got: describe_event(&event),
+                got: event.label(),
             }),
         }
     }

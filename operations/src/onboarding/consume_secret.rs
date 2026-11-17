@@ -77,7 +77,7 @@ pub enum ConsumeSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -112,7 +112,7 @@ impl Operation for ConsumeSecretOperation {
 
         match &self.state {
             ConsumeSecretState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -141,7 +141,7 @@ impl Operation for ConsumeSecretOperation {
             }
             ConsumeSecretState::ReadRecords { txn_id } => {
                 let txn_id = txn_id.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return fail(
                         self,
@@ -158,7 +158,7 @@ impl Operation for ConsumeSecretOperation {
                         ConsumeSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "record and state batch read result",
-                            got: format!("{values:?}"),
+                            got: "a batch of another length",
                         },
                     );
                 };
@@ -274,7 +274,7 @@ impl Operation for ConsumeSecretOperation {
             ConsumeSecretState::WriteConsumed { txn_id, record } => {
                 let txn_id = txn_id.clone();
                 let record = record.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
@@ -298,7 +298,7 @@ impl Operation for ConsumeSecretOperation {
             } => {
                 let record = record.clone();
                 let consumed_now = consumed_now.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,

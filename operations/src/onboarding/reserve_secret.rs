@@ -91,7 +91,7 @@ pub enum ReserveSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -241,7 +241,7 @@ impl Operation for ReserveSecretOperation {
 
         match &self.state {
             ReserveSecretState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -270,7 +270,7 @@ impl Operation for ReserveSecretOperation {
             }
             ReserveSecretState::ReadRecords { txn_id } => {
                 let txn_id = txn_id.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return fail(
                         self,
@@ -287,7 +287,7 @@ impl Operation for ReserveSecretOperation {
                         ReserveSecretError::UnexpectedEvent {
                             state: format!("{:?}", self.state),
                             expected: "record and state batch read result",
-                            got: format!("{values:?}"),
+                            got: "a batch of another length",
                         },
                     );
                 };
@@ -323,7 +323,7 @@ impl Operation for ReserveSecretOperation {
                 let txn_id = txn_id.clone();
                 let record = record.clone();
                 let owner = owner.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
@@ -379,7 +379,7 @@ impl Operation for ReserveSecretOperation {
                 let cap = cap.clone();
                 let enrolled = enrolled.clone();
                 let pending = pending.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -422,7 +422,7 @@ impl Operation for ReserveSecretOperation {
             ReserveSecretState::WriteReserved { txn_id, record } => {
                 let txn_id = txn_id.clone();
                 let record = record.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
@@ -441,7 +441,7 @@ impl Operation for ReserveSecretOperation {
             }
             ReserveSecretState::CommitTransaction { record } => {
                 let record = record.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,

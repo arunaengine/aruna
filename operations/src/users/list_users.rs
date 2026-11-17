@@ -63,7 +63,7 @@ pub enum ListUsersError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("list users did not finish")]
     NotFinished,
@@ -94,7 +94,7 @@ impl ListUsersOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ListUsersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -124,7 +124,7 @@ impl ListUsersOperation {
     }
 
     fn handle_auth_result(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })",
@@ -143,7 +143,7 @@ impl ListUsersOperation {
     }
 
     fn handle_list_users(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -225,7 +225,7 @@ impl Operation for ListUsersOperation {
             ListUsersState::Auth => self.handle_auth_result(event),
             ListUsersState::ListUsers => self.handle_list_users(event),
             ListUsersState::Init | ListUsersState::Finish | ListUsersState::Error => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 self.unexpected_event("no event in a terminal state", got)
             }
         }

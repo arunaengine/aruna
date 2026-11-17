@@ -60,7 +60,7 @@ pub enum DeleteSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -95,7 +95,7 @@ impl Operation for DeleteSecretOperation {
 
         match &self.state {
             DeleteSecretState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -116,7 +116,7 @@ impl Operation for DeleteSecretOperation {
             }
             DeleteSecretState::ReadRecord { txn_id } => {
                 let txn_id = txn_id.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
@@ -159,7 +159,7 @@ impl Operation for DeleteSecretOperation {
             DeleteSecretState::DeleteRecord { txn_id, record } => {
                 let txn_id = txn_id.clone();
                 let record = record.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return fail(
                         self,
@@ -178,7 +178,7 @@ impl Operation for DeleteSecretOperation {
             }
             DeleteSecretState::CommitTransaction { record } => {
                 let record = record.clone();
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,

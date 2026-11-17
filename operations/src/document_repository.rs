@@ -154,7 +154,7 @@ pub enum GetConfigError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -188,7 +188,7 @@ impl GetConfigOperation {
     fn unexpected_event(
         &mut self,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> aruna_core::types::Effects {
         let state = format!("{:?}", self.state);
         self.fail(GetConfigError::UnexpectedEvent {
@@ -225,7 +225,7 @@ impl Operation for GetConfigOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
+                other => self.unexpected_event("storage read result", other.label()),
             },
             GetConfigState::Finish | GetConfigState::Error | GetConfigState::Init => smallvec![],
         }
@@ -352,7 +352,7 @@ impl GetGroupOperation {
         &mut self,
         state: GetGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
@@ -374,7 +374,7 @@ impl GetGroupOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 GetGroupState::StartTransaction,
@@ -389,7 +389,7 @@ impl GetGroupOperation {
     }
 
     fn handle_get_group(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 GetGroupState::GetGroup,
@@ -408,7 +408,7 @@ impl GetGroupOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 GetGroupState::GetAuthDoc,
@@ -429,7 +429,7 @@ impl GetGroupOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 GetGroupState::CommitTransaction,
@@ -479,7 +479,7 @@ pub enum GetGroupError {
     UnexpectedEvent {
         state: GetGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -514,7 +514,7 @@ impl Operation for GetGroupOperation {
             // A terminal state owns no transaction to clean up, so this fails
             // without the abort effects `unexpected_event` would emit.
             GetGroupState::Init | GetGroupState::Finish | GetGroupState::Error => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let state = self.state;
                 self.fail(GetGroupError::UnexpectedEvent {
                     state,

@@ -58,7 +58,7 @@ pub enum ListNotificationsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("list notifications did not finish")]
     NotFinished,
@@ -87,7 +87,7 @@ impl ListNotificationsOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ListNotificationsError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -96,7 +96,7 @@ impl ListNotificationsOperation {
     }
 
     fn handle_list(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
         };

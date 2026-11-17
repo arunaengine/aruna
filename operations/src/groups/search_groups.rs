@@ -58,7 +58,7 @@ pub enum SearchGroupsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("search groups did not finish")]
     NotFinished,
@@ -89,7 +89,7 @@ impl SearchGroupsOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(SearchGroupsError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -120,7 +120,7 @@ impl SearchGroupsOperation {
     }
 
     fn handle_search_groups(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,

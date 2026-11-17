@@ -4,9 +4,10 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::backoff::conflict_backoff;
+use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::storage::routing::NodeRouting;
@@ -14,11 +15,15 @@ use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use std::any::{type_name, type_name_of_val};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
@@ -96,6 +101,8 @@ impl std::fmt::Debug for DriverContext {
 pub(crate) const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRACKED_TRANSACTIONS: usize = 32;
+/// Reruns after a transaction conflict before [`drive_retry`] returns the conflict.
+const CONFLICT_RETRIES: usize = 3;
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
@@ -415,6 +422,21 @@ impl DeadlineAbort {
     }
 }
 
+/// Stops normal effects after the run deadline and queues the operation's cleanup when the
+/// policy allows it.
+fn expire(
+    executable: &mut dyn Drive,
+    queue: &mut VecDeque<Effect>,
+    state: &mut RunState,
+    abort_policy: DeadlineAbort,
+) {
+    state.mark_expired();
+    queue.clear();
+    if abort_policy.allows(state.committed, executable.abort_after_commit()) {
+        extend_unblocked(queue, executable.abort(), &state.tracker);
+    }
+}
+
 /// How often the effect loop re-reads the deadline. The suboperation loop
 /// re-checks every effect; the parent marks expiry once and then dispatches its
 /// cleanup effects under the cleanup deadline.
@@ -487,6 +509,267 @@ impl Drive for SubRun<'_> {
     }
 }
 
+/// Whether a group refuses `effect`: storage must see transaction work in emission order, and a
+/// group runs only plain effects and sub operations.
+fn refused_member(effect: &Effect) -> bool {
+    match effect {
+        Effect::Group(_) => true,
+        Effect::Storage(storage_effect) => match storage_effect {
+            StorageEffect::StartTransaction { .. }
+            | StorageEffect::CommitTransaction { .. }
+            | StorageEffect::AbortTransaction { .. }
+            | StorageEffect::AddUsage { .. }
+            | StorageEffect::AddCounters { .. }
+            | StorageEffect::BeginUsageRebuild { .. }
+            | StorageEffect::FinishUsageRebuild { .. } => true,
+            StorageEffect::Read { txn_id, .. }
+            | StorageEffect::BatchRead { txn_id, .. }
+            | StorageEffect::Write { txn_id, .. }
+            | StorageEffect::BatchWrite { txn_id, .. }
+            | StorageEffect::Delete { txn_id, .. }
+            | StorageEffect::BatchDelete { txn_id, .. }
+            | StorageEffect::Iter { txn_id, .. }
+            | StorageEffect::IterRange { txn_id, .. }
+            | StorageEffect::Last { txn_id, .. }
+            | StorageEffect::VaultWrite { txn_id, .. }
+            | StorageEffect::VaultRead { txn_id, .. }
+            | StorageEffect::VaultDelete { txn_id, .. } => txn_id.is_some(),
+            StorageEffect::SyncAll => false,
+        },
+        _ => false,
+    }
+}
+
+/// Starts one effect with an optional deadline and answers its event.
+type Dispatch<'a> = dyn Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + Sync + 'a;
+
+/// Dispatches one effect through the adapters, as the effect loop does for a single effect.
+fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> {
+    Box::new(move |effect, until| {
+        Box::pin(effect_adapters::dispatch_effect_until(
+            effect, context, depth, until,
+        ))
+    })
+}
+
+/// When group members stop: at `at` every member still running ends as unfinished, except a
+/// managed one while `protect_managed` holds, as for a single effect.
+#[derive(Clone, Copy)]
+struct MemberStop {
+    at: Option<Instant>,
+    protect_managed: bool,
+}
+
+/// The members of one group: waiting ones in emission order and at most `limit` running. Each
+/// started member keeps its backend hold in the run state until the parent operation ends.
+struct GroupRun<'a> {
+    dispatch: Box<Dispatch<'a>>,
+    context: &'a DriverContext,
+    stop: MemberStop,
+    limit: usize,
+    added: usize,
+    waiting: VecDeque<(usize, Effect)>,
+    running: FuturesUnordered<BoxFuture<'a, (usize, GroupResult)>>,
+}
+
+impl<'a> GroupRun<'a> {
+    fn new(
+        dispatch: Box<Dispatch<'a>>,
+        context: &'a DriverContext,
+        limit: usize,
+        stop: MemberStop,
+    ) -> Self {
+        Self {
+            dispatch,
+            context,
+            stop,
+            limit: limit.max(1),
+            added: 0,
+            waiting: VecDeque::new(),
+            running: FuturesUnordered::new(),
+        }
+    }
+
+    /// Queues members; their indices continue the emission order.
+    fn add(&mut self, members: impl IntoIterator<Item = Effect>) {
+        for member in members {
+            self.waiting.push_back((self.added, member));
+            self.added += 1;
+        }
+    }
+
+    /// Starts waiting members while fewer than `limit` run.
+    fn fill(&mut self, holds: &mut Vec<GroupHold>) {
+        while self.running.len() < self.limit
+            && let Some((index, member)) = self.waiting.pop_front()
+        {
+            let run = self.start(index, member, holds);
+            self.running.push(run);
+        }
+    }
+
+    fn start(
+        &self,
+        index: usize,
+        member: Effect,
+        holds: &mut Vec<GroupHold>,
+    ) -> BoxFuture<'a, (usize, GroupResult)> {
+        if refused_member(&member) {
+            warn!(
+                index,
+                "Effect group refused a transaction effect or nested group"
+            );
+            return Box::pin(std::future::ready((index, GroupResult::Refused)));
+        }
+        let protected = self.stop.protect_managed && managed_effect(&member);
+        let cut_at = self.stop.at.filter(|_| !protected);
+        if cut_at.is_some_and(|at| at <= Instant::now()) {
+            return Box::pin(std::future::ready((index, GroupResult::Unfinished)));
+        }
+        hold_backends(self.context, &member, holds);
+        let dispatch = (self.dispatch)(member, self.stop.at);
+        Box::pin(async move {
+            let result = match cut_at {
+                Some(at) => tokio::time::timeout_at(at, dispatch).await.ok(),
+                None => Some(dispatch.await),
+            };
+            let result = result.map_or(GroupResult::Unfinished, |event| {
+                GroupResult::Done(Box::new(event))
+            });
+            (index, result)
+        })
+    }
+
+    /// The next finished member; `None` once no member runs.
+    async fn next(&mut self) -> Option<(usize, GroupResult)> {
+        self.running.next().await
+    }
+
+    /// Starts nothing more and waits for the started members, which always finish or stop at
+    /// their deadline, like a single effect.
+    async fn drain(&mut self) {
+        self.waiting.clear();
+        while self.next().await.is_some() {}
+    }
+}
+
+/// How a group ended for the effect loop.
+enum GroupEnd {
+    /// The operation saw the group's last event and asked for these effects.
+    Stepped(Effects),
+    /// The run deadline cut members off; the loop runs the expiry path.
+    Expired,
+    /// The cleanup deadline cut members off; cleanup stops.
+    CleanupExpired,
+}
+
+/// Runs one group for the effect loop and steps the operation with its events. Members stop at
+/// the cleanup deadline after expiry, otherwise at the earlier of the run and group deadline.
+async fn run_group<'a>(
+    executable: &mut dyn Drive,
+    group: EffectGroup,
+    dispatch: Box<Dispatch<'a>>,
+    context: &'a DriverContext,
+    deadline: Option<tokio::time::Instant>,
+    state: &mut RunState,
+) -> GroupEnd {
+    let EffectGroup {
+        members,
+        limit,
+        form,
+    } = group;
+    let stop = match (state.expired, form) {
+        (true, _) => MemberStop {
+            at: state.cleanup_deadline,
+            protect_managed: false,
+        },
+        (false, GroupForm::All { deadline: wait }) => MemberStop {
+            at: [
+                deadline,
+                wait.and_then(|wait| Instant::now().checked_add(wait)),
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
+            protect_managed: true,
+        },
+        (false, GroupForm::Window) => MemberStop {
+            at: deadline,
+            protect_managed: true,
+        },
+    };
+    let mut run = GroupRun::new(dispatch, context, limit, stop);
+    run.add(members);
+    trace!(members = run.added, "Running effect group");
+    let expired = state.expired;
+    let cut_end = match expired {
+        true => GroupEnd::CleanupExpired,
+        false => GroupEnd::Expired,
+    };
+    if let GroupForm::Window = form {
+        return run_window(executable, &mut run, &mut state.holds, cut_end).await;
+    }
+    let results = run_all(&mut run, &mut state.holds).await;
+    // An unfinished member past the group deadline is a result; past the run deadline the
+    // run has expired, as after a single effect that timed out.
+    let unfinished = results
+        .iter()
+        .any(|result| matches!(result, GroupResult::Unfinished));
+    if unfinished && (expired || deadline.is_some_and(|deadline| deadline <= Instant::now())) {
+        return cut_end;
+    }
+    match executable.is_complete() {
+        true => GroupEnd::Stepped(Effects::new()),
+        false => GroupEnd::Stepped(executable.step(Event::Group(GroupEvent::Finished { results }))),
+    }
+}
+
+/// Runs every member of an all-at-once group and returns the results in emission order.
+async fn run_all(run: &mut GroupRun<'_>, holds: &mut Vec<GroupHold>) -> Vec<GroupResult> {
+    let mut results: Vec<GroupResult> = std::iter::repeat_with(|| GroupResult::Unfinished)
+        .take(run.added)
+        .collect();
+    loop {
+        run.fill(holds);
+        let Some((index, result)) = run.next().await else {
+            return results;
+        };
+        if let Some(slot) = results.get_mut(index) {
+            *slot = result;
+        }
+    }
+}
+
+/// Steps the operation with each window member result as it arrives and adds the effects it
+/// returns as new members. Once no member runs or waits, steps it with `GroupEvent::Closed`.
+/// A complete operation is not stepped again, but the members it asked for still run.
+async fn run_window(
+    executable: &mut dyn Drive,
+    run: &mut GroupRun<'_>,
+    holds: &mut Vec<GroupHold>,
+    cut_end: GroupEnd,
+) -> GroupEnd {
+    loop {
+        run.fill(holds);
+        let Some((index, result)) = run.next().await else {
+            break;
+        };
+        // Window members stop only at the run or cleanup deadline.
+        if matches!(result, GroupResult::Unfinished) {
+            run.drain().await;
+            return cut_end;
+        }
+        if !executable.is_complete() {
+            let effects = executable.step(Event::Group(GroupEvent::Member { index, result }));
+            run.add(effects);
+        }
+    }
+    match executable.is_complete() {
+        true => GroupEnd::Stepped(Effects::new()),
+        false => GroupEnd::Stepped(executable.step(Event::Group(GroupEvent::Closed))),
+    }
+}
+
 /// Runs the effect queue to completion or to its deadline and returns the run
 /// state for finalization. Only a parent names `expiry_log`, so suboperation
 /// expiry stays quiet.
@@ -519,12 +802,31 @@ async fn drive_effects(
                 && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
                 && !managed_effect(&effect)
             {
-                state.mark_expired();
-                queue.clear();
                 // Suppress aborts after commit. Dropping `state.holds` releases
                 // backend reservations.
-                if abort_policy.allows(state.committed, executable.abort_after_commit()) {
-                    extend_unblocked(&mut queue, executable.abort(), &state.tracker);
+                expire(executable, &mut queue, &mut state, abort_policy);
+                continue;
+            }
+            if let Effect::Group(group) = effect {
+                let dispatch = adapter_dispatch(context, depth);
+                let run = run_group(executable, group, dispatch, context, deadline, &mut state);
+                match Box::pin(run).await {
+                    GroupEnd::Stepped(effects) => {
+                        extend_unblocked(&mut queue, effects, &state.tracker);
+                    }
+                    GroupEnd::Expired => {
+                        if let Some(operation) = expiry_log {
+                            warn!(
+                                operation = %operation,
+                                "Operation deadline expired in an effect group; running its abort path"
+                            );
+                        }
+                        expire(executable, &mut queue, &mut state, abort_policy);
+                    }
+                    GroupEnd::CleanupExpired => {
+                        queue.clear();
+                        break;
+                    }
                 }
                 continue;
             }
@@ -564,28 +866,20 @@ async fn drive_effects(
                     match tokio::time::timeout_at(deadline, dispatch).await {
                         Ok(event) => event,
                         Err(_) => {
-                            state.mark_expired();
                             if let Some(operation) = expiry_log {
                                 warn!(
                                     operation = %operation,
                                     "Operation deadline expired; running its abort path"
                                 );
                             }
-                            queue.clear();
                             if commit {
+                                state.mark_expired();
+                                queue.clear();
                                 Event::Storage(StorageEvent::Error {
                                     error: StorageError::CommitFailed,
                                 })
                             } else {
-                                if abort_policy
-                                    .allows(state.committed, executable.abort_after_commit())
-                                {
-                                    extend_unblocked(
-                                        &mut queue,
-                                        executable.abort(),
-                                        &state.tracker,
-                                    );
-                                }
+                                expire(executable, &mut queue, &mut state, abort_policy);
                                 continue;
                             }
                         }
@@ -775,25 +1069,55 @@ pub async fn drive<O: Operation>(
     result
 }
 
+/// Drives a fresh operation from `build` and, after an error that [`Operation::is_conflict`]
+/// names, waits a backoff seeded by `seed` and drives a new one, at most [`CONFLICT_RETRIES`]
+/// times. The same seed gives the same waits; distinct seeds spread conflicting writers out.
+pub async fn drive_retry<O: Operation>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+) -> Result<O::Output, O::Error> {
+    let mut attempt = 0;
+    loop {
+        match drive(build(), context).await {
+            Err(error) if O::is_conflict(&error) && attempt < CONFLICT_RETRIES => {
+                tokio::time::sleep(conflict_backoff(attempt, seed)).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DeadlineAbort, DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect,
-        TransactionState, TransactionTracker, drive, extend_unblocked,
+        DeadlineAbort, DriverContext, GroupEnd, GroupRun, Instant, MAX_TRACKED_TRANSACTIONS,
+        MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker, drive,
+        drive_retry, extend_unblocked, run_all, run_window,
     };
-    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::effects::{
+        BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
+    };
     use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{
+        BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
+        SubOperationEvent,
+    };
     use aruna_core::operation::{Operation, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
+    use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[derive(Debug, PartialEq)]
@@ -2290,5 +2614,397 @@ mod test {
         assert!(matches!(effect, StorageEffect::Read { key_space, .. } if key_space == "bulk"));
         assert!(receivers.foreground.try_recv().is_err());
         pending.abort();
+    }
+
+    /// Members in flight now and at most, as a fake dispatch counts them.
+    #[derive(Default)]
+    struct Flight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Answers a storage read the seconds its first key byte names after it starts, and a
+    /// reservation release after three seconds; tests run it on paused time only.
+    fn slow_dispatch<'a>(
+        flight: Arc<Flight>,
+    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + Sync {
+        move |effect, _| {
+            let flight = flight.clone();
+            Box::pin(async move {
+                let now = flight.now.fetch_add(1, SeqCst) + 1;
+                flight.peak.fetch_max(now, SeqCst);
+                let (seconds, event) = match effect {
+                    Effect::Storage(StorageEffect::Read { key, .. }) => (
+                        u64::from(key[0]),
+                        Event::Storage(StorageEvent::ReadResult { key, value: None }),
+                    ),
+                    Effect::Blob(BlobEffect::ReleaseReservation { id }) => {
+                        (3, Event::Blob(BlobEvent::ReservationReleased { id }))
+                    }
+                    other => panic!("unexpected member {other:?}"),
+                };
+                tokio::time::sleep_until(Instant::now() + Duration::from_secs(seconds)).await;
+                flight.now.fetch_sub(1, SeqCst);
+                event
+            })
+        }
+    }
+
+    fn slow_read(seconds: u8) -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from([seconds]),
+            txn_id: None,
+        })
+    }
+
+    fn read_seconds(result: &GroupResult) -> Option<u8> {
+        match result {
+            GroupResult::Done(event) => match event.as_ref() {
+                Event::Storage(StorageEvent::ReadResult { key, .. }) => Some(key[0]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A context whose storage has no worker, for groups that only use a fake dispatch.
+    fn bare_context() -> DriverContext {
+        let (storage_handle, _) = storage::StorageHandle::new();
+        DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    const UNBOUNDED: MemberStop = MemberStop {
+        at: None,
+        protect_managed: true,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn group_waits_slowest() {
+        let context = bare_context();
+        let flight = Arc::new(Flight::default());
+        let dispatch = Box::new(slow_dispatch(flight.clone()));
+        let mut run = GroupRun::new(dispatch, &context, 8, UNBOUNDED);
+        run.add([slow_read(3), slow_read(1), slow_read(2)]);
+        let started = Instant::now();
+        let results = run_all(&mut run, &mut Vec::new()).await;
+        // Paused time jumps from timer to timer: the group takes its slowest member, not the
+        // six seconds of the same reads one after another.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let order: Vec<_> = results.iter().map(read_seconds).collect();
+        assert_eq!(order, [Some(3), Some(1), Some(2)]);
+        assert_eq!(flight.peak.load(SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_spares_managed() {
+        let context = bare_context();
+        let stop = MemberStop {
+            at: Some(Instant::now() + Duration::from_secs(1)),
+            protect_managed: true,
+        };
+        let dispatch = Box::new(slow_dispatch(Arc::default()));
+        let mut run = GroupRun::new(dispatch, &context, 8, stop);
+        let id = ulid::Ulid::from_bytes([3u8; 16]);
+        run.add([
+            slow_read(5),
+            Effect::Blob(BlobEffect::ReleaseReservation { id }),
+        ]);
+        let started = Instant::now();
+        let results = run_all(&mut run, &mut Vec::new()).await;
+        assert_eq!(
+            results,
+            [
+                GroupResult::Unfinished,
+                GroupResult::Done(Box::new(Event::Blob(BlobEvent::ReservationReleased { id }))),
+            ]
+        );
+        // The managed release finishes after the deadline instead of being cut off.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// Records window results as (index, seconds) and asks for one more member per result
+    /// while it has any left.
+    #[derive(Debug, PartialEq)]
+    struct WindowRows {
+        rest: Vec<Effect>,
+        seen: Vec<(usize, Option<u8>)>,
+        closed: bool,
+    }
+
+    impl Operation for WindowRows {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match event {
+                Event::Group(GroupEvent::Member { index, result }) => {
+                    self.seen.push((index, read_seconds(&result)));
+                    self.rest.pop().into_iter().collect()
+                }
+                Event::Group(GroupEvent::Closed) => {
+                    self.closed = true;
+                    smallvec::smallvec![]
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.closed
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_refills_slots() {
+        let context = bare_context();
+        let flight = Arc::new(Flight::default());
+        let dispatch = Box::new(slow_dispatch(flight.clone()));
+        let mut run = GroupRun::new(dispatch, &context, 2, UNBOUNDED);
+        run.add([slow_read(4), slow_read(1)]);
+        let mut operation = WindowRows {
+            rest: vec![slow_read(1)],
+            seen: Vec::new(),
+            closed: false,
+        };
+        let end = run_window(
+            &mut ParentRun(&mut operation),
+            &mut run,
+            &mut Vec::new(),
+            GroupEnd::Expired,
+        )
+        .await;
+        assert!(matches!(end, GroupEnd::Stepped(effects) if effects.is_empty()));
+        // Member 1 frees its slot after one second, so member 2 runs before member 0 ends.
+        assert_eq!(operation.seen, [(1, Some(1)), (2, Some(1)), (0, Some(4))]);
+        assert!(operation.closed);
+        assert_eq!(flight.peak.load(SeqCst), 2);
+    }
+
+    /// Emits one group and keeps its results.
+    #[derive(Debug, PartialEq)]
+    struct OneGroup {
+        members: Vec<Effect>,
+        results: Option<Vec<GroupResult>>,
+    }
+
+    impl Operation for OneGroup {
+        type Output = Vec<GroupResult>;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Group(EffectGroup {
+                members: std::mem::take(&mut self.members),
+                limit: 4,
+                form: GroupForm::All { deadline: None },
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            if let Event::Group(GroupEvent::Finished { results }) = event {
+                self.results = Some(results);
+            }
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.results.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            self.results.ok_or(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn group_refuses_transaction() {
+        let (_directory, context) = test_context();
+        let read = StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from(*b"absent"),
+            txn_id: None,
+        };
+        let operation = OneGroup {
+            members: vec![
+                Effect::Storage(StorageEffect::StartTransaction { read: false }),
+                Effect::Storage(read),
+            ],
+            results: None,
+        };
+        let read = Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*b"absent"),
+            value: None,
+        });
+        assert_eq!(
+            drive(operation, &context).await,
+            Ok(vec![
+                GroupResult::Refused,
+                GroupResult::Done(Box::new(read))
+            ])
+        );
+    }
+
+    /// Runs one member that names a tenant backend and asks `idle` after the group ended.
+    struct HeldGroup {
+        backend_id: ulid::Ulid,
+        idle: Box<dyn Fn() -> bool + Send>,
+        idle_after: Option<bool>,
+    }
+
+    impl std::fmt::Debug for HeldGroup {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HeldGroup")
+                .field("idle_after", &self.idle_after)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PartialEq for HeldGroup {
+        fn eq(&self, other: &Self) -> bool {
+            self.idle_after == other.idle_after
+        }
+    }
+
+    impl Operation for HeldGroup {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            let location = BackendLocation {
+                backend: BackendRef::Group(self.backend_id),
+                storage_class: None,
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                backend_path: "blob/held".to_string(),
+                ulid: self.backend_id,
+                format: Default::default(),
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: Default::default(),
+            };
+            smallvec::smallvec![Effect::Group(EffectGroup {
+                members: vec![Effect::Blob(BlobEffect::Delete { location })],
+                limit: 1,
+                form: GroupForm::All { deadline: None },
+            })]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.idle_after = Some((self.idle)());
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.idle_after.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            self.idle_after.ok_or(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_outlives_member() {
+        let (_directory, context) = blob_context().await;
+        let blob = context.blob_handle.clone().expect("blob handle");
+        let backend_id = ulid::Ulid::from_bytes([4u8; 16]);
+        let probe = blob.clone();
+        let operation = HeldGroup {
+            backend_id,
+            idle: Box::new(move || probe.idle_generation(backend_id).is_some()),
+            idle_after: None,
+        };
+        // Removal needs an idle generation: the member ended, but its parent still holds.
+        assert_eq!(drive(operation, &context).await, Ok(false));
+        assert!(blob.idle_generation(backend_id).is_some());
+    }
+
+    /// Fails with a conflict until attempt `conflicts`, then answers its attempt.
+    #[derive(Debug, PartialEq)]
+    struct Conflicted {
+        attempt: usize,
+        conflicts: usize,
+    }
+
+    impl Operation for Conflicted {
+        type Output = usize;
+        type Error = StorageError;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            true
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            match self.attempt < self.conflicts {
+                true => Err(StorageError::TransactionConflict),
+                false => Ok(self.attempt),
+            }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn is_conflict(error: &Self::Error) -> bool {
+            matches!(error, StorageError::TransactionConflict)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_reruns_conflict() {
+        let context = bare_context();
+        for (conflicts, expected, attempts) in [
+            (2, Ok(2), 3),
+            (usize::MAX, Err(StorageError::TransactionConflict), 4),
+        ] {
+            let mut built = 0;
+            let build = || {
+                built += 1;
+                Conflicted {
+                    attempt: built - 1,
+                    conflicts,
+                }
+            };
+            assert_eq!(drive_retry(build, &context, &[7u8; 16]).await, expected);
+            assert_eq!(built, attempts);
+        }
     }
 }

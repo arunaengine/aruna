@@ -123,7 +123,7 @@ pub enum UpdateGroupError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("update group did not finish")]
     NotFinished,
@@ -332,7 +332,7 @@ impl UpdateGroupOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(UpdateGroupError::UnexpectedEvent {
             state,
@@ -342,7 +342,7 @@ impl UpdateGroupOperation {
     }
 
     fn handle_auth(&mut self, event: Event, allow_fallback: bool) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event("authorization result", got);
         };
@@ -397,7 +397,7 @@ impl Operation for UpdateGroupOperation {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             UpdateGroupState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -409,7 +409,7 @@ impl Operation for UpdateGroupOperation {
                     else {
                         return self.unexpected_event(
                             "storage batch read result with group, admin state, and realm config",
-                            format!("{values:?}"),
+                            "a batch of another length",
                         );
                     };
                     match self.emit_write_state(
@@ -422,7 +422,7 @@ impl Operation for UpdateGroupOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             UpdateGroupState::WriteGroupState {
                 group,
@@ -446,7 +446,7 @@ impl Operation for UpdateGroupOperation {
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                     other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
+                        self.unexpected_event("storage batch write result", other.label())
                     }
                 }
             }
@@ -458,7 +458,7 @@ impl Operation for UpdateGroupOperation {
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                     other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
+                        self.unexpected_event("storage batch delete result", other.label())
                     }
                 }
             }
@@ -474,7 +474,7 @@ impl Operation for UpdateGroupOperation {
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                     other => {
-                        self.unexpected_event("bucket fence read result", format!("{other:?}"))
+                        self.unexpected_event("bucket fence read result", other.label())
                     }
                 }
             }
@@ -497,7 +497,7 @@ impl Operation for UpdateGroupOperation {
                         self.fail(error.into())
                     }
                     other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
+                        self.unexpected_event("transaction commit result", other.label())
                     }
                 }
             }
@@ -511,13 +511,11 @@ impl Operation for UpdateGroupOperation {
                     self.state = UpdateGroupState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             UpdateGroupState::Init | UpdateGroupState::Finish | UpdateGroupState::Error => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 self.unexpected_event("no event", got)
             }
         }

@@ -10,7 +10,7 @@ mod storage;
 mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -123,19 +123,25 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        // The effect loop runs groups itself; a group never reaches a single dispatch.
+        Effect::Group(group) => {
+            warn!(depth, "Effect group reached a single dispatch");
+            let results = group.members.iter().map(|_| GroupResult::Refused).collect();
+            Event::Group(GroupEvent::Finished { results })
+        }
     };
 
     trace!(
         event = "operation.effect.result",
         depth,
         effect = effect_name,
-        result = event_kind(&event),
+        result = event.label(),
         "Received operation event"
     );
     if depth == 0 {
         debug!(
             effect = effect_name,
-            result = event_kind(&event),
+            result = event.label(),
             "Received top-level operation event"
         );
     }
@@ -155,20 +161,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
-    }
-}
-
-fn event_kind(event: &Event) -> &'static str {
-    match event {
-        Event::Blob(_) => "blob",
-        Event::StagingSource(_) => "staging_source",
-        Event::LocalFile(_) => "local_file",
-        Event::Storage(_) => "storage",
-        Event::Net(_) => "net",
-        Event::Metadata(_) => "metadata",
-        Event::SubOperation(_) => "suboperation",
-        Event::Task(_) => "task",
-        Event::Search() => "search",
-        Event::Stream() => "stream",
+        Effect::Group(_) => "group",
     }
 }

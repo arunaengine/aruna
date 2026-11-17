@@ -123,7 +123,7 @@ pub enum SearchBucketsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("bucket search did not finish")]
     NotFinished,
@@ -185,7 +185,7 @@ impl SearchBucketsOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(SearchBucketsError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -210,7 +210,7 @@ impl SearchBucketsOperation {
     }
 
     fn handle_bucket_scan(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -285,7 +285,7 @@ impl SearchBucketsOperation {
     }
 
     fn handle_permission(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected(
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
@@ -308,7 +308,7 @@ impl SearchBucketsOperation {
     }
 
     fn handle_group_read(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected("Event::Storage(StorageEvent::ReadResult)", got);
         };
@@ -360,7 +360,7 @@ impl SearchBucketsOperation {
 
     /// Adds the current metadata to a pending hit; a database search keeps only databases.
     fn handle_metadata_read(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected("Event::Storage(StorageEvent::BatchReadResult)", got);
         };

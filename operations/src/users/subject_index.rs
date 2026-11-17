@@ -81,7 +81,7 @@ pub enum ResolveConflictsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -115,7 +115,7 @@ impl ResolveConflictsOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ResolveConflictsError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -169,7 +169,7 @@ impl ResolveConflictsOperation {
     }
 
     fn accept_subject(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
         };
@@ -198,7 +198,7 @@ impl ResolveConflictsOperation {
     }
 
     fn accept_conflict(&mut self, event: Event, user_id: UserId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
         };
@@ -304,7 +304,7 @@ impl ResolveConflictsOperation {
     }
 
     fn accept_canonical_write(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::WriteResult)", got);
         };
@@ -323,7 +323,7 @@ impl ResolveConflictsOperation {
     }
 
     fn accept_stale_delete(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
         };
@@ -345,7 +345,7 @@ impl ResolveConflictsOperation {
     }
 
     fn accept_subject_write(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };

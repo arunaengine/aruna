@@ -193,7 +193,7 @@ pub enum UpdateUserError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("update user did not finish")]
     NotFinished,
@@ -249,7 +249,7 @@ impl UpdateUserOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(UpdateUserError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -296,7 +296,7 @@ impl UpdateUserOperation {
     }
 
     fn handle_auth_result(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })",
@@ -317,7 +317,7 @@ impl UpdateUserOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
@@ -377,7 +377,7 @@ impl UpdateUserOperation {
     }
 
     fn accept_admin_state(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
@@ -601,7 +601,7 @@ impl UpdateUserOperation {
         admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };
@@ -627,7 +627,7 @@ impl UpdateUserOperation {
         user: User,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchDeleteResult)", got);
         };
@@ -664,7 +664,7 @@ impl UpdateUserOperation {
         user: User,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
@@ -692,7 +692,7 @@ impl UpdateUserOperation {
         user: User,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::TransactionCommitted { .. })",
@@ -715,10 +715,9 @@ impl UpdateUserOperation {
                 self.output = Some(Ok(user));
                 smallvec![]
             }
-            other => self.unexpected_event(
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
+            other => {
+                self.unexpected_event("admin document outbox drain timer schedule", other.label())
+            }
         }
     }
 
@@ -734,7 +733,7 @@ impl UpdateUserOperation {
     }
 
     fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 "Event::SubOperation(SubOperationEvent::DocumentSyncResult { result })",
@@ -838,7 +837,7 @@ impl Operation for UpdateUserOperation {
                 self.handle_announce_user(event, user)
             }
             UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 self.unexpected_event("no event", got)
             }
         }

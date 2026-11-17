@@ -81,7 +81,7 @@ pub enum ReconcileError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -566,7 +566,7 @@ impl Operation for ReconcileFolderOperation {
 
         match self.state.clone() {
             ReconcileState::ReadBases => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return unexpected(self, "batch read result", got);
                 };
@@ -603,7 +603,7 @@ impl Operation for ReconcileFolderOperation {
                 let Some(position) = self.hashing.get(index).copied() else {
                     return self.settle();
                 };
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::LocalFile(event) = event else {
                     return unexpected(self, "local file result", got);
                 };
@@ -623,7 +623,7 @@ impl Operation for ReconcileFolderOperation {
                 self.next_hash(index + 1)
             }
             ReconcileState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return unexpected(self, "transaction started", got);
                 };
@@ -637,14 +637,14 @@ impl Operation for ReconcileFolderOperation {
                 })]
             }
             ReconcileState::WriteRows { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return unexpected(self, "batch write result", got);
                 };
                 self.emit_deletes(txn_id)
             }
             ReconcileState::DeleteRows { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return unexpected(self, "batch delete result", got);
                 };
@@ -652,7 +652,7 @@ impl Operation for ReconcileFolderOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             ReconcileState::Commit => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return unexpected(self, "transaction committed", got);
                 };
@@ -761,7 +761,7 @@ impl ReconcileFolderOperation {
 fn unexpected(
     operation: &mut ReconcileFolderOperation,
     expected: &'static str,
-    got: String,
+    got: &'static str,
 ) -> Effects {
     let state = format!("{:?}", operation.state);
     fail(
