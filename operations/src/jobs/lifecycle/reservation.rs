@@ -312,12 +312,7 @@ impl ReserveExecutionOperation {
     }
 
     fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(LifecycleError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        self.fail(LifecycleError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -494,11 +489,7 @@ impl ReleaseExecutionOperation {
     }
 
     fn unexpected(&self, expected: &'static str, got: &'static str) -> LifecycleError {
-        LifecycleError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        }
+        LifecycleError::unexpected(&self.state, expected, got)
     }
 }
 

@@ -343,12 +343,7 @@ impl AdmitSubmissionOperation {
     }
 
     fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(LifecycleError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        self.fail(LifecycleError::unexpected(&self.state, expected, got))
     }
 }
 

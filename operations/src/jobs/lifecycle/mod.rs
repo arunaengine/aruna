@@ -70,6 +70,21 @@ pub enum LifecycleError {
     },
 }
 
+impl LifecycleError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+}
+
 /// The family view a realm config row gives; a missing row is `RealmConfigMissing`.
 fn stored_view(
     value: Option<Value>,

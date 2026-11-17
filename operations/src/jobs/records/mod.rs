@@ -71,6 +71,19 @@ pub enum RecordStoreError {
 }
 
 impl RecordStoreError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+
     /// Whether the work lost its optimistic transaction and may be retried
     /// unchanged. Every other failure needs a different answer.
     pub fn is_conflict(&self) -> bool {

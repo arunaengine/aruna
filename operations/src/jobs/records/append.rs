@@ -467,12 +467,7 @@ impl AppendRecordOperation {
     }
 
     fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordStoreError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
     }
 }
 

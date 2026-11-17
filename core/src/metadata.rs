@@ -1479,6 +1479,17 @@ pub struct MetadataValidationViolation {
     pub entity_id: Option<String>,
 }
 
+impl From<craqle::CrateViolation> for MetadataValidationViolation {
+    fn from(violation: craqle::CrateViolation) -> Self {
+        Self {
+            code: violation.code.to_string(),
+            message: violation.message,
+            pointer: violation.pointer,
+            entity_id: violation.entity_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProfileValidationSeverity {
