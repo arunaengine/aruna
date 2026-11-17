@@ -682,8 +682,8 @@ impl Operation for RevokeTokenOperation {
                 let revocation_index = revocation_index.clone();
                 let apply_event = apply_event.clone();
                 let write_canonical = write_canonical.clone();
-                let mut pending_deletes = pending_deletes.clone();
-                let mut pending_live = pending_live.clone();
+                let pending_deletes = pending_deletes.clone();
+                let pending_live = pending_live.clone();
                 match event {
                     Event::Storage(StorageEvent::IterResult {
                         values,
@@ -749,8 +749,8 @@ impl Operation for RevokeTokenOperation {
                 let revocation_index = revocation_index.clone();
                 let apply_event = apply_event.clone();
                 let write_canonical = write_canonical.clone();
-                let pending_deletes = pending_deletes.clone();
-                let pending_live = pending_live.clone();
+                let mut pending_deletes = pending_deletes.clone();
+                let mut pending_live = pending_live.clone();
                 let index_keys = index_keys.clone();
                 let next_start_after = next_start_after.clone();
                 match event {
