@@ -214,7 +214,7 @@ pub(in crate::document_sync) async fn store_graph_lifecycle(
                 return Err(error);
             }
         };
-        if !delete_matches_graph(&delete, record) || registry_live {
+        if !delete.covers_graph(record) || registry_live {
             let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         }
@@ -573,25 +573,6 @@ pub(in crate::document_sync) async fn delete_registry_record(
     ))
 }
 
-pub(in crate::document_sync) fn delete_matches_graph(
-    delete: &MetadataDeleteRecord,
-    record: &GraphLifecycleRecord,
-) -> bool {
-    delete_matches_registry(delete, record.group_id, record.document_id)
-        && delete.tombstone.graph_iri == record.graph_iri
-        && delete.tombstone.updated_at_ms >= record.updated_at_ms
-}
-
-pub(in crate::document_sync) fn delete_matches_registry(
-    delete: &MetadataDeleteRecord,
-    group_id: Ulid,
-    document_id: Ulid,
-) -> bool {
-    delete.tombstone.is_deleted()
-        && delete.tombstone.group_id == group_id
-        && delete.tombstone.document_id == document_id
-}
-
 pub(in crate::document_sync) async fn current_lifecycle_entries(
     storage: &StorageHandle,
     record: &MetadataLifecycleRecord,
@@ -851,7 +832,7 @@ pub(in crate::document_sync) async fn registry_cleanup_txn(
     delete: &MetadataDeleteRecord,
     txn_id: TxnId,
 ) -> Result<Vec<(String, ByteView)>> {
-    if !delete_matches_registry(delete, group_id, document_id) {
+    if !delete.deletes_document(group_id, document_id) {
         return Ok(Vec::new());
     }
     let target = DocumentTarget::MetadataRegistry {
