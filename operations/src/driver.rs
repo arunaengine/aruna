@@ -534,16 +534,16 @@ fn refused_member(effect: &Effect) -> bool {
     }
 }
 
+/// Starts one effect with an optional deadline and answers its event.
+type Dispatch<'a> = dyn Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + Sync + 'a;
+
 /// Dispatches one effect through the adapters, as the effect loop does for a single effect.
-fn adapter_dispatch<'a>(
-    context: &'a DriverContext,
-    depth: usize,
-) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + 'a {
-    move |effect, until| {
+fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> {
+    Box::new(move |effect, until| {
         Box::pin(effect_adapters::dispatch_effect_until(
             effect, context, depth, until,
         ))
-    }
+    })
 }
 
 /// When group members stop: at `at` every member still running ends as unfinished, except a
@@ -556,8 +556,8 @@ struct MemberStop {
 
 /// The members of one group: waiting ones in emission order and at most `limit` running. Each
 /// started member keeps its backend hold in the run state until the parent operation ends.
-struct GroupRun<'a, D> {
-    dispatch: D,
+struct GroupRun<'a> {
+    dispatch: Box<Dispatch<'a>>,
     context: &'a DriverContext,
     stop: MemberStop,
     limit: usize,
@@ -566,11 +566,13 @@ struct GroupRun<'a, D> {
     running: FuturesUnordered<BoxFuture<'a, (usize, GroupResult)>>,
 }
 
-impl<'a, D> GroupRun<'a, D>
-where
-    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
-{
-    fn new(dispatch: D, context: &'a DriverContext, limit: usize, stop: MemberStop) -> Self {
+impl<'a> GroupRun<'a> {
+    fn new(
+        dispatch: Box<Dispatch<'a>>,
+        context: &'a DriverContext,
+        limit: usize,
+        stop: MemberStop,
+    ) -> Self {
         Self {
             dispatch,
             context,
@@ -657,17 +659,14 @@ enum GroupEnd {
 
 /// Runs one group for the effect loop and steps the operation with its events. Members stop at
 /// the cleanup deadline after expiry, otherwise at the earlier of the run and group deadline.
-async fn run_group<'a, D>(
+async fn run_group<'a>(
     executable: &mut dyn Drive,
     group: EffectGroup,
-    dispatch: D,
+    dispatch: Box<Dispatch<'a>>,
     context: &'a DriverContext,
     deadline: Option<tokio::time::Instant>,
     state: &mut RunState,
-) -> GroupEnd
-where
-    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
-{
+) -> GroupEnd {
     let EffectGroup {
         members,
         limit,
@@ -720,10 +719,7 @@ where
 }
 
 /// Runs every member of an all-at-once group and returns the results in emission order.
-async fn run_all<'a, D>(run: &mut GroupRun<'a, D>, holds: &mut Vec<GroupHold>) -> Vec<GroupResult>
-where
-    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
-{
+async fn run_all(run: &mut GroupRun<'_>, holds: &mut Vec<GroupHold>) -> Vec<GroupResult> {
     let mut results: Vec<GroupResult> = std::iter::repeat_with(|| GroupResult::Unfinished)
         .take(run.added)
         .collect();
@@ -741,15 +737,12 @@ where
 /// Steps the operation with each window member result as it arrives and adds the effects it
 /// returns as new members. Once no member runs or waits, steps it with `GroupEvent::Closed`.
 /// A complete operation is not stepped again, but the members it asked for still run.
-async fn run_window<'a, D>(
+async fn run_window(
     executable: &mut dyn Drive,
-    run: &mut GroupRun<'a, D>,
+    run: &mut GroupRun<'_>,
     holds: &mut Vec<GroupHold>,
     cut_end: GroupEnd,
-) -> GroupEnd
-where
-    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
-{
+) -> GroupEnd {
     loop {
         run.fill(holds);
         let Some((index, result)) = run.next().await else {
@@ -810,7 +803,8 @@ async fn drive_effects(
             }
             if let Effect::Group(group) = effect {
                 let dispatch = adapter_dispatch(context, depth);
-                match run_group(executable, group, dispatch, context, deadline, &mut state).await {
+                let run = run_group(executable, group, dispatch, context, deadline, &mut state);
+                match Box::pin(run).await {
                     GroupEnd::Stepped(effects) => {
                         extend_unblocked(&mut queue, effects, &state.tracker);
                     }
@@ -2627,7 +2621,7 @@ mod test {
     /// reservation release after three seconds; tests run it on paused time only.
     fn slow_dispatch<'a>(
         flight: Arc<Flight>,
-    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> {
+    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + Sync {
         move |effect, _| {
             let flight = flight.clone();
             Box::pin(async move {
@@ -2690,7 +2684,8 @@ mod test {
     async fn group_waits_slowest() {
         let context = bare_context();
         let flight = Arc::new(Flight::default());
-        let mut run = GroupRun::new(slow_dispatch(flight.clone()), &context, 8, UNBOUNDED);
+        let dispatch = Box::new(slow_dispatch(flight.clone()));
+        let mut run = GroupRun::new(dispatch, &context, 8, UNBOUNDED);
         run.add([slow_read(3), slow_read(1), slow_read(2)]);
         let started = Instant::now();
         let results = run_all(&mut run, &mut Vec::new()).await;
@@ -2709,7 +2704,8 @@ mod test {
             at: Some(Instant::now() + Duration::from_secs(1)),
             protect_managed: true,
         };
-        let mut run = GroupRun::new(slow_dispatch(Arc::default()), &context, 8, stop);
+        let dispatch = Box::new(slow_dispatch(Arc::default()));
+        let mut run = GroupRun::new(dispatch, &context, 8, stop);
         let id = ulid::Ulid::from_bytes([3u8; 16]);
         run.add([
             slow_read(5),
@@ -2776,7 +2772,8 @@ mod test {
     async fn window_refills_slots() {
         let context = bare_context();
         let flight = Arc::new(Flight::default());
-        let mut run = GroupRun::new(slow_dispatch(flight.clone()), &context, 2, UNBOUNDED);
+        let dispatch = Box::new(slow_dispatch(flight.clone()));
+        let mut run = GroupRun::new(dispatch, &context, 2, UNBOUNDED);
         run.add([slow_read(4), slow_read(1)]);
         let mut operation = WindowRows {
             rest: vec![slow_read(1)],
