@@ -656,7 +656,7 @@ pub async fn list_owned_jobs(
     user_id: UserId,
     cursor: Option<Vec<u8>>,
     limit: usize,
-    filter: impl Fn(&JobRecord) -> bool,
+    filter: impl Fn(&JobRecord) -> bool + Send,
 ) -> Result<(Vec<JobRecord>, Option<Vec<u8>>), String> {
     list_user_jobs(context, user_id, cursor, limit, filter).await
 }
