@@ -44,6 +44,7 @@ pub mod staging;
 mod storage_read;
 pub mod sync;
 pub mod tasks;
+pub mod triggers;
 pub mod users;
 
 #[cfg(test)]
