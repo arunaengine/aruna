@@ -1059,7 +1059,7 @@ where
 
 /// Decodes one frame. A realm node that predates `node_places` or `node_names` ends its realm
 /// documents before them, and an empty map is one zero byte; only that exact reply is padded.
-fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
+pub(crate) fn decode_message(bytes: &[u8]) -> Result<MetadataTransportMessage, postcard::Error> {
     postcard::from_bytes(bytes).or_else(|error| {
         // One zero byte supplies `node_places`, two supply `node_names` as well.
         for missing in 1..=2 {

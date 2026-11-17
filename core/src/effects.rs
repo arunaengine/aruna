@@ -714,13 +714,11 @@ pub enum NetEffect {
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
     AuditPage(Box<AuditPageEffect>),
-    PolicyFetch(Box<PolicyFetchEffect>),
     JobRecord(Box<JobRecordEffect>),
     LaunchOffer(Box<LaunchOfferEffect>),
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
-    VaultFetch(Box<VaultFetchEffect>),
     /// Signs vault or key records with this node's key; each must name this node.
     VaultSign(Box<crate::structs::identity::user::vault::VaultRecords>),
     /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
@@ -729,6 +727,17 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    /// Sends one encoded metadata protocol request to one peer and reads its answer.
+    MetadataRequest(Box<MetadataRequestEffect>),
+}
+
+/// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
+/// sends it to `peer`, waits at most `timeout`, and never routes or retries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataRequestEffect {
+    pub peer: NodeId,
+    pub frame: Vec<u8>,
+    pub timeout: Duration,
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its
@@ -966,7 +975,7 @@ impl TryFrom<JobRecordEnvelope> for ReceiptFrame {
 }
 
 /// Fetch of one immutable placement-policy document from the holders the
-/// operation resolved. The adapter tries them in order and never routes; the
+/// operation resolved. The fetch tries them in order and never routes; the
 /// operation verifies id, realm, and digest before it caches anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFetchEffect {
@@ -987,7 +996,7 @@ pub enum VaultQuery {
 }
 
 /// Fetch of one user's vault heads or key records from the holders the
-/// operation resolved. The adapter tries them in order and never routes.
+/// operation resolved. The fetch tries them in order and never routes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VaultFetchEffect {
     pub holders: HolderList<MAX_FETCH_HOLDERS>,

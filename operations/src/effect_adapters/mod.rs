@@ -67,14 +67,6 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
         }
-        // Policy fetch resolves its holders in the operation and runs only the
-        // holder round-trips here.
-        Effect::Net(NetEffect::PolicyFetch(fetch)) => Event::Net(NetEvent::PolicyFetch(
-            Box::pin(crate::placement::policy::fetch_policy(context, *fetch)).await,
-        )),
-        Effect::Net(NetEffect::VaultFetch(fetch)) => Event::Net(NetEvent::VaultFetch(
-            Box::pin(crate::users::vault_route::fetch_vault(context, *fetch)).await,
-        )),
         Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
             crate::distribution::sign_snapshot(context, *claim),
         )),
@@ -96,6 +88,10 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
             Box::pin(crate::jobs::records::dispatch_offer(context, *offer)).await,
         )),
+        // The metadata transport lives in the metadata handle the runner holds.
+        Effect::Net(NetEffect::MetadataRequest(request)) => {
+            Box::pin(metadata::dispatch_request(*request, context)).await
+        }
         Effect::Net(net_effect) => net::dispatch_net(net_effect, context).await,
         Effect::Metadata(metadata_effect) => {
             metadata::dispatch_metadata(metadata_effect, context).await

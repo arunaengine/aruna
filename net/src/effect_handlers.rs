@@ -12,7 +12,7 @@ use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
     DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent, VaultFetchEvent,
+    MetadataAnswer, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;
@@ -218,9 +218,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         }
         // Policy, job-record, and launch protocols live in the operations
         // runner too; reaching this handler is a wiring bug, never a success.
-        NetEffect::PolicyFetch(_) => NetEvent::PolicyFetch(PolicyFetchEvent::Unavailable(
-            "policy fetch must be dispatched by the operations runner".to_string(),
-        )),
         NetEffect::JobRecord(_) => NetEvent::JobRecord(JobRecordEvent::Unavailable(
             "job-record replication must be dispatched by the operations runner".to_string(),
         )),
@@ -230,9 +227,6 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::PolicySign(claim) => {
             NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
         }
-        NetEffect::VaultFetch(_) => NetEvent::VaultFetch(VaultFetchEvent::Unavailable(
-            "vault fetch must be dispatched by the operations runner".to_string(),
-        )),
         NetEffect::VaultSign(records) => {
             NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
         }
@@ -243,6 +237,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             "statement signing must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
+        // Metadata requests ride the metadata transport the runner holds.
+        NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
+            peer: request.peer,
+            elapsed: Duration::ZERO,
+            result: Err(PeerRequestError::Failed(
+                "metadata request must be dispatched by the operations runner".to_string(),
+            )),
+        })),
     }
 }
 
@@ -516,15 +518,14 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
         NetEffect::AuditPage(_) => "audit_page",
-        NetEffect::PolicyFetch(_) => "policy_fetch",
         NetEffect::JobRecord(_) => "job_record",
         NetEffect::LaunchOffer(_) => "launch_offer",
         NetEffect::PolicySign(_) => "policy_sign",
-        NetEffect::VaultFetch(_) => "vault_fetch",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
         NetEffect::Release(_) => "release",
+        NetEffect::MetadataRequest(_) => "metadata_request",
     }
 }
 
