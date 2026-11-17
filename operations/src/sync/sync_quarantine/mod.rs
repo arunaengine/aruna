@@ -2,20 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{IterStart, StorageEffect};
+mod acknowledge;
+mod list;
+mod prune;
+mod read;
+
+pub use acknowledge::AcknowledgeQuarantineOperation;
+pub use list::ListQuarantineOperation;
+pub use prune::PruneQuarantineOperation;
+pub use read::ReadQuarantineOperation;
+
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
-use aruna_core::structs::{
-    QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage, quarantine_row_entry,
-    quarantine_usage_entry,
-};
-use aruna_core::types::{Key, TxnId, Value};
-use aruna_storage::StorageHandle;
+use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::types::{TxnId, Value};
 use byteview::ByteView;
 use thiserror::Error;
-
-use crate::driver::DriverContext;
 
 pub const QUARANTINE_PAGE_DEFAULT: usize = 50;
 pub const QUARANTINE_PAGE_MAX: usize = 200;
@@ -28,6 +32,8 @@ pub enum QuarantineAdminError {
     Conversion(#[from] ConversionError),
     #[error("unexpected storage event: expected {expected}, got {got}")]
     Unexpected { expected: &'static str, got: String },
+    #[error("quarantine operation did not finish")]
+    Unfinished,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,340 +60,56 @@ pub struct QuarantinePruneResult {
     pub usage: SyncQuarantineUsage,
 }
 
-fn bounded_limit(limit: Option<usize>) -> usize {
-    limit
+/// One bounded page of rows in key order (`topic || actor || actor_seq`).
+fn iter_effect(request: &QuarantinePageRequest) -> Effect {
+    let limit = request
+        .limit
         .unwrap_or(QUARANTINE_PAGE_DEFAULT)
-        .clamp(1, QUARANTINE_PAGE_MAX)
-}
-
-async fn iter_page(
-    storage: &StorageHandle,
-    request: &QuarantinePageRequest,
-    limit: usize,
-) -> Result<(Vec<(Key, Value)>, Option<Key>), QuarantineAdminError> {
-    let start = request
-        .start_after
-        .as_deref()
-        .map(|key| IterStart::After(ByteView::from(key)));
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
-            prefix: request.topic.as_deref().map(ByteView::from),
-            start,
-            limit,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage iteration result",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-async fn read_usage_row(
-    storage: &StorageHandle,
-    txn_id: Option<TxnId>,
-) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: QUARANTINE_USAGE_KEYSPACE.to_string(),
-            key: ByteView::from(QUARANTINE_USAGE_KEY),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-            Some(bytes) => Ok(SyncQuarantineUsage::from_bytes(bytes.as_ref())?),
-            None => Ok(SyncQuarantineUsage::default()),
-        },
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage read result",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-/// The stored value, so accounting uses the exact bytes this read observed.
-async fn read_row_value(
-    storage: &StorageHandle,
-    key: &[u8],
-    txn_id: Option<TxnId>,
-) -> Result<Option<Value>, QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage read result",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-async fn read_row(
-    storage: &StorageHandle,
-    key: &[u8],
-    txn_id: Option<TxnId>,
-) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
-    read_row_value(storage, key, txn_id)
-        .await?
-        .map(|bytes| SyncQuarantineRecord::from_bytes(bytes.as_ref()))
-        .transpose()
-        .map_err(QuarantineAdminError::Conversion)
-}
-
-async fn start_txn(storage: &StorageHandle) -> Result<TxnId, QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage transaction started",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-}
-
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<(), QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage transaction committed",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-async fn write_batch(
-    storage: &StorageHandle,
-    writes: Vec<(String, Key, Value)>,
-    txn_id: TxnId,
-) -> Result<(), QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage batch write result",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-async fn delete_batch(
-    storage: &StorageHandle,
-    deletes: Vec<(String, Key)>,
-    txn_id: TxnId,
-) -> Result<(), QuarantineAdminError> {
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        got => Err(QuarantineAdminError::Unexpected {
-            expected: "storage batch delete result",
-            got: format!("{got:?}"),
-        }),
-    }
-}
-
-pub async fn read_quarantine_usage(
-    ctx: &DriverContext,
-) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
-    read_usage_row(&ctx.storage_handle, None).await
-}
-
-/// One bounded page of quarantine evidence in key order
-/// (`topic || actor || actor_seq`).
-pub async fn list_quarantine_records(
-    ctx: &DriverContext,
-    request: QuarantinePageRequest,
-) -> Result<QuarantinePage, QuarantineAdminError> {
-    let (values, next_start_after) =
-        iter_page(&ctx.storage_handle, &request, bounded_limit(request.limit)).await?;
-    let records = values
-        .into_iter()
-        .map(|(_, value)| SyncQuarantineRecord::from_bytes(value.as_ref()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(QuarantinePage {
-        records,
-        next_start_after: next_start_after.map(|key| key.as_ref().to_vec()),
-        usage: read_usage_row(&ctx.storage_handle, None).await?,
+        .clamp(1, QUARANTINE_PAGE_MAX);
+    Effect::Storage(StorageEffect::Iter {
+        key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+        prefix: request.topic.as_deref().map(ByteView::from),
+        start: request
+            .start_after
+            .as_deref()
+            .map(|key| IterStart::After(ByteView::from(key))),
+        limit,
+        txn_id: None,
     })
 }
 
-pub async fn read_quarantine_record(
-    ctx: &DriverContext,
-    key: &[u8],
-) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
-    read_row(&ctx.storage_handle, key, None).await
+fn usage_read(txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: QUARANTINE_USAGE_KEYSPACE.to_string(),
+        key: ByteView::from(QUARANTINE_USAGE_KEY),
+        txn_id,
+    })
 }
 
-/// Mark one row acknowledged. Idempotent: re-acknowledging an already
-/// acknowledged row rewrites nothing and still reports the record.
-pub async fn acknowledge_quarantine_row(
-    ctx: &DriverContext,
-    key: &[u8],
-) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
-    let storage = &ctx.storage_handle;
-    let txn_id = start_txn(storage).await?;
-    let outcome = acknowledge_in_txn(storage, key, txn_id).await;
-    match outcome {
-        Ok(None) => {
-            abort_txn(storage, txn_id).await;
-            Ok(None)
-        }
-        Ok(Some(record)) => {
-            commit_txn(storage, txn_id).await?;
-            Ok(Some(record))
-        }
-        Err(error) => {
-            abort_txn(storage, txn_id).await;
-            Err(error)
-        }
+fn row_read(key: &[u8], txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+        key: ByteView::from(key),
+        txn_id,
+    })
+}
+
+fn decode_usage(value: Option<Value>) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
+    match value {
+        Some(bytes) => Ok(SyncQuarantineUsage::from_bytes(bytes.as_ref())?),
+        None => Ok(SyncQuarantineUsage::default()),
     }
 }
 
-async fn acknowledge_in_txn(
-    storage: &StorageHandle,
-    key: &[u8],
-    txn_id: TxnId,
-) -> Result<Option<SyncQuarantineRecord>, QuarantineAdminError> {
-    let Some(value) = read_row_value(storage, key, Some(txn_id)).await? else {
-        return Ok(None);
-    };
-    let mut record = SyncQuarantineRecord::from_bytes(value.as_ref())?;
-    if record.acknowledged {
-        return Ok(Some(record));
+/// The error for an event a phase did not expect; storage errors keep their kind.
+fn unexpected(expected: &'static str, event: Event) -> QuarantineAdminError {
+    match event {
+        Event::Storage(StorageEvent::Error { error }) => error.into(),
+        got => QuarantineAdminError::Unexpected {
+            expected,
+            got: format!("{got:?}"),
+        },
     }
-    // The bytes this transaction read, not a re-encoding of them.
-    let before = value.len() as u64;
-    record.acknowledged = true;
-    let entry = quarantine_row_entry(&record)?;
-    let after = entry.2.len() as u64;
-    let mut usage = read_usage_row(storage, Some(txn_id)).await?;
-    usage.bytes = usage.bytes.saturating_sub(before).saturating_add(after);
-    write_batch(storage, vec![entry, quarantine_usage_entry(usage)?], txn_id).await?;
-    Ok(Some(record))
-}
-
-/// Deletes acknowledged rows in one bounded, resumable pass, decrementing usage in
-/// the same transaction. The scan only proposes candidates; each is re-read and
-/// re-validated inside the delete transaction to reject redelivered evidence.
-pub async fn prune_quarantine_records(
-    ctx: &DriverContext,
-    request: QuarantinePageRequest,
-) -> Result<QuarantinePruneResult, QuarantineAdminError> {
-    let storage = &ctx.storage_handle;
-    let (values, next_start_after) =
-        iter_page(storage, &request, bounded_limit(request.limit)).await?;
-    let scanned = values.len();
-    let mut candidates = Vec::new();
-    for (key, value) in values {
-        if SyncQuarantineRecord::from_bytes(value.as_ref())?.acknowledged {
-            candidates.push(key);
-        }
-    }
-
-    let next_start_after = next_start_after.map(|key| key.as_ref().to_vec());
-    if candidates.is_empty() {
-        return Ok(QuarantinePruneResult {
-            pruned: 0,
-            scanned,
-            next_start_after,
-            usage: read_usage_row(storage, None).await?,
-        });
-    }
-
-    let txn_id = start_txn(storage).await?;
-    match prune_in_txn(storage, candidates, txn_id).await {
-        Ok((0, usage)) => {
-            abort_txn(storage, txn_id).await;
-            Ok(QuarantinePruneResult {
-                pruned: 0,
-                scanned,
-                next_start_after,
-                usage,
-            })
-        }
-        Ok((pruned, usage)) => {
-            commit_txn(storage, txn_id).await?;
-            Ok(QuarantinePruneResult {
-                pruned,
-                scanned,
-                next_start_after,
-                usage,
-            })
-        }
-        Err(error) => {
-            abort_txn(storage, txn_id).await;
-            Err(error)
-        }
-    }
-}
-
-async fn prune_in_txn(
-    storage: &StorageHandle,
-    candidates: Vec<Key>,
-    txn_id: TxnId,
-) -> Result<(usize, SyncQuarantineUsage), QuarantineAdminError> {
-    let mut deletes = Vec::new();
-    let mut released = 0u64;
-    for key in candidates {
-        let Some(value) = read_row_value(storage, key.as_ref(), Some(txn_id)).await? else {
-            continue;
-        };
-        if !SyncQuarantineRecord::from_bytes(value.as_ref())?.acknowledged {
-            continue;
-        }
-        released = released.saturating_add(value.len() as u64);
-        deletes.push((SYNC_QUARANTINE_KEYSPACE.to_string(), key));
-    }
-    let mut usage = read_usage_row(storage, Some(txn_id)).await?;
-    if deletes.is_empty() {
-        return Ok((0, usage));
-    }
-    let pruned = deletes.len();
-    usage.release(pruned as u64, released);
-    delete_batch(storage, deletes, txn_id).await?;
-    write_batch(storage, vec![quarantine_usage_entry(usage)?], txn_id).await?;
-    Ok((pruned, usage))
 }
 
 #[cfg(test)]
