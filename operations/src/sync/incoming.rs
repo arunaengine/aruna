@@ -743,18 +743,11 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-    use aruna_core::structs::execution::source_access::SourceMetadata;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_core::structs::execution::staging::{
-        PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
-    };
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
-    use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
     use std::collections::HashMap;

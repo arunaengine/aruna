@@ -22,7 +22,8 @@ enum Change {
     /// Writes a new record of this intent, due from the runner's clock.
     Stage(SyncRelationship, SyncMirrorIntent),
     /// Writes the record, unless a staged delete supersedes a reconcile; a claimed rollback of
-    /// the same relationship stays claimed.
+    /// the same relationship stays claimed. Only tests store a ready record.
+    #[cfg(test)]
     Store(SyncMirrorRecord),
     /// Deletes a record of the expected intent; a reconcile must still name `relationship`.
     Clear {
@@ -68,6 +69,7 @@ impl MirrorRecordOperation {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn store(record: SyncMirrorRecord) -> Self {
         Self::with(repair_key(&record.relationship), Change::Store(record))
     }
@@ -115,6 +117,7 @@ impl MirrorRecordOperation {
             Change::Stage(relationship, intent) => {
                 SyncMirrorRecord::new(relationship.clone(), *intent, self.now_ms)
             }
+            #[cfg(test)]
             Change::Store(record) => record.clone(),
             Change::Clear {
                 relationship,
