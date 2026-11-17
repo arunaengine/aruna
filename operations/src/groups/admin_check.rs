@@ -60,10 +60,16 @@ impl Operation for AdminCheckOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, AuthorizationError> {
-        let IoResult::Event(Event::SubOperation(SubOperationEvent::AuthorizationResult {
-            allowed,
-        })) = result
-        else {
+        let answer = match result {
+            IoResult::Event(event) => match *event {
+                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                    Some(allowed)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(allowed) = answer else {
             return Err(AuthorizationError::UnexpectedEvent {
                 state: "AdminCheck".to_string(),
                 expected: "authorization result",
@@ -105,7 +111,7 @@ mod tests {
     }
 
     fn answer(allowed: Result<bool, AuthorizationError>) -> IoResult {
-        IoResult::Event(authorization_event(allowed))
+        IoResult::Event(Box::new(authorization_event(allowed)))
     }
 
     #[test]

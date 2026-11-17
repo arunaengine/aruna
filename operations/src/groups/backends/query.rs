@@ -167,24 +167,25 @@ impl Operation for BucketCheckOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match result {
-            IoResult::Event(Event::Blob(BlobEvent::BucketExists { exists, writable })) => {
+        let IoResult::Event(event) = result else {
+            return Err(BucketCheckError::Blob(BlobError::UnknownBackend(
+                "unexpected bucket check answer".to_string(),
+            )));
+        };
+        match *event {
+            Event::Blob(BlobEvent::BucketExists { exists, writable }) => {
                 Ok(Next::Done((exists, writable)))
             }
             // Kept from the direct handle call: a node without blob access says so this way.
-            IoResult::Event(Event::Blob(BlobEvent::Error(BlobError::HandleMissing))) => {
+            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => {
                 let missing = BlobError::UnknownBackend("blob handle unavailable".to_string());
                 Err(BucketCheckError::Blob(missing))
             }
-            IoResult::Event(Event::Blob(BlobEvent::Error(error))) => {
-                Err(BucketCheckError::Blob(error))
-            }
-            IoResult::Event(other) => Err(BucketCheckError::Blob(BlobError::UnknownBackend(
-                format!("unexpected bucket check answer: {}", other.label()),
-            ))),
-            _ => Err(BucketCheckError::Blob(BlobError::UnknownBackend(
-                "unexpected bucket check answer".to_string(),
-            ))),
+            Event::Blob(BlobEvent::Error(error)) => Err(BucketCheckError::Blob(error)),
+            other => Err(BucketCheckError::Blob(BlobError::UnknownBackend(format!(
+                "unexpected bucket check answer: {}",
+                other.label()
+            )))),
         }
     }
 }
@@ -303,7 +304,7 @@ mod pure_tests {
             exists: true,
             writable: Some(false),
         });
-        let answer = operation.next(IoResult::Event(answer));
+        let answer = operation.next(IoResult::Event(Box::new(answer)));
         assert_eq!(answer, Ok(Next::Done((true, Some(false)))));
     }
 
@@ -313,14 +314,15 @@ mod pure_tests {
         let down = || BlobError::ConnectionFailed("down".to_string());
         let mut operation = bucket_check();
         operation.first().unwrap();
-        let answer = operation.next(IoResult::Event(Event::Blob(BlobEvent::Error(down()))));
+        let error = Event::Blob(BlobEvent::Error(down()));
+        let answer = operation.next(IoResult::Event(Box::new(error)));
         assert_eq!(answer, Err(BucketCheckError::Blob(down())));
         let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
         let mut operation = bucket_check();
         operation.first().unwrap();
         let unknown = BlobError::UnknownBackend("blob handle unavailable".to_string());
         assert_eq!(
-            operation.next(IoResult::Event(missing)),
+            operation.next(IoResult::Event(Box::new(missing))),
             Err(BucketCheckError::Blob(unknown))
         );
     }

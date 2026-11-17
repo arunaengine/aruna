@@ -113,24 +113,20 @@ impl Operation for GetNodesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<RealmPresence>, GetNodesError> {
-        match result {
-            IoResult::Event(Event::Net(NetEvent::Dht(DhtEvent::GetResult {
-                values,
-                stale,
-                ..
-            }))) => {
+        let IoResult::Event(event) = result else {
+            return Err(GetNodesError::NotFinished);
+        };
+        match *event {
+            Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale, .. })) => {
                 let nodes = values.into_iter().map(|entry| entry.node_id).collect();
                 Ok(Next::Done(RealmPresence::new(nodes, stale)))
             }
-            IoResult::Event(Event::Net(NetEvent::Dht(DhtEvent::Error { error }))) => {
-                Err(error.into())
-            }
-            IoResult::Event(other) => Err(GetNodesError::UnexpectedEvent {
+            Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => Err(error.into()),
+            other => Err(GetNodesError::UnexpectedEvent {
                 state: "ReadDocument".to_string(),
                 expected: "dht get result",
                 got: other.label(),
             }),
-            _ => Err(GetNodesError::NotFinished),
         }
     }
 
@@ -165,7 +161,7 @@ mod pure_tests {
             }],
             stale,
         }));
-        match operation.next(IoResult::Event(answer)) {
+        match operation.next(IoResult::Event(Box::new(answer))) {
             Ok(Next::Done(presence)) => presence,
             other => panic!("expected the presence, got {other:?}"),
         }
@@ -212,7 +208,7 @@ mod pure_tests {
         ));
         let mut operation = GetNodesOperation::new(realm_id);
         operation.first().unwrap();
-        let other = IoResult::Event(Event::Net(NetEvent::InboxWoken));
+        let other = IoResult::Event(Box::new(Event::Net(NetEvent::InboxWoken)));
         assert!(matches!(
             operation.next(other),
             Err(GetNodesError::UnexpectedEvent { .. })
