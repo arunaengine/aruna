@@ -1,12 +1,15 @@
-//! Asks the holders of a record in rank order, one encoded request at a time, under one deadline.
+//! Asks peers with encoded metadata requests: the holders of a record in rank order under one
+//! deadline, or many peers at once as one effect group.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, MetadataRequestEffect, NetEffect};
-use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm, MetadataRequestEffect, NetEffect};
+use aruna_core::events::{
+    Event, GroupEvent, GroupResult, MetadataAnswer, NetEvent, PeerRequestError,
+};
 use aruna_core::operation::Operation;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -207,6 +210,128 @@ impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> Operation for HolderF
     }
 }
 
+/// One peer's answer, or why there is none.
+pub type PeerAnswer = (NodeId, Result<MetadataTransportMessage, String>);
+
+/// Asks every peer at once, at most `limit` at a time, and answers once all of them answered.
+#[derive(Debug, PartialEq)]
+pub struct FanoutOperation {
+    requests: Vec<(NodeId, Result<Vec<u8>, String>)>,
+    limit: usize,
+    timeout: Duration,
+    started: bool,
+    output: Option<Result<Vec<PeerAnswer>, FetchError>>,
+}
+
+impl FanoutOperation {
+    pub fn new(
+        requests: Vec<(NodeId, MetadataTransportMessage)>,
+        limit: usize,
+        timeout: Duration,
+    ) -> Self {
+        let requests = (requests.into_iter())
+            .map(|(peer, message)| (peer, encode_message(&message)))
+            .collect();
+        Self {
+            requests,
+            limit,
+            timeout,
+            started: false,
+            output: None,
+        }
+    }
+
+    fn answers(&self, results: Vec<GroupResult>) -> Vec<PeerAnswer> {
+        let mut results = results.into_iter();
+        (self.requests.iter())
+            .map(|(peer, frame)| {
+                let answer = match frame {
+                    Err(error) => Err(error.clone()),
+                    Ok(_) => read_answer(*peer, results.next()),
+                };
+                (*peer, answer)
+            })
+            .collect()
+    }
+}
+
+/// Decodes one member's answer; a missing, cut off or failed answer is an error text.
+fn read_answer(
+    peer: NodeId,
+    result: Option<GroupResult>,
+) -> Result<MetadataTransportMessage, String> {
+    match result {
+        Some(GroupResult::Done(event)) => match *event {
+            Event::Net(NetEvent::MetadataAnswer(answer)) if answer.peer == peer => {
+                let MetadataAnswer { result, .. } = *answer;
+                let bytes = result.map_err(|error| format!("{error:?}"))?;
+                decode_message(&bytes).map_err(|error| error.to_string())
+            }
+            other => Err(format!("unexpected answer {}", other.label())),
+        },
+        Some(GroupResult::Unfinished) => Err("the peer did not answer in time".to_string()),
+        Some(GroupResult::Refused) | None => Err("the request did not run".to_string()),
+    }
+}
+
+impl Operation for FanoutOperation {
+    type Output = Vec<PeerAnswer>;
+    type Error = FetchError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        let members: Vec<Effect> = (self.requests.iter())
+            .filter_map(|(peer, frame)| {
+                let frame = frame.as_ref().ok()?.clone();
+                Some(Effect::Net(NetEffect::MetadataRequest(Box::new(
+                    MetadataRequestEffect {
+                        peer: *peer,
+                        frame,
+                        timeout: self.timeout,
+                    },
+                ))))
+            })
+            .collect();
+        if members.is_empty() {
+            self.output = Some(Ok(self.answers(Vec::new())));
+            return smallvec![];
+        }
+        smallvec![Effect::Group(EffectGroup {
+            members,
+            limit: self.limit,
+            form: GroupForm::All { deadline: None },
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match event {
+            Event::Group(GroupEvent::Finished { results })
+                if self.started && self.output.is_none() =>
+            {
+                Ok(self.answers(results))
+            }
+            _ => Err(FetchError::Unexpected),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Vec<PeerAnswer>, FetchError> {
+        self.output.unwrap_or(Err(FetchError::Unfinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 #[path = "fetch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "fanout_tests.rs"]
+mod fanout_tests;
