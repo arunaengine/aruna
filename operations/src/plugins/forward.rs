@@ -26,7 +26,10 @@ use ulid::Ulid;
 
 use super::matcher::Outbox;
 use super::receiver::lost_reason;
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, row as row_of, scan_rows, unexpected, values, Rows, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
+    row as row_of, scan_rows, unexpected, values,
+};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::dot_applied;
 
@@ -429,7 +432,7 @@ pub struct DatasetFacts {
 
 /// The rows read for [`unreadable`].
 #[derive(Debug, Default, PartialEq)]
-struct Facts {
+pub struct Facts {
     status: Option<MaterializationStatusRecord>,
     /// Whether the event's record is in the event log.
     logged: bool,
@@ -454,8 +457,14 @@ impl Plan for DatasetFacts {
     fn first(&mut self) -> Result<Turn<Facts>, StoreError> {
         let graph = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(self.document));
         Ok(Turn::Ask(Ask::Read(vec![
-            (MATERIALIZATION_STATUS_KEYSPACE, materialization_status_key(self.document).to_vec()),
-            (EVENT_LOG_KEYSPACE, event_log_key(self.document, self.event_id).to_vec()),
+            (
+                MATERIALIZATION_STATUS_KEYSPACE,
+                materialization_status_key(self.document).to_vec(),
+            ),
+            (
+                EVENT_LOG_KEYSPACE,
+                event_log_key(self.document, self.event_id).to_vec(),
+            ),
             (GRAPH_LIFECYCLE_KEYSPACE, graph.to_vec()),
         ])))
     }
@@ -468,7 +477,9 @@ impl Plan for DatasetFacts {
             .map(|bytes| decode::<MetadataEventRecord>(bytes))
             .transpose()?;
         let batch = record.and_then(|record| match record.payload {
-            MetadataEventPayload::ApplyBatch { batch, .. } => Some((record.record.graph_iri, batch)),
+            MetadataEventPayload::ApplyBatch { batch, .. } => {
+                Some((record.record.graph_iri, batch))
+            }
             _ => None,
         });
         let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
@@ -523,7 +534,9 @@ impl Plan for Apply {
     type Error = StoreError;
 
     fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Delete(self.decided.take().unwrap_or_default())))
+        Ok(Turn::Ask(Ask::Delete(
+            self.decided.take().unwrap_or_default(),
+        )))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
@@ -539,7 +552,9 @@ impl Plan for Apply {
                     return Err(unexpected(answer));
                 };
                 let mut rows = Vec::new();
-                for ((key, sequence), value) in std::mem::take(&mut self.acked).into_iter().zip(values) {
+                for ((key, sequence), value) in
+                    std::mem::take(&mut self.acked).into_iter().zip(values)
+                {
                     let Some(bytes) = value else {
                         continue;
                     };
