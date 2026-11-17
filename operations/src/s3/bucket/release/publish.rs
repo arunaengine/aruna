@@ -34,9 +34,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{
-    Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation, load_access,
-};
+use super::read::load_access;
+use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;

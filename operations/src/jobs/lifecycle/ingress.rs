@@ -57,7 +57,8 @@ use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
-use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
+use crate::s3::bucket::release::read::release_members;
+use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is

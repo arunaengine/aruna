@@ -39,8 +39,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
-use crate::driver::{DriverContext, drive};
+use crate::auth::request_authorization::BucketAccess;
 
 /// Rows read per storage page while looking for a bucket's releases.
 const ROW_PAGE: usize = 256;
@@ -564,43 +563,6 @@ pub struct MembershipCaller<'a> {
     pub bearer: Option<&'a str>,
 }
 
-/// Loads the caller's access once, then runs the membership check.
-pub async fn release_members(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    caller: MembershipCaller<'_>,
-    queries: &[MembershipQuery],
-) -> Result<MembersOutput, ReleaseError> {
-    let access = load_access(context, scope, caller.auth).await?;
-    let config = MembersConfig {
-        realm_id: scope.realm_id,
-        node_id: scope.node_id,
-        bucket: scope.bucket.to_string(),
-        info: scope.info.clone(),
-        auth: caller.auth.clone(),
-        access,
-        bearer: caller.bearer.map(str::to_string),
-        queries: queries.to_vec(),
-        ranges: None,
-        retention: false,
-    };
-    drive(ReleaseMembersOperation::new(config), context).await
-}
-
-/// The caller's rules and policies for the bucket, read once for every key they decide.
-pub async fn load_access(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    auth: &AuthContext,
-) -> Result<Access, ReleaseError> {
-    let place = (scope.realm_id, scope.info.group_id, scope.node_id);
-    match BucketAccess::load(context, auth, place, scope.bucket).await {
-        Ok(access) => Ok(Access(Arc::new(access))),
-        Err(AuthorizeError::Storage(error)) => Err(ReleaseError::Unavailable(error.to_string())),
-        Err(error) => Err(ReleaseError::Unavailable(error.to_string())),
-    }
-}
-
 fn graph(crate_json: &Value) -> impl Iterator<Item = &Value> {
     crate_json["@graph"].as_array().into_iter().flatten()
 }
@@ -635,6 +597,7 @@ pub(crate) fn upstream_of(crate_json: &Value) -> Vec<Identifier> {
 }
 
 pub mod publish;
+pub mod read;
 pub mod view;
 
 #[cfg(test)]

@@ -31,9 +31,8 @@ use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
 use aruna_operations::s3::bucket::release::publish::release_files;
-use aruna_operations::s3::bucket::release::{
-    BucketScope, MembershipCaller, MembershipQuery, load_access, release_members,
-};
+use aruna_operations::s3::bucket::release::read::{load_access, release_members};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use serde_json::json;
 use topology::{TestResult, Topology};

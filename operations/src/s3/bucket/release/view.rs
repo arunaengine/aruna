@@ -7,7 +7,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::bucket_metadata::ReleasePointer;
@@ -20,9 +20,6 @@ use serde_json::Value;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
-
-use super::{BucketScope, load_access};
-use crate::driver::{DriverContext, drive};
 
 /// The most entries one page lists.
 pub const MAX_PAGE: usize = 1000;
@@ -246,33 +243,6 @@ fn page(files: Vec<PinnedFile>, page: &FilePage) -> (Vec<PinnedFile>, Vec<String
         }
     }
     (listed, folders, None)
-}
-
-/// Lists one page of a release's files after checking the caller may read its crate.
-pub async fn release_view(
-    context: &DriverContext,
-    scope: BucketScope<'_>,
-    auth: &AuthContext,
-    (key, version_id): (&str, Ulid),
-    page: FilePage,
-) -> Result<ReleaseView, ViewError> {
-    let access = load_access(context, scope, auth)
-        .await
-        .map_err(|error| ViewError::Unavailable(error.to_string()))?;
-    if !access.0.allows(Some(key), &Permission::READ) {
-        return Err(ViewError::Forbidden);
-    }
-    let config = ViewConfig {
-        realm_id: scope.realm_id,
-        node_id: scope.node_id,
-        bucket: scope.bucket.to_string(),
-        info: scope.info.clone(),
-        auth: auth.clone(),
-        key: key.to_string(),
-        version_id,
-        page,
-    };
-    drive(ReleaseViewOperation::new(config), context).await
 }
 
 #[cfg(test)]
