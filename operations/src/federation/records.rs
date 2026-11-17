@@ -29,7 +29,7 @@ type Writes = Vec<(String, Key, Value)>;
 
 /// One conditional change of a transfer record.
 #[derive(Clone, Debug, PartialEq)]
-pub enum RecordChange {
+pub(crate) enum RecordChange {
     /// Stores a grant record unless one exists; the stored one wins.
     StoreGrant { key: Vec<u8>, record: GrantRecord },
     /// Sets the revoked flag of a grant record; nothing clears it.
@@ -50,7 +50,7 @@ pub enum RecordChange {
 
 /// A bound upload the caller found stale, checked again inside the binding transaction.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StaleUpload {
+pub(crate) struct StaleUpload {
     pub upload_id: Ulid,
     /// The job dedup index key of the import key; its job keeps a gone upload bound.
     pub dedup_key: Vec<u8>,
@@ -58,7 +58,7 @@ pub struct StaleUpload {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RecordOutcome {
+pub(crate) enum RecordOutcome {
     /// The stored grant record: the new one or an earlier winner.
     Grant(GrantRecord),
     /// Whether a grant record existed to revoke.
@@ -90,7 +90,7 @@ enum State {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RecordOperation {
+pub(crate) struct RecordOperation {
     change: RecordChange,
     state: State,
     txn_id: Option<TxnId>,

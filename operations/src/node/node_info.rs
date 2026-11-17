@@ -59,15 +59,7 @@ const SNAPSHOT_PAGE_SIZE: usize = 128;
 
 /// Interval between two heartbeats. Peers treat a heartbeat older than three
 /// intervals as stale telemetry.
-pub const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Arms (or shortens toward) the periodic node-info heartbeat publish task.
-pub fn schedule_info_publish(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::PublishNodeInfo,
-        after,
-    })
-}
+pub(crate) const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
@@ -440,7 +432,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
 /// Heartbeat: revises the persisted node-info document, publishes it while a committed revision
 /// is still owed to replication, then pushes live telemetry to the sync peers. Scans run
 /// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
-pub async fn refresh_info_heartbeat(
+pub(crate) async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -685,7 +677,7 @@ const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
 /// removal; returning clears the flags. `Ok(false)` means the state already matched.
-pub async fn set_departure_state(
+pub(crate) async fn set_departure_state(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
@@ -1154,7 +1146,7 @@ async fn node_info_row(
 /// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
 /// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
 /// forward past the handler's own post-run re-arm.
-pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
     if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishNodeInfo,

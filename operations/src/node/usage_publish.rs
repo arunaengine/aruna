@@ -520,7 +520,7 @@ pub(crate) async fn mark_dirty(
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let has_markers = match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: NODE_STATS_KEYSPACE.to_string(),

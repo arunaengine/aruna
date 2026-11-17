@@ -25,15 +25,15 @@ use url::Url;
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// Delay of the first publication after a settings change, so renames reach the registry at once.
-pub const PUBLISH_SOON: Duration = Duration::from_secs(5);
+pub(crate) const PUBLISH_SOON: Duration = Duration::from_secs(5);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
-pub const MAX_WITHDRAWALS: u8 = 3;
+const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
 
 /// Local withdrawal count of one disable cycle, named by the disabled descriptor's issue time
 /// and the registry URL, so each cycle gets its own budget.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublicationState {
+struct PublicationState {
     pub cycle: Option<(u64, Url)>,
     pub withdrawals: u8,
 }

@@ -80,9 +80,9 @@ fn shared_topic_peers(config: &RealmConfigDocument, node_id: NodeId) -> Vec<Node
 /// Work units one bounded restore pass may process. A work-unit limit, never a
 /// wall-clock deadline, so the bound holds however many shards share a
 /// co-holder set.
-pub const RESTORE_UNIT_BUDGET: usize = 8;
+const RESTORE_UNIT_BUDGET: usize = 8;
 /// Topics per work unit; one unit still fills a document sync topic batch.
-pub const RESTORE_CHUNK_TOPICS: usize = 64;
+const RESTORE_CHUNK_TOPICS: usize = 64;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -264,7 +264,7 @@ impl RecoveryStatus {
     }
 
     /// Marks a bounded pass as started.
-    pub fn begin_pass(&self) {
+    fn begin_pass(&self) {
         self.inner
             .state
             .store(RecoveryState::Running.code(), Ordering::Relaxed);

@@ -29,7 +29,7 @@ use crate::tasks::task_persistence::persist_task_effect;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs the decision and sends the signed request through the screened egress client.
-pub async fn publish_registration(
+pub(crate) async fn publish_registration(
     context: &DriverContext,
     realm_id: RealmId,
     node_id: NodeId,
@@ -173,7 +173,7 @@ fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
 
 /// Arms the registration timer at startup without postponing a restored due time. The due
 /// time is persisted, so repeated restarts do not keep moving the first publication.
-pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let effect = TaskEffect::ShortenTimer {
         key: TaskKey::PublishRegistration,
         after: PUBLISH_INTERVAL,

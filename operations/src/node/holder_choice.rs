@@ -19,9 +19,9 @@ use crate::node::heartbeat::held_heartbeats;
 use crate::node::read_info::ReadInfoOperation;
 
 /// A heartbeat older than this does not make a holder a candidate.
-pub const HEARTBEAT_STALE_MS: u64 = 180_000;
+pub(crate) const HEARTBEAT_STALE_MS: u64 = 180_000;
 /// At most this many holders are looked at for one choice.
-pub const MAX_CANDIDATES: usize = 16;
+pub(crate) const MAX_CANDIDATES: usize = 16;
 
 /// One holder that may serve.
 #[derive(Clone, Debug, PartialEq, Eq)]

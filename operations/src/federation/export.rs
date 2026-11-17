@@ -39,7 +39,7 @@ use crate::jobs::export::{ExportCheckpoint, crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
 use crate::replication::plaintext::is_holder;
 
-pub const EXPORT_OPERATION: &str = "federation.export";
+const EXPORT_OPERATION: &str = "federation.export";
 
 /// The node-local record beside a finished export job that its grant is checked against.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +266,7 @@ pub struct GrantRequest<'a> {
 
 /// Owned inputs of [`IssueGrantOperation`].
 #[derive(Clone, Debug, PartialEq)]
-pub struct IssueGrantConfig {
+struct IssueGrantConfig {
     pub realm_id: RealmId,
     pub principal: UserId,
     pub job_id: JobId,
@@ -281,13 +281,13 @@ pub struct IssueGrantConfig {
 /// Reads the grant record and checkpoint of an export, then returns the stored grant while it
 /// is valid, or signs a new one from the finished checkpoint. Nothing is written here.
 #[derive(Debug, PartialEq)]
-pub struct IssueGrantOperation {
+struct IssueGrantOperation {
     config: IssueGrantConfig,
     output: Option<Result<(bool, GrantRecord), GrantError>>,
 }
 
 impl IssueGrantOperation {
-    pub fn new(config: IssueGrantConfig) -> Self {
+    fn new(config: IssueGrantConfig) -> Self {
         Self {
             config,
             output: None,

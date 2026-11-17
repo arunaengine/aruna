@@ -33,7 +33,7 @@ use crate::jobs::store::{dedup_index_key, find_dedup_plan, read_job_record};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
-pub const IMPORT_OPERATION: &str = "federation.import";
+const IMPORT_OPERATION: &str = "federation.import";
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ImportError {
@@ -107,7 +107,7 @@ fn answer_error(status: reqwest::StatusCode) -> ImportError {
 
 /// Before a bound import starts or resumes: a confirmation the source gave since the last start
 /// (a pull or a push), or else a fresh confirmation of the grant by the source now.
-pub async fn confirm_source(
+pub(crate) async fn confirm_source(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     timeout: std::time::Duration,
@@ -364,7 +364,7 @@ fn bound(spec: &ImportRoCrateSpec, intent: &ImportIntent) -> bool {
 
 /// Rechecks an import of another realm's artifact at every step; other imports pass. An expired
 /// intent or grant, or a superseded descriptor, pauses the job until a fresh consent rebinds it.
-pub async fn recheck_import(
+pub(crate) async fn recheck_import(
     context: &DriverContext,
     spec: &ImportRoCrateSpec,
     node_id: NodeId,
