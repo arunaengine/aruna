@@ -11,7 +11,7 @@ use craqle::{
     AllowAllAuthorizer, CompiledRoCratePolicy, CraqleError, CraqleErrorKind,
     CraqleFjallPersistMode, CraqleNode, CraqleOptions, CrateViolation, EncodedTerm, GraphId,
     MaterializedQuadChange, PrepareRoCrateOptions, PreparedRoCrateDocument, RoCratePolicyOptions,
-    RoCrateVersion, SearchStorage, ShaclCompileOptions, ShaclError, ShaclValidationResult,
+    RoCrateVersion, SearchStorage, ShaclCompileOptions, ShaclError,
 };
 use oxrdf::{NamedNode, NamedOrBlankNode, Term};
 use oxttl::TurtleParser;

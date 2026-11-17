@@ -18,7 +18,8 @@ use tokio::time::{timeout, timeout_at};
 use tracing::{Span, field};
 use ulid::Ulid;
 
-use super::effects::{record_error, record_query_counts};
+use super::effects::record_query_counts;
+use aruna_core::telemetry::record_error;
 use super::{
     METADATA_CHUNK_SIZE, METADATA_ENVELOPE_BYTES, METADATA_IO_TIMEOUT, MetadataHandle,
     MetadataInner, MetadataRequestError, PAGE_ANSWER_TIMEOUT, SYNC_MIRROR_TIMEOUT,

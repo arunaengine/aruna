@@ -53,6 +53,7 @@ pub use self::lifecycle::{
 };
 pub use self::query::query_authorized_local;
 pub use self::search::{search_authorized_local, search_local_filtered};
+pub(crate) use self::ingress::write_answer;
 pub(crate) use self::transport::transport_message_kind;
 mod ingress;
 mod lifecycle;

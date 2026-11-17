@@ -11,11 +11,9 @@ use aruna_core::metadata::{
 use aruna_core::entity_patch::craqle_patch_request;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
-    CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, DescribeRequest, Dot,
-    GraphId, GraphPolicy, PatchEntityRequest, RemoveEntityRequest, RoCrateError, vocab,
+    CraqleRequestDurability, CreateCrateRequest, DescribeRequest, Dot, GraphId, GraphPolicy,
+    RemoveEntityRequest, RoCrateError,
 };
-use oxrdf::{BlankNode, Literal, NamedNode, Term};
-use serde_json::Value;
 
 pub(crate) fn upsert_data_entity(
     node: &CraqleNode,

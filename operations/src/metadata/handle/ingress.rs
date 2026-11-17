@@ -4,7 +4,7 @@
 
 use super::peer_auth::authorize_peer;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -15,7 +15,7 @@ use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use tracing::{Span, field};
+use tracing::Span;
 
 use super::effects::metadata_read_error;
 use super::peer_auth::{
@@ -25,7 +25,7 @@ use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, transport_message_kind, write_body_at, write_message_at, write_stream_body,
+    read_budget, write_body_at, write_message_at, write_stream_body,
     write_transport_message,
 };
 use super::{

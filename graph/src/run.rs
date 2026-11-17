@@ -815,7 +815,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
     );
     let persist_sync_success = effect_persists_sync(&effect);
     let deferred_persist_success = effect_defers_persist(&effect);
-    let node = inner.node.clone();
+    let node = &inner.node;
     let effect_span = debug_span!(
         "metadata.backend.effect",
         effect = effect_name,

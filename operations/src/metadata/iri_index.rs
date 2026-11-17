@@ -5,7 +5,6 @@
 // Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
 // own rows, so a materialization replaces exactly its own postings.
 
-use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -612,6 +611,7 @@ async fn read_materialization_status(
 mod tests {
     use super::super::data_links::apply_rows;
     use super::*;
+    use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
     use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
