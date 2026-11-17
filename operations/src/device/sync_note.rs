@@ -5,16 +5,14 @@
 
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_STATE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, Key};
+use aruna_core::operation::Operation;
+use aruna_core::types::Key;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 
 /// How recently the realm must have answered for the device to call it
 /// reachable. Two folder beats, so one missed pass does not flip the view.
@@ -79,29 +77,17 @@ pub enum SyncNote {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum NoteError {
-    #[error("unexpected {0} while noting the device sync state")]
-    UnexpectedEvent(&'static str),
-    #[error("noting the device sync state did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NoteState {
-    Init,
-    Read,
-    Write,
-    Finish,
-    Error,
-}
-
-/// Records one note in the device sync state at `now_ms`. A failed write is only logged: the
-/// state is a view for the owner, and the next note writes it again.
+/// Records one note in the device sync state at `now_ms`. A failed read or write fails the
+/// note; the state is a view for the owner, and the next note writes it again.
 #[derive(Debug, PartialEq)]
 pub struct NoteSyncOperation {
     note: SyncNote,
     now_ms: u64,
-    state: NoteState,
-    output: Option<Result<(), NoteError>>,
+    read: bool,
 }
 
 impl NoteSyncOperation {
@@ -109,132 +95,73 @@ impl NoteSyncOperation {
         Self {
             note,
             now_ms,
-            state: NoteState::Init,
-            output: None,
+            read: false,
         }
     }
 
-    fn finish(&mut self, output: Result<(), NoteError>) -> Effects {
-        self.state = match output {
-            Ok(()) => NoteState::Finish,
-            Err(_) => NoteState::Error,
-        };
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn write(&mut self, state: &DeviceSyncState) -> Effects {
-        let Ok(bytes) = postcard::to_allocvec(state) else {
-            return self.finish(Ok(()));
-        };
-        self.state = NoteState::Write;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            value: ByteView::from(bytes),
-            txn_id: None,
-        })]
+    /// The state after this note, or `None` when the note changes nothing.
+    fn noted(&self, mut state: DeviceSyncState) -> Option<DeviceSyncState> {
+        match self.note {
+            SyncNote::Contact => state.last_contact_ms = Some(self.now_ms),
+            SyncNote::Failure => {
+                state.last_contact_ms.take()?;
+            }
+            SyncNote::Finished => {
+                state.last_contact_ms = Some(self.now_ms);
+                state.last_sync_ms = Some(self.now_ms);
+                state.run_started_ms = None;
+            }
+        }
+        Some(state)
     }
 }
 
-impl EffectOperation for NoteSyncOperation {
+impl Operation for NoteSyncOperation {
     type Output = ();
     type Error = NoteError;
 
-    fn start(&mut self) -> Effects {
-        self.state = NoteState::Read;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<()>, NoteError> {
+        let row = (SYNC_STATE_KEYSPACE.to_string(), sync_state_key());
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, &event) {
-            (
-                NoteState::Read,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. }),
-            ) => {
-                let mut state = read_state(&event);
-                match self.note {
-                    SyncNote::Contact => state.last_contact_ms = Some(self.now_ms),
-                    SyncNote::Failure => {
-                        if state.last_contact_ms.take().is_none() {
-                            return self.finish(Ok(()));
-                        }
-                    }
-                    SyncNote::Finished => {
-                        state.last_contact_ms = Some(self.now_ms);
-                        state.last_sync_ms = Some(self.now_ms);
-                        state.run_started_ms = None;
-                    }
-                }
-                self.write(&state)
-            }
-            (NoteState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                self.finish(Ok(()))
-            }
-            (NoteState::Write, Event::Storage(StorageEvent::Error { error })) => {
-                warn!(error = %error, "Failed to store the device sync state");
-                self.finish(Ok(()))
-            }
-            _ => {
-                let label = event.label();
-                self.finish(Err(NoteError::UnexpectedEvent(label)))
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, NoteError> {
+        if self.read {
+            result.done()?;
+            return Ok(Next::Done(()));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, NoteState::Finish | NoteState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(NoteError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        self.read = true;
+        let stored = result.values()?.into_iter().next().flatten();
+        let state = stored
+            .and_then(|bytes| postcard::from_bytes(&bytes).ok())
+            .unwrap_or_default();
+        let Some(state) = self.noted(state) else {
+            return Ok(Next::Done(()));
+        };
+        let Ok(bytes) = postcard::to_allocvec(&state) else {
+            return Ok(Next::Done(()));
+        };
+        let row = (
+            SYNC_STATE_KEYSPACE.to_string(),
+            sync_state_key(),
+            bytes.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
-    fn stored(state: &DeviceSyncState) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: sync_state_key(),
-            value: Some(postcard::to_allocvec(state).unwrap().into()),
-        })
+    fn stored(state: &DeviceSyncState) -> IoResult {
+        IoResult::Values(vec![Some(postcard::to_allocvec(state).unwrap().into())])
     }
 
-    fn read() -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            txn_id: None,
-        })
-    }
-
-    fn write(state: &DeviceSyncState) -> Effect {
-        Effect::Storage(StorageEffect::Write {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            value: postcard::to_allocvec(state).unwrap().into(),
-            txn_id: None,
-        })
-    }
-
-    fn written() -> Event {
-        Event::Storage(StorageEvent::WriteResult {
-            key: sync_state_key(),
-        })
+    fn write(state: &DeviceSyncState) -> Next<()> {
+        let value = postcard::to_allocvec(state).unwrap().into();
+        let row = (SYNC_STATE_KEYSPACE.to_string(), sync_state_key(), value);
+        Next::Call(IoCall::Write(vec![row]))
     }
 
     // A finished pass records contact and sync time and ends the run.
@@ -250,15 +177,10 @@ mod tests {
             run_started_ms: None,
         };
         let mut operation = NoteSyncOperation::new(SyncNote::Finished, 9);
-        check_trace(
-            &mut operation,
-            &[read()],
-            vec![
-                (stored(&before), vec![write(&after)]),
-                (written(), Vec::new()),
-            ],
-        );
-        assert_eq!(operation.finalize(), Ok(()));
+        let read = IoCall::Read(vec![(SYNC_STATE_KEYSPACE.to_string(), sync_state_key())]);
+        assert_eq!(operation.first(), Ok(Next::Call(read)));
+        assert_eq!(operation.next(stored(&before)), Ok(write(&after)));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
     }
 
     // A failed contact clears the last contact, and writes nothing when none was kept.
@@ -269,49 +191,26 @@ mod tests {
             ..DeviceSyncState::default()
         };
         let mut operation = NoteSyncOperation::new(SyncNote::Failure, 9);
-        check_trace(
-            &mut operation,
-            &[read()],
-            vec![(stored(&reached), vec![write(&DeviceSyncState::default())])],
-        );
+        operation.first().unwrap();
+        let cleared = write(&DeviceSyncState::default());
+        assert_eq!(operation.next(stored(&reached)), Ok(cleared));
         let mut operation = NoteSyncOperation::new(SyncNote::Failure, 9);
-        operation.start();
-        assert!(
-            operation
-                .step(stored(&DeviceSyncState::default()))
-                .is_empty()
-        );
-        assert_eq!(operation.finalize(), Ok(()));
+        operation.first().unwrap();
+        let empty = operation.next(stored(&DeviceSyncState::default()));
+        assert_eq!(empty, Ok(Next::Done(())));
     }
 
-    // An unreadable row counts as empty; a failed write is only logged.
+    // An absent or undecodable row counts as empty; a result that answers no call fails.
     #[test]
-    fn failures_tolerated() {
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
+    fn empty_row_counts() {
         let contact = DeviceSyncState {
             last_contact_ms: Some(4),
             ..DeviceSyncState::default()
         };
         let mut operation = NoteSyncOperation::new(SyncNote::Contact, 4);
-        check_trace(
-            &mut operation,
-            &[read()],
-            vec![(error(), vec![write(&contact)]), (error(), Vec::new())],
-        );
-        assert_eq!(operation.finalize(), Ok(()));
-    }
-
-    // Other events are refused; nothing is cleaned up and nothing finishes early.
-    #[test]
-    fn rejects_unexpected() {
-        let fresh = || NoteSyncOperation::new(SyncNote::Contact, 1);
-        let all = sample_events().len();
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
+        operation.first().unwrap();
+        let garbage = IoResult::Values(vec![Some(vec![0xFF].into())]);
+        assert_eq!(operation.next(garbage), Ok(write(&contact)));
+        assert!(operation.next(IoResult::Woke).is_err());
     }
 }
