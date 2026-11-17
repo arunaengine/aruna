@@ -766,6 +766,7 @@ impl Operation for EnqueueTimer {
 }
 
 /// The timer row of an install, if its timer ran before.
+#[cfg(test)]
 pub(crate) fn read_timer(install_id: Ulid) -> ReadTimer {
     ReadTimer(timer_key(install_id))
 }

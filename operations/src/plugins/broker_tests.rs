@@ -687,7 +687,8 @@ fn dataset_crates() {
     assert_eq!(dataset["@id"], "./");
     assert_eq!(dataset["@type"], "Dataset");
     assert_eq!(dataset["author"], serde_json::json!({"@id": "#p"}));
-    assert_eq!(dataset["extra"]["@type"], JSON_LITERAL);
+    let json_literal = "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON";
+    assert_eq!(dataset["extra"]["@type"], json_literal);
     assert_eq!(stored["@graph"][0]["about"]["@id"], "./");
     for refused in [
         "[1]",

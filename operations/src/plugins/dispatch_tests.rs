@@ -145,7 +145,7 @@ fn trigger_indexes_kept() {
 }
 
 #[test]
-fn timer_occurrences() {
+fn plans_timer_occurrences() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
     let plan = |now_ms| enqueue_timer(&install, "every".into(), 10, now_ms);
     // Before the first interval since activation nothing is due.
