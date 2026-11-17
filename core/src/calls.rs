@@ -61,6 +61,58 @@ pub enum IoResult {
     Woke,
 }
 
+impl IoResult {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Values(_) => "IoResult::Values",
+            Self::Page { .. } => "IoResult::Page",
+            Self::Done => "IoResult::Done",
+            Self::Event(_) => "IoResult::Event",
+            Self::Group(_) => "IoResult::Group",
+            Self::Woke => "IoResult::Woke",
+        }
+    }
+
+    fn other(&self, expected: &'static str) -> IoError {
+        IoError::Unexpected {
+            expected,
+            got: self.label(),
+        }
+    }
+
+    /// The values of a read, or the error naming the result that came instead.
+    pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
+        match self {
+            Self::Values(values) => Ok(values),
+            other => Err(other.other("IoResult::Values")),
+        }
+    }
+
+    /// The rows of a page and the key to continue after.
+    pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+        match self {
+            Self::Page { rows, next } => Ok((rows, next)),
+            other => Err(other.other("IoResult::Page")),
+        }
+    }
+
+    /// The event that answered an effect or a child.
+    pub fn event(self) -> Result<Event, IoError> {
+        match self {
+            Self::Event(event) => Ok(event),
+            other => Err(other.other("IoResult::Event")),
+        }
+    }
+
+    /// The end of a write, delete or sync.
+    pub fn done(self) -> Result<(), IoError> {
+        match self {
+            Self::Done => Ok(()),
+            other => Err(other.other("IoResult::Done")),
+        }
+    }
+}
+
 /// What an operation does next.
 #[derive(Debug, PartialEq)]
 pub enum Next<T> {
@@ -88,6 +140,18 @@ pub enum IoError {
     Hung { effect: &'static str },
     #[error("the operation did not finish")]
     Unfinished,
+}
+
+impl From<IoError> for StorageError {
+    /// A storage failure as itself, a conflict as the transaction conflict, any other as a read
+    /// error naming it.
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => error,
+            IoError::Conflict => StorageError::TransactionConflict,
+            other => StorageError::ReadError(other.to_string()),
+        }
+    }
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
