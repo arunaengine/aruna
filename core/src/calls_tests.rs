@@ -370,6 +370,9 @@ fn conflict_marks_retry() {
     let full = IoError::Storage(StorageError::QueueFull);
     assert!(!CallRun::<Script>::is_conflict(&full));
     assert_eq!(CallRun::<Script>::conflict_retries(), 3);
+    let mut fresh = run(script(Vec::new()), true);
+    assert_eq!(fresh.on_conflict(3), AfterConflict::Rerun);
+    assert_eq!(fresh.on_conflict(4), AfterConflict::Fail);
 }
 
 #[test]

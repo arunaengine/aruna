@@ -70,6 +70,37 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     {
         3
     }
+
+    /// Decides on the freshly built next attempt after attempt `attempt` (from 1) of
+    /// `drive_retry` lost a conflict; it may set its own state first, such as a recheck flag.
+    /// By default it reruns `conflict_retries()` times, then fails.
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output>
+    where
+        Self: Sized,
+    {
+        AfterConflict::rerun_within(attempt, Self::conflict_retries())
+    }
+}
+
+/// What the conflict retry does after a run lost a transaction conflict.
+#[derive(Debug, PartialEq)]
+pub enum AfterConflict<T> {
+    /// Runs the fresh attempt after the backoff.
+    Rerun,
+    /// Ends with this output, without a rerun.
+    Finish(T),
+    /// Ends with the conflict error.
+    Fail,
+}
+
+impl<T> AfterConflict<T> {
+    /// The default policy: rerun while `attempt` is at most `retries`, then fail.
+    pub fn rerun_within(attempt: u32, retries: u32) -> Self {
+        match attempt <= retries {
+            true => Self::Rerun,
+            false => Self::Fail,
+        }
+    }
 }
 
 /// An operation written against raw effects and events: `start` returns the first effects,
@@ -127,6 +158,14 @@ pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
         Self: Sized,
     {
         3
+    }
+
+    /// See [`Operation::on_conflict`].
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output>
+    where
+        Self: Sized,
+    {
+        AfterConflict::rerun_within(attempt, Self::conflict_retries())
     }
 
     /// Whether a deadline must still run `abort` after one of the operation's

@@ -14,7 +14,8 @@ use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, a
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
 use crate::operation::{
-    EffectOperation, HoldScope, Operation, Runnable, SubOperation, boxed_suboperation,
+    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation,
+    boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
@@ -517,6 +518,10 @@ impl<P: Operation> EffectOperation for CallRun<P> {
 
     fn conflict_retries() -> u32 {
         P::conflict_retries()
+    }
+
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
+        self.operation.on_conflict(attempt)
     }
 }
 
