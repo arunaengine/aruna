@@ -86,6 +86,9 @@ pub(crate) async fn dispatch_effect_until(
         Effect::Net(NetEffect::SnapshotSign(claim)) => Event::Net(NetEvent::SnapshotSign(
             crate::distribution::sign_snapshot(context, *claim),
         )),
+        Effect::Net(NetEffect::Heartbeat(effect)) => {
+            Box::pin(net::dispatch_heartbeat(*effect, context)).await
+        }
         // Release crate reads and holder requests need the runner's handles.
         Effect::Net(NetEffect::Release(effect)) => Event::Net(NetEvent::Release(
             Box::pin(crate::s3::bucket::release::publish::dispatch_release(

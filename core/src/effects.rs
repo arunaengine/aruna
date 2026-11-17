@@ -752,6 +752,8 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
+    Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

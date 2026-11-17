@@ -467,6 +467,7 @@ pub enum NetEvent {
     StatementSign(StatementSignEvent),
     Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
+    Heartbeat(crate::heartbeat::HeartbeatEvent),
 }
 
 /// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
@@ -865,6 +866,7 @@ impl Event {
                     StatementSign,
                     Release,
                     Error,
+                    Heartbeat,
                 }
             ),
             Event::Metadata(event) => variant_label!(

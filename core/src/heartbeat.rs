@@ -15,6 +15,8 @@ use crate::structs::storage::node_info::{AdvertisementEpoch, NodeUtilization};
 
 /// Largest encoded heartbeat a peer accepts.
 pub const MAX_HEARTBEAT_BYTES: usize = 32 * 1024;
+/// Deadline for reading or sending one heartbeat.
+pub const HEARTBEAT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One heartbeat. `epoch` names the committed advertisement it belongs to, with the send time as
 /// `observed_at_ms`; `sequence` grows by one per heartbeat of one process.
@@ -127,6 +129,32 @@ pub struct HeldHeartbeat {
     pub heartbeat: NodeHeartbeat,
     pub age_ms: u64,
     pub received_at_ms: u64,
+}
+
+/// A heartbeat action the runner carries out with the node's net handle.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeartbeatEffect {
+    /// Keeps this node's own heartbeat and answers the sync peers of the realm.
+    Record(NodeHeartbeat),
+    /// Sends one length-prefixed heartbeat frame to `peer`; no answer is read.
+    Push {
+        peer: NodeId,
+        frame: crate::types::Value,
+    },
+    /// Keeps a heartbeat `peer` sent when it is newer and `peer` is a sync peer.
+    Store {
+        peer: NodeId,
+        heartbeat: Box<NodeHeartbeat>,
+    },
+}
+
+/// The answer to a [`HeartbeatEffect`].
+#[derive(Debug, PartialEq)]
+pub enum HeartbeatEvent {
+    Peers(Vec<NodeId>),
+    Pushed,
+    PushFailed(String),
+    Stored(bool),
 }
 
 fn revision(epoch: &AdvertisementEpoch) -> (u64, u64) {
