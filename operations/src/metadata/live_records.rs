@@ -223,3 +223,199 @@ fn document_lifecycle_deleted(
     }
     Ok(matches!(lifecycle, MetadataLifecycleRecord::Delete { .. }))
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::metadata::timestamp_sweep::state_machine_tests::{document, record_bytes};
+    use aruna_core::metadata::MetadataDeleteRecord;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use ulid::Ulid;
+
+    fn record(seed: u8) -> MetadataRegistryRecord {
+        postcard::from_bytes(&record_bytes(document(seed), 10)).expect("record decodes")
+    }
+
+    fn tombstone(record: &MetadataRegistryRecord) -> GraphLifecycleRecord {
+        GraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        )
+    }
+
+    fn graph_deleted(record: &MetadataRegistryRecord) -> Option<Value> {
+        Some(postcard::to_allocvec(&tombstone(record)).unwrap().into())
+    }
+
+    fn document_deleted(record: &MetadataRegistryRecord) -> Option<Value> {
+        let lifecycle = MetadataLifecycleRecord::Delete {
+            event: MetadataDeleteRecord {
+                event_id: Ulid::from_bytes([3; 16]),
+                tombstone: tombstone(record),
+                deleted_after_id: record.last_event_id,
+            },
+        };
+        Some(postcard::to_allocvec(&lifecycle).unwrap().into())
+    }
+
+    fn reads_effect(records: &[MetadataRegistryRecord], txn_id: Option<TxnId>) -> Effect {
+        let reads = records
+            .iter()
+            .flat_map(|record| {
+                [
+                    (
+                        GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                        graph_lifecycle_key(&record.graph_iri),
+                    ),
+                    (
+                        DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+                        document_lifecycle_key(record.document_id),
+                    ),
+                ]
+            })
+            .collect();
+        Effect::Storage(StorageEffect::BatchRead { reads, txn_id })
+    }
+
+    /// Answers the batch read with one graph and one document value per record.
+    fn answer(rows: &[(&MetadataRegistryRecord, Option<Value>, Option<Value>)]) -> Event {
+        let values = rows
+            .iter()
+            .flat_map(|(record, graph, document)| {
+                [
+                    (graph_lifecycle_key(&record.graph_iri), graph.clone()),
+                    (document_lifecycle_key(record.document_id), document.clone()),
+                ]
+            })
+            .collect();
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
+    fn reading(records: Vec<MetadataRegistryRecord>) -> LiveRecordsOperation {
+        let mut operation = LiveRecordsOperation::new(records, None);
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn keeps_live_records() {
+        // A graph tombstone or a document delete drops a record; the rest stay in order.
+        let (live, gone, removed) = (record(1), record(2), record(3));
+        let records = vec![live.clone(), gone.clone(), removed.clone()];
+        let mut operation = LiveRecordsOperation::new(records.clone(), None);
+        check_trace(
+            &mut operation,
+            &[reads_effect(&records, None)],
+            vec![(
+                answer(&[
+                    (&live, None, None),
+                    (&gone, graph_deleted(&gone), None),
+                    (&removed, None, document_deleted(&removed)),
+                ]),
+                vec![],
+            )],
+        );
+        assert_eq!(operation.finalize(), Ok(vec![live]));
+    }
+
+    #[test]
+    fn reads_in_transaction() {
+        let txn_id = Ulid::from_bytes([4; 16]);
+        let live = record(1);
+        let mut operation = LiveRecordsOperation::new(vec![live.clone()], Some(txn_id));
+        check_trace(
+            &mut operation,
+            &[reads_effect(std::slice::from_ref(&live), Some(txn_id))],
+            vec![(answer(&[(&live, None, None)]), vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(vec![live]));
+    }
+
+    #[test]
+    fn empty_and_capped() {
+        // No records need no read; more than the candidate limit refuse before reading.
+        let mut empty = LiveRecordsOperation::new(Vec::new(), None);
+        assert!(empty.start().is_empty());
+        assert!(empty.is_complete());
+        assert_eq!(empty.finalize(), Ok(Vec::new()));
+
+        let mut capped =
+            LiveRecordsOperation::new(vec![record(1); REGISTRY_CANDIDATE_LIMIT + 1], None);
+        assert!(capped.start().is_empty());
+        assert_eq!(capped.finalize(), Err(LiveRecordsError::TooMany));
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let mut operation = reading(vec![record(1)]);
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(error).is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(LiveRecordsError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn broken_rows_fail() {
+        let (own, stranger) = (record(1), record(2));
+        let cases = [
+            answer(&[(&own, Some(vec![1u8].into()), None)]),
+            answer(&[(&own, graph_deleted(&stranger), None)]),
+            answer(&[(&own, None, document_deleted(&stranger))]),
+            answer(&[(&stranger, None, None)]),
+            Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }),
+        ];
+        for event in cases {
+            let mut operation = reading(vec![own.clone()]);
+            assert!(operation.step(event).is_empty());
+            assert!(matches!(
+                operation.finalize(),
+                Err(LiveRecordsError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::BatchReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in
+            rejects_events(|| reading(vec![record(1)]), sample_events, accepted)
+        {
+            assert!(effects.is_empty());
+            assert!(matches!(error, LiveRecordsError::UnexpectedEvent { .. }));
+        }
+        let mut idle = LiveRecordsOperation::new(vec![record(1)], None);
+        idle.step(answer(&[]));
+        assert!(matches!(
+            idle.finalize(),
+            Err(LiveRecordsError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = LiveRecordsOperation::new(vec![record(1)], None);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(LiveRecordsOperation::new(vec![record(1)], None));
+        rejects_finalize(reading(vec![record(1)]));
+    }
+}
