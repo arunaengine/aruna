@@ -106,7 +106,8 @@ pub(super) async fn export_raw(
                     Err(MetadataApiError::Internal(error.to_string()))
                 }
                 other => Err(MetadataApiError::Internal(format!(
-                    "unexpected read snapshot commit event: {other:?}"
+                    "unexpected read snapshot commit event: {}",
+                    other.label()
                 ))),
             }
         }

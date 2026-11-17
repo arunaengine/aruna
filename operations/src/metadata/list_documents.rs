@@ -129,8 +129,10 @@ impl Operation for ListDocumentsOperation {
                     smallvec![self.iter_effect(None)]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self
-                    .unexpected_event("metadata graph lifecycle iter result", format!("{other:?}")),
+                other => self.unexpected_event(
+                    "metadata graph lifecycle iter result",
+                    other.label().to_string(),
+                ),
             },
             ListDocumentsState::ListDocuments => match parse_registry_iter(event) {
                 Ok((page, next_start_after)) => {
@@ -149,7 +151,7 @@ impl Operation for ListDocumentsOperation {
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             ListDocumentsState::Finish | ListDocumentsState::Error | ListDocumentsState::Init => {
-                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
+                self.unexpected_event("no event in a terminal state", event.label().to_string())
             }
         }
     }

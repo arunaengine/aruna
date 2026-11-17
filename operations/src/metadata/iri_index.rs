@@ -511,7 +511,7 @@ fn expect_batch(event: Event) -> Result<(), MetadataIriError> {
         Event::Storage(StorageEvent::BatchWriteResult { .. })
         | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataIriError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataIriError::UnexpectedEvent(other.label().to_string())),
     }
 }
 

@@ -632,7 +632,8 @@ pub async fn load_validation_status(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataError::Backend(format!(
-            "unexpected profile validation status read: {other:?}"
+            "unexpected profile validation status read: {}",
+            other.label()
         ))),
     }
 }
@@ -769,7 +770,8 @@ pub async fn revalidate_current(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
             return Err(MetadataError::Backend(format!(
-                "unexpected profile validation status write: {other:?}"
+                "unexpected profile validation status write: {}",
+                other.label()
             )));
         }
     }
@@ -785,7 +787,8 @@ pub async fn revalidate_current(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataError::Backend(format!(
-            "unexpected profile revalidation commit: {other:?}"
+            "unexpected profile revalidation commit: {}",
+            other.label()
         ))),
     }
 }

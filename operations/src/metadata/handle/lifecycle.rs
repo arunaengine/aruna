@@ -912,7 +912,8 @@ pub(super) async fn list_deleted_iris(
             }
             other => {
                 return Err(MetadataError::Backend(format!(
-                    "unexpected metadata graph lifecycle iteration result: {other:?}"
+                    "unexpected metadata graph lifecycle iteration result: {}",
+                    other.label()
                 )));
             }
         };

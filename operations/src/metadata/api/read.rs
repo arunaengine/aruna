@@ -328,7 +328,7 @@ pub(crate) async fn filter_live_records(
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => return Err(MetadataApiError::Internal(other.label().to_string())),
     };
     if values.len() != records.len().saturating_mul(2) {
         return Err(MetadataApiError::Internal(format!(
@@ -487,7 +487,7 @@ pub(super) async fn is_deleted(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => Err(MetadataApiError::Internal(other.label().to_string())),
     }
 }
 
@@ -566,7 +566,7 @@ async fn graph_deleted_txn(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => Err(MetadataApiError::Internal(other.label().to_string())),
     }
 }
 
@@ -591,7 +591,7 @@ async fn document_deleted_txn(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => Err(MetadataApiError::Internal(other.label().to_string())),
     }
 }
 

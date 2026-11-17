@@ -829,9 +829,9 @@ async fn batch_read_values(
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -903,9 +903,9 @@ async fn read_dead_letter(
         }) => Ok(postcard::from_bytes(&value).ok()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -935,9 +935,9 @@ pub async fn requeue_dead_letters(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1108,9 +1108,9 @@ async fn transactional_batch_write(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1131,9 +1131,9 @@ async fn transactional_batch_delete(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1152,9 +1152,9 @@ pub async fn enqueue_job(
                 return Err(MetadataMaterializationError::UnexpectedEvent(message));
             }
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
     }
@@ -1187,9 +1187,9 @@ async fn read_document_job(
         },
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1226,9 +1226,9 @@ async fn scan_due_jobs(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1693,9 +1693,9 @@ async fn load_group_jobs(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1786,9 +1786,9 @@ async fn read_create_event(
             })
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1899,9 +1899,9 @@ async fn mark_capture(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1923,9 +1923,9 @@ pub async fn capture_pending(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1950,9 +1950,9 @@ pub async fn materialization_jobs_exist(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
         let Some((key, _value)) = values.into_iter().next() else {
@@ -2032,9 +2032,9 @@ async fn prune_jobs(
             Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
         let mut deletes = Vec::new();
@@ -2118,9 +2118,9 @@ async fn delete_materialization_entries(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -2200,9 +2200,9 @@ async fn materialize_create_event(
             })
         }
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -2237,9 +2237,9 @@ async fn merge_batch_event(
         Event::Metadata(MetadataEvent::GraphPolicySet { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
     match send_graph_effect(context, change).await {
@@ -2247,9 +2247,9 @@ async fn merge_batch_event(
         | Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
     let render = match send_graph_effect(
@@ -2263,9 +2263,9 @@ async fn merge_batch_event(
         Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => jsonld,
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let mut status = assess_render(
@@ -2538,9 +2538,9 @@ async fn write_status_job(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 

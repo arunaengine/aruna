@@ -182,7 +182,9 @@ pub async fn prune_jobs_exist(storage: &StorageHandle) -> Result<bool, MetadataG
             }
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
     }
@@ -254,7 +256,9 @@ pub async fn enqueue_prune_job(
                 return Err(MetadataGraphError::UnexpectedEvent(message));
             }
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
     }
@@ -413,7 +417,9 @@ async fn scan_due_prune(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -502,7 +508,9 @@ async fn write_prune_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -577,7 +585,9 @@ async fn find_decoded_prune(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -698,7 +708,9 @@ async fn transactional_batch_write(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -719,7 +731,9 @@ async fn transactional_batch_delete(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -739,7 +753,9 @@ async fn delete_batch_entries(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 

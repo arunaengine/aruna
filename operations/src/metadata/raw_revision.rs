@@ -235,7 +235,7 @@ async fn raw_deleted(
             .transpose()?
             .unwrap_or(false),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => return Err(RawReadError::UnexpectedEvent(other.label().to_string())),
     };
     if document {
         return Ok(true);
@@ -259,7 +259,7 @@ async fn raw_deleted(
             .map(|deleted| deleted.unwrap_or(false))
             .map_err(RawReadError::from),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -573,7 +573,7 @@ async fn read_raw_state(
         )),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -606,7 +606,7 @@ async fn read_raw_event(
             RawReadError::InconsistentLog(format!("raw event {event_id} is missing")),
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -644,7 +644,7 @@ async fn load_raw_events(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(RawReadError::UnexpectedEvent(format!("{other:?}")));
+                return Err(RawReadError::UnexpectedEvent(other.label().to_string()));
             }
         };
         if values.len() > page_limit {

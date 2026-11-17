@@ -248,7 +248,7 @@ pub(super) async fn load_pending_records(
             Event::Storage(StorageEvent::Error { error }) => {
                 return Err(MetadataApiError::Internal(error.to_string()));
             }
-            other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => return Err(MetadataApiError::Internal(other.label().to_string())),
         };
         scanned = scanned.saturating_add(values.len());
         if scanned > limit {
@@ -303,7 +303,7 @@ pub(super) async fn load_pending_records(
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => return Err(MetadataApiError::Internal(other.label().to_string())),
     };
 
     let mut pending = Vec::with_capacity(event_values.len());

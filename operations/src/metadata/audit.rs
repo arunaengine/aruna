@@ -262,7 +262,8 @@ impl Operation for LocalPageOperation {
                 Err(ListAuditError::Storage(error.to_string()))
             }
             other => Err(ListAuditError::Storage(format!(
-                "unexpected audit event {other:?}"
+                "unexpected audit event {}",
+                other.label()
             ))),
         });
         self.done = true;
@@ -572,7 +573,7 @@ impl Operation for ListAuditOperation {
                 self.batch.merge(batch);
                 self.pending = 0;
             }
-            other => return self.fail(&format!("unexpected audit event {other:?}")),
+            other => return self.fail(&format!("unexpected audit event {}", other.label())),
         }
         if self.pending == 0 {
             self.state = FanState::Done;

@@ -220,7 +220,7 @@ impl Operation for AddIdentifiersOperation {
                 self.fail(PersistentIdError::Storage(error))
             }
             (state, event) => {
-                let message = format!("unexpected event {event:?} in state {state:?}");
+                let message = format!("unexpected event {} in state {state:?}", event.label());
                 self.fail(PersistentIdError::Unavailable(message))
             }
         }

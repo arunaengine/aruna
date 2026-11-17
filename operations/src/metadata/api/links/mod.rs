@@ -598,7 +598,7 @@ async fn read_row(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => Err(MetadataApiError::Internal(other.label().to_string())),
     }
 }
 

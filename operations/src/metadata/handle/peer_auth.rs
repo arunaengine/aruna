@@ -374,7 +374,8 @@ async fn ensure_peer_configured(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
-            "unexpected realm config read result for `{realm_id}`: {other:?}"
+            "unexpected realm config read result for `{realm_id}`: {}",
+            other.label()
         ))),
     }
 }
@@ -402,7 +403,8 @@ where
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
         Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
-            "unexpected metadata auth state read result: {other:?}"
+            "unexpected metadata auth state read result: {}",
+            other.label()
         ))),
     }
 }

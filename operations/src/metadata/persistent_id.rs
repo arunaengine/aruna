@@ -530,7 +530,8 @@ async fn write_entries(
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id write event: {other:?}"
+            "unexpected persistent id write event: {}",
+            other.label()
         ))),
     }
 }
@@ -554,7 +555,8 @@ async fn delete_entries(
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id delete event: {other:?}"
+            "unexpected persistent id delete event: {}",
+            other.label()
         ))),
     }
 }
@@ -573,7 +575,8 @@ async fn registry_missing_txn(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected registry fence event: {other:?}"
+            "unexpected registry fence event: {}",
+            other.label()
         ))),
     }
 }
@@ -596,7 +599,8 @@ async fn registry_in_txn(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected registry read event: {other:?}"
+            "unexpected registry read event: {}",
+            other.label()
         ))),
     }
 }
@@ -626,7 +630,8 @@ async fn fence_admits(
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected mapping fence event: {other:?}"
+            "unexpected mapping fence event: {}",
+            other.label()
         ))),
     }
 }
@@ -660,7 +665,8 @@ async fn start_transaction(ctx: &DriverContext) -> Result<TxnId, PersistentIdErr
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(PersistentIdError::Storage(error)),
         other => Err(PersistentIdError::Unavailable(format!(
-            "unexpected persistent id transaction event: {other:?}"
+            "unexpected persistent id transaction event: {}",
+            other.label()
         ))),
     }
 }
@@ -678,9 +684,10 @@ async fn commit_transaction(ctx: &DriverContext, txn_id: TxnId) -> TransitionCom
         Event::Storage(StorageEvent::Error { error }) => {
             TransitionCommit::Failed(error.to_string())
         }
-        other => {
-            TransitionCommit::Failed(format!("unexpected persistent id commit event: {other:?}"))
-        }
+        other => TransitionCommit::Failed(format!(
+            "unexpected persistent id commit event: {}",
+            other.label()
+        )),
     }
 }
 

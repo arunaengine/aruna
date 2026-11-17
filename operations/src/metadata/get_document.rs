@@ -181,10 +181,10 @@ impl Operation for GetDocumentOperation {
                     smallvec![]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata export result", format!("{other:?}")),
+                other => self.unexpected_event("metadata export result", other.label().to_string()),
             },
             GetDocumentState::Finish | GetDocumentState::Error | GetDocumentState::Init => {
-                self.unexpected_event("no event in a terminal state", format!("{event:?}"))
+                self.unexpected_event("no event in a terminal state", event.label().to_string())
             }
         }
     }

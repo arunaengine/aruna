@@ -1147,7 +1147,8 @@ impl MetadataHandle {
             MetadataTransportMessage::SyncMirrorCreated => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {other:?}"
+                "unexpected sync mirror response: {}",
+                other.label()
             ))),
         }
     }
@@ -1176,7 +1177,8 @@ impl MetadataHandle {
             MetadataTransportMessage::SyncMirrorDeleted => Ok(()),
             MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
             other => Err(MetadataError::Backend(format!(
-                "unexpected sync mirror response: {other:?}"
+                "unexpected sync mirror response: {}",
+                other.label()
             ))),
         }
     }

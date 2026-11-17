@@ -183,7 +183,7 @@ pub async fn local_version(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {other:?}")),
+            other => return Err(format!("unexpected storage answer {}", other.label())),
         };
         for (_, value) in values {
             seen += 1;
@@ -285,7 +285,7 @@ async fn read_row(
             Ok(value.map(|value| value.to_vec()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage answer {other:?}")),
+        other => Err(format!("unexpected storage answer {}", other.label())),
     }
 }
 

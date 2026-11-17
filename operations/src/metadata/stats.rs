@@ -70,7 +70,7 @@ pub async fn count_realm_groups(
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => return Err(MetadataApiError::Internal(other.label().to_string())),
     };
 
     let mut count = 0_u64;
@@ -117,7 +117,7 @@ pub async fn count_realm_groups(
             Event::Storage(StorageEvent::Error { error }) => {
                 break Err(MetadataApiError::Internal(error.to_string()));
             }
-            other => break Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => break Err(MetadataApiError::Internal(other.label().to_string())),
         }
     };
 
@@ -134,7 +134,7 @@ pub async fn count_realm_groups(
             Event::Storage(StorageEvent::Error { error }) => {
                 Err(MetadataApiError::Internal(error.to_string()))
             }
-            other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => Err(MetadataApiError::Internal(other.label().to_string())),
         },
     }
 }

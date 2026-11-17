@@ -224,7 +224,7 @@ async fn export(context: &DriverContext, effect: MetadataEffect) -> MetadataEven
         Event::Metadata(event) => event,
         other => MetadataEvent::Error {
             graph_iri: None,
-            error: MetadataError::Backend(format!("unexpected metadata event: {other:?}")),
+            error: MetadataError::Backend(format!("unexpected metadata event: {}", other.label())),
         },
     }
 }
@@ -238,7 +238,8 @@ pub async fn export_rocrate_jsonld(
         MetadataEvent::RoCrateExportResult { jsonld, .. } => Ok(jsonld),
         MetadataEvent::Error { error, .. } => Err(error),
         other => Err(MetadataError::Backend(format!(
-            "unexpected metadata export event: {other:?}"
+            "unexpected metadata export event: {}",
+            other.label()
         ))),
     }
 }
@@ -252,7 +253,8 @@ pub async fn export_summary_jsonld(
         MetadataEvent::RoCrateSummaryResult { jsonld, .. } => Ok(jsonld),
         MetadataEvent::Error { error, .. } => Err(error),
         other => Err(MetadataError::Backend(format!(
-            "unexpected metadata summary event: {other:?}"
+            "unexpected metadata summary event: {}",
+            other.label()
         ))),
     }
 }
@@ -275,7 +277,8 @@ pub async fn export_rocrate_page(
         MetadataEvent::RoCratePageResult { page, .. } => Ok(page),
         MetadataEvent::Error { error, .. } => Err(error),
         other => Err(MetadataError::Backend(format!(
-            "unexpected metadata page event: {other:?}"
+            "unexpected metadata page event: {}",
+            other.label()
         ))),
     }
 }

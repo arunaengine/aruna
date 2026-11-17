@@ -137,9 +137,9 @@ pub async fn schedule_projection_drain(
         Event::Task(TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -208,9 +208,9 @@ pub async fn replay_until_stopped(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataProjectionError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -248,9 +248,9 @@ pub async fn drain_projection_queue(
         }) => (values, next_start_after),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
 
@@ -356,9 +356,9 @@ async fn read_create_event(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let Some(value) = value else {
@@ -647,9 +647,9 @@ pub async fn project_create_events(
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataProjectionError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
@@ -714,9 +714,9 @@ async fn pending_projection_marker(
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -740,9 +740,9 @@ async fn author_message(
             .transpose()
             .map_err(ConversionError::from)?),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -761,9 +761,9 @@ async fn source_journaled(
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -809,9 +809,9 @@ async fn event_message(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let lifecycle =
@@ -890,9 +890,9 @@ async fn transactional_projection_write(
         }
         other => {
             abort_projection_transaction(storage, &mut owner, txn_id).await;
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     if !fence.admits(&values[lifecycle_reads..]) {
@@ -929,9 +929,9 @@ async fn transactional_projection_write(
         }
         other => {
             abort_projection_transaction(storage, &mut owner, txn_id).await;
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
     match storage
@@ -952,9 +952,9 @@ async fn transactional_projection_write(
             }
             Err(error.into())
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -985,9 +985,9 @@ async fn write_pending_markers(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1012,9 +1012,9 @@ async fn delete_pending_markers(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1039,9 +1039,9 @@ async fn delete_marker_keys(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1096,9 +1096,9 @@ async fn read_realm_config(
             .transpose()
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1210,9 +1210,9 @@ pub(crate) async fn dot_applied(
         Event::Metadata(aruna_core::metadata::MetadataEvent::Error { error, .. }) => {
             Err(error.into())
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1281,9 +1281,9 @@ async fn read_existing_registry(
             .transpose()
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1310,9 +1310,9 @@ async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataPr
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1327,9 +1327,9 @@ async fn schedule_materialization_drain(
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 

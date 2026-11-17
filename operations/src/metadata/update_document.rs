@@ -779,7 +779,7 @@ impl UpdateDocumentOperation {
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("realm config read result", format!("{other:?}")),
+            other => self.unexpected_event("realm config read result", other.label().to_string()),
         }
     }
 
@@ -837,7 +837,7 @@ impl UpdateDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("metadata actor read result", format!("{other:?}")),
+            other => self.unexpected_event("metadata actor read result", other.label().to_string()),
         }
     }
 
@@ -851,7 +851,7 @@ impl UpdateDocumentOperation {
                 self.begin_transaction_effect()
             }
             Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-            other => self.unexpected_event("checkpoint graph state", format!("{other:?}")),
+            other => self.unexpected_event("checkpoint graph state", other.label().to_string()),
         }
     }
 
@@ -867,7 +867,7 @@ impl UpdateDocumentOperation {
                 self.begin_transaction_effect()
             }
             Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-            other => self.unexpected_event("metadata batch plan result", format!("{other:?}")),
+            other => self.unexpected_event("metadata batch plan result", other.label().to_string()),
         }
     }
 
@@ -883,7 +883,7 @@ impl UpdateDocumentOperation {
                 )]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            other => self.unexpected_event("transaction start result", other.label().to_string()),
         }
     }
 
@@ -1035,7 +1035,7 @@ impl UpdateDocumentOperation {
                 })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("raw sidecar read result", format!("{other:?}")),
+            other => self.unexpected_event("raw sidecar read result", other.label().to_string()),
         }
     }
 
@@ -1058,7 +1058,9 @@ impl UpdateDocumentOperation {
                 self.raw_fence_effect(txn_id)
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("checkpoint window read result", format!("{other:?}")),
+            other => {
+                self.unexpected_event("checkpoint window read result", other.label().to_string())
+            }
         }
     }
 
@@ -1138,7 +1140,7 @@ impl UpdateDocumentOperation {
                 }
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("raw event iteration result", format!("{other:?}")),
+            other => self.unexpected_event("raw event iteration result", other.label().to_string()),
         }
     }
 
@@ -1152,7 +1154,9 @@ impl UpdateDocumentOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected_event("metadata update batch write", format!("{other:?}")),
+            other => {
+                self.unexpected_event("metadata update batch write", other.label().to_string())
+            }
         }
     }
 
@@ -1167,7 +1171,7 @@ impl UpdateDocumentOperation {
                 self.txn_id = None;
                 self.fail(error.into())
             }
-            other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            other => self.unexpected_event("transaction commit result", other.label().to_string()),
         }
     }
 
@@ -1184,7 +1188,7 @@ impl UpdateDocumentOperation {
             }
             other => self.unexpected_event(
                 "metadata materialization drain schedule",
-                format!("{other:?}"),
+                other.label().to_string(),
             ),
         }
     }
@@ -1210,7 +1214,7 @@ impl UpdateDocumentOperation {
             }
             other => self.unexpected_event(
                 "metadata document outbox drain schedule",
-                format!("{other:?}"),
+                other.label().to_string(),
             ),
         }
     }
