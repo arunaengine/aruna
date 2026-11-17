@@ -4,6 +4,7 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
@@ -94,6 +95,8 @@ impl std::fmt::Debug for DriverContext {
 pub(crate) const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRACKED_TRANSACTIONS: usize = 32;
+/// Reruns after a transaction conflict before [`drive_retry`] returns the conflict.
+const CONFLICT_RETRIES: usize = 3;
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
@@ -1058,6 +1061,26 @@ pub async fn drive<O: Operation>(
         ),
     }
     result
+}
+
+/// Drives a fresh operation from `build` and, after an error that [`Operation::is_conflict`]
+/// names, waits a backoff seeded by `seed` and drives a new one, at most [`CONFLICT_RETRIES`]
+/// times. The same seed gives the same waits; distinct seeds spread conflicting writers out.
+pub async fn drive_retry<O: Operation>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+) -> Result<O::Output, O::Error> {
+    let mut attempt = 0;
+    loop {
+        match drive(build(), context).await {
+            Err(error) if O::is_conflict(&error) && attempt < CONFLICT_RETRIES => {
+                tokio::time::sleep(conflict_backoff(attempt, seed)).await;
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
 }
 
 #[cfg(test)]
