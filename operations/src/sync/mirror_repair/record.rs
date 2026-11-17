@@ -270,3 +270,270 @@ impl Operation for MirrorRecordOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use ulid::Ulid;
+
+    const TXN: TxnId = Ulid(9);
+
+    fn started() -> Event {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN })
+    }
+
+    fn read(record: Option<&SyncMirrorRecord>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: record.map(|record| ByteView::from(record.to_bytes().unwrap())),
+        })
+    }
+
+    fn start_effect() -> Effect {
+        Effect::Storage(StorageEffect::StartTransaction { read: false })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    fn write(record: &SyncMirrorRecord) -> Effect {
+        Effect::Storage(StorageEffect::Write {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: repair_key(&record.relationship),
+            value: ByteView::from(record.to_bytes().unwrap()),
+            txn_id: Some(TXN),
+        })
+    }
+
+    fn delete() -> Effect {
+        Effect::Storage(StorageEffect::Delete {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: repair_key(&relationship()),
+            txn_id: Some(TXN),
+        })
+    }
+
+    fn record(intent: SyncMirrorIntent) -> SyncMirrorRecord {
+        SyncMirrorRecord {
+            due_at_ms: 5,
+            ..SyncMirrorRecord::new(relationship(), intent)
+        }
+    }
+
+    fn reading(operation: MirrorRecordOperation) -> MirrorRecordOperation {
+        let mut operation = operation;
+        operation.start();
+        operation.step(started());
+        operation
+    }
+
+    #[test]
+    fn store_writes_record() {
+        let staged = record(SyncMirrorIntent::Reconcile);
+        let mut operation = MirrorRecordOperation::store(staged.clone());
+        check_trace(
+            &mut operation,
+            &[start_effect()],
+            vec![
+                (
+                    started(),
+                    vec![repair_read(&repair_key(&relationship()), Some(TXN))],
+                ),
+                (read(None), vec![write(&staged)]),
+                (
+                    Event::Storage(StorageEvent::WriteResult {
+                        key: Vec::<u8>::new().into(),
+                    }),
+                    vec![commit()],
+                ),
+                (committed(), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn delete_supersedes_reconcile() {
+        let mut operation = reading(MirrorRecordOperation::store(record(
+            SyncMirrorIntent::Reconcile,
+        )));
+        let staged = record(SyncMirrorIntent::Delete);
+        assert_eq!(operation.step(read(Some(&staged))).as_slice(), &[commit()]);
+    }
+
+    #[test]
+    fn delete_keeps_rollback() {
+        let claimed = SyncMirrorRecord {
+            rollback: true,
+            ..record(SyncMirrorIntent::Delete)
+        };
+        let next = record(SyncMirrorIntent::Delete);
+        let mut operation = reading(MirrorRecordOperation::store(next.clone()));
+        let expected = SyncMirrorRecord {
+            rollback: true,
+            ..next
+        };
+        assert_eq!(
+            operation.step(read(Some(&claimed))).as_slice(),
+            &[write(&expected)]
+        );
+    }
+
+    #[test]
+    fn clear_matches_intent() {
+        let staged = record(SyncMirrorIntent::Reconcile);
+        let clear = || MirrorRecordOperation::clear(relationship(), SyncMirrorIntent::Reconcile);
+        assert_eq!(
+            reading(clear()).step(read(Some(&staged))).as_slice(),
+            &[delete()]
+        );
+        let mut newer = staged.clone();
+        newer.relationship.status.last_error = Some("newer".to_string());
+        assert_eq!(
+            reading(clear()).step(read(Some(&newer))).as_slice(),
+            &[commit()]
+        );
+        assert_eq!(reading(clear()).step(read(None)).as_slice(), &[commit()]);
+        let deleting = MirrorRecordOperation::clear(relationship(), SyncMirrorIntent::Delete);
+        let staged_delete = SyncMirrorRecord {
+            relationship: newer.relationship,
+            ..record(SyncMirrorIntent::Delete)
+        };
+        assert_eq!(
+            reading(deleting)
+                .step(read(Some(&staged_delete)))
+                .as_slice(),
+            &[delete()]
+        );
+    }
+
+    #[test]
+    fn scanned_changes_only() {
+        let scanned = record(SyncMirrorIntent::Reconcile);
+        let mut current = scanned.clone();
+        current.due_at_ms = 10;
+        let clear = MirrorRecordOperation::clear_scanned(scanned.clone());
+        assert_eq!(
+            reading(clear).step(read(Some(&current))).as_slice(),
+            &[commit()]
+        );
+        let clear = MirrorRecordOperation::clear_scanned(scanned.clone());
+        assert_eq!(
+            reading(clear).step(read(Some(&scanned))).as_slice(),
+            &[delete()]
+        );
+
+        let reschedule = MirrorRecordOperation::reschedule(scanned.clone(), "down".to_string());
+        assert_eq!(
+            reading(reschedule).step(read(Some(&current))).as_slice(),
+            &[commit()]
+        );
+        let mut reschedule = reading(MirrorRecordOperation::reschedule(
+            scanned.clone(),
+            "down".to_string(),
+        ));
+        let effects = reschedule.step(read(Some(&scanned)));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                value,
+                txn_id: Some(TXN),
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("reschedule must write the record: {effects:?}");
+        };
+        let next = SyncMirrorRecord::from_bytes(&repair_key(&relationship()), value).unwrap();
+        assert_eq!(
+            (next.attempts, next.last_error.as_deref()),
+            (1, Some("down"))
+        );
+        assert!(next.due_at_ms > scanned.due_at_ms);
+    }
+
+    #[test]
+    fn errors_abort_transaction() {
+        let failed = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        let stage = || MirrorRecordOperation::stage(relationship(), SyncMirrorIntent::Delete);
+        let mut operation = reading(stage());
+        assert_eq!(operation.step(failed()).as_slice(), &[abort()]);
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncMirrorError::Storage(StorageError::Timeout))
+        );
+        let mut corrupt = reading(stage());
+        let bad = Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(vec![0xff].into()),
+        });
+        assert_eq!(corrupt.step(bad).as_slice(), &[abort()]);
+        let mut committing = reading(stage());
+        committing.step(read(None));
+        committing.step(Event::Storage(StorageEvent::WriteResult {
+            key: Vec::<u8>::new().into(),
+        }));
+        assert!(committing.step(failed()).is_empty());
+        assert!(committing.finalize().is_err());
+        let mut unstarted = stage();
+        unstarted.start();
+        assert!(unstarted.step(failed()).is_empty());
+    }
+
+    #[test]
+    fn rejects_foreign_events() {
+        let make = || {
+            reading(MirrorRecordOperation::clear(
+                relationship(),
+                SyncMirrorIntent::Delete,
+            ))
+        };
+        let refusals = rejects_events(make, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        });
+        assert!(!refusals.is_empty());
+        for (label, effects, error) in refusals {
+            assert_eq!(effects.as_slice(), &[abort()], "{label}");
+            assert!(matches!(error, SyncMirrorError::Unexpected(_)), "{label}");
+        }
+        let mut done = reading(MirrorRecordOperation::clear(
+            relationship(),
+            SyncMirrorIntent::Delete,
+        ));
+        done.step(read(None));
+        done.step(committed());
+        done.step(committed());
+        assert!(done.finalize().is_err());
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        let stage = || MirrorRecordOperation::stage(relationship(), SyncMirrorIntent::Delete);
+        rejects_finalize(stage());
+        rejects_finalize(reading(stage()));
+        let mut fresh = stage();
+        check_abort(&mut fresh, &[]);
+        let mut operation = reading(stage());
+        check_abort(&mut operation, &[abort()]);
+        assert_eq!(operation.finalize(), Err(SyncMirrorError::Unfinished));
+    }
+}
