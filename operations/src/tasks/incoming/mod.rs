@@ -892,9 +892,10 @@ impl OperationsTaskHandler {
                 }
             }),
             key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
-                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, store_record};
+                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
                 // The key change already applies; only its record waits for storage.
-                if let Err(error) = store_record(&self.context, &key).await {
+                let store = StoreAuditOperation::new(key.clone());
+                if let Err(error) = drive(store, &self.context).await {
                     warn!(error = %error, "Bucket key audit record still not stored");
                     self.keep_retrying(key, AUDIT_RETRY).await;
                 }

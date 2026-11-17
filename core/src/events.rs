@@ -130,6 +130,10 @@ pub enum SubOperationEvent {
     VersionRekeyed {
         outcome: RekeyOutcome,
     },
+    /// A kept bucket key audit record was stored and its retry timer row removed.
+    AuditStored {
+        result: Result<(), String>,
+    },
 }
 
 /// How the re-key of one version ended.

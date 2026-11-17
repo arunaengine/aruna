@@ -589,12 +589,12 @@ async fn record_restart_locks(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_operations::driver::drive;
-    use aruna_operations::s3::bucket::audit_retry::resume_records;
+    use aruna_operations::s3::bucket::audit_retry::ResumeAuditOperation;
     use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
     use aruna_operations::s3::restart_notice::RestartNoticeOperation;
 
     // Records kept by retry timers before the stop join the trail before it is read.
-    match resume_records(driver_ctx).await {
+    match drive(ResumeAuditOperation::default(), driver_ctx).await {
         Ok(0) => {}
         Ok(stored) => info!(records = stored, "Stored kept bucket key audit records"),
         Err(error) => warn!(error = %error, "Kept bucket key audit records not read"),
