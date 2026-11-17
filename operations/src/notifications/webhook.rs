@@ -110,7 +110,7 @@ async fn write_webhook(
 /// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer
 /// other than 408 and 429 is permanent; while no management node opens the secret, the job
 /// waits without an attempt.
-pub async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
+pub(crate) async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
     let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
     else {
         return no_transport();

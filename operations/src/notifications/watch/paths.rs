@@ -88,7 +88,7 @@ pub fn watch_permission_path(
     }
 }
 
-pub fn event_permission_path(event: &WatchEvent) -> Option<String> {
+pub(crate) fn event_permission_path(event: &WatchEvent) -> Option<String> {
     if event.actor.is_nil() {
         return None;
     }

@@ -201,7 +201,7 @@ impl Operation for EmitNotificationsOperation {
     }
 }
 
-pub fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
+pub(crate) fn emit_notifications_effect(records: Vec<NotificationRecord>) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         EmitNotificationsOperation::new(EmitNotificationsInput { records }),
         |result| match result {

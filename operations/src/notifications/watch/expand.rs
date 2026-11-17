@@ -34,7 +34,7 @@ use crate::notifications::watch::paths::WatchAuthorization;
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
 /// Returns the write outcome and whether stale or unauthorized rows were skipped.
-pub async fn expand_watch_events(
+pub(crate) async fn expand_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
     realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
@@ -252,7 +252,7 @@ async fn stage_retry_change(
     Ok(true)
 }
 
-pub async fn drain_watch_events(
+pub(crate) async fn drain_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
     realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,

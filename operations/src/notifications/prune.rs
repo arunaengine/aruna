@@ -21,9 +21,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-pub const PRUNE_PAGE_SIZE: usize = 512;
-pub const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
-pub const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const PRUNE_PAGE_SIZE: usize = 512;
+pub(crate) const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
+pub(crate) const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {

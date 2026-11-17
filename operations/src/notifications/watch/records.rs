@@ -19,13 +19,13 @@ use crate::sync::outbox_record::new_identified_record;
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.
-pub const WATCH_CAP_REACHED: &str = "notification watch subscription cap reached";
+pub(crate) const WATCH_CAP_REACHED: &str = "notification watch subscription cap reached";
 
 /// Stable reject reason for an unauthorized create; matched verbatim by the
 /// holder proxy to surface a 403 to the API layer.
-pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
+pub(crate) const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
     "watch subscription owner lacks READ on the watched path";
-pub const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
+pub(crate) const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
     "watch subscription authorization is temporarily unavailable";
 
 #[derive(Debug, Error, PartialEq, Eq)]

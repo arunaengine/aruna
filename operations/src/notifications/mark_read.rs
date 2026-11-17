@@ -18,7 +18,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-pub const MARK_PAGE_SIZE: usize = 512;
+pub(crate) const MARK_PAGE_SIZE: usize = 512;
 pub const MARK_MAX_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]

@@ -97,7 +97,7 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
 /// Post-commit, best-effort `metadata_created` emission shared by every dataset
 /// creation path, so an import or a job notifies exactly like `POST /metadata`.
 /// `event_id` dates the event, keeping a retried create's inbox key stable.
-pub async fn emit_metadata_created(
+pub(crate) async fn emit_metadata_created(
     context: &DriverContext,
     realm_id: RealmId,
     actor: UserId,

@@ -132,28 +132,28 @@ pub fn marked_read(answer: Answer) -> Result<u32, String> {
     })
 }
 
-pub fn watch_created(answer: Answer) -> Result<WatchSubscription, String> {
+pub(crate) fn watch_created(answer: Answer) -> Result<WatchSubscription, String> {
     expect(answer, |answer| match answer {
         NotificationTransportMessage::WatchCreated { subscription } => Ok(subscription),
         other => Err(other),
     })
 }
 
-pub fn watch_deleted(answer: Answer) -> Result<(), String> {
+pub(crate) fn watch_deleted(answer: Answer) -> Result<(), String> {
     expect(answer, |answer| match answer {
         NotificationTransportMessage::WatchDeleted => Ok(()),
         other => Err(other),
     })
 }
 
-pub fn watches_listed(answer: Answer) -> Result<Vec<WatchSubscription>, String> {
+pub(crate) fn watches_listed(answer: Answer) -> Result<Vec<WatchSubscription>, String> {
     expect(answer, |answer| match answer {
         NotificationTransportMessage::WatchList { subscriptions } => Ok(subscriptions),
         other => Err(other),
     })
 }
 
-pub fn events_delivered(answer: Answer) -> Result<u32, String> {
+pub(crate) fn events_delivered(answer: Answer) -> Result<u32, String> {
     expect(answer, |answer| match answer {
         NotificationTransportMessage::WatchEventsAck { written } => Ok(written),
         other => Err(other),

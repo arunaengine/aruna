@@ -50,7 +50,7 @@ pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
 
 /// The hook every sync result handler runs after applying `targets`: inbound, outbound and
 /// restored. A realm config change refreshes the cached mail sender of this node.
-pub async fn config_applied(context: &DriverContext, targets: &[DocumentTarget]) {
+pub(crate) async fn config_applied(context: &DriverContext, targets: &[DocumentTarget]) {
     let Some(realm_id) = targets.iter().find_map(|target| match target {
         DocumentTarget::RealmConfig { realm_id } => Some(*realm_id),
         _ => None,
@@ -192,7 +192,7 @@ async fn verified(ctx: &DriverContext, owner: UserId, address: &str) -> Result<b
 /// Sends one notification email when this node's current setting has email on for its
 /// category. A permanent SMTP refusal ends the job; while no management node opens the address,
 /// the job waits without an attempt.
-pub async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRunOutcome {
+pub(crate) async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRunOutcome {
     let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
     else {
         return no_transport();

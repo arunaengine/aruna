@@ -26,10 +26,10 @@ use ulid::Ulid;
 /// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
 /// fires this long after the first dirty write, collapsing a run of watch CRUD
 /// into one publish with bounded latency.
-pub const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+pub(crate) const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Schedules (or shortens toward) the debounced watch-interest publish task.
-pub fn schedule_publish_effect() -> Effect {
+pub(crate) fn schedule_publish_effect() -> Effect {
     Effect::Task(TaskEffect::ShortenTimer {
         key: TaskKey::PublishWatchInterest,
         after: WATCH_PUBLISH_DEBOUNCE,
@@ -39,7 +39,7 @@ pub fn schedule_publish_effect() -> Effect {
 /// Dirty marker written in the same transaction as a subscription row change,
 /// so the debounced publisher knows which realm's digest to rebuild. The value
 /// is a generation id; a marker is only cleared if its generation still matches.
-pub fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
+pub(crate) fn dirty_marker_write(realm_id: RealmId) -> (KeySpace, Key, Value) {
     let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
     (
         WATCH_INTEREST_KEYSPACE.to_string(),

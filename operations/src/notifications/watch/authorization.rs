@@ -41,7 +41,7 @@ pub struct AuthorizedWatchSubscriptions {
 /// still hold READ on the watched prefix's permission path. No resource
 /// identity or a non-user owner denies; unevaluable checks are errors, not grants.
 #[cfg(test)]
-pub async fn is_watch_authorized(
+pub(crate) async fn is_watch_authorized(
     context: &DriverContext,
     realm_id: RealmId,
     owner: UserId,
@@ -63,7 +63,7 @@ pub async fn is_watch_authorized(
     ))
 }
 
-pub async fn evaluate_watch_authorization(
+pub(crate) async fn evaluate_watch_authorization(
     context: &DriverContext,
     realm_id: RealmId,
     owner: UserId,
@@ -83,7 +83,7 @@ pub async fn evaluate_watch_authorization(
     .await
 }
 
-pub async fn evaluate_watch_delivery(
+pub(crate) async fn evaluate_watch_delivery(
     context: &DriverContext,
     realm_id: RealmId,
     owner: UserId,
@@ -159,7 +159,7 @@ pub async fn evaluate_watch_creation(
     .await
 }
 
-pub async fn authorize_forwarded_watch(
+pub(crate) async fn authorize_forwarded_watch(
     context: &DriverContext,
     realm_id: RealmId,
     owner: UserId,
@@ -253,7 +253,7 @@ async fn evaluate_permission_path(
     }
 }
 
-pub async fn authorize_watch_event(
+pub(crate) async fn authorize_watch_event(
     context: &DriverContext,
     owner: UserId,
     authorization: &WatchAuthorizationBinding,
@@ -284,7 +284,7 @@ pub async fn authorize_watch_event(
     .await
 }
 
-pub async fn authorize_notification(
+pub(crate) async fn authorize_notification(
     context: &DriverContext,
     recipient: UserId,
     kind: &NotificationKind,
@@ -369,7 +369,7 @@ pub async fn authorize_notification(
 /// Holder-side enumeration of one user's watches through the same authorization
 /// result delivery uses. Revoked watches retain only their opaque deletion id;
 /// protected watch details are redacted so the owner can still release quota.
-pub async fn list_authorized_subscriptions(
+pub(crate) async fn list_authorized_subscriptions(
     context: &DriverContext,
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, String> {
@@ -403,7 +403,7 @@ pub async fn list_authorized_subscriptions(
     Ok(authorized)
 }
 
-pub async fn filter_authorized_subscriptions(
+pub(crate) async fn filter_authorized_subscriptions(
     context: &DriverContext,
     realm_id: RealmId,
     realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,

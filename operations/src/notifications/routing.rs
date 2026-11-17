@@ -12,7 +12,7 @@ use aruna_core::structs::execution::notification_watch::{
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 
-pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
+pub(crate) fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -25,7 +25,7 @@ pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
     ids
 }
 
-pub fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
+pub(crate) fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
     let mut ids: Vec<UserId> = auth_doc
         .roles
         .values()
@@ -45,7 +45,7 @@ pub struct RoutingContext<'a> {
     pub realm_id: RealmId,
 }
 
-pub fn route_resource_event(
+pub(crate) fn route_resource_event(
     event: &ResourceEvent,
     ctx: RoutingContext<'_>,
     now_ms: u64,

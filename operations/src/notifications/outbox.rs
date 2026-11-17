@@ -26,9 +26,9 @@ use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::placement::resolve_inbox_holder;
 
-pub const OUTBOX_BATCH_SIZE: usize = 512;
-pub const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
-pub const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
+pub(crate) const OUTBOX_BATCH_SIZE: usize = 512;
+pub(crate) const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
+pub(crate) const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DrainError {

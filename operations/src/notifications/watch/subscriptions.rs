@@ -22,7 +22,7 @@ use crate::notifications::watch::store::StoreWatchOperation;
 /// The one holder-side create path, used by both the local API arm and the holder
 /// RPC. A proxying peer's assertion is not authority, so the holder re-derives
 /// the permission path and checks READ before any durable write.
-pub async fn create_holder_watch(
+pub(crate) async fn create_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -62,7 +62,7 @@ pub async fn create_holder_watch(
     Ok(subscription)
 }
 
-pub async fn delete_holder_watch(
+pub(crate) async fn delete_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,

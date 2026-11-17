@@ -51,7 +51,7 @@ fn deliver_deadline() -> Instant {
     skip(context, stream),
     fields(peer = %peer)
 )]
-pub async fn handle_notification_stream(
+pub(crate) async fn handle_notification_stream(
     context: &DriverContext,
     mut stream: BiStream,
     peer: NodeId,

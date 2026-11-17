@@ -12,9 +12,9 @@ use ulid::Ulid;
 
 use crate::placement::{build_view, resolve_holders};
 
-pub const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
+pub(crate) const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
 
-pub fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
+pub(crate) fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(INBOX_TOPIC_DOMAIN);
     hasher.update(&user_id.to_storage_key());
@@ -45,7 +45,7 @@ pub fn resolve_inbox_holder(
         .next())
 }
 
-pub fn filter_local_subscriptions(
+pub(crate) fn filter_local_subscriptions(
     subscriptions: Vec<WatchSubscription>,
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,

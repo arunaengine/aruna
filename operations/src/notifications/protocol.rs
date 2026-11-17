@@ -6,14 +6,14 @@ use aruna_core::UserId;
 use aruna_core::structs::execution::notification_watch::{WatchEventRetry, watch_retry_key};
 use aruna_core::structs::identity::realm::RealmId;
 
-pub const EVENT_BATCH_SIZE: usize = 128;
-pub const SUBSCRIPTION_SCAN_CAP: usize = 1024;
-pub const DIRTY_REALM_CAP: usize = 4;
-pub const RETRY_BATCH_CAP: usize = 4;
-pub const RETRY_BYTES_CAP: usize = 1024 * 1024;
-pub const EXPANSION_WORK_CAP: usize = 4096;
-pub const EXPANSION_CANDIDATE_CAP: usize = 1024;
-pub const EXPANSION_RECORD_CAP: usize = 1024;
+pub(crate) const EVENT_BATCH_SIZE: usize = 128;
+pub(crate) const SUBSCRIPTION_SCAN_CAP: usize = 1024;
+pub(crate) const DIRTY_REALM_CAP: usize = 4;
+pub(crate) const RETRY_BATCH_CAP: usize = 4;
+pub(crate) const RETRY_BYTES_CAP: usize = 1024 * 1024;
+pub(crate) const EXPANSION_WORK_CAP: usize = 4096;
+pub(crate) const EXPANSION_CANDIDATE_CAP: usize = 1024;
+pub(crate) const EXPANSION_RECORD_CAP: usize = 1024;
 /// Subscription rows read per expansion page.
 pub(crate) const WATCH_PAGE_LIMIT: usize = 256;
 
