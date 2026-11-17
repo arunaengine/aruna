@@ -7,6 +7,7 @@ pub mod accept_delegation;
 pub mod admit;
 pub mod balance;
 pub mod change;
+pub mod charged_ranges;
 pub mod counts;
 pub mod create;
 pub mod delegate;
