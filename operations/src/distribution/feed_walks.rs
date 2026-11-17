@@ -1500,3 +1500,313 @@ impl Operation for FeedPassOperation {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::test_record::{record, searched};
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const TXN: TxnId = Ulid::from_bytes([9; 16]);
+
+    fn rows(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: (values.into_iter())
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            next_start_after: next.map(Key::from),
+        })
+    }
+
+    fn read(values: Vec<Option<Vec<u8>>>) -> Event {
+        let values = values
+            .into_iter()
+            .map(|value| (Key::from(Vec::new()), value.map(Value::from)));
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: values.collect(),
+        })
+    }
+
+    fn record_value(searching: bool) -> Option<Vec<u8>> {
+        let (_, bytes) = match searching {
+            true => searched(),
+            false => record(true),
+        };
+        Some(bytes)
+    }
+
+    fn error() -> Event {
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        })
+    }
+
+    // An undecodable feed row settles; it is deleted only while it still holds the value read.
+    #[test]
+    fn settled_rows_guarded() {
+        let row = (vec![1], vec![0xFF]);
+        for (now, dropped) in [(vec![0xFF], 1), (vec![0xFE], 0)] {
+            let mut walk = FeedWalk::new(8, None);
+            let mut steps = vec![
+                (
+                    rows(vec![row.clone()], Some(vec![1])),
+                    vec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![(SEARCH_FEED_KEYSPACE.to_string(), vec![1].into())],
+                        txn_id: Some(TXN),
+                    })],
+                ),
+            ];
+            let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN });
+            let current = read(vec![Some(now)]);
+            match dropped {
+                1 => steps.extend([
+                    (
+                        current,
+                        vec![Effect::Storage(StorageEffect::BatchDelete {
+                            deletes: vec![(SEARCH_FEED_KEYSPACE.to_string(), vec![1].into())],
+                            txn_id: Some(TXN),
+                        })],
+                    ),
+                    (
+                        Event::Storage(StorageEvent::BatchDeleteResult {
+                            entries: Vec::new(),
+                        }),
+                        vec![commit],
+                    ),
+                ]),
+                _ => steps.push((current, vec![commit])),
+            }
+            steps.push((
+                Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                Vec::new(),
+            ));
+            check_trace(&mut walk, &iter(SEARCH_FEED_KEYSPACE, None, 8), steps);
+            assert_eq!(walk.cursor(), Some(vec![1]));
+            assert_eq!(walk.finalize(), Ok(dropped));
+        }
+    }
+
+    // A failed read of the settled rows aborts the transaction and fails the walk.
+    #[test]
+    fn failed_settle_aborts() {
+        let mut walk = FeedWalk::new(8, None);
+        walk.start();
+        walk.step(rows(vec![(vec![1], vec![0xFF])], None));
+        walk.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
+        let aborted = walk.step(error());
+        assert_eq!(
+            aborted.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TXN
+            })]
+        );
+        assert!(walk.abort().is_empty());
+        walk.step(Event::Storage(StorageEvent::TransactionAborted {
+            txn_id: TXN,
+        }));
+        let failed = FeedError::Storage(StorageError::Timeout.to_string());
+        assert_eq!(walk.finalize(), Err(failed));
+    }
+
+    // A live range without a state row in a searched set gets its leftovers pruned and a first
+    // building generation; one in a set without a search index is skipped.
+    #[test]
+    fn opens_searched_ranges() {
+        let (snapshot, _) = searched();
+        let key = state_key(snapshot.set_id(), Ulid::from_bytes([1; 16]));
+        let account = RangeAccount::fresh(String::new(), None).to_bytes().unwrap();
+        let building = IndexState::Building {
+            generation: 1,
+            cursor: None,
+        };
+        let mut walk = OpenWalk::new(4, None);
+        check_trace(
+            &mut walk,
+            &iter(RANGE_ACCOUNT_KEYSPACE, None, 4),
+            vec![
+                (
+                    rows(vec![(key.clone(), account.clone())], None),
+                    batch_read(SEARCH_INDEX_KEYSPACE, [key.clone()]).into_vec(),
+                ),
+                (read(vec![None]), record_read(snapshot.set_id()).into_vec()),
+                (
+                    Event::Storage(StorageEvent::ReadResult {
+                        key: Vec::new().into(),
+                        value: record_value(true).map(Value::from),
+                    }),
+                    index(IndexEffect::Prune {
+                        set_id: snapshot.set_id(),
+                        range_id: Ulid::from_bytes([1; 16]),
+                        keep: None,
+                    })
+                    .into_vec(),
+                ),
+                (
+                    Event::Index(IndexEvent::Pruned),
+                    put_row(
+                        SEARCH_INDEX_KEYSPACE,
+                        key.clone(),
+                        building.to_bytes().unwrap(),
+                    )
+                    .into_vec(),
+                ),
+                (
+                    Event::Storage(StorageEvent::WriteResult {
+                        key: key.clone().into(),
+                    }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(walk.finalize(), Ok(1));
+
+        let mut walk = OpenWalk::new(4, None);
+        walk.start();
+        walk.step(rows(vec![(key, account)], None));
+        walk.step(read(vec![None]));
+        let effects = walk.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: record_value(false).map(Value::from),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(walk.finalize(), Ok(0));
+    }
+
+    // A state row without a live account loses its index and its row; the walk then moves on.
+    #[test]
+    fn drops_gone_ranges() {
+        let (set_id, range_id) = (Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
+        let key = state_key(set_id, range_id);
+        let ready = IndexState::Ready { generation: 2 }.to_bytes().unwrap();
+        let mut walk = StateWalk::new(FeedLimits::default(), Some(vec![0]));
+        let state_rows = FeedLimits::default().state_rows;
+        check_trace(
+            &mut walk,
+            &iter(SEARCH_INDEX_KEYSPACE, Some(vec![0]), state_rows),
+            vec![
+                (
+                    rows(vec![(key.clone(), ready)], Some(vec![7])),
+                    batch_read(RANGE_ACCOUNT_KEYSPACE, [key.clone()]).into_vec(),
+                ),
+                (
+                    read(vec![None]),
+                    index(IndexEffect::Prune {
+                        set_id,
+                        range_id,
+                        keep: None,
+                    })
+                    .into_vec(),
+                ),
+                (
+                    Event::Index(IndexEvent::Pruned),
+                    vec![Effect::Storage(StorageEffect::Delete {
+                        key_space: SEARCH_INDEX_KEYSPACE.to_string(),
+                        key: key.clone().into(),
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::DeleteResult { key: key.into() }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(walk.cursor(), Some(vec![7]));
+        assert_eq!(walk.finalize(), Ok(1));
+    }
+
+    // A failed walk starts over at the next pass, as the cursor is held back meanwhile.
+    #[test]
+    fn failed_walk_restarts() {
+        let key = state_key(Ulid::from_bytes([3; 16]), Ulid::from_bytes([4; 16]));
+        let ready = IndexState::Ready { generation: 2 }.to_bytes().unwrap();
+        let mut walk = StateWalk::new(FeedLimits::default(), Some(vec![0]));
+        walk.start();
+        walk.step(rows(vec![(key, ready)], Some(vec![7])));
+        walk.step(read(vec![None]));
+        let failed = IndexError::Failed("disk".to_string());
+        walk.step(Event::Index(IndexEvent::Error(failed.clone())));
+        assert_eq!(walk.cursor(), None);
+        assert_eq!(walk.finalize(), Err(failed.into()));
+    }
+
+    // A pass runs the three walks in order and reports the cursors they reached.
+    #[test]
+    fn pass_runs_walks() {
+        let limits = FeedLimits::default();
+        let mut pass = FeedPassOperation::new(limits, FeedCursors::default());
+        check_trace(
+            &mut pass,
+            &iter(SEARCH_FEED_KEYSPACE, None, limits.feed_rows),
+            vec![
+                (
+                    rows(Vec::new(), None),
+                    iter(RANGE_ACCOUNT_KEYSPACE, None, limits.account_rows).into_vec(),
+                ),
+                (
+                    rows(Vec::new(), Some(vec![5])),
+                    iter(SEARCH_INDEX_KEYSPACE, None, limits.state_rows).into_vec(),
+                ),
+                (rows(Vec::new(), None), Vec::new()),
+            ],
+        );
+        let cursors = FeedCursors {
+            feed: None,
+            accounts: Some(vec![5]),
+            states: None,
+        };
+        assert_eq!(
+            pass.finalize(),
+            Ok(FeedPass {
+                busy: false,
+                cursors
+            })
+        );
+    }
+
+    // A failed walk is logged and the next walk still runs.
+    #[test]
+    fn pass_survives_failure() {
+        let limits = FeedLimits::default();
+        let mut pass = FeedPassOperation::new(limits, FeedCursors::default());
+        pass.start();
+        let next = pass.step(error());
+        assert_eq!(
+            next.as_slice(),
+            iter(RANGE_ACCOUNT_KEYSPACE, None, limits.account_rows).as_slice()
+        );
+        pass.step(rows(Vec::new(), None));
+        pass.step(rows(Vec::new(), None));
+        assert!(pass.finalize().is_ok_and(|pass| !pass.busy));
+    }
+
+    // Unstarted walks and passes refuse every event; none finishes early.
+    #[test]
+    fn rejects_unexpected() {
+        let all = sample_events().len();
+        let feed = || FeedWalk::new(1, None);
+        assert_eq!(rejects_events(feed, sample_events, |_| false).len(), all);
+        let open = || OpenWalk::new(1, None);
+        assert_eq!(rejects_events(open, sample_events, |_| false).len(), all);
+        let states = || StateWalk::new(FeedLimits::default(), None);
+        assert_eq!(rejects_events(states, sample_events, |_| false).len(), all);
+        let pass = || FeedPassOperation::new(FeedLimits::default(), FeedCursors::default());
+        assert_eq!(rejects_events(pass, sample_events, |_| false).len(), all);
+        rejects_finalize(feed());
+        rejects_finalize(open());
+        rejects_finalize(states());
+        rejects_finalize(pass());
+        assert!(pass().abort().is_empty());
+    }
+}
