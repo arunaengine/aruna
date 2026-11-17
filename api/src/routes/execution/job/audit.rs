@@ -22,9 +22,10 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::jobs::{JobOutputResponse, map_job_route, output_response};
+use super::super::jobs::{map_job_route, output_response};
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::JobOutputResponse;
 use crate::jobs::hex32;
 use crate::server::state::ServerState;
 

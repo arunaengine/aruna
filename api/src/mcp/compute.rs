@@ -862,7 +862,7 @@ impl McpServer {
 /// Outputs of a job with no replicated family live in its own result payload.
 fn result_outputs(
     result: Option<&serde_json::Value>,
-) -> Result<Vec<crate::routes::jobs::JobOutputResponse>, CallToolResult> {
+) -> Result<Vec<crate::jobs::JobOutputResponse>, CallToolResult> {
     let Some(outputs) = result.and_then(|result| result.get("outputs")) else {
         return Ok(Vec::new());
     };
@@ -875,7 +875,7 @@ fn result_outputs(
 async fn artifact_output(
     server: &McpServer,
     job_id: &str,
-    output: crate::routes::jobs::JobOutputResponse,
+    output: crate::jobs::JobOutputResponse,
     node_id: Option<aruna_core::NodeId>,
 ) -> JobArtifactOutput {
     let local = node_id.is_none_or(|node_id| node_id == server.state.get_node_id());
@@ -933,10 +933,10 @@ async fn accepted_payload(
     state: &crate::server::state::ServerState,
     accepted: AcceptedExecution,
 ) -> Result<Json<JsonPayload>, CallToolResult> {
-    let urls = crate::routes::jobs::job_urls(state, accepted.job_id)
+    let urls = crate::jobs::job_urls(state, accepted.job_id)
         .await
         .map_err(server_error)?;
-    let response = crate::routes::jobs::SubmitJobResponse {
+    let response = crate::jobs::SubmitJobResponse {
         job_id: accepted.job_id.to_string(),
         created: accepted.created,
         submission_id: accepted.submission_id,

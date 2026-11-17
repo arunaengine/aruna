@@ -23,8 +23,9 @@ use utoipa::ToSchema;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::metadata::ensure_metadata_scope;
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

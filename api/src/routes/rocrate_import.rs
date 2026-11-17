@@ -46,8 +46,9 @@ use utoipa_axum::routes;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::lookup::bucket_info;
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";

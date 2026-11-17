@@ -5,6 +5,7 @@
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::lookup::actor;
 use crate::metadata::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
@@ -13,7 +14,7 @@ use crate::metadata::{
     load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
     map_write_error, parse_document_id, serialize_jsonld_object, with_global_ids,
 };
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };

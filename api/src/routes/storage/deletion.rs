@@ -562,7 +562,7 @@ pub async fn submit_purge(
     )
     .await
     .map_err(crate::routes::execution::jobs::map_submit_error)?;
-    let urls = crate::routes::execution::jobs::job_urls(&state, result.job_id).await?;
+    let urls = crate::jobs::job_urls(&state, result.job_id).await?;
     Ok((
         if result.created {
             StatusCode::CREATED

@@ -32,8 +32,8 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::metadata::{ensure_metadata_scope, load_document_record, parse_document_id};
-use crate::routes::execution::jobs::job_urls;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
