@@ -245,6 +245,27 @@ mod state_machine_tests {
     }
 
     #[test]
+    fn rejects_late_events() {
+        // An event after the answer, or before start, is refused instead of ignored.
+        let info = fixed_bucket_info();
+        let mut finished = GetBucketOperation::new("bucket".to_owned());
+        finished.start();
+        finished.step(read_result("bucket", Some(info.to_bytes().unwrap())));
+        finished.step(read_result("bucket", None));
+        assert!(matches!(
+            finished.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
+        let mut fresh = GetBucketOperation::new("bucket".to_owned());
+        assert!(fresh.step(read_result("bucket", None)).is_empty());
+        assert!(fresh.is_complete());
+        assert!(matches!(
+            fresh.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
+    }
+
+    #[test]
     fn absence_is_expected() {
         assert!(GetBucketOperation::expected_error(
             &GetBucketError::NotFound
