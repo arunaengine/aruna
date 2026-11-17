@@ -11,12 +11,10 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::usage::{
-    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, SUMMARY_GROUP_PREFIX,
-    USAGE_GROUP_PREFIX, UsageCounters, dirty_group_id, dirty_group_key, dirty_share_id,
+    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters, dirty_group_id, dirty_group_key, dirty_share_id,
     global_shard_keys, usage_global_key, usage_group_id, usage_group_key, usage_node_id,
     usage_snapshot_key,
 };
@@ -415,7 +413,7 @@ async fn write_snapshot_documents(
 /// Deletes each observed dirty marker only if its stored generation still matches
 /// the one seen at publish start. Re-reading inside the transaction makes a racing
 /// counter update abort the commit, so its retry signal is never lost.
-pub(super) async fn clear_consumed_markers(
+pub(crate) async fn clear_consumed_markers(
     storage: &StorageHandle,
     observed: Vec<(Key, Value)>,
 ) -> Result<(), String> {
