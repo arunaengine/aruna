@@ -61,6 +61,20 @@ pub enum IoResult {
     Woke,
 }
 
+impl IoResult {
+    /// The variant name, for errors about a result an operation did not expect.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Values(_) => "IoResult::Values",
+            Self::Page { .. } => "IoResult::Page",
+            Self::Done => "IoResult::Done",
+            Self::Event(event) => event.label(),
+            Self::Group(_) => "IoResult::Group",
+            Self::Woke => "IoResult::Woke",
+        }
+    }
+}
+
 /// What an operation does next.
 #[derive(Debug, PartialEq)]
 pub enum Next<T> {
