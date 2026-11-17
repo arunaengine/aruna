@@ -18,7 +18,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

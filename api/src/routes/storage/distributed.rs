@@ -34,8 +34,8 @@ use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::routes::storage::bucket::usage::range_sizes;
-use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

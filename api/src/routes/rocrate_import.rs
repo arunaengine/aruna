@@ -23,7 +23,6 @@ use aruna_operations::jobs::import::{
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,
@@ -47,6 +46,7 @@ use utoipa_axum::routes;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::routes::execution::jobs::{job_urls, map_submit_error};
 use crate::server::state::ServerState;
 
@@ -654,7 +654,7 @@ async fn fast_source_check(
             key,
             version,
         } => {
-            let bucket_info = load_bucket(state, bucket).await?;
+            let bucket_info = bucket_info(state, bucket).await?;
             ensure_permission(
                 state,
                 auth,
@@ -736,7 +736,7 @@ async fn fast_target_check(
     auth: &AuthContext,
     target: &ImportRoCrateTarget,
 ) -> ServerResult<()> {
-    let bucket_info = load_bucket(state, &target.bucket).await?;
+    let bucket_info = bucket_info(state, &target.bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -771,22 +771,6 @@ async fn fast_metadata_check(
     )
     .await?;
     Ok(())
-}
-
-async fn load_bucket(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.into())),
-    }
 }
 
 pub(crate) fn upload_body_stream(

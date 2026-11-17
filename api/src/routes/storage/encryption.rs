@@ -7,6 +7,7 @@ use super::abe::ScopeView;
 use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::errors::BlobError;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -28,7 +29,6 @@ use aruna_operations::driver::{DriverContext, drive, now_ms};
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::holders::lookup_keys;
 use aruna_operations::s3::bucket::key_install::{
     InstallInput, InstallKeyOperation, install_and_wake,
@@ -339,7 +339,7 @@ pub async fn list_bucket_tokens(
     RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<TokenListView>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     if !is_holder(&snapshot, auth.user_id) {
         ensure_group_admin(&state, &auth, group_id).await?;
@@ -414,19 +414,6 @@ pub(crate) fn not_encrypted() -> ServerError {
         "not_encrypted",
         "the bucket has no keys",
     )
-}
-
-pub(crate) async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<GroupId> {
-    drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    .map(|info| info.group_id)
-    .map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    })
 }
 
 pub(crate) async fn ensure_bucket_read(
@@ -712,7 +699,7 @@ pub async fn get_bucket_encryption(
     RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
@@ -760,7 +747,7 @@ pub async fn put_bucket_encryption(
     Path(bucket): Path<String>,
     Json(request): Json<EncryptionRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let current = &snapshot.settings;

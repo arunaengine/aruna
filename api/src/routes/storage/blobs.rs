@@ -5,12 +5,13 @@
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
-    BucketInfo, CopyOrigin, bucket_permission_path, object_permission_path,
+    CopyOrigin, bucket_permission_path, object_permission_path,
 };
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
@@ -27,7 +28,6 @@ use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
@@ -85,19 +85,6 @@ pub struct ReplicateBlobResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version_id: Option<String>,
     pub target_node_id: String,
-}
-
-async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.into())),
-    }
 }
 
 #[utoipa::path(
@@ -163,7 +150,7 @@ pub async fn replicate_blob(
     RealmAuth(auth): RealmAuth,
     Json(request): Json<ReplicateBlobRequest>,
 ) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
-    let bucket_info = load_bucket(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
 
     let permission_path = match request.path.as_deref() {
         Some(path) => object_permission_path(
@@ -565,7 +552,7 @@ pub async fn blob_locations(
         .map(ulid::Ulid::from_string)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
-    let info = load_bucket(&state, &query.bucket).await?;
+    let info = bucket_info(&state, &query.bucket).await?;
     crate::auth::ensure_permission(
         &state,
         &auth,

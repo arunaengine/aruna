@@ -791,8 +791,8 @@ fn keeps_encoded_keys() {
 mod global {
     use super::super::*;
     use crate::auth::ValidatedBearer;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, Node, PEER, distribute, mirror, node_id, node_state, peer_heartbeat, publish_api,
         unsigned_token,

@@ -39,6 +39,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::lookup::{
     self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
@@ -48,7 +49,6 @@ use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::bucket::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, describe_bucket,
 };
-use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::distributed::map_guard_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;

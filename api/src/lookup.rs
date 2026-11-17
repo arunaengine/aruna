@@ -17,6 +17,8 @@ use aruna_operations::distribution::delegate::node_urls;
 use aruna_operations::distribution::guard::{read_coordinator, route_read, route_write};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::status::node_reach;
+use aruna_operations::driver::drive;
+use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
@@ -479,6 +481,20 @@ pub(crate) fn node_directed(state: &ServerState, headers: &HeaderMap) -> ServerR
     Err(ServerError::Conflict(
         "the read was directed at another node".to_string(),
     ))
+}
+
+/// The bucket a name resolves to on this node; an unknown name is 404.
+pub(crate) async fn bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
+    match drive(
+        GetBucketOperation::new(bucket.to_string()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(info) => Ok(info),
+        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
+        Err(error) => Err(ServerError::InternalError(error.into())),
+    }
 }
 
 #[cfg(test)]

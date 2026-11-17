@@ -15,7 +15,6 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
 use aruna_operations::metadata::api::set_preview_distributed;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};
@@ -37,6 +36,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
@@ -1071,22 +1071,6 @@ async fn purge_ended(
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
-}
-
-pub(crate) async fn bucket_info(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.into())),
-    }
 }
 
 fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePurgeScope) -> String {

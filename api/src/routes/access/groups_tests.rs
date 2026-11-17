@@ -1410,8 +1410,8 @@ mod distributed {
     use super::{DataPathKind, DataPathsQuery, list_data_paths};
     use crate::auth::UnrestrictedAuth;
     use crate::auth::ValidatedBearer;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, PEER, distribute, hidden_link, mock_peer, node_id, node_state, publish_api,
     };

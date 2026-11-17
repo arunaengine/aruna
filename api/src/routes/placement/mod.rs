@@ -6,6 +6,7 @@
 use crate::auth::ValidatedBearer;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
 use crate::metadata::forwarded_auth_token;
 use crate::server::state::ServerState;
@@ -35,7 +36,6 @@ use aruna_operations::placement::policy::{
     PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
     ResolveQuarantineOperation, create_policy_routed,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
@@ -693,22 +693,6 @@ async fn local_subject(
         ));
     }
     Ok(gate.subject)
-}
-
-async fn bucket_info(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.into())),
-    }
 }
 
 #[utoipa::path(

@@ -9,8 +9,8 @@ use super::visit::{
 };
 use super::*;
 use crate::auth::UnrestrictedAuth;
+use crate::lookup::bucket_info;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::deletion::bucket_info;
 use crate::tests::distributed::{BUCKET, Node, node_state};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission, SessionRef};
 use axum::body::{Body, to_bytes};

@@ -29,7 +29,6 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::deletion::bucket_info;
 use super::super::routing::ensure_group_admin;
 use super::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, write_metadata,
@@ -37,6 +36,7 @@ use super::metadata::{
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::{forwarded_auth_token, local_write_record, run_create_metadata};
 use crate::server::state::ServerState;
 

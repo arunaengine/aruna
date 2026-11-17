@@ -338,8 +338,8 @@ mod mint {
     use super::super::{ObjectPlacementRequest, mint_object_placement};
     use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
     };

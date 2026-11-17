@@ -19,6 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,

@@ -4,14 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::encryption::{
-    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, bucket_group, change_bucket,
-    current_status, holder_report, is_holder, key_refusal, not_encrypted, read_snapshot, refused,
-    settings_refusal, unlock_view,
+    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, change_bucket, current_status,
+    holder_report, is_holder, key_refusal, not_encrypted, read_snapshot, refused, settings_refusal,
+    unlock_view,
 };
 use super::super::routing::ensure_group_admin;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::compute::{SecretBytes, SharedSecret};
@@ -233,7 +234,7 @@ async fn holder_snapshot(
     auth: &AuthContext,
     bucket: &str,
 ) -> ServerResult<KeySnapshot> {
-    let group_id = bucket_group(state, bucket).await?;
+    let group_id = bucket_info(state, bucket).await?.group_id;
     let snapshot = read_snapshot(state, bucket, group_id).await?;
     if !is_holder(&snapshot, auth.user_id) {
         return Err(forbidden_holder());
@@ -297,7 +298,7 @@ pub async fn unlock_bucket(
     let private_key = unlock_key(body)?;
     let auth = require_unrestricted_auth(&state, auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = UnlockInput {
         bucket: bucket.clone(),
         group_id,
@@ -404,7 +405,7 @@ pub async fn extend_unlock(
     Json(request): Json<ExtendRequest>,
 ) -> ServerResult<Json<UnlockView>> {
     let session_id = parse_ulid(&request.session_id, "session_id")?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = ExtendInput {
         bucket,
         group_id,
@@ -454,7 +455,7 @@ pub async fn lock_bucket(
     UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<UnlockView>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let now_ms = now_ms();
     let input = LockInput {
         bucket,
@@ -564,7 +565,7 @@ pub async fn grant_holder(
     if user_id.is_nil() {
         return Err(ServerError::BadRequestReason("invalid user".into()));
     }
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let mut lookups = lookup_keys(
         &state.get_ctx(),
@@ -650,7 +651,7 @@ pub async fn remove_holder(
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| ServerError::BadRequestReason("invalid revision".into()))?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let creator = snapshot.info.as_ref().map(|info| info.created_by);
@@ -777,7 +778,7 @@ pub async fn rotate_key(
     Path(bucket): Path<String>,
     Json(request): Json<RotateRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let change = KeyChange::Rotate;

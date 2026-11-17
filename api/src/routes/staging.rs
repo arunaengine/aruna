@@ -8,6 +8,7 @@ use crate::auth::{
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::lookup::{RestForward, relay_json, rest_target};
 use crate::routes::execution::jobs::{
     decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
@@ -29,7 +30,7 @@ use aruna_core::structs::execution::table::{
     TableImport, TableSource, source_path as table_source_path,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
+use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_operations::auth::permission_rules::permission_rules;
 use aruna_operations::connectors::get_connector::{GetSourceOperation, GetSourceResult};
@@ -40,7 +41,6 @@ use aruna_operations::jobs::staging::read_staging_checkpoint;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
@@ -367,7 +367,7 @@ pub async fn stage_blob(
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     // A member that does not coordinate the key's range relays the write with the bearer.
     if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
-        let bucket_info = load_bucket_info(&state, &target.bucket).await?;
+        let bucket_info = bucket_info(&state, &target.bucket).await?;
         let forward = rest_target(&state, &bucket_info, &target.key, &headers).await?;
         if let Some(forward) = forward {
             let path = "/data/staging";
@@ -805,7 +805,7 @@ pub async fn submit_staging(
             "staging node must be the local node".to_string(),
         ));
     }
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -1197,7 +1197,7 @@ pub async fn list_references(
     RealmAuth(auth): RealmAuth,
     Query(query): Query<ReferenceListQuery>,
 ) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
-    let bucket_info = load_bucket_info(&state, &query.bucket).await?;
+    let bucket_info = bucket_info(&state, &query.bucket).await?;
     let bucket_path = bucket_permission_path(
         state.get_realm_id(),
         bucket_info.group_id,
@@ -1521,7 +1521,7 @@ async fn snapshot_blob(
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -1591,7 +1591,7 @@ async fn reference_blob(
 ) -> ServerResult<(StatusCode, Json<StageResponse>)> {
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
-    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
     if bucket_info.group_id != group_id {
         return Err(ServerError::NotFound);
     }
@@ -1793,26 +1793,13 @@ async fn check_table(
             ensure_source_permission(state, auth, group_id, connector_id, &path).await?;
         }
         TableSource::Object { bucket, key } => {
-            let info = load_bucket_info(state, bucket).await?;
+            let info = bucket_info(state, bucket).await?;
             let path = blob_permission_path(state, info.group_id, bucket, key);
             ensure_permission(state, auth, path, Permission::READ).await?;
         }
     }
     let target = blob_permission_path(state, group_id, bucket, "");
     ensure_permission(state, auth, target, Permission::WRITE).await
-}
-
-async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.into())),
-    }
 }
 
 async fn ensure_source_permission(

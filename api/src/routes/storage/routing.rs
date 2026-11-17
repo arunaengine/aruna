@@ -5,6 +5,7 @@
 use crate::auth::RealmAuth;
 use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
@@ -16,7 +17,6 @@ use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
@@ -309,19 +309,6 @@ async fn warnings_for<'a>(
     target_warnings(&catalog, targets)
 }
 
-async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info.group_id),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.into())),
-    }
-}
-
 /// The bucket overview shows the backend a bucket writes to, so reading the
 /// rules takes the same right as reading the bucket itself.
 async fn ensure_bucket_read(
@@ -406,7 +393,7 @@ pub async fn get_bucket_routing(
     RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let group_id = group_of_bucket(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
 
     let rules = drive(GetRoutingOperation::new(bucket.clone()), &state.get_ctx())
@@ -504,7 +491,7 @@ pub async fn put_bucket_routing(
     Path(bucket): Path<String>,
     Json(request): Json<BucketRoutingRequest>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let group_id = group_of_bucket(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
 
     let rules = request

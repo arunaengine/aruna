@@ -20,7 +20,6 @@ use aruna_operations::jobs::lifecycle::ids::session_of;
 use aruna_operations::jobs::service::read_session_reason;
 use aruna_operations::jobs::service::submit_copy_job;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
@@ -45,6 +44,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::owned_session_job;
+use crate::lookup::bucket_info;
 use crate::routes::execution::jobs::{
     JobStatusResponse, coded_response, job_status_response, map_submit_error,
 };
@@ -913,19 +913,6 @@ fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
     }
 }
 
-/// The bucket a name resolves to here. Absence reads as 404 like every other
-/// name the caller may not see.
-async fn bucket_info(
-    context: &aruna_operations::driver::DriverContext,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.into())),
-    }
-}
-
 /// What one item became: an object in the bucket, or a job still bringing it.
 enum InputOutcome {
     Staged(StagedInputResponse),
@@ -943,8 +930,8 @@ async fn stage_one(
 ) -> ServerResult<InputOutcome> {
     let node_id = state.get_node_id();
     let context = state.get_ctx();
-    let source_info = bucket_info(&context, &item.bucket).await?;
-    let dest_info = bucket_info(&context, bucket).await?;
+    let source_info = bucket_info(state, &item.bucket).await?;
+    let dest_info = bucket_info(state, bucket).await?;
     ensure_permission(
         state,
         auth,

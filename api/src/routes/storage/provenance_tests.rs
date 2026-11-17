@@ -11,8 +11,8 @@ use ulid::Ulid;
 
 use super::*;
 use crate::auth::RealmAuth;
+use crate::lookup::bucket_info;
 use crate::mcp::data::{WriteObjectInput, store_text};
-use crate::routes::storage::deletion::bucket_info;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, Node, PEER, node_id, node_state, publish_api,
 };

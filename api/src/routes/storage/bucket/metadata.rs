@@ -25,12 +25,12 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::deletion::bucket_info;
 use super::super::distributed::map_create_error;
 use super::super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierParserBody;
 use crate::server::state::ServerState;

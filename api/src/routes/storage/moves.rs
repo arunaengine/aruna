@@ -6,6 +6,7 @@ use super::compression::MigrationProgress;
 use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
@@ -13,7 +14,6 @@ use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_operations::blob::migration::misplaced::count_misplaced;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_move::{StartMoveError, StartMoveOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -63,18 +63,6 @@ pub struct BucketMoveStarted {
     /// The keys the move handles.
     pub prefix: String,
     pub progress: MigrationProgress,
-}
-
-async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::Ulid> {
-    let info = drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await;
-    info.map(|info| info.group_id).map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    })
 }
 
 #[utoipa::path(
@@ -134,7 +122,7 @@ pub async fn get_bucket_move(
     Path(bucket): Path<String>,
     Query(query): Query<BucketMoveQuery>,
 ) -> ServerResult<Json<BucketMoveResponse>> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), &bucket);
     crate::auth::ensure_permission(&state, &auth, path, Permission::READ).await?;
     let counted = count_misplaced(&state.get_ctx(), &bucket, &query.prefix, None)
@@ -225,7 +213,7 @@ pub async fn start_bucket_move(
     let prefix = request
         .map(|Json(request)| request.prefix)
         .unwrap_or_default();
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms());
     let record: CompressionMigration = drive(operation, &state.get_ctx())

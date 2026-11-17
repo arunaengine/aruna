@@ -40,7 +40,7 @@ use super::visit::{
     sign_ticket, unavailable, visit_scope, visited_link,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 
 /// How long resolving one global version or content hash of a dataset may take.

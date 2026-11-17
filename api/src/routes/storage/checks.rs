@@ -5,13 +5,13 @@
 use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
 use aruna_operations::blob::migration::check::{clean_broken, is_current, list_broken, read_check};
 use aruna_operations::driver::{drive, now_ms};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
 use aruna_operations::s3::object::delete::DeleteObjectInput;
 use axum::Json;
@@ -141,18 +141,6 @@ fn parse_after(after: Option<&str>) -> ServerResult<Option<aruna_core::types::Ke
     }
 }
 
-async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<ulid::Ulid> {
-    let info = drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await;
-    info.map(|info| info.group_id).map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    })
-}
-
 async fn ensure_bucket(
     state: &ServerState,
     auth: &AuthContext,
@@ -233,7 +221,7 @@ pub async fn get_bucket_check(
         ));
     }
     let after = parse_after(query.after.as_deref())?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::READ).await?;
     let ctx = state.get_ctx();
     let progress = read_check(&ctx, &bucket)
@@ -367,7 +355,7 @@ pub async fn start_bucket_check(
     RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<(StatusCode, Json<CheckProgress>)> {
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let operation = StartCheckOperation::new(bucket, group_id, now_ms());
     let record = drive(operation, &state.get_ctx())
@@ -423,7 +411,7 @@ pub async fn clean_bucket_check(
     Query(query): Query<CleanupQuery>,
 ) -> ServerResult<Json<BucketCleanupResponse>> {
     let after = parse_after(query.after.as_deref())?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket(&state, &auth, &bucket, group_id, Permission::WRITE).await?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let template = DeleteObjectInput {

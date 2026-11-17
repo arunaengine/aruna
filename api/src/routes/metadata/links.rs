@@ -20,9 +20,9 @@ use utoipa::{IntoParams, ToSchema};
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::lookup::{node_read, query_path};
 use crate::metadata::{bearer_token_string, map_api_error};
-use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 25;

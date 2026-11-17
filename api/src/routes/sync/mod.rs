@@ -5,14 +5,13 @@
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::routes::storage::blobs::plaintext_holder;
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BucketInfo, bucket_permission_path, ensure_confined_path,
-};
+use aruna_core::structs::storage::blob::{bucket_permission_path, ensure_confined_path};
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
@@ -31,7 +30,6 @@ use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
@@ -389,7 +387,7 @@ pub async fn create_sync(
         ));
     }
 
-    let source_info = load_bucket(&state, &request.source.bucket).await?;
+    let source_info = bucket_info(&state, &request.source.bucket).await?;
     ensure_permission(
         &state,
         &auth,
@@ -819,7 +817,7 @@ pub async fn update_sync(
         annotate(&state, &mut response).await?;
         return Ok(Json(response));
     }
-    let source_group_id = load_bucket(
+    let source_group_id = bucket_info(
         &state,
         relationship
             .source
@@ -1044,19 +1042,6 @@ fn make_endpoint(
     .map_err(|error| ServerError::BadRequestReason(error.to_string()))
 }
 
-async fn load_bucket(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(bucket_info) => Ok(bucket_info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.into())),
-    }
-}
-
 async fn ensure_source_read(
     state: &ServerState,
     auth: &AuthContext,
@@ -1066,7 +1051,7 @@ async fn ensure_source_read(
         .source
         .bucket()
         .ok_or_else(|| ServerError::BadRequestReason("invalid source ARN".to_string()))?;
-    let bucket_info = load_bucket(state, bucket).await?;
+    let bucket_info = bucket_info(state, bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -1092,7 +1077,7 @@ async fn ensure_sync_write(
         SyncRelationshipDirection::Incoming => relationship.target.bucket(),
     }
     .ok_or_else(|| ServerError::BadRequestReason("invalid sync bucket ARN".to_string()))?;
-    let bucket_info = load_bucket(state, bucket).await?;
+    let bucket_info = bucket_info(state, bucket).await?;
     ensure_permission_with(
         state,
         auth,
@@ -1120,7 +1105,7 @@ async fn create_mirror(
             .target
             .bucket()
             .ok_or(ServerError::BadRequest)?;
-        let bucket_info = load_bucket(state, bucket).await?;
+        let bucket_info = bucket_info(state, bucket).await?;
         ensure_permission_with(
             state,
             auth,
