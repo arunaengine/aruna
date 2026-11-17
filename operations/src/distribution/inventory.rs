@@ -82,7 +82,7 @@ impl StagedCall {
     }
 
     /// The effect of this call for a host that holds the transaction `txn_id` itself.
-    fn into_effect(self, txn_id: TxnId) -> Result<Effect, InventoryError> {
+    pub(crate) fn into_effect(self, txn_id: TxnId) -> Result<Effect, InventoryError> {
         let (call, txn) = match self {
             Self::InTransaction(call) => (call, Some(txn_id)),
             Self::Outside(call) => (call, None),
@@ -112,6 +112,16 @@ impl StagedCall {
             IoCall::AddCounters { space, deltas } => StorageEffect::AddCounters {
                 key_space: space,
                 deltas,
+                txn_id,
+            },
+            IoCall::AddUsage {
+                space,
+                deltas,
+                buckets,
+            } => StorageEffect::AddUsage {
+                key_space: space,
+                deltas,
+                buckets,
                 txn_id,
             },
             IoCall::Effect(effect) => match *effect {

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -27,7 +28,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
 
-use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
+use crate::distribution::inventory::{
+    InventoryChange, InventoryError, InventoryUpdate, StagedCall,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -35,6 +38,14 @@ pub enum UsageUpdateError {
     UnexpectedEvent(&'static str),
     #[error(transparent)]
     Inventory(#[from] InventoryError),
+    #[error("usage counter update failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for UsageUpdateError {
+    fn from(error: IoError) -> Self {
+        Self::Io(error)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -327,20 +338,68 @@ impl UsageCounterUpdate {
             && self.inventory.is_none()
     }
 
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+    /// The first call: the counter additions, which apply when the host's transaction commits.
+    pub fn start_calls(&mut self) -> StagedCall {
         self.phase = UsageUpdatePhase::Adding;
-        smallvec![Effect::Storage(StorageEffect::AddUsage {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            deltas: self
-                .entries
-                .iter()
+        StagedCall::InTransaction(IoCall::AddUsage {
+            space: USAGE_STATS_KEYSPACE.to_string(),
+            deltas: (self.entries.iter())
                 .map(|(key, delta)| (key.clone().into(), *delta))
                 .collect(),
             buckets: (self.bucket.iter())
                 .map(|(key, delta)| (key.clone().into(), *delta))
                 .collect(),
-            txn_id,
-        })]
+        })
+    }
+
+    /// The next call after `result`, or `None` once the update is staged in the transaction.
+    pub fn step_calls(&mut self, result: IoResult) -> Result<Option<StagedCall>, UsageUpdateError> {
+        match self.phase {
+            UsageUpdatePhase::Adding => {
+                result.done()?;
+                self.phase = UsageUpdatePhase::Writing;
+                let writes = IoCall::Write(self.dirty_marker_writes());
+                Ok(Some(StagedCall::InTransaction(writes)))
+            }
+            UsageUpdatePhase::Writing => {
+                result.done()?;
+                self.phase = UsageUpdatePhase::Inventory;
+                Ok(self.inventory_start())
+            }
+            UsageUpdatePhase::Inventory => {
+                let inventory = self.inventory.as_mut().ok_or(IoError::Unfinished)?;
+                match inventory.step_calls(result)? {
+                    Some(call) => Ok(Some(call)),
+                    None => {
+                        self.phase = UsageUpdatePhase::Done;
+                        Ok(None)
+                    }
+                }
+            }
+            UsageUpdatePhase::Pending | UsageUpdatePhase::Done => {
+                Err(UsageUpdateError::UnexpectedEvent(result.label()))
+            }
+        }
+    }
+
+    /// Starts the inventory update, or ends the update without one.
+    fn inventory_start(&mut self) -> Option<StagedCall> {
+        let call = self
+            .inventory
+            .as_mut()
+            .and_then(InventoryUpdate::start_calls);
+        if call.is_none() {
+            self.phase = UsageUpdatePhase::Done;
+        }
+        call
+    }
+
+    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+        match self.start_calls().into_effect(txn_id) {
+            Ok(effect) => smallvec![effect],
+            // The counter addition is always a storage call.
+            Err(_) => smallvec![],
+        }
     }
 
     /// Returns `Ok(Some(effects))` while more storage work is needed and
@@ -350,49 +409,29 @@ impl UsageCounterUpdate {
         event: Event,
         txn_id: TxnId,
     ) -> Result<Option<Effects>, UsageUpdateError> {
-        match (&self.phase, event) {
-            (UsageUpdatePhase::Adding, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.phase = UsageUpdatePhase::Writing;
-                Ok(Some(smallvec![Effect::Storage(
-                    StorageEffect::BatchWrite {
-                        writes: self.dirty_marker_writes(),
-                        txn_id: Some(txn_id),
-                    }
-                )]))
-            }
-            (UsageUpdatePhase::Writing, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.phase = UsageUpdatePhase::Inventory;
-                Ok(self.next_inventory(txn_id))
-            }
+        let result = match (&self.phase, event) {
             (UsageUpdatePhase::Inventory, event) => {
-                let Some(inventory) = self.inventory.as_mut() else {
-                    return Err(UsageUpdateError::UnexpectedEvent(event.label()));
-                };
-                match inventory.step(event, txn_id)? {
-                    Some(effects) => Ok(Some(effects)),
-                    None => {
-                        self.phase = UsageUpdatePhase::Done;
-                        Ok(None)
-                    }
+                let inventory = self.inventory.as_mut().ok_or(IoError::Unfinished)?;
+                let next = inventory.step(event, txn_id)?;
+                if next.is_none() {
+                    self.phase = UsageUpdatePhase::Done;
                 }
+                return Ok(next);
             }
-            (_, received) => Err(UsageUpdateError::UnexpectedEvent(received.label())),
+            (
+                UsageUpdatePhase::Adding | UsageUpdatePhase::Writing,
+                Event::Storage(StorageEvent::BatchWriteResult { .. }),
+            ) => IoResult::Done,
+            (_, received) => return Err(UsageUpdateError::UnexpectedEvent(received.label())),
+        };
+        match self.step_calls(result)? {
+            Some(call) => Ok(Some(smallvec![call.into_effect(txn_id)?])),
+            None => Ok(None),
         }
     }
 
     pub fn is_done(&self) -> bool {
         self.phase == UsageUpdatePhase::Done
-    }
-
-    /// Starts the inventory update, or ends the update without one.
-    fn next_inventory(&mut self, txn_id: TxnId) -> Option<Effects> {
-        match self.inventory.as_mut() {
-            Some(inventory) => Some(inventory.start(txn_id)),
-            None => {
-                self.phase = UsageUpdatePhase::Done;
-                None
-            }
-        }
     }
 }
 
