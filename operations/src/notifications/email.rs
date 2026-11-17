@@ -15,8 +15,6 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::outbound::{OutgoingMail, SmtpSettings};
-use aruna_core::realm_vault::seal_setting;
-use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::email::{
     EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile,
 };
@@ -30,13 +28,17 @@ use aruna_outbound::Backoffs;
 use lettre::Address;
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::send::{SendError, SendOperation};
+use crate::notifications::setting_rows::{
+    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+};
 use crate::notifications::settings::{
-    BACKOFF_START_MS, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
-    delivery_setting, local_setting, managers, write_setting,
+    BACKOFF_START_MS, Delivery, MetadataPeers, SettingPeers, SettingWinner, delivery_setting,
+    managers,
 };
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm_vault::{prune_secret_cache, read_realm_secret};
@@ -98,7 +100,7 @@ pub async fn read_email(
     ctx: &DriverContext,
     owner: UserId,
 ) -> Result<Option<EmailPreference>, EmailError> {
-    let bytes = local_setting(ctx, SettingChannel::Email, owner).await?;
+    let bytes = drive(ReadSettingOperation::new(SettingChannel::Email, owner), ctx).await?;
     Ok(bytes
         .as_deref()
         .map(EmailPreference::from_bytes)
@@ -126,14 +128,8 @@ pub async fn set_email(
     if !verified(ctx, owner, &address).await? || address.parse::<Address>().is_err() {
         return Err(EmailError::NotVerified);
     }
-    let secret = SecretBytes::new(address.into_bytes());
-    let build = |stamp: RegisterStamp| {
-        let id = stamp.write_id;
-        let sealed = seal_setting(&owner.realm_id, SettingChannel::Email, &owner, id, &secret)
-            .map_err(|error| SettingError::Build(error.to_string()))?;
-        email_bytes(owner, stamp, categories.clone(), Some(sealed))
-    };
-    write_email(ctx, local, owner, &build).await
+    let address = Some(SecretBytes::new(address.into_bytes()));
+    write_email(ctx, local, owner, categories, address).await
 }
 
 /// Turns email off with a newer register write; queued emails then send nothing.
@@ -142,37 +138,30 @@ pub async fn remove_email(
     local: NodeId,
     owner: UserId,
 ) -> Result<(), EmailError> {
-    let build = |stamp: RegisterStamp| email_bytes(owner, stamp, BTreeSet::new(), None);
-    write_email(ctx, local, owner, &build).await.map(|_| ())
+    let off = write_email(ctx, local, owner, BTreeSet::new(), None);
+    off.await.map(|_| ())
 }
 
 async fn write_email(
     ctx: &DriverContext,
     local: NodeId,
     owner: UserId,
-    build: &(dyn Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> + Sync),
-) -> Result<EmailPreference, EmailError> {
-    let bytes = write_setting(ctx, local, SettingChannel::Email, owner, build).await?;
-    Ok(EmailPreference::from_bytes(&bytes)?)
-}
-
-fn email_bytes(
-    owner: UserId,
-    stamp: RegisterStamp,
     categories: BTreeSet<String>,
-    sealed: Option<Vec<u8>>,
-) -> Result<Vec<u8>, SettingError> {
-    let preference = EmailPreference {
-        preference_id: stamp.write_id,
-        user_id: owner,
-        stamp,
-        categories,
-        sealed,
-        created_at_ms: unix_timestamp_millis(),
+    address: Option<SecretBytes>,
+) -> Result<EmailPreference, EmailError> {
+    let write = SettingWrite {
+        owner,
+        local,
+        write_id: Ulid::generate(),
+        event_id: Ulid::generate(),
+        now_ms: unix_timestamp_millis(),
+        value: SettingValue::Email {
+            categories,
+            address,
+        },
     };
-    preference
-        .to_bytes()
-        .map_err(|error| SettingError::Build(error.to_string()))
+    let bytes = drive(WriteSettingOperation::new(write), ctx).await?;
+    Ok(EmailPreference::from_bytes(&bytes)?)
 }
 
 async fn realm_config(

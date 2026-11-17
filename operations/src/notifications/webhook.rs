@@ -7,8 +7,6 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::ConversionError;
-use aruna_core::realm_vault::seal_setting;
-use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::job::JobResultPayload;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
@@ -17,14 +15,17 @@ use aruna_core::structs::execution::webhook::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_outbound::Backoffs;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::notifications::email::{job_error, no_transport};
 use crate::notifications::send::SendOperation;
+use crate::notifications::setting_rows::{
+    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+};
 use crate::notifications::settings::{
-    Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting, managers,
-    write_setting,
+    Delivery, MetadataPeers, SettingPeers, delivery_setting, managers,
 };
 use crate::realm::get_config::GetConfigOperation;
 
@@ -52,7 +53,8 @@ pub async fn read_webhook(
     ctx: &DriverContext,
     owner: UserId,
 ) -> Result<Option<WebhookSubscription>, WebhookError> {
-    let bytes = local_setting(ctx, SettingChannel::Webhook, owner).await?;
+    let read = ReadSettingOperation::new(SettingChannel::Webhook, owner);
+    let bytes = drive(read, ctx).await?;
     Ok(bytes
         .as_deref()
         .map(WebhookSubscription::from_bytes)
@@ -70,20 +72,8 @@ pub async fn set_webhook(
         return Err(WebhookError::InvalidUrl);
     }
     let secret: [u8; 32] = rand::random();
-    let sealed_secret = SecretBytes::new(secret.to_vec());
-    let build = |stamp: RegisterStamp| {
-        let id = stamp.write_id;
-        let sealed = seal_setting(
-            &owner.realm_id,
-            SettingChannel::Webhook,
-            &owner,
-            id,
-            &sealed_secret,
-        )
-        .map_err(|error| SettingError::Build(error.to_string()))?;
-        webhook_bytes(owner, stamp, Some(url.clone()), Some(sealed))
-    };
-    let subscription = write_webhook(ctx, local, owner, &build).await?;
+    let target = Some((url, SecretBytes::new(secret.to_vec())));
+    let subscription = write_webhook(ctx, local, owner, target).await?;
     Ok(WebhookOutcome {
         subscription,
         secret: hex::encode(secret),
@@ -96,37 +86,25 @@ pub async fn remove_webhook(
     local: NodeId,
     owner: UserId,
 ) -> Result<(), WebhookError> {
-    let build = |stamp: RegisterStamp| webhook_bytes(owner, stamp, None, None);
-    write_webhook(ctx, local, owner, &build).await.map(|_| ())
+    write_webhook(ctx, local, owner, None).await.map(|_| ())
 }
 
 async fn write_webhook(
     ctx: &DriverContext,
     local: NodeId,
     owner: UserId,
-    build: &(dyn Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> + Sync),
+    target: Option<(String, SecretBytes)>,
 ) -> Result<WebhookSubscription, WebhookError> {
-    let bytes = write_setting(ctx, local, SettingChannel::Webhook, owner, build).await?;
-    Ok(WebhookSubscription::from_bytes(&bytes)?)
-}
-
-fn webhook_bytes(
-    owner: UserId,
-    stamp: RegisterStamp,
-    url: Option<String>,
-    sealed: Option<Vec<u8>>,
-) -> Result<Vec<u8>, SettingError> {
-    let subscription = WebhookSubscription {
-        subscription_id: stamp.write_id,
-        user_id: owner,
-        stamp,
-        url,
-        sealed,
-        created_at_ms: unix_timestamp_millis(),
+    let write = SettingWrite {
+        owner,
+        local,
+        write_id: Ulid::generate(),
+        event_id: Ulid::generate(),
+        now_ms: unix_timestamp_millis(),
+        value: SettingValue::Webhook { target },
     };
-    subscription
-        .to_bytes()
-        .map_err(|error| SettingError::Build(error.to_string()))
+    let bytes = drive(WriteSettingOperation::new(write), ctx).await?;
+    Ok(WebhookSubscription::from_bytes(&bytes)?)
 }
 
 /// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer

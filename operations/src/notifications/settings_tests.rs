@@ -4,14 +4,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::notifications::setting_rows::{
+    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+};
 use crate::tests::notifications::{
     CannedPeers, context, managers, opening, store_setting, temp_storage,
 };
+use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+use aruna_core::register::RegisterError;
+use aruna_core::register::RegisterStamp;
 use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
+use aruna_core::structs::execution::setting::SettingHead;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::RealmId;
 use std::sync::atomic::Ordering;
+use ulid::Ulid;
 
 const SECRET: &[u8] = b"canary-hook-17";
 /// A time before the notice expires.
@@ -40,13 +50,21 @@ fn webhook(on: bool) -> impl Fn(RegisterStamp) -> Result<Vec<u8>, SettingError> 
     }
 }
 
-async fn write(ctx: &DriverContext, writer: NodeId, on: bool) -> SettingHead {
-    let build = webhook(on);
-    let channel = SettingChannel::Webhook;
-    let bytes = write_setting(ctx, writer, channel, owner(), &build)
-        .await
-        .unwrap();
-    channel.head(&bytes).unwrap()
+/// Turns the webhook of `owner()` off with a new local register write.
+fn webhook_off(writer: NodeId) -> WriteSettingOperation {
+    WriteSettingOperation::new(SettingWrite {
+        owner: owner(),
+        local: writer,
+        write_id: Ulid::generate(),
+        event_id: Ulid::generate(),
+        now_ms: NOW_MS,
+        value: SettingValue::Webhook { target: None },
+    })
+}
+
+async fn write(ctx: &DriverContext, writer: NodeId) -> SettingHead {
+    let bytes = drive(webhook_off(writer), ctx).await.unwrap();
+    SettingChannel::Webhook.head(&bytes).unwrap()
 }
 
 /// Stores a webhook setting written elsewhere, as sync would.
@@ -109,14 +127,15 @@ async fn write_counts_up() {
     // Each write is one above the highest counter this node holds, also from other nodes.
     let (_dir, storage) = temp_storage();
     let ctx = context(&storage);
-    let first = write(&ctx, node(1), true).await;
+    let first = write(&ctx, node(1)).await;
     assert_eq!((first.stamp.counter, first.stamp.node_id), (1, node(1)));
     assert_eq!(first.stamp.write_id, first.id);
     received(&ctx, 7, node(2), true).await;
-    let next = write(&ctx, node(1), false).await;
+    let next = write(&ctx, node(1)).await;
     assert_eq!(next.stamp.counter, 8);
     assert_eq!(outbox_rows(&ctx).await, 2, "every local write is published");
-    let shown = local_setting(&ctx, SettingChannel::Webhook, owner()).await;
+    let read = ReadSettingOperation::new(SettingChannel::Webhook, owner());
+    let shown = drive(read, &ctx).await;
     assert_eq!(
         shown.unwrap(),
         None,
@@ -129,9 +148,7 @@ async fn counter_refused() {
     let (_dir, storage) = temp_storage();
     let ctx = context(&storage);
     received(&ctx, u64::MAX, node(2), true).await;
-    let build = webhook(false);
-    let channel = SettingChannel::Webhook;
-    let refused = write_setting(&ctx, node(1), channel, owner(), &build).await;
+    let refused = drive(webhook_off(node(1)), &ctx).await;
     assert_eq!(
         refused,
         Err(SettingError::Register(RegisterError::CounterLimit))
