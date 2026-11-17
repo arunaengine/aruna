@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 use aruna_core::rows::done;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
@@ -145,8 +145,8 @@ impl Operation for StoreStatusOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -230,7 +230,10 @@ mod tests {
     #[test]
     fn stores_status() {
         let (mut operation, next) = writing(relationship());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(
             spaces(&next),
             vec![

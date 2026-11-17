@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::*;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::blob::{ArchiveKey, BlobVersion, VersionKey};
 use aruna_core::types::Value;
@@ -74,8 +74,8 @@ impl Operation for EnvelopeOperation {
     type Output = Envelope;
     type Error = AbeError;
     /// The reads see one snapshot, so the version and its envelope agree.
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
     fn first(&mut self) -> Result<Next<Envelope>, AbeError> {
         let key = self.version.to_bytes().map_err(|_| AbeError::Context)?;
@@ -117,7 +117,10 @@ mod tests {
         // A version row that is absent ends the read before any envelope row.
         let mut operation =
             EnvelopeOperation::new("b".into(), "k".into(), Ulid::from_bytes([1; 16]));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(
             matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2)
         );

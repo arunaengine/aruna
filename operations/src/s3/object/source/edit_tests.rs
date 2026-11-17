@@ -100,7 +100,10 @@ fn started(change: SourceChange) -> SourceEditOperation {
         after: None,
         page: 10,
     });
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
     operation
 }

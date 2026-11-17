@@ -63,8 +63,14 @@ fn single_requests() {
 
 #[test]
 fn modes_and_conflicts() {
-    assert!(writes(Vec::new(), Vec::new()).transaction());
-    assert!(!sync_all().transaction());
+    assert_eq!(
+        writes(Vec::new(), Vec::new()).transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
+    assert_eq!(
+        sync_all().transaction(),
+        aruna_core::operation::TransactionMode::None
+    );
     assert_eq!(sync_all().first().unwrap(), Next::Call(IoCall::Sync));
     let conflict = StoreError::from(IoError::Conflict);
     assert!(<Writes as Operation>::is_conflict(&conflict));

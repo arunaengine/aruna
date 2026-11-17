@@ -13,7 +13,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
@@ -505,8 +505,8 @@ impl Operation for OwnerSecretOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     /// The outbox drain, then the notice drain; a missed timer leaves the rows to the next drain.

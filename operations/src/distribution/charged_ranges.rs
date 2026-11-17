@@ -9,7 +9,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::Event;
 use aruna_core::keyspaces::{RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, RangeAccount, RangeCounters, account_key, generation_key, pending_key,
 };
@@ -146,8 +146,8 @@ impl Operation for ChargedRangesOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -175,7 +175,10 @@ mod tests {
     fn reads_held_rows() {
         let row = generation_key(set(), range(), 3);
         let mut charged = ChargedRangesOperation::new(set(), vec![range(), Ulid::nil()]);
-        assert!(charged.transaction());
+        assert_eq!(
+            charged.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let accounts = IoCall::Read(vec![
             (
                 RANGE_ACCOUNT_KEYSPACE.to_string(),

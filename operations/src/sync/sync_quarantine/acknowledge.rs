@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 use aruna_core::structs::{SyncQuarantineRecord, quarantine_row_entry, quarantine_usage_entry};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -96,8 +96,8 @@ impl Operation for AcknowledgeQuarantineOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -114,7 +114,10 @@ mod tests {
 
     fn reading_row() -> AcknowledgeQuarantineOperation {
         let mut operation = AcknowledgeQuarantineOperation::new(vec![4]);
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(operation.first(), Ok(Next::Call(row_read(&[4]))));
         operation
     }

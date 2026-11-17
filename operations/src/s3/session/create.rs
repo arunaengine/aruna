@@ -10,7 +10,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_MAX_TTL};
@@ -227,8 +227,8 @@ impl Operation for CreateS3Operation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -263,7 +263,10 @@ mod tests {
             panic!("expected the owner index and group fence read");
         };
         assert_eq!(reads[1], group_fence_key(Ulid::from_parts(3, 3)));
-        assert!(create.transaction());
+        assert_eq!(
+            create.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let Ok(Next::Call(IoCall::Read(sessions))) =
             create.next(IoResult::Values(vec![None, None]))
         else {

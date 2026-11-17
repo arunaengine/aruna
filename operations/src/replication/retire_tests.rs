@@ -97,7 +97,10 @@ fn completed_job_journals() {
     // The job's own row goes, and the completed sync job journals one event in the same commit.
     let mut operation =
         RetireJobOperation::new(b"row".to_vec(), job(), &BlobJobOutcome::Completed, 5);
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let delete = IoCall::Delete(vec![(
         REPLICATION_JOB_KEYSPACE.to_string(),
         b"row".to_vec().into(),

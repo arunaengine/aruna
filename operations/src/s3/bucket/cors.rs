@@ -5,7 +5,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BucketCorsConfiguration, BucketInfo};
 use thiserror::Error;
@@ -120,8 +120,8 @@ impl Operation for PutCorsOperation {
         Ok(Next::Call(cors_row(&self.bucket, &bytes, config)?))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -191,8 +191,8 @@ impl Operation for DeleteCorsOperation {
         Ok(Next::Call(cors_row(&self.bucket, &bytes, None)?))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

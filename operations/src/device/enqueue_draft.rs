@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE;
 use aruna_core::metadata::MetadataActor;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::metadata_actor_entry;
 use thiserror::Error;
@@ -116,8 +116,8 @@ impl Operation for EnqueueDraftOperation {
         Ok(Next::Call(self.write()?))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -179,7 +179,10 @@ mod tests {
             entry: queued.clone(),
         })
         .with_fence(7);
-        assert!(enqueue.transaction());
+        assert_eq!(
+            enqueue.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert_eq!(enqueue.first(), Ok(Next::Call(count_call())));
         let rows = IoCall::Write(vec![
             publish_entry(&queued).unwrap(),

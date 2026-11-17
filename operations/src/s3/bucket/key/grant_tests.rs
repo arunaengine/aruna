@@ -57,7 +57,10 @@ fn started(lookup: KeyLookup, encrypted: bool) -> (GrantHolderOperation, Step) {
 /// Runs a grant by user(1) while `admins` hold the group admin role in the transaction.
 fn granted(lookup: KeyLookup, encrypted: bool, admins: &[UserId]) -> (GrantHolderOperation, Step) {
     let mut operation = GrantHolderOperation::new(input(lookup));
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let _ = operation.first();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),

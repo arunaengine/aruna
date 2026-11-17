@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::user::session::UserSession;
 use thiserror::Error;
@@ -81,8 +81,8 @@ impl Operation for ListSessionOperation {
     type Error = ListSessionError;
 
     /// The index and the session rows come from one snapshot.
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Vec<UserSession>>, ListSessionError> {
@@ -144,7 +144,10 @@ mod pure_tests {
             via: None,
         };
         let mut operation = ListSessionOperation::new(user_id);
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         operation.first().unwrap();
         let index = postcard::to_allocvec(&BTreeSet::from([sid.clone()])).unwrap();
         let read = operation.next(IoResult::Values(vec![Some(ByteView::from(index))]));
