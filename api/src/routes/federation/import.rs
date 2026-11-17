@@ -29,7 +29,7 @@ use aruna_operations::federation::transfer::{
     AdmitTransferConfig, AdmitTransferOperation, IssueIntentConfig, IssueIntentOperation,
     TransferAdmitError,
 };
-use aruna_operations::jobs::import::{
+use aruna_operations::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
 };
 use axum::Json;

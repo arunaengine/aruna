@@ -33,7 +33,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use super::import::{UploadClaimError, claim_upload, upload_key};
+use super::import::upload::{UploadClaimError, claim_upload, upload_key};
 use crate::groups::imports::cron::is_running;
 use crate::harvest::repository::source_key;
 use aruna_core::structs::execution::job::{dedup_index_key, job_insert_entries};
@@ -1017,8 +1017,9 @@ mod tests {
         };
         let upload_id = Ulid::from_bytes([seed; 16]);
         import.source = ImportRoCrateSource::Upload { upload_id };
-        let record = crate::jobs::import::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::write_rocrate_upload(storage, &record)
+        let record =
+            crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
+        crate::jobs::import::upload::write_rocrate_upload(storage, &record)
             .await
             .unwrap();
         upload_id
@@ -1336,10 +1337,10 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored = crate::jobs::import::read_rocrate_upload(&storage, upload_id).await;
+        let stored = crate::jobs::import::upload::read_rocrate_upload(&storage, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
-        let reclaimed = crate::jobs::import::claim_rocrate_upload(
+        let reclaimed = crate::jobs::import::upload::claim_rocrate_upload(
             &storage,
             upload_id,
             owner,

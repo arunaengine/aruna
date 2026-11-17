@@ -1882,13 +1882,16 @@ mod tests {
         };
         let blob_path = location.get_full_path().unwrap();
         let blob_len = std::fs::metadata(&blob_path).unwrap().len();
-        let mut upload =
-            crate::jobs::import::upload_record(record.created_by, Ulid::from_bytes([3u8; 16]), 0);
+        let mut upload = crate::jobs::import::upload::tests::upload_record(
+            record.created_by,
+            Ulid::from_bytes([3u8; 16]),
+            0,
+        );
         upload.location = location.clone();
         upload.blake3 = blake3;
         upload.size = size;
         upload.claimed_by = Some(job_id);
-        crate::jobs::import::write_rocrate_upload(&storage, &upload)
+        crate::jobs::import::upload::write_rocrate_upload(&storage, &upload)
             .await
             .unwrap();
         let checkpoint_value =
@@ -1942,7 +1945,7 @@ mod tests {
         let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
         assert_eq!(
-            crate::jobs::import::read_rocrate_upload(&storage, upload.upload_id)
+            crate::jobs::import::upload::read_rocrate_upload(&storage, upload.upload_id)
                 .await
                 .unwrap(),
             Some(upload)

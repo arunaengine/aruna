@@ -27,7 +27,7 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
-use crate::jobs::import::{load_rocrate_upload, upload_stale};
+use crate::jobs::import::upload::{load_rocrate_upload, upload_stale};
 use crate::jobs::key_wake::read_row;
 use crate::jobs::store::{find_dedup_plan, read_job_record};
 use crate::realm::get_config::GetConfigOperation;
@@ -773,7 +773,7 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::jobs::import::write_rocrate_upload(storage, &live)
+        crate::jobs::import::upload::write_rocrate_upload(storage, &live)
             .await
             .unwrap();
         let mut record = record();

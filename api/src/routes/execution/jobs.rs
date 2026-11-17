@@ -509,7 +509,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::UploadClaimError;
+            use aruna_operations::jobs::import::upload::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,

@@ -18,7 +18,7 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::federation::import::read_import;
-use aruna_operations::jobs::import::{
+use aruna_operations::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
 };
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};

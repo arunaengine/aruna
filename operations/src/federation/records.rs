@@ -22,7 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::export::GrantRecord;
-use crate::jobs::import::{upload_key, upload_stale};
+use crate::jobs::import::upload::{upload_key, upload_stale};
 
 const CONFLICT_RETRIES: u8 = 5;
 
@@ -613,7 +613,7 @@ mod tests {
         // binding transaction or with its retired upload; the retry keeps the claimed upload.
         let old = Ulid::from_bytes([1; 16]);
         let owner = grant_record().principal;
-        let mut upload = crate::jobs::import::upload_record(owner, old, 10);
+        let mut upload = crate::jobs::import::upload::tests::upload_record(owner, old, 10);
         let mut operation = RecordOperation::new(binding(stale(old)));
         operation.start();
         operation.step(started(1));
