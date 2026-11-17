@@ -259,7 +259,7 @@ pub fn intent_keys(rows: Rows) -> Vec<(&'static str, Vec<u8>)> {
 mod tests {
     use super::*;
     use crate::driver::drive;
-    use crate::plugins::rows::{delete_rows, write_rows};
+    use crate::plugins::rows::{delete_rows, scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
 
     #[tokio::test]
@@ -290,32 +290,12 @@ mod tests {
 
         let rows = vec![(b"k".to_vec(), Vec::new())];
         assert_eq!(intent_keys(rows), [(PLUGIN_INTENTS_KEYSPACE, b"k".to_vec())]);
-        let all = drive(RowsOperation::direct(Everything(intent_scan(run))), &ctx);
+        let all = drive(scan_rows(intent_scan(run)), &ctx);
         let keys = intent_keys(all.await.unwrap());
         assert_eq!(keys.len(), 3);
         drive(delete_rows(keys), &ctx).await.unwrap();
         assert_eq!(open().await, None);
         assert_eq!(begun(&first).await.unwrap(), Begun::Fresh);
-    }
-
-    /// Every row a scan reads.
-    #[derive(Debug, PartialEq)]
-    struct Everything(Scan);
-
-    impl Plan for Everything {
-        type Output = Rows;
-        type Error = StoreError;
-
-        fn first(&mut self) -> Result<Turn<Rows>, StoreError> {
-            Ok(Turn::Ask(self.0.ask()))
-        }
-
-        fn next(&mut self, answer: Answer) -> Result<Turn<Rows>, StoreError> {
-            Ok(match self.0.take(answer)? {
-                Some(rows) => Turn::Finish(rows),
-                None => Turn::Ask(self.0.ask()),
-            })
-        }
     }
 
     #[test]

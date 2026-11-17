@@ -17,10 +17,11 @@ use ulid::Ulid;
 
 use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
 use super::receiver::lost_reason;
-use super::runs::{ADMISSIONS, RunError, admit, admit_in};
+use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, done, row as row_of, values};
+use super::runs::{ADMISSIONS, Admission, RunError, admit};
 use super::settings::{SettingError, check_fields};
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use super::store::{StoreError, decode, encode};
+use crate::driver::{DriverContext, drive};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
@@ -141,7 +142,8 @@ pub async fn start_run(
         input,
     };
     let run = new_run(install, manual.as_str().to_string(), trigger, now_ms);
-    admit(ctx, &run).await?;
+    let _admitting = ADMISSIONS.lock().await;
+    drive(admit(run.clone()), ctx).await?;
     Ok(run)
 }
 
@@ -194,68 +196,129 @@ pub async fn enqueue_timers(
             continue;
         };
         let handler = TriggerKind::Every.as_str().to_string();
-        if enqueue_timer(ctx, install, handler, secs * 1000, now_ms).await? {
+        let _admitting = ADMISSIONS.lock().await;
+        let timer = enqueue_timer(install, handler, secs * 1000, now_ms);
+        if drive(timer, ctx).await? {
             queued += 1;
         }
     }
     Ok(queued)
 }
 
-async fn enqueue_timer(
-    ctx: &DriverContext,
+/// Queues the due occurrence of an install's timer, or counts it as skipped over the queue bound;
+/// the caller holds `ADMISSIONS`.
+fn enqueue_timer(
     install: &PluginInstall,
     handler: String,
     interval_ms: u64,
     now_ms: u64,
-) -> Result<bool, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
-    let key = timer_key(install.install_id);
-    transact(ctx, async |txn: &Txn<'_>| {
-        let mut row = match txn.read(PLUGIN_RUNS_KEYSPACE, &key).await? {
-            Some(bytes) => decode::<TimerRow>(&bytes)?,
-            None => TimerRow::default(),
-        };
-        // Occurrences count from the last activation, so a pause is never replayed.
-        let base = row
-            .last_due_ms
-            .max(install.active_since_ms.unwrap_or(now_ms));
-        if now_ms < base.saturating_add(interval_ms) {
-            return Ok(false);
-        }
-        let occurrence = base + (now_ms - base) / interval_ms * interval_ms;
-        let trigger = RunTrigger::Timer {
-            occurrence_ms: occurrence,
-        };
-        let run = new_run(install, handler, trigger, now_ms);
-        let admitted = match admit_in(txn, &run).await {
-            Ok(()) => true,
-            Err(RunError::Full(_)) => false,
-            Err(RunError::Store(error)) => return Err(error),
-            Err(
-                RunError::NotFound
-                | RunError::NotWaiting(_)
-                | RunError::NotRetried(_)
-                | RunError::NotHeld,
-            ) => false,
-        };
-        row.last_due_ms = occurrence;
-        row.skipped += u64::from(!admitted);
-        txn.write(PLUGIN_RUNS_KEYSPACE, vec![(key.clone(), encode(&row)?)])
-            .await?;
-        Ok(admitted)
+) -> RowsOperation<EnqueueTimer> {
+    RowsOperation::transaction(EnqueueTimer {
+        install: Box::new(install.clone()),
+        handler,
+        interval_ms,
+        now_ms,
+        key: timer_key(install.install_id),
+        phase: TimerPhase::Reading,
     })
-    .await
+}
+
+#[derive(Debug, PartialEq)]
+pub struct EnqueueTimer {
+    install: Box<PluginInstall>,
+    handler: String,
+    interval_ms: u64,
+    now_ms: u64,
+    key: Vec<u8>,
+    phase: TimerPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum TimerPhase {
+    Reading,
+    Admitting(TimerRow, Admission),
+    Writing(bool),
+}
+
+impl Plan for EnqueueTimer {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_RUNS_KEYSPACE, self.key.clone())])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+        match std::mem::replace(&mut self.phase, TimerPhase::Writing(false)) {
+            TimerPhase::Reading => {
+                let [found] = values::<1>(answer)?;
+                let mut row = match found {
+                    Some(bytes) => decode::<TimerRow>(&bytes)?,
+                    None => TimerRow::default(),
+                };
+                // Occurrences count from the last activation, so a pause is never replayed.
+                let base = (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
+                if self.now_ms < base.saturating_add(self.interval_ms) {
+                    return Ok(Turn::Finish(false));
+                }
+                let occurrence = base + (self.now_ms - base) / self.interval_ms * self.interval_ms;
+                let trigger = RunTrigger::Timer {
+                    occurrence_ms: occurrence,
+                };
+                let handler = std::mem::take(&mut self.handler);
+                let run = new_run(&self.install, handler, trigger, self.now_ms);
+                row.last_due_ms = occurrence;
+                let admission = Admission::new(run);
+                let ask = admission.ask();
+                self.phase = TimerPhase::Admitting(row, admission);
+                Ok(Turn::Ask(ask))
+            }
+            TimerPhase::Admitting(row, mut admission) => {
+                let (admitted, rows) = match admission.take(answer) {
+                    Ok(None) => {
+                        let ask = admission.ask();
+                        self.phase = TimerPhase::Admitting(row, admission);
+                        return Ok(Turn::Ask(ask));
+                    }
+                    Ok(Some(rows)) => (true, rows),
+                    Err(RunError::Store(error)) => return Err(error),
+                    Err(_) => (false, Vec::new()),
+                };
+                let mut row = row;
+                row.skipped += u64::from(!admitted);
+                let mut rows = rows;
+                rows.push(row_of(PLUGIN_RUNS_KEYSPACE, self.key.clone(), encode(&row)?));
+                self.phase = TimerPhase::Writing(admitted);
+                Ok(Turn::Ask(Ask::Write(rows)))
+            }
+            TimerPhase::Writing(admitted) => {
+                done(answer)?;
+                Ok(Turn::Finish(admitted))
+            }
+        }
+    }
 }
 
 /// The timer row of an install, if its timer ran before.
-pub async fn read_timer(
-    ctx: &DriverContext,
-    install_id: Ulid,
-) -> Result<Option<TimerRow>, StoreError> {
-    let row = (Txn::direct(ctx))
-        .read(PLUGIN_RUNS_KEYSPACE, &timer_key(install_id))
-        .await?;
-    row.map(|bytes| decode(&bytes)).transpose()
+pub fn read_timer(install_id: Ulid) -> RowsOperation<ReadTimer> {
+    RowsOperation::direct(ReadTimer(timer_key(install_id)))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReadTimer(Vec<u8>);
+
+impl Plan for ReadTimer {
+    type Output = Option<TimerRow>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_RUNS_KEYSPACE, self.0.clone())])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        let [found] = values::<1>(answer)?;
+        Ok(Turn::Finish(found.map(|bytes| decode(&bytes)).transpose()?))
+    }
 }
 
 #[cfg(test)]

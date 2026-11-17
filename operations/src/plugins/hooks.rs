@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use aruna_core::injection::verify_request;
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, InstallState};
-use aruna_core::plugin_runs::{HookRequest, RunTrigger, hook_key, hook_time_key};
+use aruna_core::plugin_runs::{HookRequest, PluginRun, RunTrigger, hook_key, hook_time_key};
 use aruna_core::secrets::Delivery;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_plugins::manifest::SecretKind;
@@ -23,9 +23,10 @@ use super::install::{pick_version, read_config, read_manifest};
 use super::rate::take_hook;
 use super::receiver::lost_reason;
 use super::release::{ReleaseKeys, ReleaseRequest};
-use super::runs::{ADMISSIONS, RunError, admit_in};
-use super::store::{Txn, encode, transact};
-use crate::driver::DriverContext;
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values};
+use super::runs::{ADMISSIONS, Admission, RunError};
+use super::store::encode;
+use crate::driver::{DriverContext, drive};
 
 /// Headers removed before a request is stored: hop-by-hop ones and the relay mark. The check
 /// itself removes the credential headers.
@@ -123,20 +124,93 @@ pub async fn admit_hook(
     let delivery_id = request.delivery_id.clone();
     let run = new_run(install, handler, RunTrigger::Webhook(request), now_ms);
     let _admitting = ADMISSIONS.lock().await;
-    let admitted = transact(ctx, async |txn: &Txn<'_>| {
-        if let Some(id) = &delivery_id {
-            let key = hook_key(install_id, id);
-            if txn.read(PLUGIN_HOOKS_KEYSPACE, &key).await?.is_some() {
-                return Ok(false);
+    let admit = AdmitHook::new(run, (install_id, delivery_id), now_ms)?;
+    Ok(drive(RowsOperation::transaction(admit), ctx).await?)
+}
+
+/// Queues a webhook's run once per delivery id in one transaction: `false` for a delivery id
+/// the receiver already admitted, which starts nothing. The caller holds `ADMISSIONS`.
+#[derive(Debug, PartialEq)]
+pub struct AdmitHook {
+    /// The delivery's rows, written with the run; `None` without a delivery id.
+    delivery: Option<(Vec<u8>, Vec<Row>)>,
+    admission: Admission,
+    phase: HookPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum HookPhase {
+    Seen,
+    Admitting,
+    Writing,
+}
+
+impl AdmitHook {
+    pub fn new(
+        run: PluginRun,
+        (install_id, delivery_id): (Ulid, Option<String>),
+        now_ms: u64,
+    ) -> Result<Self, RunError> {
+        let delivery = match delivery_id {
+            Some(id) => {
+                let key = hook_key(install_id, &id);
+                let time = hook_time_key(now_ms, install_id, &id);
+                let rows = vec![
+                    row(PLUGIN_HOOKS_KEYSPACE, key.clone(), encode(&now_ms)?),
+                    row(PLUGIN_HOOKS_KEYSPACE, time, Vec::new()),
+                ];
+                Some((key, rows))
             }
-            let time = hook_time_key(now_ms, install_id, id);
-            let rows = vec![(key, encode(&now_ms)?), (time, Vec::new())];
-            txn.write(PLUGIN_HOOKS_KEYSPACE, rows).await?;
+            None => None,
+        };
+        Ok(Self {
+            delivery,
+            admission: Admission::new(run),
+            phase: HookPhase::Seen,
+        })
+    }
+}
+
+impl Plan for AdmitHook {
+    type Output = bool;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<bool>, RunError> {
+        match &self.delivery {
+            Some((key, _)) => Ok(Turn::Ask(Ask::Read(vec![(PLUGIN_HOOKS_KEYSPACE, key.clone())]))),
+            None => {
+                self.phase = HookPhase::Admitting;
+                Ok(Turn::Ask(self.admission.ask()))
+            }
         }
-        admit_in(txn, &run).await?;
-        Ok::<_, RunError>(true)
-    });
-    Ok(admitted.await?)
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, RunError> {
+        match self.phase {
+            HookPhase::Seen => {
+                let [seen] = values::<1>(answer)?;
+                if seen.is_some() {
+                    return Ok(Turn::Finish(false));
+                }
+                self.phase = HookPhase::Admitting;
+                Ok(Turn::Ask(self.admission.ask()))
+            }
+            HookPhase::Admitting => {
+                let Some(mut rows) = self.admission.take(answer)? else {
+                    return Ok(Turn::Ask(self.admission.ask()));
+                };
+                if let Some((_, delivery)) = self.delivery.take() {
+                    rows.splice(0..0, delivery);
+                }
+                self.phase = HookPhase::Writing;
+                Ok(Turn::Ask(Ask::Write(rows)))
+            }
+            HookPhase::Writing => {
+                done(answer)?;
+                Ok(Turn::Finish(true))
+            }
+        }
+    }
 }
 
 /// Whether a relay from `local` passes `authorization` on: only when the install's verify secret
