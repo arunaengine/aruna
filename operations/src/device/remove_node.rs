@@ -122,7 +122,7 @@ pub enum RemoveNodeError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -286,7 +286,12 @@ impl RemoveNodeOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, state: &str, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(
+        &mut self,
+        state: &str,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Effects {
         self.fail(RemoveNodeError::UnexpectedEvent {
             state: state.to_string(),
             expected,
@@ -314,9 +319,7 @@ impl Operation for RemoveNodeOperation {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event(name, "transaction start result", format!("{other:?}"))
-                }
+                other => self.unexpected_event(name, "transaction start result", other.label()),
             },
             RemoveNodeState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -329,7 +332,7 @@ impl Operation for RemoveNodeOperation {
                         return self.unexpected_event(
                             name,
                             "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
+                            "a batch of another length",
                         );
                     };
                     let membership = match MembershipFence::from_value(membership.as_deref()) {
@@ -352,9 +355,7 @@ impl Operation for RemoveNodeOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event(name, "storage batch read result", format!("{other:?}"))
-                }
+                other => self.unexpected_event(name, "storage batch read result", other.label()),
             },
             RemoveNodeState::ReadCutoffs {
                 document_value,
@@ -371,7 +372,7 @@ impl Operation for RemoveNodeOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(name, "publisher index rows", format!("{other:?}")),
+                other => self.unexpected_event(name, "publisher index rows", other.label()),
             },
             RemoveNodeState::WriteDocumentState {
                 stale_conflict_deletes,
@@ -390,18 +391,14 @@ impl Operation for RemoveNodeOperation {
                     self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event(name, "storage batch write result", format!("{other:?}"))
-                }
+                other => self.unexpected_event(name, "storage batch write result", other.label()),
             },
             RemoveNodeState::DeleteAdminConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => {
-                    self.unexpected_event(name, "storage batch delete result", format!("{other:?}"))
-                }
+                other => self.unexpected_event(name, "storage batch delete result", other.label()),
             },
             RemoveNodeState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -413,9 +410,7 @@ impl Operation for RemoveNodeOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => {
-                    self.unexpected_event(name, "transaction commit result", format!("{other:?}"))
-                }
+                other => self.unexpected_event(name, "transaction commit result", other.label()),
             },
             RemoveNodeState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -430,7 +425,7 @@ impl Operation for RemoveNodeOperation {
                 other => self.unexpected_event(
                     name,
                     "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
+                    other.label(),
                 ),
             },
             state @ (RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init) => {

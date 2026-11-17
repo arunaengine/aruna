@@ -86,7 +86,10 @@ pub enum PublishError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +222,7 @@ impl PublishOperation {
         let [view, accepted, config, reducer] =
             <[Option<Value>; 4]>::try_from(values).map_err(|_| PublishError::UnexpectedEvent {
                 state: "read state",
-                got: "a batch of another length".to_string(),
+                got: "a batch of another length",
             })?;
         if let Some(accepted) = accepted {
             let accepted: AcceptedRequest =
@@ -444,7 +447,7 @@ impl PublishOperation {
         }
         self.fail(PublishError::UnexpectedEvent {
             state,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 
@@ -554,6 +557,13 @@ impl Operation for PublishOperation {
 
     fn abort(&mut self) -> Effects {
         abort_effects(&mut self.txn_id)
+    }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            PublishError::Storage(StorageError::TransactionConflict)
+        )
     }
 }
 

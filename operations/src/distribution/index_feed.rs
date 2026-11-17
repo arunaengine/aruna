@@ -154,7 +154,8 @@ async fn read_states(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(FeedError::Storage(error.to_string())),
         event => Err(FeedError::Storage(format!(
-            "unexpected storage event: {event:?}"
+            "unexpected storage event: {}",
+            event.label()
         ))),
     }
 }

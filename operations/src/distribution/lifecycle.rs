@@ -185,7 +185,7 @@ async fn scan_markers(context: &DriverContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>
             Ok(rows)
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {other:?}")),
+        other => Err(format!("unexpected scan answer {}", other.label())),
     }
 }
 
@@ -202,7 +202,10 @@ pub(crate) async fn settle_marker(
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("the marker transaction did not start: {started:?}"));
+        return Err(format!(
+            "the marker transaction did not start: {}",
+            started.label()
+        ));
     };
     let read = StorageEffect::Read {
         key_space: key_space.to_string(),
@@ -215,7 +218,7 @@ pub(crate) async fn settle_marker(
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(format!("the marker was not read: {other:?}"));
+            return Err(format!("the marker was not read: {}", other.label()));
         }
     };
     if current.as_deref() != Some(seen) {
@@ -819,7 +822,10 @@ pub(super) async fn update_fence(
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await;
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-            return Err(format!("the fence transaction did not start: {started:?}"));
+            return Err(format!(
+                "the fence transaction did not start: {}",
+                started.label()
+            ));
         };
         let read = StorageEffect::Read {
             key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
@@ -832,7 +838,7 @@ pub(super) async fn update_fence(
                 storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(format!("the fence row was not read: {other:?}"));
+                return Err(format!("the fence row was not read: {}", other.label()));
             }
         };
         let mut fence = LocalFence::decode(value.as_deref()).map_err(|error| error.to_string())?;
@@ -864,7 +870,12 @@ pub(super) async fn update_fence(
         {
             Event::Storage(StorageEvent::TransactionCommitted { .. }) => return Ok(fence),
             Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => continue,
-            other => return Err(format!("the fence row was not committed: {other:?}")),
+            other => {
+                return Err(format!(
+                    "the fence row was not committed: {}",
+                    other.label()
+                ));
+            }
         }
     }
     Err("the fence row kept changing concurrently".to_string())
@@ -883,7 +894,7 @@ async fn unbind(
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("the release did not start: {started:?}"));
+        return Err(format!("the release did not start: {}", started.label()));
     };
     let key: Key = bucket.as_bytes().to_vec().into();
     let read = StorageEffect::Read {
@@ -898,7 +909,7 @@ async fn unbind(
         }
         other => {
             storage.send_storage_effect(abort).await;
-            return Err(format!("the bucket was not read: {other:?}"));
+            return Err(format!("the bucket was not read: {}", other.label()));
         }
     };
     let same = |info: &BucketInfo| {
@@ -942,7 +953,7 @@ async fn unbind(
             wake_publish(context).await;
             Ok(())
         }
-        other => Err(format!("the bucket was not released: {other:?}")),
+        other => Err(format!("the bucket was not released: {}", other.label())),
     }
 }
 

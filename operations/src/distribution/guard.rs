@@ -99,7 +99,8 @@ pub fn authority_rows(event: Event) -> Result<(Option<Value>, Option<Value>), Gu
             Err(GuardError::Unreadable(error.to_string()))
         }
         other => Err(GuardError::Unreadable(format!(
-            "unexpected answer {other:?}"
+            "unexpected answer {}",
+            other.label()
         ))),
     }
 }

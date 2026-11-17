@@ -51,7 +51,7 @@ pub enum RootsError {
     #[error("unexpected event while checking source roots in state {state}: {received}")]
     UnexpectedEvent {
         state: &'static str,
-        received: String,
+        received: &'static str,
     },
     #[error("checking source roots did not finish")]
     NotFinished,
@@ -249,7 +249,7 @@ impl RootsCheckOperation {
         let state = self.state.name();
         self.finish(Err(RootsError::UnexpectedEvent {
             state,
-            received: format!("{event:?}"),
+            received: event.label(),
         }))
     }
 }

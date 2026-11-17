@@ -175,7 +175,7 @@ async fn page(
             .map(|(key, value)| (key.to_vec(), value))
             .collect()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected purge page answer {other:?}")),
+        other => Err(format!("unexpected purge page answer {}", other.label())),
     }
 }
 
@@ -335,7 +335,7 @@ async fn clear_page(
     match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {other:?}")),
+        other => Err(format!("unexpected scan answer {}", other.label())),
     }
 }
 
@@ -410,7 +410,7 @@ async fn debit_rows(
     let start = StorageEffect::StartTransaction { read: false };
     let txn_id = match storage.send_storage_effect(start).await {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction answer {other:?}")),
+        other => return Err(format!("unexpected transaction answer {}", other.label())),
     };
     let debited = match stage_debit(context, target, deletes, left, txn_id).await {
         Ok(debited) => debited,
@@ -425,7 +425,7 @@ async fn debit_rows(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
-        other => return Err(format!("a purge page did not commit: {other:?}")),
+        other => return Err(format!("a purge page did not commit: {}", other.label())),
     }
     if debited {
         wake_publish(context).await;
@@ -453,7 +453,7 @@ async fn stage_debit(
     };
     let mut values = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
-        other => return Err(format!("unexpected read answer {other:?}")),
+        other => return Err(format!("unexpected read answer {}", other.label())),
     }
     .map(|(_, value)| value);
     let account = (values
@@ -508,7 +508,7 @@ async fn stage_debit(
             Event::Storage(
                 StorageEvent::BatchDeleteResult { .. } | StorageEvent::BatchWriteResult { .. },
             ) => {}
-            other => return Err(format!("unexpected purge answer {other:?}")),
+            other => return Err(format!("unexpected purge answer {}", other.label())),
         }
     }
     Ok(debited)
@@ -566,7 +566,10 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("a cache entry was not dropped: {started:?}"));
+        return Err(format!(
+            "a cache entry was not dropped: {}",
+            started.label()
+        ));
     };
     let abort = || StorageEffect::AbortTransaction { txn_id };
     let read = StorageEffect::BatchRead {
@@ -583,7 +586,7 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
         Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => values,
         other => {
             storage.send_storage_effect(abort()).await;
-            return Err(format!("a cache entry was not read: {other:?}"));
+            return Err(format!("a cache entry was not read: {}", other.label()));
         }
     };
     let mut values = values.into_iter().map(|(_, value)| value);
@@ -708,7 +711,7 @@ pub(super) async fn clear_prefix(
                 values.into_iter().map(|(key, _)| key).collect()
             }
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected scan answer {other:?}")),
+            other => return Err(format!("unexpected scan answer {}", other.label())),
         };
         if keys.is_empty() {
             return Ok(());
@@ -734,7 +737,7 @@ pub(super) async fn read(
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected read answer {other:?}")),
+        other => Err(format!("unexpected read answer {}", other.label())),
     }
 }
 
@@ -753,7 +756,7 @@ async fn write(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected write answer {other:?}")),
+        other => Err(format!("unexpected write answer {}", other.label())),
     }
 }
 
@@ -771,7 +774,7 @@ pub(super) async fn batch_delete(
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected delete answer {other:?}")),
+        other => Err(format!("unexpected delete answer {}", other.label())),
     }
 }
 

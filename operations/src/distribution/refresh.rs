@@ -526,7 +526,10 @@ impl Operation for RefreshRangesOperation {
                 self.busy |= self.walk.take().is_some_and(|walk| !walk.walked.finished);
                 self.next_range()
             }
-            (state, event) => self.fail(format!("unexpected event in state {state:?}: {event:?}")),
+            (state, event) => self.fail(format!(
+                "unexpected event in state {state:?}: {}",
+                event.label()
+            )),
         }
     }
 

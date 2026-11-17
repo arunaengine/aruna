@@ -127,7 +127,7 @@ fn change_of(key: String, head: Option<HeadEntry>) -> KeyChange {
 fn storage_error(event: Event) -> FeedError {
     match event {
         Event::Storage(StorageEvent::Error { error }) => FeedError::Storage(error.to_string()),
-        event => FeedError::Storage(format!("unexpected storage event: {event:?}")),
+        event => FeedError::Storage(format!("unexpected storage event: {}", event.label())),
     }
 }
 
@@ -1476,7 +1476,7 @@ impl Operation for FeedPassOperation {
     fn step(&mut self, event: Event) -> Effects {
         let Some(mut walk) = self.walk.take() else {
             self.done = true;
-            self.refused = Some(format!("{event:?}"));
+            self.refused = Some(event.label().to_string());
             return smallvec![];
         };
         let effects = match &mut walk {

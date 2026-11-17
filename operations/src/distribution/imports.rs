@@ -348,7 +348,7 @@ async fn write_row(context: &DriverContext, key: Key, value: Vec<u8>) -> Result<
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("handed over imports not kept: {other:?}")),
+        other => Err(format!("handed over imports not kept: {}", other.label())),
     }
 }
 
@@ -435,7 +435,10 @@ async fn delete(context: &DriverContext, key: Key) -> Result<(), String> {
     };
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        other => Err(format!("handed over imports not dropped: {other:?}")),
+        other => Err(format!(
+            "handed over imports not dropped: {}",
+            other.label()
+        )),
     }
 }
 
@@ -451,7 +454,7 @@ async fn read_value(
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("unexpected read answer {other:?}")),
+        other => Err(format!("unexpected read answer {}", other.label())),
     }
 }
 
@@ -474,7 +477,7 @@ async fn page(
             values,
             next_start_after,
         }) => Ok((values, next_start_after)),
-        other => Err(format!("unexpected page answer {other:?}")),
+        other => Err(format!("unexpected page answer {}", other.label())),
     }
 }
 

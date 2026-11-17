@@ -229,7 +229,7 @@ async fn accounts(
             next_start_after.is_some(),
         )),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected answer {other:?}")),
+        other => Err(format!("unexpected answer {}", other.label())),
     }
 }
 

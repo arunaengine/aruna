@@ -171,7 +171,7 @@ async fn scan_sets(
                 next_start_after,
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {other:?}")),
+            other => return Err(format!("unexpected storage answer {}", other.label())),
         };
         for (_, value) in values {
             seen += 1;
@@ -217,7 +217,7 @@ pub async fn indexed_key(
     let value = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {other:?}")),
+        other => return Err(format!("unexpected storage answer {}", other.label())),
     };
     let Some(value) = value else {
         return Ok(None);
@@ -366,7 +366,7 @@ pub async fn content_versions(
     let values = match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage answer {other:?}")),
+        other => return Err(format!("unexpected storage answer {}", other.label())),
     };
     let more = values.len() > limit;
     let mut versions = Vec::new();

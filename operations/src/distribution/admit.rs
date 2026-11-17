@@ -72,7 +72,10 @@ pub enum AdmitError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("usage counters are being rebuilt; new ranges are admitted once they are complete")]
     UsageIncomplete,
     #[error(
@@ -380,7 +383,7 @@ impl AdmitOperation {
         }
         self.fail(AdmitError::UnexpectedEvent {
             state,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 }

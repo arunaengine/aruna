@@ -96,7 +96,9 @@ async fn batch_read(
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into()),
+        other => {
+            Err(StorageError::ReadError(format!("unexpected answer {}", other.label())).into())
+        }
     }
 }
 
@@ -135,7 +137,9 @@ pub async fn held_ranges(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
+            return Err(
+                StorageError::ReadError(format!("unexpected answer {}", other.label())).into(),
+            );
         }
     };
     let rows = charged_ranges(context, &binding, &snapshot, txn_id).await;
@@ -244,7 +248,9 @@ pub async fn replica_share(
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
+            return Err(
+                StorageError::ReadError(format!("unexpected answer {}", other.label())).into(),
+            );
         }
     };
     let share = binding_share(context, &binding, txn_id).await;
@@ -351,7 +357,11 @@ async fn scan_in(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(StorageError::ReadError(format!("unexpected answer {other:?}")).into());
+                return Err(StorageError::ReadError(format!(
+                    "unexpected answer {}",
+                    other.label()
+                ))
+                .into());
             }
         };
         rows.extend(values);

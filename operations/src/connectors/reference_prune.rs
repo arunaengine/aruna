@@ -113,7 +113,7 @@ impl Operation for RestorePruneOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => self.finish(Err(error.into())),
             (state, event) => self.finish(Err(PruneError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label(),
             })),
         }
     }
@@ -222,7 +222,7 @@ impl Operation for PruneReferencesOperation {
             (PruneState::Page, event) => self.step_page(event),
             (state, event) => self.fail(PruneError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label(),
             }),
         }
     }
@@ -250,7 +250,10 @@ pub enum PruneError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error("unexpected event in state {state:?}: {received}")]
-    UnexpectedEvent { state: PruneState, received: String },
+    UnexpectedEvent {
+        state: PruneState,
+        received: &'static str,
+    },
     #[error("connector reference pruning did not finish")]
     NotFinished,
     #[error("connector reference pruning was not scheduled: {0}")]
@@ -412,7 +415,7 @@ impl PrunePageOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(PruneError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label(),
             }),
         }
     }

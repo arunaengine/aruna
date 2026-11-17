@@ -99,7 +99,7 @@ pub enum CountsError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error("unexpected event while counting sets: {0}")]
-    UnexpectedEvent(String),
+    UnexpectedEvent(&'static str),
     #[error("counting sets did not finish")]
     NotFinished,
 }
@@ -182,7 +182,7 @@ impl Operation for SetCountsOperation {
             (State::Page, Event::Storage(StorageEvent::Error { error })) => {
                 self.finish(Err(error.into()))
             }
-            (_, event) => self.finish(Err(CountsError::UnexpectedEvent(format!("{event:?}")))),
+            (_, event) => self.finish(Err(CountsError::UnexpectedEvent(event.label()))),
         }
     }
 
