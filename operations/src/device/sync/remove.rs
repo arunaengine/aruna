@@ -102,7 +102,9 @@ impl Operation for RemoveEntryOperation {
                     other => {
                         return remove_failed(
                             self,
-                            ActionError::Storage(StorageError::WriteError(format!("{other:?}"))),
+                            ActionError::Storage(StorageError::WriteError(
+                                Event::LocalFile(other).label().to_string(),
+                            )),
                         );
                     }
                 };

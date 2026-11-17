@@ -297,7 +297,10 @@ impl Operation for MaterializeEntryOperation {
                     LocalFileEvent::Error { message } => {
                         (MaterializeOutcome::Failed { message }, None)
                     }
-                    other => return unexpected(self, format!("{other:?}")),
+                    other => {
+                        let label = Event::LocalFile(other).label();
+                        return unexpected(self, label.to_string());
+                    }
                 };
                 self.rows = match self.rows_for(&outcome, written) {
                     Ok(rows) => rows,
