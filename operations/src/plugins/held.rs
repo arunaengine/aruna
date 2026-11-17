@@ -15,7 +15,8 @@ use aruna_plugins::broker::{ErrorKind, HostError};
 use ulid::Ulid;
 
 use super::artifacts::managers;
-use super::release::{ReleaseKeys, release};
+use super::bound::ReleaseKeys;
+use super::release::release;
 use super::unavailable;
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::is_management;

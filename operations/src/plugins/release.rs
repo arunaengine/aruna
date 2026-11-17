@@ -4,17 +4,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
 use aruna_core::plugins::{Refusal, ReleaseError, ReleaseRequest, Released};
+use aruna_core::realm_vault::{RealmSealKey, RealmVaultKey};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secrets::{
     Delivery, SecretConsumer, SecretName, SecretScope, UseRequest, check_use,
 };
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, SecretAudit, SecretUse};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use ulid::Ulid;
 use url::Url;
 
 use super::account::{owned, read_user};
@@ -219,16 +220,18 @@ impl Audit<'_> {
     }
 }
 
-/// The management side of a release request from an infrastructure peer.
+/// The management side of a release request from an infrastructure peer, with the realm keys a
+/// management node opens group and realm secrets with.
 pub(crate) async fn serve_release(
     ctx: &DriverContext,
-    keys: ReleaseKeys,
+    (seal, vault): (Option<Arc<RealmSealKey>>, Option<Arc<RealmVaultKey>>),
     peer: NodeId,
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let local = super::artifacts::local_config(ctx).await;
     let local = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
     let (config, local) = local;
+    let keys = ReleaseKeys { seal, vault };
     release(ctx, &keys, (&config, local, peer), &request).await
 }
 

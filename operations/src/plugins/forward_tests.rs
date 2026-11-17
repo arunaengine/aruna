@@ -6,7 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;

@@ -18,8 +18,7 @@ use aruna_core::metadata::{
     MetadataEventPayload, MetadataEventRecord,
 };
 use aruna_core::plugin_runs::{
-    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, SourceKind,
-    gap_key,
+    Decisions, EventBatch, ForwardRow, GapReason, GapRow, Outcome, SEND_EXPIRY_MS, gap_key,
 };
 use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, materialization_status_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;

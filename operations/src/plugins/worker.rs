@@ -34,6 +34,7 @@ use ulid::Ulid;
 use super::account::prerequisites_held;
 use super::artifacts::fetch_artifact;
 use super::artifacts::local_config;
+use super::bound::ReleaseKeys;
 use super::broker::{RunBroker, absent};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
@@ -61,7 +62,6 @@ use super::matcher::match_page;
 use super::outbound::Outbound;
 use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
-use super::release::ReleaseKeys;
 use super::replay::{
     COVERAGE_ROW, CoverageRow, StartReplay, growth, replay_page, replay_rows, replay_scan, row_key,
 };

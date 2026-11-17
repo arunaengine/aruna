@@ -8,9 +8,7 @@ use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
 use aruna_core::plugin_runs::GapReason;
 
 use super::decide::{GapCount, Verdict, WaitingRow, seen_row};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, StoreError, Turn, decode, done, scan_rows,
-};
+use super::rows::{Answer, Ask, Plan, Row, StoreError, Turn, done};
 use super::runs::{Admission, RunError};
 use aruna_core::plugin_runs::Outcome;
 

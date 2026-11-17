@@ -22,7 +22,7 @@ use aruna_plugins::trigger::{Trigger, TriggerKind};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::bound::{check_node_binding, delivery_clash, select, vault_kind};
+use super::bound::{ReleaseKeys, check_node_binding, delivery_clash, select, vault_kind};
 use super::finished::retry_run;
 use super::held::{HeldSecrets, ask_release};
 use super::hooks::{AdmitHook, DROPPED, HookError};
@@ -30,7 +30,6 @@ use super::install::{InstallError, check_admin, pick_version, read_config, read_
 use super::matcher::event_trigger;
 use super::rate::take_hook;
 use super::receiver::lost_reason;
-use super::release::ReleaseKeys;
 use super::rows::{
     Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row as row_of, values,
 };

@@ -16,6 +16,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::store::Txn;
 use crate::secrets::SecretChange;
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use ulid::Ulid;
 
 fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {
     ReleaseRequest {

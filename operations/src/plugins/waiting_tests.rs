@@ -14,6 +14,7 @@ use super::*;
 use crate::plugins::decide::{SeenRow, seen_key};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
+use crate::plugins::rows::decode;
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;

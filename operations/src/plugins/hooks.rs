@@ -8,7 +8,7 @@ use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
 use aruna_core::plugin_runs::{PluginRun, hook_key, hook_time_key};
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, encode, row, values};
+use super::rows::{Answer, Ask, Plan, Row, Turn, done, encode, row, values};
 use super::runs::{Admission, RunError};
 
 /// Headers removed before a request is stored: hop-by-hop ones and the relay mark. The check
