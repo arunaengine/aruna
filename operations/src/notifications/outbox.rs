@@ -7,10 +7,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
@@ -25,6 +26,7 @@ use tracing::warn;
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::placement::resolve_inbox_holder;
+use crate::notifications::unexpected;
 
 pub(crate) const OUTBOX_BATCH_SIZE: usize = 512;
 pub(crate) const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -589,17 +591,8 @@ impl EffectOperation for DrainOutboxOperation {
 #[derive(Debug, PartialEq)]
 pub struct RestoreOutboxOperation {
     shorten: Option<Duration>,
-    state: RestoreState,
-}
-
-#[derive(Debug, Default, PartialEq)]
-enum RestoreState {
-    #[default]
-    Init,
-    Scan,
-    Arm,
-    Done(bool),
-    Failed(DrainError),
+    /// Whether the scan found rows and the timer is being armed.
+    arming: bool,
 }
 
 impl RestoreOutboxOperation {
@@ -607,7 +600,7 @@ impl RestoreOutboxOperation {
     pub fn shorten(after: Duration) -> Self {
         Self {
             shorten: Some(after),
-            state: RestoreState::Init,
+            arming: false,
         }
     }
 
@@ -615,74 +608,40 @@ impl RestoreOutboxOperation {
     pub fn probe() -> Self {
         Self {
             shorten: None,
-            state: RestoreState::Init,
+            arming: false,
         }
     }
 }
 
-impl EffectOperation for RestoreOutboxOperation {
+impl Operation for RestoreOutboxOperation {
     type Output = bool;
-    type Error = DrainError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RestoreState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(IoCall::Page {
+            space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
             limit: 1,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (RestoreState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                match (values.is_empty(), self.shorten) {
-                    (false, Some(after)) => {
-                        self.state = RestoreState::Arm;
-                        smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                            key: TaskKey::DrainNotificationOutbox,
-                            after,
-                        })]
-                    }
-                    (empty, _) => {
-                        self.state = RestoreState::Done(!empty);
-                        smallvec![]
-                    }
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        match (self.arming, result) {
+            (false, IoResult::Page { rows, .. }) => match (rows.is_empty(), self.shorten) {
+                (false, Some(after)) => {
+                    self.arming = true;
+                    let key = TaskKey::DrainNotificationOutbox;
+                    let arm = TaskEffect::ShortenTimer { key, after };
+                    Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
                 }
+                (empty, _) => Ok(Next::Done(!empty)),
+            },
+            (true, IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. }))) => {
+                Ok(Next::Done(true))
             }
-            (RestoreState::Arm, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = RestoreState::Done(true);
-                smallvec![]
-            }
-            (state, event) => {
-                self.state = RestoreState::Failed(DrainError::UnexpectedEvent {
-                    state: match state {
-                        RestoreState::Arm => "restore arm",
-                        _ => "restore scan",
-                    },
-                    got: format!("{event:?}"),
-                });
-                smallvec![]
-            }
+            (_, other) => Err(unexpected("an outbox page or a timer", &other)),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RestoreState::Done(_) | RestoreState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            RestoreState::Done(pending) => Ok(pending),
-            RestoreState::Failed(error) => Err(error),
-            _ => Err(DrainError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -975,58 +934,38 @@ mod state_machine_tests {
     #[test]
     fn unfinished_drain_fails() {
         rejects_finalize(started());
-        rejects_finalize(RestoreOutboxOperation::probe());
     }
 
     #[test]
     fn restore_arms_pending() {
         let row = (Key::from(vec![1]), Value::from(vec![1]));
-        let arm = Effect::Task(TaskEffect::ShortenTimer {
+        let page = |rows| IoResult::Page { rows, next: None };
+        let arm = TaskEffect::ShortenTimer {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        };
+        let mut shorten = RestoreOutboxOperation::shorten(Duration::ZERO);
+        assert!(matches!(
+            shorten.first(),
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
+        ));
+        assert_eq!(
+            shorten.next(page(vec![row.clone()])),
+            Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
+        );
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::DrainNotificationOutbox,
             after: Duration::ZERO,
         });
-        let mut shorten = RestoreOutboxOperation::shorten(Duration::ZERO);
-        check_trace(
-            &mut shorten,
-            &[Effect::Storage(StorageEffect::Iter {
-                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start: None,
-                limit: 1,
-                txn_id: None,
-            })],
-            vec![
-                (
-                    Event::Storage(StorageEvent::IterResult {
-                        values: vec![row],
-                        next_start_after: None,
-                    }),
-                    vec![arm],
-                ),
-                (
-                    Event::Task(TaskEvent::TimerScheduled {
-                        key: TaskKey::DrainNotificationOutbox,
-                        after: Duration::ZERO,
-                    }),
-                    vec![],
-                ),
-            ],
+        assert_eq!(
+            shorten.next(IoResult::Event(scheduled)),
+            Ok(Next::Done(true))
         );
-        assert_eq!(shorten.finalize(), Ok(true));
 
         let mut empty = RestoreOutboxOperation::shorten(Duration::ZERO);
-        empty.start();
-        empty.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        assert_eq!(empty.finalize(), Ok(false));
-
-        let mut failed = RestoreOutboxOperation::probe();
-        failed.start();
-        failed.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert!(failed.finalize().is_err());
+        assert_eq!(empty.next(page(Vec::new())), Ok(Next::Done(false)));
+        let mut probe = RestoreOutboxOperation::probe();
+        assert_eq!(probe.next(page(vec![row])), Ok(Next::Done(true)));
+        assert!(probe.next(IoResult::Done).is_err());
     }
 }
