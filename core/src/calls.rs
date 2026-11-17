@@ -61,6 +61,60 @@ pub enum IoResult {
     Woke,
 }
 
+impl IoResult {
+    /// The variant name, for an unexpected-result error.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Values(_) => "IoResult::Values",
+            Self::Page { .. } => "IoResult::Page",
+            Self::Done => "IoResult::Done",
+            Self::Event(_) => "IoResult::Event",
+            Self::Group(_) => "IoResult::Group",
+            Self::Woke => "IoResult::Woke",
+        }
+    }
+
+    /// The values of a read, in call order.
+    pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
+        match self {
+            Self::Values(values) => Ok(values),
+            other => Err(unexpected("IoResult::Values", other.label())),
+        }
+    }
+
+    /// The value of a read of one row.
+    pub fn value(self) -> Result<Option<Value>, IoError> {
+        match self.values()?.as_mut_slice() {
+            [value] => Ok(value.take()),
+            _ => Err(unexpected("one value", "another number of values")),
+        }
+    }
+
+    /// The rows of a page and the key to continue after.
+    pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+        match self {
+            Self::Page { rows, next } => Ok((rows, next)),
+            other => Err(unexpected("IoResult::Page", other.label())),
+        }
+    }
+
+    /// The end of a write, delete or sync.
+    pub fn done(self) -> Result<(), IoError> {
+        match self {
+            Self::Done => Ok(()),
+            other => Err(unexpected("IoResult::Done", other.label())),
+        }
+    }
+
+    /// The event that answered an effect or a child.
+    pub fn event(self) -> Result<Event, IoError> {
+        match self {
+            Self::Event(event) => Ok(event),
+            other => Err(unexpected("IoResult::Event", other.label())),
+        }
+    }
+}
+
 /// What an operation does next.
 #[derive(Debug, PartialEq)]
 pub enum Next<T> {
@@ -88,6 +142,18 @@ pub enum IoError {
     Hung { effect: &'static str },
     #[error("the operation did not finish")]
     Unfinished,
+}
+
+impl IoError {
+    /// The storage failure this error is, a lost conflict as `TransactionConflict`; any other
+    /// error as it is.
+    pub fn into_storage(self) -> Result<StorageError, IoError> {
+        match self {
+            Self::Conflict => Ok(StorageError::TransactionConflict),
+            Self::Storage(error) => Ok(error),
+            other => Err(other),
+        }
+    }
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
