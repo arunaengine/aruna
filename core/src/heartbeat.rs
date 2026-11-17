@@ -143,7 +143,7 @@ pub struct HeldHeartbeat {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeartbeatEffect {
     /// Keeps this node's own heartbeat and answers the sync peers of the realm.
-    Record(NodeHeartbeat),
+    Record(Box<NodeHeartbeat>),
     /// Sends one length-prefixed heartbeat frame to `peer`; no answer is read.
     Push {
         peer: NodeId,
