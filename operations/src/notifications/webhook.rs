@@ -24,8 +24,6 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
-use crate::jobs::submit::SubmitJobSpec;
 use crate::notifications::email::{job_error, no_transport};
 use crate::notifications::send::SendOperation;
 use crate::notifications::settings::{
@@ -133,55 +131,6 @@ fn webhook_bytes(
     subscription
         .to_bytes()
         .map_err(|error| SettingError::Build(error.to_string()))
-}
-
-/// Queues one delivery job per held share upload notification, whatever the settings say now;
-/// the job decides from the setting when it runs. The notification id deduplicates; a failure is returned
-/// so the sender delivers again.
-pub async fn enqueue_webhooks(
-    context: &DriverContext,
-    owner_node_id: NodeId,
-    records: &[NotificationRecord],
-) -> Result<(), String> {
-    for record in records {
-        if !matches!(record.kind, NotificationKind::ShareUpload { .. }) {
-            continue;
-        }
-        let dedup_key = user_dedup_key(
-            record.recipient,
-            &format!("webhook/{}", record.notification_id),
-        );
-        let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
-        if queued
-            .map_err(|error| format!("webhook delivery lookup: {error}"))?
-            .is_some()
-        {
-            continue;
-        }
-        let realm_id = record.recipient.realm_id;
-        let submitted = async {
-            let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
-            let spec = SubmitJobSpec {
-                payload: JobPayload::WebhookDelivery(WebhookDeliverySpec {
-                    subscription_id: Ulid::nil(),
-                    notification: record.clone(),
-                }),
-                created_by: record.recipient,
-                owner_node_id,
-                dedup_key: Some(dedup_key.clone()),
-                now_ms: unix_timestamp_millis(),
-                retention_ms: crate::jobs::JOB_RETENTION_MS,
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-                active_cap: None,
-            };
-            submit_local_job(context, spec, job_id).await
-        };
-        submitted
-            .await
-            .map_err(|error| format!("webhook delivery queue: {error}"))?;
-    }
-    Ok(())
 }
 
 /// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer

@@ -37,8 +37,6 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
-use crate::jobs::submit::SubmitJobSpec;
 use crate::notifications::send::{SendError, SendOperation};
 use crate::notifications::settings::{
     BACKOFF_START_MS, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
@@ -205,62 +203,6 @@ async fn verified(ctx: &DriverContext, owner: UserId, address: &str) -> Result<b
     };
     let hash = user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned());
     Ok(hash.is_some_and(|hash| hash == email_hash(address)))
-}
-
-/// Queues one email job per held notice of an email category, whatever the settings say now;
-/// the job decides from the setting when it runs. The notification id deduplicates; a failure
-/// is returned so the sender delivers again.
-pub async fn enqueue_emails(
-    context: &DriverContext,
-    owner_node_id: NodeId,
-    records: &[NotificationRecord],
-) -> Result<(), String> {
-    // A realm without a profile queues nothing; a read error queues, and the job retries.
-    if let Some(record) = records.first() {
-        let config = drive(GetConfigOperation::new(record.recipient.realm_id), context).await;
-        if config.is_ok_and(|config| config.email.is_none()) {
-            return Ok(());
-        }
-    }
-    for record in records {
-        if !EMAIL_CATEGORIES.contains(&record.kind.category()) {
-            continue;
-        }
-        let dedup_key = user_dedup_key(
-            record.recipient,
-            &format!("email/{}", record.notification_id),
-        );
-        let queued = find_dedup_job(context, record.recipient, &dedup_key).await;
-        if queued
-            .map_err(|error| format!("email delivery lookup: {error}"))?
-            .is_some()
-        {
-            continue;
-        }
-        let realm_id = record.recipient.realm_id;
-        let submitted = async {
-            let job_id = mint_local_job(context, realm_id, owner_node_id, Some(&dedup_key)).await?;
-            let spec = SubmitJobSpec {
-                payload: JobPayload::EmailDelivery(EmailDeliverySpec {
-                    preference_id: Ulid::nil(),
-                    notification: record.clone(),
-                }),
-                created_by: record.recipient,
-                owner_node_id,
-                dedup_key: Some(dedup_key.clone()),
-                now_ms: unix_timestamp_millis(),
-                retention_ms: crate::jobs::JOB_RETENTION_MS,
-                workspace_mode: WorkspaceMode::default(),
-                workspace_bucket: None,
-                active_cap: None,
-            };
-            submit_local_job(context, spec, job_id).await
-        };
-        submitted
-            .await
-            .map_err(|error| format!("email delivery queue: {error}"))?;
-    }
-    Ok(())
 }
 
 /// Sends one notification email when this node's current setting has email on for its
