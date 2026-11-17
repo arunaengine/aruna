@@ -468,7 +468,7 @@ async fn read(
 }
 
 /// Puts the root's settings back into a version read with a compact binding.
-pub async fn hydrate_version(
+async fn hydrate_version(
     context: &DriverContext,
     version: BlobVersion,
 ) -> Result<BlobVersion, String> {
