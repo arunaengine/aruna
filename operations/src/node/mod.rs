@@ -12,3 +12,4 @@ mod rebuild_counts;
 pub mod startup;
 pub mod usage_publish;
 pub mod usage_rebuild;
+pub mod usage_refresh;
