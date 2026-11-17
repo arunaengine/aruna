@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
+};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::Event;
@@ -33,7 +36,11 @@ use smallvec::smallvec;
 use std::time::Duration;
 use ulid::Ulid;
 
+use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::storage_read::{parse_storage_iter, parse_storage_read};
+use aruna_core::storage_entries::lifecycle_revision_change;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::record::PlacementRef;
 
 pub use crate::storage_read::StorageReadError;
 
@@ -349,10 +356,92 @@ pub(crate) fn schedule_materialization() -> Effect {
     })
 }
 
+/// The document's registry row, published on the registry class's own
+/// everywhere-bound topic rather than the replica-capped bucket topic, so every
+/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
+pub(crate) fn registry_outbox_record(
+    event: &MetadataEventRecord,
+    realm_config: Option<&RealmConfigDocument>,
+    allow_genesis: bool,
+) -> Option<DocumentOutboxRecord> {
+    let record = &event.record;
+    let config = realm_config?;
+    let placement = registry_placement(config, record);
+    if placement == PlacementRef::NIL {
+        return None;
+    }
+    let target = DocumentTarget::MetadataRegistry {
+        group_id: record.group_id,
+        document_id: record.document_id,
+    };
+    let peers = resolve_shard_holders(config, &placement);
+    if peers.is_empty() {
+        return None;
+    }
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id: event.event_id,
+            actor: event.node_id,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    };
+    Some(DocumentOutboxRecord {
+        outbox_id: event.event_id,
+        node_id: event.node_id,
+        target,
+        peers,
+        event: DocumentOutboxEvent::Upsert {
+            bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
+            change,
+        },
+        placement,
+        generation: 0,
+        updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
+    })
+}
+
+pub(crate) fn create_outbox_record(
+    event: &MetadataEventRecord,
+    message: Option<&str>,
+    realm_config: Option<&RealmConfigDocument>,
+    allow_genesis: bool,
+) -> DocumentOutboxRecord {
+    let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), message.map(str::to_owned));
+    let target = DocumentTarget::MetadataDocumentLifecycle {
+        document_id: event.record.document_id,
+    };
+    // The bucket is the one the create stamped; peers are its live holders, so a publish after
+    // a rebalance targets the current holder set and not the event-time one.
+    let placement = event.record.placement;
+    let peers = realm_config
+        .map(|config| resolve_shard_holders(config, &placement))
+        .unwrap_or_default();
+    let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
+    DocumentOutboxRecord {
+        outbox_id: event.event_id,
+        node_id: event.node_id,
+        target,
+        peers,
+        event: DocumentOutboxEvent::Upsert {
+            bytes: postcard::to_allocvec(&lifecycle)
+                .expect("metadata document lifecycle event serializes"),
+            change,
+        },
+        placement,
+        generation: 0,
+        updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::metadata::projector::create_outbox_record;
     use crate::sync::outbox_record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
     use aruna_core::keyspaces::{

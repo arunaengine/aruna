@@ -40,10 +40,11 @@ use crate::metadata::profile::validation::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
     submission_profile_tag,
 };
-use crate::metadata::projector::{create_outbox_record, registry_outbox_record};
-use crate::metadata::repository::schedule_materialization;
 use crate::metadata::repository::{
     StorageReadError, event_projection_entries, parse_registry_read, read_registry_effect,
+};
+use crate::metadata::repository::{
+    create_outbox_record, registry_outbox_record, schedule_materialization,
 };
 use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
 use crate::sync::shard_placement::sort_node_ids;

@@ -7,10 +7,7 @@ use std::time::Duration;
 
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
-use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
-    DocumentSyncRevision, DocumentTarget,
-};
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -26,11 +23,10 @@ use aruna_core::metadata::{
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
-    event_log_key, graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
-    pending_projection_key, pending_projection_target, registry_delete_entries,
+    event_log_key, graph_lifecycle_key, materialization_job_entry, pending_projection_key,
+    pending_projection_target, registry_delete_entries,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -47,10 +43,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::repository::schedule_materialization;
 use crate::metadata::repository::{
-    StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
-    parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
+    StorageReadError, create_materialization_entries, create_outbox_entries, create_outbox_record,
+    parse_lifecycle_read, parse_status_read, read_document_registry, read_lifecycle_effect,
+    read_status_effect, registry_outbox_record, schedule_materialization,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::schedule_drain_effect;
@@ -1103,89 +1099,6 @@ async fn read_realm_config(
     }
 }
 
-/// The document's registry row, published on the registry class's own
-/// everywhere-bound topic rather than the replica-capped bucket topic, so every
-/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
-pub(crate) fn registry_outbox_record(
-    event: &MetadataEventRecord,
-    realm_config: Option<&RealmConfigDocument>,
-    allow_genesis: bool,
-) -> Option<DocumentOutboxRecord> {
-    let record = &event.record;
-    let config = realm_config?;
-    let placement = registry_placement(config, record);
-    if placement == PlacementRef::NIL {
-        return None;
-    }
-    let target = DocumentTarget::MetadataRegistry {
-        group_id: record.group_id,
-        document_id: record.document_id,
-    };
-    let peers = resolve_shard_holders(config, &placement);
-    if peers.is_empty() {
-        return None;
-    }
-    let change = DocumentChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: record.updated_at_ms,
-            event_id: event.event_id,
-            actor: event.node_id,
-            updated_at_ms: record.updated_at_ms,
-        },
-        kind: DocumentChangeKind::Upsert,
-        placement,
-    };
-    Some(DocumentOutboxRecord {
-        outbox_id: event.event_id,
-        node_id: event.node_id,
-        target,
-        peers,
-        event: DocumentOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
-            change,
-        },
-        placement,
-        generation: 0,
-        updated_at: event.occurred_at_ms / 1_000,
-        allow_genesis,
-    })
-}
-
-pub(crate) fn create_outbox_record(
-    event: &MetadataEventRecord,
-    message: Option<&str>,
-    realm_config: Option<&RealmConfigDocument>,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), message.map(str::to_owned));
-    let target = DocumentTarget::MetadataDocumentLifecycle {
-        document_id: event.record.document_id,
-    };
-    // The bucket is the one the create stamped; peers are its live holders, so a publish after
-    // a rebalance targets the current holder set and not the event-time one.
-    let placement = event.record.placement;
-    let peers = realm_config
-        .map(|config| resolve_shard_holders(config, &placement))
-        .unwrap_or_default();
-    let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
-    DocumentOutboxRecord {
-        outbox_id: event.event_id,
-        node_id: event.node_id,
-        target,
-        peers,
-        event: DocumentOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(&lifecycle)
-                .expect("metadata document lifecycle event serializes"),
-            change,
-        },
-        placement,
-        generation: 0,
-        updated_at: event.occurred_at_ms / 1_000,
-        allow_genesis,
-    }
-}
-
 pub(crate) async fn dot_applied(
     context: &DriverContext,
     graph_iri: &str,
@@ -1338,6 +1251,7 @@ async fn schedule_materialization_drain(
 mod tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::document::DocumentOutboxRecord;
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
