@@ -206,12 +206,13 @@ mod state_machine_tests {
 
     #[test]
     fn webhook_post_signed() {
-        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
+        let spec = spec();
+        let mut send = SendOperation::webhook(&spec, "https://hooks.example.org/a", &[9; 32], 7);
         let effects = send.start();
         let [Effect::Outbound(OutboundEffect::Post(post))] = effects.as_slice() else {
             panic!("one post: {effects:?}");
         };
-        let body = serde_json::to_vec(&spec().body().unwrap()).unwrap();
+        let body = serde_json::to_vec(&spec.body().unwrap()).unwrap();
         assert_eq!(post.body.as_ref(), body.as_slice());
         assert_eq!(post.url, "https://hooks.example.org/a");
         assert_eq!(post.deadline, DELIVERY_DEADLINE);

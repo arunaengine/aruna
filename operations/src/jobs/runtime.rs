@@ -1283,11 +1283,7 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (
-                CancellationToken::new(),
-                RangeTurns::default(),
-                Default::default(),
-            ),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1332,11 +1328,7 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (
-                CancellationToken::new(),
-                RangeTurns::default(),
-                Default::default(),
-            ),
+            (CancellationToken::new(), RangeTurns::default()),
         )
         .await;
 
@@ -1364,11 +1356,7 @@ mod tests {
             claimed,
             stale_token,
             (cancel.clone(), None),
-            (
-                CancellationToken::new(),
-                RangeTurns::default(),
-                Default::default(),
-            ),
+            (CancellationToken::new(), RangeTurns::default()),
         ));
         for _ in 0..100 {
             if marker.exists() {

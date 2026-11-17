@@ -647,7 +647,6 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::tests::notifications::{context, record, temp_storage, user};
-    use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;

@@ -912,15 +912,6 @@ mod tests {
         let key = |seed: u8| vec![seed; 4].into();
         assert!(!key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(1)).await);
         assert!(key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(2)).await);
-
-        // A deletion renews a time the sweep saw expired: the renewed time stays.
-        let renewed = StorageEffect::BatchWrite {
-            writes: vec![row(3, now)],
-            txn_id: None,
-        };
-        storage.send_storage_effect(renewed).await;
-        delete_expired(&storage, vec![key(3)], now).await.unwrap();
-        assert!(key_exists(&storage, NOTIFICATION_CUTOFF_KEYSPACE, key(3)).await);
     }
 
     #[tokio::test]
@@ -1369,6 +1360,22 @@ mod state_machine_tests {
             })]
         );
         assert!(operation.finalize().is_err());
+    }
+
+    // A deletion that renewed a time the sweep saw expired keeps it.
+    #[test]
+    fn renewed_cutoff_kept() {
+        let mut operation = in_cutoff_read();
+        let renewed = Value::from(NOW_MS.to_be_bytes().to_vec());
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Key::from(vec![1]), Some(renewed))],
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: TxnId::from_parts(7, 7)
+            })]
+        );
     }
 
     #[test]

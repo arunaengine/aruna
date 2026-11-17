@@ -14,6 +14,7 @@ use crate::tests::staging::setup_driver_context;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::outbound::{MailRequest, OutboundEffect, OutboundError, OutboundEvent};
+use aruna_core::structs::execution::email::SmtpTls;
 use aruna_core::structs::execution::job::user_dedup_key;
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::NotificationRecord;
