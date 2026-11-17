@@ -138,6 +138,34 @@ fn effects_join_transaction() {
 }
 
 #[test]
+fn snapshot_joins_reads() {
+    // In a read snapshot only passed-through reads join; a delete keeps running on its own.
+    let delete = |txn_id| StorageEffect::Delete {
+        key_space: "rows".to_string(),
+        key: key("b"),
+        txn_id,
+    };
+    let read = |txn_id| StorageEffect::Read {
+        key_space: "rows".to_string(),
+        key: key("a"),
+        txn_id,
+    };
+    let calls = vec![
+        IoCall::Effect(Box::new(storage(delete(None)))),
+        IoCall::Effect(Box::new(storage(read(None)))),
+    ];
+    let mut procedure = script(calls);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    assert_eq!(operation.start().as_slice(), &[storage(delete(None))]);
+    let deleted = StorageEvent::DeleteResult { key: key("b") };
+    let start = storage(StorageEffect::StartTransaction { read: true });
+    assert_eq!(operation.step(Event::Storage(deleted)).as_slice(), &[start]);
+    let effects = operation.step(started());
+    assert_eq!(effects.as_slice(), &[storage(read(Some(txn())))]);
+}
+
+#[test]
 fn sends_after_commit() {
     // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
     let write = vec![("rows".to_string(), key("a"), key("1"))];
