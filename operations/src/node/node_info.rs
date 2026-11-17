@@ -10,7 +10,7 @@ use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot,
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
 };
-use aruna_core::document::{DocumentChange, DocumentTarget};
+use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -39,7 +39,7 @@ use crate::jobs::demand::{demand_snapshot, read_reservations};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
-use crate::node::info_write::{InfoChange, InfoWriteOperation};
+use crate::node::info_write::{InfoChange, InfoWriteOperation, revision_generation};
 use crate::placement::policy::{
     SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
 };
@@ -208,10 +208,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
-            .map(|change| change.current.generation)
-            .unwrap_or_default()),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(revision_generation(value)),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!(
             "realm config revision read failed: {}",

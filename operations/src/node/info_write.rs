@@ -217,6 +217,14 @@ impl InfoWriteOperation {
     }
 }
 
+/// The realm config generation of its stored revision row; an unreadable revision counts as
+/// generation zero, as a missing one does.
+pub(crate) fn revision_generation(revision: Option<Value>) -> u64 {
+    revision
+        .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
+        .map_or(0, |change| change.current.generation)
+}
+
 /// The advertisement without telemetry and publication stamps; only a change here publishes.
 fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
     let mut view = document.clone();
@@ -262,10 +270,7 @@ impl Operation for InfoWriteOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match (self.phase, result) {
             (Phase::Generation, IoResult::Values(values)) => {
-                // An unreadable revision counts as generation zero, as a missing one does.
-                self.generation = (values.into_iter().next().flatten())
-                    .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
-                    .map_or(0, |change| change.current.generation);
+                self.generation = revision_generation(values.into_iter().next().flatten());
                 self.phase = Phase::Read;
                 Ok(Next::Call(IoCall::Read(self.row_reads())))
             }
