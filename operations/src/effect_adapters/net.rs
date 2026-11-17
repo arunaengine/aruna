@@ -8,7 +8,7 @@ use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent};
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
 use tokio::io::AsyncWriteExt;
@@ -51,6 +51,22 @@ pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &Driver
         }
         HeartbeatEffect::Store { peer, heartbeat } => {
             HeartbeatEvent::Stored(net_handle.record_heartbeat(peer, *heartbeat))
+        }
+        HeartbeatEffect::Holders { holders, now_ms } => {
+            let avoid_list = net_handle.avoided_holders();
+            let avoided = (holders.iter())
+                .filter(|holder| avoid_list.avoided(holder, now_ms))
+                .copied()
+                .collect();
+            let held = (net_handle.held_heartbeats().into_iter())
+                .filter(|held| holders.contains(&held.node_id))
+                .collect();
+            HeartbeatEvent::Holders(Box::new(HolderFacts {
+                local: net_handle.node_id(),
+                realm_id: *net_handle.realm_id(),
+                held,
+                avoided,
+            }))
         }
     };
     Event::Net(NetEvent::Heartbeat(event))

@@ -149,6 +149,19 @@ pub enum HeartbeatEffect {
         peer: NodeId,
         heartbeat: Box<NodeHeartbeat>,
     },
+    /// Answers this node, its realm, and the held heartbeats and avoided state of `holders`.
+    Holders { holders: Vec<NodeId>, now_ms: u64 },
+}
+
+/// What this node knows about candidate holders, from its heartbeat state.
+#[derive(Debug, PartialEq)]
+pub struct HolderFacts {
+    pub local: NodeId,
+    pub realm_id: RealmId,
+    /// Held heartbeats of the asked holders, fresh or stale.
+    pub held: Vec<HeldHeartbeat>,
+    /// The asked holders this node avoids for now after a failure.
+    pub avoided: Vec<NodeId>,
 }
 
 /// The answer to a [`HeartbeatEffect`].
@@ -158,6 +171,7 @@ pub enum HeartbeatEvent {
     Pushed,
     PushFailed(String),
     Stored(bool),
+    Holders(Box<HolderFacts>),
 }
 
 fn revision(epoch: &AdvertisementEpoch) -> (u64, u64) {
