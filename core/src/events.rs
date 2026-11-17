@@ -938,6 +938,10 @@ impl Event {
                     KeyRequestsFailed,
                     ReissuePaged,
                     VersionRekeyed,
+                    AuditStored,
+                    KeysLooked,
+                    CopySealed,
+                    CopyWoken,
                 }
             ),
             Event::Task(event) => variant_label!(
