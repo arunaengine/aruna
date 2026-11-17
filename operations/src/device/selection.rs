@@ -7,27 +7,18 @@ use std::sync::Arc;
 
 use aruna_core::structs::SyncRefusal;
 use aruna_core::types::GroupId;
-use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 use super::refresh::{RefreshOutcome, refresh_replica, refusal_reason};
-use super::replica::{ReplicaOrigin, ReplicaRecord, ReplicaState, cache_budget};
+use super::replica::{
+    DeselectDocumentOperation, ReplicaOrigin, ReplicaRecord, SelectionError, TrackCreatedOperation,
+    cache_budget,
+};
 use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-
-#[derive(Debug, Error, PartialEq)]
-pub enum SelectionError {
-    #[error("the realm does not know this document")]
-    NotFound,
-    #[error("{0}")]
-    Refused(String),
-    #[error("the document has edits this device has not published yet")]
-    PendingEdits,
-    #[error("the device store is unavailable")]
-    Unavailable,
-}
 
 /// Keeps one document available offline.
 /// A first selection needs the realm once for the graph; selecting again is
@@ -74,26 +65,12 @@ pub async fn select_document(
     }
 }
 
-/// Stops keeping one document offline. The local graph is left in place: it is
-/// an OR-Set replica, so re-selecting joins onto it instead of resurrecting
-/// anything, and deleting it would tombstone the graph on this device.
+/// Stops keeping one document offline; see [`DeselectDocumentOperation`].
 pub async fn deselect_document(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Result<ReplicaRecord, SelectionError> {
-    let replica = read_replica(context, document_id)
-        .await
-        .ok_or(SelectionError::NotFound)?;
-    if replica.pending_edits > 0 {
-        return Err(SelectionError::PendingEdits);
-    }
-    if !delete_replica(context, document_id).await {
-        return Err(SelectionError::Unavailable);
-    }
-    Ok(ReplicaRecord {
-        selected: false,
-        ..replica
-    })
+    drive(DeselectDocumentOperation::new(document_id), context).await
 }
 
 /// Keeps a document the owner just read online as an unselected replica, so it stays readable
@@ -145,11 +122,8 @@ pub async fn track_created(
     group_id: GroupId,
     document_path: String,
 ) {
-    if read_replica(context, document_id).await.is_some() {
-        return;
+    let tracking = TrackCreatedOperation::new(document_id, group_id, document_path);
+    if let Err(error) = drive(tracking, context).await {
+        warn!(%document_id, error = %error, "Failed to track a created document");
     }
-    let mut replica =
-        ReplicaRecord::new(document_id, group_id, document_path, ReplicaOrigin::Device);
-    replica.state = ReplicaState::LocalOnly;
-    store_replica(context, &replica).await;
 }

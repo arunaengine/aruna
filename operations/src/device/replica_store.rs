@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
+use aruna_core::keyspaces::DEVICE_GRAPH_KEYSPACE;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
@@ -14,7 +14,8 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 
 use super::replica::{
-    CacheUsageOperation, ListReplicasOperation, ReplicaRecord, replica_entry, replica_key,
+    CacheUsageOperation, ListReplicasOperation, ReplicaRecord, read_answer, replica_delete,
+    replica_entry, replica_key, replica_read,
 };
 
 /// One replica, or `None` for both an absent row and an unreadable one: every
@@ -23,20 +24,11 @@ pub async fn read_replica(
     context: &Arc<DriverContext>,
     document_id: Ulid,
 ) -> Option<ReplicaRecord> {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
+    let answer = context
         .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
-            key: replica_key(document_id),
-            txn_id: None,
-        })
-        .await
-    else {
-        return None;
-    };
-    ReplicaRecord::from_bytes(&bytes).ok()
+        .send_storage_effect(replica_read(document_id))
+        .await;
+    read_answer(&answer)
 }
 
 pub async fn store_replica(context: &Arc<DriverContext>, replica: &ReplicaRecord) -> bool {
@@ -62,11 +54,7 @@ pub async fn delete_replica(context: &Arc<DriverContext>, document_id: Ulid) -> 
     matches!(
         context
             .storage_handle
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
-                key: replica_key(document_id),
-                txn_id: None,
-            })
+            .send_storage_effect(replica_delete(document_id))
             .await,
         Event::Storage(StorageEvent::DeleteResult { .. })
     )

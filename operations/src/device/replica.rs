@@ -17,6 +17,7 @@ use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::publish_queue::{PublishEntry, PublishState};
@@ -191,6 +192,208 @@ pub(crate) fn replica_entry(
         replica_key(replica.document_id),
         ByteView::from(replica.to_bytes()?),
     ))
+}
+
+pub(crate) fn replica_read(document_id: Ulid) -> StorageEffect {
+    StorageEffect::Read {
+        key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
+        key: replica_key(document_id),
+        txn_id: None,
+    }
+}
+
+pub(crate) fn replica_delete(document_id: Ulid) -> StorageEffect {
+    StorageEffect::Delete {
+        key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
+        key: replica_key(document_id),
+        txn_id: None,
+    }
+}
+
+/// The replica a read answer holds; an absent, unreadable or undecodable row is none.
+pub(crate) fn read_answer(event: &Event) -> Option<ReplicaRecord> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => ReplicaRecord::from_bytes(bytes).ok(),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SelectionError {
+    #[error("the realm does not know this document")]
+    NotFound,
+    #[error("{0}")]
+    Refused(String),
+    #[error("the document has edits this device has not published yet")]
+    PendingEdits,
+    #[error("the device store is unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RowState {
+    Init,
+    Read,
+    Write,
+    Finish,
+}
+
+/// Stops keeping one document offline by dropping its replica row. The local graph is left in
+/// place: it is an OR-Set replica, so selecting again joins onto it instead of resurrecting
+/// anything, and deleting it would tombstone the graph on this device.
+#[derive(Debug, PartialEq)]
+pub struct DeselectDocumentOperation {
+    document_id: Ulid,
+    state: RowState,
+    replica: Option<ReplicaRecord>,
+    output: Option<Result<ReplicaRecord, SelectionError>>,
+}
+
+impl DeselectDocumentOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self {
+            document_id,
+            state: RowState::Init,
+            replica: None,
+            output: None,
+        }
+    }
+
+    fn finish(&mut self, output: Result<ReplicaRecord, SelectionError>) -> Effects {
+        self.state = RowState::Finish;
+        self.output = Some(output);
+        smallvec![]
+    }
+}
+
+impl Operation for DeselectDocumentOperation {
+    type Output = ReplicaRecord;
+    type Error = SelectionError;
+
+    fn start(&mut self) -> Effects {
+        self.state = RowState::Read;
+        smallvec![Effect::Storage(replica_read(self.document_id))]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, &event) {
+            (
+                RowState::Read,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. }),
+            ) => match read_answer(&event) {
+                None => self.finish(Err(SelectionError::NotFound)),
+                Some(replica) if replica.pending_edits > 0 => {
+                    self.finish(Err(SelectionError::PendingEdits))
+                }
+                Some(replica) => {
+                    self.replica = Some(replica);
+                    self.state = RowState::Write;
+                    smallvec![Effect::Storage(replica_delete(self.document_id))]
+                }
+            },
+            (RowState::Write, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+                let replica = self.replica.take().ok_or(SelectionError::Unavailable);
+                self.finish(replica.map(|replica| ReplicaRecord {
+                    selected: false,
+                    ..replica
+                }))
+            }
+            _ => self.finish(Err(SelectionError::Unavailable)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == RowState::Finish
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(SelectionError::Unavailable))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Selects a document this device created, once the realm has accepted it, unless this device
+/// already holds a replica of it. A failed write is ignored and leaves the document untracked.
+#[derive(Debug, PartialEq)]
+pub struct TrackCreatedOperation {
+    replica: ReplicaRecord,
+    state: RowState,
+    output: Option<Result<(), SelectionError>>,
+}
+
+impl TrackCreatedOperation {
+    pub fn new(document_id: Ulid, group_id: GroupId, document_path: String) -> Self {
+        let mut replica =
+            ReplicaRecord::new(document_id, group_id, document_path, ReplicaOrigin::Device);
+        replica.state = ReplicaState::LocalOnly;
+        Self {
+            replica,
+            state: RowState::Init,
+            output: None,
+        }
+    }
+
+    fn finish(&mut self, output: Result<(), SelectionError>) -> Effects {
+        self.state = RowState::Finish;
+        self.output = Some(output);
+        smallvec![]
+    }
+}
+
+impl Operation for TrackCreatedOperation {
+    type Output = ();
+    type Error = SelectionError;
+
+    fn start(&mut self) -> Effects {
+        self.state = RowState::Read;
+        smallvec![Effect::Storage(replica_read(self.replica.document_id))]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, &event) {
+            (
+                RowState::Read,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. }),
+            ) => {
+                if read_answer(&event).is_some() {
+                    return self.finish(Ok(()));
+                }
+                let Ok((key_space, key, value)) = replica_entry(&self.replica) else {
+                    warn!(document_id = %self.replica.document_id, "Failed to encode a device replica");
+                    return self.finish(Ok(()));
+                };
+                self.state = RowState::Write;
+                smallvec![Effect::Storage(StorageEffect::Write {
+                    key_space,
+                    key,
+                    value,
+                    txn_id: None,
+                })]
+            }
+            (
+                RowState::Write,
+                Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::Error { .. }),
+            ) => self.finish(Ok(())),
+            _ => self.finish(Err(SelectionError::Unavailable)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.state == RowState::Finish
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(SelectionError::Unavailable))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -561,6 +764,108 @@ mod pure_tests {
         rejects_finalize(CacheUsageOperation::new());
         assert!(ListReplicasOperation::new().abort().is_empty());
         assert!(CacheUsageOperation::new().abort().is_empty());
+    }
+
+    fn stored(replica: Option<&ReplicaRecord>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: replica.map(|replica| replica.to_bytes().unwrap().into()),
+        })
+    }
+
+    // A deselected replica row is deleted and answered unselected; pending edits keep it.
+    #[test]
+    fn deselect_drops_row() {
+        let held = replica();
+        let id = held.document_id;
+        let mut deselect = DeselectDocumentOperation::new(id);
+        let deleted = Event::Storage(StorageEvent::DeleteResult {
+            key: replica_key(id),
+        });
+        check_trace(
+            &mut deselect,
+            &[Effect::Storage(replica_read(id))],
+            vec![
+                (
+                    stored(Some(&held)),
+                    vec![Effect::Storage(replica_delete(id))],
+                ),
+                (deleted, Vec::new()),
+            ],
+        );
+        let unselected = ReplicaRecord {
+            selected: false,
+            ..held.clone()
+        };
+        assert_eq!(deselect.finalize(), Ok(unselected));
+
+        let edited = ReplicaRecord {
+            pending_edits: 1,
+            ..held
+        };
+        let mut deselect = DeselectDocumentOperation::new(id);
+        deselect.start();
+        assert!(deselect.step(stored(Some(&edited))).is_empty());
+        assert_eq!(deselect.finalize(), Err(SelectionError::PendingEdits));
+        let mut deselect = DeselectDocumentOperation::new(id);
+        deselect.start();
+        deselect.step(stored(None));
+        assert_eq!(deselect.finalize(), Err(SelectionError::NotFound));
+    }
+
+    // A created document gets a local-only row, unless a replica row is already there.
+    #[test]
+    fn tracks_created_once() {
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let make =
+            || TrackCreatedOperation::new(Ulid::from_bytes([2u8; 16]), group_id, "notes".into());
+        let mut expected = replica();
+        expected.origin = ReplicaOrigin::Device;
+        expected.state = ReplicaState::LocalOnly;
+        let (key_space, key, value) = replica_entry(&expected).unwrap();
+        let write = Effect::Storage(StorageEffect::Write {
+            key_space,
+            key: key.clone(),
+            value,
+            txn_id: None,
+        });
+        let mut track = make();
+        let read = [Effect::Storage(replica_read(expected.document_id))];
+        let written = Event::Storage(StorageEvent::WriteResult { key });
+        check_trace(
+            &mut track,
+            &read,
+            vec![(stored(None), vec![write]), (written, Vec::new())],
+        );
+        assert_eq!(track.finalize(), Ok(()));
+        let mut track = make();
+        check_trace(
+            &mut track,
+            &read,
+            vec![(stored(Some(&expected)), Vec::new())],
+        );
+        assert_eq!(track.finalize(), Ok(()));
+    }
+
+    // Other events fail both operations with an unavailable store; nothing finishes early.
+    #[test]
+    fn selection_rejects_unexpected() {
+        let id = Ulid::from_bytes([2u8; 16]);
+        let deselect = || DeselectDocumentOperation::new(id);
+        let track = || TrackCreatedOperation::new(id, Ulid::from_bytes([1u8; 16]), "notes".into());
+        let all = sample_events().len();
+        let refused = rejects_events(deselect, sample_events, |_| false);
+        assert!(
+            refused
+                .iter()
+                .all(|(_, _, error)| *error == SelectionError::Unavailable)
+        );
+        assert_eq!(refused.len(), all);
+        assert_eq!(rejects_events(track, sample_events, |_| false).len(), all);
+        rejects_finalize(deselect());
+        rejects_finalize(track());
+        assert!(deselect().abort().is_empty());
+        assert!(track().abort().is_empty());
     }
 
     #[test]
