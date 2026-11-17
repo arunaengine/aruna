@@ -51,7 +51,7 @@ use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared, 
 use crate::groups::imports::{read_earlier, read_import};
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::queue::complete_put;
+use crate::replication::live_queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{

@@ -8,6 +8,7 @@ pub(crate) mod catch_up;
 pub(crate) mod drain;
 mod error;
 pub(crate) mod incoming;
+pub mod live_queue;
 pub mod locations;
 pub mod members;
 mod obligations;

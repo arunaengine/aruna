@@ -44,7 +44,7 @@ use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms}
 use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::queue::complete_put;
+use crate::replication::live_queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};

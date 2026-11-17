@@ -4,7 +4,7 @@
 
 use super::ArunaS3Service;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::replication::queue::complete_put;
+use aruna_operations::replication::live_queue::complete_put;
 use s3s::{S3Result, s3_error};
 
 pub(super) fn parse_upload_marker(

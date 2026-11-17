@@ -20,7 +20,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::replication::queue::complete_put;
+use aruna_operations::replication::live_queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
