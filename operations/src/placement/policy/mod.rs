@@ -12,6 +12,7 @@ pub mod list;
 pub mod names;
 pub mod quarantine;
 pub mod read;
+pub mod reconcile;
 pub mod resolve;
 pub mod resolve_set;
 pub mod subject;
@@ -40,11 +41,11 @@ pub use quarantine::{
 pub use read::{
     AuthenticPolicy, PolicySource, ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
+pub use reconcile::{LocalSubjectOperation, SubjectSyncOperation, SubjectTrigger};
 pub use resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
 pub use resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 pub use subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
-    observe_placement, sync_subject,
 };
 pub use transport::ServePolicyOperation;
 

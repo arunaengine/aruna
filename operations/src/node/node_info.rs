@@ -49,6 +49,9 @@ use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
+use crate::placement::policy::{
+    SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
+};
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 use aruna_core::placement::{build_view, held_buckets};
@@ -685,6 +688,27 @@ const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
 /// The newest advertisement revision not yet handed to replication. It is written in the same
 /// transaction as that revision, so a failure after the commit only delays the publish.
 const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
+
+/// Reacts to an observed placement change for this node. A node the realm still
+/// places revalidates its inventory under the observed subject; one draining or
+/// no longer placed departs, blocking admission and recording copies unresolved.
+pub async fn observe_placement(
+    context: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    now_ms: u64,
+) -> Result<Option<SubjectScanResult>, SubjectScanError> {
+    let observe = SubjectSyncOperation::new(realm_id, node_id, SubjectTrigger::Observe, now_ms);
+    let Some((mode, result)) = drive(observe, context).await? else {
+        return Ok(None);
+    };
+    // Compute follows departure state as best effort because departure cannot block on it.
+    let departing = matches!(mode, SubjectScanMode::Depart);
+    if let Err(error) = set_departure_state(context, node_id, realm_id, departing).await {
+        warn!(%error, "failed to publish compute departure state");
+    }
+    Ok(Some(result))
+}
 
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
@@ -2164,7 +2188,7 @@ mod tests {
         config.placement_map.clear();
         config.nodes.clear();
         write_realm_config(&ctx, &config).await;
-        crate::placement::policy::observe_placement(&ctx, realm_id, local, 10)
+        observe_placement(&ctx, realm_id, local, 10)
             .await
             .expect("observation completes");
 

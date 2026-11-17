@@ -32,10 +32,10 @@ use super::store::{
     JobMutationError, begin_external_running, cancel_running_job, read_job_record,
     record_attempt_intent, transition_to_preparing, transition_to_ready,
 };
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::job_reservation;
 use crate::jobs::lifecycle::updates::publish_progress;
-use crate::placement::policy::subject::read_local_subject;
+use crate::placement::policy::LocalSubjectOperation;
 use finalize::{cleanup_and_crate, fail_and_crate, finalize_cancel};
 use prepare::{build_task_spec, job_bucket, prepare_task};
 use recovery::{pre_submit_failure, recover_failed_submit};
@@ -456,7 +456,7 @@ pub async fn resolve_backend(
     else {
         return Ok(selected);
     };
-    let Some(subject) = read_local_subject(context)
+    let Some(subject) = drive(LocalSubjectOperation::new(), context)
         .await
         .ok()
         .flatten()
@@ -496,7 +496,7 @@ async fn launch_record(
 ) -> LaunchRecord {
     let caps = backend.capabilities();
     let location = match caps.local_site {
-        true => read_local_subject(context)
+        true => drive(LocalSubjectOperation::new(), context)
             .await
             .ok()
             .flatten()

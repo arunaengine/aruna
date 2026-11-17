@@ -313,18 +313,19 @@ async fn provision_realm(
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::placement::policy::sync_subject(
-        ctx,
+    let mode = aruna_operations::placement::policy::SubjectScanMode::Revalidate(
+        aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
+    );
+    let sync = aruna_operations::placement::policy::SubjectSyncOperation::new(
         config.realm_id,
         config.node_id,
-        aruna_operations::placement::policy::SubjectScanMode::Revalidate(
-            aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
-        ),
+        aruna_operations::placement::policy::SubjectTrigger::Reconcile(mode),
         aruna_core::time::unix_timestamp_millis(),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+    );
+    aruna_operations::driver::drive(sync, ctx)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {

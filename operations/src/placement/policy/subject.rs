@@ -5,13 +5,10 @@
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::placement::node_subject::{
-    NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
-};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{
     ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
@@ -19,9 +16,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::types::{Effects, Key, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::driver::{DriverContext, drive};
 use aruna_core::managed_copy::{
     COPY_PAGE_LIMIT, ManagedCopyError, ManagedCopyPage, scan_effect, transition_effect,
 };
@@ -382,139 +378,6 @@ impl Operation for SubjectScanOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
-}
-
-/// Reacts to an observed placement change for this node. A node the realm still
-/// places revalidates its inventory under the observed subject; one draining or
-/// no longer placed departs, blocking admission and recording copies unresolved.
-pub async fn observe_placement(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    now_ms: u64,
-) -> Result<Option<SubjectScanResult>, SubjectScanError> {
-    let Some(config) = read_realm_config(context, realm_id).await? else {
-        return Ok(None);
-    };
-    let (observed, mode) = match config.placement_entry(node_id) {
-        Some(entry) if !entry.draining => (
-            storage_subject(entry, 1),
-            SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
-        ),
-        Some(entry) => (storage_subject(entry, 1), SubjectScanMode::Depart),
-        // The realm no longer places this node: an ungraceful removal it only
-        // learns about through config sync.
-        None => match read_local_subject(context).await? {
-            Some(record) => (record.subject, SubjectScanMode::Depart),
-            None => return Ok(None),
-        },
-    };
-    let result = drive(
-        SubjectScanOperation::new(SubjectScanConfig {
-            realm_id,
-            observed,
-            mode,
-            now_ms,
-        }),
-        context,
-    )
-    .await?;
-    // Compute follows departure state as best effort because departure cannot block on it.
-    if let Err(error) = crate::node::node_info::set_departure_state(
-        context,
-        node_id,
-        realm_id,
-        matches!(mode, SubjectScanMode::Depart),
-    )
-    .await
-    {
-        warn!(%error, "failed to publish compute departure state");
-    }
-    Ok(Some(result))
-}
-
-async fn read_realm_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<Option<RealmConfigDocument>, SubjectScanError> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return Err(SubjectScanError::InvalidEvent("ReadRealmConfig"));
-    };
-    Ok(value
-        .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
-        .transpose()?)
-}
-
-/// The subject record this node advertises, if it ever advertised one.
-pub async fn read_local_subject(
-    context: &DriverContext,
-) -> Result<Option<NodeSubjectRecord>, SubjectScanError> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-            txn_id: None,
-        })
-        .await
-    else {
-        return Err(SubjectScanError::InvalidEvent("ReadLocalSubject"));
-    };
-    Ok(value
-        .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
-        .transpose()?)
-}
-
-/// Reconciles the local subject with the realm's placement map and revalidates
-/// the inventory. `Ok(None)` means this node has no placement entry, so it may
-/// hold nothing governed and advertises no subject at all.
-pub async fn sync_subject(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    mode: SubjectScanMode,
-    now_ms: u64,
-) -> Result<Option<SubjectScanResult>, SubjectScanError> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return Err(SubjectScanError::InvalidEvent("ReadRealmConfig"));
-    };
-    let Some(config) = value
-        .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
-        .transpose()?
-    else {
-        return Ok(None);
-    };
-    let Some(entry) = config.placement_entry(node_id) else {
-        return Ok(None);
-    };
-    let observed = storage_subject(entry, 1);
-    drive(
-        SubjectScanOperation::new(SubjectScanConfig {
-            realm_id,
-            observed,
-            mode,
-            now_ms,
-        }),
-        context,
-    )
-    .await
-    .map(Some)
 }
 
 #[cfg(test)]

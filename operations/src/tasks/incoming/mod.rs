@@ -88,6 +88,7 @@ use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::node::node_info::observe_placement;
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
@@ -102,7 +103,6 @@ use crate::notifications::prune::{
 use crate::notifications::watch::interest::{
     WATCH_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
 };
-use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
