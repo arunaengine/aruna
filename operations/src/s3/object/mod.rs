@@ -12,6 +12,7 @@ pub mod link;
 pub mod list;
 mod lookup;
 pub mod metadata;
+pub mod metadata_drain;
 pub mod origin;
 pub mod pages;
 pub mod placement;

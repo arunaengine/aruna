@@ -46,9 +46,8 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::subscriptions::create_local_watch;
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
-use aruna_operations::s3::object::metadata::{
-    QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
-};
+use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_operations::s3::object::metadata_drain::refresh_reference_metadata;
 use aruna_operations::s3::object::put::PutObjectResult;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
