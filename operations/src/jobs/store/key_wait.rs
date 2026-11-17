@@ -5,20 +5,25 @@
 use aruna_core::structs::execution::job::{KeyWait, key_wait_key, parse_wait_key};
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
+
+use super::mutation::{MutateJobCalls, NoGuard, forward, settle_attempt};
 use super::*;
+use crate::driver::drive;
 
 /// Wake rows handled per transaction page.
 pub const WAKE_PAGE: usize = 64;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum AwaitOutcome {
     Parked(JobRecord),
     /// The job is settled or cancel-requested; the caller follows the normal path.
     Skipped,
 }
 
-/// Parks a claimed job until every key in `waits` is unlocked. The claim and schedule entry go;
-/// checkpoints, captured inputs, attempts and the due time stay. No retry deadline is set.
+/// Parks a claimed job until every key in `waits` is unlocked; see [`ParkJobOperation`].
 pub async fn park_job(
     context: &DriverContext,
     job_id: JobId,
@@ -29,69 +34,127 @@ pub async fn park_job(
     if waits.is_empty() {
         return Err(JobMutationError::Storage("park without key waits".into()));
     }
-    let list = postcard::to_allocvec(&waits)
-        .map(ByteView::from)
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let mut parked = false;
-        let mut mutate = |record: &mut JobRecord| {
-            parked = false;
-            guard_token(record, token)?;
-            if record.is_settled() || record.cancel_requested {
-                return Ok(JobMutation::Skip);
-            }
-            // An attempt intent may already have reached an executor; it cannot wait here.
-            if record.attempt_intent.is_some() {
-                return Err(JobMutationError::IntentConflict);
-            }
-            record.state = JobState::AwaitingKey;
-            record.claim = None;
-            record.updated_at_ms = now_ms;
-            parked = true;
-            Ok(JobMutation::Persist)
-        };
-        let result = Box::pin(mutate_in_txn(context, txn_id, job_id, &mut mutate, None)).await;
-        let result = match result {
-            Ok(record) if parked => {
-                let mut writes = vec![(
-                    KEY_WAIT_KEYSPACE.to_string(),
-                    job_wait_key(job_id),
-                    list.clone(),
-                )];
-                writes.extend(waits.iter().map(|wait| {
-                    (
-                        KEY_WAIT_KEYSPACE.to_string(),
-                        key_wait_key(wait.key, job_id),
-                        aruna_core::types::Value::from(Vec::<u8>::new()),
-                    )
-                }));
-                batch_write(context, writes, Some(txn_id))
-                    .await
-                    .map(|()| record)
-                    .map_err(JobMutationError::Storage)
-            }
-            other => other,
-        };
-        match result {
-            Ok(record) => {
-                match commit_write(context, txn_id, attempt, "job park exhausted retries").await? {
-                    CommitStep::Committed if parked => return Ok(AwaitOutcome::Parked(record)),
-                    CommitStep::Committed => return Ok(AwaitOutcome::Skipped),
-                    CommitStep::Retry => continue,
-                }
-            }
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+    let mut mutate = park_mutation(token, now_ms);
+    let mut attempt = 0;
+    loop {
+        let result = drive(
+            ParkJobOperation::new(job_id, &mut mutate, waits.clone()),
+            context,
+        )
+        .await;
+        match settle_attempt(result, attempt, "job park exhausted retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "job park exhausted retries".to_string(),
-    ))
+}
+
+/// Parks the claimed job unless it settled or a cancel was requested meanwhile.
+fn park_mutation(
+    token: Ulid,
+    now_ms: u64,
+) -> impl FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send {
+    move |record: &mut JobRecord| {
+        guard_token(record, token)?;
+        if record.is_settled() || record.cancel_requested {
+            return Ok(JobMutation::Skip);
+        }
+        // An attempt intent may already have reached an executor; it cannot wait here.
+        if record.attempt_intent.is_some() {
+            return Err(JobMutationError::IntentConflict);
+        }
+        record.state = JobState::AwaitingKey;
+        record.claim = None;
+        record.updated_at_ms = now_ms;
+        Ok(JobMutation::Persist)
+    }
+}
+
+/// Parks a claimed job until every key in `waits` is unlocked. The claim and schedule entry go;
+/// checkpoints, captured inputs, attempts and the due time stay. No retry deadline is set. The
+/// wait rows are written in the same transaction as the parked job.
+pub(crate) struct ParkJobOperation<F> {
+    calls: MutateJobCalls<F, NoGuard>,
+    waits: Vec<KeyWait>,
+    parked: Option<JobRecord>,
+}
+
+impl<F> std::fmt::Debug for ParkJobOperation<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParkJobOperation")
+            .field("calls", &self.calls)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> PartialEq for ParkJobOperation<F> {
+    fn eq(&self, other: &Self) -> bool {
+        self.calls == other.calls && self.waits == other.waits && self.parked == other.parked
+    }
+}
+
+impl<F> ParkJobOperation<F>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+{
+    pub(crate) fn new(job_id: JobId, mutate: F, waits: Vec<KeyWait>) -> Self {
+        Self {
+            calls: MutateJobCalls::new(job_id, mutate, None),
+            waits,
+            parked: None,
+        }
+    }
+
+    fn wait_rows(&self, job_id: JobId) -> Result<JobWrites, JobMutationError> {
+        let list = postcard::to_allocvec(&self.waits)
+            .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+        let mut writes = vec![(
+            KEY_WAIT_KEYSPACE.to_string(),
+            job_wait_key(job_id),
+            ByteView::from(list),
+        )];
+        writes.extend(self.waits.iter().map(|wait| {
+            (
+                KEY_WAIT_KEYSPACE.to_string(),
+                key_wait_key(wait.key, job_id),
+                Value::from(Vec::<u8>::new()),
+            )
+        }));
+        Ok(writes)
+    }
+}
+
+impl<F> Operation for ParkJobOperation<F>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+{
+    type Output = AwaitOutcome;
+    type Error = JobMutationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<AwaitOutcome>, JobMutationError> {
+        forward(self.calls.first()?)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<AwaitOutcome>, JobMutationError> {
+        if let Some(record) = self.parked.take() {
+            done(result)?;
+            return Ok(Next::Done(AwaitOutcome::Parked(record)));
+        }
+        let record = match self.calls.next(result)? {
+            Next::Done(record) => record,
+            other => return forward(other),
+        };
+        if !self.calls.persisted() {
+            return Ok(Next::Done(AwaitOutcome::Skipped));
+        }
+        let writes = self.wait_rows(record.job_id)?;
+        self.parked = Some(record);
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
 }
 
 /// The keys a parked job still waits for; empty when it is not parked.
@@ -104,107 +167,157 @@ pub async fn read_key_waits(
         .map(Option::unwrap_or_default)
 }
 
-/// Marks `key` available for one job. The job returns to `Queued`, due now, only when no
-/// other wait remains; its run then rechecks source, authorization and generation.
+/// Marks `key` available for one job; see [`SatisfyWaitOperation`].
 pub async fn satisfy_key_wait(
     context: &DriverContext,
     job_id: JobId,
     key: BucketKeyRef,
     now_ms: u64,
 ) -> Result<bool, JobMutationError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        match Box::pin(satisfy_in_txn(context, txn_id, job_id, key, now_ms)).await {
-            Ok(woken) => {
-                match commit_write(context, txn_id, attempt, "key wake exhausted retries").await? {
-                    CommitStep::Committed => return Ok(woken),
-                    CommitStep::Retry => continue,
-                }
-            }
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+    let mut attempt = 0;
+    loop {
+        let result = drive(SatisfyWaitOperation::new(job_id, key, now_ms), context).await;
+        match settle_attempt(result, attempt, "key wake exhausted retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "key wake exhausted retries".to_string(),
-    ))
 }
 
-async fn satisfy_in_txn(
-    context: &DriverContext,
-    txn_id: TxnId,
+type WakeMutation = Box<dyn FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send>;
+
+#[derive(Debug, PartialEq)]
+enum WaitStep {
+    DeleteRow,
+    ReadList,
+    Mutate,
+    Store,
+}
+
+/// Marks `key` available for one job. The job returns to `Queued`, due now, only when no
+/// other wait remains; its run then rechecks source, authorization and generation. The answer
+/// is whether the job woke.
+#[derive(Debug, PartialEq)]
+pub(crate) struct SatisfyWaitOperation {
     job_id: JobId,
     key: BucketKeyRef,
     now_ms: u64,
-) -> Result<bool, JobMutationError> {
-    let storage_error = |error: String| JobMutationError::Storage(error);
-    batch_delete(
-        context,
-        vec![(KEY_WAIT_KEYSPACE.to_string(), key_wait_key(key, job_id))],
-        Some(txn_id),
-    )
-    .await
-    .map_err(storage_error)?;
-    let list = read_raw(
-        context,
-        KEY_WAIT_KEYSPACE,
-        job_wait_key(job_id),
-        Some(txn_id),
-    )
-    .await
-    .map_err(storage_error)?;
-    let Some(list) = list else {
-        return Ok(false);
-    };
-    let mut waits: Vec<KeyWait> =
-        postcard::from_bytes(list.as_ref()).map_err(|error| storage_error(error.to_string()))?;
-    waits.retain(|wait| wait.key != key);
-    let remaining = !waits.is_empty();
-    let mut woken = false;
-    let mut mutate = |record: &mut JobRecord| {
-        woken = false;
-        if record.state != JobState::AwaitingKey || remaining {
-            return Ok(JobMutation::Skip);
+    waits: Vec<KeyWait>,
+    calls: Option<MutateJobCalls<WakeMutation, NoGuard>>,
+    woken: bool,
+    step: WaitStep,
+}
+
+impl SatisfyWaitOperation {
+    pub(crate) fn new(job_id: JobId, key: BucketKeyRef, now_ms: u64) -> Self {
+        Self {
+            job_id,
+            key,
+            now_ms,
+            waits: Vec::new(),
+            calls: None,
+            woken: false,
+            step: WaitStep::DeleteRow,
         }
-        record.state = JobState::Queued;
-        record.due_at_ms = now_ms;
-        record.updated_at_ms = now_ms;
-        woken = true;
-        Ok(JobMutation::Persist)
-    };
-    match Box::pin(mutate_in_txn(context, txn_id, job_id, &mut mutate, None)).await {
-        Ok(_) | Err(JobMutationError::NotFound) => {}
-        Err(error) => return Err(error),
     }
-    if remaining {
-        let value =
-            postcard::to_allocvec(&waits).map_err(|error| storage_error(error.to_string()))?;
-        batch_write(
-            context,
-            vec![(
-                KEY_WAIT_KEYSPACE.to_string(),
-                job_wait_key(job_id),
+
+    /// Wakes the parked job when this was its last wait.
+    fn mutate(&mut self, remaining: bool) -> Result<Next<bool>, JobMutationError> {
+        let now_ms = self.now_ms;
+        let mutate: WakeMutation = Box::new(move |record: &mut JobRecord| {
+            if record.state != JobState::AwaitingKey || remaining {
+                return Ok(JobMutation::Skip);
+            }
+            record.state = JobState::Queued;
+            record.due_at_ms = now_ms;
+            record.updated_at_ms = now_ms;
+            Ok(JobMutation::Persist)
+        });
+        let mut calls = MutateJobCalls::new(self.job_id, mutate, None);
+        let first = calls.first()?;
+        self.calls = Some(calls);
+        self.step = WaitStep::Mutate;
+        forward(first)
+    }
+
+    /// Keeps the remaining waits, or drops a list that no longer belongs to a parked job.
+    fn store(&mut self) -> Result<Next<bool>, JobMutationError> {
+        self.step = WaitStep::Store;
+        let list = (KEY_WAIT_KEYSPACE.to_string(), job_wait_key(self.job_id));
+        if !self.waits.is_empty() {
+            let value = postcard::to_allocvec(&self.waits)
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+            return Ok(Next::Call(IoCall::Write(vec![(
+                list.0,
+                list.1,
                 ByteView::from(value),
-            )],
-            Some(txn_id),
-        )
-        .await
-        .map_err(storage_error)?;
-    } else if !woken {
-        // A list without a parked job is stale: the job was cancelled or pruned.
-        batch_delete(
-            context,
-            vec![(KEY_WAIT_KEYSPACE.to_string(), job_wait_key(job_id))],
-            Some(txn_id),
-        )
-        .await
-        .map_err(storage_error)?;
+            )])));
+        }
+        match self.woken {
+            true => Ok(Next::Done(true)),
+            // A list without a parked job is stale: the job was cancelled or pruned.
+            false => Ok(Next::Call(IoCall::Delete(vec![list]))),
+        }
     }
-    Ok(woken)
+}
+
+impl Operation for SatisfyWaitOperation {
+    type Output = bool;
+    type Error = JobMutationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, JobMutationError> {
+        let row = (
+            KEY_WAIT_KEYSPACE.to_string(),
+            key_wait_key(self.key, self.job_id),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, JobMutationError> {
+        match self.step {
+            WaitStep::DeleteRow => {
+                done(result)?;
+                self.step = WaitStep::ReadList;
+                let row = (KEY_WAIT_KEYSPACE.to_string(), job_wait_key(self.job_id));
+                Ok(Next::Call(IoCall::Read(vec![row])))
+            }
+            WaitStep::ReadList => {
+                let [list] = values::<1>(result)?;
+                let Some(list) = list else {
+                    return Ok(Next::Done(false));
+                };
+                let mut waits: Vec<KeyWait> = postcard::from_bytes(list.as_ref())
+                    .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+                waits.retain(|wait| wait.key != self.key);
+                self.waits = waits;
+                self.mutate(!self.waits.is_empty())
+            }
+            WaitStep::Mutate => {
+                let Some(calls) = self.calls.as_mut() else {
+                    return Err(JobMutationError::Storage(
+                        "key wake lost its mutation".into(),
+                    ));
+                };
+                match calls.next(result) {
+                    Ok(Next::Done(_)) => {
+                        self.woken = calls.persisted();
+                        self.store()
+                    }
+                    Ok(other) => forward(other),
+                    Err(JobMutationError::NotFound) => self.store(),
+                    Err(error) => Err(error),
+                }
+            }
+            WaitStep::Store => {
+                done(result)?;
+                Ok(Next::Done(self.woken))
+            }
+        }
+    }
 }
 
 /// Wakes one page of jobs waiting for `key`. Handled rows are deleted, so callers repeat
