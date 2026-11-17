@@ -11,8 +11,8 @@ use crate::events::{BlobEvent, GroupResult, SubOperationEvent};
 use crate::operation::boxed_suboperation;
 use crate::task::{TaskEffect, TaskEvent, TaskKey};
 
-/// Makes its calls in order, keeps every answer and ends with them. After a window member it
-/// adds `on_member` once, otherwise waits.
+/// Makes its calls in order, keeps every answer and ends with them, then the `then` calls.
+/// After a window member it adds `on_member` once, otherwise waits. Aborts with `cleanup`.
 #[derive(Debug, PartialEq)]
 struct Script {
     calls: VecDeque<IoCall>,
@@ -20,13 +20,20 @@ struct Script {
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
     transaction: bool,
+    then: Vec<IoCall>,
+    cleanup: Vec<IoCall>,
+    after: Vec<Effect>,
 }
 
 impl Script {
     fn turn(&mut self) -> Next<Vec<IoResult>> {
-        match self.calls.pop_front() {
-            Some(call) => Next::Call(call),
-            None => Next::Done(std::mem::take(&mut self.seen)),
+        let output = match self.calls.pop_front() {
+            Some(call) => return Next::Call(call),
+            None => std::mem::take(&mut self.seen),
+        };
+        match std::mem::take(&mut self.then) {
+            calls if calls.is_empty() => Next::Done(output),
+            calls => Next::Then { output, calls },
         }
     }
 }
@@ -55,6 +62,14 @@ impl Operation for Script {
     fn transaction(&self) -> bool {
         self.transaction
     }
+
+    fn abort(&mut self) -> Vec<IoCall> {
+        std::mem::take(&mut self.cleanup)
+    }
+
+    fn after_commit(&mut self) -> Option<Effect> {
+        (!self.after.is_empty()).then(|| self.after.remove(0))
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -64,6 +79,9 @@ fn script(calls: Vec<IoCall>) -> Script {
         on_member: None,
         scope: None,
         transaction: false,
+        then: Vec::new(),
+        cleanup: Vec::new(),
+        after: Vec::new(),
     }
 }
 
@@ -91,6 +109,85 @@ fn storage(effect: StorageEffect) -> Effect {
 
 fn read_a() -> IoCall {
     IoCall::Read(vec![("rows".to_string(), key("a"))])
+}
+
+#[test]
+fn effects_join_transaction() {
+    // A passed-through storage effect without a transaction id runs in the operation's one.
+    let entry = crate::node_vault::VaultEntry::new(
+        crate::node_vault::VaultPurpose::NamedSecret,
+        ulid::Ulid::from_parts(1, 1),
+    );
+    let delete = StorageEffect::VaultDelete {
+        entry,
+        txn_id: None,
+    };
+    let mut operation = run(
+        script(vec![IoCall::Effect(Box::new(storage(delete)))]),
+        true,
+    );
+    let start = storage(StorageEffect::StartTransaction { read: false });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let joined = StorageEffect::VaultDelete {
+        entry,
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(joined)]);
+}
+
+#[test]
+fn sends_after_commit() {
+    // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut script = script(vec![IoCall::Write(write)]);
+    let wake = || {
+        Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        })
+    };
+    let sync = || Effect::Storage(StorageEffect::SyncAll);
+    script.after = vec![wake(), sync()];
+    let mut operation = run(script, true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(committed)).as_slice(),
+        &[wake()]
+    );
+    assert!(!operation.is_complete());
+    let refused = TaskEvent::Error {
+        key: None,
+        message: "timer refused".to_string(),
+    };
+    assert_eq!(operation.step(Event::Task(refused)).as_slice(), &[sync()]);
+    let synced = Event::Storage(StorageEvent::SyncAllFinished);
+    assert!(operation.step(synced).is_empty());
+    assert!(operation.is_complete());
+    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
+}
+
+#[test]
+fn storage_refusal_fails() {
+    // A storage effect answered with a storage error fails the operation like a storage call.
+    let read = StorageEffect::Read {
+        key_space: "rows".to_string(),
+        key: key("a"),
+        txn_id: None,
+    };
+    let mut operation = run(script(vec![IoCall::Effect(Box::new(storage(read)))]), false);
+    operation.start();
+    let error = StorageError::ReadError("disk".to_string());
+    let refused = Event::Storage(StorageEvent::Error {
+        error: error.clone(),
+    });
+    assert!(operation.step(refused).is_empty());
+    assert_eq!(operation.finalize(), Err(IoError::Storage(error)));
 }
 
 #[test]
@@ -175,7 +272,9 @@ fn passes_other_calls() {
         IoCall::Effect(Box::new(Effect::Task(TaskEffect::CancelTimer {
             key: TaskKey::DrainSyncOutbox,
         }))),
-        IoCall::Effect(Box::new(Effect::Blob(BlobEffect::ReleaseReservation { id }))),
+        IoCall::Effect(Box::new(Effect::Blob(BlobEffect::ReleaseReservation {
+            id,
+        }))),
         IoCall::Child(child),
         IoCall::Group(EffectGroup {
             members: vec![Effect::Delay(Duration::from_secs(1))],
@@ -272,7 +371,10 @@ fn refuses_wrong_event() {
     let task = TaskEffect::CancelTimer {
         key: TaskKey::DrainSyncOutbox,
     };
-    let mut operation = run(script(vec![IoCall::Effect(Box::new(Effect::Task(task)))]), false);
+    let mut operation = run(
+        script(vec![IoCall::Effect(Box::new(Effect::Task(task)))]),
+        false,
+    );
     operation.start();
     let id = ulid::Ulid::from(4u128);
     operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
@@ -373,4 +475,162 @@ fn hung_adapter_fails() {
     assert_eq!(effects.as_slice(), &[storage(abort)]);
     let hung = IoError::Hung { effect: "storage" };
     assert_eq!(operation.finalize(), Err(hung));
+}
+
+#[test]
+fn child_returns_output() {
+    let mut operation = run(script(vec![IoCall::child(script(Vec::new()))]), true);
+    let effects = operation.start();
+    assert_eq!(
+        effects.len(),
+        1,
+        "a child call never opens the parent's transaction"
+    );
+    let Some(Effect::SubOperation(mut child)) = effects.into_iter().next() else {
+        panic!("a child call is one sub operation");
+    };
+    assert!(child.start().is_empty(), "the child needs no I/O");
+    assert!(child.is_complete());
+    let event = child.finalize();
+    let outcome = ChildOutcome::new::<Vec<IoResult>, IoError>(Ok(Vec::new()));
+    assert_eq!(event, Event::Child(outcome));
+    assert!(operation.step(event).is_empty());
+    let Ok(mut seen) = operation.finalize() else {
+        panic!("the parent finishes");
+    };
+    let result = seen.pop().map(IoResult::child::<Vec<IoResult>, IoError>);
+    assert_eq!(result, Some(Ok(Ok(Vec::new()))));
+}
+
+#[test]
+fn child_refuses_type() {
+    let outcome = IoResult::Child(ChildOutcome::new::<u8, IoError>(Err(IoError::Aborted)));
+    let refused = IoError::Unexpected {
+        expected: type_name::<Result<u16, IoError>>(),
+        got: "a child of another type",
+    };
+    assert_eq!(outcome.child::<u16, IoError>(), Err(refused));
+    let refused = IoError::Unexpected {
+        expected: type_name::<Result<u8, IoError>>(),
+        got: "IoResult::Done",
+    };
+    assert_eq!(IoResult::Done.child::<u8, IoError>(), Err(refused));
+    let failed = IoResult::Child(ChildOutcome::new::<u8, IoError>(Err(IoError::Aborted)));
+    assert_eq!(failed.child::<u8, IoError>(), Ok(Err(IoError::Aborted)));
+}
+
+#[test]
+fn adds_counters_inside() {
+    let usage = IoCall::AddUsage {
+        space: "usage".to_string(),
+        deltas: Vec::new(),
+        buckets: Vec::new(),
+    };
+    let counters = IoCall::AddCounters {
+        space: "counters".to_string(),
+        deltas: Vec::new(),
+    };
+    let mut operation = run(script(vec![usage, counters]), true);
+    let start = storage(StorageEffect::StartTransaction { read: false });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let usage = StorageEffect::AddUsage {
+        key_space: "usage".to_string(),
+        deltas: Vec::new(),
+        buckets: Vec::new(),
+        txn_id: txn(),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(usage)]);
+    let written = || {
+        Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    };
+    let counters = StorageEffect::AddCounters {
+        key_space: "counters".to_string(),
+        deltas: Vec::new(),
+        txn_id: txn(),
+    };
+    assert_eq!(operation.step(written()).as_slice(), &[storage(counters)]);
+    let commit = StorageEffect::CommitTransaction { txn_id: txn() };
+    assert_eq!(operation.step(written()).as_slice(), &[storage(commit)]);
+
+    // Without a transaction the call has nothing to add to.
+    let counters = IoCall::AddCounters {
+        space: "counters".to_string(),
+        deltas: Vec::new(),
+    };
+    let mut operation = run(script(vec![counters]), false);
+    assert!(operation.start().is_empty());
+    let refused = IoError::Unexpected {
+        expected: "a transaction",
+        got: "IoCall::AddCounters",
+    };
+    assert_eq!(operation.finalize(), Err(refused));
+}
+
+#[test]
+fn abort_sends_cleanup() {
+    let id = ulid::Ulid::from(5u128);
+    let release = || Effect::Blob(BlobEffect::ReleaseReservation { id });
+    let mut procedure = script(vec![read_a()]);
+    procedure.cleanup = vec![IoCall::Effect(Box::new(release()))];
+    let mut operation = run(procedure, true);
+    operation.start();
+    operation.step(started());
+    let abort = storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    assert_eq!(operation.abort().as_slice(), &[abort, release()]);
+    assert!(operation.abort().is_empty(), "cleanup is sent once");
+    assert_eq!(operation.finalize(), Err(IoError::Aborted));
+
+    // A hung adapter ends the run the same way.
+    let mut procedure = script(vec![read_a()]);
+    procedure.cleanup = vec![IoCall::Effect(Box::new(release()))];
+    let mut operation = run(procedure, true);
+    operation.start();
+    operation.step(started());
+    let effects = operation.step(Event::Hung { effect: "storage" });
+    let abort = storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    assert_eq!(effects.as_slice(), &[abort, release()]);
+}
+
+#[test]
+fn calls_after_commit() {
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut procedure = script(vec![IoCall::Write(write)]);
+    procedure.then = vec![
+        IoCall::Delete(vec![("rows".to_string(), key("old"))]),
+        IoCall::Delay(Duration::from_secs(1)),
+    ];
+    let mut operation = run(procedure, true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    let commit = StorageEffect::CommitTransaction { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(written)).as_slice(),
+        &[storage(commit)]
+    );
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    let delete = StorageEffect::BatchDelete {
+        deletes: vec![("rows".to_string(), key("old"))],
+        txn_id: None,
+    };
+    let effects = operation.step(Event::Storage(committed));
+    assert_eq!(
+        effects.as_slice(),
+        &[storage(delete)],
+        "outside the transaction"
+    );
+    // A failed call after the commit is logged and the next one runs.
+    let failed = StorageEvent::Error {
+        error: StorageError::QueueFull,
+    };
+    let effects = operation.step(Event::Storage(failed));
+    assert_eq!(effects.as_slice(), &[Effect::Delay(Duration::from_secs(1))]);
+    assert!(!operation.is_complete());
+    // An abort now keeps the committed outcome.
+    assert!(operation.abort().is_empty());
+    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }

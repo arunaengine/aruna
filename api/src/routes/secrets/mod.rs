@@ -289,7 +289,6 @@ async fn owner_change(
         readable,
         now_ms: unix_timestamp_millis(),
         write_ids: [Ulid::generate(), Ulid::generate(), Ulid::generate()],
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &state.get_ctx())
         .await

@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::GroupId;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use super::group_admin_path;
@@ -63,104 +62,73 @@ impl ServiceCheckError {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum ServiceCheckState {
-    Init,
-    ReadRecords,
-    Authorize { target: Option<User> },
-    Finish,
-    Error,
+impl From<IoError> for ServiceCheckError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ServiceCheck".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ServiceCheckOperation {
     config: ServiceCheckConfig,
-    state: ServiceCheckState,
-    output: Option<Result<Option<User>, ServiceCheckError>>,
+    /// The target account once the records are read; the outer `None` means not read yet.
+    target: Option<Option<User>>,
 }
 
 impl ServiceCheckOperation {
     pub fn new(config: ServiceCheckConfig) -> Self {
         Self {
             config,
-            state: ServiceCheckState::Init,
-            output: None,
+            target: None,
         }
     }
 
-    fn fail(&mut self, error: ServiceCheckError) -> Effects {
-        self.state = ServiceCheckState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(ServiceCheckError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn handle_records(&mut self, event: Event) -> Effects {
-        let values = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => return self.unexpected("batch read result", other),
-        };
-        let mut users = Vec::with_capacity(values.len());
-        for (_, value) in values {
-            match value.as_deref().map(User::from_bytes).transpose() {
-                Ok(user) => users.push(user),
-                Err(error) => return self.fail(error.into()),
-            }
-        }
+    fn authorize(
+        &mut self,
+        values: Vec<Option<aruna_core::types::Value>>,
+    ) -> Result<Next<Option<User>>, ServiceCheckError> {
+        let users = (values.into_iter())
+            .map(|value| value.as_deref().map(User::from_bytes).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
         // Service accounts never administer accounts, whatever roles they hold.
         if users
             .first()
             .and_then(Option::as_ref)
             .is_some_and(|caller| caller.service_group().is_some())
         {
-            return self.fail(ServiceCheckError::Refused);
+            return Err(ServiceCheckError::Refused);
         }
         let target = users.into_iter().nth(1).flatten();
         if self.config.target.is_some() {
-            let Some(user) = target.as_ref() else {
-                return self.fail(ServiceCheckError::NotFound);
-            };
+            let user = target.as_ref().ok_or(ServiceCheckError::NotFound)?;
             if user.service_group() != Some(self.config.group_id) {
-                return self.fail(ServiceCheckError::NotFound);
+                return Err(ServiceCheckError::NotFound);
             }
             if user.is_deactivated() {
-                return self.fail(ServiceCheckError::Deactivated);
+                return Err(ServiceCheckError::Deactivated);
             }
         }
-        self.state = ServiceCheckState::Authorize { target };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: group_admin_path(self.config.auth_context.realm_id, self.config.group_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
-    }
-
-    fn handle_authorized(&mut self, event: Event, target: Option<User>) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) }) => {
-                self.state = ServiceCheckState::Finish;
-                self.output = Some(Ok(target));
-                smallvec![]
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(false) }) => {
-                self.fail(ServiceCheckError::Refused)
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: Err(error),
-            }) => self.fail(error.into()),
-            other => self.unexpected("authorization result", other),
-        }
+        self.target = Some(target);
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: group_admin_path(self.config.auth_context.realm_id, self.config.group_id),
+            required_permission: Permission::WRITE,
+        });
+        let child = boxed_suboperation(check, |allowed| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 }
 
@@ -171,50 +139,45 @@ fn user_read(user_id: &UserId) -> (String, ByteView) {
     )
 }
 
-impl EffectOperation for ServiceCheckOperation {
+impl Operation for ServiceCheckOperation {
     type Output = Option<User>;
     type Error = ServiceCheckError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Option<User>>, ServiceCheckError> {
         // Federated users never administer service accounts, whatever group roles they hold.
         let auth = &self.config.auth_context;
         if auth.user_id.realm_id != auth.realm_id {
-            return self.fail(ServiceCheckError::Refused);
+            return Err(ServiceCheckError::Refused);
         }
         let mut reads = vec![user_read(&self.config.auth_context.user_id)];
         reads.extend(self.config.target.as_ref().map(user_read));
-        self.state = ServiceCheckState::ReadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.state, ServiceCheckState::Error) {
-            ServiceCheckState::ReadRecords => self.handle_records(event),
-            ServiceCheckState::Authorize { target } => self.handle_authorized(event, target),
-            ServiceCheckState::Init => self.unexpected("no event before start", event),
-            state @ (ServiceCheckState::Finish | ServiceCheckState::Error) => {
-                self.state = state;
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<User>>, ServiceCheckError> {
+        let event = match result {
+            IoResult::Values(values) if self.target.is_none() => return self.authorize(values),
+            IoResult::Event(event) => *event,
+            other => {
+                return Err(ServiceCheckError::UnexpectedEvent {
+                    state: "ServiceCheck".to_string(),
+                    expected: "batch read or authorization result",
+                    got: other.label(),
+                });
             }
+        };
+        let got = event.label();
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return Err(ServiceCheckError::UnexpectedEvent {
+                state: "Authorize".to_string(),
+                expected: "authorization result",
+                got,
+            });
+        };
+        if !allowed? {
+            return Err(ServiceCheckError::Refused);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ServiceCheckState::Finish | ServiceCheckState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ServiceCheckError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(Next::Done(self.target.take().flatten()))
     }
 }
 
@@ -239,8 +202,28 @@ mod tests {
             group_id: Ulid::from_bytes([2u8; 16]),
             target: None,
         });
-        assert!(operation.start().is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(ServiceCheckError::Refused));
+        assert_eq!(operation.first(), Err(ServiceCheckError::Refused));
+    }
+
+    #[test]
+    fn missing_target_refused() {
+        // A named account that does not exist is not found before any permission check.
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let caller = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let target = UserId::new(Ulid::from_bytes([3u8; 16]), realm_id);
+        let mut operation = ServiceCheckOperation::new(ServiceCheckConfig {
+            auth_context: AuthContext {
+                user_id: caller,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            group_id: Ulid::from_bytes([2u8; 16]),
+            target: Some(target),
+        });
+        let reads = vec![user_read(&caller), user_read(&target)];
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+        let missing = operation.next(IoResult::Values(vec![None, None]));
+        assert_eq!(missing, Err(ServiceCheckError::NotFound));
     }
 }

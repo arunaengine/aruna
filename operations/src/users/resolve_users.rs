@@ -4,14 +4,12 @@
 
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -35,21 +33,13 @@ pub struct ResolveUsersOutput {
     pub users: Vec<ResolvedUser>,
 }
 
+/// Reads the users, then the primaries of merged ones, whose names and attributes they show.
 #[derive(Debug, PartialEq)]
 pub struct ResolveUsersOperation {
     realm_id: RealmId,
     ids: Vec<UserId>,
-    state: ResolveUsersState,
-    output: Option<Result<ResolveUsersOutput, ResolveUsersError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ResolveUsersState {
-    Init,
-    ResolveUsers,
-    ResolvePrimaries { users: Vec<ResolvedUser> },
-    Finish,
-    Error,
+    /// The resolved users once read, while their primaries are read.
+    users: Option<Vec<ResolvedUser>>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -68,6 +58,31 @@ pub enum ResolveUsersError {
     NotFinished,
 }
 
+impl From<IoError> for ResolveUsersError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ResolveUsers".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
+fn user_reads(ids: &[UserId]) -> IoCall {
+    let reads = ids
+        .iter()
+        .map(|id| (USER_KEYSPACE.to_string(), Key::from(id.to_bytes())))
+        .collect();
+    IoCall::Read(reads)
+}
+
 impl ResolveUsersOperation {
     pub fn new(input: ResolveUsersInput) -> Self {
         let mut seen = HashSet::new();
@@ -79,75 +94,16 @@ impl ResolveUsersOperation {
         Self {
             realm_id: input.realm_id,
             ids,
-            state: ResolveUsersState::Init,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: ResolveUsersError) -> Effects {
-        self.state = ResolveUsersState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(ResolveUsersError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn emit_resolve(&mut self) -> Effects {
-        if self.ids.is_empty() {
-            return self.emit_finish(Vec::new());
-        }
-        self.state = ResolveUsersState::ResolveUsers;
-        let reads = self
-            .ids
-            .iter()
-            .map(|id| (USER_KEYSPACE.to_string(), Key::from(id.to_bytes())))
-            .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
-    }
-
-    fn handle_resolve(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
-        };
-        if values.len() != self.ids.len() {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::BatchReadResult) matching requested ids",
-                got,
-            );
-        }
-
-        match self.collect_users(values) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+            users: None,
         }
     }
 
     fn collect_users(
         &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<Effects, ResolveUsersError> {
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<ResolveUsersOutput>, ResolveUsersError> {
         let mut users = Vec::new();
-        for (_, value) in values {
-            let Some(value) = value else {
-                continue;
-            };
+        for value in values.into_iter().flatten() {
             let user = User::from_bytes(&value)?;
             if user.user_id.realm_id != self.realm_id {
                 continue;
@@ -163,106 +119,75 @@ impl ResolveUsersOperation {
         primaries.sort();
         primaries.dedup();
         if primaries.is_empty() {
-            return Ok(self.emit_finish(users));
+            return Ok(Next::Done(ResolveUsersOutput { users }));
         }
-        self.state = ResolveUsersState::ResolvePrimaries { users };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: primaries
-                .iter()
-                .map(|id| (USER_KEYSPACE.to_string(), Key::from(id.to_bytes())))
-                .collect(),
-            txn_id: None,
-        })])
+        self.users = Some(users);
+        Ok(Next::Call(user_reads(&primaries)))
     }
 
     /// Shows each merged account as its primary, which always is the root of the merge.
-    fn handle_primaries(&mut self, event: Event, mut users: Vec<ResolvedUser>) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
-        };
+    fn show_primaries(
+        &mut self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<ResolveUsersOutput>, ResolveUsersError> {
         let mut primaries = HashMap::new();
-        for (_, value) in values {
-            match value.map(|bytes| User::from_bytes(&bytes)).transpose() {
-                Ok(Some(user)) => {
-                    primaries.insert(user.user_id, user);
-                }
-                Ok(None) => {}
-                Err(error) => return self.fail(error.into()),
-            }
+        for value in values.into_iter().flatten() {
+            let user = User::from_bytes(&value)?;
+            primaries.insert(user.user_id, user);
         }
+        let mut users = self.users.take().unwrap_or_default();
         for resolved in &mut users {
             if let Some(primary) = resolved.merged_into.and_then(|id| primaries.get(&id)) {
                 resolved.name = primary.public_name();
                 resolved.attributes = primary.public_attributes();
             }
         }
-        self.emit_finish(users)
-    }
-
-    fn emit_finish(&mut self, users: Vec<ResolvedUser>) -> Effects {
-        self.state = ResolveUsersState::Finish;
-        self.output = Some(Ok(ResolveUsersOutput { users }));
-        smallvec![]
+        Ok(Next::Done(ResolveUsersOutput { users }))
     }
 }
 
-impl EffectOperation for ResolveUsersOperation {
+impl Operation for ResolveUsersOperation {
     type Output = ResolveUsersOutput;
     type Error = ResolveUsersError;
 
-    fn start(&mut self) -> Effects {
-        self.emit_resolve()
+    /// No ids is an empty read, which the runner answers without storage.
+    fn first(&mut self) -> Result<Next<ResolveUsersOutput>, ResolveUsersError> {
+        Ok(Next::Call(user_reads(&self.ids)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
+    fn next(&mut self, result: IoResult) -> Result<Next<ResolveUsersOutput>, ResolveUsersError> {
+        let IoResult::Values(values) = result else {
+            return Err(ResolveUsersError::UnexpectedEvent {
+                state: "ResolveUsers".to_string(),
+                expected: "IoResult::Values",
+                got: result.label(),
+            });
         };
-
-        match std::mem::replace(&mut self.state, ResolveUsersState::Error) {
-            ResolveUsersState::ResolveUsers => {
-                self.state = ResolveUsersState::ResolveUsers;
-                self.handle_resolve(event)
-            }
-            ResolveUsersState::ResolvePrimaries { users } => self.handle_primaries(event, users),
-            state @ (ResolveUsersState::Init
-            | ResolveUsersState::Finish
-            | ResolveUsersState::Error) => {
-                self.state = state;
-                smallvec![]
-            }
+        if self.users.is_some() {
+            return self.show_primaries(values);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ResolveUsersState::Finish | ResolveUsersState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ResolveUsersError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if values.len() != self.ids.len() {
+            return Err(ResolveUsersError::UnexpectedEvent {
+                state: "ResolveUsers".to_string(),
+                expected: "IoResult::Values matching requested ids",
+                got: "IoResult::Values",
+            });
+        }
+        self.collect_users(values)
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
+    use super::ResolveUsersOutput;
     use super::{ResolveUsersInput, ResolveUsersOperation, ResolvedUser};
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
-    use aruna_core::types::{Key, Value};
+    use aruna_core::types::Value;
     use std::collections::HashMap;
     use ulid::Ulid;
 
@@ -288,6 +213,19 @@ mod pure_tests {
         user.to_bytes(&actor(user.user_id)).unwrap().into()
     }
 
+    fn read(values: Vec<Option<Value>>) -> IoResult {
+        IoResult::Values(values)
+    }
+
+    fn done(
+        next: Result<Next<ResolveUsersOutput>, super::ResolveUsersError>,
+    ) -> ResolveUsersOutput {
+        match next {
+            Ok(Next::Done(output)) => output,
+            other => panic!("expected the users, got {other:?}"),
+        }
+    }
+
     fn input(realm_id: RealmId, ids: Vec<UserId>) -> ResolveUsersInput {
         ResolveUsersInput {
             realm_id,
@@ -304,16 +242,9 @@ mod pure_tests {
         let mut operation =
             ResolveUsersOperation::new(input(realm_id, vec![local.user_id, foreign.user_id]));
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(local.user_id.to_bytes()), Some(value(&local))),
-                (Key::from(foreign.user_id.to_bytes()), Some(value(&foreign))),
-            ],
-        }));
-
-        assert!(effects.is_empty());
-        let output = operation.finalize().unwrap();
+        operation.first().unwrap();
+        let rows = vec![Some(value(&local)), Some(value(&foreign))];
+        let output = done(operation.next(read(rows)));
         assert_eq!(
             output.users,
             vec![ResolvedUser {
@@ -336,19 +267,10 @@ mod pure_tests {
         );
         let mut operation = ResolveUsersOperation::new(input(realm_id, vec![secondary.user_id]));
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(
-                Key::from(secondary.user_id.to_bytes()),
-                Some(value(&secondary)),
-            )],
-        }));
-        assert_eq!(effects.len(), 1);
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(primary.user_id.to_bytes()), Some(value(&primary)))],
-        }));
-
-        let output = operation.finalize().unwrap();
+        operation.first().unwrap();
+        let primaries = operation.next(read(vec![Some(value(&secondary))]));
+        assert!(matches!(primaries, Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 1));
+        let output = done(operation.next(read(vec![Some(value(&primary))])));
         assert_eq!(output.users.len(), 1);
         assert_eq!(output.users[0].user_id, secondary.user_id);
         assert_eq!(output.users[0].name, "Primary");
@@ -363,16 +285,8 @@ mod pure_tests {
         let mut operation =
             ResolveUsersOperation::new(input(realm_id, vec![known.user_id, missing]));
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(known.user_id.to_bytes()), Some(value(&known))),
-                (Key::from(missing.to_bytes()), None),
-            ],
-        }));
-
-        assert!(effects.is_empty());
-        let output = operation.finalize().unwrap();
+        operation.first().unwrap();
+        let output = done(operation.next(read(vec![Some(value(&known)), None])));
         assert_eq!(output.users.len(), 1);
         assert_eq!(output.users[0].user_id, known.user_id);
     }
@@ -387,14 +301,10 @@ mod pure_tests {
             vec![alice.user_id, alice.user_id, bob.user_id],
         ));
 
-        let effects = operation.start();
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchRead { reads, txn_id }) => {
-                assert_eq!(reads.len(), 2);
-                assert_eq!(txn_id, &None);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2
+        ));
     }
 
     #[test]
@@ -413,12 +323,8 @@ mod pure_tests {
         ]);
         let mut operation = ResolveUsersOperation::new(input(realm_id, vec![alice.user_id]));
 
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(alice.user_id.to_bytes()), Some(value(&alice)))],
-        }));
-
-        let output = operation.finalize().unwrap();
+        operation.first().unwrap();
+        let output = done(operation.next(read(vec![Some(value(&alice))])));
         assert_eq!(
             output.users[0].attributes,
             HashMap::from([
@@ -431,18 +337,13 @@ mod pure_tests {
 
     #[test]
     fn rejects_unexpected_event() {
-        // The sans-I/O contract fails on an event invalid for the state.
+        // A result of another kind, or a read of another length, fails the lookup.
         let realm_id = RealmId::from_bytes([8u8; 32]);
         let alice = user(realm_id, 2, "Alice");
         let mut operation = ResolveUsersOperation::new(input(realm_id, vec![alice.user_id]));
 
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(alice.user_id.to_bytes()),
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(operation.finalize().is_err());
+        operation.first().unwrap();
+        assert!(operation.next(IoResult::Done).is_err());
+        assert!(operation.next(read(Vec::new())).is_err());
     }
 }

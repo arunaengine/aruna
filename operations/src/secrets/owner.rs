@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentClock, AdminDocumentTarget, NodeInterval};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
@@ -12,10 +13,11 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, OWNER_SECRETS_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{RealmVaultError, seal_named};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::register::{RegisterError, RegisterStamp};
+use aruna_core::rows;
 use aruna_core::secret_registers::{
     Eligibility, SecretBody, SecretDocument, SecretEntry, SecretInfo, SecretLifecycle, SecretOwner,
     SecretPart, SecretValue, current_entry, entry_prefix, owner_prefix, writer_eligibility,
@@ -27,12 +29,9 @@ use aruna_core::storage_entries::{reducer_state_key, sync_revision_entry};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord, SecretAudit};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Key, TxnId};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use super::{ChangeError, Managers, SecretChange, widening_notices};
@@ -57,9 +56,6 @@ pub struct OwnerChange {
     pub now_ms: u64,
     /// Ids for the lifecycle, info and value writes this change may make.
     pub write_ids: [Ulid; 3],
-    /// A parent operation's transaction to write in. The parent commits or aborts it and, after
-    /// a commit, schedules the document and notification drains. `None` opens and commits its own.
-    pub txn_id: Option<TxnId>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -83,6 +79,14 @@ pub enum OwnerSecretError {
     NotReadable,
     #[error("operation did not finish")]
     NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for OwnerSecretError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
+    }
 }
 
 impl From<SecretError> for OwnerSecretError {
@@ -99,6 +103,18 @@ pub struct WriterView {
 }
 
 impl WriterView {
+    /// The view of a stored realm config reducer state; none yet is the empty view.
+    fn read(value: Option<&[u8]>) -> Result<Self, OwnerSecretError> {
+        let Some(value) = value else {
+            return Ok(Self::default());
+        };
+        let state = decode_reducer_state(value).map_err(ConversionError::from)?;
+        Ok(Self {
+            intervals: state.node_intervals(),
+            clock: state.clock,
+        })
+    }
+
     pub fn counts(&self, document: &SecretDocument) -> bool {
         writer_eligibility(document, &self.intervals, &self.clock) == Eligibility::Counts
     }
@@ -112,7 +128,6 @@ pub(crate) struct EntryReader {
     pub view: WriterView,
     pub documents: Vec<SecretDocument>,
     reading_view: bool,
-    done: bool,
 }
 
 impl EntryReader {
@@ -123,7 +138,6 @@ impl EntryReader {
             view: WriterView::default(),
             documents: Vec::new(),
             reading_view: true,
-            done: false,
         }
     }
 
@@ -156,13 +170,7 @@ impl EntryReader {
     ) -> Result<Option<Effect>, OwnerSecretError> {
         match (self.reading_view, event) {
             (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if let Some(value) = value {
-                    let state = decode_reducer_state(&value).map_err(ConversionError::from)?;
-                    self.view = WriterView {
-                        intervals: state.node_intervals(),
-                        clock: state.clock,
-                    };
-                }
+                self.view = WriterView::read(value.as_deref())?;
                 self.reading_view = false;
                 Ok(Some(self.page(None, txn_id)))
             }
@@ -178,10 +186,7 @@ impl EntryReader {
                 }
                 match next_start_after {
                     Some(after) => Ok(Some(self.page(Some(IterStart::After(after)), txn_id))),
-                    None => {
-                        self.done = true;
-                        Ok(None)
-                    }
+                    None => Ok(None),
                 }
             }
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
@@ -197,17 +202,12 @@ impl EntryReader {
     }
 }
 
+/// The call an owner secret change waits for.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    StartTransaction,
+enum Stage {
     Reading,
-    ReadManagers,
+    Managers,
     Write,
-    Commit,
-    ScheduleDrain,
-    ScheduleNotices,
-    Done,
 }
 
 /// Creates, replaces, rotates or deletes one user or group secret on this node.
@@ -215,11 +215,11 @@ enum State {
 pub struct OwnerSecretOperation {
     input: OwnerChange,
     reader: EntryReader,
-    state: State,
-    txn_id: Option<TxnId>,
+    stage: Stage,
+    /// Whether the outbox drain and the notice drain still wait for the commit.
+    drain: bool,
     notices: bool,
     result: Option<Option<SecretEntry>>,
-    output: Option<Result<Option<SecretEntry>, OwnerSecretError>>,
 }
 
 impl OwnerSecretOperation {
@@ -228,28 +228,11 @@ impl OwnerSecretOperation {
         Self {
             input,
             reader,
-            state: State::Init,
-            txn_id: None,
+            stage: Stage::Reading,
+            drain: false,
             notices: false,
             result: None,
-            output: None,
         }
-    }
-
-    fn notices_or_done(&mut self) -> Effects {
-        if self.notices {
-            self.state = State::ScheduleNotices;
-            return smallvec![notice_drain_effect()];
-        }
-        self.state = State::Done;
-        self.output = Some(Ok(self.result.take().flatten()));
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: OwnerSecretError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Done;
-        self.abort()
     }
 
     /// One document of this change with the next stamp of its register on this node.
@@ -387,19 +370,21 @@ impl OwnerSecretOperation {
     }
 
     /// A group secret reads its group's roles, which name the managers a widening notice goes to.
-    fn read_managers(&mut self) -> Result<Effects, OwnerSecretError> {
+    fn read_managers(&mut self) -> Result<Next<Option<SecretEntry>>, OwnerSecretError> {
         let SecretOwner::Group(group_id) = self.input.owner else {
             return self.write(None);
         };
-        self.state = State::ReadManagers;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key: group_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })])
+        self.stage = Stage::Managers;
+        Ok(Next::Call(rows::read_row(
+            AUTH_KEYSPACE,
+            group_id.to_bytes().to_vec(),
+        )))
     }
 
-    fn write(&mut self, auth: Option<&[u8]>) -> Result<Effects, OwnerSecretError> {
+    fn write(
+        &mut self,
+        auth: Option<&[u8]>,
+    ) -> Result<Next<Option<SecretEntry>>, OwnerSecretError> {
         let old = (self.reader.entry())
             .and_then(|entry| entry.info)
             .map(|info| match info.body {
@@ -481,11 +466,9 @@ impl OwnerSecretOperation {
         writes.extend(audit.entries()?);
         self.reader.documents.extend(documents);
         self.result = Some(self.reader.entry());
-        self.state = State::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })])
+        self.stage = Stage::Write;
+        self.drain = true;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -498,112 +481,40 @@ fn expected(change: &SecretChange) -> Option<&str> {
     }
 }
 
-impl EffectOperation for OwnerSecretOperation {
+impl Operation for OwnerSecretOperation {
     type Output = Option<SecretEntry>;
     type Error = OwnerSecretError;
 
-    fn start(&mut self) -> Effects {
-        if let Some(txn_id) = self.input.txn_id {
-            self.txn_id = Some(txn_id);
-            self.state = State::Reading;
-            return smallvec![self.reader.start(self.txn_id)];
-        }
-        self.state = State::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
+        Ok(Next::Call(IoCall::Effect(Box::new(
+            self.reader.start(None),
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if self.state == State::Commit {
-                self.txn_id = None;
-            }
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
-            (
-                State::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Reading;
-                smallvec![self.reader.start(self.txn_id)]
-            }
-            (State::Reading, event) => match self.reader.step(event, self.txn_id) {
-                Ok(Some(effect)) => smallvec![effect],
-                Ok(None) => self
-                    .read_managers()
-                    .unwrap_or_else(|error| self.fail(error)),
-                Err(error) => self.fail(error),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
+        match self.stage {
+            Stage::Reading => match self.reader.step(rows::event(result)?, None)? {
+                Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
+                None => self.read_managers(),
             },
-            (State::ReadManagers, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                (self.write(value.as_deref())).unwrap_or_else(|error| self.fail(error))
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
-                if self.input.txn_id.is_some() =>
-            {
-                // The parent commits and schedules the document and notification drains.
-                self.txn_id = None;
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(OwnerSecretError::NotFinished);
-                };
-                self.state = State::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = State::ScheduleDrain;
-                smallvec![schedule_drain_effect()]
-            }
-            (State::ScheduleDrain, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.notices_or_done()
-            }
-            (State::ScheduleDrain, Event::Task(TaskEvent::Error { message, .. })) => {
-                warn!(error = %message, "Outbox drain not scheduled; the durable outbox retries");
-                self.notices_or_done()
-            }
-            (
-                State::ScheduleNotices,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                // The notice rows are committed; a missed timer leaves them to the next drain.
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
-            }
-            (State::Init | State::Done, _) => smallvec![],
-            (_, event) => {
-                let got = event.label();
-                self.fail(OwnerSecretError::UnexpectedEvent {
-                    state: "OwnerSecret",
-                    got,
-                })
+            Stage::Managers => self.write(rows::value(result)?.as_deref()),
+            Stage::Write => {
+                rows::done(result)?;
+                Ok(Next::Done(self.result.take().flatten()))
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        let own = self.input.txn_id.is_none();
-        match self.txn_id.take() {
-            Some(txn_id) if own => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
+    /// The outbox drain, then the notice drain; a missed timer leaves the rows to the next drain.
+    fn after_commit(&mut self) -> Option<Effect> {
+        if std::mem::take(&mut self.drain) {
+            return Some(schedule_drain_effect());
         }
+        std::mem::take(&mut self.notices).then(notice_drain_effect)
     }
 }
 
@@ -612,11 +523,10 @@ impl EffectOperation for OwnerSecretOperation {
 pub struct OwnerSecretsOperation {
     realm_id: RealmId,
     prefix: Vec<u8>,
-    start: Option<IterStart>,
+    after: Option<Key>,
     limit: usize,
     view: Option<WriterView>,
     documents: Vec<SecretDocument>,
-    output: Option<Result<(Vec<SecretEntry>, bool), OwnerSecretError>>,
 }
 
 impl OwnerSecretsOperation {
@@ -628,16 +538,14 @@ impl OwnerSecretsOperation {
         limit: usize,
     ) -> Self {
         // Part tags are 1 to 3, so 0xff sorts after every document of the cursor name.
-        let start = after
-            .map(|name| IterStart::After([entry_prefix(&owner, name), vec![0xff]].concat().into()));
+        let after = after.map(|name| [entry_prefix(&owner, name), vec![0xff]].concat().into());
         Self {
             realm_id,
             prefix: owner_prefix(&owner),
-            start,
+            after,
             limit: limit.clamp(1, 200),
             view: None,
             documents: Vec::new(),
-            output: None,
         }
     }
 
@@ -648,14 +556,13 @@ impl OwnerSecretsOperation {
         }
     }
 
-    fn page(&self, start: Option<IterStart>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OWNER_SECRETS_KEYSPACE.to_string(),
-            prefix: Some(self.prefix.clone().into()),
-            start,
+    fn page(&self, after: Option<Key>) -> Next<(Vec<SecretEntry>, bool)> {
+        Next::Call(IoCall::Page {
+            space: OWNER_SECRETS_KEYSPACE.to_string(),
+            prefix: self.prefix.clone().into(),
+            after,
             limit: PAGE,
-            txn_id: None,
-        })]
+        })
     }
 
     fn names(&self) -> Vec<&SecretName> {
@@ -686,104 +593,47 @@ impl OwnerSecretsOperation {
 
     /// Ends once more than `limit` entries are selected or nothing is left, so a page of
     /// deleted names never ends a listing early.
-    fn finish(&mut self, mut entries: Vec<SecretEntry>) {
+    fn finish(&self, mut entries: Vec<SecretEntry>) -> Next<(Vec<SecretEntry>, bool)> {
         let more = entries.len() > self.limit;
         entries.truncate(self.limit);
-        self.output = Some(Ok((entries, more)));
+        Next::Done((entries, more))
     }
 }
 
-impl EffectOperation for OwnerSecretsOperation {
+impl Operation for OwnerSecretsOperation {
     /// The entries and whether more names follow.
     type Output = (Vec<SecretEntry>, bool);
     type Error = OwnerSecretError;
 
-    fn start(&mut self) -> Effects {
-        let reader = EntryReader {
+    fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
+        let target = AdminDocumentTarget::RealmConfig {
             realm_id: self.realm_id,
-            prefix: Vec::new(),
-            view: WriterView::default(),
-            documents: Vec::new(),
-            reading_view: true,
-            done: false,
         };
-        smallvec![reader.start(None)]
+        Ok(Next::Call(rows::read_row(
+            DOCUMENT_STATE_KEYSPACE,
+            reducer_state_key(&target),
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.output.is_some() {
-            return smallvec![];
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
+        if self.view.is_none() {
+            self.view = Some(WriterView::read(rows::value(result)?.as_deref())?);
+            return Ok(self.page(self.after.clone()));
         }
-        let result: Result<(), OwnerSecretError> = match (self.view.is_none(), event) {
-            (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let state = value.map(|value| decode_reducer_state(&value)).transpose();
-                match state.map_err(ConversionError::from) {
-                    Ok(state) => {
-                        self.view =
-                            Some(state.map_or_else(WriterView::default, |state| WriterView {
-                                intervals: state.node_intervals(),
-                                clock: state.clock,
-                            }));
-                        return self.page(self.start.clone());
-                    }
-                    Err(error) => Err(OwnerSecretError::from(error)),
+        let (values, next) = rows::page(result)?;
+        for (_, value) in values {
+            self.documents.push(SecretDocument::from_bytes(&value)?);
+        }
+        Ok(match next {
+            Some(after) => {
+                let entries = self.entries(false);
+                match entries.len() > self.limit {
+                    true => self.finish(entries),
+                    false => self.page(Some(after)),
                 }
             }
-            (
-                false,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                let decoded: Result<Vec<_>, _> = values
-                    .iter()
-                    .map(|(_, value)| SecretDocument::from_bytes(value))
-                    .collect();
-                match decoded {
-                    Ok(documents) => {
-                        self.documents.extend(documents);
-                        match next_start_after {
-                            Some(after) => {
-                                let entries = self.entries(false);
-                                if entries.len() > self.limit {
-                                    self.finish(entries);
-                                    return smallvec![];
-                                }
-                                return self.page(Some(IterStart::After(after)));
-                            }
-                            None => {
-                                let entries = self.entries(true);
-                                self.finish(entries);
-                                return smallvec![];
-                            }
-                        }
-                    }
-                    Err(error) => Err(error.into()),
-                }
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, other) => Err(OwnerSecretError::UnexpectedEvent {
-                state: "OwnerSecrets",
-                got: other.label(),
-            }),
-        };
-        if let Err(error) = result {
-            self.output = Some(Err(error));
-        }
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+            None => self.finish(self.entries(true)),
+        })
     }
 }
 
@@ -795,7 +645,6 @@ pub struct ReadbackOperation {
     owner: SecretOwner,
     actor: UserId,
     entry: Option<SecretEntry>,
-    output: Option<Result<SecretEntry, OwnerSecretError>>,
 }
 
 impl ReadbackOperation {
@@ -805,11 +654,10 @@ impl ReadbackOperation {
             owner,
             actor,
             entry: None,
-            output: None,
         }
     }
 
-    fn audit(&mut self) -> Result<Effects, OwnerSecretError> {
+    fn audit(&mut self) -> Result<Next<SecretEntry>, OwnerSecretError> {
         let entry = self.reader.entry().filter(SecretEntry::complete);
         let entry = entry.ok_or(ChangeError::NotFound)?;
         let readable = entry.readable() && self.owner == SecretOwner::User(self.actor);
@@ -827,57 +675,29 @@ impl ReadbackOperation {
             },
         );
         self.entry = Some(entry);
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: audit.entries()?,
-            txn_id: None,
-        })])
+        Ok(Next::Call(IoCall::Write(audit.entries()?)))
     }
 }
 
-impl EffectOperation for ReadbackOperation {
+impl Operation for ReadbackOperation {
     type Output = SecretEntry;
     type Error = OwnerSecretError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![self.reader.start(None)]
+    fn first(&mut self) -> Result<Next<Self::Output>, OwnerSecretError> {
+        Ok(Next::Call(IoCall::Effect(Box::new(
+            self.reader.start(None),
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.output.is_some() {
-            return smallvec![];
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, OwnerSecretError> {
+        if let Some(entry) = self.entry.take() {
+            rows::done(result)?;
+            return Ok(Next::Done(entry));
         }
-        let result = match (&self.entry, event) {
-            (None, event) => match self.reader.step(event, None) {
-                Ok(Some(effect)) => return smallvec![effect],
-                Ok(None) => match self.audit() {
-                    Ok(effects) => return effects,
-                    Err(error) => Err(error),
-                },
-                Err(error) => Err(error),
-            },
-            (Some(entry), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(entry.clone())
-            }
-            (Some(_), Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (Some(_), other) => Err(OwnerSecretError::UnexpectedEvent {
-                state: "Readback",
-                got: other.label(),
-            }),
-        };
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(OwnerSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        match self.reader.step(rows::event(result)?, None)? {
+            Some(effect) => Ok(Next::Call(IoCall::Effect(Box::new(effect)))),
+            None => self.audit(),
+        }
     }
 }
 

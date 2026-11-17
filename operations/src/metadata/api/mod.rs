@@ -42,15 +42,11 @@ use ulid::Ulid;
 use self::distributed_types::{
     object_search_fingerprint, record_object_result, record_preflight_node,
 };
-use self::export::export_summary_jsonld;
-
-use self::fanout::run_metadata_fanout;
 
 use self::fanout_types::forwarded_bearer;
 
 use self::fanout_types::{MetadataFanoutOperation, MetadataNodeCall};
 use self::fanout_types::{fanout_bearer, metadata_node_call, query_union_safe};
-use self::list::{load_group_records, load_pending_records};
 #[cfg(test)]
 use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
@@ -61,14 +57,7 @@ use self::list_types::{check_policy_limit, merge_pending_records};
 use self::path_types::select_fanout_nodes;
 use self::path_types::{deduplicate_fanout_nodes, replica_query_nodes};
 
-use self::preflight::discover_realm_nodes;
-use self::preflight::{reference_document_title, resolve_graph_reference};
-use self::read::ensure_record_materialized;
-use self::read::{can_read_record, ensure_record_readable, load_live_record};
-
 use self::read_types::metadata_read_request;
-use super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
-use super::handle::QUERY_MAX_BYTES;
 use super::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
@@ -83,22 +72,17 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::record_reads::{load_document_record, record_materialized_read};
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
     parse_registry_read, read_document_registry,
 };
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::realm::load_config::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::local_search::search_local_buckets;
 use crate::s3::bucket::search::{BucketPage, BucketSearchHit, SearchBucketsInput};
 use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
 };
-use crate::s3::object::search_scan::search_local_objects;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
 use aruna_core::placement::selector::{

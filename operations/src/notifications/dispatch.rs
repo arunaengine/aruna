@@ -24,11 +24,11 @@ use crate::notifications::client::{
     watches_listed,
 };
 use crate::notifications::list::{
-    LIST_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
+    LIST_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation, SCAN_MAX_ROWS,
+    UNREAD_COUNT_CAP,
 };
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unread::{SCAN_MAX_ROWS, UNREAD_COUNT_CAP};
 use crate::notifications::watch::authorization::{
     authorize_notification, list_authorized_subscriptions,
 };

@@ -3,28 +3,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, LocalFileEvent, StorageEvent};
+use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::{ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
 
 use super::actions::ActionError;
 use super::repository::{action_entry, base_key};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum RemoveState {
-    Init,
+enum RemoveStep {
     MoveFile,
-    StartTransaction,
-    WriteRows { txn_id: TxnId },
-    DeleteBase { txn_id: TxnId },
-    Commit,
-    Finish,
-    Error,
+    WriteRows,
+    DeleteBase,
 }
 
 /// Moves one file into the folder's trash and drops its base row, with the
@@ -35,12 +30,10 @@ pub struct RemoveEntryOperation {
     relative: String,
     guard: WriteGuard,
     record: SyncActionRecord,
-    state: RemoveState,
-    rows: Vec<(String, Key, Value)>,
+    step: RemoveStep,
     /// A refused move keeps the entry exactly as it was: only the audit row is
     /// written, never the base-row deletion.
     refused: bool,
-    output: Option<Result<SyncActionRecord, ActionError>>,
 }
 
 impl RemoveEntryOperation {
@@ -55,131 +48,160 @@ impl RemoveEntryOperation {
             relative,
             guard,
             record,
-            state: RemoveState::Init,
-            rows: Vec::new(),
+            step: RemoveStep::MoveFile,
             refused: false,
-            output: None,
         }
+    }
+
+    /// Records what the move did and writes the audit row.
+    fn moved(&mut self, event: Event) -> Result<IoCall, ActionError> {
+        let Event::LocalFile(event) = event else {
+            return Err(ActionError::Unavailable);
+        };
+        self.refused = matches!(event, LocalFileEvent::Refused { .. });
+        self.record = match event {
+            // The trash path is the evidence the bytes still exist.
+            LocalFileEvent::Moved { to } => SyncActionRecord {
+                trashed_to: Some(to),
+                outcome: ActionOutcome::Applied,
+                ..self.record.clone()
+            },
+            LocalFileEvent::Refused { reason } => SyncActionRecord {
+                outcome: match reason {
+                    LocalFileRefusal::Drifted => ActionOutcome::Stale,
+                    other => ActionOutcome::Failed {
+                        reason: format!("{other:?}"),
+                    },
+                },
+                ..self.record.clone()
+            },
+            other => {
+                let label = Event::LocalFile(other).label().to_string();
+                return Err(ActionError::Storage(StorageError::WriteError(label)));
+            }
+        };
+        let row = action_entry(&self.record).map_err(|_| ActionError::Unavailable)?;
+        self.step = RemoveStep::WriteRows;
+        Ok(IoCall::Write(vec![row]))
     }
 }
 
-impl EffectOperation for RemoveEntryOperation {
+impl Operation for RemoveEntryOperation {
     type Output = SyncActionRecord;
     type Error = ActionError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RemoveState::MoveFile;
-        smallvec![Effect::LocalFile(LocalFileEffect::MoveAside {
+    fn first(&mut self) -> Result<Next<SyncActionRecord>, ActionError> {
+        let effect = LocalFileEffect::MoveAside {
             root: self.folder.root.clone(),
             relative: self.relative.clone(),
             guard: self.guard.clone(),
-        })]
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::LocalFile(
+            effect,
+        )))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return remove_failed(self, ActionError::Storage(error));
-        }
-        match (self.state, event) {
-            (RemoveState::MoveFile, Event::LocalFile(event)) => {
-                let refused = matches!(event, LocalFileEvent::Refused { .. });
-                self.record = match event {
-                    // The trash path is the evidence the bytes still exist.
-                    LocalFileEvent::Moved { to } => SyncActionRecord {
-                        trashed_to: Some(to),
-                        outcome: ActionOutcome::Applied,
-                        ..self.record.clone()
-                    },
-                    LocalFileEvent::Refused { reason } => SyncActionRecord {
-                        outcome: match reason {
-                            aruna_core::events::LocalFileRefusal::Drifted => ActionOutcome::Stale,
-                            other => ActionOutcome::Failed {
-                                reason: format!("{other:?}"),
-                            },
-                        },
-                        ..self.record.clone()
-                    },
-                    other => {
-                        return remove_failed(
-                            self,
-                            ActionError::Storage(StorageError::WriteError(
-                                Event::LocalFile(other).label().to_string(),
-                            )),
-                        );
-                    }
-                };
-                let Ok(row) = action_entry(&self.record) else {
-                    return remove_failed(self, ActionError::Unavailable);
-                };
-                self.rows = vec![row];
-                self.refused = refused;
-                self.state = RemoveState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
+    fn next(&mut self, result: IoResult) -> Result<Next<SyncActionRecord>, ActionError> {
+        match self.step {
+            RemoveStep::MoveFile => Ok(Next::Call(self.moved(result.event()?)?)),
+            RemoveStep::WriteRows if !self.refused => {
+                done(result)?;
+                self.step = RemoveStep::DeleteBase;
+                let key = base_key(self.folder.folder_id, &self.relative);
+                Ok(Next::Call(IoCall::Delete(vec![(
+                    SYNC_BASE_KEYSPACE.to_string(),
+                    key,
+                )])))
             }
-            (
-                RemoveState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.state = RemoveState::WriteRows { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: std::mem::take(&mut self.rows),
-                    txn_id: Some(txn_id),
-                })]
+            RemoveStep::WriteRows | RemoveStep::DeleteBase => {
+                done(result)?;
+                Ok(Next::Done(self.record.clone()))
             }
-            (
-                RemoveState::WriteRows { txn_id },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
-                if self.refused {
-                    self.state = RemoveState::Commit;
-                    return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-                }
-                self.state = RemoveState::DeleteBase { txn_id };
-                smallvec![Effect::Storage(StorageEffect::Delete {
-                    key_space: SYNC_BASE_KEYSPACE.to_string(),
-                    key: base_key(self.folder.folder_id, &self.relative),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (
-                RemoveState::DeleteBase { txn_id },
-                Event::Storage(StorageEvent::DeleteResult { .. }),
-            ) => {
-                self.state = RemoveState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (RemoveState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = RemoveState::Finish;
-                self.output = Some(Ok(self.record.clone()));
-                smallvec![]
-            }
-            (_, _) => remove_failed(self, ActionError::Unavailable),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RemoveState::Finish | RemoveState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ActionError::Unavailable)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            RemoveState::WriteRows { txn_id } | RemoveState::DeleteBase { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
-fn remove_failed(operation: &mut RemoveEntryOperation, error: ActionError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = RemoveState::Error;
-    operation.output = Some(Err(error));
-    cleanup
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::sync::reconcile::pure_tests::folder;
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::{ActionKind, ActionScope};
+    use ulid::Ulid;
+
+    fn record() -> SyncActionRecord {
+        SyncActionRecord {
+            action_id: Ulid::from_bytes([5u8; 16]),
+            folder_id: folder().folder_id,
+            kind: ActionKind::RemoveLocal,
+            scope: ActionScope::Entry {
+                relative: "a.txt".to_string(),
+            },
+            actor: UserId::new(Ulid::nil(), RealmId::from_bytes([7u8; 32])),
+            at_ms: 1,
+            before: None,
+            after: None,
+            outcome: ActionOutcome::Applied,
+            trashed_to: None,
+            entries: 0,
+        }
+    }
+
+    fn remove() -> RemoveEntryOperation {
+        RemoveEntryOperation::new(folder(), "a.txt".to_string(), WriteGuard::MustNotExist, record())
+    }
+
+    fn answer(event: LocalFileEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::LocalFile(event)))
+    }
+
+    // A moved file writes the audit row, then drops the base row, in the transaction.
+    #[test]
+    fn moves_then_drops_base() {
+        let mut remove = remove();
+        assert!(remove.transaction());
+        assert!(matches!(
+            remove.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let moved = answer(LocalFileEvent::Moved {
+            to: ".trash/a.txt".to_string(),
+        });
+        let applied = SyncActionRecord {
+            trashed_to: Some(".trash/a.txt".to_string()),
+            ..record()
+        };
+        let audit = IoCall::Write(vec![action_entry(&applied).unwrap()]);
+        assert_eq!(remove.next(moved), Ok(Next::Call(audit)));
+        let base = (
+            SYNC_BASE_KEYSPACE.to_string(),
+            base_key(folder().folder_id, "a.txt"),
+        );
+        let drop = IoCall::Delete(vec![base]);
+        assert_eq!(remove.next(IoResult::Done), Ok(Next::Call(drop)));
+        assert_eq!(remove.next(IoResult::Done), Ok(Next::Done(applied)));
+    }
+
+    // A refused move keeps the base row and records only the audit row.
+    #[test]
+    fn refused_keeps_base() {
+        let mut remove = remove();
+        remove.first().unwrap();
+        let refused = answer(LocalFileEvent::Refused {
+            reason: LocalFileRefusal::Drifted,
+        });
+        assert!(matches!(
+            remove.next(refused),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Done(stale)) = remove.next(IoResult::Done) else {
+            panic!("expected the stale record");
+        };
+        assert_eq!(stale.outcome, ActionOutcome::Stale);
+    }
 }

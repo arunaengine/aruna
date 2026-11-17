@@ -3,17 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Effects, Key};
-use aruna_tasks::shutdown::Shutdown;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -38,23 +36,24 @@ pub enum CutoffSweepError {
     Conversion(#[from] ConversionError),
     #[error("credential revocation failed: {0}")]
     Revocation(String),
-    #[error("cutoff sweep did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error("cutoff sweep failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for CutoffSweepError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SweepState {
-    Init,
     ReadConfig,
     Scan,
     Revoke,
-    Finish,
 }
 
 /// Reads the realm's cutoffs, then pages through the credentials and revokes, one at a time,
@@ -65,48 +64,20 @@ pub struct CutoffSweepOperation {
     state: SweepState,
     cutoffs: Option<RealmConfigDocument>,
     pending: Vec<String>,
-    after: Option<Key>,
+    pages: PrefixPages,
     revoked: usize,
-    output: Option<Result<usize, CutoffSweepError>>,
 }
 
 impl CutoffSweepOperation {
     pub fn new(config: CutoffSweepConfig) -> Self {
         Self {
             config,
-            state: SweepState::Init,
+            state: SweepState::ReadConfig,
             cutoffs: None,
             pending: Vec::new(),
-            after: None,
+            pages: PrefixPages::new(USER_ACCESS_KEYSPACE, Vec::new(), PAGE),
             revoked: 0,
-            output: None,
         }
-    }
-
-    fn finish(&mut self, result: Result<usize, CutoffSweepError>) -> Effects {
-        self.state = SweepState::Finish;
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        let error = CutoffSweepError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label().to_string(),
-        };
-        self.finish(Err(error))
-    }
-
-    fn scan(&mut self, start: Option<Key>) -> Effects {
-        self.state = SweepState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USER_ACCESS_KEYSPACE.to_string(),
-            prefix: None,
-            start: start.map(IterStart::After),
-            limit: PAGE,
-            txn_id: None,
-        })]
     }
 
     /// Whether this node issued the credential before a live cutoff of its owner.
@@ -118,60 +89,48 @@ impl CutoffSweepOperation {
             && cutoff.is_some_and(|cutoff| issued < cutoff)
     }
 
-    fn handle_config(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("realm config read", event);
+    fn handle_config(&mut self, result: IoResult) -> Result<Next<usize>, CutoffSweepError> {
+        let Some(bytes) = result.value()? else {
+            return Ok(Next::Done(0));
         };
-        let Some(bytes) = value else {
-            return self.finish(Ok(0));
-        };
-        match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => self.cutoffs = Some(config),
-            Err(error) => return self.finish(Err(error.into())),
-        }
-        self.scan(None)
+        self.cutoffs = Some(RealmConfigDocument::from_bytes(&bytes)?);
+        self.state = SweepState::Scan;
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected("credential page", event);
-        };
-        for (_, value) in values {
-            match UserAccess::from_bytes(&value) {
-                Ok(access) if self.cut_off(&access) => self.pending.push(access.access_key),
-                Ok(_) => {}
-                Err(error) => return self.finish(Err(error.into())),
+    fn handle_page(&mut self, result: IoResult) -> Result<Next<usize>, CutoffSweepError> {
+        for (_, value) in self.pages.take(result)? {
+            let access = UserAccess::from_bytes(&value)?;
+            if self.cut_off(&access) {
+                self.pending.push(access.access_key);
             }
         }
-        self.after = next_start_after;
-        self.next()
+        Ok(self.advance())
     }
 
-    fn next(&mut self) -> Effects {
+    fn advance(&mut self) -> Next<usize> {
         if let Some(access_key) = self.pending.pop() {
             self.state = SweepState::Revoke;
             let revoke = RevokeUserOperation::new(access_key);
-            return smallvec![Effect::SubOperation(boxed_suboperation(revoke, revoked))];
+            return Next::Call(IoCall::Child(boxed_suboperation(revoke, revoked)));
         }
-        match self.after.take() {
-            Some(after) => self.scan(Some(after)),
-            None => self.finish(Ok(self.revoked)),
+        if self.pages.done() {
+            return Next::Done(self.revoked);
         }
+        self.state = SweepState::Scan;
+        Next::Call(self.pages.call())
     }
 
-    fn handle_revoked(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::TokenRevoked { result }) = event else {
-            return self.unexpected("credential revocation", event);
+    fn handle_revoked(&mut self, result: IoResult) -> Result<Next<usize>, CutoffSweepError> {
+        let Event::SubOperation(SubOperationEvent::TokenRevoked { result }) = result.event()?
+        else {
+            let expected = "SubOperationEvent::TokenRevoked";
+            let got = "another event";
+            return Err(IoError::Unexpected { expected, got }.into());
         };
-        match result {
-            Ok(()) => self.revoked += 1,
-            Err(error) => return self.finish(Err(CutoffSweepError::Revocation(error))),
-        }
-        self.next()
+        result.map_err(CutoffSweepError::Revocation)?;
+        self.revoked += 1;
+        Ok(self.advance())
     }
 }
 
@@ -184,44 +143,24 @@ fn revoked(result: Result<UserAccess, RevokeUserError>) -> Event {
     Event::SubOperation(SubOperationEvent::TokenRevoked { result })
 }
 
-impl EffectOperation for CutoffSweepOperation {
+impl Operation for CutoffSweepOperation {
     type Output = usize;
     type Error = CutoffSweepError;
 
-    fn start(&mut self) -> Effects {
-        self.state = SweepState::ReadConfig;
+    fn first(&mut self) -> Result<Next<usize>, CutoffSweepError> {
         let target = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })]
+        let read = read_row(target.storage_keyspace(), target.storage_key());
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.finish(Err(error.into()));
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, CutoffSweepError> {
         match self.state {
-            SweepState::ReadConfig => self.handle_config(event),
-            SweepState::Scan => self.handle_page(event),
-            SweepState::Revoke => self.handle_revoked(event),
-            SweepState::Init | SweepState::Finish => self.unexpected("no event", event),
+            SweepState::ReadConfig => self.handle_config(result),
+            SweepState::Scan => self.handle_page(result),
+            SweepState::Revoke => self.handle_revoked(result),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == SweepState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CutoffSweepError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

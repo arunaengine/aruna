@@ -15,6 +15,7 @@ use crate::plugins::decide::{SeenRow, seen_key};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::config;
 use crate::plugins::rows::decode;
+use crate::plugins::rows::{page_result, values_result};
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;
@@ -157,23 +158,23 @@ fn settle_frees_slot() {
         (PLUGIN_WAITING_KEYSPACE, key.clone()),
         (PLUGIN_QUEUE_KEYSPACE, key.clone()),
     ];
-    assert_eq!(expired.first().unwrap(), Turn::Ask(Ask::Delete(freed)));
+    assert_eq!(expired.first().unwrap(), Next::Call(delete_call(freed)));
     assert!(matches!(
-        expired.next(Answer::Done).unwrap(),
-        Turn::Ask(Ask::Read(_))
+        expired.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Read(_))
     ));
-    let Turn::Ask(Ask::Write(rows)) = expired.next(Answer::Values(vec![None])).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = expired.next(values_result(vec![None])).unwrap() else {
         panic!("the gap and the dedup record are written");
     };
     assert_eq!(rows.len(), 2);
-    assert_eq!(expired.next(Answer::Done).unwrap(), Turn::Finish(()));
+    assert_eq!(expired.next(IoResult::Done).unwrap(), Next::Done(()));
     // A denied event records its denial only.
     let denied = Some(Verdict::Denied("no".into()));
     let mut refused = SettleWaiting::new(key, waiting_row(1), denied, (local, 9));
     refused.first().unwrap();
-    let Turn::Ask(Ask::Write(rows)) = refused.next(Answer::Done).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = refused.next(IoResult::Done).unwrap() else {
         panic!("the denial is recorded");
     };
     assert_eq!(rows.len(), 1);
-    assert!(refused.next(Answer::Page(Vec::new(), None)).is_err());
+    assert!(refused.next(page_result(Vec::new(), None)).is_err());
 }

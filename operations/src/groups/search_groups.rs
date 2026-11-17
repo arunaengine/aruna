@@ -2,14 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group::Group;
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,21 +29,11 @@ pub struct SearchGroupsOutput {
     pub next_start_after: Option<String>,
 }
 
+/// Scans groups page by page until one more match than the limit or the end of the keyspace.
 #[derive(Debug, PartialEq)]
 pub struct SearchGroupsOperation {
     input: SearchGroupsInput,
-    state: SearchGroupsState,
     matches: Vec<SearchGroupsMatch>,
-    storage_start_after: Option<Key>,
-    output: Option<Result<SearchGroupsOutput, SearchGroupsError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SearchGroupsState {
-    Init,
-    SearchGroups,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -64,90 +52,73 @@ pub enum SearchGroupsError {
     NotFinished,
 }
 
+impl From<IoError> for SearchGroupsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SearchGroups".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl SearchGroupsOperation {
     pub fn new(mut input: SearchGroupsInput) -> Self {
         input.limit = input.limit.max(1);
         Self {
             input,
-            state: SearchGroupsState::Init,
             matches: Vec::new(),
-            storage_start_after: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: SearchGroupsError) -> Effects {
-        self.state = SearchGroupsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
+    fn page(&self, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: GROUP_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: self.input.limit.saturating_add(1).max(64),
         }
-        Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(SearchGroupsError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
+    fn finish(&mut self, next_start_after: Option<String>) -> Next<SearchGroupsOutput> {
+        Next::Done(SearchGroupsOutput {
+            groups: std::mem::take(&mut self.matches),
+            next_start_after,
         })
     }
+}
 
-    fn start_after_key(&self) -> Result<Option<Key>, SearchGroupsError> {
-        match (&self.storage_start_after, &self.input.start_after) {
-            (Some(key), _) => Ok(Some(key.clone())),
-            (None, Some(group_id)) => {
-                let group_id = GroupId::from_string(group_id).map_err(ConversionError::from)?;
-                Ok(Some(group_id.to_bytes().to_vec().into()))
-            }
-            (None, None) => Ok(None),
-        }
+impl Operation for SearchGroupsOperation {
+    type Output = SearchGroupsOutput;
+    type Error = SearchGroupsError;
+
+    fn first(&mut self) -> Result<Next<SearchGroupsOutput>, SearchGroupsError> {
+        let after = (self.input.start_after.as_deref())
+            .map(|group_id| GroupId::from_string(group_id).map_err(ConversionError::from))
+            .transpose()?
+            .map(|group_id| Key::from(group_id.to_bytes().to_vec()));
+        Ok(Next::Call(self.page(after)))
     }
 
-    fn emit_search_groups(&mut self) -> Result<Effects, SearchGroupsError> {
-        self.state = SearchGroupsState::SearchGroups;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.start_after_key()?.map(IterStart::After),
-            limit: self.input.limit.saturating_add(1).max(64),
-            txn_id: None,
-        })])
-    }
-
-    fn handle_search_groups(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
+    fn next(&mut self, result: IoResult) -> Result<Next<SearchGroupsOutput>, SearchGroupsError> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(SearchGroupsError::UnexpectedEvent {
+                state: "SearchGroups".to_string(),
+                expected: "IoResult::Page",
+                got: result.label(),
+            });
         };
-
-        match self.collect_matches(values, next_start_after) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn matches_query(group: &Group, query: &str) -> bool {
-        group.display_name.to_lowercase().contains(query)
-    }
-
-    fn collect_matches(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        next_start_after: Option<Key>,
-    ) -> Result<Effects, SearchGroupsError> {
         let query = self.input.query.to_lowercase();
-        for (_, value) in values {
+        for (_, value) in rows {
             let group = Group::from_bytes(&value)?;
-            if !Self::matches_query(&group, &query) {
+            if !group.display_name.to_lowercase().contains(&query) {
                 continue;
             }
             self.matches.push(SearchGroupsMatch {
@@ -155,69 +126,15 @@ impl SearchGroupsOperation {
                 display_name: group.display_name,
             });
         }
-
         if self.matches.len() > self.input.limit {
             self.matches.truncate(self.input.limit);
             let next_start_after = self.matches.last().map(|group| group.group_id.to_string());
-            return Ok(self.emit_finish(next_start_after));
+            return Ok(self.finish(next_start_after));
         }
-
-        if let Some(next_start_after) = next_start_after {
-            self.storage_start_after = Some(next_start_after);
-            return self.emit_search_groups();
+        match next {
+            Some(after) => Ok(Next::Call(self.page(Some(after)))),
+            None => Ok(self.finish(None)),
         }
-
-        Ok(self.emit_finish(None))
-    }
-
-    fn emit_finish(&mut self, next_start_after: Option<String>) -> Effects {
-        self.state = SearchGroupsState::Finish;
-        self.output = Some(Ok(SearchGroupsOutput {
-            groups: std::mem::take(&mut self.matches),
-            next_start_after,
-        }));
-        smallvec![]
-    }
-}
-
-impl EffectOperation for SearchGroupsOperation {
-    type Output = SearchGroupsOutput;
-    type Error = SearchGroupsError;
-
-    fn start(&mut self) -> Effects {
-        match self.emit_search_groups() {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.catch_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            SearchGroupsState::SearchGroups => self.handle_search_groups(event),
-            SearchGroupsState::Init | SearchGroupsState::Finish | SearchGroupsState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SearchGroupsState::Finish | SearchGroupsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(SearchGroupsError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -225,9 +142,8 @@ impl EffectOperation for SearchGroupsOperation {
 mod pure_tests {
     use super::{SearchGroupsInput, SearchGroupsMatch, SearchGroupsOperation, SearchGroupsOutput};
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, IterStart, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::Group;
     use aruna_core::structs::identity::realm::RealmId;
@@ -265,6 +181,10 @@ mod pure_tests {
         )
     }
 
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
+    }
+
     fn matched(group: &Group) -> SearchGroupsMatch {
         SearchGroupsMatch {
             group_id: group.group_id,
@@ -287,38 +207,20 @@ mod pure_tests {
         let bob = group(3, "bob");
         let mut operation = SearchGroupsOperation::new(input("ali", 10));
 
-        let effects = operation.start();
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix,
-                start,
-                limit,
-                txn_id,
-            }) => {
-                assert_eq!(key_space, aruna_core::keyspaces::GROUP_KEYSPACE);
-                assert_eq!(prefix, &None);
-                assert_eq!(start, &None);
-                assert_eq!(*limit, 64);
-                assert_eq!(txn_id, &None);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        let scan = IoCall::Page {
+            space: aruna_core::keyspaces::GROUP_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: 64,
+        };
+        assert_eq!(operation.first(), Ok(Next::Call(scan)));
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&bob)],
+        let page = page(vec![entry(&alice), entry(&bob)], None);
+        let output = SearchGroupsOutput {
+            groups: vec![matched(&alice)],
             next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize().unwrap(),
-            SearchGroupsOutput {
-                groups: vec![matched(&alice)],
-                next_start_after: None,
-            }
-        );
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(output)));
     }
 
     #[test]
@@ -326,21 +228,14 @@ mod pure_tests {
         let alice = group(2, "match-alice");
         let bob = group(3, "match-bob");
         let mut operation = SearchGroupsOperation::new(input("match", 1));
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&bob)],
-            next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert_eq!(
-            operation.finalize().unwrap(),
-            SearchGroupsOutput {
-                groups: vec![matched(&alice)],
-                next_start_after: Some(alice.group_id.to_string()),
-            }
-        );
+        let page = page(vec![entry(&alice), entry(&bob)], None);
+        let output = SearchGroupsOutput {
+            groups: vec![matched(&alice)],
+            next_start_after: Some(alice.group_id.to_string()),
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(output)));
     }
 
     #[test]
@@ -350,36 +245,25 @@ mod pure_tests {
         let skipped = group(3, "other");
         let bob = group(4, "match-bob");
         let mut operation = SearchGroupsOperation::new(input("match", 2));
-        operation.start();
+        operation.first().unwrap();
 
         let continuation_key: Key = skipped.group_id.to_bytes().to_vec().into();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&skipped)],
-            next_start_after: Some(continuation_key.clone()),
-        }));
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            }) => {
-                assert_eq!(key, &continuation_key);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-        assert!(!operation.is_complete());
+        let first = page(
+            vec![entry(&alice), entry(&skipped)],
+            Some(continuation_key.clone()),
+        );
+        assert!(matches!(
+            operation.next(first),
+            Ok(Next::Call(IoCall::Page { after: Some(key), .. })) if key == continuation_key
+        ));
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&bob)],
+        let output = SearchGroupsOutput {
+            groups: vec![matched(&alice), matched(&bob)],
             next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
-            SearchGroupsOutput {
-                groups: vec![matched(&alice), matched(&bob)],
-                next_start_after: None,
-            }
+            operation.next(page(vec![entry(&bob)], None)),
+            Ok(Next::Done(output))
         );
     }
 }

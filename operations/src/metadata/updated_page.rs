@@ -2,19 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::effects::IterStart;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
-use aruna_core::storage_entries::{metadata_document_key, parse_updated_key, updated_index_key};
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::timestamp_sweep::INDEX_SCAN_BATCH;
+use crate::metadata::call_results::{page_rows, read_values};
+use crate::metadata::timestamp_sweep::{records_call, scan_call};
 
 /// One page of registry records ordered by `updated_at_ms`, plus stale index
 /// keys the caller may sweep.
@@ -34,33 +33,21 @@ pub enum UpdatedPageError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event while {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("the updated records page did not finish")]
-    Unfinished,
+    #[error(transparent)]
+    Io(IoError),
 }
 
-#[derive(Debug, PartialEq)]
-enum PageState {
-    Init,
-    Scan,
-    Records,
-    Done,
-}
-
-impl PageState {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Init => "starting",
-            Self::Scan => "reading an index page",
-            Self::Records => "reading registry records",
-            Self::Done => "finished",
+impl From<IoError> for UpdatedPageError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
         }
     }
 }
+
+type PageTurn = Result<Next<UpdatedRecordsPage>, UpdatedPageError>;
 
 /// Enumerates registry records whose `updated_at_ms` is in `[from_ms, until_ms]`,
 /// ascending, up to `limit` records. Keys are validated against the current record;
@@ -72,12 +59,11 @@ pub struct UpdatedPageOperation {
     limit: usize,
     records: Vec<MetadataRegistryRecord>,
     stale_keys: Vec<Key>,
-    /// The candidate keys of the current page with their datestamp, in scan order.
+    /// The candidate keys of the current page with their datestamp, in scan order;
+    /// empty while an index page is read.
     candidates: Vec<(Key, u64)>,
     /// Where the scan continues after this page; `None` ends the window.
     after_page: Option<IterStart>,
-    state: PageState,
-    output: Option<Result<UpdatedRecordsPage, UpdatedPageError>>,
 }
 
 impl UpdatedPageOperation {
@@ -94,48 +80,22 @@ impl UpdatedPageOperation {
             stale_keys: Vec::new(),
             candidates: Vec::new(),
             after_page: None,
-            state: PageState::Init,
-            output: None,
         }
     }
 
-    fn scan(&mut self, start: IterStart) -> Effects {
-        self.state = PageState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPDATED_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: Some(start),
-            limit: INDEX_SCAN_BATCH,
-            txn_id: None,
-        })]
-    }
-
-    fn finish(&mut self, output: Result<UpdatedRecordsPage, UpdatedPageError>) -> Effects {
-        self.state = PageState::Done;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn page(&mut self, next_after: Option<Key>) -> Effects {
-        let page = UpdatedRecordsPage {
+    fn page(&mut self, next_after: Option<Key>) -> PageTurn {
+        Ok(Next::Done(UpdatedRecordsPage {
             records: std::mem::take(&mut self.records),
             next_after,
             stale_keys: std::mem::take(&mut self.stale_keys),
-        };
-        self.finish(Ok(page))
+        }))
     }
 
-    fn scanned_page(&mut self, entries: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        if entries.is_empty() {
-            return self.page(None);
-        }
+    fn scanned_page(&mut self, entries: Vec<(Key, Value)>, next: Option<Key>) -> PageTurn {
         let mut documents = Vec::new();
         let mut past_window = false;
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = match parse_updated_key(key.as_ref()) {
-                Ok(parsed) => parsed,
-                Err(error) => return self.finish(Err(error.into())),
-            };
+            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())?;
             if updated_at_ms > self.until_ms {
                 past_window = true;
                 break;
@@ -150,38 +110,23 @@ impl UpdatedPageOperation {
         if documents.is_empty() {
             return self.page(None);
         }
-        let reads = documents
-            .into_iter()
-            .map(|document_id| {
-                (
-                    DOCUMENT_INDEX_KEYSPACE.to_string(),
-                    metadata_document_key(document_id),
-                )
-            })
-            .collect();
-        self.state = PageState::Records;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(records_call(documents)))
     }
 
-    fn read_records(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn read_records(&mut self, values: Vec<Option<Value>>) -> PageTurn {
         let candidates = std::mem::take(&mut self.candidates);
         if values.len() != candidates.len() {
-            return self.finish(Err(UpdatedPageError::UnexpectedEvent {
-                state: self.state.name(),
-                got: "StorageEvent::BatchReadResult with a different length",
-            }));
+            return Err(IoError::Unexpected {
+                expected: "one record per index key",
+                got: "another count of records",
+            }
+            .into());
         }
-        for ((key, updated_at_ms), (_, value)) in candidates.into_iter().zip(values) {
-            let record = match value
+        for ((key, updated_at_ms), value) in candidates.into_iter().zip(values) {
+            let record = value
                 .map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes))
-            {
-                Some(Ok(record)) => Some(record),
-                Some(Err(error)) => return self.finish(Err(ConversionError::from(error).into())),
-                None => None,
-            };
+                .transpose()
+                .map_err(ConversionError::from)?;
             match record {
                 Some(record) if record.updated_at_ms == updated_at_ms => {
                     self.records.push(record);
@@ -193,76 +138,48 @@ impl UpdatedPageOperation {
             }
         }
         match self.after_page.take() {
-            Some(next) => self.scan(next),
+            Some(next) => Ok(Next::Call(scan_call(next))),
             None => self.page(None),
         }
     }
 }
 
-impl EffectOperation for UpdatedPageOperation {
+impl Operation for UpdatedPageOperation {
     type Output = UpdatedRecordsPage;
     type Error = UpdatedPageError;
 
-    fn start(&mut self) -> Effects {
-        let start = self.start.clone();
-        self.scan(start)
+    fn first(&mut self) -> PageTurn {
+        Ok(Next::Call(scan_call(self.start.clone())))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let reading = matches!(self.state, PageState::Scan | PageState::Records);
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if self.state == PageState::Scan => self.scanned_page(values, next_start_after),
-            Event::Storage(StorageEvent::BatchReadResult { values })
-                if self.state == PageState::Records =>
-            {
-                self.read_records(values)
-            }
-            Event::Storage(StorageEvent::Error { error }) if reading => {
-                self.finish(Err(error.into()))
-            }
-            event => {
-                let error = UpdatedPageError::UnexpectedEvent {
-                    state: self.state.name(),
-                    got: event.label(),
-                };
-                self.finish(Err(error))
-            }
+    fn next(&mut self, result: IoResult) -> PageTurn {
+        if self.candidates.is_empty() {
+            let (rows, next) = page_rows(result)?;
+            return self.scanned_page(rows, next);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == PageState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(UpdatedPageError::Unfinished))
-    }
-
-    // Every read runs outside a transaction, so nothing is left to clean up.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        self.read_records(read_values(result)?)
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::metadata::timestamp_sweep::state_machine_tests::{
-        document, first_start, page, reads_effect, record_bytes, records, scan_effect,
-    };
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+        document, first_start, page, record_bytes,
     };
 
     fn record(document_id: Ulid, updated_at_ms: u64) -> MetadataRegistryRecord {
         postcard::from_bytes(&record_bytes(document_id, updated_at_ms)).expect("record decodes")
     }
 
+    fn scanning(operation: UpdatedPageOperation) -> UpdatedPageOperation {
+        let mut operation = operation;
+        operation.first().unwrap();
+        operation
+    }
+
     fn whole_window() -> UpdatedPageOperation {
-        UpdatedPageOperation::new(0, u64::MAX, None, 10)
+        scanning(UpdatedPageOperation::new(0, u64::MAX, None, 10))
     }
 
     #[test]
@@ -275,27 +192,22 @@ mod state_machine_tests {
             updated_index_key(30, late),
         ];
         let mut operation = UpdatedPageOperation::new(0, 25, None, 10);
-        check_trace(
-            &mut operation,
-            &[scan_effect(first_start())],
-            vec![
-                (page(&keys, None), vec![reads_effect(&[current, moved])]),
-                (
-                    records(vec![
-                        Some(record_bytes(current, 10)),
-                        Some(record_bytes(moved, 99)),
-                    ]),
-                    vec![],
-                ),
-            ],
-        );
+        assert_eq!(operation.first(), Ok(Next::Call(scan_call(first_start()))));
         assert_eq!(
-            operation.finalize(),
-            Ok(UpdatedRecordsPage {
+            operation.next(page(&keys, None)),
+            Ok(Next::Call(records_call([current, moved])))
+        );
+        let values = vec![
+            Some(record_bytes(current, 10)),
+            Some(record_bytes(moved, 99)),
+        ];
+        assert_eq!(
+            operation.next(IoResult::Values(values)),
+            Ok(Next::Done(UpdatedRecordsPage {
                 records: vec![record(current, 10)],
                 next_after: None,
                 stale_keys: vec![keys[1].clone()],
-            })
+            }))
         );
     }
 
@@ -308,30 +220,25 @@ mod state_machine_tests {
             updated_index_key(12, document(3)),
         ];
         let mut operation = UpdatedPageOperation::new(0, u64::MAX, Some(keys[0].clone()), 1);
-        check_trace(
-            &mut operation,
-            &[scan_effect(IterStart::After(keys[0].clone()))],
-            vec![
-                (
-                    page(&keys[1..], Some(keys[2].clone())),
-                    vec![reads_effect(&[document(2), document(3)])],
-                ),
-                (
-                    records(vec![
-                        Some(record_bytes(document(2), 11)),
-                        Some(record_bytes(document(3), 12)),
-                    ]),
-                    vec![],
-                ),
-            ],
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(scan_call(IterStart::After(keys[0].clone()))))
         );
         assert_eq!(
-            operation.finalize(),
-            Ok(UpdatedRecordsPage {
+            operation.next(page(&keys[1..], Some(keys[2].clone()))),
+            Ok(Next::Call(records_call([document(2), document(3)])))
+        );
+        let values = vec![
+            Some(record_bytes(document(2), 11)),
+            Some(record_bytes(document(3), 12)),
+        ];
+        assert_eq!(
+            operation.next(IoResult::Values(values)),
+            Ok(Next::Done(UpdatedRecordsPage {
                 records: vec![record(document(2), 11)],
                 next_after: Some(keys[1].clone()),
                 stale_keys: Vec::new(),
-            })
+            }))
         );
     }
 
@@ -340,121 +247,61 @@ mod state_machine_tests {
         // A short page continues the scan until the index ends.
         let key = updated_index_key(10, document(1));
         let mut operation = whole_window();
-        check_trace(
-            &mut operation,
-            &[scan_effect(first_start())],
-            vec![
-                (
-                    page(std::slice::from_ref(&key), Some(key.clone())),
-                    vec![reads_effect(&[document(1)])],
-                ),
-                (
-                    records(vec![None]),
-                    vec![scan_effect(IterStart::After(key.clone()))],
-                ),
-                (page(&[], None), vec![]),
-            ],
+        assert_eq!(
+            operation.next(page(std::slice::from_ref(&key), Some(key.clone()))),
+            Ok(Next::Call(records_call([document(1)])))
         );
         assert_eq!(
-            operation.finalize(),
-            Ok(UpdatedRecordsPage {
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(scan_call(IterStart::After(key.clone()))))
+        );
+        assert_eq!(
+            operation.next(page(&[], None)),
+            Ok(Next::Done(UpdatedRecordsPage {
                 records: Vec::new(),
                 next_after: None,
                 stale_keys: vec![key],
-            })
+            }))
         );
-    }
-
-    #[test]
-    fn storage_errors_fail() {
-        let key = updated_index_key(10, document(1));
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        let mut at_scan = whole_window();
-        at_scan.start();
-        let mut at_reads = whole_window();
-        at_reads.start();
-        at_reads.step(page(std::slice::from_ref(&key), None));
-        for mut operation in [at_scan, at_reads] {
-            assert!(operation.step(error()).is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(UpdatedPageError::Storage(StorageError::Timeout))
-            );
-        }
     }
 
     #[test]
     fn broken_rows_fail() {
-        let mut bad_key = whole_window();
-        bad_key.start();
-        bad_key.step(page(&[vec![1u8].into()], None));
         assert!(matches!(
-            bad_key.finalize(),
+            whole_window().next(page(&[vec![1u8].into()], None)),
             Err(UpdatedPageError::Conversion(_))
         ));
-
         let key = updated_index_key(10, document(1));
         let mut bad_record = whole_window();
-        bad_record.start();
-        bad_record.step(page(std::slice::from_ref(&key), None));
-        bad_record.step(records(vec![Some(vec![0xff].into())]));
+        bad_record
+            .next(page(std::slice::from_ref(&key), None))
+            .unwrap();
         assert!(matches!(
-            bad_record.finalize(),
+            bad_record.next(IoResult::Values(vec![Some(vec![0xff].into())])),
             Err(UpdatedPageError::Conversion(_))
         ));
-
         let mut short = whole_window();
-        short.start();
-        short.step(page(std::slice::from_ref(&key), None));
-        short.step(records(Vec::new()));
+        short.next(page(std::slice::from_ref(&key), None)).unwrap();
         assert!(matches!(
-            short.finalize(),
-            Err(UpdatedPageError::UnexpectedEvent { .. })
+            short.next(IoResult::Values(Vec::new())),
+            Err(UpdatedPageError::Io(IoError::Unexpected { .. }))
         ));
     }
 
     #[test]
-    fn rejects_other_events() {
-        let scanning = || {
-            let mut operation = whole_window();
-            operation.start();
-            operation
-        };
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(scanning, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, UpdatedPageError::UnexpectedEvent { .. }));
-        }
-        let mut idle = whole_window();
-        idle.step(page(&[], None));
+    fn errors_map() {
+        let error = IoResult::Event(Box::new(aruna_core::events::Event::Storage(
+            aruna_core::events::StorageEvent::Error {
+                error: StorageError::Timeout,
+            },
+        )));
+        assert_eq!(
+            whole_window().next(error),
+            Err(UpdatedPageError::Storage(StorageError::Timeout))
+        );
         assert!(matches!(
-            idle.finalize(),
-            Err(UpdatedPageError::UnexpectedEvent { .. })
+            whole_window().next(IoResult::Done),
+            Err(UpdatedPageError::Io(IoError::Unexpected { .. }))
         ));
-    }
-
-    #[test]
-    fn abort_cleans_nothing() {
-        let mut operation = whole_window();
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(whole_window());
-        let mut scanning = whole_window();
-        scanning.start();
-        rejects_finalize(scanning);
     }
 }

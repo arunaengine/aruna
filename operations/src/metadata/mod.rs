@@ -6,6 +6,7 @@ pub mod api;
 pub mod audit;
 pub mod audit_entry;
 pub(crate) mod builtin;
+pub(crate) mod call_results;
 pub(crate) mod checkpoint;
 pub(crate) mod checkpoint_window;
 pub mod contact;

@@ -6,13 +6,9 @@
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
-use tracing::warn;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::Operation;
+use aruna_core::rows::encoded_row;
 
 use super::*;
 
@@ -67,8 +63,7 @@ pub struct OwedWake {
 /// Writes or drops one wait row: a registration, or an owed wake its waiter acknowledged.
 #[derive(Debug, PartialEq)]
 pub struct WaitRowOperation {
-    effect: Option<StorageEffect>,
-    outcome: Option<Result<(), JobMutationError>>,
+    call: Option<Result<IoCall, JobMutationError>>,
 }
 
 impl WaitRowOperation {
@@ -76,70 +71,35 @@ impl WaitRowOperation {
     /// afterwards and answers "already available" when the key is unlocked, so no unlock is missed.
     pub fn register(key: BucketKeyRef, waiter: NodeId, job_id: JobId, auth: &AuthContext) -> Self {
         let row = registration_key(key, waiter, job_id);
-        match postcard::to_allocvec(auth) {
-            Ok(value) => Self::new(StorageEffect::BatchWrite {
-                writes: vec![(KEY_WAIT_KEYSPACE.to_string(), row, ByteView::from(value))],
-                txn_id: None,
-            }),
-            Err(error) => Self {
-                effect: None,
-                outcome: Some(Err(JobMutationError::Storage(error.to_string()))),
-            },
+        let write = encoded_row(KEY_WAIT_KEYSPACE, row, auth).map(|row| IoCall::Write(vec![row]));
+        Self {
+            call: Some(write.map_err(JobMutationError::from)),
         }
     }
 
     /// Drops an owed wake once the waiting node acknowledged it.
     pub fn acknowledge(waiter: NodeId, job_id: JobId, key: BucketKeyRef) -> Self {
         let row = delivery_key(waiter, job_id, key);
-        Self::new(StorageEffect::BatchDelete {
-            deletes: vec![(KEY_WAIT_KEYSPACE.to_string(), row)],
-            txn_id: None,
-        })
-    }
-
-    fn new(effect: StorageEffect) -> Self {
         Self {
-            effect: Some(effect),
-            outcome: None,
+            call: Some(Ok(IoCall::Delete(vec![(KEY_WAIT_KEYSPACE.to_string(), row)]))),
         }
     }
 }
 
-impl EffectOperation for WaitRowOperation {
+impl Operation for WaitRowOperation {
     type Output = ();
     type Error = JobMutationError;
 
-    fn start(&mut self) -> Effects {
-        match self.effect.take() {
-            Some(effect) => smallvec![Effect::Storage(effect)],
-            None => smallvec![],
-        }
+    fn first(&mut self) -> Result<Next<()>, JobMutationError> {
+        let call = self.call.take().unwrap_or(Err(not_finished()))?;
+        Ok(Next::Call(call))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.outcome = Some(match event {
-            _ if self.outcome.is_some() => Err(unexpected(&event)),
-            Event::Storage(
-                StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
-            ) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(JobMutationError::Storage(error.to_string()))
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobMutationError> {
+        match result {
+            IoResult::Done => Ok(Next::Done(())),
             other => Err(unexpected(&other)),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(not_finished()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        }
     }
 }
 
@@ -152,47 +112,27 @@ pub struct QueueWakesOperation {
     full: bool,
     /// The registrations a page clears once its owed wakes are written.
     pending: JobDeletes,
-    outcome: Option<Result<bool, JobMutationError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QueuePhase {
-    Init,
-    Begin,
-    Page(TxnId),
-    Write(TxnId),
-    Delete(TxnId),
-    Commit(TxnId),
-    Abort,
-    Done,
+    Page,
+    Write,
+    Delete,
 }
 
 impl QueueWakesOperation {
     pub fn new(key: BucketKeyRef) -> Self {
         Self {
             key,
-            phase: QueuePhase::Init,
+            phase: QueuePhase::Page,
             full: false,
             pending: Vec::new(),
-            outcome: None,
         }
     }
 
     fn prefix(&self) -> Key {
         ByteView::from([&[REMOTE_PREFIX][..], &self.key.key()].concat())
-    }
-
-    fn finish(&mut self, outcome: Result<bool, JobMutationError>) -> Effects {
-        self.outcome = Some(outcome);
-        self.phase = QueuePhase::Done;
-        smallvec![]
-    }
-
-    /// Ends the page with `error`, aborting its open transaction first.
-    fn fail(&mut self, txn_id: TxnId, error: JobMutationError) -> Effects {
-        self.outcome = Some(Err(error));
-        self.phase = QueuePhase::Abort;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
     /// The owed wakes and cleared registrations of one page of registration rows.
@@ -214,127 +154,43 @@ impl QueueWakesOperation {
         }
         (writes, deletes)
     }
-
-    /// The next write of the page, skipping an empty batch as the old helper did.
-    fn write_or_commit(
-        &mut self,
-        txn_id: TxnId,
-        writes: JobWrites,
-        deletes: JobDeletes,
-    ) -> Effects {
-        if !writes.is_empty() {
-            self.phase = QueuePhase::Write(txn_id);
-            self.pending = deletes;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            })];
-        }
-        self.delete_or_commit(txn_id, deletes)
-    }
-
-    fn delete_or_commit(&mut self, txn_id: TxnId, deletes: JobDeletes) -> Effects {
-        if !deletes.is_empty() {
-            self.phase = QueuePhase::Delete(txn_id);
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })];
-        }
-        self.phase = QueuePhase::Commit(txn_id);
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
 }
 
-impl EffectOperation for QueueWakesOperation {
+impl Operation for QueueWakesOperation {
     type Output = bool;
     type Error = JobMutationError;
 
-    fn start(&mut self) -> Effects {
-        self.phase = QueuePhase::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<bool>, JobMutationError> {
+        Ok(Next::Call(IoCall::Page {
+            space: KEY_WAIT_KEYSPACE.to_string(),
+            prefix: self.prefix(),
+            after: None,
+            limit: WAKE_PAGE,
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.phase, event) {
-            (QueuePhase::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.phase = QueuePhase::Page(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: KEY_WAIT_KEYSPACE.to_string(),
-                    prefix: Some(self.prefix()),
-                    start: None,
-                    limit: WAKE_PAGE,
-                    txn_id: Some(txn_id),
-                })]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, JobMutationError> {
+        match (self.phase, result) {
+            (QueuePhase::Page, IoResult::Page { rows, .. }) => {
+                self.full = rows.len() == WAKE_PAGE;
+                let (writes, deletes) = self.rewrite(&rows);
+                self.pending = deletes;
+                self.phase = QueuePhase::Write;
+                Ok(Next::Call(IoCall::Write(writes)))
             }
-            (QueuePhase::Page(txn_id), Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.full = values.len() == WAKE_PAGE;
-                let (writes, deletes) = self.rewrite(&values);
-                self.write_or_commit(txn_id, writes, deletes)
+            (QueuePhase::Write, IoResult::Done) => {
+                self.phase = QueuePhase::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.pending,
+                ))))
             }
-            (QueuePhase::Write(txn_id), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let deletes = std::mem::take(&mut self.pending);
-                self.delete_or_commit(txn_id, deletes)
-            }
-            (
-                QueuePhase::Delete(txn_id),
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => {
-                self.phase = QueuePhase::Commit(txn_id);
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (QueuePhase::Commit(_), Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                let full = self.full;
-                self.finish(Ok(full))
-            }
-            (QueuePhase::Commit(_), Event::Storage(StorageEvent::Error { error })) => {
-                let error = match error {
-                    StorageError::TransactionConflict => JobMutationError::Conflict,
-                    error => JobMutationError::Storage(error.to_string()),
-                };
-                self.finish(Err(error))
-            }
-            (QueuePhase::Begin, Event::Storage(StorageEvent::Error { error })) => {
-                self.finish(Err(JobMutationError::Storage(error.to_string())))
-            }
-            (
-                QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id),
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.fail(txn_id, JobMutationError::Storage(error.to_string())),
-            (QueuePhase::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.phase = QueuePhase::Done;
-                smallvec![]
-            }
-            (QueuePhase::Abort, Event::Storage(StorageEvent::Error { error })) => {
-                warn!(error = %error, "Failed to abort the remote wake transaction");
-                self.phase = QueuePhase::Done;
-                smallvec![]
-            }
-            (
-                QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id),
-                other,
-            ) => self.fail(txn_id, unexpected(&other)),
-            (_, other) => self.finish(Err(unexpected(&other))),
+            (QueuePhase::Delete, IoResult::Done) => Ok(Next::Done(self.full)),
+            (_, other) => Err(unexpected(&other)),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.phase == QueuePhase::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(not_finished()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.phase {
-            QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id) => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn is_conflict(error: &Self::Error) -> bool {
@@ -350,57 +206,32 @@ pub type OwedPage = (Vec<OwedWake>, Option<Key>);
 #[derive(Debug, PartialEq)]
 pub struct OwedWakesOperation {
     start_after: Option<Key>,
-    started: bool,
-    outcome: Option<Result<OwedPage, JobMutationError>>,
 }
 
 impl OwedWakesOperation {
     pub fn new(start_after: Option<Key>) -> Self {
-        Self {
-            start_after,
-            started: false,
-            outcome: None,
-        }
+        Self { start_after }
     }
 }
 
-impl EffectOperation for OwedWakesOperation {
+impl Operation for OwedWakesOperation {
     type Output = OwedPage;
     type Error = JobMutationError;
 
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: KEY_WAIT_KEYSPACE.to_string(),
-            prefix: Some(ByteView::from(vec![DELIVERY_PREFIX])),
-            start: self.start_after.take().map(IterStart::After),
+    fn first(&mut self) -> Result<Next<OwedPage>, JobMutationError> {
+        Ok(Next::Call(IoCall::Page {
+            space: KEY_WAIT_KEYSPACE.to_string(),
+            prefix: ByteView::from(vec![DELIVERY_PREFIX]),
+            after: self.start_after.take(),
             limit: WAKE_PAGE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.outcome = Some(match event {
-            _ if !self.started || self.outcome.is_some() => Err(unexpected(&event)),
-            Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(owed_page(&values)),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(JobMutationError::Storage(error.to_string()))
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<OwedPage>, JobMutationError> {
+        match result {
+            IoResult::Page { rows, .. } => Ok(Next::Done(owed_page(&rows))),
             other => Err(unexpected(&other)),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(not_finished()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        }
     }
 }
 
@@ -424,8 +255,8 @@ fn owed_page(rows: &[(Key, Value)]) -> OwedPage {
     (owed, next)
 }
 
-fn unexpected(event: &Event) -> JobMutationError {
-    JobMutationError::Storage(format!("unexpected storage event: {}", event.label()))
+fn unexpected(result: &IoResult) -> JobMutationError {
+    JobMutationError::Storage(format!("unexpected storage result: {}", result.label()))
 }
 
 fn not_finished() -> JobMutationError {

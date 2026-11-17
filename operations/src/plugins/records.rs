@@ -4,14 +4,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::{done, values};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -19,8 +21,7 @@ use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -31,7 +32,6 @@ use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::service_account::group_admin_path;
-use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, PartialEq)]
 pub struct InstallEntryConfig {
@@ -68,47 +68,42 @@ pub enum RecordError {
     Mismatch,
     #[error("the node that runs an install cannot change")]
     ReceiverChanged,
-    #[error("missing active transaction")]
-    MissingTransaction,
-    #[error("operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
+    #[error(transparent)]
+    Call(IoError),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum RecordState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteState { stale: Vec<(KeySpace, Key)> },
-    DeleteConflicts,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
+/// A lost transaction stays a storage conflict, so callers can tell it from other failures.
+impl From<IoError> for RecordError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Call(other),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
+enum Phase {
+    Auth,
+    Read,
+    Write { stale: Vec<(KeySpace, Key)> },
+    DeleteConflicts,
+}
+
+/// Checks the caller's group admin right, then reads, checks and writes the record in one
+/// transaction. [`write_entry`](super::install::write_entry) wakes the outbox drain after the commit.
+#[derive(Debug, PartialEq)]
 pub struct InstallEntryOperation {
     config: InstallEntryConfig,
-    txn_id: Option<TxnId>,
-    state: RecordState,
-    output: Option<Result<Option<PluginInstall>, RecordError>>,
+    phase: Phase,
 }
 
 impl InstallEntryOperation {
     pub fn new(config: InstallEntryConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            state: RecordState::Init,
-            output: None,
+            phase: Phase::Auth,
         }
     }
 
@@ -124,23 +119,19 @@ impl InstallEntryOperation {
         }
     }
 
-    fn emit_read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = RecordState::ReadCurrent;
+    fn read(&mut self) -> IoCall {
+        self.phase = Phase::Read;
         let document = self.document();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key()
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&self.admin_target())
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.admin_target()),
+            ),
+        ])
     }
 
     /// Whether the new record keeps this install's id and group and raises the revision by one.
@@ -153,12 +144,30 @@ impl InstallEntryOperation {
         })
     }
 
-    fn emit_write(
+    fn authorized(&mut self, result: IoResult) -> Result<IoCall, RecordError> {
+        let event = match result {
+            IoResult::Event(event) => *event,
+            other => return Err(unexpected(other.label())),
+        };
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return Err(unexpected(event.label()));
+        };
+        match allowed {
+            Ok(true) => Ok(self.read()),
+            Ok(false) => Err(RecordError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(%error, "Plugin install authorization check failed");
+                Err(RecordError::Unauthorized)
+            }
+        }
+    }
+
+    fn write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, RecordError> {
-        let txn_id = self.txn_id.ok_or(RecordError::MissingTransaction)?;
+    ) -> Result<IoCall, RecordError> {
         let document_value = document_value.ok_or(RecordError::ConfigMissing)?;
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -224,176 +233,105 @@ impl InstallEntryOperation {
         if let Some(audit) = &self.config.audit {
             writes.extend(audit.entries()?);
         }
-        self.output = Some(Ok(self.config.install.clone()));
-        self.state = RecordState::WriteState {
+        self.phase = Phase::Write {
             stale: stale_conflict_deletes(previous.as_ref(), Some(&reducer_state)),
         };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RecordError::MissingTransaction);
-        };
-        self.state = RecordState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: RecordError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RecordState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-
-    fn handle_auth(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected("authorization result", event.label());
-        };
-        match allowed {
-            Ok(true) => {
-                self.state = RecordState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-            Ok(false) => self.fail(RecordError::Unauthorized),
-            Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
-            Err(error) => {
-                warn!(%error, "Plugin install authorization check failed");
-                self.fail(RecordError::Unauthorized)
-            }
-        }
-    }
-
-    fn handle_written(&mut self, event: Event, stale: Vec<(KeySpace, Key)>) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) if stale.is_empty() => {
-                self.emit_commit()
-            }
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(RecordError::MissingTransaction);
-                };
-                self.state = RecordState::DeleteConflicts;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: stale,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected("storage batch write result", other.label()),
-        }
+        Ok(IoCall::Write(writes))
     }
 }
 
-impl EffectOperation for InstallEntryOperation {
+impl Operation for InstallEntryOperation {
     type Output = Option<PluginInstall>;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, RecordError> {
         if self.config.auth_context.realm_id != self.config.actor.realm_id || !self.matches() {
-            return self.fail(RecordError::Mismatch);
+            return Err(RecordError::Mismatch);
         }
-        self.state = RecordState::Auth;
         let realm_id = self.config.actor.realm_id;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: group_admin_path(realm_id, self.config.group_id),
-                required_permission: Permission::WRITE,
-            }),
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: group_admin_path(realm_id, self.config.group_id),
+            required_permission: Permission::WRITE,
+        });
+        Ok(Next::Call(IoCall::Child(boxed_suboperation(
+            check,
             |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            RecordState::Auth => self.handle_auth(event),
-            RecordState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read(txn_id)
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RecordError> {
+        match std::mem::replace(&mut self.phase, Phase::DeleteConflicts) {
+            Phase::Auth => Ok(Next::Call(self.authorized(result)?)),
+            Phase::Read => {
+                let [document, state] = values::<2>(result)?;
+                Ok(Next::Call(self.write(document, state)?))
+            }
+            Phase::Write { stale } => {
+                done(result)?;
+                match stale.is_empty() {
+                    true => Ok(Next::Done(self.config.install.clone())),
+                    false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start result", other.label()),
-            },
-            RecordState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document), (_, state)] = values.as_slice() else {
-                        return self.unexpected(
-                            "realm config and reducer state",
-                            "StorageEvent::BatchReadResult",
-                        );
-                    };
-                    match self.emit_write(document.clone(), state.clone()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch read result", other.label()),
-            },
-            RecordState::WriteState { stale } => self.handle_written(event, stale),
-            RecordState::DeleteConflicts => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch delete result", other.label()),
-            },
-            RecordState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = RecordState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected("transaction commit result", other.label()),
-            },
-            RecordState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = RecordState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule the outbox drain; the durable outbox stays retryable");
-                    self.state = RecordState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected("outbox drain timer schedule", other.label()),
-            },
-            RecordState::Finish | RecordState::Error | RecordState::Init => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RecordState::Finish | RecordState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(RecordError::NotFinished);
-        }
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            }
+            Phase::DeleteConflicts => {
+                done(result)?;
+                Ok(Next::Done(self.config.install.clone()))
+            }
         }
     }
 }
+
+fn unexpected(got: &'static str) -> RecordError {
+    RecordError::Call(IoError::Unexpected {
+        expected: "an authorization result",
+        got,
+    })
+}
+
+/// Schedules the outbox drain at once.
+#[derive(Debug, PartialEq)]
+pub(super) struct WakeDrain;
+
+impl Operation for WakeDrain {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Effect(
+            Box::new(schedule_drain_effect()),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let expected = "outbox drain timer schedule";
+        let event = match result {
+            IoResult::Event(event) => *event,
+            other => {
+                return Err(IoError::Unexpected {
+                    expected,
+                    got: other.label(),
+                });
+            }
+        };
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(())),
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(error = %message, "Failed to schedule the outbox drain; the durable outbox stays retryable");
+                Ok(Next::Done(()))
+            }
+            other => Err(IoError::Unexpected {
+                expected,
+                got: other.label(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "records_tests.rs"]
+mod tests;

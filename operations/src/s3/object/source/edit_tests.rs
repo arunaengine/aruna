@@ -81,16 +81,12 @@ fn bucket() -> BucketInfo {
 }
 
 /// The edit's guard reads, answered with `bucket` and, for an addition, `connector`.
-fn guarded(bucket: &BucketInfo, connector: Option<&SourceConnector>) -> Event {
-    let mut values = vec![(
-        Key::from(b"bucket".to_vec()),
-        Some(bucket.to_bytes().unwrap().into()),
-    )];
+fn guarded(bucket: &BucketInfo, connector: Option<&SourceConnector>) -> IoResult {
+    let mut values = vec![Some(bucket.to_bytes().unwrap().into())];
     if let Some(connector) = connector {
-        let value = Some(connector.to_bytes().unwrap().into());
-        values.push((Key::from(b"connector".to_vec()), value));
+        values.push(Some(connector.to_bytes().unwrap().into()));
     }
-    Event::Storage(StorageEvent::BatchReadResult { values })
+    IoResult::Values(values)
 }
 
 fn started(change: SourceChange) -> SourceEditOperation {
@@ -104,13 +100,8 @@ fn started(change: SourceChange) -> SourceEditOperation {
         after: None,
         page: 10,
     });
-    operation.start();
-    let txn_id = Ulid::generate();
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ));
+    assert!(operation.transaction());
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
     operation
 }
 
@@ -120,7 +111,8 @@ fn edit(change: SourceChange) -> SourceEditOperation {
         SourceChange::Remove { .. } => None,
     };
     let mut operation = started(change);
-    operation.step(guarded(&bucket(), connector.as_ref()));
+    let scan = operation.next(guarded(&bucket(), connector.as_ref()));
+    assert!(matches!(scan, Ok(Next::Call(IoCall::Page { .. }))));
     operation
 }
 
@@ -155,20 +147,15 @@ fn changed_guards_refused() {
             SourceEditError::ConnectorChanged,
         ),
     ];
-    for (event, expected) in cases {
+    for (read, expected) in cases {
         let mut operation = started(add());
-        let effects = operation.step(event);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(operation.finalize(), Err(expected));
+        assert_eq!(operation.next(read), Err(expected));
     }
 }
 
-fn written(effects: &Effects) -> Vec<(KeySpace, Key, Value)> {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected one batch write, got {effects:?}")
+fn written(turn: &Result<Next<SourceEditResult>, SourceEditError>) -> Vec<(KeySpace, Key, Value)> {
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected one batch write, got {turn:?}")
     };
     writes.clone()
 }
@@ -190,8 +177,8 @@ fn mapping_adds_sources() {
         read_root: "/sources".to_string(),
     });
     let first = reference("genomes/a.fna");
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![
+    let turn = operation.next(IoResult::Page {
+        rows: vec![
             row("genomes/a.fna", &first),
             row("other/b.fna", &reference("genomes/b.fna")),
             // The caller may not read this file's new source, so it stays as it is.
@@ -199,9 +186,9 @@ fn mapping_adds_sources() {
             // A mapped path a server would trim to a readable one is refused.
             row("genomes/ a.fna", &reference("genomes/ a.fna")),
         ],
-        next_start_after: Some(b"cursor".to_vec().into()),
-    }));
-    let writes = written(&effects);
+        next: Some(b"cursor".to_vec().into()),
+    });
+    let writes = written(&turn);
     assert_eq!(writes.len(), 3, "{writes:?}");
     let references = writes
         .iter()
@@ -226,18 +213,9 @@ fn mapping_adds_sources() {
     };
     let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
     assert!(!added_twice(&mut again, (&mapping, &mirror), node));
-    let txn_written = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert!(matches!(
-        txn_written.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    let txn_id = operation.txn_id.unwrap();
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    let result = operation.finalize().unwrap();
+    let Ok(Next::Done(result)) = operation.next(IoResult::Done) else {
+        panic!("expected the edit result");
+    };
     assert_eq!((result.scanned, result.changed, result.denied), (4, 1, 2));
     assert_eq!(result.next.as_deref(), Some(&b"cursor"[..]));
 }

@@ -517,6 +517,19 @@ impl NotificationTransportMessage {
     }
 }
 
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxWriteOutcome {
+    pub written: usize,
+    pub recipients: Vec<UserId>,
+    pub purged: usize,
+    pub cutoffs: usize,
+    /// Batch records the inbox holds after the write, new or already present, never discarded.
+    pub held: Vec<NotificationRecord>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -33,7 +33,7 @@ use aruna_operations::distribution::accept_delegation::DelegateError;
 use aruna_operations::distribution::delegate::accept_delegation;
 use aruna_operations::distribution::routing::{delegated_range, delegated_read};
 use aruna_operations::document_repository::GetConfigOperation;
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::jobs::workflow::input_view::view_job;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
@@ -319,17 +319,17 @@ impl S3Access for AuthProvider {
         }
 
         if let Some(token_hash) = session_token_hash {
-            drive(
-                TouchS3Operation::new(TouchS3Config {
-                    access_key: access_key_id,
-                    token_hash,
-                    now,
-                    issued_by: *self.node_id.as_bytes(),
-                }),
-                self.driver_ctx.as_ref(),
-            )
-            .await
-            .map_err(map_session_error)?;
+            let config = TouchS3Config {
+                access_key: access_key_id,
+                token_hash,
+                now,
+                issued_by: *self.node_id.as_bytes(),
+            };
+            let seed = config.access_key.clone();
+            let build = || TouchS3Operation::new(config.clone());
+            drive_retry(build, self.driver_ctx.as_ref(), seed.as_bytes())
+                .await
+                .map_err(map_session_error)?;
         }
 
         cx.extensions_mut().insert(extras);

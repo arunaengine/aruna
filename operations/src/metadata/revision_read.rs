@@ -2,28 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, RAW_REVISION_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord,
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataEventRecord,
     MetadataLifecycleRecord, MetadataRawRevision, resolve_raw_revision,
 };
-use aruna_core::operation::EffectOperation;
-use aruna_core::storage_entries::{document_lifecycle_key, graph_lifecycle_key, raw_revision_key};
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{
+    document_lifecycle_key, graph_lifecycle_key, materialization_status_key, raw_revision_key,
+};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use ulid::Ulid;
 
+use crate::metadata::call_results::read_value;
 use crate::metadata::raw_events::{
     RawEventsOperation, RawLoadBudget, RawReadError, RawRevisionState,
 };
-use crate::metadata::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 /// The materialization status, when asked for, and the raw revision of a live document.
 pub type RawViewOutput = (
@@ -39,15 +41,33 @@ pub struct MetadataRawView {
     pub projected_event_id: Option<Ulid>,
 }
 
+/// One row read, in the caller's transaction when there is one.
+fn row_call(key_space: &str, key: Key, txn_id: Option<TxnId>) -> IoCall {
+    let reads = vec![(key_space.to_string(), key)];
+    match txn_id {
+        // The caller's transaction is not the runner's, so the read goes out as an effect.
+        Some(txn_id) => IoCall::Effect(Box::new(Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: Some(txn_id),
+        }))),
+        None => IoCall::Read(reads),
+    }
+}
+
+fn decode<T: serde::de::DeserializeOwned>(value: Option<Value>) -> Result<Option<T>, RawReadError> {
+    value
+        .map(|value| postcard::from_bytes::<T>(&value))
+        .transpose()
+        .map_err(|error| ConversionError::from(error).into())
+}
+
 #[derive(Debug, PartialEq)]
-enum ViewState {
-    Init,
+enum ViewStep {
     Status,
     Document,
     Graph,
     Raw,
     Events,
-    Done,
 }
 
 /// A deleted document or graph has no revision. A merged document answers with its
@@ -59,9 +79,10 @@ pub struct RawViewOperation {
     with_status: bool,
     status: Option<MaterializationStatusRecord>,
     events: Option<RawEventsOperation>,
-    state: ViewState,
-    output: Option<Result<RawViewOutput, RawReadError>>,
+    step: ViewStep,
 }
+
+type ViewTurn = Result<Next<RawViewOutput>, RawReadError>;
 
 impl RawViewOperation {
     pub(crate) fn new(document_id: Ulid, txn_id: Option<TxnId>, with_status: bool) -> Self {
@@ -71,276 +92,170 @@ impl RawViewOperation {
             with_status,
             status: None,
             events: None,
-            state: ViewState::Init,
-            output: None,
+            step: ViewStep::Document,
         }
     }
 
-    fn finish(&mut self, revision: Result<Option<MetadataRawRevision>, RawReadError>) -> Effects {
-        self.state = ViewState::Done;
-        self.output = Some(revision.map(|revision| (self.status.take(), revision)));
-        smallvec![]
+    fn read(&mut self, step: ViewStep, key_space: &str, key: Key) -> ViewTurn {
+        self.step = step;
+        Ok(Next::Call(row_call(key_space, key, self.txn_id)))
     }
 
-    fn read(&mut self, state: ViewState, key_space: &str, key: Key) -> Effects {
-        self.state = state;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
+    fn done(&mut self, revision: Option<MetadataRawRevision>) -> ViewTurn {
+        Ok(Next::Done((self.status.take(), revision)))
     }
 
-    fn read_document(&mut self) -> Effects {
+    fn read_document(&mut self) -> ViewTurn {
         let key = document_lifecycle_key(self.document_id);
-        self.read(ViewState::Document, DOCUMENT_LIFECYCLE_KEYSPACE, key)
+        self.read(ViewStep::Document, DOCUMENT_LIFECYCLE_KEYSPACE, key)
     }
 
-    fn status_read(&mut self, event: Event) -> Effects {
-        match parse_status_read(event) {
-            Ok(status) => {
-                self.status = status;
-                self.read_document()
-            }
-            Err(StorageReadError::Storage(error)) => self.finish(Err(error.into())),
-            Err(StorageReadError::Conversion(error)) => self.finish(Err(error.into())),
+    fn document_read(&mut self, value: Option<Value>) -> ViewTurn {
+        let record = decode::<MetadataLifecycleRecord>(value)?;
+        if matches!(record, Some(MetadataLifecycleRecord::Delete { .. })) {
+            return self.done(None);
         }
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(self.document_id);
+        self.read(
+            ViewStep::Graph,
+            GRAPH_LIFECYCLE_KEYSPACE,
+            graph_lifecycle_key(&graph_iri),
+        )
     }
 
-    fn document_read(&mut self, value: Option<Value>) -> Effects {
-        let deleted = value
-            .map(|value| postcard::from_bytes::<MetadataLifecycleRecord>(&value))
-            .transpose()
-            .map(|record| matches!(record, Some(MetadataLifecycleRecord::Delete { .. })));
-        match deleted {
-            Ok(true) => self.finish(Ok(None)),
-            Ok(false) => {
-                let graph_iri = MetadataRegistryRecord::graph_iri_for(self.document_id);
-                let key = graph_lifecycle_key(&graph_iri);
-                self.read(ViewState::Graph, GRAPH_LIFECYCLE_KEYSPACE, key)
-            }
-            Err(error) => self.finish(Err(ConversionError::from(error).into())),
+    fn graph_read(&mut self, value: Option<Value>) -> ViewTurn {
+        let record = decode::<GraphLifecycleRecord>(value)?;
+        if record.is_some_and(|record| record.is_deleted()) {
+            return self.done(None);
         }
-    }
-
-    fn graph_read(&mut self, value: Option<Value>) -> Effects {
-        let deleted = value
-            .map(|value| postcard::from_bytes::<GraphLifecycleRecord>(&value))
-            .transpose()
-            .map(|record| record.is_some_and(|record| record.is_deleted()));
-        match deleted {
-            Ok(true) => self.finish(Ok(None)),
-            Ok(false) => {
-                let key = raw_revision_key(self.document_id);
-                self.read(ViewState::Raw, RAW_REVISION_KEYSPACE, key)
-            }
-            Err(error) => self.finish(Err(ConversionError::from(error).into())),
-        }
+        let key = raw_revision_key(self.document_id);
+        self.read(ViewStep::Raw, RAW_REVISION_KEYSPACE, key)
     }
 
     // Once a batch has merged, the rendered graph is the document's revision;
     // the authored-text replay only serves a document until then.
-    fn raw_read(&mut self, value: Option<Value>) -> Effects {
-        let state = value
-            .map(|value| postcard::from_bytes::<RawRevisionState>(&value))
-            .transpose();
-        match state {
-            Ok(Some(state)) if state.merged => self.finish(Ok(state.revision)),
-            Ok(_) => {
-                let budget = RawLoadBudget::default();
-                let mut events =
-                    RawEventsOperation::new(self.document_id, None, None, self.txn_id, budget);
-                let effects = events.start();
-                self.events = Some(events);
-                self.state = ViewState::Events;
-                self.events_progress(effects)
-            }
-            Err(error) => self.finish(Err(ConversionError::from(error).into())),
+    fn raw_read(&mut self, value: Option<Value>) -> ViewTurn {
+        if let Some(state) = decode::<RawRevisionState>(value)?
+            && state.merged
+        {
+            return self.done(state.revision);
         }
+        let budget = RawLoadBudget::default();
+        let mut events = RawEventsOperation::new(self.document_id, None, None, self.txn_id, budget);
+        let turn = events.first()?;
+        self.events = Some(events);
+        self.step = ViewStep::Events;
+        self.events_turn(turn)
     }
 
-    /// Passes the event read's effects on until it completes, then resolves the revision.
-    fn events_progress(&mut self, effects: Effects) -> Effects {
-        if !self
-            .events
-            .as_ref()
-            .is_some_and(|events| events.is_complete())
-        {
-            return effects;
+    /// Passes the event read's calls on until it finishes, then resolves the revision.
+    fn events_turn(&mut self, turn: Next<Vec<MetadataEventRecord>>) -> ViewTurn {
+        match turn {
+            Next::Call(call) => Ok(Next::Call(call)),
+            Next::Wait => Ok(Next::Wait),
+            Next::Done(events) => {
+                self.events = None;
+                let revision = resolve_raw_revision(&events)?;
+                self.done(revision)
+            }
         }
-        let Some(events) = self.events.take() else {
-            return self.finish(Err(RawReadError::UnexpectedEvent("no event read".into())));
-        };
-        let revision = events
-            .finalize()
-            .and_then(|events| resolve_raw_revision(&events).map_err(Into::into));
-        self.finish(revision)
     }
 }
 
-impl EffectOperation for RawViewOperation {
+impl Operation for RawViewOperation {
     type Output = RawViewOutput;
     type Error = RawReadError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ViewTurn {
         if !self.with_status {
             return self.read_document();
         }
-        self.state = ViewState::Status;
-        smallvec![read_status_effect(self.document_id, self.txn_id)]
+        let key = materialization_status_key(self.document_id);
+        self.read(ViewStep::Status, MATERIALIZATION_STATUS_KEYSPACE, key)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == ViewState::Events {
-            let effects = match self.events.as_mut() {
-                Some(events) => events.step(event),
-                None => smallvec![],
+    fn next(&mut self, result: IoResult) -> ViewTurn {
+        if self.step == ViewStep::Events {
+            let turn = match self.events.as_mut() {
+                Some(events) => events.next(result)?,
+                None => return Err(RawReadError::UnexpectedEvent("no event read".into())),
             };
-            return self.events_progress(effects);
+            return self.events_turn(turn);
         }
-        if self.state == ViewState::Status {
-            return self.status_read(event);
-        }
-        let reading = matches!(
-            self.state,
-            ViewState::Document | ViewState::Graph | ViewState::Raw
-        );
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if reading => match self.state {
-                ViewState::Document => self.document_read(value),
-                ViewState::Graph => self.graph_read(value),
-                _ => self.raw_read(value),
-            },
-            Event::Storage(StorageEvent::Error { error }) if reading => {
-                self.finish(Err(error.into()))
+        let value = read_value(result)?;
+        match self.step {
+            ViewStep::Status => {
+                self.status = decode(value)?;
+                self.read_document()
             }
-            other => {
-                let error = RawReadError::UnexpectedEvent(other.label().to_string());
-                self.finish(Err(error))
-            }
+            ViewStep::Document => self.document_read(value),
+            ViewStep::Graph => self.graph_read(value),
+            _ => self.raw_read(value),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == ViewState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RawReadError::UnexpectedEvent(
-            "the raw view read did not finish".to_string(),
-        )))
-    }
-
-    // Every read is untransacted or runs in the caller's transaction.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 /// Reads a document's stored raw state outside any transaction.
 #[derive(Debug, PartialEq)]
-pub(crate) struct RawStateOperation {
+pub struct RawStateOperation {
     document_id: Ulid,
-    reading: bool,
-    output: Option<Result<Option<RawRevisionState>, RawReadError>>,
 }
 
 impl RawStateOperation {
     pub(crate) fn new(document_id: Ulid) -> Self {
-        Self {
-            document_id,
-            reading: false,
-            output: None,
-        }
+        Self { document_id }
     }
 }
 
-impl EffectOperation for RawStateOperation {
+impl Operation for RawStateOperation {
     type Output = Option<RawRevisionState>;
     type Error = RawReadError;
 
-    fn start(&mut self) -> Effects {
-        self.reading = true;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: RAW_REVISION_KEYSPACE.to_string(),
-            key: raw_revision_key(self.document_id),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<Self::Output>, RawReadError> {
+        let key = raw_revision_key(self.document_id);
+        Ok(Next::Call(row_call(RAW_REVISION_KEYSPACE, key, None)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let output = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if self.reading => value
-                .map(|value| postcard::from_bytes::<RawRevisionState>(&value))
-                .transpose()
-                .map_err(|error| ConversionError::from(error).into()),
-            Event::Storage(StorageEvent::Error { error }) if self.reading => Err(error.into()),
-            other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
-        };
-        self.reading = false;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RawReadError::UnexpectedEvent(
-            "the raw state read did not finish".to_string(),
-        )))
-    }
-
-    // One untransacted read leaves nothing to clean up.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
+        Ok(Next::Done(decode(read_value(result)?)?))
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
-    use crate::metadata::raw_events::state_machine_tests::{event, page, page_effect, row};
+    use crate::metadata::raw_events::call_tests::{event, page, page_call, row};
+    use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
-    use aruna_core::metadata::{MetadataDeleteRecord, MetadataEventRecord};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::metadata::MetadataDeleteRecord;
 
     fn document() -> Ulid {
         event(10).record.document_id
     }
 
-    fn read_effect(key_space: &str, key: Key) -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: None,
-        })
+    fn read_call<T>(key_space: &str, key: Key) -> Next<T> {
+        Next::Call(IoCall::Read(vec![(key_space.to_string(), key)]))
     }
 
-    fn document_effect() -> Effect {
-        read_effect(
+    fn document_call<T>() -> Next<T> {
+        read_call(
             DOCUMENT_LIFECYCLE_KEYSPACE,
             document_lifecycle_key(document()),
         )
     }
 
-    fn graph_effect() -> Effect {
+    fn graph_call<T>() -> Next<T> {
         let graph_iri = MetadataRegistryRecord::graph_iri_for(document());
-        read_effect(GRAPH_LIFECYCLE_KEYSPACE, graph_lifecycle_key(&graph_iri))
+        read_call(GRAPH_LIFECYCLE_KEYSPACE, graph_lifecycle_key(&graph_iri))
     }
 
-    fn raw_effect() -> Effect {
-        read_effect(RAW_REVISION_KEYSPACE, raw_revision_key(document()))
+    fn raw_call<T>() -> Next<T> {
+        read_call(RAW_REVISION_KEYSPACE, raw_revision_key(document()))
     }
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: value.map(Into::into),
-        })
+    fn value(bytes: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![bytes.map(Value::from)])
     }
 
     fn bytes<T: serde::Serialize>(value: &T) -> Option<Vec<u8>> {
@@ -359,7 +274,7 @@ mod state_machine_tests {
 
     fn reading(with_status: bool) -> RawViewOperation {
         let mut operation = RawViewOperation::new(document(), None, with_status);
-        operation.start();
+        operation.first().unwrap();
         operation
     }
 
@@ -373,16 +288,13 @@ mod state_machine_tests {
             merged: true,
         };
         let mut operation = RawViewOperation::new(document(), None, false);
-        check_trace(
-            &mut operation,
-            &[document_effect()],
-            vec![
-                (read(None), vec![graph_effect()]),
-                (read(None), vec![raw_effect()]),
-                (read(bytes(&merged)), vec![]),
-            ],
+        assert_eq!(operation.first(), Ok(document_call()));
+        assert_eq!(operation.next(value(None)), Ok(graph_call()));
+        assert_eq!(operation.next(value(None)), Ok(raw_call()));
+        assert_eq!(
+            operation.next(value(bytes(&merged))),
+            Ok(Next::Done((None, Some(revision(&event(10))))))
         );
-        assert_eq!(operation.finalize(), Ok((None, Some(revision(&event(10))))));
     }
 
     #[test]
@@ -390,19 +302,46 @@ mod state_machine_tests {
         let first = event(10);
         let status = MaterializationStatusRecord::pending(&first, 1);
         let mut operation = RawViewOperation::new(document(), None, true);
-        check_trace(
-            &mut operation,
-            &[read_status_effect(document(), None)],
-            vec![
-                (read(bytes(&status)), vec![document_effect()]),
-                (read(None), vec![graph_effect()]),
-                (read(None), vec![raw_effect()]),
-                (read(None), vec![page_effect(None)]),
-                (page(vec![row(&first)], None), vec![]),
-            ],
+        assert_eq!(
+            operation.first(),
+            Ok(read_call(
+                MATERIALIZATION_STATUS_KEYSPACE,
+                materialization_status_key(document())
+            ))
         );
+        assert_eq!(operation.next(value(bytes(&status))), Ok(document_call()));
+        assert_eq!(operation.next(value(None)), Ok(graph_call()));
+        assert_eq!(operation.next(value(None)), Ok(raw_call()));
+        assert_eq!(operation.next(value(None)), Ok(page_call(None)));
         let expected = resolve_raw_revision(std::slice::from_ref(&first)).unwrap();
-        assert_eq!(operation.finalize(), Ok((Some(status), expected)));
+        assert_eq!(
+            operation.next(page(vec![row(&first)], None)),
+            Ok(Next::Done((Some(status), expected)))
+        );
+    }
+
+    #[test]
+    fn reads_in_transaction() {
+        let txn_id = Ulid::from_bytes([6; 16]);
+        let mut operation = RawViewOperation::new(document(), Some(txn_id), false);
+        let read = StorageEffect::BatchRead {
+            reads: vec![(
+                DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+                document_lifecycle_key(document()),
+            )],
+            txn_id: Some(txn_id),
+        };
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(read)))))
+        );
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(error))),
+            Err(RawReadError::Storage(StorageError::Timeout))
+        );
     }
 
     #[test]
@@ -423,35 +362,17 @@ mod state_machine_tests {
             },
         };
         let mut by_document = reading(false);
-        by_document.step(read(bytes(&removed)));
-        assert_eq!(by_document.finalize(), Ok((None, None)));
+        assert_eq!(
+            by_document.next(value(bytes(&removed))),
+            Ok(Next::Done((None, None)))
+        );
 
         let mut by_graph = reading(false);
-        by_graph.step(read(None));
-        by_graph.step(read(bytes(&tombstone)));
-        assert_eq!(by_graph.finalize(), Ok((None, None)));
-    }
-
-    #[test]
-    fn storage_errors_fail() {
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        // Steps already taken before the error: status, document, graph, raw, event page.
-        for answered in 0..5 {
-            let mut operation = reading(true);
-            for _ in 0..answered {
-                operation.step(read(None));
-            }
-            assert!(operation.step(error()).is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(RawReadError::Storage(StorageError::Timeout)),
-                "after {answered} answers"
-            );
-        }
+        by_graph.next(value(None)).unwrap();
+        assert_eq!(
+            by_graph.next(value(bytes(&tombstone))),
+            Ok(Next::Done((None, None)))
+        );
     }
 
     #[test]
@@ -459,48 +380,28 @@ mod state_machine_tests {
         for answered in 0..4 {
             let mut operation = reading(true);
             for _ in 0..answered {
-                operation.step(read(None));
+                operation.next(value(None)).unwrap();
             }
-            operation.step(read(Some(vec![0xff, 0xff])));
             assert!(
-                matches!(operation.finalize(), Err(RawReadError::Conversion(_))),
+                matches!(
+                    operation.next(value(Some(vec![0xff, 0xff]))),
+                    Err(RawReadError::Conversion(_))
+                ),
                 "after {answered} answers"
             );
         }
     }
 
     #[test]
-    fn rejects_other_events() {
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(|| reading(false), sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
-        }
-        let mut idle = RawViewOperation::new(document(), None, false);
-        idle.step(read(None));
+    fn wrong_result_fails() {
         assert!(matches!(
-            idle.finalize(),
+            reading(false).next(IoResult::Done),
             Err(RawReadError::UnexpectedEvent(_))
         ));
-    }
-
-    #[test]
-    fn abort_cleans_nothing() {
-        let mut operation = RawViewOperation::new(document(), None, true);
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(RawViewOperation::new(document(), None, true));
-        rejects_finalize(reading(true));
+        assert_eq!(
+            RawReadError::from(IoError::Conflict),
+            RawReadError::Storage(StorageError::TransactionConflict)
+        );
     }
 
     #[test]
@@ -512,63 +413,26 @@ mod state_machine_tests {
             merged: false,
         };
         let mut operation = RawStateOperation::new(document());
-        check_trace(
-            &mut operation,
-            &[raw_effect()],
-            vec![(read(bytes(&stored)), vec![])],
+        assert_eq!(operation.first(), Ok(raw_call()));
+        assert_eq!(
+            operation.next(value(bytes(&stored))),
+            Ok(Next::Done(Some(stored)))
         );
-        assert_eq!(operation.finalize(), Ok(Some(stored)));
-
         let mut missing = RawStateOperation::new(document());
-        check_trace(&mut missing, &[raw_effect()], vec![(read(None), vec![])]);
-        assert_eq!(missing.finalize(), Ok(None));
+        missing.first().unwrap();
+        assert_eq!(missing.next(value(None)), Ok(Next::Done(None)));
     }
 
     #[test]
     fn state_read_fails() {
-        let mut failed = RawStateOperation::new(document());
-        failed.start();
-        let error = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(failed.step(error).is_empty());
-        assert_eq!(
-            failed.finalize(),
-            Err(RawReadError::Storage(StorageError::Timeout))
-        );
-
         let mut broken = RawStateOperation::new(document());
-        broken.start();
-        broken.step(read(Some(vec![0xff, 0xff])));
+        broken.first().unwrap();
         assert!(matches!(
-            broken.finalize(),
+            broken.next(value(Some(vec![0xff, 0xff]))),
             Err(RawReadError::Conversion(_))
         ));
-
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        let reading = || {
-            let mut operation = RawStateOperation::new(document());
-            operation.start();
-            operation
-        };
-        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
-        }
-    }
-
-    #[test]
-    fn state_read_lifecycle() {
-        let mut operation = RawStateOperation::new(document());
-        rejects_finalize(RawStateOperation::new(document()));
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        rejects_finalize(operation);
+        let mut wrong = RawStateOperation::new(document());
+        wrong.first().unwrap();
+        assert!(wrong.next(IoResult::Woke).is_err());
     }
 }

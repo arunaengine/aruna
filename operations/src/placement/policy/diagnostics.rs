@@ -3,18 +3,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE, POLICY_CACHE_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
 use aruna_core::structs::storage::blob::{ManagedCopyRecord, ManagedCopyState, VersionKey};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
@@ -82,30 +82,38 @@ pub enum DiagnosticsError {
     InvalidEvent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiagnosticsState {
-    Init,
-    Authorize,
-    ReadSubject,
-    ScanCopies,
-    ScanCache,
-    Finish,
-    Error,
+impl From<IoError> for DiagnosticsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::InvalidEvent,
+        }
+    }
 }
 
+/// The read a diagnostics run waits for after its permission check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Stage {
+    Authorize,
+    Subject,
+    Copies,
+    Cache,
+}
+
+/// Checks the caller, reads the local subject, one page of copies, then the policy cache.
 #[derive(Debug, PartialEq)]
 pub struct PolicyDiagnosticsOperation {
     input: DiagnosticsInput,
-    state: DiagnosticsState,
+    stage: Stage,
     report: DiagnosticsReport,
-    output: Option<Result<DiagnosticsReport, DiagnosticsError>>,
 }
 
 impl PolicyDiagnosticsOperation {
     pub fn new(input: DiagnosticsInput) -> Self {
         Self {
             input,
-            state: DiagnosticsState::Init,
+            stage: Stage::Authorize,
             report: DiagnosticsReport {
                 subject: None,
                 policy_draining: false,
@@ -119,54 +127,55 @@ impl PolicyDiagnosticsOperation {
                 cursor: None,
                 complete: false,
             },
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: DiagnosticsError) -> Effects {
-        self.state = DiagnosticsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn authorized(&mut self, result: IoResult) -> Result<IoCall, DiagnosticsError> {
+        let IoResult::Event(event) = result else {
+            return Err(DiagnosticsError::InvalidEvent);
+        };
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = *event else {
+            return Err(DiagnosticsError::InvalidEvent);
+        };
+        match allowed {
+            Ok(true) => {
+                self.stage = Stage::Subject;
+                Ok(read_row(NODE_SUBJECT_KEYSPACE, NODE_SUBJECT_KEY.to_vec()))
+            }
+            Ok(false) => Err(DiagnosticsError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Policy diagnostics authorization check failed");
+                Err(DiagnosticsError::Unauthorized)
+            }
+        }
     }
 
-    fn handle_subject(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(DiagnosticsError::InvalidEvent);
-        };
+    fn subject(&mut self, result: IoResult) -> Result<IoCall, DiagnosticsError> {
+        let [value] = values::<1>(result)?;
         if let Some(value) = value {
-            let record = match NodeSubjectRecord::from_bytes(value.as_ref()) {
-                Ok(record) => record,
-                Err(error) => return self.fail(error.into()),
-            };
+            let record = NodeSubjectRecord::from_bytes(value.as_ref())?;
             self.report.policy_draining = record.policy_draining;
             self.report.serving_blocked = record.serving_blocked;
             self.report.subject = Some(record.subject);
         }
-        self.state = DiagnosticsState::ScanCopies;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: MANAGED_COPY_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.input.start_after.clone().map(IterStart::After),
+        self.stage = Stage::Copies;
+        Ok(IoCall::Page {
+            space: MANAGED_COPY_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.input.start_after.clone(),
             limit: self.input.limit.clamp(1, DIAGNOSTICS_PAGE_LIMIT),
-            txn_id: None,
-        })]
+        })
     }
 
-    fn handle_copies(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(DiagnosticsError::InvalidEvent);
-        };
-        self.report.cursor = next_start_after;
+    fn copies(
+        &mut self,
+        rows: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Result<IoCall, DiagnosticsError> {
+        self.report.cursor = next;
         self.report.complete = self.report.cursor.is_none();
-        for (_, value) in values {
-            let record = match ManagedCopyRecord::from_bytes(value.as_ref()) {
-                Ok(record) => record,
-                Err(error) => return self.fail(error.into()),
-            };
+        for (_, value) in rows {
+            let record = ManagedCopyRecord::from_bytes(value.as_ref())?;
             self.report.observed += 1;
             match record.state {
                 ManagedCopyState::Registered => {
@@ -182,29 +191,21 @@ impl PolicyDiagnosticsOperation {
                 policies: record.policies,
             });
         }
-        self.state = DiagnosticsState::ScanCache;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: POLICY_CACHE_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
+        self.stage = Stage::Cache;
+        Ok(IoCall::Page {
+            space: POLICY_CACHE_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
             limit: MAX_CACHE_ENTRIES + 1,
-            txn_id: None,
-        })]
+        })
     }
 
-    fn handle_cache(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(DiagnosticsError::InvalidEvent);
-        };
+    fn cache(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> DiagnosticsReport {
         let mut coverage = CacheCoverage {
-            truncated: next_start_after.is_some(),
+            truncated: next.is_some(),
             ..CacheCoverage::default()
         };
-        for (_, value) in values {
+        for (_, value) in rows {
             coverage.entries += 1;
             coverage.bytes += value.len();
             match PolicyCacheEntry::from_bytes(value.as_ref()) {
@@ -216,78 +217,36 @@ impl PolicyDiagnosticsOperation {
             }
         }
         self.report.cache = coverage;
-        self.output = Some(Ok(self.report.clone()));
-        self.state = DiagnosticsState::Finish;
-        smallvec![]
+        self.report.clone()
     }
 }
 
-impl EffectOperation for PolicyDiagnosticsOperation {
+impl Operation for PolicyDiagnosticsOperation {
     type Output = DiagnosticsReport;
     type Error = DiagnosticsError;
 
-    fn start(&mut self) -> Effects {
-        self.state = DiagnosticsState::Authorize;
+    fn first(&mut self) -> Result<Next<DiagnosticsReport>, DiagnosticsError> {
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
             path: policy_admin_path(self.input.auth_context.realm_id),
             required_permission: Permission::READ,
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        let child = boxed_suboperation(CheckPermissionsOperation::new(auth_config), |result| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match self.state {
-            DiagnosticsState::Init => self.start(),
-            DiagnosticsState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(DiagnosticsError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => {
-                        self.state = DiagnosticsState::ReadSubject;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-                            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-                            txn_id: None,
-                        })]
-                    }
-                    Ok(false) => self.fail(DiagnosticsError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Policy diagnostics authorization check failed");
-                        self.fail(DiagnosticsError::Unauthorized)
-                    }
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<DiagnosticsReport>, DiagnosticsError> {
+        match (self.stage, result) {
+            (Stage::Authorize, result) => self.authorized(result).map(Next::Call),
+            (Stage::Subject, result) => self.subject(result).map(Next::Call),
+            (Stage::Copies, IoResult::Page { rows, next }) => {
+                self.copies(rows, next).map(Next::Call)
             }
-            DiagnosticsState::ReadSubject => self.handle_subject(event),
-            DiagnosticsState::ScanCopies => self.handle_copies(event),
-            DiagnosticsState::ScanCache => self.handle_cache(event),
-            DiagnosticsState::Finish | DiagnosticsState::Error => smallvec![],
+            (Stage::Cache, IoResult::Page { rows, next }) => Ok(Next::Done(self.cache(rows, next))),
+            _ => Err(DiagnosticsError::InvalidEvent),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            DiagnosticsState::Finish | DiagnosticsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(DiagnosticsError::InvalidEvent))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -301,9 +260,10 @@ mod pure_tests {
         DiagnosticsError, DiagnosticsInput, DiagnosticsReport, PolicyDiagnosticsOperation,
     };
     use aruna_core::UserId;
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
@@ -383,45 +343,49 @@ mod pure_tests {
         })
     }
 
-    fn authorized(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
+    fn authorized(allowed: bool) -> IoResult {
+        let event = SubOperationEvent::AuthorizationResult {
             allowed: Ok(allowed),
-        })
+        };
+        IoResult::Event(Box::new(Event::SubOperation(event)))
     }
 
-    fn iter(values: Vec<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: values
+    fn iter(values: Vec<Vec<u8>>) -> IoResult {
+        IoResult::Page {
+            rows: values
                 .into_iter()
                 .map(|value| (Key::from(Vec::new()), Key::from(value)))
                 .collect(),
-            next_start_after: None,
-        })
+            next: None,
+        }
     }
 
     fn report(copies: Vec<ManagedCopyState>) -> DiagnosticsReport {
         let mut operation = operation();
-        operation.start();
-        operation.step(authorized(true));
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
         let record = NodeSubjectRecord::seed(subject(node_id(), "eu-west")).expect("subject valid");
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: Some(record.to_bytes().expect("record encodes").into()),
-        }));
-        operation.step(iter(
-            copies
-                .into_iter()
-                .map(|state| copy(state).to_bytes().expect("record encodes"))
-                .collect(),
-        ));
+        let row = Some(record.to_bytes().expect("record encodes").into());
+        operation.next(IoResult::Values(vec![row])).unwrap();
+        operation
+            .next(iter(
+                copies
+                    .into_iter()
+                    .map(|state| copy(state).to_bytes().expect("record encodes"))
+                    .collect(),
+            ))
+            .unwrap();
         let entry = PolicyCacheEntry::verified(&signed_document(realm_id(), &policy(), 9), 10);
-        operation.step(iter(vec![
+        let cache = iter(vec![
             entry.to_bytes().expect("entry encodes"),
             PolicyCacheEntry::unavailable(10)
                 .to_bytes()
                 .expect("entry encodes"),
-        ]));
-        operation.finalize().expect("report returned")
+        ]);
+        match operation.next(cache) {
+            Ok(Next::Done(report)) => report,
+            other => panic!("expected the report, got {other:?}"),
+        }
     }
 
     #[test]
@@ -457,11 +421,12 @@ mod pure_tests {
 
     #[test]
     fn denies_non_admin() {
+        // Nothing is read for a denied caller.
         let mut operation = operation();
-        operation.start();
-        let effects = operation.step(authorized(false));
-
-        assert!(effects.is_empty(), "nothing is read for a denied caller");
-        assert_eq!(operation.finalize(), Err(DiagnosticsError::Unauthorized));
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(authorized(false)),
+            Err(DiagnosticsError::Unauthorized)
+        );
     }
 }

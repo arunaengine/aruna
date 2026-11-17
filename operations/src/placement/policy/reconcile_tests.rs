@@ -10,6 +10,7 @@ use aruna_core::structs::placement::record::NodePlacementEntry;
 
 use super::*;
 use crate::tests::policy::{admin_user, realm_view};
+use aruna_core::calls::{IoCall, IoResult, Next};
 
 fn node() -> NodeId {
     iroh::SecretKey::from_bytes(&[5u8; 32]).public()
@@ -193,7 +194,7 @@ fn read_failures_fail() {
 
 #[test]
 fn rejects_unexpected_events() {
-    // Before start every event fails both operations, without effects.
+    // Before start every event fails the subject sync, without effects.
     let make = || sync(SubjectTrigger::Observe);
     for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
         assert!(effects.is_empty(), "{label} emitted effects");
@@ -203,43 +204,50 @@ fn rejects_unexpected_events() {
             "{label}"
         );
     }
-    for (label, effects, error) in
-        rejects_events(LocalSubjectOperation::new, sample_events, |_| false)
-    {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(
-            error,
-            SubjectScanError::InvalidEvent("ReadLocalSubject"),
-            "{label}"
-        );
-    }
 }
 
 #[test]
 fn reads_local_subject() {
-    // The local read answers the advertised record, or none.
+    // One read of the advertised record; the answer is that record, or none.
     let advertised = NodeSubjectRecord::seed(storage_subject(&entry(false), 2)).unwrap();
-    let mut operation = LocalSubjectOperation::new();
-    check_trace(
-        &mut operation,
-        &[local_read()],
-        vec![(read(Some(advertised.to_bytes().unwrap().into())), vec![])],
+    let row = (
+        NODE_SUBJECT_KEYSPACE.to_string(),
+        Key::from(NODE_SUBJECT_KEY.to_vec()),
     );
-    assert_eq!(operation.finalize(), Ok(Some(advertised)));
     let mut operation = LocalSubjectOperation::new();
-    operation.start();
-    operation.step(read(None));
-    assert_eq!(operation.finalize(), Ok(None));
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+    let stored = IoResult::Values(vec![Some(advertised.to_bytes().unwrap().into())]);
+    assert_eq!(operation.next(stored), Ok(Next::Done(Some(advertised))));
+    let mut operation = LocalSubjectOperation::new();
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(IoResult::Values(vec![None])),
+        Ok(Next::Done(None))
+    );
+}
+
+#[test]
+fn local_read_failures() {
+    // An undecodable row or an answer that is not a read fails the read.
+    let mut operation = LocalSubjectOperation::new();
+    operation.first().unwrap();
+    let broken = IoResult::Values(vec![Some(Value::from(vec![0xff; 3]))]);
+    assert!(matches!(
+        operation.next(broken),
+        Err(SubjectScanError::Conversion(_))
+    ));
+    let mut operation = LocalSubjectOperation::new();
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Err(SubjectScanError::InvalidEvent("ReadLocalSubject"))
+    );
 }
 
 #[test]
 fn abort_and_finalize() {
     // Choosing the subject only reads: abort has nothing to clean up, and an early finalize fails.
     let mut operation = sync(SubjectTrigger::Observe);
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
-    let mut operation = LocalSubjectOperation::new();
     operation.start();
     assert!(operation.abort().is_empty());
     rejects_finalize(operation);

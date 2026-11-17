@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::Effect;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::authorization_event;
@@ -43,85 +41,40 @@ pub enum RevokeAllError {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RevokeAllState {
-    Init,
-    Authorize,
-    Cutoff,
-    Finish,
-    Error,
+impl From<IoError> for RevokeAllError {
+    fn from(error: IoError) -> Self {
+        Self::Authorization(error.into())
+    }
 }
 
 /// Bearer tokens, S3 credentials and S3 sessions issued up to `now` are refused on every node.
 #[derive(Debug, PartialEq)]
 pub struct RevokeAllOperation {
     config: RevokeAllConfig,
-    state: RevokeAllState,
-    output: Option<Result<(), RevokeAllError>>,
 }
 
 impl RevokeAllOperation {
     pub fn new(config: RevokeAllConfig) -> Self {
-        Self {
-            config,
-            state: RevokeAllState::Init,
-            output: None,
-        }
+        Self { config }
     }
 
-    fn done(&mut self, result: Result<(), RevokeAllError>) -> Effects {
-        self.state = match result {
-            Ok(()) => RevokeAllState::Finish,
-            Err(_) => RevokeAllState::Error,
-        };
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.done(Err(RevokeAllError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        }))
-    }
-
-    fn handle_authorized(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected("authorization result", event);
-        };
-        match allowed {
-            Ok(true) => {
-                self.state = RevokeAllState::Cutoff;
-                let now = self.config.now;
-                let config = owner_cutoff(self.config.actor.clone(), self.config.target, now, now);
-                smallvec![Effect::SubOperation(boxed_suboperation(
-                    RevokeTokenOperation::new(config),
-                    |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
-                        result: result.map(|_| ()).map_err(|error| error.to_string()),
-                    }),
-                ))]
-            }
-            Ok(false) => self.done(Err(RevokeAllError::Refused)),
-            Err(error) => self.done(Err(error.into())),
-        }
-    }
-
-    fn handle_cutoff(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::TokenRevoked { result }) => {
-                self.done(result.map_err(RevokeAllError::Cutoff))
-            }
-            other => self.unexpected("token revocation result", other),
-        }
+    fn cutoff(&self) -> Next<()> {
+        let now = self.config.now;
+        let config = owner_cutoff(self.config.actor.clone(), self.config.target, now, now);
+        let child = boxed_suboperation(RevokeTokenOperation::new(config), |result| {
+            Event::SubOperation(SubOperationEvent::TokenRevoked {
+                result: result.map(|_| ()).map_err(|error| error.to_string()),
+            })
+        });
+        Next::Call(IoCall::Child(child))
     }
 }
 
-impl EffectOperation for RevokeAllOperation {
+impl Operation for RevokeAllOperation {
     type Output = ();
     type Error = RevokeAllError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<()>, RevokeAllError> {
         let auth = &self.config.auth_context;
         // Federated callers never administer accounts of this realm.
         if auth.user_id != self.config.actor.user_id
@@ -129,37 +82,92 @@ impl EffectOperation for RevokeAllOperation {
             || auth.user_id.realm_id != auth.realm_id
             || self.config.target.realm_id != auth.realm_id
         {
-            return self.done(Err(RevokeAllError::Refused));
+            return Err(RevokeAllError::Refused);
         }
-        self.state = RevokeAllState::Authorize;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: auth.clone(),
-                path: format!("/{}/admin/u/{}", auth.realm_id, self.config.target),
-                required_permission: Permission::WRITE,
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path: format!("/{}/admin/u/{}", auth.realm_id, self.config.target),
+            required_permission: Permission::WRITE,
+        });
+        let child = boxed_suboperation(check, authorization_event);
+        Ok(Next::Call(IoCall::Child(child)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, RevokeAllError> {
+        let IoResult::Event(event) = result else {
+            return Err(RevokeAllError::NotFinished);
+        };
+        match *event {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                match allowed {
+                    Ok(true) => Ok(self.cutoff()),
+                    Ok(false) => Err(RevokeAllError::Refused),
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Event::SubOperation(SubOperationEvent::TokenRevoked { result }) => {
+                result.map_err(RevokeAllError::Cutoff)?;
+                Ok(Next::Done(()))
+            }
+            other => Err(RevokeAllError::UnexpectedEvent {
+                state: "RevokeAll".to_string(),
+                expected: "authorization or token revocation result",
+                got: other.label(),
             }),
-            authorization_event,
-        ))]
+        }
     }
+}
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            RevokeAllState::Authorize => self.handle_authorized(event),
-            RevokeAllState::Cutoff => self.handle_cutoff(event),
-            RevokeAllState::Init => self.unexpected("no event before start", event),
-            RevokeAllState::Finish | RevokeAllState::Error => smallvec![],
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    fn config(target_realm: u8) -> RevokeAllConfig {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        let auth_context = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let target_realm = RealmId::from_bytes([target_realm; 32]);
+        RevokeAllConfig {
+            actor: Actor {
+                node_id: iroh::SecretKey::from_bytes(&[7; 32]).public(),
+                user_id,
+                realm_id,
+            },
+            auth_context,
+            target: UserId::local(Ulid::from_bytes([3; 16]), target_realm),
+            now: 7,
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RevokeAllState::Finish | RevokeAllState::Error)
+    fn answer(event: SubOperationEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::SubOperation(event)))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(RevokeAllError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn cutoff_after_authorization() {
+        // A foreign target is refused at once; an allowed caller moves the cutoff.
+        let mut foreign = RevokeAllOperation::new(config(9));
+        assert_eq!(foreign.first(), Err(RevokeAllError::Refused));
+        let mut operation = RevokeAllOperation::new(config(1));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let denied = SubOperationEvent::AuthorizationResult { allowed: Ok(false) };
+        assert_eq!(operation.next(answer(denied)), Err(RevokeAllError::Refused));
+        let allowed = SubOperationEvent::AuthorizationResult { allowed: Ok(true) };
+        assert!(matches!(
+            operation.next(answer(allowed)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let revoked = SubOperationEvent::TokenRevoked { result: Ok(()) };
+        assert_eq!(operation.next(answer(revoked)), Ok(Next::Done(())));
     }
 }

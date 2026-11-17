@@ -2,29 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoResult, Next};
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::SyncRelationship;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use ulid::Ulid;
 
-use super::{SyncRelationshipDirection, SyncRelationshipError, iter_effect, parse_values};
+use super::{SyncRelationshipDirection, SyncRelationshipError, pages, parse_values};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GetState {
-    Init,
-    Listing,
-    Finish,
-    Error,
-}
-
+/// The relationship `id` of `direction`, searched page by page; `NotFound` when absent.
 #[derive(Debug, PartialEq)]
 pub struct GetRelationshipOperation {
     id: Ulid,
     direction: SyncRelationshipDirection,
-    state: GetState,
-    output: Option<Result<SyncRelationship, SyncRelationshipError>>,
+    pages: PrefixPages,
 }
 
 impl GetRelationshipOperation {
@@ -32,89 +23,28 @@ impl GetRelationshipOperation {
         Self {
             id,
             direction,
-            state: GetState::Init,
-            output: None,
+            pages: pages(direction, None),
         }
-    }
-
-    fn fail(&mut self, error: SyncRelationshipError) -> Effects {
-        self.state = GetState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
     }
 }
 
-impl EffectOperation for GetRelationshipOperation {
+impl Operation for GetRelationshipOperation {
     type Output = SyncRelationship;
     type Error = SyncRelationshipError;
 
-    fn start(&mut self) -> Effects {
-        self.state = GetState::Listing;
-        smallvec![iter_effect(self.direction, None, None, None)]
+    fn first(&mut self) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
+        let rows = self.pages.take(result)?;
+        let found = parse_values(self.direction, rows)?
+            .into_iter()
+            .find(|relationship| relationship.id == self.id);
+        match found {
+            Some(relationship) => Ok(Next::Done(relationship)),
+            None if self.pages.done() => Err(SyncRelationshipError::NotFound),
+            None => Ok(Next::Call(self.pages.call())),
         }
-
-        match self.state {
-            GetState::Listing => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return self.fail(SyncRelationshipError::UnexpectedEvent {
-                        state: "Listing",
-                        expected: "storage iteration result",
-                        received: event,
-                    });
-                };
-
-                let relationships = match parse_values(self.direction, values) {
-                    Ok(relationships) => relationships,
-                    Err(error) => return self.fail(error.into()),
-                };
-                if let Some(relationship) = relationships
-                    .into_iter()
-                    .find(|relationship| relationship.id == self.id)
-                {
-                    self.state = GetState::Finish;
-                    self.output = Some(Ok(relationship));
-                    return smallvec![];
-                }
-
-                if let Some(start_after) = next_start_after {
-                    return smallvec![iter_effect(self.direction, None, Some(start_after), None)];
-                }
-
-                self.fail(SyncRelationshipError::NotFound)
-            }
-            GetState::Init => self.fail(SyncRelationshipError::UnexpectedEvent {
-                state: "Init",
-                expected: "operation start",
-                received: event,
-            }),
-            GetState::Finish | GetState::Error => {
-                self.fail(SyncRelationshipError::UnexpectedEvent {
-                    state: "terminal",
-                    expected: "no event",
-                    received: event,
-                })
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetState::Finish | GetState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(SyncRelationshipError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }

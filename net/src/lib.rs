@@ -1104,8 +1104,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
         Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
-        Effect::Net(NetEffect::JobRecord(_)) => "job_record",
-        Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",

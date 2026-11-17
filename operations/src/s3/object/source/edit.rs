@@ -4,11 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{SourceMapping, SourceMirror, VersionSourceBinding};
@@ -17,9 +16,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     BlobVersion, BlobVersionState, BucketIdentity, BucketInfo, VersionKey,
 };
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -86,53 +84,47 @@ pub enum SourceEditError {
     BucketChanged,
     #[error("the connector changed since the edit was authorized")]
     ConnectorChanged,
-    #[error("unexpected event in state {state:?}: {received}")]
-    UnexpectedEvent {
-        state: SourceEditState,
-        received: String,
-    },
+    #[error("the source edit failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for SourceEditError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SourceEditState {
-    Init,
-    Started,
+enum SourceEditState {
     Guards,
     Scan,
     Write,
-    Commit,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<SourceEditResult>, SourceEditError>;
 
 #[derive(Debug, PartialEq)]
 pub struct SourceEditOperation {
     input: SourceEditInput,
     state: SourceEditState,
-    txn_id: Option<TxnId>,
     result: SourceEditResult,
-    output: Option<Result<SourceEditResult, SourceEditError>>,
 }
 
 impl SourceEditOperation {
     pub fn new(input: SourceEditInput) -> Self {
         Self {
             input,
-            state: SourceEditState::Init,
-            txn_id: None,
+            state: SourceEditState::Guards,
             result: SourceEditResult::default(),
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: SourceEditError) -> Effects {
-        self.state = SourceEditState::Error;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
     /// Reads the bucket and the new source's connector in the edit transaction.
-    fn read_guards(&mut self) -> Effects {
+    fn read_guards(&mut self) -> Step {
         let bucket = ByteView::from(self.input.bucket.as_bytes().to_vec());
         let mut reads = vec![(S3_BUCKET_KEYSPACE.to_string(), bucket)];
         if let SourceChange::Add { connector, .. } = &self.input.change {
@@ -140,14 +132,11 @@ impl SourceEditOperation {
             reads.push((SOURCE_INDEX_KEYSPACE.to_string(), key));
         }
         self.state = SourceEditState::Guards;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn check_guards(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<(), SourceEditError> {
-        let mut values = values.into_iter().map(|(_, value)| value);
+    fn check_guards(&mut self, values: Vec<Option<Value>>) -> Result<(), SourceEditError> {
+        let mut values = values.into_iter();
         let bucket = values.next().flatten();
         let bucket = bucket.map(|value| BucketInfo::from_bytes(value.as_ref()));
         match bucket.transpose()? {
@@ -166,27 +155,24 @@ impl SourceEditOperation {
         Ok(())
     }
 
-    fn scan(&mut self) -> Result<Effects, SourceEditError> {
+    fn scan(&mut self) -> Step {
         let input = &self.input;
         let prefix = match input.exact {
             true => VersionKey::object_prefix(&input.bucket, &input.prefix)?,
             false => VersionKey::bucket_prefix(&input.bucket)?,
         };
+        let after = (input.after.clone()).map(Key::from);
+        let limit = input.page;
         self.state = SourceEditState::Scan;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: (input.after.clone()).map(|after| IterStart::After(after.into())),
-            limit: input.page,
-            txn_id: self.txn_id,
-        })])
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after,
+            limit,
+        }))
     }
 
-    fn edit_page(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        next: Option<Key>,
-    ) -> Result<Effects, SourceEditError> {
+    fn edit_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
         self.result.scanned = values.len() as u64;
         self.result.next = next.map(|key| key.to_vec());
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
@@ -250,68 +236,11 @@ impl SourceEditOperation {
                 version.to_bytes()?.into(),
             ));
         }
-        let Some(txn_id) = self.txn_id else {
-            return Err(StorageError::ReadError("no source edit transaction".to_string()).into());
-        };
         if writes.is_empty() {
-            self.state = SourceEditState::Commit;
-            return Ok(smallvec![Effect::Storage(
-                StorageEffect::CommitTransaction { txn_id }
-            )]);
+            return Ok(Next::Done(self.result.clone()));
         }
         self.state = SourceEditState::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn step_inner(&mut self, event: Event) -> Result<Effects, SourceEditError> {
-        match (self.state, event) {
-            (
-                SourceEditState::Started,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                Ok(self.read_guards())
-            }
-            (SourceEditState::Guards, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.check_guards(values)?;
-                self.scan()
-            }
-            (
-                SourceEditState::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.edit_page(values, next_start_after),
-            (SourceEditState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return Err(
-                        StorageError::WriteError("no source edit transaction".into()).into(),
-                    );
-                };
-                self.state = SourceEditState::Commit;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::CommitTransaction { txn_id }
-                )])
-            }
-            (
-                SourceEditState::Commit,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.txn_id = None;
-                self.state = SourceEditState::Finish;
-                self.output = Some(Ok(self.result.clone()));
-                Ok(smallvec![])
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(SourceEditError::UnexpectedEvent {
-                state,
-                received: event.label().to_string(),
-            }),
-        }
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -419,39 +348,33 @@ fn removed(
     Removal::Removed
 }
 
-impl EffectOperation for SourceEditOperation {
+impl Operation for SourceEditOperation {
     type Output = SourceEditResult;
     type Error = SourceEditError;
 
-    fn start(&mut self) -> Effects {
-        self.state = SourceEditState::Started;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        self.read_guards()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            SourceEditState::Guards => {
+                self.check_guards(result.values()?)?;
+                self.scan()
+            }
+            SourceEditState::Scan => {
+                let (values, next) = result.page()?;
+                self.edit_page(values, next)
+            }
+            SourceEditState::Write => {
+                result.done()?;
+                Ok(Next::Done(self.result.clone()))
+            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SourceEditState::Finish | SourceEditState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SourceEditError::UnexpectedEvent {
-            state: self.state,
-            received: "operation did not finish".to_string(),
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id.take().map_or_else(Effects::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
+    fn transaction(&self) -> bool {
+        true
     }
 }
 

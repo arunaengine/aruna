@@ -10,6 +10,7 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::auth::{ADMIN_CLAIMED_KEY, REALMS_LIST_KEY};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::device_wipe::DeviceWipe;
 use aruna_core::errors::StorageError;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
@@ -32,7 +33,6 @@ use aruna_operations::onboarding::issue_ticket::{
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_tasks::wipe::DeviceWipe;
 use aruna_wire::address::client_host_url;
 use aruna_wire::info::PortalStatus;
 use async_trait::async_trait;

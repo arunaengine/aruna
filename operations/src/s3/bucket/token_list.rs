@@ -2,16 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ABE_GRANT_KEYSPACE, USER_ACCESS_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::abe_access::KeyGrant;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
 use std::collections::BTreeSet;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -27,10 +25,17 @@ pub enum TokenListError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Abe(#[from] AbeError),
-    #[error("unexpected event while listing tokens: {0:?}")]
-    InvalidStateEvent(Event),
-    #[error("the token listing did not finish")]
-    NotFinished,
+    #[error("could not list tokens: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for TokenListError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// One token grant and whether its credential still authenticates.
@@ -40,157 +45,90 @@ pub struct TokenEntry {
     pub credential_active: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Step {
-    ScanCopies,
-    ReadCredentials,
-    Finish,
-    Error,
-}
+type Step = Result<Next<Vec<TokenEntry>>, TokenListError>;
 
 #[derive(Debug, PartialEq)]
 pub struct ListTokensOperation {
-    bucket_id: Ulid,
     now: SystemTime,
-    step: Step,
+    pages: PrefixPages,
     grants: Vec<KeyGrant>,
-    output: Option<Result<Vec<TokenEntry>, TokenListError>>,
+    /// The access keys read, in read order, once every grant page was taken.
+    reads: Option<Vec<String>>,
 }
 
 impl ListTokensOperation {
     /// Lists every generation's token grants of the bucket with stable id `bucket_id`.
     pub fn new(bucket_id: Ulid, now: SystemTime) -> Self {
+        let prefix = bucket_id.to_bytes().to_vec();
         Self {
-            bucket_id,
             now,
-            step: Step::ScanCopies,
+            pages: PrefixPages::new(ABE_GRANT_KEYSPACE, prefix, SCAN_PAGE),
             grants: Vec::new(),
-            output: None,
+            reads: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<TokenListError>) -> Effects {
-        self.step = Step::Error;
-        self.output = Some(Err(error.into()));
-        smallvec![]
-    }
-
-    fn scan(&mut self, start: Option<Key>) -> Effects {
-        self.step = Step::ScanCopies;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ABE_GRANT_KEYSPACE.to_string(),
-            prefix: Some(self.bucket_id.to_bytes().to_vec().into()),
-            start: start.map(IterStart::After),
-            limit: SCAN_PAGE,
-            txn_id: None,
-        })]
-    }
-
-    fn page(&mut self, values: Vec<(Key, Key)>, next: Option<Key>) -> Effects {
-        for (_, value) in values {
-            match KeyGrant::from_bytes(&value) {
-                Ok(grant) if grant.context.request.credential_id.is_some() => {
-                    self.grants.push(grant)
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error),
+    fn page(&mut self, result: IoResult) -> Step {
+        for (_, value) in self.pages.take(result)? {
+            let grant = KeyGrant::from_bytes(&value)?;
+            if grant.context.request.credential_id.is_some() {
+                self.grants.push(grant);
             }
         }
-        if next.is_some() {
-            return self.scan(next);
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
         }
-        let access_keys: BTreeSet<_> = self
-            .grants
-            .iter()
-            .filter_map(|grant| grant.context.request.credential_id.as_ref())
+        let access_keys: BTreeSet<_> = (self.grants.iter())
+            .filter_map(|grant| grant.context.request.credential_id.clone())
             .collect();
         if access_keys.is_empty() {
-            return self.finish(Vec::new());
+            return Ok(Next::Done(Vec::new()));
         }
-        let reads = access_keys
-            .into_iter()
+        let access_keys: Vec<_> = access_keys.into_iter().collect();
+        let reads = (access_keys.iter())
             .map(|access_key| {
                 let key = access_key.as_bytes().to_vec().into();
                 (USER_ACCESS_KEYSPACE.to_string(), key)
             })
             .collect();
-        self.step = Step::ReadCredentials;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        self.reads = Some(access_keys);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn credentials(&mut self, values: Vec<(Key, Option<Key>)>) -> Effects {
+    fn credentials(&mut self, keys: Vec<String>, result: IoResult) -> Step {
         let mut active = BTreeSet::new();
-        for (key, value) in values {
+        for (key, value) in keys.into_iter().zip(result.values()?) {
             let Some(value) = value else { continue };
-            match UserAccess::from_bytes(&value) {
-                Ok(access) if !access.is_revoked() && !access.is_expired(self.now) => {
-                    active.insert(key.to_vec());
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error),
+            let access = UserAccess::from_bytes(&value)?;
+            if !access.is_revoked() && !access.is_expired(self.now) {
+                active.insert(key);
             }
         }
         let entries = std::mem::take(&mut self.grants)
             .into_iter()
             .map(|grant| TokenEntry {
-                credential_active: grant
-                    .context
-                    .request
-                    .credential_id
-                    .as_ref()
-                    .is_some_and(|access_key| active.contains(access_key.as_bytes())),
+                credential_active: (grant.context.request.credential_id.as_ref())
+                    .is_some_and(|access_key| active.contains(access_key)),
                 grant,
             })
             .collect();
-        self.finish(entries)
-    }
-
-    fn finish(&mut self, entries: Vec<TokenEntry>) -> Effects {
-        self.step = Step::Finish;
-        self.output = Some(Ok(entries));
-        smallvec![]
+        Ok(Next::Done(entries))
     }
 }
 
-impl EffectOperation for ListTokensOperation {
+impl Operation for ListTokensOperation {
     type Output = Vec<TokenEntry>;
     type Error = TokenListError;
 
-    fn start(&mut self) -> Effects {
-        self.scan(None)
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (Step::Finish | Step::Error, _) => smallvec![],
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
-            (
-                Step::ScanCopies,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page(values, next_start_after),
-            (Step::ReadCredentials, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.credentials(values)
-            }
-            (_, received) => self.fail(TokenListError::InvalidStateEvent(received)),
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.reads.take() {
+            Some(keys) => self.credentials(keys, result),
+            None => self.page(result),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.step, Step::Finish | Step::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(TokenListError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -202,6 +140,7 @@ mod tests {
     use crate::tests::s3::test_storage;
     use aruna_core::UserId;
     use aruna_core::credential_encryption::EncryptedS3Secret;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::abe::AbeParameters;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyIssuer, KeyRequest, KeyScope};

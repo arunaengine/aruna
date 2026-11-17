@@ -5,17 +5,17 @@
 
 // Nothing walks the node's uploads of other buckets or sorts uploads in memory.
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{UPLOAD_INVENTORY_KEYSPACE, UPLOAD_KEYSPACE, prefix_upper_bound};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, bound_position, head_position, prefix_interval, upload_position,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -45,22 +45,21 @@ pub struct InventoryUploadsInput {
 #[derive(Debug, Error, PartialEq)]
 pub enum InventoryUploadsError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("the upload listing received an unexpected event: {0:?}")]
-    Unexpected(Box<Event>),
-    #[error("the upload listing did not finish")]
-    NotFinished,
+    #[error("the upload listing received an unexpected event: {0}")]
+    Unexpected(&'static str),
 }
 
+/// What the pending call reads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    Init,
     Scan,
     Records,
-    Done,
 }
+
+type Step = Result<Next<ListUploadsResult>, InventoryUploadsError>;
 
 #[derive(Debug, PartialEq)]
 pub struct InventoryUploadsOperation {
@@ -75,14 +74,13 @@ pub struct InventoryUploadsOperation {
     last: Option<(String, Option<Ulid>)>,
     rounds: usize,
     truncated: bool,
-    output: Option<Result<ListUploadsResult, InventoryUploadsError>>,
 }
 
 impl InventoryUploadsOperation {
     pub fn new(input: InventoryUploadsInput) -> Self {
         Self {
             input,
-            state: State::Init,
+            state: State::Scan,
             start: Vec::new(),
             after: false,
             end: Vec::new(),
@@ -91,7 +89,6 @@ impl InventoryUploadsOperation {
             last: None,
             rounds: 0,
             truncated: false,
-            output: None,
         }
     }
 
@@ -130,9 +127,9 @@ impl InventoryUploadsOperation {
         prefix_upper_bound(&rows).unwrap_or(rows)
     }
 
-    fn begin(&mut self) -> Effects {
+    fn begin(&mut self) -> Step {
         if self.input.max_uploads == 0 {
-            return self.finish(Vec::new());
+            return Ok(self.finish(Vec::new()));
         }
         self.bounds();
         let set_id = self.input.set_id;
@@ -148,10 +145,10 @@ impl InventoryUploadsOperation {
             };
             self.resume(position, after);
         }
-        self.scan()
+        Ok(self.scan())
     }
 
-    fn scan(&mut self) -> Effects {
+    fn scan(&mut self) -> Next<ListUploadsResult> {
         if self.start >= self.end || self.rounds >= MAX_ROUNDS {
             self.truncated = self.start < self.end && self.last.is_some();
             return self.hydrate();
@@ -163,21 +160,18 @@ impl InventoryUploadsOperation {
             true => IterStart::After(self.start.clone().into()),
             false => IterStart::At(self.start.clone().into()),
         };
-        smallvec![Effect::Storage(StorageEffect::IterRange {
+        let range = StorageEffect::IterRange {
             key_space: UPLOAD_INVENTORY_KEYSPACE.to_string(),
             start,
             end: IterEnd::Before(self.end.clone().into()),
             limit: remaining.saturating_add(1),
             max_bytes: ROUND_BYTES,
             txn_id: None,
-        })]
+        };
+        Next::Call(IoCall::Effect(Box::new(Effect::Storage(range))))
     }
 
-    fn scanned(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        more: bool,
-    ) -> Result<Effects, InventoryUploadsError> {
+    fn scanned(&mut self, values: Vec<(Key, Value)>, more: bool) -> Step {
         for (row, _) in values {
             let position = Position::decode(&row)?;
             let Entry::Upload(upload_id) = position.entry else {
@@ -214,7 +208,7 @@ impl InventoryUploadsOperation {
         }
     }
 
-    fn hydrate(&mut self) -> Effects {
+    fn hydrate(&mut self) -> Next<ListUploadsResult> {
         if self.candidates.is_empty() {
             return self.finish(Vec::new());
         }
@@ -222,18 +216,12 @@ impl InventoryUploadsOperation {
             .map(|(_, id)| (UPLOAD_KEYSPACE.to_string(), id.to_bytes().to_vec().into()))
             .collect();
         self.state = State::Records;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Next::Call(IoCall::Read(reads))
     }
 
-    fn records(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<Effects, InventoryUploadsError> {
+    fn records(&mut self, values: Vec<Option<Value>>) -> Step {
         let mut uploads = Vec::with_capacity(values.len());
-        for (_, value) in values {
+        for value in values {
             // A row whose record is gone or no longer open is being completed or aborted.
             let Some(value) = value else { continue };
             let upload = MultipartUpload::from_bytes(&value)?;
@@ -244,73 +232,41 @@ impl InventoryUploadsOperation {
         Ok(self.finish(uploads))
     }
 
-    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Effects {
+    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Next<ListUploadsResult> {
         let (next_key_marker, next_upload_marker) = match (self.truncated, self.last.take()) {
             (true, Some((key, upload_id))) => (Some(key), upload_id),
             _ => (None, None),
         };
-        self.state = State::Done;
-        self.output = Some(Ok(ListUploadsResult {
+        Next::Done(ListUploadsResult {
             uploads,
             common_prefixes: std::mem::take(&mut self.prefixes),
             is_truncated: next_key_marker.is_some(),
             next_key_marker,
             next_upload_marker,
-        }));
-        smallvec![]
-    }
-
-    fn handle(&mut self, event: Event) -> Result<Effects, InventoryUploadsError> {
-        match (self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (
-                State::Scan,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.scanned(values, next_start_after.is_some()),
-            (State::Records, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.records(values)
-            }
-            (_, event) => Err(InventoryUploadsError::Unexpected(Box::new(event))),
-        }
+        })
     }
 }
 
-impl EffectOperation for InventoryUploadsOperation {
+impl Operation for InventoryUploadsOperation {
     type Output = ListUploadsResult;
     type Error = InventoryUploadsError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Step {
         self.begin()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Done {
-            return smallvec![];
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            State::Scan => match result.event()? {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => self.scanned(values, next_start_after.is_some()),
+                Event::Storage(StorageEvent::Error { error }) => Err(IoError::Storage(error).into()),
+                other => Err(InventoryUploadsError::Unexpected(other.label())),
+            },
+            State::Records => self.records(result.values()?),
         }
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => {
-                self.state = State::Done;
-                self.output = Some(Err(error));
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<ListUploadsResult, InventoryUploadsError> {
-        self.output
-            .unwrap_or(Err(InventoryUploadsError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

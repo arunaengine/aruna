@@ -4,16 +4,14 @@
 
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
-use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -28,17 +26,6 @@ pub struct GetUserInput {
 #[derive(Debug, PartialEq)]
 pub struct GetUserOperation {
     input: GetUserInput,
-    state: GetUserState,
-    output: Option<Result<User, GetUserError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum GetUserState {
-    Init,
-    Auth,
-    ReadExistingUser,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -63,102 +50,34 @@ pub enum GetUserError {
     UserNotFound,
 }
 
-impl GetUserOperation {
-    pub fn new(input: GetUserInput) -> Self {
-        Self {
-            input,
-            state: GetUserState::Init,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: GetUserError) -> Effects {
-        let cleanup = self.abort();
-        self.state = GetUserState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(GetUserError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn handle_auth_result(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(aruna_core::events::SubOperationEvent::AuthorizationResult {
-            allowed,
-        }) = event
-        else {
-            return self.unexpected_event(
-                "Event::SubOperation(aruna_core::events::SubOperationEvent::AuthorizationResult { allowed })",
+impl From<IoError> for GetUserError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "GetUser".to_string(),
+                expected,
                 got,
-            );
-        };
-
-        match self.read_existing(allowed) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
         }
-    }
-
-    fn read_existing(
-        &mut self,
-        allowed: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, GetUserError> {
-        if allowed? {
-            self.state = GetUserState::ReadExistingUser;
-            let user_id = UserId::from_string(&self.input.user_id)?;
-            let key = user_id.to_bytes().into();
-            Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USER_KEYSPACE.to_string(),
-                key,
-                txn_id: None
-            })])
-        } else {
-            Err(GetUserError::Unauthorized)
-        }
-    }
-
-    fn accept_existing(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::ReadResult { key, value })",
-                got,
-            );
-        };
-
-        match self.emit_finish(value) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_finish(&mut self, value: Option<ByteView>) -> Result<Effects, GetUserError> {
-        let user = User::from_bytes(&value.ok_or_else(|| GetUserError::UserNotFound)?)?;
-        self.state = GetUserState::Finish;
-        self.output = Some(Ok(user));
-        Ok(smallvec![])
     }
 }
 
-impl EffectOperation for GetUserOperation {
+impl GetUserOperation {
+    pub fn new(input: GetUserInput) -> Self {
+        Self { input }
+    }
+}
+
+impl Operation for GetUserOperation {
     type Output = User;
     type Error = GetUserError;
 
-    fn start(&mut self) -> Effects {
-        self.state = GetUserState::Auth;
+    fn first(&mut self) -> Result<Next<User>, GetUserError> {
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
             path: format!(
@@ -167,37 +86,75 @@ impl EffectOperation for GetUserOperation {
             ),
             required_permission: Permission::READ,
         };
-        let auth_operation =
-            boxed_suboperation(CheckPermissionsOperation::new(auth_config), |result| {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
-            });
-
-        smallvec![Effect::SubOperation(auth_operation)]
+        let check = boxed_suboperation(CheckPermissionsOperation::new(auth_config), |result| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
+        });
+        Ok(Next::Call(IoCall::Child(check)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
+    fn next(&mut self, result: IoResult) -> Result<Next<User>, GetUserError> {
+        let IoResult::Event(event) = result else {
+            let [value] = values::<1>(result)?;
+            let user = User::from_bytes(&value.ok_or(GetUserError::UserNotFound)?)?;
+            return Ok(Next::Done(user));
         };
-        match &self.state {
-            GetUserState::Auth => self.handle_auth_result(event),
-            GetUserState::ReadExistingUser => self.accept_existing(event),
-            GetUserState::Init | GetUserState::Finish | GetUserState::Error => {
-                smallvec![]
-            }
+        let got = event.label();
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = *event else {
+            return Err(GetUserError::UnexpectedEvent {
+                state: "Auth".to_string(),
+                expected: "authorization result",
+                got,
+            });
+        };
+        if !allowed? {
+            return Err(GetUserError::Unauthorized);
         }
+        let user_id = UserId::from_string(&self.input.user_id)?;
+        Ok(Next::Call(read_row(USER_KEYSPACE, user_id.to_bytes())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ulid::Ulid;
+
+    fn allowed(allowed: bool) -> IoResult {
+        let event = SubOperationEvent::AuthorizationResult {
+            allowed: Ok(allowed),
+        };
+        IoResult::Event(Box::new(Event::SubOperation(event)))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetUserState::Finish | GetUserState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(GetUserError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn reads_after_authorization() {
+        // A refused caller reads nothing; an allowed one reads the user row.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), realm_id);
+        let input = GetUserInput {
+            auth_context: AuthContext {
+                user_id,
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            self_realm_id: realm_id,
+            user_id: user_id.to_string(),
+        };
+        let mut refused = GetUserOperation::new(input.clone());
+        refused.first().unwrap();
+        assert_eq!(
+            refused.next(allowed(false)),
+            Err(GetUserError::Unauthorized)
+        );
+        let mut operation = GetUserOperation::new(input);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let read = read_row(USER_KEYSPACE, user_id.to_bytes());
+        assert_eq!(operation.next(allowed(true)), Ok(Next::Call(read)));
+        let missing = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(GetUserError::UserNotFound));
     }
 }
