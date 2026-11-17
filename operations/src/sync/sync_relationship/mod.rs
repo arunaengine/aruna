@@ -18,12 +18,11 @@ pub use list::ListRelationshipsOperation;
 pub use remove::RemoveOutgoingOperation;
 pub use store::StoreRelationshipOperation;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::keyspaces::{RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -63,14 +62,17 @@ pub enum SyncRelationshipError {
     Duplicate,
     #[error("sync relationship creation was rolled back")]
     RolledBack,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
-    UnexpectedEvent {
-        state: &'static str,
-        expected: &'static str,
-        received: Event,
-    },
-    #[error("sync relationship operation did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for SyncRelationshipError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 fn same_create_identity(left: &SyncRelationship, right: &SyncRelationship) -> bool {
@@ -90,18 +92,66 @@ fn storage_key(
     )))
 }
 
-fn iter_effect(
+/// One page of relationships of `direction`, of one bucket or of all.
+fn page_call(
     direction: SyncRelationshipDirection,
     bucket: Option<&str>,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: direction.keyspace().to_string(),
-        prefix: bucket.map(sync_relationship_prefix).map(ByteView::from),
-        start: start_after.map(IterStart::After),
+    after: Option<Key>,
+) -> IoCall {
+    IoCall::Page {
+        space: direction.keyspace().to_string(),
+        prefix: ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default()),
+        after,
         limit: RELATIONSHIP_PAGE_SIZE,
-        txn_id,
+    }
+}
+
+/// Writes `relationship` in the keyspace of `direction`.
+fn write_call(
+    direction: SyncRelationshipDirection,
+    relationship: &SyncRelationship,
+) -> Result<IoCall, ConversionError> {
+    let row = (
+        direction.keyspace().to_string(),
+        storage_key(direction, relationship)?,
+        ByteView::from(relationship.to_bytes()?),
+    );
+    Ok(IoCall::Write(vec![row]))
+}
+
+/// Deletes `relationship` from the keyspace of `direction`.
+fn delete_call(
+    direction: SyncRelationshipDirection,
+    relationship: &SyncRelationship,
+) -> Result<IoCall, ConversionError> {
+    relationship.validate()?;
+    let row = (
+        direction.keyspace().to_string(),
+        storage_key(direction, relationship)?,
+    );
+    Ok(IoCall::Delete(vec![row]))
+}
+
+/// The rows of a page, or the error for any other result.
+fn page_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), SyncRelationshipError> {
+    match result {
+        IoResult::Page { rows, next } => Ok((rows, next)),
+        other => Err(unexpected("IoResult::Page", &other)),
+    }
+}
+
+/// Checks that a write or delete finished.
+fn finished(result: IoResult) -> Result<(), SyncRelationshipError> {
+    match result {
+        IoResult::Done => Ok(()),
+        other => Err(unexpected("IoResult::Done", &other)),
+    }
+}
+
+fn unexpected(expected: &'static str, result: &IoResult) -> SyncRelationshipError {
+    SyncRelationshipError::Io(IoError::Unexpected {
+        expected,
+        got: result.label(),
     })
 }
 
