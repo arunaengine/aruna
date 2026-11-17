@@ -5,7 +5,7 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::outbox_record::{new_outbox_record, schedule_drain_effect};
-use crate::s3::bucket::holders::lookup_keys;
+use crate::s3::bucket::holders::LookupKeysOperation;
 use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
 use crate::s3::key_status::KeyStatusOperation;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -371,7 +371,10 @@ pub async fn check_recovery(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect();
-    let lookups = lookup_keys(context, realm_id, node_id, users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(LookupKeysOperation::new(realm_id, node_id, users), context)
+        .await
+        .unwrap_or_default();
     let input = RecoveryInput {
         bucket: bucket.to_string(),
         group_id,

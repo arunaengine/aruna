@@ -29,7 +29,7 @@ use aruna_operations::driver::{DriverContext, drive, now_ms};
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
-use aruna_operations::s3::bucket::holders::lookup_keys;
+use aruna_operations::s3::bucket::holders::LookupKeysOperation;
 use aruna_operations::s3::bucket::key_install::{
     InstallInput, InstallKeyOperation, install_and_wake,
 };
@@ -452,13 +452,13 @@ pub(crate) async fn holder_report(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let copies: Vec<_> = snapshot
         .copies
         .iter()
@@ -902,7 +902,13 @@ pub(crate) async fn change_bucket(
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
     let context = state.get_ctx();
-    let lookups = lookup_keys(&context, state.get_realm_id(), state.get_node_id(), users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
+        &context,
+    )
+    .await
+    .unwrap_or_default();
     let input = ChangeInput {
         bucket: bucket.to_string(),
         group_id,
@@ -982,7 +988,10 @@ pub(crate) async fn enable_bucket(
         .into_iter()
         .chain(snapshot.admins.iter().copied())
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(context, realm_id, node_id, users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(LookupKeysOperation::new(realm_id, node_id, users), context)
+        .await
+        .unwrap_or_default();
     let input = EnableInput {
         bucket: bucket.to_string(),
         group_id,

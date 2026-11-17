@@ -134,6 +134,10 @@ pub enum SubOperationEvent {
     AuditStored {
         result: Result<(), String>,
     },
+    /// The key directory answer for one user.
+    KeysLooked {
+        lookup: crate::structs::storage::holders::KeyLookup,
+    },
 }
 
 /// How the re-key of one version ended.
