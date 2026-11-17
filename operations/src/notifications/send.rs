@@ -14,6 +14,7 @@ use aruna_core::outbound::{
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
 };
+use aruna_core::structs::execution::job::JobError;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -135,6 +136,14 @@ impl Operation for SendOperation {
             other => Err(unexpected_event("an outbound event", &other).into()),
         };
         sent.map(Next::Done)
+    }
+}
+
+/// A send failure as the job runtime takes it.
+pub(crate) fn job_error(error: SendError) -> JobError {
+    match error {
+        SendError::Failed(message) => JobError::retryable(message),
+        error => JobError::permanent(error.to_string()),
     }
 }
 

@@ -7,6 +7,7 @@ pub mod client;
 pub mod deliver;
 pub mod dispatch;
 pub mod email;
+pub(crate) mod email_job;
 pub mod emit;
 pub mod enqueue;
 pub mod inbox;
@@ -27,6 +28,7 @@ pub mod settings;
 mod tests;
 pub mod watch;
 pub mod webhook;
+pub(crate) mod webhook_job;
 
 use aruna_core::calls::{IoError, IoResult};
 use aruna_core::events::Event;
