@@ -16,6 +16,10 @@ use thiserror::Error;
 use crate::notifications::unexpected;
 
 pub const LIST_MAX_LIMIT: usize = 200;
+/// The unread count a holder reports before it marks the count as capped.
+pub(crate) const UNREAD_COUNT_CAP: usize = 100;
+/// The inbox rows one unread count examines at most.
+pub(crate) const SCAN_MAX_ROWS: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ListNotificationsInput {
