@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
+use aruna_core::structs::storage::blob::CurrentVersionPointer;
 
 use super::super::preflight::{
     assemble_preflight_execution, index_state, plan_preflight_request, resolve_all_preflight,

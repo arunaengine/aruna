@@ -11,23 +11,21 @@ use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::short_display_id;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataError, MetadataEventRecord,
-    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataQueryResults,
+    MetadataRoCratePage, MetadataSearchHit,
 };
-use aruna_core::storage_entries::{
-    event_log_key, graph_lifecycle_key, pending_projection_target,
-};
+use aruna_core::storage_entries::{event_log_key, graph_lifecycle_key, pending_projection_target};
 use aruna_core::structs::PathClaimRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
-    bucket_permission_path, object_permission_path,
+    BlobHeadKey, BlobVersion, BlobVersionState, VersionKey, bucket_permission_path,
+    object_permission_path,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
@@ -118,15 +116,16 @@ pub mod export;
 pub mod export_types;
 pub mod fanout;
 pub mod fanout_types;
+mod head_versions;
 mod join;
 pub mod links;
 pub mod list;
 pub mod list_types;
 pub mod path;
 pub mod path_types;
+mod prefix_scan;
 pub mod preflight;
 pub mod preflight_types;
-mod prefix_scan;
 pub mod read;
 pub mod read_types;
 pub mod search;
