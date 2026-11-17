@@ -493,4 +493,73 @@ mod state_machine_tests {
         rejects_finalize(RawViewOperation::new(document(), None, true));
         rejects_finalize(reading(true));
     }
+
+    #[test]
+    fn reads_stored_state() {
+        let stored = RawRevisionState {
+            base: None,
+            last_event_id: event(10).event_id,
+            revision: None,
+            merged: false,
+        };
+        let mut operation = RawStateOperation::new(document());
+        check_trace(
+            &mut operation,
+            &[raw_effect()],
+            vec![(read(bytes(&stored)), vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(Some(stored)));
+
+        let mut missing = RawStateOperation::new(document());
+        check_trace(&mut missing, &[raw_effect()], vec![(read(None), vec![])]);
+        assert_eq!(missing.finalize(), Ok(None));
+    }
+
+    #[test]
+    fn state_read_fails() {
+        let mut failed = RawStateOperation::new(document());
+        failed.start();
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(failed.step(error).is_empty());
+        assert_eq!(
+            failed.finalize(),
+            Err(RawReadError::Storage(StorageError::Timeout))
+        );
+
+        let mut broken = RawStateOperation::new(document());
+        broken.start();
+        broken.step(read(Some(vec![0xff, 0xff])));
+        assert!(matches!(
+            broken.finalize(),
+            Err(RawReadError::Conversion(_))
+        ));
+
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        let reading = || {
+            let mut operation = RawStateOperation::new(document());
+            operation.start();
+            operation
+        };
+        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
+        }
+    }
+
+    #[test]
+    fn state_read_lifecycle() {
+        let mut operation = RawStateOperation::new(document());
+        rejects_finalize(RawStateOperation::new(document()));
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        rejects_finalize(operation);
+    }
 }
