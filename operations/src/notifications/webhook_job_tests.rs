@@ -120,6 +120,19 @@ fn on_setting_posts() {
     assert_eq!(error.kind, JobErrorKind::Permanent);
 }
 
+/// The post is signed with the runner's time of the step that sends it, not the job start.
+#[test]
+fn signed_when_sent() {
+    let mut job = WebhookJobOperation::new(spec(), node(), NOW_MS);
+    let later_ms = NOW_MS + 90_000;
+    job.stamp(later_ms);
+    let url = "https://hooks.example.org/aruna";
+    let fresh = SendOperation::webhook(&spec(), url, &[9; 32], later_ms / 1000);
+    assert_eq!(job.post(url, &[9; 32]), fresh);
+    let stale = SendOperation::webhook(&spec(), url, &[9; 32], NOW_MS / 1000);
+    assert_ne!(job.post(url, &[9; 32]), stale);
+}
+
 #[test]
 fn unexpected_results_fail() {
     let mut job = WebhookJobOperation::new(spec(), node(), NOW_MS);

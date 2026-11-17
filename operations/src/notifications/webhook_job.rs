@@ -31,6 +31,8 @@ pub struct WebhookJobOperation {
     spec: WebhookDeliverySpec,
     local: NodeId,
     now_ms: u64,
+    /// The runner's clock at the latest step; receivers check how fresh the signed time is.
+    clock_ms: u64,
     state: WebhookState,
 }
 
@@ -47,6 +49,7 @@ impl WebhookJobOperation {
             spec,
             local,
             now_ms,
+            clock_ms: now_ms,
             state: WebhookState::Config,
         }
     }
@@ -64,15 +67,23 @@ impl WebhookJobOperation {
         else {
             return status(None);
         };
-        let send = SendOperation::webhook(&self.spec, &url, secret.expose(), self.now_ms / 1000);
         self.state = WebhookState::Send;
-        Ok(Next::Call(IoCall::child(send)))
+        Ok(Next::Call(IoCall::child(self.post(&url, secret.expose()))))
+    }
+
+    /// The signed post, timed at the step that sends it.
+    fn post(&self, url: &str, secret: &[u8]) -> SendOperation {
+        SendOperation::webhook(&self.spec, url, secret, self.clock_ms / 1000)
     }
 }
 
 impl Operation for WebhookJobOperation {
     type Output = DeliveryOutcome;
     type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.clock_ms = now_ms;
+    }
 
     fn first(&mut self) -> Turn {
         let realm_id = self.spec.notification.recipient.realm_id;
