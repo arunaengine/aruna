@@ -18,6 +18,7 @@ use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed};
 use aruna_core::plugin_runs::EventBatch;
+use ulid::Ulid;
 
 /// An event decided as waiting because the account's writes are gone; returns the event and
 /// the account's state row, which arrives again later.
@@ -119,4 +120,57 @@ async fn expires_with_gap() {
         .unwrap();
     let gap: GapRow = decode(&gaps[0].1).unwrap();
     assert_eq!((gap.reason, gap.count), (GapReason::Waited, 1));
+}
+
+/// A waiting event received at `received_ms`.
+fn waiting_row(received_ms: u64) -> WaitingRow {
+    let event = aruna_core::plugin_runs::SourceEvent {
+        kind: aruna_core::plugin_runs::SourceKind::DatasetCreated,
+        group_id: Ulid::from_parts(1, 9),
+        path: "/r/g/x/meta/a@d".into(),
+        resource: "d".into(),
+        revision: "e".into(),
+        source: "s1".into(),
+        actor: None,
+        anchor_ms: 5,
+        journaled_ms: 5,
+    };
+    let row = ForwardRow {
+        install_id: Ulid::from_parts(1, 1),
+        revision: 1,
+        event,
+        queued_ms: 5,
+    };
+    WaitingRow { row, received_ms }
+}
+
+#[test]
+fn settle_frees_slot() {
+    let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let key = b"slot".to_vec();
+    // An expired event frees its slot and is counted as a gap.
+    let mut expired = SettleWaiting::new(key.clone(), waiting_row(1), None, (local, 9));
+    let freed = vec![
+        (PLUGIN_WAITING_KEYSPACE, key.clone()),
+        (PLUGIN_QUEUE_KEYSPACE, key.clone()),
+    ];
+    assert_eq!(expired.first().unwrap(), Turn::Ask(Ask::Delete(freed)));
+    assert!(matches!(
+        expired.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Read(_))
+    ));
+    let Turn::Ask(Ask::Write(rows)) = expired.next(Answer::Values(vec![None])).unwrap() else {
+        panic!("the gap and the dedup record are written");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(expired.next(Answer::Done).unwrap(), Turn::Finish(()));
+    // A denied event records its denial only.
+    let denied = Some(Verdict::Denied("no".into()));
+    let mut refused = SettleWaiting::new(key, waiting_row(1), denied, (local, 9));
+    refused.first().unwrap();
+    let Turn::Ask(Ask::Write(rows)) = refused.next(Answer::Done).unwrap() else {
+        panic!("the denial is recorded");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(refused.next(Answer::Page(Vec::new(), None)).is_err());
 }

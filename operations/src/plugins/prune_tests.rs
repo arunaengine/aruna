@@ -129,3 +129,29 @@ async fn prunes_old_hooks() {
             .is_empty()
     );
 }
+
+#[test]
+fn old_hooks_go() {
+    let install = Ulid::from_parts(1, 1);
+    let mut plan = PruneHooks {
+        cutoff: 100,
+        removing: Vec::new(),
+        phase: HooksPhase::Times,
+        pruned: 0,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let (old, young) = (
+        hook_time_key(50, install, "d1"),
+        hook_time_key(150, install, "d2"),
+    );
+    let page = vec![(old.clone(), Vec::new()), (young, Vec::new())];
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(page, None)).unwrap() else {
+        panic!("the old delivery id and its time row go");
+    };
+    let expected = vec![
+        (PLUGIN_HOOKS_KEYSPACE, hook_key(install, "d1")),
+        (PLUGIN_HOOKS_KEYSPACE, old),
+    ];
+    assert_eq!(keys, expected);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+}
