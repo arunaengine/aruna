@@ -5,21 +5,24 @@
 
 use aruna_core::UserId;
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::{
     JobId, JobRecord, JobResultPayload, JobState, OutputObject, PluginWorkSpec,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 use ulid::Ulid;
 
-use super::marks::{Mark, mark_in};
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
-use crate::jobs::service::find_dedup_job;
-use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
+use super::marks::{Mark, mark_row};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values,
+};
+use super::store::{Rows, StoreError, decode, encode};
+
+/// The row of a work under its key.
+fn row_of(key: Vec<u8>, work: &WorkRow) -> Result<Row, StoreError> {
+    Ok(row(PLUGIN_WORK_KEYSPACE, key, encode(work)?))
+}
 
 /// Row kinds of the work keyspace: the work by install and identity, and its identity by work id.
 pub const WORK_ROW: u8 = b'w';
@@ -209,7 +212,7 @@ pub fn row_key(install_id: Ulid, identity: &Identity) -> Result<Vec<u8>, StoreEr
     Ok([&[WORK_ROW][..], &install_id.to_bytes(), &encode(identity)?].concat())
 }
 
-fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
+pub(super) fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
     [
         &[WORK_INDEX][..],
         &install_id.to_bytes(),
@@ -219,150 +222,363 @@ fn index_key(install_id: Ulid, work_id: Ulid) -> Vec<u8> {
 }
 
 /// Writes `proposed` for `identity` in one transaction, or adopts the row an earlier call with
-/// the same digest wrote; another digest is a conflict. A former install's row is replaced.
-pub async fn reserve(
-    ctx: &DriverContext,
-    (install, identity): (&PluginInstall, &Identity),
-    proposed: WorkRow,
-) -> Result<(WorkRow, Reserve), WorkError> {
-    reserve_marked(ctx, (install, identity), proposed, None).await
-}
-
-/// [`reserve`], marking the version the work writes at `bucket/key` in the same transaction when
-/// it writes the row, so the version is marked before any byte of it exists.
-pub async fn reserve_marked(
-    ctx: &DriverContext,
+/// the same digest wrote; another digest is a conflict. A former install's row is replaced. With
+/// `marked`, the version the work writes at that bucket and key is marked in the same
+/// transaction when it writes the row, so the version is marked before any byte of it exists.
+pub fn reserve(
     (install, identity): (&PluginInstall, &Identity),
     proposed: WorkRow,
     marked: Option<(&str, &str)>,
-) -> Result<(WorkRow, Reserve), WorkError> {
-    let key = row_key(install.install_id, identity)?;
-    transact(ctx, async |txn: &Txn<'_>| {
-        let stored = match txn.read(PLUGIN_WORK_KEYSPACE, &key).await? {
-            Some(bytes) => Some(decode::<WorkRow>(&bytes)?),
-            None => None,
-        };
-        match stored {
-            Some(stored) if stored.account == install.account => {
-                match stored.digest == proposed.digest {
-                    true => Ok((stored, Reserve::Earlier)),
-                    false => Err(WorkError::Conflict),
-                }
-            }
-            former => {
-                // A former install's index goes too, so no index row leads to the replacement.
-                if let Some(former) = former {
-                    let index = vec![index_key(install.install_id, former.work_id)];
-                    txn.delete(PLUGIN_WORK_KEYSPACE, index).await?;
-                }
-                let index = index_key(install.install_id, proposed.work_id);
-                txn.write(PLUGIN_WORK_KEYSPACE, vec![(index, key.clone())])
-                    .await?;
-                txn.write(
-                    PLUGIN_WORK_KEYSPACE,
-                    vec![(key.clone(), encode(&proposed)?)],
-                )
-                .await?;
-                if let (Some((bucket, object)), Some(version_id)) = (marked, proposed.version_id) {
-                    let mark = Mark {
-                        install_id: install.install_id,
-                        work_id: proposed.work_id,
-                        job: None,
-                        kind: proposed.kind,
-                        at_ms: proposed.created_ms,
+) -> Result<RowsOperation<ReserveWork>, WorkError> {
+    let mark = match (marked, proposed.version_id) {
+        (Some((bucket, object)), Some(version_id)) => {
+            let mark = Mark {
+                install_id: install.install_id,
+                work_id: proposed.work_id,
+                job: None,
+                kind: proposed.kind,
+                at_ms: proposed.created_ms,
+            };
+            Some(mark_row((bucket, object, version_id), &mark)?)
+        }
+        _ => None,
+    };
+    Ok(RowsOperation::transaction(ReserveWork {
+        key: row_key(install.install_id, identity)?,
+        install_id: install.install_id,
+        account: install.account,
+        proposed: Some(Box::new(proposed)),
+        mark,
+        phase: ReservePhase::Reading,
+    }))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReserveWork {
+    key: Vec<u8>,
+    install_id: Ulid,
+    account: UserId,
+    proposed: Option<Box<WorkRow>>,
+    mark: Option<Row>,
+    phase: ReservePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum ReservePhase {
+    Reading,
+    /// A former install's index row is being deleted; the new rows follow.
+    Deleting(Vec<Row>),
+    Writing,
+}
+
+impl Plan for ReserveWork {
+    type Output = (WorkRow, Reserve);
+    type Error = WorkError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, WorkError> {
+        let read = vec![(PLUGIN_WORK_KEYSPACE, self.key.clone())];
+        Ok(Turn::Ask(Ask::Read(read)))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, WorkError> {
+        match std::mem::replace(&mut self.phase, ReservePhase::Writing) {
+            ReservePhase::Reading => {
+                let [stored] = values::<1>(answer)?;
+                let stored = stored.map(|bytes| decode::<WorkRow>(&bytes)).transpose()?;
+                let proposed = self.proposed.as_deref().ok_or(WorkError::Conflict)?;
+                if let Some(stored) = stored.as_ref().filter(|row| row.account == self.account) {
+                    return match stored.digest == proposed.digest {
+                        true => Ok(Turn::Finish((stored.clone(), Reserve::Earlier))),
+                        false => Err(WorkError::Conflict),
                     };
-                    mark_in(txn, (bucket, object, version_id), &mark).await?;
                 }
-                Ok((proposed, Reserve::Fresh))
+                let index = index_key(self.install_id, proposed.work_id);
+                let mut rows = vec![
+                    row(PLUGIN_WORK_KEYSPACE, index, self.key.clone()),
+                    row(PLUGIN_WORK_KEYSPACE, self.key.clone(), encode(proposed)?),
+                ];
+                rows.extend(self.mark.take());
+                // A former install's index goes too, so no index row leads to the replacement.
+                let Some(former) = stored else {
+                    return Ok(Turn::Ask(Ask::Write(rows)));
+                };
+                self.phase = ReservePhase::Deleting(rows);
+                let index = index_key(self.install_id, former.work_id);
+                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, index)])))
+            }
+            ReservePhase::Deleting(rows) => {
+                done(answer)?;
+                Ok(Turn::Ask(Ask::Write(rows)))
+            }
+            ReservePhase::Writing => {
+                done(answer)?;
+                let proposed = self.proposed.take().ok_or(WorkError::Conflict)?;
+                Ok(Turn::Finish((*proposed, Reserve::Fresh)))
             }
         }
-    })
-    .await
+    }
 }
 
-/// The row of work `work_id` of an install and its key, read in `txn`.
-pub async fn read_in(
-    txn: &Txn<'_>,
+/// A sub-plan that reads the row of work `work_id` of an install and its key, through the index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkLookup {
     install_id: Ulid,
     work_id: Ulid,
-) -> Result<Option<(Vec<u8>, WorkRow)>, StoreError> {
-    let index = index_key(install_id, work_id);
-    let Some(key) = txn.read(PLUGIN_WORK_KEYSPACE, &index).await? else {
-        return Ok(None);
-    };
-    let Some(bytes) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
-        return Ok(None);
-    };
-    let row: WorkRow = decode(&bytes)?;
-    Ok((row.work_id == work_id).then_some((key, row)))
+    /// The row key the index named, once read.
+    key: Option<Vec<u8>>,
 }
 
-pub async fn read_work(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    work_id: Ulid,
-) -> Result<Option<WorkRow>, StoreError> {
-    let found = read_in(&Txn::direct(ctx), install_id, work_id).await?;
-    Ok(found.map(|(_, row)| row))
+/// What a lookup needs next, or the row it found.
+#[derive(Debug, PartialEq)]
+pub enum Found {
+    Ask(Ask),
+    Row(Option<(Vec<u8>, WorkRow)>),
+}
+
+impl WorkLookup {
+    pub fn new(install_id: Ulid, work_id: Ulid) -> Self {
+        Self {
+            install_id,
+            work_id,
+            key: None,
+        }
+    }
+
+    pub fn ask(&self) -> Ask {
+        let index = index_key(self.install_id, self.work_id);
+        Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, index)])
+    }
+
+    pub fn take(&mut self, answer: Answer) -> Result<Found, StoreError> {
+        let [value] = values::<1>(answer)?;
+        let Some(value) = value else {
+            return Ok(Found::Row(None));
+        };
+        let Some(key) = self.key.take() else {
+            self.key = Some(value.clone());
+            return Ok(Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, value)])));
+        };
+        let row: WorkRow = decode(&value)?;
+        Ok(Found::Row((row.work_id == self.work_id).then_some((key, row))))
+    }
+}
+
+pub fn read_work(install_id: Ulid, work_id: Ulid) -> RowsOperation<ReadWork> {
+    RowsOperation::direct(ReadWork(WorkLookup::new(install_id, work_id)))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReadWork(WorkLookup);
+
+impl Plan for ReadWork {
+    type Output = Option<WorkRow>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(self.0.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(match self.0.take(answer)? {
+            Found::Ask(ask) => Turn::Ask(ask),
+            Found::Row(found) => Turn::Finish(found.map(|(_, row)| row)),
+        })
+    }
+}
+
+/// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
+pub fn holds_job(spec: &PluginWorkSpec) -> RowsOperation<HoldsJob> {
+    RowsOperation::direct(HoldsJob(ReadWork(WorkLookup::new(
+        spec.install_id,
+        spec.work_id,
+    ))))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct HoldsJob(ReadWork);
+
+impl Plan for HoldsJob {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
+        Ok(Turn::Ask(self.0.0.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+        Ok(match self.0.next(answer)? {
+            Turn::Ask(ask) => Turn::Ask(ask),
+            Turn::Finish(row) => {
+                Turn::Finish(row.is_some_and(|row| row.state != WorkState::Settled))
+            }
+        })
+    }
+}
+
+/// A change of one work row.
+#[derive(Clone, Debug, PartialEq)]
+pub enum WorkChange {
+    /// Records the job a reserved work was submitted as; a later state keeps its job.
+    Dispatched(JobId),
+    /// Keeps the answer of a sent request: its status and its reply as exposed now, with the
+    /// bytes and version it sent.
+    Sent {
+        status: u16,
+        reply: Option<String>,
+        bytes: u64,
+        version: Ulid,
+    },
+    /// Forgets the send boundary, so the next attempt sends again.
+    Reopened,
+    /// Keeps the summary of a dispatched work whose job finished, at `now_ms`.
+    Settled(Box<Summary>, u64),
+    /// A removed install's job accepted its cancel.
+    Cancelling(JobId),
+}
+
+impl WorkChange {
+    fn apply(self, row: &mut WorkRow) {
+        match self {
+            WorkChange::Dispatched(job) => {
+                if row.state == WorkState::Reserved {
+                    row.state = WorkState::Dispatched;
+                    row.job = Some(job);
+                }
+            }
+            WorkChange::Sent {
+                status,
+                reply,
+                bytes,
+                version,
+            } => {
+                row.boundary = Some(SendBoundary::Sent {
+                    status,
+                    reply,
+                    bytes,
+                    version,
+                });
+            }
+            WorkChange::Reopened => row.boundary = None,
+            WorkChange::Settled(summary, now_ms) => {
+                if row.state == WorkState::Dispatched {
+                    // The paths and an upload's answer stay answerable after the job record is
+                    // pruned.
+                    let (source, target) = (row.source.clone(), row.target.clone());
+                    let (status, reply) = match &row.boundary {
+                        Some(SendBoundary::Sent { status, reply, .. }) => {
+                            (Some(*status), reply.clone())
+                        }
+                        _ => (None, None),
+                    };
+                    row.state = WorkState::Settled;
+                    row.summary = Some(Summary {
+                        source,
+                        target,
+                        status,
+                        reply,
+                        ..*summary
+                    });
+                    row.settled_ms = Some(now_ms);
+                }
+            }
+            WorkChange::Cancelling(job) => {
+                row.job = Some(job);
+                row.state = WorkState::Dispatched;
+                row.cancel = true;
+            }
+        }
+    }
 }
 
 /// Changes the row of work `work_id` in one transaction; `None` when it is gone.
-pub async fn update_work(
-    ctx: &DriverContext,
-    (install_id, work_id): (Ulid, Ulid),
-    change: impl FnOnce(&mut WorkRow),
-) -> Result<Option<WorkRow>, StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
-            return Ok(None);
-        };
-        change(&mut row);
-        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
-            .await?;
-        Ok(Some(row))
+pub fn update_work(ids: (Ulid, Ulid), change: WorkChange) -> RowsOperation<UpdateWork> {
+    RowsOperation::transaction(UpdateWork {
+        lookup: WorkLookup::new(ids.0, ids.1),
+        change: Some(change),
+        written: None,
     })
-    .await
 }
 
-/// Records the job a reserved work was submitted as; a later state keeps its job.
-pub async fn dispatched(
-    ctx: &DriverContext,
-    (install_id, work_id): (Ulid, Ulid),
-    job: JobId,
-) -> Result<Option<WorkRow>, StoreError> {
-    update_work(ctx, (install_id, work_id), |row| {
-        if row.state == WorkState::Reserved {
-            row.state = WorkState::Dispatched;
-            row.job = Some(job);
+#[derive(Debug, PartialEq)]
+pub struct UpdateWork {
+    lookup: WorkLookup,
+    change: Option<WorkChange>,
+    /// The changed row once it is sent.
+    written: Option<Box<WorkRow>>,
+}
+
+impl Plan for UpdateWork {
+    type Output = Option<WorkRow>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        if let Some(row) = self.written.take() {
+            done(answer)?;
+            return Ok(Turn::Finish(Some(*row)));
         }
-    })
-    .await
+        let (key, mut row) = match self.lookup.take(answer)? {
+            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
+            Found::Row(None) => return Ok(Turn::Finish(None)),
+            Found::Row(Some(found)) => found,
+        };
+        let change = self.change.take().ok_or_else(|| StoreError("changed twice".into()))?;
+        change.apply(&mut row);
+        let write = vec![row_of(key, &row)?];
+        self.written = Some(Box::new(row));
+        Ok(Turn::Ask(Ask::Write(write)))
+    }
 }
 
 /// Moves the send boundary of work `work_id` before an attempt sends, in one transaction, unless
 /// the boundary earlier attempts left decides already.
-pub async fn begin_send(
-    ctx: &DriverContext,
-    (install_id, work_id): (Ulid, Ulid),
+pub fn begin_send(ids: (Ulid, Ulid), again: bool) -> RowsOperation<BeginSend> {
+    RowsOperation::transaction(BeginSend {
+        lookup: WorkLookup::new(ids.0, ids.1),
+        again,
+        written: false,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct BeginSend {
+    lookup: WorkLookup,
     again: bool,
-) -> Result<Option<Send>, StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let Some((key, mut row)) = read_in(txn, install_id, work_id).await? else {
-            return Ok(None);
+    written: bool,
+}
+
+impl Plan for BeginSend {
+    type Output = Option<Send>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        if self.written {
+            done(answer)?;
+            return Ok(Turn::Finish(Some(Send::Now)));
+        }
+        let (key, mut row) = match self.lookup.take(answer)? {
+            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
+            Found::Row(None) => return Ok(Turn::Finish(None)),
+            Found::Row(Some(found)) => found,
         };
-        if let Some(decided) = decided(row.boundary.as_ref(), again) {
-            return Ok(Some(decided));
+        if let Some(decided) = decided(row.boundary.as_ref(), self.again) {
+            return Ok(Turn::Finish(Some(decided)));
         }
         let attempt = match &row.boundary {
             Some(SendBoundary::Sending { attempt }) => attempt + 1,
             _ => 1,
         };
         row.boundary = Some(SendBoundary::Sending { attempt });
-        txn.write(PLUGIN_WORK_KEYSPACE, vec![(key, encode(&row)?)])
-            .await?;
-        Ok(Some(Send::Now))
-    })
-    .await
+        self.written = true;
+        Ok(Turn::Ask(Ask::Write(vec![row_of(key, &row)?])))
+    }
 }
 
 /// What a boundary decides without a new request: a kept answer, unless it asks a request that may
@@ -389,25 +605,6 @@ pub fn decided(boundary: Option<&SendBoundary>, again: bool) -> Option<Send> {
 /// Whether an answer asks to try again later: a timeout, a throttle or a server error.
 pub fn retried(status: u16) -> bool {
     matches!(status, 408 | 429 | 500..=599)
-}
-
-/// Keeps the answer of a sent request: its status and its reply as exposed now, with the bytes
-/// and version it sent.
-pub async fn record_sent(
-    ctx: &DriverContext,
-    ids: (Ulid, Ulid),
-    (status, reply): (u16, Option<String>),
-    (bytes, version): (u64, Ulid),
-) -> Result<Option<WorkRow>, StoreError> {
-    update_work(ctx, ids, |row| {
-        row.boundary = Some(SendBoundary::Sent {
-            status,
-            reply,
-            bytes,
-            version,
-        });
-    })
-    .await
 }
 
 /// The summary of a finished job, or `None` while it may still run. A job record that is gone
@@ -688,7 +885,7 @@ pub fn dedup_key(work_id: Ulid) -> Vec<u8> {
     [&b"plugin-work/"[..], &work_id.to_bytes()].concat()
 }
 
-fn install_at(key: &[u8]) -> Option<Ulid> {
+pub(super) fn install_at(key: &[u8]) -> Option<Ulid> {
     Some(Ulid::from_bytes(key.get(1..17)?.try_into().ok()?))
 }
 
