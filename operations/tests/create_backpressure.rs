@@ -62,7 +62,7 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
         compute_handle: None,
     });
     if let Some(task_handle) = task_handle {
-        let shutdown = aruna_core::shutdown::Shutdown::new();
+        let shutdown = aruna_tasks::shutdown::Shutdown::new();
         start_task_queues(
             context.clone(),
             task_handle,

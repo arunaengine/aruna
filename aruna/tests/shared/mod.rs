@@ -1114,7 +1114,7 @@ async fn initialize_context(
         compute_handle: compute,
     });
     initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
         task_handle,
@@ -1194,7 +1194,7 @@ async fn spawn_ops_server(
     metrics: Arc<NodeMetrics>,
 ) -> TestResult<(String, Readiness, JoinHandle<()>)> {
     let readiness = Readiness::new();
-    let ops_state = MonitoringState::new(context, metrics, readiness.clone()).await;
+    let ops_state = MonitoringState::new(context, metrics, readiness.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {

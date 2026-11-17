@@ -71,6 +71,10 @@ CRATE_TARGETS = {
     "aruna-registry": ("aruna-core", "aruna-blob"),
     "aruna-compute-helper": (),
 }
+# Backends keep their table for test and build dependencies as well.
+BACKENDS = frozenset(
+    "aruna-storage aruna-net aruna-blob aruna-tasks aruna-compute aruna-plugins aruna-graph aruna-outbound".split()
+)
 TRIGGER_MATCHES = (
     ("operations/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("operations/src/sync/incoming.rs", "Alpn::"),
@@ -598,7 +602,7 @@ def similar_names(sources):
 
 
 def crate_manifests(root):
-    """Map each workspace crate name to its set of internal normal dependencies."""
+    """Map each workspace crate name to its internal normal dependencies, for backends all of them."""
     with open(os.path.join(root, "Cargo.toml"), "rb") as handle:
         workspace = tomllib.load(handle).get("workspace", {})
     renames = {
@@ -613,8 +617,11 @@ def crate_manifests(root):
     names = {data["package"]["name"] for data in manifests.values()}
     result = {}
     for data in manifests.values():
-        tables = [data.get("dependencies", {})]
-        tables.extend(target.get("dependencies", {}) for target in data.get("target", {}).values())
+        kinds = ("dependencies",)
+        if data["package"]["name"] in BACKENDS:
+            kinds = ("dependencies", "dev-dependencies", "build-dependencies")
+        sections = [data, *data.get("target", {}).values()]
+        tables = [section.get(kind, {}) for section in sections for kind in kinds]
         deps = set()
         for table in tables:
             for key, value in table.items():

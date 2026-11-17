@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
-use aruna_core::shutdown::Shutdown;
 use aruna_operations::distribution::index_feed::spawn_index_feed;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::restore_drain_timer;
@@ -20,6 +19,7 @@ use aruna_operations::s3::access::cutoff::spawn_cutoff_sweep;
 use aruna_operations::s3::session::sweep::spawn_session_sweep;
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::application::{Service, ServiceExit};

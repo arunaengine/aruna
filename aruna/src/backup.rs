@@ -9,8 +9,8 @@ use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter, cons
 use tracing::warn;
 #[cfg(unix)]
 use {
-    aruna_core::shutdown::Shutdown,
     aruna_operations::driver::DriverContext,
+    aruna_tasks::shutdown::Shutdown,
     std::io::BufWriter,
     std::os::unix::fs::{FileTypeExt, PermissionsExt},
     tokio::net::UnixListener,
