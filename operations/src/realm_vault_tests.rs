@@ -12,7 +12,9 @@ use ed25519_dalek::SigningKey;
 use std::time::Duration;
 use tempfile::TempDir;
 
+use crate::driver::{DriverContext, drive};
 use crate::tests::policy::realm_view;
+use aruna_core::handle::Handle;
 
 const SECRET: &[u8] = b"canary-9e41";
 
@@ -342,10 +344,10 @@ async fn prunes_stale_rows() {
         None,
     );
     ctx.storage_handle.send_effect(write).await;
-    assert_eq!(prune_secret_cache(&ctx, &config).await, Ok(0));
+    assert_eq!(drive(PruneCacheOperation::new(&config), &ctx).await, Ok(0));
 
     let (rotated, _) = realm_config(3);
-    assert_eq!(prune_secret_cache(&ctx, &rotated).await, Ok(1));
+    assert_eq!(drive(PruneCacheOperation::new(&rotated), &ctx).await, Ok(1));
     let event = ctx
         .storage_handle
         .send_effect(read_secret(cache_entry(reference), None))

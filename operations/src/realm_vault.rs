@@ -10,7 +10,6 @@ use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::operation::Operation;
@@ -19,14 +18,13 @@ use aruna_core::realm_vault::{
 };
 use aruna_core::structs::execution::setting::{SettingChannel, validate_setting};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::types::{Effects, Value};
+use aruna_core::types::{Effects, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
 use crate::document_repository::read_effect;
-use crate::driver::DriverContext;
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
@@ -442,69 +440,144 @@ fn infrastructure_peer(
     }
 }
 
-/// Deletes cached secrets whose entry or revision is no longer current in `config`.
-pub async fn prune_secret_cache(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-) -> Result<usize, String> {
-    let prefix = vec![VaultPurpose::RealmSecret.tag()];
-    let mut start = None;
-    let mut pruned = 0;
-    loop {
-        let page = StorageEffect::Iter {
+/// Deletes the cached secrets whose entry or revision is no longer current in a realm config,
+/// one page of cache rows at a time; answers how many rows it deleted.
+#[derive(Debug, PartialEq)]
+pub struct PruneCacheOperation {
+    current: Vec<RealmSecretRef>,
+    keys: Vec<Key>,
+    next: Option<Key>,
+    state: PruneState,
+    pruned: usize,
+    output: Option<Result<usize, RealmSecretError>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum PruneState {
+    Init,
+    Page,
+    Read(VaultEntry),
+    Delete,
+    Done,
+}
+
+impl PruneCacheOperation {
+    pub fn new(config: &RealmConfigDocument) -> Self {
+        let fetchable =
+            (config.vault.iter()).filter(|record| record.entry.purpose.fetch_scope().is_some());
+        let current = fetchable
+            .map(|record| RealmSecretRef {
+                entry: record.entry,
+                revision: record.revision,
+            })
+            .collect();
+        Self {
+            current,
+            keys: Vec::new(),
+            next: None,
+            state: PruneState::Init,
+            pruned: 0,
+            output: None,
+        }
+    }
+
+    fn page(&mut self, start: Option<Key>) -> Effects {
+        self.state = PruneState::Page;
+        smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: NODE_VAULT_KEYSPACE.to_string(),
-            prefix: Some(prefix.clone().into()),
-            start: start.take(),
+            prefix: Some(vec![VaultPurpose::RealmSecret.tag()].into()),
+            start: start.map(IterStart::After),
             limit: PRUNE_PAGE,
             txn_id: None,
-        };
-        let (keys, next) = match ctx.storage_handle.send_storage_effect(page).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values.into_iter().map(|(key, _)| key), next_start_after),
-            other => return Err(format!("node vault page: {}", other.label())),
-        };
-        for key in keys {
+        })]
+    }
+
+    /// Reads the next cache row of the page, or turns the page.
+    fn next_row(&mut self) -> Effects {
+        while let Some(key) = self.keys.pop() {
             let Some(id) = key.get(1..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
                 continue;
             };
             let entry = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_bytes(id));
-            let event = ctx
-                .storage_handle
-                .send_effect(read_secret(entry, None))
-                .await;
-            let current = parse_secret(event, entry, |bytes| Ok(cached_current(config, id, bytes)))
-                .map_err(|error| error.to_string())?;
-            if current == Some(true) {
-                continue;
-            }
-            match ctx
-                .storage_handle
-                .send_effect(delete_secret(entry, None))
-                .await
-            {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => pruned += 1,
-                other => return Err(format!("node vault delete: {}", other.label())),
-            }
+            self.state = PruneState::Read(entry);
+            return smallvec![read_secret(entry, None)];
         }
-        match next {
-            Some(after) => start = Some(IterStart::After(after)),
-            None => return Ok(pruned),
+        match self.next.take() {
+            Some(start) => self.page(Some(start)),
+            None => self.finish(Ok(self.pruned)),
         }
+    }
+
+    fn finish(&mut self, result: Result<usize, RealmSecretError>) -> Effects {
+        self.state = PruneState::Done;
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn is_current(&self, entry: VaultEntry, bytes: &[u8]) -> bool {
+        (self.current.iter()).any(|reference| {
+            reference.entry.id == entry.id && cached_secret(bytes, *reference).is_some()
+        })
     }
 }
 
-fn cached_current(config: &RealmConfigDocument, id: [u8; 16], bytes: &[u8]) -> bool {
-    let mut fetchable =
-        (config.vault.iter()).filter(|record| record.entry.purpose.fetch_scope().is_some());
-    fetchable.any(|record| {
-        let reference = RealmSecretRef {
-            entry: record.entry,
-            revision: record.revision,
+impl Operation for PruneCacheOperation {
+    type Output = usize;
+    type Error = RealmSecretError;
+
+    fn start(&mut self) -> Effects {
+        self.page(None)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let cache = |text: String| RealmSecretError::Cache(text);
+        match (std::mem::replace(&mut self.state, PruneState::Done), event) {
+            (
+                PruneState::Page,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                // Rows are visited last first; the order does not change what is deleted.
+                self.keys = values.into_iter().map(|(key, _)| key).collect();
+                self.next = next_start_after;
+                self.next_row()
+            }
+            (PruneState::Read(entry), event) => {
+                match parse_secret(event, entry, |bytes| Ok(self.is_current(entry, bytes))) {
+                    Ok(Some(true)) => self.next_row(),
+                    Ok(_) => {
+                        self.state = PruneState::Delete;
+                        smallvec![delete_secret(entry, None)]
+                    }
+                    Err(error) => self.finish(Err(cache(error.to_string()))),
+                }
+            }
+            (PruneState::Delete, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+                self.pruned += 1;
+                self.next_row()
+            }
+            (_, event) => self.finish(Err(cache(format!("node vault answered {}", event.label())))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<usize, RealmSecretError> {
+        let unfinished = || {
+            Err(RealmSecretError::Cache(
+                "the prune did not finish".to_string(),
+            ))
         };
-        record.entry.id == Ulid::from_bytes(id) && cached_secret(bytes, reference).is_some()
-    })
+        self.output.unwrap_or_else(unfinished)
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 #[cfg(test)]

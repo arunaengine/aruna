@@ -47,7 +47,7 @@ use crate::notifications::settings::{
     BACKOFF_START_MS, Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
     delivery_setting, local_setting, managers, write_setting,
 };
-use crate::realm_vault::{ReadSecretOperation, prune_secret_cache};
+use crate::realm_vault::{PruneCacheOperation, ReadSecretOperation};
 use crate::storage_read::{StorageReadError, parse_storage_read};
 
 /// Time one SMTP exchange may take; the job runtime retries a timed out attempt.
@@ -260,7 +260,7 @@ pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId, mail: Opti
     if let Some(mail) = mail {
         mail.refresh(config.email.as_ref());
     }
-    if let Err(error) = prune_secret_cache(context, &config).await {
+    if let Err(error) = drive(PruneCacheOperation::new(&config), context).await {
         warn!(error = %error, "Pruning cached realm secrets failed");
     }
 }
