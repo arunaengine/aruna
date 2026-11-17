@@ -15,6 +15,7 @@ pub mod purge_fence;
 pub mod restart_notice;
 mod row_fence;
 pub mod session;
+pub mod sweeps;
 pub mod unlock_limit;
 pub mod usage;
 mod write_cleanup;

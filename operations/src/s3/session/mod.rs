@@ -9,7 +9,6 @@ mod list;
 mod purge;
 mod refresh;
 mod revoke;
-pub mod sweep;
 mod touch;
 
 pub use create::{CreateS3Config, CreateS3Operation};
