@@ -17,6 +17,7 @@ use crate::metadata::api::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
 use crate::metadata::api::read::ensure_record_readable;
 use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
 use crate::metadata::protocol::MetadataReadError;
@@ -737,10 +738,6 @@ pub(super) fn ensure_export_limit(
     }
     Ok(())
 }
-
-/// The only document path the Profile validation channel serves. Serving
-/// nothing else is the whole authorization of a fetch that asserts no user.
-pub(crate) const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
 
 /// Reads one registered Profile at an exact revision so a holder can validate a
 /// Dataset without a caller. Infrastructure nodes use the user-less purpose-bound

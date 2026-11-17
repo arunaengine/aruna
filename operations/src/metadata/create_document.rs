@@ -611,7 +611,7 @@ impl CreateDocumentOperation {
             let profile = match &self.config.payload {
                 CreateDocumentPayload::Scaffold { .. } => false,
                 CreateDocumentPayload::RoCrate { jsonld } => {
-                    crate::metadata::stats::rocrate_is_profile(
+                    crate::metadata::profile::rules::rocrate_is_profile(
                         jsonld,
                         &create_event.record.graph_iri,
                     )

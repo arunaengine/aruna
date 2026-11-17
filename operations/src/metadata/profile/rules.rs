@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::forward::read::PROFILE_DOCUMENT_PREFIX;
+use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQuadOp;
@@ -21,8 +21,14 @@ use oxrdf::NamedOrBlankNodeRef;
 use oxrdf::Quad;
 use oxrdf::Term;
 use oxttl::NQuadsParser;
-use std::collections::BTreeSet;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashSet};
 use ulid::Ulid;
+
+/// The only document path the Profile validation channel serves. Serving
+/// nothing else is the whole authorization of a fetch that asserts no user.
+pub(crate) const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
+pub(crate) const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
 
 pub(super) const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
@@ -191,5 +197,82 @@ pub(super) fn term_as_node(term: Term) -> Option<NamedOrBlankNode> {
         Term::NamedNode(node) => Some(NamedOrBlankNode::NamedNode(node)),
         Term::BlankNode(node) => Some(NamedOrBlankNode::BlankNode(node)),
         _ => None,
+    }
+}
+
+/// Classifies the validated create payload before projection. Imported crates
+/// may still name their root as `./`, so fall back to the descriptor's `about`
+/// target when the final graph IRI is not present yet.
+pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, String> {
+    let document: Value = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
+    let graph = document
+        .get("@graph")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "RO-Crate has no @graph".to_string())?;
+    let descriptor_root = graph
+        .iter()
+        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some("ro-crate-metadata.json"))
+        .and_then(|descriptor| {
+            [
+                "about",
+                "http://schema.org/about",
+                "https://schema.org/about",
+            ]
+            .into_iter()
+            .find_map(|key| descriptor.get(key))
+        })
+        .and_then(|about| about.get("@id"))
+        .and_then(Value::as_str);
+    let root = graph
+        .iter()
+        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(graph_iri))
+        .or_else(|| {
+            descriptor_root.and_then(|root_id| {
+                graph
+                    .iter()
+                    .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(root_id))
+            })
+        })
+        .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
+    Ok(jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI))
+}
+
+pub(crate) fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
+    match value {
+        Some(Value::Array(values)) => {
+            for value in values {
+                collect_conforms_terms(Some(value), terms);
+            }
+        }
+        Some(Value::Object(entries)) => {
+            for (term, definition) in entries {
+                let iri = match definition {
+                    Value::String(iri) => Some(iri.as_str()),
+                    Value::Object(definition) => definition.get("@id").and_then(Value::as_str),
+                    _ => None,
+                };
+                if iri == Some(DCTERMS_CONFORMS_IRI) {
+                    terms.insert(term.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
+    match value {
+        Some(Value::String(value)) => value == expected,
+        Some(Value::Array(values)) => values
+            .iter()
+            .any(|value| jsonld_contains_iri(Some(value), expected)),
+        Some(Value::Object(value)) => {
+            value
+                .get("@id")
+                .or_else(|| value.get("id"))
+                .and_then(Value::as_str)
+                == Some(expected)
+        }
+        _ => false,
     }
 }

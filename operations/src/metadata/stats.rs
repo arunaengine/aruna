@@ -18,12 +18,14 @@ use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::live_records::LiveRecordsOperation;
+use crate::metadata::profile::rules::{
+    PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
+};
 use crate::metadata::record_reads::record_materialized_read;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
-const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupDocumentCounts {
@@ -231,83 +233,6 @@ pub(crate) fn classify_root_summary(
     }
 
     Ok(DocumentPurpose::Dataset)
-}
-
-/// Classifies the validated create payload before projection. Imported crates
-/// may still name their root as `./`, so fall back to the descriptor's `about`
-/// target when the final graph IRI is not present yet.
-pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, String> {
-    let document: Value = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
-    let graph = document
-        .get("@graph")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "RO-Crate has no @graph".to_string())?;
-    let descriptor_root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some("ro-crate-metadata.json"))
-        .and_then(|descriptor| {
-            [
-                "about",
-                "http://schema.org/about",
-                "https://schema.org/about",
-            ]
-            .into_iter()
-            .find_map(|key| descriptor.get(key))
-        })
-        .and_then(|about| about.get("@id"))
-        .and_then(Value::as_str);
-    let root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(graph_iri))
-        .or_else(|| {
-            descriptor_root.and_then(|root_id| {
-                graph
-                    .iter()
-                    .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(root_id))
-            })
-        })
-        .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
-    Ok(jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI))
-}
-
-fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
-    match value {
-        Some(Value::Array(values)) => {
-            for value in values {
-                collect_conforms_terms(Some(value), terms);
-            }
-        }
-        Some(Value::Object(entries)) => {
-            for (term, definition) in entries {
-                let iri = match definition {
-                    Value::String(iri) => Some(iri.as_str()),
-                    Value::Object(definition) => definition.get("@id").and_then(Value::as_str),
-                    _ => None,
-                };
-                if iri == Some(DCTERMS_CONFORMS_IRI) {
-                    terms.insert(term.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
-    match value {
-        Some(Value::String(value)) => value == expected,
-        Some(Value::Array(values)) => values
-            .iter()
-            .any(|value| jsonld_contains_iri(Some(value), expected)),
-        Some(Value::Object(value)) => {
-            value
-                .get("@id")
-                .or_else(|| value.get("id"))
-                .and_then(Value::as_str)
-                == Some(expected)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
