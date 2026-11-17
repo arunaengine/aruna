@@ -184,10 +184,10 @@ mod tests {
         write_manifest_row(&context.storage_handle, 3, 2).await;
         write_manifest_row(&context.storage_handle, 4, 3).await;
 
-        let shard3 = scan_manifest_entries(&context, &placement(3))
+        let shard3 = drive(ManifestScanOperation::new(&placement(3)), &context)
             .await
             .expect("scan shard 3");
-        let shard4 = scan_manifest_entries(&context, &placement(4))
+        let shard4 = drive(ManifestScanOperation::new(&placement(4)), &context)
             .await
             .expect("scan shard 4");
 
