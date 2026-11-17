@@ -12,3 +12,4 @@ pub mod page;
 pub mod read_source;
 pub mod reference;
 pub mod snapshot;
+pub mod snapshot_reuse;
