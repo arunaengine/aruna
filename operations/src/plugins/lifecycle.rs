@@ -25,10 +25,10 @@ use super::grants::{
 };
 use super::install::{
     InstallError, check_admin, check_holder, lock_install, pick_version, read_config,
-    read_manifest, scope_of, settle, write_record,
+    read_manifest, scope_of, settle, write_entry, write_record,
 };
 use super::matcher::Target;
-use super::records::{InstallEntryConfig, write_entry};
+use super::records::InstallEntryConfig;
 use super::rules::retire_rules;
 use super::settings::check_settings;
 use crate::driver::DriverContext;

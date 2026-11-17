@@ -27,7 +27,6 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -93,7 +92,7 @@ enum Phase {
 }
 
 /// Checks the caller's group admin right, then reads, checks and writes the record in one
-/// transaction. [`write_entry`] wakes the outbox drain after the commit.
+/// transaction. [`write_entry`](super::install::write_entry) wakes the outbox drain after the commit.
 #[derive(Debug, PartialEq)]
 pub struct InstallEntryOperation {
     config: InstallEntryConfig,
@@ -294,26 +293,9 @@ fn unexpected(got: &'static str) -> RecordError {
     })
 }
 
-/// Writes or deletes the record, then wakes the outbox drain.
-pub(crate) async fn write_entry(
-    ctx: &DriverContext,
-    config: InstallEntryConfig,
-) -> Result<Option<PluginInstall>, RecordError> {
-    let written = drive(InstallEntryOperation::new(config), ctx).await?;
-    wake_drain(ctx).await;
-    Ok(written)
-}
-
-/// Wakes the outbox drain after a committed config write; a failed wake only delays the drain.
-pub(super) async fn wake_drain(ctx: &DriverContext) {
-    if let Err(error) = drive(WakeDrain, ctx).await {
-        warn!(%error, "Failed to schedule the outbox drain; the durable outbox stays retryable");
-    }
-}
-
 /// Schedules the outbox drain at once.
 #[derive(Debug, PartialEq)]
-struct WakeDrain;
+pub(super) struct WakeDrain;
 
 impl Operation for WakeDrain {
     type Output = ();

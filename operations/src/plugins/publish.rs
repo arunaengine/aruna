@@ -33,7 +33,7 @@ use tracing::{info, warn};
 use super::artifacts::{ArtifactError, managers};
 use super::copies::{chunk_count, chunk_of, store_local};
 use super::copies_needed;
-use super::records::wake_drain;
+use super::install::wake_drain;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};

@@ -38,7 +38,7 @@ use super::grants::{
     parse_grants, patterns_for, role_paths, stored_grants, writes,
 };
 use super::receiver::pick_receiver;
-use super::records::{InstallEntryConfig, RecordError, write_entry};
+use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError, WakeDrain};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
@@ -607,6 +607,23 @@ pub(crate) async fn write_record(
     };
     write_entry(ctx, write).await?;
     Ok(install)
+}
+
+/// Writes or deletes the record, then wakes the outbox drain.
+pub(crate) async fn write_entry(
+    ctx: &DriverContext,
+    config: InstallEntryConfig,
+) -> Result<Option<PluginInstall>, RecordError> {
+    let written = drive(InstallEntryOperation::new(config), ctx).await?;
+    wake_drain(ctx).await;
+    Ok(written)
+}
+
+/// Wakes the outbox drain after a committed config write; a failed wake only delays the drain.
+pub(super) async fn wake_drain(ctx: &DriverContext) {
+    if let Err(error) = drive(WakeDrain, ctx).await {
+        warn!(%error, "Failed to schedule the outbox drain; the durable outbox stays retryable");
+    }
 }
 
 /// One grant line: `read`, or `write` when the plugin writes, and its granted patterns.
