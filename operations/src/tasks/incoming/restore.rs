@@ -370,7 +370,7 @@ impl OperationsTaskHandler {
         // outcome so a transient failure never stops the heartbeat.
         self.reschedule_timer(
             TaskKey::PublishNodeInfo,
-            crate::node::node_info::INFO_PUBLISH_INTERVAL,
+            aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
         )
         .await;
     }

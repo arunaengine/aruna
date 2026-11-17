@@ -649,7 +649,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn conflict_left_to_runner() {
+    fn runner_retries_conflict() {
         // A lost revision conflict ends the run for the runner's retry; a seed conflict is final.
         let mut operation = reading(leaving());
         operation.step(rows(Some(&document(1)), false));

@@ -10,7 +10,9 @@ use aruna_core::NodeId;
 use aruna_core::compute::ExecutorAvailability;
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
-use aruna_core::heartbeat::{HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, NodeHeartbeat};
+use aruna_core::heartbeat::{
+    HeartbeatEffect, HeartbeatEvent, HeldHeartbeat, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
@@ -20,7 +22,6 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::node::node_info::INFO_PUBLISH_INTERVAL;
 /// Heartbeat sends in flight at once.
 const PARALLEL_SENDS: usize = 16;
 /// Longest one send pass over all peers may take, well inside the heartbeat interval.

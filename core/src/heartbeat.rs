@@ -15,6 +15,9 @@ use crate::structs::storage::node_info::{AdvertisementEpoch, NodeUtilization};
 
 /// Largest encoded heartbeat a peer accepts.
 pub const MAX_HEARTBEAT_BYTES: usize = 32 * 1024;
+/// Interval between two heartbeats. Peers treat a heartbeat older than three intervals as stale
+/// telemetry.
+pub const INFO_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 /// Deadline for reading or sending one heartbeat.
 pub const HEARTBEAT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 

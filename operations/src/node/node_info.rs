@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
@@ -16,7 +15,7 @@ use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
+use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
@@ -57,10 +56,6 @@ use crate::realm::mutate_placement::node_kind;
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
-
-/// Interval between two heartbeats. Peers treat a heartbeat older than three
-/// intervals as stale telemetry.
-pub(crate) const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
