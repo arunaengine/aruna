@@ -3,20 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::structs::execution::notification::InboxWriteOutcome;
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventRetry, watch_retry_prefix,
-};
+use aruna_core::structs::execution::notification_watch::WatchEvent;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use tracing::warn;
 
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::notifications::protocol::{RETRY_BATCH_CAP, RETRY_BYTES_CAP, valid_retry};
-use crate::notifications::watch::digest::InterestOperation;
-use crate::notifications::watch::expansion::WatchExpandOperation;
+use crate::notifications::watch::expansion::{RetryDrainOperation, WatchExpandOperation};
 
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
@@ -44,91 +36,27 @@ pub(crate) async fn drain_watch_events(
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,
 ) -> Result<(), String> {
-    let values = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(watch_retry_prefix(realm_id).into()),
-            start: None,
-            limit: RETRY_BATCH_CAP.saturating_add(1),
-            txn_id: None,
-        })
+    let drain = RetryDrainOperation::new(realm_id, realm_config.clone(), local_node_id);
+    drive(drain, context)
         .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(defer_retry(context, realm_id, error.to_string()).await);
-        }
-        other => {
-            let error = format!("unexpected watch retry scan event: {}", other.label());
-            return Err(defer_retry(context, realm_id, error).await);
-        }
-    };
-    let over_batch = values.len() > RETRY_BATCH_CAP;
-    if over_batch {
-        warn!(%realm_id, "Watch retry queue row cap reached");
-    }
-    let mut failed = over_batch;
-    for (key, value) in values.into_iter().take(RETRY_BATCH_CAP) {
-        let key = key.to_vec();
-        if value.len() > RETRY_BYTES_CAP {
-            warn!(%realm_id, "Retaining watch retry row over byte cap");
-            failed = true;
-            continue;
-        }
-        let retry: WatchEventRetry = match postcard::from_bytes(&value) {
-            Ok(retry) if valid_retry(&retry, realm_id, &key) => retry,
-            Ok(_) | Err(_) => {
-                warn!(%realm_id, "Retaining malformed watch retry row");
-                failed = true;
-                continue;
-            }
-        };
-        let build = || {
-            let resume = Some((key.clone(), retry.cursor.clone()));
-            let events = retry.events.clone();
-            WatchExpandOperation::new(
-                realm_id,
-                realm_config.clone(),
-                local_node_id,
-                events,
-                resume,
-            )
-        };
-        if let Err(error) = drive_retry(build, context, &key).await {
-            warn!(%realm_id, %error, "Watch retry row deferred");
-            failed = true;
-        }
-    }
-    if failed {
-        let error = "watch retry drain deferred work".to_string();
-        return Err(defer_retry(context, realm_id, error).await);
-    }
-    Ok(())
-}
-
-async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) -> String {
-    if let Err(marker) = drive(InterestOperation::mark(realm_id), context).await {
-        warn!(%realm_id, %marker, "Failed to retain watch retry marker");
-        return format!("{error}; failed to retain retry marker: {marker}");
-    }
-    error
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::notifications::protocol::WATCH_PAGE_LIMIT;
-    use aruna_core::UserId;
+    use crate::notifications::protocol::valid_retry;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, GROUP_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        WATCH_INTEREST_KEYSPACE,
     };
     use aruna_core::structs::execution::notification_watch::{
         WatchAuthorizationBinding, WatchEventDetail, WatchEventKind, WatchEventMask,
-        watch_resource_path,
+        WatchEventRetry, watch_resource_path, watch_retry_prefix,
     };
     use aruna_core::structs::identity::auth::{Actor, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -140,8 +68,7 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::create_holder_watch;
-    use crate::tests::notifications::create_local_watch;
+    use crate::tests::notifications::{create_holder_watch, create_local_watch};
 
     fn temp_context() -> (tempfile::TempDir, DriverContext) {
         let dir = tempdir().expect("temp dir");
