@@ -162,7 +162,8 @@ impl Worker {
         if let Err(error) = plan_replays(&self.ctx, &config, self.local, now_ms, probe).await {
             warn!(%error, "Could not plan plugin event replays");
         }
-        if let Err(error) = self.match_pending(&config, now_ms).await {
+        let matched = match_journal(&self.ctx, &config, self.local, (now_ms, EVENTS_QUEUED));
+        if let Err(error) = matched.await {
             warn!(%error, "Could not match plugin events to installs");
         }
         if let Err(error) = run_replays(&self.ctx, now_ms, (JOURNAL_PAGE, usize::MAX)).await {
@@ -224,21 +225,6 @@ impl Worker {
     }
 
     /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
-    /// Matches every pending journal row of this node, a page per transaction; returns how many
-    /// rows were read.
-    async fn match_pending(&self, config: &RealmConfigDocument, now_ms: u64) -> Result<usize, StoreError> {
-        let targets = match_targets(config, self.local);
-        let mut read = 0;
-        loop {
-            let page = match_page((&targets.0, targets.1), now_ms, EVENTS_QUEUED);
-            let count = drive(page, &self.ctx).await?;
-            read += count;
-            if count < JOURNAL_PAGE {
-                return Ok(read);
-            }
-        }
-    }
-
     async fn notify(&self, now_ms: u64) -> Result<usize, String> {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
@@ -585,6 +571,25 @@ fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
     run.state = RunState::Queued;
     run.message = Some(message);
     run.due_ms = now_ms.saturating_add(backoff);
+}
+
+/// Matches every pending journal row of this node with at most `bound` forward rows per install,
+/// a page per transaction; returns how many rows were read.
+pub(crate) async fn match_journal(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    (now_ms, bound): (u64, usize),
+) -> Result<usize, StoreError> {
+    let (targets, keep) = match_targets(config, local);
+    let mut read = 0;
+    loop {
+        let count = drive(match_page((&targets, keep), now_ms, bound), ctx).await?;
+        read += count;
+        if count < JOURNAL_PAGE {
+            return Ok(read);
+        }
+    }
 }
 
 /// Deletes the use audit rows past their retention, a page per transaction; answers how many
