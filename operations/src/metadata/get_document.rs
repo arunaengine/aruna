@@ -331,7 +331,7 @@ mod tests {
         }
 
         #[test]
-        fn missing_or_deleted_absent() {
+        fn deleted_not_found() {
             let record = record();
             let mut missing = GetDocumentOperation::new(record.group_id, record.document_id);
             missing.first().unwrap();
