@@ -232,7 +232,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     );
     record.state = JobState::Running;
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&ctx.storage_handle, &record)
+    insert_job(&ctx, &record)
         .await
         .expect("the job is stored");
     registry.sessions().open(
@@ -526,7 +526,7 @@ async fn finished_job_ends() {
     record.state = JobState::Cancelled;
     record.finished_at_ms = Some(2_000);
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&state.get_ctx().storage_handle, &record)
+    insert_job(&state.get_ctx(), &record)
         .await
         .expect("the settled job is stored");
     let body = session_body(&state, owner, settled).await;
@@ -542,7 +542,7 @@ async fn reported_reason_wins() {
     // The reason the workflow recorded beats the state's own default.
     let owner = user(2);
     let (_dir, state, _job_id, _helper) = build_node(owner).await;
-    let storage = state.get_ctx().storage_handle.clone();
+    let context = state.get_ctx();
     let settled = JobId::from_bytes([5u8; 16]);
     let mut record = JobRecord::new(
         settled,
@@ -554,10 +554,10 @@ async fn reported_reason_wins() {
         None,
     );
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&storage, &record)
+    insert_job(&context, &record)
         .await
         .expect("the queued job is stored");
-    let ClaimOutcome::Claimed(claimed) = claim_job(&storage, settled, node(), 1_100)
+    let ClaimOutcome::Claimed(claimed) = claim_job(&context, settled, node(), 1_100)
         .await
         .expect("the job is claimable")
     else {
@@ -570,10 +570,10 @@ async fn reported_reason_wins() {
             reason: "idle".to_string(),
         },
     };
-    put_job_entry(&storage, settled, token, b"end", &row)
+    put_job_entry(&context, settled, token, b"end", &row)
         .await
         .expect("the report row is stored");
-    cancel_running_job(&storage, settled, token, 2_000)
+    cancel_running_job(&context, settled, token, 2_000)
         .await
         .expect("the job settles");
 
@@ -824,7 +824,7 @@ async fn queues_reference_copy() {
     assert_eq!(body.pending[0].source_node_id, node().to_string());
 
     let copy_id = JobId::from_str(&body.pending[0].job_id).expect("a job id");
-    let record = read_job_record(&state.get_ctx().storage_handle, copy_id, None)
+    let record = read_job_record(&state.get_ctx(), copy_id, None)
         .await
         .expect("the record reads")
         .expect("the copy job is stored");

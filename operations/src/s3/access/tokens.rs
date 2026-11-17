@@ -209,13 +209,13 @@ impl TokenScan {
         self.step = step;
         self.pages += 1;
         let (space, prefix) = match step {
-            ScanStep::Credentials => (USER_ACCESS_KEYSPACE, Vec::new()),
-            ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, Vec::new()),
+            ScanStep::Credentials => (USER_ACCESS_KEYSPACE, Key::from(Vec::<u8>::new())),
+            ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, Key::from(Vec::<u8>::new())),
             _ => (USER_KEYSPACE, UserId::storage_prefix(self.realm_id)),
         };
         IoCall::Page {
             space: space.to_string(),
-            prefix: prefix.into(),
+            prefix,
             after,
             limit: PAGE,
         }

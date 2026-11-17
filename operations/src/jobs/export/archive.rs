@@ -1045,7 +1045,7 @@ pub(super) async fn publish_export(
             return JobRunOutcome::Interrupted;
         }
         if let Err(error) = put_job_entry(
-            &ctx.driver.storage_handle,
+            &ctx.driver,
             ctx.job_id,
             ctx.claim_token,
             row.entry_key.as_bytes(),
@@ -1297,16 +1297,16 @@ pub(crate) async fn read_export_checkpoint(
     ctx: &JobContext,
     job_id: JobId,
 ) -> Result<Option<ExportCheckpoint>, String> {
-    stored_checkpoint(&ctx.driver.storage_handle, job_id).await
+    stored_checkpoint(&ctx.driver, job_id).await
 }
 
 /// The checkpoint an export job left, also after the job ended.
 pub(crate) async fn stored_checkpoint(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<ExportCheckpoint>, String> {
     read_state(
-        storage,
+        context,
         JOB_STATE_KEYSPACE,
         ByteView::from(job_id.to_bytes().to_vec()),
         "export checkpoint",
@@ -1319,7 +1319,7 @@ pub(crate) async fn persist_checkpoint<T: Serialize>(
     checkpoint: &T,
 ) -> Result<(), String> {
     put_state(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         ctx.job_id,
         ctx.claim_token,
         JOB_STATE_KEYSPACE,
@@ -1394,7 +1394,7 @@ pub(super) async fn write_validation_rows(
             },
         };
         put_job_entry(
-            &ctx.driver.storage_handle,
+            &ctx.driver,
             ctx.job_id,
             ctx.claim_token,
             row.entry_key.as_bytes(),

@@ -14,10 +14,11 @@ use aruna_core::outbound::{
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
 };
+use aruna_core::structs::execution::job::JobError;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::notifications::unexpected;
+use crate::notifications::unexpected_event;
 
 /// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -121,20 +122,28 @@ impl Operation for SendOperation {
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         let effect = self.ready.take().ok_or(IoError::Unfinished)??;
-        Ok(Next::Call(IoCall::Effect(Effect::Outbound(effect))))
+        Ok(Next::Call(IoCall::from(Effect::Outbound(effect))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        let sent = match result {
-            IoResult::Event(Event::Outbound(OutboundEvent::Posted { result })) => {
+        let sent = match result.event()? {
+            Event::Outbound(OutboundEvent::Posted { result }) => {
                 result.map_err(SendError::from).and_then(posted)
             }
-            IoResult::Event(Event::Outbound(OutboundEvent::MailSent { result })) => {
+            Event::Outbound(OutboundEvent::MailSent { result }) => {
                 result.map(|()| None).map_err(SendError::from)
             }
-            other => Err(unexpected("an outbound event", &other).into()),
+            other => Err(unexpected_event("an outbound event", &other).into()),
         };
         sent.map(Next::Done)
+    }
+}
+
+/// A send failure as the job runtime takes it.
+pub(crate) fn job_error(error: SendError) -> JobError {
+    match error {
+        SendError::Failed(message) => JobError::retryable(message),
+        error => JobError::permanent(error.to_string()),
     }
 }
 
@@ -163,7 +172,7 @@ mod call_tests {
     }
 
     fn posted(result: Result<u16, OutboundError>) -> IoResult {
-        IoResult::Event(Event::Outbound(OutboundEvent::Posted { result }))
+        IoResult::Event(Box::new(Event::Outbound(OutboundEvent::Posted { result })))
     }
 
     fn webhook() -> SendOperation {
@@ -180,9 +189,10 @@ mod call_tests {
     fn webhook_post_signed() {
         let spec = spec();
         let mut send = SendOperation::webhook(&spec, "https://hooks.example.org/a", &[9; 32], 7);
-        let Ok(Next::Call(IoCall::Effect(Effect::Outbound(OutboundEffect::Post(post))))) =
-            send.first()
-        else {
+        let Ok(Next::Call(IoCall::Effect(effect))) = send.first() else {
+            panic!("one post");
+        };
+        let Effect::Outbound(OutboundEffect::Post(post)) = *effect else {
             panic!("one post");
         };
         let body = serde_json::to_vec(&spec.body().unwrap()).unwrap();
@@ -230,13 +240,15 @@ mod call_tests {
         let mut send = SendOperation::mail(Ulid::from_parts(2, 2), None, mail);
         assert!(matches!(
             send.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Outbound(
+            Ok(Next::Call(IoCall::from(Effect::Outbound(
                 OutboundEffect::Mail(_)
             ))))
         ));
-        let sent = send.next(IoResult::Event(Event::Outbound(OutboundEvent::MailSent {
-            result: Err(OutboundError::NoSender),
-        })));
+        let sent = send.next(IoResult::Event(Box::new(Event::Outbound(
+            OutboundEvent::MailSent {
+                result: Err(OutboundError::NoSender),
+            },
+        ))));
         assert_eq!(sent, Err(SendError::NoSender));
     }
 

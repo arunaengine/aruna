@@ -99,7 +99,7 @@ async fn stored_record(
     let Some(digest) = control.output_record else {
         return Ok(None);
     };
-    let envelope = read_output_record(&context.storage_handle, job_id, control.attempt_epoch)
+    let envelope = read_output_record(context, job_id, control.attempt_epoch)
         .await
         .map_err(|error| JobError::retryable(format!("output record read failed: {error}")))?;
     let Some(envelope) = envelope else {
@@ -136,7 +136,7 @@ async fn publish_output_record(
         .map_err(|error| JobError::permanent(format!("output record digest failed: {error}")))?;
     let bytes = postcard::to_allocvec(frame.envelope())
         .map_err(|error| JobError::permanent(format!("output record encoding failed: {error}")))?;
-    persist_output_record(&context.storage_handle, job_id, control, digest, bytes)
+    persist_output_record(&context, job_id, control, digest, bytes)
         .await
         .map_err(|error| match error {
             JobMutationError::OutputRecordConflict => {
@@ -283,7 +283,9 @@ mod tests {
             claim_token: TOKEN,
             lease_expires_ms: 10_000,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&crate::testing::test_context(storage.clone()), &record)
+            .await
+            .unwrap();
         let context = DriverContext {
             storage_handle: storage,
             net_handle: Some(net.clone()),
@@ -316,7 +318,7 @@ mod tests {
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
         super::super::store::state::record_attempt_intent(
-            &context.storage_handle,
+            &context,
             record.job_id,
             TOKEN,
             AttemptIntent {
@@ -333,14 +335,10 @@ mod tests {
         .await
         .unwrap();
         let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
-        let control = reserve_output_commits(
-            &context.storage_handle,
-            record.job_id,
-            &destinations,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+        let control =
+            reserve_output_commits(&context, record.job_id, &destinations, &Default::default())
+                .await
+                .unwrap();
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 
@@ -348,25 +346,16 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_attempt_control(
-            &context.storage_handle,
-            record.job_id,
-            control.attempt_epoch,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let stored = read_attempt_control(&context, record.job_id, control.attempt_epoch, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_output_record(
-            &context.storage_handle,
-            record.job_id,
-            control.attempt_epoch,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let envelope = read_output_record(&context, record.job_id, control.attempt_epoch)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
         let JobFamilyRecord::Output(output_record) = &envelope.record else {

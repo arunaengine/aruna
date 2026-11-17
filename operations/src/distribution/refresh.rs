@@ -7,12 +7,14 @@ use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, NODE_STATE_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
@@ -21,15 +23,17 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionView, KeyRange, WriteRoute,
 };
-use aruna_core::types::{Effects, Key, Value};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::guard::{authority_reads, authority_rows, write_target};
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use super::guard::{authority_reads, write_target};
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::object::metadata::{
+    QueueRefreshOperation, QueueRefreshResult, ReferenceRefresh, ReferenceRefreshError,
+};
 
 /// Heads one range's page reads.
 const PAGE: usize = 256;
@@ -93,9 +97,21 @@ pub(crate) struct RefreshError {
     pub record: Option<Vec<u8>>,
 }
 
+/// A failure of the runner itself carries no cursor; the caller resumes where the pass began.
+impl From<IoError> for RefreshError {
+    fn from(error: IoError) -> Self {
+        Self {
+            reason: error.to_string(),
+            record: None,
+        }
+    }
+}
+
+type Step = Result<Next<RefreshPass>, String>;
+
+/// What the pending call of a pass reads or writes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
-    Init,
     Records,
     Bucket,
     Authority,
@@ -104,8 +120,6 @@ enum State {
     Version,
     Queue,
     WriteRound,
-    Finish,
-    Error,
 }
 
 /// The record whose ranges the pass walks.
@@ -146,12 +160,9 @@ pub(crate) struct RefreshRangesOperation {
     ranges: VecDeque<KeyRange>,
     last: Option<String>,
     walk: Option<RangeWalk>,
-    bucket: Option<GetBucketOperation>,
-    queue: Option<QueueRefreshOperation>,
     pages: usize,
     busy: bool,
     done: Option<Vec<u8>>,
-    output: Option<Result<RefreshPass, RefreshError>>,
 }
 
 impl RefreshRangesOperation {
@@ -174,41 +185,32 @@ impl RefreshRangesOperation {
             after: cursor.record.clone(),
             record: cursor.record.clone(),
             sweep: cursor.sweep,
-            state: State::Init,
+            state: State::Records,
             records: VecDeque::new(),
             set: None,
             ranges: VecDeque::new(),
             last: None,
             walk: None,
-            bucket: None,
-            queue: None,
             pages: 0,
             busy: false,
             done: cursor.record,
-            output: None,
         }
     }
 
-    fn finish(&mut self, busy: bool, sweep: Option<(Ulid, String)>) -> Effects {
+    fn finish(&mut self, busy: bool, sweep: Option<(Ulid, String)>) -> Step {
         let cursor = RefreshCursor {
             record: self.record.clone(),
             sweep,
         };
-        self.state = State::Finish;
-        self.output = Some(Ok(RefreshPass { busy, cursor }));
-        smallvec![]
+        Ok(Next::Done(RefreshPass { busy, cursor }))
     }
 
-    fn fail(&mut self, reason: impl ToString) -> Effects {
-        self.state = State::Error;
-        self.output = Some(Err(RefreshError {
-            reason: reason.to_string(),
-            record: self.record.clone(),
-        }));
-        smallvec![]
+    fn call(&mut self, state: State, call: IoCall) -> Step {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn next_record(&mut self) -> Effects {
+    fn next_record(&mut self) -> Step {
         while let Some((record_key, value)) = self.records.pop_front() {
             let Ok(view) = DistributionView::from_bytes(&value) else {
                 continue;
@@ -225,25 +227,19 @@ impl RefreshRangesOperation {
                 binding: None,
                 after: None,
             });
-            let mut bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
-            let effects = bucket.start();
-            self.state = State::Bucket;
-            return self.bucket_step(bucket, effects);
+            let bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
+            return self.call(State::Bucket, IoCall::child(bucket));
         }
         let busy = self.busy;
         self.finish(busy, None)
     }
 
-    /// Keeps a running bucket read; a finished one decides whether the set is walked here.
-    fn bucket_step(&mut self, bucket: GetBucketOperation, effects: Effects) -> Effects {
-        if !bucket.is_complete() {
-            self.bucket = Some(bucket);
-            return effects;
-        }
+    /// A read bucket decides whether the set is walked here; an unreadable one is skipped.
+    fn bucket_read(&mut self, bucket: Result<BucketInfo, GetBucketError>) -> Step {
         let Some(set) = self.set.as_mut() else {
-            return self.fail("no set is walked");
+            return Err("no set is walked".to_string());
         };
-        let binding = (bucket.finalize().ok())
+        let binding = (bucket.ok())
             .and_then(|info| info.distribution)
             .filter(|binding| binding.set_id == set.set_id);
         let Some(binding) = binding else {
@@ -254,17 +250,13 @@ impl RefreshRangesOperation {
             .map(|(_, lower)| lower);
         let reads = authority_reads(binding.set_id);
         set.binding = Some(binding);
-        self.state = State::Authority;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        self.call(State::Authority, IoCall::Read(reads))
     }
 
     /// Walks the next range the set's sweep visits, while the pass has pages left.
-    fn next_range(&mut self) -> Effects {
+    fn next_range(&mut self) -> Step {
         let Some(set) = self.set.as_ref() else {
-            return self.fail("no set is walked");
+            return Err("no set is walked".to_string());
         };
         let Some(range) = self.ranges.pop_front() else {
             self.done = Some(set.record_key.clone());
@@ -285,47 +277,38 @@ impl RefreshRangesOperation {
             heads: VecDeque::new(),
             head: None,
         });
-        self.state = State::Round;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
+        self.call(State::Round, read_row(NODE_STATE_KEYSPACE, key))
     }
 
     /// Reads the next page of the range's heads for a due round.
-    fn walk_page(&mut self, round: RefreshRound) -> Effects {
+    fn walk_page(&mut self, round: RefreshRound) -> Step {
         let (Some(set), Some(walk)) = (self.set.as_ref(), self.walk.as_mut()) else {
-            return self.fail("no range is walked");
+            return Err("no range is walked".to_string());
         };
         let bucket = &set.bucket;
         let start = match &round.after {
-            Some(after) => {
-                (BlobHeadKey::new(bucket, after).to_bytes()).map(|key| IterStart::After(key.into()))
-            }
+            Some(after) => (BlobHeadKey::new(bucket, after).to_bytes())
+                .map(|key| IterStart::After(key.into())),
             None => (BlobHeadKey::new(bucket, &walk.range.lower).to_bytes())
                 .map(|key| IterStart::At(key.into())),
         };
         let page = start.and_then(|start| Ok((BlobHeadKey::bucket_prefix(bucket)?, start)));
-        let (prefix, start) = match page {
-            Ok(page) => page,
-            Err(error) => return self.fail(error),
-        };
+        let (prefix, start) = page.map_err(|error| error.to_string())?;
         walk.walked = round;
-        self.state = State::Heads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        let iter = StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start: Some(start),
             limit: PAGE,
             txn_id: None,
-        })]
+        };
+        self.call(State::Heads, IoCall::Effect(Box::new(Effect::Storage(iter))))
     }
 
     /// Reads the version of the next head of the page, or writes the round once the page ends.
-    fn next_head(&mut self) -> Effects {
+    fn next_head(&mut self) -> Step {
         let (Some(set), Some(walk)) = (self.set.as_ref(), self.walk.as_mut()) else {
-            return self.fail("no range is walked");
+            return Err("no range is walked".to_string());
         };
         let Some((key, value)) = walk.heads.pop_front() else {
             return self.write_round();
@@ -335,25 +318,17 @@ impl RefreshRangesOperation {
             let row = VersionKey::new(&set.bucket, &head.key, pointer.version_id).to_bytes()?;
             Ok((head.key, pointer.version_id, row))
         });
-        let (name, version_id, row) = match found {
-            Ok(found) => found,
-            Err(error) => return self.fail(error),
-        };
+        let (name, version_id, row) = found.map_err(|error| error.to_string())?;
         if !walk.range.contains(&name) {
             walk.walked.finished = true;
             return self.write_round();
         }
         walk.head = Some((name, version_id));
-        self.state = State::Version;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: row.into(),
-            txn_id: None,
-        })]
+        self.call(State::Version, read_row(BLOB_VERSIONS_KEYSPACE, row))
     }
 
     /// Notes the head as walked and moves to the next one.
-    fn walked_head(&mut self) -> Effects {
+    fn walked_head(&mut self) -> Step {
         if let Some(walk) = self.walk.as_mut()
             && let Some((name, _)) = walk.head.take()
         {
@@ -362,33 +337,13 @@ impl RefreshRangesOperation {
         self.next_head()
     }
 
-    fn write_round(&mut self) -> Effects {
+    fn write_round(&mut self) -> Step {
         let Some(walk) = self.walk.as_ref() else {
-            return self.fail("no range is walked");
+            return Err("no range is walked".to_string());
         };
-        let value = match postcard::to_allocvec(&walk.walked) {
-            Ok(value) => value,
-            Err(error) => return self.fail(error),
-        };
-        self.state = State::WriteRound;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: walk.key.clone().into(),
-            value: value.into(),
-            txn_id: None,
-        })]
-    }
-
-    /// Keeps a running refresh queue write; a finished one moves to the next head.
-    fn queue_step(&mut self, queue: QueueRefreshOperation, effects: Effects) -> Effects {
-        if !queue.is_complete() {
-            self.queue = Some(queue);
-            return effects;
-        }
-        match queue.finalize() {
-            Ok(_) => self.walked_head(),
-            Err(error) => self.fail(error),
-        }
+        let value = postcard::to_allocvec(&walk.walked).map_err(|error| error.to_string())?;
+        let row = (NODE_STATE_KEYSPACE.to_string(), walk.key.clone().into(), value.into());
+        self.call(State::WriteRound, IoCall::Write(vec![row]))
     }
 
     fn refresh(&self, version: &BlobVersion) -> Option<ReferenceRefresh> {
@@ -411,147 +366,109 @@ impl RefreshRangesOperation {
     }
 }
 
-impl EffectOperation for RefreshRangesOperation {
-    type Output = RefreshPass;
-    type Error = RefreshError;
-
-    fn start(&mut self) -> Effects {
-        self.state = State::Records;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: self
-                .after
-                .clone()
-                .map(|after| IterStart::After(after.into())),
-            limit: SETS_PER_PASS,
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                State::Records,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                self.record = next_start_after.map(|next| next.to_vec());
+impl RefreshRangesOperation {
+    fn advance(&mut self, result: IoResult) -> Result<Next<RefreshPass>, String> {
+        let text = |error: IoError| error.to_string();
+        match self.state {
+            State::Records => {
+                let (values, next) = result.page().map_err(text)?;
+                self.record = next.map(|next| next.to_vec());
                 self.records = values.into();
                 self.next_record()
             }
-            (State::Bucket, event) => match self.bucket.take() {
-                Some(mut bucket) => {
-                    let effects = bucket.step(event);
-                    self.bucket_step(bucket, effects)
-                }
-                None => self.fail("no bucket is read"),
-            },
-            (State::Authority, event) => {
-                let rows = authority_rows(event).map_err(|error| error.to_string());
-                let Some(set) = self.set.as_ref() else {
-                    return self.fail("no set is walked");
-                };
-                let ranges = rows.and_then(|(record, fence)| {
-                    coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())
-                });
-                match ranges.map(|ranges| after_range(ranges, set.after.as_deref())) {
-                    Ok(ranges) => {
-                        self.ranges = ranges.into();
-                        self.last = None;
-                        self.next_range()
-                    }
-                    Err(reason) => self.fail(reason),
-                }
+            State::Bucket => {
+                let bucket = result.child::<BucketInfo, GetBucketError>().map_err(text)?;
+                self.bucket_read(bucket)
             }
-            (State::Round, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let stored = (value.as_deref())
-                    .map(postcard::from_bytes::<RefreshRound>)
-                    .transpose();
-                let round = match stored {
-                    Ok(round) => round.unwrap_or(RefreshRound {
-                        started_ms: self.now_ms,
-                        ..RefreshRound::default()
-                    }),
-                    Err(error) => return self.fail(error),
+            State::Authority => {
+                let [record, fence] = values::<2>(result).map_err(text)?;
+                let Some(set) = self.set.as_ref() else {
+                    return Err("no set is walked".to_string());
                 };
+                let ranges = coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())?;
+                self.ranges = after_range(ranges, set.after.as_deref()).into();
+                self.last = None;
+                self.next_range()
+            }
+            State::Round => {
+                let [value] = values::<1>(result).map_err(text)?;
+                let stored = (value.as_deref()).map(postcard::from_bytes::<RefreshRound>);
+                let round = stored.transpose().map_err(|error| error.to_string())?;
+                let round = round.unwrap_or(RefreshRound {
+                    started_ms: self.now_ms,
+                    ..RefreshRound::default()
+                });
                 let refresh_secs = self.set.as_ref().map_or(0, |set| set.refresh_secs);
                 match round.due(self.now_ms, refresh_secs) {
                     Some(round) => self.walk_page(round),
                     None => self.next_range(),
                 }
             }
-            (
-                State::Heads,
-                Event::Storage(StorageEvent::IterResult {
+            State::Heads => {
+                let event = result.event().map_err(text)?;
+                let Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
-                }),
-            ) => {
+                }) = event
+                else {
+                    return Err(format!("unexpected head page answer {}", event.label()));
+                };
                 let Some(walk) = self.walk.as_mut() else {
-                    return self.fail("no range is walked");
+                    return Err("no range is walked".to_string());
                 };
                 walk.walked.finished = next_start_after.is_none();
                 walk.heads = values.into();
                 self.next_head()
             }
-            (State::Version, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let version = match (value.as_deref()).map(BlobVersion::from_bytes).transpose() {
-                    Ok(version) => version,
-                    Err(error) => return self.fail(error),
-                };
+            State::Version => {
+                let [value] = values::<1>(result).map_err(text)?;
+                let version = (value.as_deref()).map(BlobVersion::from_bytes).transpose();
+                let version = version.map_err(|error| error.to_string())?;
                 // The worker observes the source; only a confirmed change mints a successor.
                 let refresh = version
                     .filter(|version| matches!(version.state, BlobVersionState::Reference { .. }))
                     .and_then(|version| self.refresh(&version));
-                let Some(refresh) = refresh else {
-                    return self.walked_head();
-                };
-                let mut queue = QueueRefreshOperation::new(refresh);
-                let effects = queue.start();
-                self.state = State::Queue;
-                self.queue_step(queue, effects)
-            }
-            (State::Queue, event) => match self.queue.take() {
-                Some(mut queue) => {
-                    let effects = queue.step(event);
-                    self.queue_step(queue, effects)
+                match refresh {
+                    Some(refresh) => {
+                        let queue = QueueRefreshOperation::new(refresh);
+                        self.call(State::Queue, IoCall::child(queue))
+                    }
+                    None => self.walked_head(),
                 }
-                None => self.fail("no refresh is queued"),
-            },
-            (State::WriteRound, Event::Storage(StorageEvent::WriteResult { .. })) => {
+            }
+            State::Queue => {
+                let queued = result.child::<QueueRefreshResult, ReferenceRefreshError>();
+                queued.map_err(text)?.map_err(|error| error.to_string())?;
+                self.walked_head()
+            }
+            State::WriteRound => {
+                done(result).map_err(text)?;
                 self.pages += 1;
                 self.busy |= self.walk.take().is_some_and(|walk| !walk.walked.finished);
                 self.next_range()
             }
-            (state, event) => self.fail(format!(
-                "unexpected event in state {state:?}: {}",
-                event.label()
-            )),
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
+impl Operation for RefreshRangesOperation {
+    type Output = RefreshPass;
+    type Error = RefreshError;
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RefreshError {
-            reason: "the pass did not finish".to_string(),
-            record: self.record,
+    fn first(&mut self) -> Result<Next<RefreshPass>, RefreshError> {
+        Ok(Next::Call(IoCall::Page {
+            space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.clone().map(Key::from),
+            limit: SETS_PER_PASS,
         }))
     }
 
-    fn abort(&mut self) -> Effects {
-        if let Some(queue) = self.queue.as_mut() {
-            return queue.abort();
-        }
-        match self.bucket.as_mut() {
-            Some(bucket) => bucket.abort(),
-            None => smallvec![],
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<RefreshPass>, RefreshError> {
+        self.advance(result).map_err(|reason| RefreshError {
+            reason,
+            record: self.record.clone(),
+        })
     }
 }
 
@@ -635,10 +552,7 @@ mod tests {
         );
     }
     use crate::distribution::test_record::with_settings;
-    use aruna_core::errors::StorageError;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::storage::distribution::DistributionSettings;
 
     fn pass(cursor: RefreshCursor) -> RefreshRangesOperation {
@@ -648,23 +562,13 @@ mod tests {
         RefreshRangesOperation::new(realm_id, node_id, now, cursor)
     }
 
-    fn records(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: (values.into_iter())
+    fn records(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> IoResult {
+        IoResult::Page {
+            rows: (values.into_iter())
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect(),
-            next_start_after: next.map(Key::from),
-        })
-    }
-
-    fn record_page(after: Option<Vec<u8>>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: DISTRIBUTION_KEYSPACE.to_string(),
-            prefix: None,
-            start: after.map(|after| IterStart::After(after.into())),
-            limit: SETS_PER_PASS,
-            txn_id: None,
-        })
+            next: next.map(Key::from),
+        }
     }
 
     // Records without a refresh interval are skipped; the record cursor moves past the page.
@@ -675,25 +579,23 @@ mod tests {
             record: Some(vec![1]),
             sweep: None,
         });
-        check_trace(
-            &mut operation,
-            &[record_page(Some(vec![1]))],
-            vec![(
-                records(vec![(vec![2], plain), (vec![3], vec![0xFF])], Some(vec![3])),
-                Vec::new(),
-            )],
-        );
+        let page = IoCall::Page {
+            space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: Some(Key::from(vec![1])),
+            limit: SETS_PER_PASS,
+        };
+        assert_eq!(operation.first(), Ok(Next::Call(page)));
+        let read = records(vec![(vec![2], plain), (vec![3], vec![0xFF])], Some(vec![3]));
         let cursor = RefreshCursor {
             record: Some(vec![3]),
             sweep: None,
         };
-        assert_eq!(
-            operation.finalize(),
-            Ok(RefreshPass {
-                busy: false,
-                cursor
-            })
-        );
+        let pass = RefreshPass {
+            busy: false,
+            cursor,
+        };
+        assert_eq!(operation.next(read), Ok(Next::Done(pass)));
     }
 
     // A set whose bucket is not readable here is skipped, and the pass goes on.
@@ -703,53 +605,29 @@ mod tests {
             refresh_secs: Some(60),
             ..DistributionSettings::default()
         };
-        let (snapshot, refreshed) = with_settings(true, 0, settings);
+        let (_, refreshed) = with_settings(true, 0, settings);
         let mut operation = pass(RefreshCursor::default());
-        operation.start();
-        let effects = operation.step(records(vec![(vec![2], refreshed)], None));
-        let mut bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
-        assert_eq!(effects, bucket.start());
-        let failed = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(operation.step(failed).is_empty());
-        let pass = operation.finalize().unwrap();
+        operation.first().unwrap();
+        let bucket = operation.next(records(vec![(vec![2], refreshed)], None));
+        assert!(matches!(bucket, Ok(Next::Call(IoCall::Child(_)))));
+        let failed: Result<BucketInfo, GetBucketError> = Err(GetBucketError::NotFound);
+        let Ok(Next::Done(pass)) = operation.next(IoResult::Child(ChildOutcome::new(failed)))
+        else {
+            panic!("expected the pass to end");
+        };
         assert_eq!((pass.busy, pass.cursor), (false, RefreshCursor::default()));
     }
 
-    // A failed record page keeps the cursor the pass began at.
+    // A failure inside the pass keeps the record cursor it reached; a runner failure has none.
     #[test]
     fn failure_keeps_cursor() {
         let mut operation = pass(RefreshCursor {
             record: Some(vec![1]),
             sweep: Some((Ulid::nil(), "a".to_string())),
         });
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        let error = operation.finalize().unwrap_err();
+        operation.first().unwrap();
+        let error = operation.next(IoResult::Done).unwrap_err();
         assert_eq!(error.record, Some(vec![1]));
-    }
-
-    // Events outside the record read are refused; nothing is cleaned up before a child runs.
-    #[test]
-    fn rejects_unexpected() {
-        let started = || {
-            let mut operation = pass(RefreshCursor::default());
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(started, sample_events, |event| {
-            matches!(event, Event::Storage(StorageEvent::IterResult { .. }))
-        });
-        assert_eq!(refused.len(), sample_events().len() - 1);
-        let fresh = || pass(RefreshCursor::default());
-        assert_eq!(
-            rejects_events(fresh, sample_events, |_| false).len(),
-            sample_events().len()
-        );
-        assert!(started().abort().is_empty());
-        rejects_finalize(started());
+        assert_eq!(RefreshError::from(IoError::Aborted).record, None);
     }
 }

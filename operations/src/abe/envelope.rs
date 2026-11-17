@@ -75,7 +75,7 @@ impl Operation for EnvelopeOperation {
     type Error = AbeError;
     /// The reads see one snapshot, so the version and its envelope agree.
     fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
+        TransactionMode::ReadSnapshot
     }
     fn first(&mut self) -> Result<Next<Envelope>, AbeError> {
         let key = self.version.to_bytes().map_err(|_| AbeError::Context)?;
@@ -117,10 +117,7 @@ mod tests {
         // A version row that is absent ends the read before any envelope row.
         let mut operation =
             EnvelopeOperation::new("b".into(), "k".into(), Ulid::from_bytes([1; 16]));
-        assert_eq!(
-            operation.transaction(),
-            aruna_core::operation::TransactionMode::Write
-        );
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
         assert!(
             matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2)
         );

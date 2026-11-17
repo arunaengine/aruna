@@ -267,7 +267,7 @@ pub async fn process_materialization_batch(
         && let Some(task_handle) = &context.task_handle
     {
         crate::jobs::repository::link_queue::restore_link_timer(
-            &context.storage_handle,
+            context,
             task_handle,
         )
         .await;

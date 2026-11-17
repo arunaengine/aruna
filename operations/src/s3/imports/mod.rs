@@ -116,7 +116,7 @@ pub async fn last_run(
     let (Some(job_id), Some(started_ms)) = (rule.last_job, rule.last_started_ms) else {
         return Ok(None);
     };
-    let Some(record) = read_job_record(&context.storage_handle, job_id, None)
+    let Some(record) = read_job_record(context, job_id, None)
         .await
         .map_err(ImportRuleError::Read)?
     else {

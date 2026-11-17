@@ -153,7 +153,8 @@ impl RawViewOperation {
         match turn {
             Next::Call(call) => Ok(Next::Call(call)),
             Next::Wait => Ok(Next::Wait),
-            Next::Done(events) => {
+            // The event read is a plain read, so it has no calls after a commit.
+            Next::Done(events) | Next::Then { output: events, .. } => {
                 self.events = None;
                 let revision = resolve_raw_revision(&events)?;
                 self.done(revision)
@@ -197,7 +198,7 @@ impl Operation for RawViewOperation {
 
 /// Reads a document's stored raw state outside any transaction.
 #[derive(Debug, PartialEq)]
-pub struct RawStateOperation {
+pub(crate) struct RawStateOperation {
     document_id: Ulid,
 }
 

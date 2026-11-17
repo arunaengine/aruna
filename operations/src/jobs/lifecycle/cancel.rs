@@ -316,7 +316,7 @@ pub(crate) async fn cancel_local_run(context: &DriverContext, physical: JobId) {
 /// Requests cancellation of one local physical row. A settled or pruned row is
 /// a no-op, and a repeated request leaves the stored record untouched.
 async fn flag_local_run(context: &DriverContext, physical: JobId) -> bool {
-    match set_cancel_requested(&context.storage_handle, physical, unix_timestamp_millis()).await {
+    match set_cancel_requested(context, physical, unix_timestamp_millis()).await {
         Ok(CancelRequestOutcome::Cancelled(record)) => {
             if !publish_terminal(context, &record).await
                 && let Some(task) = context.task_handle.as_ref()

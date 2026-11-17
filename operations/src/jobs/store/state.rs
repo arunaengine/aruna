@@ -6,11 +6,11 @@ use super::*;
 
 /// Read a job record, retaining malformed rows for offline recovery.
 pub async fn read_job_record(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobRecord>, String> {
-    match read_raw(storage, JOB_KEYSPACE, job_record_key(job_id), txn_id).await? {
+    match read_raw(context, JOB_KEYSPACE, job_record_key(job_id), txn_id).await? {
         Some(value) => match JobRecord::from_bytes(&value) {
             Ok(record) => Ok(Some(record)),
             Err(error) => {
@@ -23,7 +23,7 @@ pub async fn read_job_record(
 }
 
 pub(crate) async fn preserve_artifact_tombstone(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     owner: UserId,
     expires_at_ms: u64,
@@ -33,7 +33,7 @@ pub(crate) async fn preserve_artifact_tombstone(
         expires_at_ms,
     };
     batch_write(
-        storage,
+        context,
         vec![
             (
                 ARTIFACT_TOMBSTONE_KEYSPACE.to_string(),
@@ -58,12 +58,12 @@ pub(crate) fn artifact_tombstone_key(job_id: JobId) -> Key {
 }
 
 pub(crate) async fn read_artifact_tombstone(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     now_ms: u64,
 ) -> Result<Option<UserId>, String> {
     read_raw(
-        storage,
+        context,
         ARTIFACT_TOMBSTONE_KEYSPACE,
         artifact_tombstone_key(job_id),
         None,
@@ -90,14 +90,14 @@ pub enum ClaimOutcome {
 
 /// Claim a queued job, or cancel it directly if it never ran and is cancel-requested.
 pub async fn claim_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     holder_node_id: NodeId,
     now_ms: u64,
 ) -> Result<ClaimOutcome, JobMutationError> {
     let mut claimed_now = false;
     let mut cancelled_fresh = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         claimed_now = false;
         cancelled_fresh = false;
         if record.state != JobState::Queued {
@@ -133,12 +133,12 @@ pub async fn claim_job(
 }
 
 pub async fn transition_to_running(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.state = JobState::Running;
         record.has_run = true;
@@ -156,13 +156,13 @@ pub struct RenewOutcome {
 }
 
 pub async fn renew_lease(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
     progress: Option<JobProgress>,
 ) -> Result<RenewOutcome, JobMutationError> {
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.updated_at_ms = now_ms;
         if let Some(claim) = record.claim.as_mut() {
@@ -181,13 +181,13 @@ pub async fn renew_lease(
 
 /// Persist an in-memory progress snapshot without touching the lease or state.
 pub async fn flush_progress(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     progress: JobProgress,
     now_ms: u64,
 ) -> Result<RenewOutcome, JobMutationError> {
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.progress = progress.clone();
         record.updated_at_ms = now_ms;
@@ -200,14 +200,14 @@ pub async fn flush_progress(
 }
 
 pub async fn complete_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     result: JobResultPayload,
     final_progress: JobProgress,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.state = JobState::Succeeded;
         record.finished_at_ms = Some(now_ms);
@@ -229,7 +229,7 @@ pub enum ExecutionCompleteOutcome {
 
 /// Complete an execution only when cancellation has not already committed.
 pub async fn complete_execution(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     result: JobResultPayload,
@@ -238,7 +238,7 @@ pub async fn complete_execution(
 ) -> Result<ExecutionCompleteOutcome, JobMutationError> {
     let mut completed = false;
     let record = commit_success(
-        storage,
+        context,
         job_id,
         token,
         result,
@@ -265,7 +265,7 @@ pub async fn complete_execution(
 /// requested. It carries the same durable-output invariant as an ordinary
 /// success, because it publishes the same terminal result.
 pub async fn complete_cancelled(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     result: JobResultPayload,
@@ -273,7 +273,7 @@ pub async fn complete_cancelled(
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
     commit_success(
-        storage,
+        context,
         job_id,
         token,
         result,
@@ -288,7 +288,7 @@ pub async fn complete_cancelled(
 /// that reads the attempt control, and only when every output binds the active
 /// ExecutionId, names a reserved version, and the exact output record is durable.
 async fn commit_success<G>(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     result: JobResultPayload,
@@ -301,7 +301,7 @@ where
 {
     let proof = result.clone();
     mutate_job_guarded(
-        storage,
+        context,
         job_id,
         |record| {
             guard_token(record, token)?;
@@ -331,12 +331,12 @@ where
 /// The signed output record the attempt already stored, if any. It shares the
 /// attempt-control key, so pruning the job removes both.
 pub async fn read_output_record(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     attempt_epoch: u64,
 ) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
     let value = read_raw(
-        storage,
+        context,
         OUTPUT_RECORD_KEYSPACE,
         ByteView::from(attempt_control_key(job_id, attempt_epoch)),
         None,
@@ -355,7 +355,7 @@ pub async fn read_output_record(
 /// the attempt control in one transaction, so terminal success can never
 /// observe the digest without the record it names.
 pub async fn persist_output_record(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     control: &AttemptControl,
     digest: [u8; 32],
@@ -366,7 +366,7 @@ pub async fn persist_output_record(
         ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
         ByteView::from(envelope),
     )];
-    mutate_control_with(storage, job_id, write, |_, stored| {
+    mutate_control_with(context, job_id, write, |_, stored| {
         if stored.execution_id != control.execution_id {
             return Err(JobMutationError::EpochMismatch);
         }
@@ -385,13 +385,13 @@ pub async fn persist_output_record(
 }
 
 pub async fn fail_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     error: JobError,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.state = JobState::Failed;
         record.finished_at_ms = Some(now_ms);
@@ -406,13 +406,13 @@ pub async fn fail_job(
 /// Ends the attempts of a job whose outcome cannot be known: `Indeterminate` and locally
 /// exhausted, so nothing tries it again here and nothing claims it failed.
 pub async fn exhaust_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     error: JobError,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.last_error = Some(JobError::retryable(error.message.clone()));
         record.updated_at_ms = now_ms;
@@ -423,12 +423,12 @@ pub async fn exhaust_job(
 }
 
 pub async fn cancel_running_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
 ) -> Result<JobRecord, JobMutationError> {
-    mutate_job(storage, job_id, |record| {
+    mutate_job(context, job_id, |record| {
         guard_token(record, token)?;
         record.state = JobState::Cancelled;
         record.finished_at_ms = Some(now_ms);
@@ -484,7 +484,7 @@ pub(super) fn exhaust_attempts(record: &mut JobRecord, now_ms: u64) {
 /// `None` for the sweep and recovery, and `require_expired_before` re-checks the
 /// expired lease in-txn. External attempts return `NeedsReconcile` untouched.
 pub async fn requeue_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Option<Ulid>,
     now_ms: u64,
@@ -492,20 +492,20 @@ pub async fn requeue_job(
     error: Option<JobError>,
 ) -> Result<RequeueOutcome, JobMutationError> {
     let expired = require_expired_before;
-    requeue_counted(storage, job_id, token, now_ms, expired, error, false).await
+    requeue_counted(context, job_id, token, now_ms, expired, error, false).await
 }
 
 /// Re-queue after a transient failure of an execution that advanced a durable checkpoint:
 /// attempts count consecutive failures without progress, so this one starts a new count.
 pub async fn requeue_progressed(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
     error: JobError,
 ) -> Result<RequeueOutcome, JobMutationError> {
     requeue_counted(
-        storage,
+        context,
         job_id,
         Some(token),
         now_ms,
@@ -517,7 +517,7 @@ pub async fn requeue_progressed(
 }
 
 async fn requeue_counted(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Option<Ulid>,
     now_ms: u64,
@@ -527,7 +527,7 @@ async fn requeue_counted(
 ) -> Result<RequeueOutcome, JobMutationError> {
     let mut persisted = false;
     let mut needs_reconcile = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         persisted = false;
         needs_reconcile = false;
         if let Some(token) = token {
@@ -596,13 +596,13 @@ pub enum ReleaseOutcome {
 /// due now. Guarded by `token`, so a job another node already took over is left alone.
 /// Distinct from `requeue_job`, whose attempt increment is unconditional.
 pub async fn release_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     let mut released = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         released = false;
         guard_token(record, token)?;
         if record.state.is_terminal() {
@@ -629,7 +629,7 @@ pub async fn release_job(
 /// shutdown release, this records the reason and delays the next claim so a
 /// lagging projection is not hot-polled.
 pub async fn defer_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
@@ -637,7 +637,7 @@ pub async fn defer_job(
     error: JobError,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     let mut deferred = false;
-    let record = mutate_job(storage, job_id, |record| {
+    let record = mutate_job(context, job_id, |record| {
         deferred = false;
         guard_token(record, token)?;
         if record.state.is_terminal() {
@@ -665,13 +665,13 @@ pub async fn defer_job(
 /// Rotating the token fences the old supervisor; the expired replacement claim keeps
 /// the unchanged state and attempt intent discoverable by the lease sweep.
 pub async fn handoff_external_attempt(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     now_ms: u64,
 ) -> Result<ReleaseOutcome, JobMutationError> {
     let mut released = false;
-    let result = mutate_attempt_control(storage, job_id, |record, control| {
+    let result = mutate_attempt_control(context, job_id, |record, control| {
         released = false;
         guard_token(record, token)?;
         if record.execution_class != JobExecutionClass::ExternalAttempt
@@ -700,11 +700,11 @@ pub async fn handoff_external_attempt(
         // A job interrupted while still staging has no attempt intent; release
         // its lease instead of leaving it to the sweep's attempt charge.
         Err(JobMutationError::MissingControl) => {
-            let record = read_job_record(storage, job_id, None)
+            let record = read_job_record(context, job_id, None)
                 .await
                 .map_err(JobMutationError::Storage)?;
             if record.is_some_and(|record| record.attempt_intent.is_none()) {
-                release_job(storage, job_id, token, now_ms).await
+                release_job(context, job_id, token, now_ms).await
             } else {
                 Err(JobMutationError::MissingControl)
             }
@@ -725,7 +725,7 @@ pub struct AttemptCommit {
 /// `execution_id` binds the fenced attempt to the physical execution a target
 /// already receipted; `None` mints a fresh one for a purely local attempt.
 pub async fn record_attempt_intent(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: Ulid,
     draft: AttemptIntent,
@@ -734,11 +734,11 @@ pub async fn record_attempt_intent(
     now_ms: u64,
 ) -> Result<AttemptCommit, JobMutationError> {
     for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(storage)
+        let txn_id = start_write_txn(context)
             .await
             .map_err(JobMutationError::Storage)?;
         let result = async {
-            let Some(mut record) = read_job_record(storage, job_id, Some(txn_id))
+            let Some(mut record) = read_job_record(context, job_id, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?
             else {
@@ -754,7 +754,7 @@ pub async fn record_attempt_intent(
                     return Err(JobMutationError::IntentConflict);
                 }
                 let control =
-                    read_attempt_control(storage, job_id, intent.attempt_epoch, Some(txn_id))
+                    read_attempt_control(context, job_id, intent.attempt_epoch, Some(txn_id))
                         .await?
                         .ok_or(JobMutationError::MissingControl)?;
                 return Ok(AttemptCommit { record, control });
@@ -805,10 +805,10 @@ pub async fn record_attempt_intent(
                     ),
                 ));
             }
-            batch_write(storage, writes, Some(txn_id))
+            batch_write(context, writes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
-            batch_delete(storage, deletes, Some(txn_id))
+            batch_delete(context, deletes, Some(txn_id))
                 .await
                 .map_err(JobMutationError::Storage)?;
             Ok(AttemptCommit { record, control })
@@ -816,7 +816,7 @@ pub async fn record_attempt_intent(
         .await;
         match result {
             Ok(commit) => match commit_write(
-                storage,
+                context,
                 txn_id,
                 attempt,
                 "attempt commit exhausted conflict retries",
@@ -827,7 +827,7 @@ pub async fn record_attempt_intent(
                 CommitStep::Retry => continue,
             },
             Err(error) => {
-                abort_txn(storage, txn_id).await;
+                abort_txn(context, txn_id).await;
                 return Err(error);
             }
         }

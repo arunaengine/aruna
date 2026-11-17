@@ -38,7 +38,7 @@ fn auth(user_id: UserId) -> AuthContext {
 
 /// Whether the local physical row of the seeded execution is flagged.
 async fn flagged(ctx: &DriverContext) -> bool {
-    read_job_record(&ctx.storage_handle, physical(), None)
+    read_job_record(ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists")
@@ -60,7 +60,7 @@ async fn cancel_stops_local() {
         .expect("alias names a family")
         .expect("cancellation publishes");
 
-    let record = read_job_record(&ctx.storage_handle, physical(), None)
+    let record = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -81,7 +81,7 @@ async fn repeated_cancel_quiet() {
         .await
         .expect("alias names a family")
         .expect("cancellation publishes");
-    let first = read_job_record(&ctx.storage_handle, physical(), None)
+    let first = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -90,7 +90,7 @@ async fn repeated_cancel_quiet() {
         .expect("alias names a family")
         .expect("cancellation publishes");
 
-    let second = read_job_record(&ctx.storage_handle, physical(), None)
+    let second = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -281,13 +281,13 @@ async fn winner_cancel_recovers() {
     .unwrap();
 
     assert_eq!(accepted, raced);
-    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+    let record = read_job_record(&ctx, JobId::from_bytes([1u8; 16]), None)
         .await
         .unwrap()
         .unwrap();
     assert!(record.cancel_requested);
     assert!(
-        read_job_record(&ctx.storage_handle, JobId::from_bytes([2u8; 16]), None)
+        read_job_record(&ctx, JobId::from_bytes([2u8; 16]), None)
             .await
             .unwrap()
             .is_none()
@@ -309,7 +309,7 @@ async fn late_cancel_flags() {
         .expect("commit decides")
         .expect("receipt commits");
 
-    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+    let record = read_job_record(&ctx, JobId::from_bytes([1u8; 16]), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -417,19 +417,19 @@ async fn unrecorded_deletion_kept() {
     let outsider = secret(9);
     let (_dir, ctx) = node_context(&family, &outsider).await;
     seed_family(&ctx, &family).await;
-    insert_job(&ctx.storage_handle, &finished(outsider.public()))
+    insert_job(&ctx, &finished(outsider.public()))
         .await
         .expect("run row written");
     let kept = delete_owned_run(&ctx, &owner, job_id)
         .await
         .expect("delete runs");
     assert!(matches!(kept, RunDelete::Unrecorded(_)), "{kept:?}");
-    let row = read_job_record(&ctx.storage_handle, job_id, None).await;
+    let row = read_job_record(&ctx, job_id, None).await;
     assert!(row.expect("run row read").is_some());
 
     let (_dir, ctx) = node_context(&family, &family.holder).await;
     seed_family(&ctx, &family).await;
-    insert_job(&ctx.storage_handle, &finished(family.holder.public()))
+    insert_job(&ctx, &finished(family.holder.public()))
         .await
         .expect("run row written");
     let deleted = delete_owned_run(&ctx, &owner, job_id)

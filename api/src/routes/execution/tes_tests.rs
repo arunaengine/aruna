@@ -1706,7 +1706,7 @@ async fn basic_scopes_tasks() {
         let (spec, _) =
             map_execution_spec(&sample_task(group_id), None, ExecutionTarget::Realm).unwrap();
         insert_job(
-            &state.get_ctx().storage_handle,
+            &state.get_ctx(),
             &execution_record(job_id, owner, spec),
         )
         .await
@@ -1787,7 +1787,7 @@ async fn lists_zero_pagesize() {
     let headers = basic_headers(&access, TES_SECRET);
     let (spec, _) = map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &execution_record(JobId::from_bytes([9u8; 16]), owner, spec),
     )
     .await
@@ -1831,7 +1831,7 @@ async fn lists_derived_tags() {
         let (spec, _) =
             map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
         insert_job(
-            &state.get_ctx().storage_handle,
+            &state.get_ctx(),
             &execution_record(job_id, owner, spec),
         )
         .await
@@ -1879,7 +1879,7 @@ async fn get_resolves() {
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &execution_record(job_id, owner, spec),
     )
     .await
@@ -1927,7 +1927,7 @@ async fn cancel_maps_through() {
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &execution_record(job_id, owner, spec),
     )
     .await

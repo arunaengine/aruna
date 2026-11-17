@@ -51,7 +51,7 @@ impl ArunaS3Service {
         };
         if let Some(job_id) = credential_job_id(&access.access_key)
             && let Ok(Some(record)) =
-                read_job_record(&self.state.storage_handle, job_id, None).await
+                read_job_record(&self.state, job_id, None).await
             && record.created_by == access.user_identity
             && record.workspace_bucket.as_deref() == Some(bucket)
         {

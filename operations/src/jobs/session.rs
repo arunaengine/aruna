@@ -82,7 +82,11 @@ mod tests {
         let mut operation = touch();
         operation.first().expect("session call");
         assert!(operation.next(IoResult::Woke).is_err());
-        assert!(operation.next(IoResult::Event(Box::new(Event::Delayed))).is_err());
+        assert!(
+            operation
+                .next(IoResult::Event(Box::new(Event::Delayed)))
+                .is_err()
+        );
     }
 
     #[test]

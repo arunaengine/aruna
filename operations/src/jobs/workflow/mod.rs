@@ -77,7 +77,6 @@ pub async fn run_execution_job(
     record: JobRecord,
     cancel: CancellationToken,
 ) {
-    let storage = &context.storage_handle;
     let job_id = record.job_id;
     let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
         warn!(job_id = %job_id, "Execution job has no claim token; skipping");
@@ -94,7 +93,7 @@ pub async fn run_execution_job(
     // A fresh cancel before any attempt was submitted: no container exists, so
     // terminalize directly (Claimed -> Cancelled).
     if record.cancel_requested && record.attempt_intent.is_none() {
-        match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
+        match cancel_running_job(&context, job_id, token, unix_timestamp_millis()).await {
             Ok(record) => Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await,
             Err(error) => {
                 warn!(job_id = %job_id, error = %error, "Fresh cancellation write failed")
@@ -129,7 +128,7 @@ pub async fn run_execution_job(
     };
 
     // Claimed -> Preparing.
-    if transition_to_preparing(storage, job_id, token, unix_timestamp_millis())
+    if transition_to_preparing(&context, job_id, token, unix_timestamp_millis())
         .await
         .is_err()
     {
@@ -148,7 +147,7 @@ pub async fn run_execution_job(
 
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(execution_heartbeat(
-        storage.clone(),
+        context.as_ref().clone(),
         job_id,
         token,
         cancel.clone(),
@@ -176,7 +175,7 @@ pub async fn run_execution_job(
         };
 
         // Preparing -> Ready.
-        if transition_to_ready(storage, job_id, token, unix_timestamp_millis())
+        if transition_to_ready(&context, job_id, token, unix_timestamp_millis())
             .await
             .is_err()
         {
@@ -245,7 +244,7 @@ pub async fn run_execution_job(
             attempt_epoch: 0,
         };
         let intent_commit = match Box::pin(record_attempt_intent(
-            storage,
+            &context,
             job_id,
             token,
             intent,
@@ -257,13 +256,13 @@ pub async fn run_execution_job(
         {
             Ok(record) => record,
             Err(JobMutationError::IntentConflict) => {
-                if read_job_record(storage, job_id, None)
+                if read_job_record(&context, job_id, None)
                     .await
                     .ok()
                     .flatten()
                     .is_some_and(|record| record.cancel_requested)
                 {
-                    match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await
+                    match cancel_running_job(&context, job_id, token, unix_timestamp_millis()).await
                     {
                         Ok(record) => {
                             Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await
@@ -278,7 +277,7 @@ pub async fn run_execution_job(
             Err(_) => return AttemptOutcome::Stopped,
         };
         if intent_commit.record.cancel_requested {
-            match cancel_running_job(storage, job_id, token, unix_timestamp_millis()).await {
+            match cancel_running_job(&context, job_id, token, unix_timestamp_millis()).await {
                 Ok(record) => Box::pin(cleanup_and_crate(&context, job_id, Some(record))).await,
                 Err(error) => {
                     warn!(job_id = %job_id, error = %error, "Pre-submit cancellation write failed")
@@ -321,7 +320,7 @@ pub async fn run_execution_job(
 
         // Ready -> Running only after the backend accepted the fenced attempt.
         let running = match begin_external_running(
-            storage,
+            &context,
             job_id,
             token,
             submitted.started_at_ms,

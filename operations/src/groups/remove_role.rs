@@ -5,15 +5,16 @@
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::{done, read_row};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -21,17 +22,16 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, KeySpace, RoleId, TxnId};
+use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::epoch_due::DueMarks;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::auth::Permission;
 
@@ -44,76 +44,16 @@ pub struct RemoveGroupConfig {
     pub role_id: RoleId,
 }
 
-#[derive(PartialEq)]
+/// The group and its authorization document after the removal.
+type RemovedRole = (Group, GroupAuthorizationDocument);
+
+/// Checks the caller, then removes the role in a write transaction that reruns after a lost
+/// conflict, since background writes touch the same rows.
+#[derive(Debug, PartialEq)]
 pub struct RemoveGroupOperation {
     input: RemoveGroupConfig,
-    /// Bucket the authorization rows publish onto, read inside the write
-    /// transaction.
-    fence: aruna_core::placement::fence::WriteFence,
-    state: RemoveGroupState,
-    conflicts: u8,
-    output: Option<Result<(Group, GroupAuthorizationDocument), RemoveGroupError>>,
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
-}
-
-impl std::fmt::Debug for RemoveGroupOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoveGroupOperation")
-            .field("input", &self.input)
-            .field("state", &self.state)
-            .field("output", &self.output)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum RemoveGroupState {
-    Init,
-    Auth,
-    StartTransaction,
-    GetGroup {
-        txn_id: TxnId,
-    },
-    #[serde(rename = "GetAuthDocAndAdminState")]
-    GetAdminState {
-        txn_id: TxnId,
-        group: Group,
-    },
-    #[serde(rename = "WriteGroupAuthDocAndAdminState")]
-    WriteDocState {
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        #[serde(rename = "stale_conflict_delete_keys")]
-        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
-    },
-    #[serde(rename = "DeleteStaleAdminConflicts")]
-    DeleteAdminConflicts {
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    ReadBucketFence {
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    #[serde(rename = "ScheduleAdminDocumentOutboxDrain")]
-    ScheduleDocumentDrain {
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-    },
-    Finish,
-    Error,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -130,8 +70,6 @@ pub enum RemoveGroupError {
     TopicAnnouncement(String),
     #[error("the group's bucket cut over to a new holder set; retry the change")]
     PlacementFenced,
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("Unauthorized")]
     Unauthorized,
     #[error("No group found")]
@@ -146,23 +84,37 @@ pub enum RemoveGroupError {
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Removing role from group did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: RemoveGroupState,
+        state: String,
         expected: &'static str,
         got: &'static str,
     },
+}
+
+impl From<IoError> for RemoveGroupError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RemoveGroup".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl RemoveGroupOperation {
     pub fn new(input: RemoveGroupConfig) -> Self {
         RemoveGroupOperation {
             input,
-            fence: Default::default(),
-            state: RemoveGroupState::Init,
-            conflicts: 0,
-            output: None,
             guard: None,
+            authorized: false,
         }
     }
 
@@ -172,127 +124,124 @@ impl RemoveGroupOperation {
         self
     }
 
-    fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected_event(
-                RemoveGroupState::Auth,
-                "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                got,
-            );
-        };
+    fn change(&self) -> IoCall {
+        let input = self.input.clone();
+        let guard = self.guard;
+        let seed = self.input.role_id.to_bytes();
+        let build = move || RoleRemoval::new(input.clone(), guard);
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
 
-        match self.emit_start_transaction(allowed) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+impl Operation for RemoveGroupOperation {
+    type Output = RemovedRole;
+    type Error = RemoveGroupError;
+
+    fn first(&mut self) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.input.auth_context.clone(),
+                path: format!("/{}/g/{}/admin", self.input.realm_id, self.input.group_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        if self.authorized {
+            return result
+                .child::<RemovedRole, RemoveGroupError>()?
+                .map(Next::Done);
+        }
+        if !result.child::<bool, AuthorizationError>()?? {
+            return Err(RemoveGroupError::Unauthorized);
+        }
+        self.authorized = true;
+        Ok(Next::Call(self.change()))
+    }
+}
+
+/// What the removal transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Group,
+    Documents,
+    Write,
+    Delete,
+    Fence,
+    Marks,
+}
+
+/// Reads the group and its documents, writes the removal, takes the bucket fence and marks the
+/// group's key epochs due, in one write transaction.
+#[derive(Debug, PartialEq)]
+struct RoleRemoval {
+    input: RemoveGroupConfig,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    stage: Stage,
+    group: Option<Group>,
+    /// Bucket the authorization rows publish onto, read inside the write transaction.
+    fence: WriteFence,
+    written: Option<RemovedRole>,
+    outbox: bool,
+    deletes: Vec<(KeySpace, Key)>,
+    marks: DueMarks,
+}
+
+impl RoleRemoval {
+    fn new(
+        input: RemoveGroupConfig,
+        guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    ) -> Self {
+        let marks = DueMarks::new(
+            Some(input.group_id),
+            aruna_core::time::unix_timestamp_millis(),
+        );
+        Self {
+            input,
+            guard,
+            stage: Stage::Group,
+            group: None,
+            fence: Default::default(),
+            written: None,
+            outbox: false,
+            deletes: Vec::new(),
+            marks,
         }
     }
 
-    fn emit_start_transaction(
-        &mut self,
-        auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, RemoveGroupError> {
-        if auth_result? {
-            self.state = RemoveGroupState::StartTransaction;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::StartTransaction { read: false }
-            )])
-        } else {
-            Err(RemoveGroupError::Unauthorized)
-        }
-    }
-
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                RemoveGroupState::StartTransaction,
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                got,
-            );
-        };
-        match self.emit_get_group(txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_get_group(&mut self, txn_id: TxnId) -> Result<Effects, RemoveGroupError> {
-        self.state = RemoveGroupState::GetGroup { txn_id };
-        let key = self.input.group_id.to_bytes().into();
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: GROUP_KEYSPACE.to_string(),
-            key,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn handle_get_group(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
-        };
-
-        match self.emit_auth_read(value, txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_auth_read(
-        &mut self,
-        group: Option<ByteView>,
-        txn_id: TxnId,
-    ) -> Result<Effects, RemoveGroupError> {
-        let group = Group::from_bytes(&group.ok_or_else(|| RemoveGroupError::GroupNotFound)?)?;
-
-        self.state = RemoveGroupState::GetAdminState { txn_id, group };
-
+    fn read_documents(&mut self, result: IoResult) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        let [group] = aruna_core::rows::values::<1>(result)?;
+        let group = Group::from_bytes(&group.ok_or(RemoveGroupError::GroupNotFound)?)?;
+        self.group = Some(group);
+        self.stage = Stage::Documents;
         let target = AdminDocumentTarget::Group {
             group_id: self.input.group_id,
         };
-        let key = self.input.group_id.to_bytes().into();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (AUTH_KEYSPACE.to_string(), key),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    ByteView::from(*self.input.actor.realm_id.as_bytes()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId, group: Group) -> Effects {
-        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
-            Ok(values) => values,
-            Err((expected, got)) => {
-                return self.unexpected_event(self.state.clone(), expected, got);
-            }
-        };
-        match self.emit_document_write(txn_id, group, auth_doc, reducer_state, realm_config) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
+        let key: Key = self.input.group_id.to_bytes().into();
+        Ok(Next::Call(IoCall::Read(vec![
+            (AUTH_KEYSPACE.to_string(), key),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*self.input.actor.realm_id.as_bytes()),
+            ),
+        ])))
     }
 
     fn emit_document_write(
         &mut self,
-        txn_id: TxnId,
         mut group: Group,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
-    ) -> Result<Effects, RemoveGroupError> {
+    ) -> Result<Next<RemovedRole>, RemoveGroupError> {
         let mut auth_doc =
             super::parse_auth_record(auth_doc)?.ok_or(RemoveGroupError::DocNotFound)?;
         let role = auth_doc
@@ -331,11 +280,8 @@ impl RemoveGroupOperation {
             &reducer_state,
         );
 
-        let conflict_delete_keys: Vec<_> =
-            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
-                .into_iter()
-                .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
-                .collect();
+        let conflict_delete_keys =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
         let mut writes = vec![
             (
                 AUTH_KEYSPACE.to_string(),
@@ -383,373 +329,92 @@ impl RemoveGroupOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = RemoveGroupState::WriteDocState {
-            txn_id,
-            group,
-            auth_doc,
-            admin_outbox_written: !admin_events.is_empty(),
-            conflict_delete_keys,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.written = Some((group, auth_doc));
+        self.outbox = !admin_events.is_empty();
+        self.deletes = conflict_delete_keys;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn handle_document_write(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchWriteResult)",
-                got,
-            );
-        };
-
-        if !conflict_delete_keys.is_empty() {
-            self.state = RemoveGroupState::DeleteAdminConflicts {
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-            };
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: conflict_delete_keys
-                    .into_iter()
-                    .map(|(key_space, key)| (key_space, ByteView::from(key)))
-                    .collect(),
-                txn_id: Some(txn_id),
-            })];
-        }
-
-        self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
-    }
-
-    fn handle_conflict_deletes(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchDeleteResult)",
-                got,
-            );
-        };
-
-        self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
-    }
-
-    /// Takes the bucket's fence inside the transaction before committing, so a
-    /// departing holder's close rejects or conflicts this write.
-    fn emit_commit_transaction(
-        &mut self,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
+    /// Takes the bucket's fence inside the transaction before committing, so a departing
+    /// holder's close rejects or conflicts this write.
+    fn after_writes(&mut self) -> Next<RemovedRole> {
         if self.fence.is_empty() {
-            return self.emit_commit(txn_id, group, auth_doc, admin_outbox_written);
+            return self.marks();
         }
-        self.state = RemoveGroupState::ReadBucketFence {
-            txn_id,
-            group,
-            auth_doc,
-            admin_outbox_written,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
+        self.stage = Stage::Fence;
+        Next::Call(IoCall::Read(self.fence.reads()))
     }
 
-    fn handle_bucket_fence(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
-        };
-        if !self.fence.admits(&values) {
-            return self.fail(RemoveGroupError::PlacementFenced);
+    fn marks(&mut self) -> Next<RemovedRole> {
+        self.stage = Stage::Marks;
+        Next::Call(self.marks.first())
+    }
+
+    /// Wakes the outbox drain after the commit when the removal queued admin events; a failed
+    /// timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        let output = self.written.take().ok_or(RemoveGroupError::NotFinished)?;
+        if !self.outbox {
+            return Ok(Next::Done(output));
         }
-        self.emit_commit(txn_id, group, auth_doc, admin_outbox_written)
-    }
-
-    fn emit_commit(
-        &mut self,
-        txn_id: TxnId,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        self.state = RemoveGroupState::CommitTransaction {
-            txn_id,
-            group,
-            auth_doc,
-            admin_outbox_written,
-        };
-        smallvec![crate::auth::epoch_due::mark_due(
-            Some(self.input.group_id),
-            txn_id
-        )]
-    }
-
-    fn handle_commit_transaction(
-        &mut self,
-        event: Event,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            );
-        };
-        if admin_outbox_written {
-            self.state = RemoveGroupState::ScheduleDocumentDrain { group, auth_doc };
-            return smallvec![schedule_drain_effect()];
-        }
-
-        self.state = RemoveGroupState::Finish;
-        self.output = Some(Ok((group, auth_doc)));
-        smallvec![]
-    }
-
-    fn handle_drain_schedule(
-        &mut self,
-        event: Event,
-        group: Group,
-        auth_doc: GroupAuthorizationDocument,
-    ) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = RemoveGroupState::Finish;
-                self.output = Some(Ok((group, auth_doc)));
-                smallvec![]
-            }
-            other => self.unexpected_event(
-                self.state.clone(),
-                "admin document outbox drain timer schedule",
-                other.label(),
-            ),
-        }
-    }
-
-    fn fail(&mut self, err: RemoveGroupError) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(err, cleanup_effects)
-    }
-
-    fn fail_with_cleanup(&mut self, err: RemoveGroupError, cleanup_effects: Effects) -> Effects {
-        self.state = RemoveGroupState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: RemoveGroupState,
-        expected: &'static str,
-        got: &'static str,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            RemoveGroupError::UnexpectedEvent {
-                state,
-                expected,
-                got,
-            },
-            cleanup_effects,
-        )
-    }
-
-    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if error == StorageError::TransactionConflict
-                && matches!(self.state, RemoveGroupState::CommitTransaction { .. })
-                && self.conflicts < super::CONFLICT_RETRIES
-            {
-                return Err(self.restart_after_conflict());
-            }
-            return Err(self.fail(error.into()));
-        }
-
-        Ok(event)
-    }
-
-    /// A conflicted commit already discarded its transaction, so the retry
-    /// opens a fresh one and rereads every row, including the realm config.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.fence = Default::default();
-        self.start()
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl EffectOperation for RemoveGroupOperation {
-    type Output = (Group, GroupAuthorizationDocument);
-
+impl Operation for RoleRemoval {
+    type Output = RemovedRole;
     type Error = RemoveGroupError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RemoveGroupState::Auth;
-
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.input.auth_context.clone(),
-            path: format!("/{}/g/{}/admin", self.input.realm_id, self.input.group_id),
-            required_permission: Permission::WRITE,
-        };
-        let auth_operation =
-            boxed_suboperation(CheckPermissionsOperation::new(auth_config), |result| {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
-            });
-
-        smallvec![Effect::SubOperation(auth_operation)]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.catch_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-        if let RemoveGroupState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-
-        match &self.state {
-            RemoveGroupState::Auth => self.handle_authorization(event),
-            RemoveGroupState::StartTransaction => self.handle_start_transaction(event),
-            RemoveGroupState::GetGroup { txn_id } => {
-                let txn_id = txn_id.clone();
-                self.handle_get_group(event, txn_id)
-            }
-            RemoveGroupState::GetAdminState { txn_id, group } => {
-                let txn_id = txn_id.clone();
-                let group = group.clone();
-                self.handle_auth_read(event, txn_id, group)
-            }
-            RemoveGroupState::WriteDocState {
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-            } => {
-                let txn_id = txn_id.clone();
-                let group = group.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let conflict_delete_keys = conflict_delete_keys.clone();
-                self.handle_document_write(
-                    event,
-                    txn_id,
-                    group,
-                    auth_doc,
-                    admin_outbox_written,
-                    conflict_delete_keys,
-                )
-            }
-            RemoveGroupState::DeleteAdminConflicts {
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-            } => {
-                let txn_id = txn_id.clone();
-                let group = group.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written)
-            }
-            RemoveGroupState::ReadBucketFence {
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-            } => {
-                let txn_id = txn_id.clone();
-                let group = group.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written)
-            }
-            RemoveGroupState::CommitTransaction {
-                group,
-                auth_doc,
-                admin_outbox_written,
-                ..
-            } => {
-                let group = group.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written)
-            }
-            RemoveGroupState::ScheduleDocumentDrain { group, auth_doc } => {
-                let group = group.clone();
-                let auth_doc = auth_doc.clone();
-                self.handle_drain_schedule(event, group, auth_doc)
-            }
-            RemoveGroupState::Init | RemoveGroupState::Finish | RemoveGroupState::Error => {
-                smallvec![]
-            }
-        }
+    fn conflict_retries() -> u32 {
+        u32::from(super::CONFLICT_RETRIES)
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RemoveGroupState::Finish | RemoveGroupState::Error
-        )
+    fn first(&mut self) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        let key = self.input.group_id.to_bytes().to_vec();
+        Ok(Next::Call(read_row(GROUP_KEYSPACE, key)))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| RemoveGroupError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            RemoveGroupState::GetGroup { txn_id }
-            | RemoveGroupState::GetAdminState { txn_id, .. }
-            | RemoveGroupState::WriteDocState { txn_id, .. }
-            | RemoveGroupState::DeleteAdminConflicts { txn_id, .. }
-            | RemoveGroupState::ReadBucketFence { txn_id, .. }
-            | RemoveGroupState::CommitTransaction { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> Result<Next<RemovedRole>, RemoveGroupError> {
+        match self.stage {
+            Stage::Group => self.read_documents(result),
+            Stage::Documents => {
+                let [auth_doc, reducer, realm_config] = aruna_core::rows::values::<3>(result)?;
+                let group = self.group.take().ok_or(RemoveGroupError::GroupNotFound)?;
+                self.emit_document_write(group, auth_doc, reducer, realm_config)
             }
-
-            _ => smallvec![],
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                Ok(self.after_writes())
+            }
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(RemoveGroupError::NotFinished);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(RemoveGroupError::PlacementFenced);
+                }
+                Ok(self.marks())
+            }
+            Stage::Marks => match self.marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            },
         }
     }
 }
@@ -788,16 +453,13 @@ pub mod test {
     use aruna_core::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::UserId;
     use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::types::TxnId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -808,7 +470,7 @@ pub mod test {
     use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::groups::remove_role::{
-        RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RemoveGroupState,
+        RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation, RoleRemoval,
     };
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
@@ -882,71 +544,36 @@ pub mod test {
 
     #[test]
     fn retries_commit_conflict() {
+        // A lost commit reruns the whole removal, rereading every row, up to the retry bound.
+        let conflict = RemoveGroupError::from(IoError::Conflict);
+        assert!(RoleRemoval::is_conflict(&conflict));
+        assert_eq!(
+            RoleRemoval::conflict_retries(),
+            u32::from(crate::groups::CONFLICT_RETRIES)
+        );
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let group_id = Ulid::from_bytes([8u8; 16]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
             user_id: UserId::local(Ulid::from_bytes([10u8; 16]), realm_id),
             realm_id,
         };
-        let group = Group {
-            display_name: "Test group".to_string(),
-            group_id,
-            realm_id,
-            roles: HashSet::new(),
-            owner: actor.user_id,
-        };
-        let auth_doc = GroupAuthorizationDocument {
-            group_id,
-            policies: Vec::new(),
-            roles: HashMap::new(),
-        };
         let config = RemoveGroupConfig {
             auth_context: auth_context(&actor),
             actor,
             realm_id,
-            group_id,
+            group_id: Ulid::from_bytes([8u8; 16]),
             role_id: Ulid::from_bytes([11u8; 16]),
         };
-        let conflict = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            })
-        };
-        let mut operation = RemoveGroupOperation::new(config.clone());
-        let commit = |operation: &mut RemoveGroupOperation| {
-            operation.state = RemoveGroupState::CommitTransaction {
-                txn_id: TxnId::generate(),
-                group: group.clone(),
-                auth_doc: auth_doc.clone(),
-                admin_outbox_written: true,
-            };
-            operation.step(conflict())
-        };
-
-        for _ in 0..crate::groups::CONFLICT_RETRIES {
-            let effects = commit(&mut operation);
-            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-            assert_eq!(operation.state, RemoveGroupState::Auth);
-        }
-        commit(&mut operation);
-        assert_eq!(
-            operation.finalize(),
-            Err(RemoveGroupError::StorageError(
-                StorageError::TransactionConflict
-            ))
-        );
-
-        // Before the commit the transaction is still open, so a conflict aborts it.
+        let mut removal = RoleRemoval::new(config.clone(), None);
+        assert_eq!(removal.transaction(), TransactionMode::Write);
+        assert!(matches!(removal.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let missing = removal.next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(RemoveGroupError::GroupNotFound));
         let mut operation = RemoveGroupOperation::new(config);
-        let txn_id = TxnId::generate();
-        operation.state = RemoveGroupState::GetGroup { txn_id };
-        let effects = operation.step(conflict());
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert_eq!(operation.state, RemoveGroupState::Error);
     }
 
     #[test]
@@ -978,26 +605,26 @@ pub mod test {
             policies: Vec::new(),
             roles: HashMap::from([(role_id, role)]),
         };
-        let mut operation = RemoveGroupOperation::new(RemoveGroupConfig {
-            auth_context: auth_context(&actor),
-            actor: actor.clone(),
-            realm_id,
-            group_id,
-            role_id,
-        });
+        let mut operation = RoleRemoval::new(
+            RemoveGroupConfig {
+                auth_context: auth_context(&actor),
+                actor: actor.clone(),
+                realm_id,
+                group_id,
+                role_id,
+            },
+            None,
+        );
 
-        let effects = operation
-            .emit_document_write(
-                TxnId::generate(),
-                group,
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                None,
-                None,
-            )
-            .unwrap();
+        let turn = operation.emit_document_write(
+            group,
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            None,
+            None,
+        );
 
-        let (stored_group, stored_auth_doc, outbox_records) = match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
+        let (stored_group, stored_auth_doc, outbox_records) = match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => {
                 let group_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == GROUP_KEYSPACE)
@@ -1017,7 +644,7 @@ pub mod test {
                     outbox_records,
                 )
             }
-            other => panic!("unexpected write effect: {other:?}"),
+            other => panic!("unexpected write call: {other:?}"),
         };
 
         assert!(!stored_group.roles.contains(&role_id));

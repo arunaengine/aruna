@@ -56,22 +56,26 @@ impl Operation for OfferLaunchOperation {
         let Some(frame) = self.frame.take() else {
             return Ok(Next::Done(OfferOutcome::Unavailable));
         };
-        Ok(Next::Call(IoCall::Effect(Effect::Net(
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
             NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
                 peer: self.target,
                 frame,
                 timeout: self.timeout,
             })),
-        ))))
+        )))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<OfferOutcome>, LifecycleError> {
-        let IoResult::Event(Event::Net(NetEvent::MetadataAnswer(answer))) = result else {
-            return Err(LifecycleError::UnexpectedEvent {
-                state: "Offer".to_string(),
-                expected: "metadata answer",
-                got: "another result",
-            });
+        let unexpected = || LifecycleError::UnexpectedEvent {
+            state: "Offer".to_string(),
+            expected: "metadata answer",
+            got: "another result",
+        };
+        let IoResult::Event(event) = result else {
+            return Err(unexpected());
+        };
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = *event else {
+            return Err(unexpected());
         };
         let MetadataAnswer { result, .. } = *answer;
         let reply = match result {

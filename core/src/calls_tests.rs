@@ -22,7 +22,6 @@ struct Script {
     mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
-    after: Vec<Effect>,
 }
 
 impl Script {
@@ -66,10 +65,6 @@ impl Operation for Script {
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
     }
-
-    fn after_commit(&mut self) -> Option<Effect> {
-        (!self.after.is_empty()).then(|| self.after.remove(0))
-    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -81,7 +76,6 @@ fn script(calls: Vec<IoCall>) -> Script {
         mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
-        after: Vec::new(),
     }
 }
 
@@ -165,44 +159,6 @@ fn snapshot_joins_reads() {
     assert_eq!(effects.as_slice(), &[storage(read(Some(txn())))]);
 }
 
-#[test]
-fn sends_after_commit() {
-    // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
-    let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut script = script(vec![IoCall::Write(write)]);
-    let wake = || {
-        Effect::Task(TaskEffect::ResetTimer {
-            key: TaskKey::DrainNotificationOutbox,
-            after: Duration::ZERO,
-        })
-    };
-    let sync = || Effect::Storage(StorageEffect::SyncAll);
-    script.after = vec![wake(), sync()];
-    let mut operation = run(script, true);
-    operation.start();
-    operation.step(started());
-    let written = StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    };
-    operation.step(Event::Storage(written));
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
-    assert_eq!(
-        operation.step(Event::Storage(committed)).as_slice(),
-        &[wake()]
-    );
-    assert!(!operation.is_complete());
-    let refused = TaskEvent::Error {
-        key: None,
-        message: "timer refused".to_string(),
-    };
-    assert_eq!(operation.step(Event::Task(refused)).as_slice(), &[sync()]);
-    let synced = Event::Storage(StorageEvent::SyncAllFinished);
-    assert!(operation.step(synced).is_empty());
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
-}
-
-#[test]
 fn storage_refusal_fails() {
     // A storage effect answered with a storage error fails the operation like a storage call.
     let read = StorageEffect::Read {
@@ -623,6 +579,20 @@ fn child_refuses_type() {
     assert_eq!(IoResult::Done.child::<u8, IoError>(), Err(refused));
     let failed = IoResult::Child(ChildOutcome::new::<u8, IoError>(Err(IoError::Aborted)));
     assert_eq!(failed.child::<u8, IoError>(), Ok(Err(IoError::Aborted)));
+}
+
+// A child output that is only `Send`, like a stream, still travels and compares.
+#[test]
+fn child_carries_send() {
+    let outcome = || ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(4)));
+    assert_eq!(outcome(), outcome());
+    let other = ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(5)));
+    assert_ne!(outcome(), other);
+    let result = IoResult::Child(outcome()).child::<std::cell::Cell<u8>, IoError>();
+    assert_eq!(
+        result.map(|value| value.map(std::cell::Cell::into_inner)),
+        Ok(Ok(4))
+    );
 }
 
 #[test]

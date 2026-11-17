@@ -25,13 +25,13 @@ use super::grants::{
 };
 use super::install::{
     InstallError, check_admin, check_holder, lock_install, pick_version, read_config,
-    read_manifest, scope_of, settle, write_entry, write_record,
+    read_manifest, scope_of, settle, write_record,
 };
 use super::matcher::Target;
-use super::records::InstallEntryConfig;
+use super::records::{InstallEntryConfig, InstallEntryOperation};
 use super::rules::retire_rules;
 use super::settings::check_settings;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 
 /// Replaces the grants: a permission left out gets all of the group, an empty list removes an
@@ -212,7 +212,7 @@ pub async fn remove_install(
         install: None,
         audit: Some(audit),
     };
-    write_entry(ctx, delete).await?;
+    drive(InstallEntryOperation::new(delete), ctx).await?;
     info!(%install_id, plugin = %removing.plugin, "Removed a plugin install");
     Ok(removing)
 }

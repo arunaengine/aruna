@@ -29,8 +29,8 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::drive;
 use crate::driver::drive_retry;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
@@ -110,8 +110,7 @@ async fn run_fenced_purge(
             .into());
         }
         Ok(info) if info.group_id == spec.group_id => {
-            let storage = &ctx.driver.storage_handle;
-            incarnation = read_incarnation(storage, spec.scope.bucket(), None)
+            incarnation = read_incarnation(&ctx.driver, spec.scope.bucket(), None)
                 .await
                 .map_err(|event| {
                     JobError::retryable(format!("purge bucket read failed: {}", event.label()))
@@ -128,7 +127,7 @@ async fn run_fenced_purge(
         }
     };
 
-    let mut checkpoint = match read_purge_checkpoint(&ctx.driver.storage_handle, ctx.job_id).await {
+    let mut checkpoint = match read_purge_checkpoint(&ctx.driver, ctx.job_id).await {
         Ok(Some(checkpoint)) => checkpoint,
         Ok(None) => {
             let initial_versions = count_versions(ctx, &spec.scope).await?;
@@ -138,16 +137,11 @@ async fn run_fenced_purge(
                 initial_multipart_uploads,
                 batches_completed: 0,
             };
-            put_purge_checkpoint(
-                &ctx.driver.storage_handle,
-                ctx.job_id,
-                ctx.claim_token,
-                &checkpoint,
-            )
-            .await
-            .map_err(|error| {
-                JobError::retryable(format!("purge checkpoint write failed: {error}"))
-            })?;
+            put_purge_checkpoint(&ctx.driver, ctx.job_id, ctx.claim_token, &checkpoint)
+                .await
+                .map_err(|error| {
+                    JobError::retryable(format!("purge checkpoint write failed: {error}"))
+                })?;
             checkpoint
         }
         Err(error) => {
@@ -261,7 +255,7 @@ fn audit_rows(
 
 /// The incarnation of `bucket` while it exists, from its row and its creation row.
 async fn read_incarnation(
-    storage: &aruna_storage::storage::StorageHandle,
+    context: &DriverContext,
     bucket: &str,
     txn_id: Option<ulid::Ulid>,
 ) -> Result<Option<u128>, Event> {
@@ -273,7 +267,7 @@ async fn read_incarnation(
         ],
         txn_id,
     };
-    match storage.send_storage_effect(read).await {
+    match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => {
             let (bucket, creation) = (&values[0].1, &values[1].1);
             let creation = creation.as_ref().map(|value| value.as_ref());
@@ -303,7 +297,7 @@ async fn write_purge_audit(
         other => return Err(failed(other).into()),
     };
     // The bucket is read in the transaction, so its removal or replacement meanwhile conflicts.
-    let current = match read_incarnation(storage, spec.scope.bucket(), Some(txn_id)).await {
+    let current = match read_incarnation(&ctx.driver, spec.scope.bucket(), Some(txn_id)).await {
         Ok(current) => current,
         Err(other) => {
             let abort = StorageEffect::AbortTransaction { txn_id };
@@ -729,21 +723,16 @@ async fn persist_batch(
 ) -> Result<(), PurgeRunError> {
     ctx.progress.advance(completed);
     persist_progress(ctx).await?;
-    put_purge_checkpoint(
-        &ctx.driver.storage_handle,
-        ctx.job_id,
-        ctx.claim_token,
-        checkpoint,
-    )
-    .await
-    .map_err(|error| JobError::retryable(format!("purge checkpoint write failed: {error}")))?;
+    put_purge_checkpoint(&ctx.driver, ctx.job_id, ctx.claim_token, checkpoint)
+        .await
+        .map_err(|error| JobError::retryable(format!("purge checkpoint write failed: {error}")))?;
     Ok(())
 }
 
 async fn persist_progress(ctx: &JobContext) -> Result<(), PurgeRunError> {
     let progress: JobProgress = ctx.progress.snapshot();
     let renew = flush_progress(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         ctx.job_id,
         ctx.claim_token,
         progress,

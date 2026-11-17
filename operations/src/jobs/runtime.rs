@@ -29,7 +29,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::executor::{
-    JobContext, JobRunOutcome, ProgressReporter, RangeTurns, dispatch_payload, run_cleanup,
+    JobContext, JobRunOutcome, PayloadHandler, ProgressReporter, RangeTurns, dispatch_payload,
+    run_cleanup,
 };
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
@@ -97,6 +98,7 @@ pub struct JobsRuntime {
     /// means "stop here"; in-process jobs re-queue and external attempts hand off.
     shutdown: CancellationToken,
     range_turns: RangeTurns,
+    handlers: Mutex<Vec<Arc<dyn PayloadHandler>>>,
 }
 
 impl std::fmt::Debug for JobsRuntime {
@@ -148,6 +150,7 @@ impl JobsRuntime {
             claim_producer_barrier: RwLock::new(()),
             shutdown: CancellationToken::new(),
             range_turns: RangeTurns::default(),
+            handlers: Mutex::default(),
         })
     }
 
@@ -164,6 +167,21 @@ impl JobsRuntime {
 
     pub(crate) fn set_reconciler(&self, reconciler: Arc<dyn ExternalReconciler>) {
         *self.reconciler.lock().expect("reconciler mutex poisoned") = Some(reconciler);
+    }
+
+    /// Adds the runner of payload kinds another domain owns; the node wiring calls it at start.
+    pub fn register_handler(&self, handler: Arc<dyn PayloadHandler>) {
+        self.handlers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(handler);
+    }
+
+    /// The registered runners of payload kinds other domains own.
+    pub fn handlers(&self) -> Vec<Arc<dyn PayloadHandler>> {
+        (self.handlers.lock())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn running_count(&self) -> usize {
@@ -284,10 +302,10 @@ impl JobsRuntime {
             // Claimed just as the drain was stopping: hand the lease straight back
             // rather than let it rot until the sweep spends an attempt on it.
             if state.draining {
-                let storage = context.storage_handle.clone();
+                let context = context.clone();
                 let release = tokio::spawn(async move {
                     let _ =
-                        release_job(&storage, job_id, claim_token, unix_timestamp_millis()).await;
+                        release_job(&context, job_id, claim_token, unix_timestamp_millis()).await;
                 });
                 state.pending_releases.push(release);
                 return;
@@ -308,6 +326,7 @@ impl JobsRuntime {
         let runtime = self.clone();
         let shutdown = self.shutdown.clone();
         let turns = self.range_turns.clone();
+        let handlers = self.handlers();
         tokio::spawn(async move {
             // A panicking payload is turned into a failure inside `supervise`; this guard
             // still runs `finish` on other unwinds, so a panic cannot leak the slot.
@@ -316,7 +335,7 @@ impl JobsRuntime {
                 record,
                 claim_token,
                 (cancel, progress),
-                (shutdown, turns),
+                (shutdown, turns, handlers),
             ))
             .catch_unwind()
             .await;
@@ -398,6 +417,17 @@ impl JobsRuntime {
     /// Whatever is still running then has its lease handed back, so a restart costs a
     /// job no attempt. Storage must outlive this call: releasing a lease writes.
     pub async fn shutdown(&self, storage: &StorageHandle, grace: Duration) -> JobShutdownReport {
+        // Releasing a lease writes storage only, so the node's other planes stay out.
+        let context = &DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
         self.close_admission();
         let waiters: Vec<_> = {
             let state = self.state();
@@ -428,10 +458,10 @@ impl JobsRuntime {
             }
             let released = match class {
                 JobExecutionClass::InProcess => {
-                    release_job(storage, job_id, claim_token, unix_timestamp_millis()).await
+                    release_job(context, job_id, claim_token, unix_timestamp_millis()).await
                 }
                 JobExecutionClass::ExternalAttempt => {
-                    handoff_external_attempt(storage, job_id, claim_token, unix_timestamp_millis())
+                    handoff_external_attempt(context, job_id, claim_token, unix_timestamp_millis())
                         .await
                 }
             };
@@ -519,7 +549,7 @@ impl JobsRuntime {
     /// Block until the job is terminal or `timeout` elapses (local signal, else 250ms poll).
     pub async fn wait_for_terminal(
         &self,
-        storage: &StorageHandle,
+        context: &DriverContext,
         job_id: JobId,
         timeout: Duration,
     ) -> Option<JobState> {
@@ -530,7 +560,7 @@ impl JobsRuntime {
             .get(&job_id)
             .map(|job| job.completion.subscribe());
         loop {
-            if let Ok(Some(record)) = read_job_record(storage, job_id, None).await
+            if let Ok(Some(record)) = read_job_record(context, job_id, None).await
                 && record.is_settled()
             {
                 return Some(record.state);
@@ -552,8 +582,8 @@ impl JobsRuntime {
     /// At startup every claimed/running holder is definitionally dead. Re-queue
     /// the in-process ones and route external attempts to the reconcile hook,
     /// since a blind requeue would double-run; a restart costs them no attempt.
-    pub async fn recover_stale_jobs(&self, storage: &StorageHandle) -> Result<usize, String> {
-        self.recover_until_stopped(storage, &CancellationToken::new(), || false)
+    pub async fn recover_stale_jobs(&self, context: &DriverContext) -> Result<usize, String> {
+        self.recover_until_stopped(context, &CancellationToken::new(), || false)
             .await
     }
 
@@ -562,7 +592,7 @@ impl JobsRuntime {
     /// stop or observed failure lets the current unit finish and admits no next.
     pub async fn recover_until_stopped(
         &self,
-        storage: &StorageHandle,
+        context: &DriverContext,
         stop: &CancellationToken,
         should_stop: impl Fn() -> bool,
     ) -> Result<usize, String> {
@@ -575,7 +605,7 @@ impl JobsRuntime {
                 break;
             }
             let (values, next) = iter_prefix_page(
-                storage,
+                &context.storage_handle,
                 SCHEDULE_INDEX_KEYSPACE,
                 Some(ByteView::from(LEASE_INDEX_PREFIX.to_vec())),
                 start_after,
@@ -599,14 +629,14 @@ impl JobsRuntime {
             if stopped() {
                 break;
             }
-            let Some(record) = read_job_record(storage, job_id, None).await? else {
+            let Some(record) = read_job_record(context, job_id, None).await? else {
                 continue;
             };
             if record.execution_class == JobExecutionClass::InProcess {
                 let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
                     continue;
                 };
-                match release_job(storage, job_id, token, now_ms).await {
+                match release_job(context, job_id, token, now_ms).await {
                     Ok(ReleaseOutcome::Released(_)) => recovered += 1,
                     Ok(ReleaseOutcome::Skipped)
                     | Err(JobMutationError::NotFound | JobMutationError::TokenMismatch) => {}
@@ -615,7 +645,7 @@ impl JobsRuntime {
                 continue;
             }
             match requeue_job(
-                storage,
+                context,
                 job_id,
                 None,
                 now_ms,
@@ -628,7 +658,7 @@ impl JobsRuntime {
             {
                 Ok(RequeueOutcome::NeedsReconcile(record)) => {
                     if let Some(reconciler) = self.reconciler() {
-                        reconciler.reconcile_lost_attempt(storage, record).await;
+                        reconciler.reconcile_lost_attempt(context, record).await;
                     }
                 }
                 Ok(_) => recovered += 1,
@@ -653,7 +683,11 @@ async fn run_job(
     record: JobRecord,
     token: ulid::Ulid,
     (cancel, progress): (CancellationToken, Option<ProgressReporter>),
-    (shutdown, range_turns): (CancellationToken, RangeTurns),
+    (shutdown, range_turns, handlers): (
+        CancellationToken,
+        RangeTurns,
+        Vec<Arc<dyn PayloadHandler>>,
+    ),
 ) {
     // External attempts drive a container through the fenced lifecycle; a lost
     // lease reconciles, and a mid-supervise shutdown hands it back for adoption.
@@ -662,7 +696,6 @@ async fn run_job(
         return;
     }
 
-    let storage = &context.storage_handle;
     let job_id = record.job_id;
     // These jobs settle their own cancellation: an import cleans up, a purge hands over files.
     let import_cleanup = matches!(
@@ -673,7 +706,7 @@ async fn run_job(
     if record.cancel_requested && !import_cleanup {
         run_cleanup(&record.payload);
         terminal_or_none(
-            retry_terminal(|| cancel_running_job(storage, job_id, token, unix_timestamp_millis()))
+            retry_terminal(|| cancel_running_job(&context, job_id, token, unix_timestamp_millis()))
                 .await,
             job_id,
         );
@@ -683,7 +716,7 @@ async fn run_job(
         cancel.cancel();
     }
 
-    match transition_to_running(storage, job_id, token, unix_timestamp_millis()).await {
+    match transition_to_running(&context, job_id, token, unix_timestamp_millis()).await {
         Ok(fresh_record) => {
             if fresh_record.cancel_requested {
                 if import_cleanup {
@@ -692,7 +725,7 @@ async fn run_job(
                     run_cleanup(&record.payload);
                     terminal_or_none(
                         retry_terminal(|| {
-                            cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                            cancel_running_job(&context, job_id, token, unix_timestamp_millis())
                         })
                         .await,
                         job_id,
@@ -723,17 +756,18 @@ async fn run_job(
         shutdown,
         progress: progress.clone(),
         range_turns,
+        handlers,
     };
 
     // Capture the timestamp AFTER the payload runs, so finished_at, backoff, and
     // retention reflect completion time, not the job's start.
-    match supervise(storage, job_id, token, &record, &ctx).await {
+    match supervise(&context, job_id, token, &record, &ctx).await {
         SuperviseResult::Zombie => {}
         SuperviseResult::Outcome(JobRunOutcome::Succeeded(result)) => {
             terminal_or_none(
                 retry_terminal(|| {
                     complete_job(
-                        storage,
+                        &context,
                         job_id,
                         token,
                         result.clone(),
@@ -748,7 +782,7 @@ async fn run_job(
         SuperviseResult::Outcome(JobRunOutcome::Failed(error)) => {
             if error.kind == JobErrorKind::Retryable {
                 // External attempts return before supervision and cannot reach this requeue.
-                if let Err(error) = requeue_failed(storage, job_id, token, error, &progress).await
+                if let Err(error) = requeue_failed(&context, job_id, token, error, &progress).await
                     && !matches!(error, JobMutationError::TokenMismatch)
                 {
                     warn!(job_id = %job_id, error = %error, "Failed to requeue job");
@@ -757,7 +791,7 @@ async fn run_job(
                 terminal_or_none(
                     retry_terminal(|| {
                         fail_job(
-                            storage,
+                            &context,
                             job_id,
                             token,
                             error.clone(),
@@ -771,7 +805,7 @@ async fn run_job(
         }
         SuperviseResult::Outcome(JobRunOutcome::Deferred(error)) => {
             if let Err(error) = defer_job(
-                storage,
+                &context,
                 job_id,
                 token,
                 unix_timestamp_millis(),
@@ -787,7 +821,7 @@ async fn run_job(
         SuperviseResult::Outcome(JobRunOutcome::DeferredFor(error, delay)) => {
             let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
             let now = unix_timestamp_millis();
-            if let Err(error) = defer_job(storage, job_id, token, now, delay_ms, error).await
+            if let Err(error) = defer_job(&context, job_id, token, now, delay_ms, error).await
                 && !matches!(error, JobMutationError::TokenMismatch)
             {
                 warn!(job_id = %job_id, error = %error, "Failed to defer job");
@@ -795,7 +829,7 @@ async fn run_job(
         }
         SuperviseResult::Outcome(JobRunOutcome::Cancelled) => {
             let terminal = retry_terminal(|| {
-                cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                cancel_running_job(&context, job_id, token, unix_timestamp_millis())
             })
             .await;
             if !matches!(&terminal, Err(JobMutationError::TokenMismatch)) {
@@ -805,7 +839,7 @@ async fn run_job(
         }
         // Shutdown, not cancellation: no cleanup handler, no attempt spent.
         SuperviseResult::Outcome(JobRunOutcome::Interrupted) => {
-            match release_job(storage, job_id, token, unix_timestamp_millis()).await {
+            match release_job(&context, job_id, token, unix_timestamp_millis()).await {
                 Ok(_) => {}
                 Err(JobMutationError::TokenMismatch) => {
                     info!(job_id = %job_id, "Lease already handed back or re-claimed")
@@ -822,7 +856,7 @@ async fn run_job(
             terminal_or_none(
                 retry_terminal(|| {
                     exhaust_job(
-                        storage,
+                        &context,
                         job_id,
                         token,
                         error.clone(),
@@ -843,14 +877,13 @@ async fn await_keys(
     token: ulid::Ulid,
     waits: Vec<aruna_core::structs::execution::job::KeyWait>,
 ) {
-    let storage = &context.storage_handle;
     let job_id = record.job_id;
     let keys: Vec<_> = waits.iter().map(|wait| wait.key).collect();
-    match park_job(storage, job_id, token, unix_timestamp_millis(), waits).await {
+    match park_job(context, job_id, token, unix_timestamp_millis(), waits).await {
         Ok(AwaitOutcome::Parked(_)) => {}
         Ok(AwaitOutcome::Skipped) => {
             let terminal = retry_terminal(|| {
-                cancel_running_job(storage, job_id, token, unix_timestamp_millis())
+                cancel_running_job(context, job_id, token, unix_timestamp_millis())
             })
             .await;
             if !matches!(&terminal, Err(JobMutationError::TokenMismatch)) {
@@ -864,7 +897,7 @@ async fn await_keys(
             warn!(job_id = %job_id, error = %error, "Failed to park job for a bucket key");
             let error = JobError::retryable("bucket key is locked");
             let now = unix_timestamp_millis();
-            if let Err(error) = defer_job(storage, job_id, token, now, RETRY_AFTER_MS, error).await
+            if let Err(error) = defer_job(context, job_id, token, now, RETRY_AFTER_MS, error).await
             {
                 warn!(job_id = %job_id, error = %error, "Failed to defer job");
             }
@@ -874,7 +907,7 @@ async fn await_keys(
     for key in keys {
         if key_unlocked(context, key).await
             && let Err(error) =
-                satisfy_key_wait(storage, job_id, key, unix_timestamp_millis()).await
+                satisfy_key_wait(context, job_id, key, unix_timestamp_millis()).await
         {
             warn!(job_id = %job_id, error = %error, "Failed to wake parked job");
         }
@@ -937,7 +970,7 @@ where
 }
 
 async fn supervise(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     record: &JobRecord,
@@ -947,7 +980,7 @@ async fn supervise(
     // payload cannot starve its renewals and be swept into a second execution.
     let stop = CancellationToken::new();
     let heartbeat = tokio::spawn(heartbeat_loop(
-        storage.clone(),
+        context.clone(),
         job_id,
         token,
         ctx.progress.clone(),
@@ -981,7 +1014,7 @@ async fn supervise(
 
 /// A transient failure after a durable checkpoint advanced spends no attempt of a long job.
 async fn requeue_failed(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     error: JobError,
@@ -989,8 +1022,8 @@ async fn requeue_failed(
 ) -> Result<RequeueOutcome, JobMutationError> {
     let now = unix_timestamp_millis();
     match progress.checkpointed() {
-        true => requeue_progressed(storage, job_id, token, now, error).await,
-        false => requeue_job(storage, job_id, Some(token), now, None, Some(error)).await,
+        true => requeue_progressed(context, job_id, token, now, error).await,
+        false => requeue_job(context, job_id, Some(token), now, None, Some(error)).await,
     }
 }
 
@@ -1002,7 +1035,7 @@ fn handle_panic(ctx: &JobContext) -> JobRunOutcome {
 /// Returns only when `stop` fires (payload finished) or the claim is lost. A lost claim
 /// ends the task, which `supervise` reads as this execution having been superseded.
 async fn heartbeat_loop(
-    storage: StorageHandle,
+    context: DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     progress: ProgressReporter,
@@ -1018,7 +1051,7 @@ async fn heartbeat_loop(
         tokio::select! {
             _ = stop.cancelled() => return,
             _ = heartbeat.tick() => {
-                match renew_lease(&storage, job_id, token, unix_timestamp_millis(), Some(progress.snapshot())).await {
+                match renew_lease(&context, job_id, token, unix_timestamp_millis(), Some(progress.snapshot())).await {
                     Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
                     Err(JobMutationError::TokenMismatch) => return,
                     Err(error) => warn!(job_id = %job_id, error = %error, "Lease renew failed"),
@@ -1029,7 +1062,7 @@ async fn heartbeat_loop(
                 Box::pin(flush.tick()),
                 Box::pin(progress.flush_requested()),
             ) => {
-                match flush_progress(&storage, job_id, token, progress.snapshot(), unix_timestamp_millis()).await {
+                match flush_progress(&context, job_id, token, progress.snapshot(), unix_timestamp_millis()).await {
                     Ok(renew) => if renew.cancel_requested { cancel.cancel(); }
                     Err(JobMutationError::TokenMismatch) => return,
                     Err(error) => warn!(job_id = %job_id, error = %error, "Progress flush failed"),
@@ -1133,30 +1166,30 @@ mod tests {
         )
     }
 
-    async fn claim(storage: &StorageHandle, record: JobRecord) -> JobRecord {
-        insert_job(storage, &record).await.unwrap();
-        claim_job(storage, record.job_id, node_id(3), 1)
+    async fn claim(context: &DriverContext, record: JobRecord) -> JobRecord {
+        insert_job(context, &record).await.unwrap();
+        claim_job(context, record.job_id, node_id(3), 1)
             .await
             .unwrap();
-        read_job_record(storage, record.job_id, None)
+        read_job_record(context, record.job_id, None)
             .await
             .unwrap()
             .unwrap()
     }
 
-    async fn reclaim(storage: &StorageHandle, job_id: JobId) -> JobRecord {
-        claim_job(storage, job_id, node_id(3), unix_timestamp_millis())
+    async fn reclaim(context: &DriverContext, job_id: JobId) -> JobRecord {
+        claim_job(context, job_id, node_id(3), unix_timestamp_millis())
             .await
             .unwrap();
-        read_job_record(storage, job_id, None)
+        read_job_record(context, job_id, None)
             .await
             .unwrap()
             .unwrap()
     }
 
-    async fn wait_running(storage: &StorageHandle, job_id: JobId) {
+    async fn wait_running(context: &DriverContext, job_id: JobId) {
         for _ in 0..400 {
-            if let Ok(Some(record)) = read_job_record(storage, job_id, None).await
+            if let Ok(Some(record)) = read_job_record(context, job_id, None).await
                 && record.state == JobState::Running
             {
                 return;
@@ -1190,19 +1223,16 @@ mod tests {
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([1u8; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 3, 0, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 3, 0, None)).await;
 
         runtime.spawn(ctx.clone(), claimed);
         let state = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(
             record.result,
             Some(JobResultPayload::Probe { completed_steps: 3 })
@@ -1217,7 +1247,7 @@ mod tests {
         let job_id = JobId::from_bytes([2u8; 16]);
         let marker = dir.path().join("probe-marker");
         let marker_str = marker.to_str().unwrap().to_string();
-        let claimed = claim(&storage, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
+        let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
         runtime.spawn(ctx.clone(), claimed);
         for _ in 0..100 {
@@ -1233,7 +1263,7 @@ mod tests {
         assert!(runtime.request_cancel(job_id));
 
         let state = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(state, JobState::Cancelled);
@@ -1259,11 +1289,11 @@ mod tests {
         record.cancel_requested = true;
         // A prior run means it is claimed (not fresh-cancelled) so cleanup runs.
         record.has_run = true;
-        let claimed = claim(&storage, record).await;
+        let claimed = claim(&ctx, record).await;
 
         runtime.spawn(ctx.clone(), claimed);
         let state = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(state, JobState::Cancelled);
@@ -1278,7 +1308,7 @@ mod tests {
         let mut record = import_record(job_id);
         record.cancel_requested = true;
         record.has_run = true;
-        let claimed = claim(&storage, record).await;
+        let claimed = claim(&ctx, record).await;
         let token = claimed.claim.as_ref().unwrap().claim_token;
 
         run_job(
@@ -1286,14 +1316,11 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         )
         .await;
 
-        let stored = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(matches!(
             storage
@@ -1320,9 +1347,9 @@ mod tests {
             panic!("probe payload");
         };
         *fail_at = Some(0);
-        let claimed = claim(&storage, record).await;
+        let claimed = claim(&ctx, record).await;
         let token = claimed.claim.as_ref().unwrap().claim_token;
-        set_cancel_requested(&storage, job_id, unix_timestamp_millis())
+        set_cancel_requested(&ctx, job_id, unix_timestamp_millis())
             .await
             .unwrap();
 
@@ -1331,14 +1358,11 @@ mod tests {
             claimed,
             token,
             (CancellationToken::new(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         )
         .await;
 
-        let stored = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(!marker.exists(), "late cancellation must run cleanup");
     }
@@ -1351,7 +1375,7 @@ mod tests {
         let job_id = JobId::from_bytes([0x2A; 16]);
         let marker = dir.path().join("zombie-marker");
         let marker_str = marker.to_str().unwrap().to_string();
-        let claimed = claim(&storage, probe_record(job_id, 1, 60_000, Some(marker_str))).await;
+        let claimed = claim(&ctx, probe_record(job_id, 1, 60_000, Some(marker_str))).await;
         let stale_token = claimed.claim.as_ref().unwrap().claim_token;
         let cancel = CancellationToken::new();
         let execution = tokio::spawn(run_job(
@@ -1359,7 +1383,7 @@ mod tests {
             claimed,
             stale_token,
             (cancel.clone(), None),
-            (CancellationToken::new(), RangeTurns::default()),
+            (CancellationToken::new(), RangeTurns::default(), Vec::new()),
         ));
         for _ in 0..100 {
             if marker.exists() {
@@ -1370,7 +1394,7 @@ mod tests {
         assert!(marker.exists(), "probe must reach its cleanup side effect");
 
         requeue_job(
-            &storage,
+            &ctx,
             job_id,
             Some(stale_token),
             unix_timestamp_millis(),
@@ -1380,7 +1404,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            claim_job(&storage, job_id, node_id(4), unix_timestamp_millis())
+            claim_job(&ctx, job_id, node_id(4), unix_timestamp_millis())
                 .await
                 .unwrap(),
             ClaimOutcome::Claimed(_)
@@ -1398,6 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn completion_wins_race() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = probe_record(job_id, 1, 0, None);
         record.state = JobState::Running;
@@ -1407,10 +1432,10 @@ mod tests {
             claim_token: token,
             lease_expires_ms: 60_000,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         complete_job(
-            &storage,
+            &context,
             job_id,
             token,
             JobResultPayload::Probe { completed_steps: 1 },
@@ -1421,9 +1446,9 @@ mod tests {
         .unwrap();
 
         // The cancel loser hits a cleared claim and is rejected without corrupting state.
-        let loser = cancel_running_job(&storage, job_id, token, 5_001).await;
+        let loser = cancel_running_job(&context, job_id, token, 5_001).await;
         assert!(matches!(loser, Err(JobMutationError::TokenMismatch)));
-        let record = read_job_record(&storage, job_id, None)
+        let record = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -1433,6 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn recover_requeues_inflight() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = probe_record(job_id, 3, 0, None);
@@ -1442,11 +1468,11 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
-            assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
-            let recovered = read_job_record(&storage, job_id, None)
+            assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 1);
+            let recovered = read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1454,7 +1480,7 @@ mod tests {
             assert_eq!(recovered.attempts, 0, "restart {restart}");
             assert!(recovered.claim.is_none());
             if restart < JOB_MAX_ATTEMPTS + 1 {
-                reclaim(&storage, job_id).await;
+                reclaim(&context, job_id).await;
             }
         }
     }
@@ -1466,20 +1492,17 @@ mod tests {
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([8u8; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 30, 10, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 30, 10, None)).await;
 
         let t_before = unix_timestamp_millis();
         runtime.spawn(ctx.clone(), claimed);
         let state = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert!(
             record.finished_at_ms.unwrap() >= t_before + 150,
             "finished_at must be set after the payload ran, not at start"
@@ -1493,12 +1516,12 @@ mod tests {
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([7u8; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 10_000, 0, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 10_000, 0, None)).await;
 
         let before = storage.snapshot_metrics().requests_total;
         runtime.spawn(ctx.clone(), claimed);
         let state = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
@@ -1509,10 +1532,7 @@ mod tests {
             "10k-step run must not scale with steps, got {delta}"
         );
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.progress.current, 10_000);
     }
 
@@ -1522,20 +1542,17 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let job_id = JobId::from_bytes([0x11; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 100, 20, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 100, 20, None)).await;
 
         let runtime = JobsRuntime::new();
         runtime.spawn(ctx.clone(), claimed);
-        wait_running(&storage, job_id).await;
+        wait_running(&ctx, job_id).await;
         let report = runtime.shutdown(&storage, Duration::ZERO).await;
         // The payload's own Interrupted release races the shutdown sweep; both
         // hand the lease back attempt-free, so only the sum is deterministic.
         assert_eq!(report.released + report.finished + report.skipped, 1);
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(record.attempts, 0, "a shutdown is not a spent attempt");
         assert!(record.claim.is_none());
@@ -1546,17 +1563,14 @@ mod tests {
 
         // The next node picks it straight back up and drives it to success.
         let restarted = JobsRuntime::new();
-        let reclaimed = reclaim(&storage, job_id).await;
+        let reclaimed = reclaim(&ctx, job_id).await;
         restarted.spawn(ctx.clone(), reclaimed);
         let state = restarted
-            .wait_for_terminal(&storage, job_id, Duration::from_secs(20))
+            .wait_for_terminal(&ctx, job_id, Duration::from_secs(20))
             .await
             .unwrap();
         assert_eq!(state, JobState::Succeeded);
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.attempts, 0);
     }
 
@@ -1565,7 +1579,7 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let job_id = JobId::from_bytes([0x15; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 1, 0, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 1, 0, None)).await;
         let runtime = JobsRuntime::new();
         let producer = runtime.claim_producer().await.unwrap();
 
@@ -1581,10 +1595,7 @@ mod tests {
             .await
             .expect("shutdown waits only for the producer barrier");
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert!(record.claim.is_none());
         assert_eq!(record.attempts, 0);
@@ -1606,18 +1617,19 @@ mod tests {
     #[tokio::test]
     async fn progress_spares_attempts() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([0x16; 16]);
-        insert_job(&storage, &probe_record(job_id, 1, 0, None))
+        insert_job(&context, &probe_record(job_id, 1, 0, None))
             .await
             .unwrap();
         let failure = JobError::retryable("source timed out");
 
         for failure_no in 0..(JOB_MAX_ATTEMPTS + 2) {
-            let claimed = reclaim(&storage, job_id).await;
+            let claimed = reclaim(&context, job_id).await;
             let token = claimed.claim.unwrap().claim_token;
             let progress = ProgressReporter::from_progress(&claimed.progress);
             progress.checkpoint();
-            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+            let outcome = requeue_failed(&context, job_id, token, failure.clone(), &progress)
                 .await
                 .unwrap();
             assert!(
@@ -1627,18 +1639,18 @@ mod tests {
         }
 
         for _ in 2..JOB_MAX_ATTEMPTS {
-            let claimed = reclaim(&storage, job_id).await;
+            let claimed = reclaim(&context, job_id).await;
             let token = claimed.claim.unwrap().claim_token;
             let progress = ProgressReporter::from_progress(&claimed.progress);
-            let outcome = requeue_failed(&storage, job_id, token, failure.clone(), &progress)
+            let outcome = requeue_failed(&context, job_id, token, failure.clone(), &progress)
                 .await
                 .unwrap();
             assert!(matches!(outcome, RequeueOutcome::Requeued(_)));
         }
-        let claimed = reclaim(&storage, job_id).await;
+        let claimed = reclaim(&context, job_id).await;
         let token = claimed.claim.unwrap().claim_token;
         let progress = ProgressReporter::from_progress(&claimed.progress);
-        let outcome = requeue_failed(&storage, job_id, token, failure, &progress)
+        let outcome = requeue_failed(&context, job_id, token, failure, &progress)
             .await
             .unwrap();
         assert!(matches!(outcome, RequeueOutcome::Exhausted(_)));
@@ -1650,21 +1662,18 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let job_id = JobId::from_bytes([0x12; 16]);
-        insert_job(&storage, &probe_record(job_id, 10_000, 5, None))
+        insert_job(&ctx, &probe_record(job_id, 10_000, 5, None))
             .await
             .unwrap();
 
         for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
             let runtime = JobsRuntime::new();
-            let claimed = reclaim(&storage, job_id).await;
+            let claimed = reclaim(&ctx, job_id).await;
             runtime.spawn(ctx.clone(), claimed);
-            wait_running(&storage, job_id).await;
+            wait_running(&ctx, job_id).await;
             runtime.shutdown(&storage, Duration::ZERO).await;
 
-            let record = read_job_record(&storage, job_id, None)
-                .await
-                .unwrap()
-                .unwrap();
+            let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
             assert_eq!(record.state, JobState::Queued, "restart {restart}");
             assert_eq!(record.attempts, 0, "restart {restart}");
         }
@@ -1678,11 +1687,11 @@ mod tests {
         let job_id = JobId::from_bytes([0x13; 16]);
         let marker = dir.path().join("probe-marker");
         let marker_str = marker.to_str().unwrap().to_string();
-        let claimed = claim(&storage, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
+        let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, Some(marker_str))).await;
 
         let runtime = JobsRuntime::new();
         runtime.spawn(ctx.clone(), claimed);
-        wait_running(&storage, job_id).await;
+        wait_running(&ctx, job_id).await;
         for _ in 0..100 {
             if marker.exists() {
                 break;
@@ -1694,10 +1703,7 @@ mod tests {
         let report = runtime.shutdown(&storage, Duration::from_secs(10)).await;
         assert_eq!(report.finished, 1, "the probe winds down inside the grace");
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Queued);
         assert_eq!(record.attempts, 0);
         assert!(marker.exists(), "cleanup must not run for an interruption");
@@ -1709,17 +1715,17 @@ mod tests {
         let (_dir, storage) = temp_storage();
         let ctx = context(storage.clone());
         let job_id = JobId::from_bytes([0x14; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 10_000, 5, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 10_000, 5, None)).await;
 
         let runtime = JobsRuntime::new();
         runtime.spawn(ctx.clone(), claimed);
-        wait_running(&storage, job_id).await;
+        wait_running(&ctx, job_id).await;
 
         // The lease lapses and a peer takes the job over while we still hold it locally.
-        requeue_job(&storage, job_id, None, unix_timestamp_millis(), None, None)
+        requeue_job(&ctx, job_id, None, unix_timestamp_millis(), None, None)
             .await
             .unwrap();
-        claim_job(&storage, job_id, node_id(4), unix_timestamp_millis())
+        claim_job(&ctx, job_id, node_id(4), unix_timestamp_millis())
             .await
             .unwrap();
 
@@ -1727,10 +1733,7 @@ mod tests {
         assert_eq!(report.released, 0);
         assert_eq!(report.skipped, 1);
 
-        let record = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(record.state, JobState::Claimed);
         assert_eq!(record.claim.unwrap().holder_node_id, node_id(4));
     }
@@ -1745,7 +1748,7 @@ mod tests {
         let job_id = JobId::from_bytes([0x6C; 16]);
         let record = probe_record(job_id, 5, 0, None);
         let owner = record.created_by;
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&ctx, &record).await.unwrap();
         assert_eq!(runtime.available_slots(), 0);
 
         let outcome = crate::jobs::service::cancel_owned_job(&ctx, &runtime, owner, job_id)
@@ -1756,10 +1759,7 @@ mod tests {
             crate::jobs::service::CancelJobOutcome::Requested(_)
         ));
 
-        let stored = read_job_record(&storage, job_id, None)
-            .await
-            .unwrap()
-            .unwrap();
+        let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
         assert_eq!(stored.state, JobState::Cancelled);
         assert!(stored.finished_at_ms.is_some());
         assert!(stored.claim.is_none());
@@ -1768,14 +1768,15 @@ mod tests {
     #[tokio::test]
     async fn wait_times_out() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([6u8; 16]);
-        insert_job(&storage, &probe_record(job_id, 1, 0, None))
+        insert_job(&context, &probe_record(job_id, 1, 0, None))
             .await
             .unwrap();
 
         let result = runtime
-            .wait_for_terminal(&storage, job_id, Duration::from_millis(100))
+            .wait_for_terminal(&context, job_id, Duration::from_millis(100))
             .await;
         assert_eq!(result, None);
     }
@@ -1792,7 +1793,7 @@ mod tests {
             unreachable!()
         };
         *panic_at = Some(0);
-        let claimed = claim(&storage, record).await;
+        let claimed = claim(&ctx, record).await;
 
         runtime.spawn(ctx.clone(), claimed);
         let mut freed = false;
@@ -1806,10 +1807,10 @@ mod tests {
         assert!(freed, "panic must release the concurrency slot");
 
         let ok = JobId::from_bytes([0xAB; 16]);
-        let claimed = claim(&storage, probe_record(ok, 2, 0, None)).await;
+        let claimed = claim(&ctx, probe_record(ok, 2, 0, None)).await;
         runtime.spawn(ctx.clone(), claimed);
         let state = runtime
-            .wait_for_terminal(&storage, ok, Duration::from_secs(10))
+            .wait_for_terminal(&ctx, ok, Duration::from_secs(10))
             .await
             .unwrap();
         assert_eq!(
@@ -1838,7 +1839,7 @@ mod tests {
             claim_token: token,
             lease_expires_ms: 60_000,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&driver, &record).await.unwrap();
 
         let Event::Blob(BlobEvent::HiddenSpooled {
             location,
@@ -1873,7 +1874,7 @@ mod tests {
         upload.blake3 = blake3;
         upload.size = size;
         upload.claimed_by = Some(job_id);
-        crate::jobs::import::upload_store::write_rocrate_upload(&storage, &upload)
+        crate::jobs::import::upload_store::write_rocrate_upload(&driver, &upload)
             .await
             .unwrap();
         let checkpoint_value =
@@ -1901,6 +1902,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&record.progress),
             range_turns: RangeTurns::default(),
+            handlers: Default::default(),
         };
 
         let JobRunOutcome::Failed(error) = handle_panic(&ctx) else {
@@ -1908,7 +1910,7 @@ mod tests {
         };
         assert_eq!(error.kind, JobErrorKind::Retryable);
         let outcome = requeue_job(
-            &storage,
+            &ctx.driver,
             job_id,
             Some(token),
             unix_timestamp_millis(),
@@ -1923,10 +1925,12 @@ mod tests {
         assert_eq!(exhausted.state, JobState::Indeterminate);
         assert!(exhausted.locally_exhausted);
 
-        let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
+        let (rows, _) = list_job_entries(&ctx.driver, job_id, None, 10)
+            .await
+            .unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
         assert_eq!(
-            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload.upload_id)
+            crate::jobs::import::upload_store::read_rocrate_upload(&ctx.driver, upload.upload_id)
                 .await
                 .unwrap(),
             Some(upload)
@@ -1976,6 +1980,7 @@ mod tests {
         };
         use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
         let (_dir, storage) = temp_storage();
+        let driver = context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x6D; 16]);
         let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
@@ -1994,7 +1999,7 @@ mod tests {
             notification,
         });
         let record = JobRecord::new(job_id, payload, owner, node_id(7), 1, 1, None);
-        let claimed = claim(&storage, record).await;
+        let claimed = claim(&driver, record).await;
         let attempts = claimed.attempts;
 
         runtime.spawn(context(storage.clone()), claimed);
@@ -2003,7 +2008,7 @@ mod tests {
             .await
             .expect("delivery finishes its attempt")
             .unwrap();
-        let stored = read_job_record(&storage, job_id, None)
+        let stored = read_job_record(&driver, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -2026,7 +2031,7 @@ mod tests {
         let ctx = context(storage.clone());
         let runtime = JobsRuntime::new();
         let job_id = JobId::from_bytes([0x6B; 16]);
-        let claimed = claim(&storage, probe_record(job_id, 2, 0, None)).await;
+        let claimed = claim(&ctx, probe_record(job_id, 2, 0, None)).await;
 
         runtime.spawn(ctx, claimed);
         assert_eq!(
@@ -2105,7 +2110,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExternalReconciler for RecordingReconciler {
-        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
             self.seen.lock().unwrap().push(record.job_id);
         }
     }
@@ -2171,6 +2176,7 @@ mod tests {
     #[tokio::test]
     async fn recover_reconciles_external() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let recorder = Arc::new(RecordingReconciler::default());
         let runtime = JobsRuntime::with_reconciler(recorder.clone());
         let job_id = JobId::from_bytes([0xE7; 16]);
@@ -2189,11 +2195,11 @@ mod tests {
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
         // No in-process job was recovered; the external one was reconciled, not requeued.
-        assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 0);
-        let after = read_job_record(&storage, job_id, None)
+        assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 0);
+        let after = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -2231,7 +2237,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExternalReconciler for BlockingReconciler {
-        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
+        async fn reconcile_lost_attempt(&self, _context: &DriverContext, record: JobRecord) {
             self.seen.lock().unwrap().push(record.job_id);
             self.entered.notify_one();
             self.release.notified().await;
@@ -2243,20 +2249,21 @@ mod tests {
     #[tokio::test]
     async fn stop_between_units() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let reconciler = Arc::new(BlockingReconciler::default());
         let runtime = JobsRuntime::with_reconciler(reconciler.clone());
         let first = JobId::from_bytes([0xE9; 16]);
         let second = JobId::from_bytes([0xEA; 16]);
-        insert_job(&storage, &external_running_record(first))
+        insert_job(&context, &external_running_record(first))
             .await
             .unwrap();
-        insert_job(&storage, &external_running_record(second))
+        insert_job(&context, &external_running_record(second))
             .await
             .unwrap();
 
         let stop = CancellationToken::new();
         let failure = std::sync::atomic::AtomicBool::new(false);
-        let recover = runtime.recover_until_stopped(&storage, &stop, || {
+        let recover = runtime.recover_until_stopped(&context, &stop, || {
             failure.load(std::sync::atomic::Ordering::SeqCst)
         });
         tokio::pin!(recover);
@@ -2274,7 +2281,7 @@ mod tests {
         let processed = reconciler.seen.lock().unwrap().clone();
         assert_eq!(processed.len(), 1, "no next recovery unit after the stop");
         let unprocessed = if processed[0] == first { second } else { first };
-        let untouched = read_job_record(&storage, unprocessed, None)
+        let untouched = read_job_record(&context, unprocessed, None)
             .await
             .unwrap()
             .unwrap();
@@ -2286,10 +2293,11 @@ mod tests {
     #[tokio::test]
     async fn cancel_before_recovery() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let recorder = Arc::new(RecordingReconciler::default());
         let runtime = JobsRuntime::with_reconciler(recorder.clone());
         let job_id = JobId::from_bytes([0xEB; 16]);
-        insert_job(&storage, &external_running_record(job_id))
+        insert_job(&context, &external_running_record(job_id))
             .await
             .unwrap();
 
@@ -2297,7 +2305,7 @@ mod tests {
         stop.cancel();
         assert_eq!(
             runtime
-                .recover_until_stopped(&storage, &stop, || false)
+                .recover_until_stopped(&context, &stop, || false)
                 .await
                 .unwrap(),
             0
@@ -2309,9 +2317,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ExternalReconciler for AdoptingReconciler {
-        async fn reconcile_lost_attempt(&self, storage: &StorageHandle, record: JobRecord) {
+        async fn reconcile_lost_attempt(&self, context: &DriverContext, record: JobRecord) {
             let outcome = adopt_external_attempt(
-                storage,
+                context,
                 record.job_id,
                 record.owner_node_id,
                 unix_timestamp_millis(),
@@ -2327,6 +2335,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_spares_attempts() {
         let (_dir, storage) = temp_storage();
+        let context = crate::testing::test_context(storage.clone());
         let runtime = JobsRuntime::with_reconciler(Arc::new(AdoptingReconciler));
         let job_id = JobId::from_bytes([0xE8; 16]);
         let token = Ulid::generate();
@@ -2338,9 +2347,9 @@ mod tests {
             claim_token: token,
             lease_expires_ms: unix_timestamp_millis() + 60_000,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
         record_attempt_intent(
-            &storage,
+            &context,
             job_id,
             token,
             AttemptIntent {
@@ -2358,9 +2367,9 @@ mod tests {
         .unwrap();
 
         for restart in 0..(JOB_MAX_ATTEMPTS + 2) {
-            expire_lease(&storage, job_id).await;
-            assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 0);
-            let after = read_job_record(&storage, job_id, None)
+            expire_lease(&context, job_id).await;
+            assert_eq!(runtime.recover_stale_jobs(&context).await.unwrap(), 0);
+            let after = read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -2370,8 +2379,8 @@ mod tests {
         }
     }
 
-    async fn expire_lease(storage: &StorageHandle, job_id: JobId) {
-        mutate_job(storage, job_id, |record| {
+    async fn expire_lease(context: &DriverContext, job_id: JobId) {
+        mutate_job(context, job_id, |record| {
             if let Some(claim) = record.claim.as_mut() {
                 claim.lease_expires_ms = 1;
             }

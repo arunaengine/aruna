@@ -158,12 +158,11 @@ impl Operation for BucketCheckOperation {
     type Error = BucketCheckError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
-        Ok(Next::Call(IoCall::Effect(Effect::Blob(
-            BlobEffect::HeadBucket {
-                backend: BackendRef::Group(self.backend_id),
-                bucket: self.bucket.clone(),
-            },
-        ))))
+        let head = Effect::Blob(BlobEffect::HeadBucket {
+            backend: BackendRef::Group(self.backend_id),
+            bucket: self.bucket.clone(),
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(head))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
@@ -299,7 +298,10 @@ mod pure_tests {
             backend: BackendRef::Group(Ulid::from_bytes([9u8; 16])),
             bucket: "data".to_string(),
         });
-        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Effect(head))));
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(head))))
+        );
         let answer = Event::Blob(BlobEvent::BucketExists {
             exists: true,
             writable: Some(false),

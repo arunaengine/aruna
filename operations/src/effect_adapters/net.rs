@@ -7,8 +7,8 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{
-    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, SnapshotSignEvent,
-    StatementSignEvent, VaultSignEvent,
+    Event, ExecutionSignEvent, JobControlEvent, NetError, NetEvent, PolicySignEvent,
+    SnapshotSignEvent, StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
@@ -16,6 +16,7 @@ use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use aruna_net::NetHandle;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
+use tracing::warn;
 
 use crate::driver::DriverContext;
 
@@ -75,7 +76,46 @@ async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Resul
     stream.0.finish().map_err(|error| error.to_string())
 }
 
+/// Carries out a change of this node's watch metrics or watch interest; without a net handle
+/// only the suppression is logged.
+fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Event, NetEffect> {
+    match effect {
+        NetEffect::RecordSuppression(reason) => {
+            if let Some(net_handle) = net_handle {
+                let metrics = net_handle.notification_watch_metrics();
+                metrics.record_delivery_suppression(reason);
+            }
+            warn!(
+                parent: None,
+                reason = reason.as_str(),
+                "Notification watch delivery suppressed"
+            );
+        }
+        NetEffect::RegisterInterest {
+            watch_id,
+            realm_id,
+            holder,
+            entry,
+        } => {
+            if let Some(net_handle) = net_handle {
+                net_handle.register_local_interest(watch_id, realm_id, holder, entry);
+            }
+        }
+        NetEffect::RetractInterest(watch_id) => {
+            if let Some(net_handle) = net_handle {
+                net_handle.retract_local_interest(watch_id);
+            }
+        }
+        other => return Err(other),
+    }
+    Ok(Event::Net(NetEvent::Recorded))
+}
+
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
+    let effect = match record_watch(effect, context.net_handle.as_ref()) {
+        Ok(recorded) => return recorded,
+        Err(effect) => effect,
+    };
     if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
         return Event::Net(NetEvent::DocumentSync(
             reconcile_topics(context, topics).await,
@@ -104,6 +144,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             )),
             NetEffect::StatementSign(_) => Event::Net(NetEvent::StatementSign(
                 StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::ExecutionSign(_) => Event::Net(NetEvent::ExecutionSign(
+                ExecutionSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::JobControl(_) => {
                 Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(

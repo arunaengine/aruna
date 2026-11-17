@@ -1342,18 +1342,38 @@ pub async fn drive_retry<O, K>(
 where
     O: Runnable<K>,
 {
-    retry_machine(move || build().into_machine(), context, seed).await
+    retry_machine(move || build().into_machine(), context, seed, None).await
+}
+
+/// [`drive_retry`] with every attempt and backoff under one wall-clock deadline, as
+/// [`drive_until`] runs one attempt.
+pub async fn drive_retry_until<O, K>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+    deadline: tokio::time::Instant,
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    let build = move || build().into_machine();
+    retry_machine(build, context, seed, Some(deadline)).await
 }
 
 async fn retry_machine<O: EffectOperation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<O::Output, O::Error> {
     let mut operation = build();
     let mut attempt: u32 = 0;
     loop {
-        let error = match drive_machine(operation, context).await {
+        let result = match deadline {
+            Some(deadline) => machine_until(operation, context, deadline).await,
+            None => drive_machine(operation, context).await,
+        };
+        let error = match result {
             Err(error) if O::is_conflict(&error) => error,
             result => return result,
         };
@@ -1362,7 +1382,10 @@ async fn retry_machine<O: EffectOperation>(
         match operation.on_conflict(attempt) {
             AfterConflict::Rerun => {
                 let index = usize::try_from(attempt - 1).unwrap_or(usize::MAX);
-                tokio::time::sleep(conflict_backoff(index, seed)).await;
+                let wake = tokio::time::Instant::now() + conflict_backoff(index, seed);
+                // A backoff past the deadline ends there; the next attempt then expires at once.
+                tokio::time::sleep_until(deadline.map_or(wake, |deadline| deadline.min(wake)))
+                    .await;
             }
             AfterConflict::Finish(output) => return Ok(output),
             AfterConflict::Fail => return Err(error),
@@ -1375,8 +1398,8 @@ mod test {
     use crate::driver::{
         DeadlineAbort, DriverContext, GroupEnd, GroupRun, HangLimits, Instant,
         MAX_TRACKED_TRANSACTIONS, MemberStop, ParentRun, TransactionEffect, TransactionState,
-        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_until, extend_unblocked,
-        run_all, run_window,
+        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_retry_until, drive_until,
+        extend_unblocked, run_all, run_window,
     };
     use aruna_core::calls::{IoError, IoResult, Next};
     use aruna_core::effects::{
@@ -3390,6 +3413,33 @@ mod test {
             let result = drive_retry(build, &context, &[7u8; 16]).await;
             assert_eq!((result, built), (Ok(expected.0), expected.1));
         }
+    }
+
+    /// Under a deadline the hook still reruns a lost conflict; a backoff past the deadline
+    /// ends the retries there.
+    #[tokio::test(start_paused = true)]
+    async fn retry_until_deadline() {
+        let context = bare_context();
+        let mut built = 0;
+        let build = || {
+            built += 1;
+            Rechecking {
+                recheck: false,
+                finish_at: None,
+            }
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let result = drive_retry_until(build, &context, &[7u8; 16], deadline).await;
+        assert_eq!((result, built), (Ok("rechecked"), 3));
+
+        let past = tokio::time::Instant::now();
+        let build = || Conflicted::<3> {
+            attempt: 0,
+            conflicts: usize::MAX,
+        };
+        let result = drive_retry_until(build, &context, &[7u8; 16], past).await;
+        assert!(result.is_err());
+        assert_eq!(tokio::time::Instant::now(), past);
     }
 
     /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a

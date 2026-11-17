@@ -16,7 +16,6 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::driver::{DriverContext, drive};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -24,7 +23,6 @@ use crate::s3::usage::{
 use crate::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
-use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -33,7 +31,8 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::ChildOutcome;
+use aruna_core::operation::{EffectOperation, boxed_suboperation};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::source_access::SourceMetadata;
@@ -113,7 +112,8 @@ pub struct MaterializeReferenceOperation {
     input: Option<MaterializeReferenceInput>,
     now: SystemTime,
     fresh: Ulid,
-    head: Option<HeadSourceOperation>,
+    /// The source head runs as a child; its result comes back as a child event.
+    heading: bool,
     write: Option<WriteReferenceOperation>,
     found: Option<(SourceConnector, SourceMetadata, VersionSourceBinding)>,
     output: Option<Result<MaterializeReferenceResult, MaterializeReferenceError>>,
@@ -126,7 +126,7 @@ impl MaterializeReferenceOperation {
             input: Some(input),
             now,
             fresh,
-            head: None,
+            heading: false,
             write: None,
             found: None,
             output: None,
@@ -134,7 +134,7 @@ impl MaterializeReferenceOperation {
     }
 
     fn fail(&mut self, error: MaterializeReferenceError) -> Effects {
-        self.head = None;
+        self.heading = false;
         self.write = None;
         self.output = Some(Err(error));
         smallvec![]
@@ -211,14 +211,16 @@ impl MaterializeReferenceOperation {
         }
     }
 
-    fn head_step(&mut self, operation: HeadSourceOperation, effects: Effects) -> Effects {
-        if !operation.is_complete() {
-            self.head = Some(operation);
-            return effects;
-        }
-        match operation.finalize() {
-            Ok(head) => self.headed(head),
-            Err(error) => self.fail(error.into()),
+    fn head_step(&mut self, event: Event) -> Effects {
+        self.heading = false;
+        let Event::Child(outcome) = event else {
+            let label = event.label();
+            return self.fail(StorageError::ReadError(format!("unexpected event {label}")).into());
+        };
+        match outcome.take::<HeadSourceResult, HeadSourceError>() {
+            Some(Ok(head)) => self.headed(head),
+            Some(Err(error)) => self.fail(error.into()),
+            None => self.fail(StorageError::ReadError("unexpected head answer".into()).into()),
         }
     }
 }
@@ -231,19 +233,19 @@ impl EffectOperation for MaterializeReferenceOperation {
         let Some(input) = self.input.as_ref() else {
             return self.fail(StorageError::InvalidEffect.into());
         };
-        let mut head = HeadSourceOperation::new(HeadSourceInput {
+        let head = HeadSourceOperation::new(HeadSourceInput {
             group_id: input.group_id,
             connector_id: input.connector_id,
             source_path: input.source_path.clone(),
         });
-        let effects = head.start();
-        self.head_step(head, effects)
+        self.heading = true;
+        let child = boxed_suboperation(head, |result| Event::Child(ChildOutcome::new(result)));
+        smallvec![Effect::SubOperation(child)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if let Some(mut head) = self.head.take() {
-            let effects = head.step(event);
-            return self.head_step(head, effects);
+        if self.heading {
+            return self.head_step(event);
         }
         if let Some(mut write) = self.write.take() {
             let effects = write.step(event);
@@ -254,7 +256,7 @@ impl EffectOperation for MaterializeReferenceOperation {
     }
 
     fn is_complete(&self) -> bool {
-        self.output.is_some() && self.head.is_none() && self.write.is_none()
+        self.output.is_some() && !self.heading && self.write.is_none()
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
@@ -265,10 +267,9 @@ impl EffectOperation for MaterializeReferenceOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match (self.head.as_mut(), self.write.as_mut()) {
-            (Some(head), _) => head.abort(),
-            (_, Some(write)) => write.abort(),
-            _ => smallvec![],
+        match self.write.as_mut() {
+            Some(write) => write.abort(),
+            None => smallvec![],
         }
     }
 }
