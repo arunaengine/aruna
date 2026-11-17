@@ -1,22 +1,16 @@
-//! Reads the job of a bucket and runs running key re-mapping and duplicate cleanup jobs page
-//! by page.
+//! Runs running key re-mapping and duplicate cleanup jobs of buckets page by page.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{LINKED_JOB_KEYSPACE, RENAME_TOTAL_KEYSPACE};
+use aruna_core::keyspaces::LINKED_JOB_KEYSPACE;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
-use aruna_core::structs::storage::format::CompressionMigration;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask};
 use aruna_core::types::GroupId;
 use tracing::warn;
 
 use super::job_progress::{JobStep, StoreProgressError, StoreProgressOperation};
-use super::linked::{BucketJob, reads};
 use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
 use crate::driver::{DriverContext, drive_retry};
 use crate::s3::bucket::remap::{RemapScope, job_page};
@@ -25,81 +19,6 @@ use crate::s3::bucket::remap::{RemapScope, job_page};
 const CONTINUE: Duration = Duration::from_secs(1);
 const WAIT: Duration = Duration::from_secs(30);
 const JOB_PAGE: usize = 64;
-
-/// The job of a bucket as stored: the running one, else the one started last.
-pub async fn read_bucket_job(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<BucketJob>, String> {
-    let mut reads = reads(bucket);
-    reads.remove(0);
-    reads.remove(0);
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(format!("could not read the bucket job: {}", other.label())),
-    };
-    let mut values = values.into_iter().map(|(_, value)| value);
-    let mut next = || values.next().flatten();
-    let (linked, migration, rename) = (next(), next(), next());
-    let linked = linked.as_deref().map(LinkedJob::from_bytes).transpose();
-    let linked = linked.map_err(|error| error.to_string())?;
-    let migration = migration.as_deref().map(CompressionMigration::from_bytes);
-    let migration = migration.transpose().map_err(|error| error.to_string())?;
-    let rename = rename.as_deref().map(RenameRequest::from_bytes).transpose();
-    let rename = rename.map_err(|error| error.to_string())?;
-    let rename = match (migration, rename) {
-        (Some(migration), Some(request))
-            if migration.moving && migration.started_at_ms == request.started_at_ms =>
-        {
-            Some((migration, request))
-        }
-        _ => None,
-    };
-    let rename_runs = (rename.as_ref()).is_some_and(|(migration, request)| {
-        migration.finished_at_ms.is_none() && request.aborted_at_ms.is_none()
-    });
-    Ok(match (linked, rename) {
-        (Some(job), _) if job.is_active() => Some(BucketJob::Linked(job)),
-        (_, Some((migration, request))) if rename_runs => {
-            Some(BucketJob::Rename(migration, request))
-        }
-        (Some(job), Some((migration, request))) => {
-            match job.started_at_ms > migration.started_at_ms {
-                true => Some(BucketJob::Linked(job)),
-                false => Some(BucketJob::Rename(migration, request)),
-            }
-        }
-        (Some(job), None) => Some(BucketJob::Linked(job)),
-        (None, Some((migration, request))) => Some(BucketJob::Rename(migration, request)),
-        (None, None) => None,
-    })
-}
-
-/// The files the rename of the move started at `started_at_ms` planned to rename; `None` when
-/// none was stored for that move.
-pub async fn rename_total(
-    context: &DriverContext,
-    bucket: &str,
-    started_at_ms: u64,
-) -> Result<Option<u64>, String> {
-    let read = StorageEffect::Read {
-        key_space: RENAME_TOTAL_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) =
-        context.storage_handle.send_storage_effect(read).await
-    else {
-        return Err("could not read the rename total".to_string());
-    };
-    let row = value.as_deref().map(RenameTotal::from_bytes).transpose();
-    let row = row.map_err(|error| error.to_string())?;
-    Ok(row.and_then(|row| row.for_move(started_at_ms)))
-}
 
 /// Runs one page of every running linked job; answers when the worker must run again.
 pub async fn process_linked(context: &DriverContext) -> Result<Option<Duration>, String> {
@@ -169,7 +88,7 @@ fn ended_step() -> JobStep {
 }
 
 /// The caller's access to the bucket for one page; `None` once its token or access ended.
-async fn job_access(
+pub(super) async fn job_access(
     context: &DriverContext,
     bucket: &str,
     job: &LinkedJob,
@@ -257,7 +176,7 @@ async fn page(
 }
 
 /// Stores a page's progress on the job it ran for; a pause or an abort meanwhile stays.
-async fn store(
+pub(super) async fn store(
     context: &DriverContext,
     bucket: &str,
     job: &LinkedJob,

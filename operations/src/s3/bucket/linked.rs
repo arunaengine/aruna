@@ -10,10 +10,10 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
-    RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
+    RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::storage::backend_import::RenameRequest;
+use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::CompressionMigration;
@@ -60,7 +60,7 @@ pub enum LinkedError {
 }
 
 /// The rows a bucket job change reads, in this order.
-pub(super) fn reads(bucket: &str) -> Vec<(String, Key)> {
+fn reads(bucket: &str) -> Vec<(String, Key)> {
     let key: Key = bucket.as_bytes().to_vec().into();
     [
         S3_BUCKET_KEYSPACE,
@@ -333,6 +333,154 @@ impl Operation for BucketJobOperation {
             .take()
             .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
             .unwrap_or_default()
+    }
+}
+
+/// The job of a bucket as stored: the running one, else the one started last.
+pub struct ShownJobOperation {
+    bucket: String,
+    result: Option<Result<Option<BucketJob>, LinkedError>>,
+}
+
+impl ShownJobOperation {
+    pub fn new(bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            result: None,
+        }
+    }
+}
+
+impl Operation for ShownJobOperation {
+    type Output = Option<BucketJob>;
+    type Error = LinkedError;
+
+    fn start(&mut self) -> Effects {
+        let mut reads = reads(&self.bucket);
+        reads.drain(..2);
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.result = Some(match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                shown_job(values).map_err(LinkedError::from)
+            }
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            _ => Err(LinkedError::Unexpected),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Option<BucketJob>, LinkedError> {
+        self.result.unwrap_or(Err(LinkedError::Unexpected))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// The shown job of the linked job, migration and rename rows, read in that order.
+fn shown_job(values: Vec<(Key, Option<Value>)>) -> Result<Option<BucketJob>, ConversionError> {
+    let mut values = values.into_iter().map(|(_, value)| value);
+    let mut next = || values.next().flatten();
+    let (linked, migration, rename) = (next(), next(), next());
+    let linked = linked.as_deref().map(LinkedJob::from_bytes).transpose()?;
+    let migration = migration.as_deref().map(CompressionMigration::from_bytes);
+    let migration = migration.transpose()?;
+    let rename = rename
+        .as_deref()
+        .map(RenameRequest::from_bytes)
+        .transpose()?;
+    let rename = match (migration, rename) {
+        (Some(migration), Some(request))
+            if migration.moving && migration.started_at_ms == request.started_at_ms =>
+        {
+            Some((migration, request))
+        }
+        _ => None,
+    };
+    let rename_runs = (rename.as_ref()).is_some_and(|(migration, request)| {
+        migration.finished_at_ms.is_none() && request.aborted_at_ms.is_none()
+    });
+    Ok(match (linked, rename) {
+        (Some(job), _) if job.is_active() => Some(BucketJob::Linked(job)),
+        (_, Some((migration, request))) if rename_runs => {
+            Some(BucketJob::Rename(migration, request))
+        }
+        (Some(job), Some((migration, request))) => {
+            match job.started_at_ms > migration.started_at_ms {
+                true => Some(BucketJob::Linked(job)),
+                false => Some(BucketJob::Rename(migration, request)),
+            }
+        }
+        (Some(job), None) => Some(BucketJob::Linked(job)),
+        (None, Some((migration, request))) => Some(BucketJob::Rename(migration, request)),
+        (None, None) => None,
+    })
+}
+
+/// The files the rename of the move started at `started_at_ms` planned to rename; `None` when
+/// none was stored for that move.
+pub struct RenameTotalOperation {
+    bucket: String,
+    started_at_ms: u64,
+    result: Option<Result<Option<u64>, LinkedError>>,
+}
+
+impl RenameTotalOperation {
+    pub fn new(bucket: &str, started_at_ms: u64) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            started_at_ms,
+            result: None,
+        }
+    }
+}
+
+impl Operation for RenameTotalOperation {
+    type Output = Option<u64>;
+    type Error = LinkedError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: RENAME_TOTAL_KEYSPACE.to_string(),
+            key: self.bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.result = Some(match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                let row = value.as_deref().map(RenameTotal::from_bytes).transpose();
+                row.map(|row| row.and_then(|row| row.for_move(self.started_at_ms)))
+                    .map_err(LinkedError::from)
+            }
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            _ => Err(LinkedError::Unexpected),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Option<u64>, LinkedError> {
+        self.result.unwrap_or(Err(LinkedError::Unexpected))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 

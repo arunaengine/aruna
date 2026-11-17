@@ -17,9 +17,9 @@ use aruna_operations::blob::unify;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::groups::imports::discovery::bucket_access;
 use aruna_operations::groups::imports::last_run;
-use aruna_operations::s3::bucket::job_pages::{read_bucket_job, rename_total};
 use aruna_operations::s3::bucket::linked::{
-    BucketJob, BucketJobOperation, LinkedAction, LinkedError,
+    BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
+    ShownJobOperation,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
 use axum::extract::{Path, State};
@@ -653,7 +653,7 @@ pub async fn get_job(
 ) -> ServerResult<Json<Option<OrganizeJob>>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
     let context = state.get_ctx();
-    let job = read_bucket_job(&context, &rule.bucket)
+    let job = drive(ShownJobOperation::new(&rule.bucket), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     match job {
@@ -671,7 +671,8 @@ async fn shown(
 ) -> ServerResult<OrganizeJob> {
     let total = match &job {
         BucketJob::Rename(record, _) => {
-            let total = rename_total(context, bucket, record.started_at_ms).await;
+            let read = RenameTotalOperation::new(bucket, record.started_at_ms);
+            let total = drive(read, context).await;
             total.map_err(|error| ServerError::InternalError(error.into()))?
         }
         _ => None,
