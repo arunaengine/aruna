@@ -28,10 +28,10 @@ use super::install::{
     read_manifest, scope_of, settle, write_record,
 };
 use super::matcher::Target;
-use super::records::{InstallEntryConfig, InstallEntryOperation};
+use super::records::{InstallEntryConfig, write_entry};
 use super::rules::retire_rules;
 use super::settings::check_settings;
-use crate::driver::{DriverContext, drive};
+use crate::driver::DriverContext;
 use crate::realm::mutate_placement::node_kind;
 
 /// Replaces the grants: a permission left out gets all of the group, an empty list removes an
@@ -203,7 +203,7 @@ pub async fn remove_install(
     retire_rules(ctx, actor, &removing).await;
     let action = AdminAuditAction::PluginRemoved;
     let audit = AdminAuditRecord::for_install(action, actor.user_id, &removing);
-    let delete = InstallEntryOperation::new(InstallEntryConfig {
+    let delete = InstallEntryConfig {
         actor: actor.clone(),
         auth_context: auth.clone(),
         install_id,
@@ -211,8 +211,8 @@ pub async fn remove_install(
         expected: Some(removing.revision),
         install: None,
         audit: Some(audit),
-    });
-    drive(delete, ctx).await?;
+    };
+    write_entry(ctx, delete).await?;
     info!(%install_id, plugin = %removing.plugin, "Removed a plugin install");
     Ok(removing)
 }

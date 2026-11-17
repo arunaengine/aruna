@@ -38,7 +38,7 @@ use super::grants::{
     parse_grants, patterns_for, role_paths, stored_grants, writes,
 };
 use super::receiver::pick_receiver;
-use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
+use super::records::{InstallEntryConfig, RecordError, write_entry};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
 use super::sweep::{ORPHAN_GRACE_MS, plugin_accounts};
@@ -596,7 +596,7 @@ pub(crate) async fn write_record(
     install: PluginInstall,
     audit: Option<AdminAuditRecord>,
 ) -> Result<PluginInstall, InstallError> {
-    let write = InstallEntryOperation::new(InstallEntryConfig {
+    let write = InstallEntryConfig {
         actor: actor.clone(),
         auth_context: auth.clone(),
         install_id: install.install_id,
@@ -604,8 +604,8 @@ pub(crate) async fn write_record(
         expected,
         install: Some(install.clone()),
         audit,
-    });
-    drive(write, ctx).await?;
+    };
+    write_entry(ctx, write).await?;
     Ok(install)
 }
 
