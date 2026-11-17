@@ -425,3 +425,30 @@ fn seen_records_expire() {
     );
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
 }
+
+#[test]
+fn seen_outcome_read() {
+    let row = plain_row("s1");
+    let mut plan = SeenOutcome(seen_key(row.install_id, row.event.kind, &row.event.source));
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    let (_, _, stored) = seen_row(&row, &Outcome::Queued, 7).unwrap();
+    let answer = plan
+        .next(Answer::Values(vec![Some(stored.to_vec())]))
+        .unwrap();
+    assert_eq!(answer, Turn::Finish(Some(Outcome::Queued)));
+    let missing = plan.next(Answer::Values(vec![None])).unwrap();
+    assert_eq!(missing, Turn::Finish(None));
+    assert!(plan.next(Answer::Done).is_err());
+}
+
+#[test]
+fn late_event_counted() {
+    let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let mut plan = LateEvent(GapCount::new(local, &plain_row("s1"), GapReason::Late));
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Values(vec![None])).unwrap() else {
+        panic!("a late event writes its gap row");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+}

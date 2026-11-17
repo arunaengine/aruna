@@ -443,3 +443,40 @@ fn expired_rows_counted() {
     let rest = vec![(b"k".to_vec(), kept)];
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(rest));
 }
+
+#[test]
+fn next_after_install() {
+    let id = Ulid::from_parts(3, 3);
+    let start = [&id.to_bytes()[..], &[0xff; 24]].concat();
+    let mut plan = NextInstall(Some(start.clone()));
+    let Turn::Ask(Ask::Page { after, limit, .. }) = plan.first().unwrap() else {
+        panic!("the next install reads one row");
+    };
+    assert_eq!((after, limit), (Some(start), 1));
+    let key = [&id.to_bytes()[..], &[0; 24]].concat();
+    let found = plan.next(Answer::Page(vec![(key, Vec::new())], None));
+    assert_eq!(found.unwrap(), Turn::Finish(Some(id)));
+    let mut empty = NextInstall(None);
+    let none = empty.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(none, Turn::Finish(None));
+    assert!(empty.next(Answer::Done).is_err());
+}
+
+#[test]
+fn drops_every_page() {
+    let space = PLUGIN_OUTBOX_KEYSPACE;
+    let mut plan = DropRows {
+        space,
+        prefix: b"p".to_vec(),
+        deleting: false,
+    };
+    let first = plan.first().unwrap();
+    assert!(matches!(first, Turn::Ask(Ask::Page { limit: 1_000, .. })));
+    let rows = vec![(b"p1".to_vec(), b"x".to_vec())];
+    let asked = plan.next(Answer::Page(rows, None)).unwrap();
+    assert_eq!(asked, Turn::Ask(Ask::Delete(vec![(space, b"p1".to_vec())])));
+    let again = plan.next(Answer::Done).unwrap();
+    assert!(matches!(again, Turn::Ask(Ask::Page { .. })));
+    let last = plan.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(last, Turn::Finish(()));
+}
