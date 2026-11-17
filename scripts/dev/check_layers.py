@@ -122,6 +122,10 @@ MATCH_RE = re.compile(r"\bmatch\b")
 STATE_CLONE = re.compile(r"\bmatch\s+self\s*\.\s*state\s*\.\s*clone\s*\(\s*\)")
 PARALLEL_RE = re.compile(r"\b(?:join_all|FuturesUnordered|buffer_unordered|JoinSet|try_join\w*)\b")
 SLEEP_RE = re.compile(r"(?<![\w.:])(?:(?:std::)?thread::|(?:tokio::)?time::)?sleep\s*\(")
+CLOCK_RE = re.compile(
+    r"\b(?:(?:SystemTime|Instant|Utc)::now|unix_timestamp_(?:secs|millis)|now_ms(?=\s*\()"
+    r"|Ulid::(?:new|generate)|thread_rng|OsRng|rand::random|getrandom)\b"
+)
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
 SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
@@ -663,6 +667,18 @@ def measure(root):
     return counts, details, async_lines(ops), ops, sources
 
 
+def clock_calls(ops):
+    """Clock and random calls in production files that define an operation, reported only."""
+    found = []
+    for rel, info in sorted(ops.files.items()):
+        if info["kind"] not in ("op", "mixed"):
+            continue
+        masked = info["source"].masked
+        for hit in CLOCK_RE.finditer(masked):
+            found.append(f"{rel}:{masked.count(chr(10), 0, hit.start()) + 1}")
+    return found
+
+
 def clean_findings(ops, clean):
     found = []
     for rel, info in sorted(ops.files.items()):
@@ -696,6 +712,11 @@ def report(root, baseline, show_all):
         now, before = lines.get(module, 0), baseline["async_lines"].get(module, 0)
         if show_all or now != before:
             print(f"  {module}: {now} (baseline {before})")
+    clocks = clock_calls(ops)
+    print(f"clock and random calls in operation files: {len(clocks)}, reported only")
+    if show_all:
+        for hit in clocks:
+            print(f"    {hit}")
     for key, label in COUNTS:
         now, limit = counts[key], baseline["structural"][key]
         print(f"{label}: {now} (baseline {limit})")
