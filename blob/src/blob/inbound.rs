@@ -22,7 +22,7 @@ pub enum InboundError {
     #[error("the inbound bao stream timed out")]
     TimedOut,
     #[error(transparent)]
-    Blob(#[from] BlobError),
+    Blob(Box<BlobError>),
     #[error("unexpected first event on the inbound bao stream: {0}")]
     Unexpected(String),
 }
@@ -36,7 +36,7 @@ impl BlobHandle {
         limit: Duration,
     ) -> Result<Ulid, InboundError> {
         match timeout(limit, self.store_connection(peer, stream)).await {
-            Ok(result) => Ok(result?),
+            Ok(result) => result.map_err(|error| InboundError::Blob(Box::new(error))),
             Err(_) => Err(InboundError::TimedOut),
         }
     }
@@ -51,7 +51,7 @@ impl BlobHandle {
         match timeout(limit, read).await {
             Err(_) => Err(InboundError::TimedOut),
             Ok(Event::Blob(BlobEvent::MessageReceived { payload, .. })) => Ok(payload),
-            Ok(Event::Blob(BlobEvent::Error(error))) => Err(error.into()),
+            Ok(Event::Blob(BlobEvent::Error(error))) => Err(InboundError::Blob(Box::new(error))),
             Ok(other) => Err(InboundError::Unexpected(format!("{other:?}"))),
         }
     }
