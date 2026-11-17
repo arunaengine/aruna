@@ -625,6 +625,20 @@ fn child_refuses_type() {
     assert_eq!(failed.child::<u8, IoError>(), Ok(Err(IoError::Aborted)));
 }
 
+// A child output that is only `Send`, like a stream, still travels and compares.
+#[test]
+fn child_carries_send() {
+    let outcome = || ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(4)));
+    assert_eq!(outcome(), outcome());
+    let other = ChildOutcome::new::<std::cell::Cell<u8>, IoError>(Ok(std::cell::Cell::new(5)));
+    assert_ne!(outcome(), other);
+    let result = IoResult::Child(outcome()).child::<std::cell::Cell<u8>, IoError>();
+    assert_eq!(
+        result.map(|value| value.map(std::cell::Cell::into_inner)),
+        Ok(Ok(4))
+    );
+}
+
 #[test]
 fn adds_counters_inside() {
     let usage = IoCall::AddUsage {

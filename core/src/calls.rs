@@ -5,6 +5,7 @@
 use std::any::{Any, type_name};
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use smallvec::smallvec;
@@ -102,8 +103,8 @@ impl IoCall {
     where
         O: Runnable<K> + 'static,
         K: 'static,
-        O::Output: PartialEq + Sync + 'static,
-        O::Error: PartialEq + Sync + 'static,
+        O::Output: PartialEq + 'static,
+        O::Error: PartialEq + 'static,
     {
         Self::Child(boxed_suboperation(operation, |result| {
             Event::Child(ChildOutcome::new(result))
@@ -111,16 +112,34 @@ impl IoCall {
     }
 }
 
-/// A child's `Result<Output, Error>`, boxed so events stay free of operation types.
+/// A child's `Result<Output, Error>`, boxed so events stay free of operation types. The value
+/// sits behind a mutex, so an output that is only `Send`, such as a stream, can be carried.
 pub struct ChildOutcome(Box<dyn ChildValue>);
 
 trait ChildValue: Any + Send + Sync + Debug {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
 }
 
-impl<T: Any + Send + Sync + Debug + PartialEq> ChildValue for T {
+/// One child result, locked only to compare or print it and taken out whole.
+struct Held<T>(Mutex<T>);
+
+impl<T: Debug> Debug for Held<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).fmt(f)
+    }
+}
+
+impl<T: Any + Send + Debug + PartialEq> ChildValue for Held<T> {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool {
-        (other as &dyn Any).downcast_ref::<T>() == Some(self)
+        let Some(other) = (other as &dyn Any).downcast_ref::<Held<T>>() else {
+            return false;
+        };
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        let mine = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let theirs = other.0.lock().unwrap_or_else(PoisonError::into_inner);
+        *mine == *theirs
     }
 }
 
@@ -128,16 +147,17 @@ impl ChildOutcome {
     /// Wraps a child's result; a group member child maps its outcome with this.
     pub fn new<T, E>(result: Result<T, E>) -> Self
     where
-        T: Send + Sync + Debug + PartialEq + 'static,
-        E: Send + Sync + Debug + PartialEq + 'static,
+        T: Send + Debug + PartialEq + 'static,
+        E: Send + Debug + PartialEq + 'static,
     {
-        Self(Box::new(result))
+        Self(Box::new(Held(Mutex::new(result))))
     }
 
     /// The child's result, or `None` when the child's output or error has another type.
     pub fn take<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
         let value: Box<dyn Any> = self.0;
-        value.downcast::<Result<T, E>>().ok().map(|result| *result)
+        let held = value.downcast::<Held<Result<T, E>>>().ok()?;
+        Some(held.0.into_inner().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
