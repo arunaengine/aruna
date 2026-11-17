@@ -101,15 +101,14 @@ impl Operation for GetNodesOperation {
     type Error = GetNodesError;
 
     fn first(&mut self) -> Result<Next<RealmPresence>, GetNodesError> {
-        Ok(Next::Call(IoCall::Effect(Effect::Net(NetEffect::Dht(
-            DhtEffect::Get {
-                key: realm_presence_key(&self.realm_id),
-                realm_filter: Some(self.realm_id),
-                // Multi-publisher presence must stay exhaustive; the driver enforces
-                // the same budget the caller races this operation against.
-                options: DhtGetOptions::presence(REALM_DISCOVERY_TIMEOUT, self.realm_id),
-            },
-        )))))
+        let get = Effect::Net(NetEffect::Dht(DhtEffect::Get {
+            key: realm_presence_key(&self.realm_id),
+            realm_filter: Some(self.realm_id),
+            // Multi-publisher presence must stay exhaustive; the driver enforces
+            // the same budget the caller races this operation against.
+            options: DhtGetOptions::presence(REALM_DISCOVERY_TIMEOUT, self.realm_id),
+        }));
+        Ok(Next::Call(IoCall::Effect(Box::new(get))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<RealmPresence>, GetNodesError> {
@@ -176,7 +175,7 @@ mod pure_tests {
             panic!("expected a DHT lookup");
         };
         assert!(matches!(
-            effect,
+            *effect,
             Effect::Net(NetEffect::Dht(DhtEffect::Get { options, .. }))
                 if options.presence == Some(realm_id)
                     && options.deadline == REALM_DISCOVERY_TIMEOUT

@@ -2,13 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::types::{Effects, TxnId};
+use smallvec::smallvec;
 
-use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
+use crate::auth::permission_rules::{read_rules, rule_reads};
 
 /// Maps any authorization sub-operation onto the shared result event.
 pub fn authorization_event(allowed: Result<bool, AuthorizationError>) -> Event {
@@ -22,71 +25,113 @@ pub struct CheckPermissionsConfig {
     pub required_permission: Permission,
 }
 
+impl CheckPermissionsConfig {
+    /// Whether the rules read in `values`, in the order of `rule_reads`, allow the path.
+    fn allowed(
+        &self,
+        values: Vec<Option<aruna_core::types::Value>>,
+    ) -> Result<bool, AuthorizationError> {
+        let rules = read_rules(&self.auth_context, values)?;
+        Ok(rules.allows(&self.path, &self.required_permission))
+    }
+}
+
 /// Decides a single path. Rule collection and evaluation live in
 /// `permission_rules`, so read paths that filter many paths at once share
 /// exactly these semantics.
 #[derive(Debug, PartialEq)]
 pub struct CheckPermissionsOperation {
-    rules: PermissionRulesOperation,
-    path: String,
-    required_permission: Permission,
+    config: CheckPermissionsConfig,
 }
 
 impl CheckPermissionsOperation {
     pub fn new(config: CheckPermissionsConfig) -> Self {
-        CheckPermissionsOperation {
-            rules: PermissionRulesOperation::new(PermissionRulesConfig {
-                auth_context: config.auth_context,
-                path: config.path.clone(),
-            }),
-            path: config.path,
-            required_permission: config.required_permission,
-        }
+        CheckPermissionsOperation { config }
     }
 
-    pub fn new_with_txn(config: CheckPermissionsConfig, txn_id: TxnId) -> Self {
-        CheckPermissionsOperation {
-            rules: PermissionRulesOperation::new_with_txn(
-                PermissionRulesConfig {
-                    auth_context: config.auth_context,
-                    path: config.path.clone(),
-                },
-                txn_id,
-            ),
-            path: config.path,
-            required_permission: config.required_permission,
+    /// The same check with its reads in `txn_id`, for a raw parent that holds that transaction.
+    pub fn new_with_txn(config: CheckPermissionsConfig, txn_id: TxnId) -> TransactionCheck {
+        TransactionCheck {
+            config,
+            txn_id,
+            output: None,
         }
     }
 }
 
-impl EffectOperation for CheckPermissionsOperation {
+impl Operation for CheckPermissionsOperation {
     type Output = bool;
+    type Error = AuthorizationError;
 
+    fn first(&mut self) -> Result<Next<bool>, AuthorizationError> {
+        Ok(Next::Call(IoCall::Read(rule_reads(&self.config.path)?)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, AuthorizationError> {
+        let IoResult::Values(values) = result else {
+            return Err(AuthorizationError::UnexpectedEvent {
+                state: "CheckPermissions".to_string(),
+                expected: "IoResult::Values",
+                got: result.label().to_string(),
+            });
+        };
+        self.config.allowed(values).map(Next::Done)
+    }
+}
+
+/// A permission check whose reads join the transaction of a parent that is not converted yet.
+#[derive(Debug, PartialEq)]
+pub struct TransactionCheck {
+    config: CheckPermissionsConfig,
+    txn_id: TxnId,
+    output: Option<Result<bool, AuthorizationError>>,
+}
+
+impl EffectOperation for TransactionCheck {
+    type Output = bool;
     type Error = AuthorizationError;
 
     fn start(&mut self) -> Effects {
-        self.rules.start()
+        match rule_reads(&self.config.path) {
+            Ok(reads) => smallvec![Effect::Storage(StorageEffect::BatchRead {
+                reads,
+                txn_id: Some(self.txn_id),
+            })],
+            Err(error) => {
+                self.output = Some(Err(error));
+                smallvec![]
+            }
+        }
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        self.rules.step(event)
+        if self.output.is_some() {
+            return smallvec![];
+        }
+        self.output = Some(match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => self
+                .config
+                .allowed(values.into_iter().map(|(_, value)| value).collect()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(AuthorizationError::UnexpectedEvent {
+                state: "TransactionCheck".to_string(),
+                expected: "storage batch read result",
+                got: other.label().to_string(),
+            }),
+        });
+        smallvec![]
     }
 
     fn is_complete(&self) -> bool {
-        self.rules.is_complete()
+        self.output.is_some()
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let CheckPermissionsOperation {
-            rules,
-            path,
-            required_permission,
-        } = self;
-        Ok(rules.finalize()?.allows(&path, &required_permission))
+    fn finalize(self) -> Result<bool, AuthorizationError> {
+        self.output.unwrap_or(Err(AuthorizationError::NotFinished))
     }
 
     fn abort(&mut self) -> Effects {
-        self.rules.abort()
+        smallvec![]
     }
 }
 

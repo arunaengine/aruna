@@ -129,7 +129,7 @@ impl ResolvePolicyOperation {
         let ([(_, config_value), (_, auth_value)], group_value) = match values.as_slice() {
             [config, auth] => ([config, auth], None),
             [config, auth, (_, group)] => ([config, auth], Some(group)),
-            other => {
+            _ => {
                 return self.unexpected_event(
                     "realm config and authorization",
                     "a batch of another length",

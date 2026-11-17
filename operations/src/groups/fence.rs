@@ -2,15 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::GROUP_DELETE_KEYSPACE;
 use aruna_core::node_vault::VaultEntry;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::rows::done;
 use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 
 pub fn group_fence_key(group_id: GroupId) -> (String, Key) {
     (
@@ -81,26 +82,23 @@ pub fn parse_group_record(event: Event) -> Result<Option<Value>, GroupWriteError
     }
 }
 
+/// What the group write waits for after its fence read.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
+enum Stage {
     Read,
     Write,
     Secret,
-    Commit,
-    Finish,
 }
 
+/// Writes group resource rows, and optionally seals a secret into the node vault, in one write
+/// transaction that also reads the group's deletion fence.
 #[derive(Debug, PartialEq)]
 pub struct GroupWriteOperation {
     group_id: GroupId,
     writes: Vec<(String, Key, Value)>,
     secret: Option<(VaultEntry, SecretBytes)>,
     absent: Option<(String, Key)>,
-    txn_id: Option<TxnId>,
-    state: State,
-    output: Option<Result<(), GroupWriteError>>,
+    stage: Stage,
 }
 
 impl GroupWriteOperation {
@@ -110,9 +108,7 @@ impl GroupWriteOperation {
             writes,
             secret: None,
             absent: None,
-            txn_id: None,
-            state: State::Init,
-            output: None,
+            stage: Stage::Read,
         }
     }
 
@@ -122,108 +118,81 @@ impl GroupWriteOperation {
         self
     }
 
-    fn write(&mut self) -> Effects {
-        self.state = State::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: std::mem::take(&mut self.writes),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn fail(&mut self, error: GroupWriteError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Finish;
-        self.abort()
+    /// Checks the fence and the row that must be absent, then writes the records.
+    fn admit(&mut self, values: Vec<Option<Value>>) -> Result<Next<()>, GroupWriteError> {
+        let mut values = values.into_iter();
+        check_group_write(values.next().flatten().as_deref())?;
+        if values.next().flatten().is_some() {
+            return Err(GroupWriteError::Taken);
+        }
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
     }
 }
 
-impl EffectOperation for GroupWriteOperation {
+impl Operation for GroupWriteOperation {
     type Output = ();
     type Error = GroupWriteError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                let (key_space, key) = group_fence_key(self.group_id);
-                let Some(absent) = self.absent.clone() else {
-                    return smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space,
-                        key,
-                        txn_id: Some(txn_id),
-                    })];
-                };
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![(key_space, key), absent],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if let Err(error) = check_group_write(value.as_deref()) {
-                    return self.fail(error);
-                }
-                self.write()
-            }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let mut values = values.into_iter().map(|(_, value)| value);
-                if let Err(error) = check_group_write(values.next().flatten().as_deref()) {
-                    return self.fail(error);
-                }
-                if values.next().flatten().is_some() {
-                    return self.fail(GroupWriteError::Taken);
-                }
-                self.write()
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
-                if self.secret.is_some() =>
-            {
+    fn first(&mut self) -> Result<Next<()>, GroupWriteError> {
+        let mut reads = vec![group_fence_key(self.group_id)];
+        reads.extend(self.absent.clone());
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, GroupWriteError> {
+        match self.stage {
+            Stage::Read => match result {
+                IoResult::Values(values) => self.admit(values),
+                _ => Err(GroupWriteError::Unexpected),
+            },
+            Stage::Write => {
+                done(result)?;
                 let Some((entry, secret)) = self.secret.take() else {
-                    return self.fail(GroupWriteError::Unexpected);
+                    return Ok(Next::Done(()));
                 };
-                self.state = State::Secret;
-                smallvec![crate::node_vault::write_secret(entry, secret, self.txn_id)]
+                self.stage = Stage::Secret;
+                // The runner puts the vault write into this operation's transaction.
+                let seal = crate::node_vault::write_secret(entry, secret, None);
+                Ok(Next::Call(IoCall::Effect(Box::new(seal))))
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. }))
-            | (State::Secret, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(GroupWriteError::Unexpected);
-                };
-                self.state = State::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = State::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            _ => self.fail(GroupWriteError::Unexpected),
+            Stage::Secret => match result {
+                IoResult::Event(event) => match *event {
+                    Event::Storage(StorageEvent::WriteResult { .. }) => Ok(Next::Done(())),
+                    _ => Err(GroupWriteError::Unexpected),
+                },
+                _ => Err(GroupWriteError::Unexpected),
+            },
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn finalize(self) -> Result<(), GroupWriteError> {
-        self.output.unwrap_or(Err(GroupWriteError::Unexpected))
-    }
+    #[test]
+    fn taken_row_refused() {
+        // An open fence admits the write; an existing row it must create refuses it.
+        let group_id = ulid::Ulid::from_bytes([1; 16]);
+        let row = ("rows".to_string(), Key::from(b"a".to_vec()));
+        let writes = vec![(row.0.clone(), row.1.clone(), Value::from(b"v".to_vec()))];
+        let mut operation = GroupWriteOperation::new(group_id, writes.clone());
+        operation.absent = Some(row.clone());
+        let reads = vec![group_fence_key(group_id), row];
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+        let taken = IoResult::Values(vec![None, Some(Value::from(b"x".to_vec()))]);
+        assert_eq!(operation.next(taken), Err(GroupWriteError::Taken));
 
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+        let mut operation = GroupWriteOperation::new(group_id, writes.clone());
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let open = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(open, Ok(Next::Call(IoCall::Write(writes))));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
     }
 }

@@ -4,17 +4,17 @@
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::reducer::decode_reducer_state;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -49,21 +49,21 @@ pub enum ListJoinError {
     Conversion(#[from] ConversionError),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum State {
-    Init,
-    Auth,
-    Read,
-    Done,
-    Failed,
+impl From<IoError> for ListJoinError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::UnexpectedEvent,
+        }
+    }
 }
 
+/// Checks a group administrator, then scans the group reducer states for join requests.
 #[derive(Debug, PartialEq)]
 pub struct ListJoinOperation {
     input: ListJoinInput,
-    state: State,
     requests: Vec<JoinRequestState>,
-    output: Option<Result<JoinRequestsPage, ListJoinError>>,
 }
 
 impl ListJoinOperation {
@@ -71,20 +71,13 @@ impl ListJoinOperation {
         input.limit = input.limit.clamp(1, 100);
         Self {
             input,
-            state: State::Init,
             requests: Vec::new(),
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: ListJoinError) -> Effects {
-        self.state = State::Failed;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn read(&mut self, after: Option<Key>) -> Effects {
-        self.state = State::Read;
+    /// The next page of reducer states; the first starts at the cursor's group, inclusive, which
+    /// `IoCall::Page` cannot express, so it passes the storage scan through.
+    fn read(&self, after: Option<Key>) -> Next<JoinRequestsPage> {
         let prefix = self.input.group_id.map_or_else(
             || Key::from(vec![b'g']),
             |group_id| reducer_state_key(&AdminDocumentTarget::Group { group_id }),
@@ -94,20 +87,21 @@ impl ListJoinOperation {
                 IterStart::At(reducer_state_key(&AdminDocumentTarget::Group { group_id }))
             })
         });
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        let scan = Effect::Storage(StorageEffect::Iter {
             key_space: DOCUMENT_STATE_KEYSPACE.into(),
             prefix: Some(prefix),
             start,
             limit: 64,
             txn_id: None,
-        })]
+        });
+        Next::Call(IoCall::Effect(Box::new(scan)))
     }
 
     fn collect(
         &mut self,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Result<Effects, ListJoinError> {
+    ) -> Result<Next<JoinRequestsPage>, ListJoinError> {
         for (key, value) in values {
             let state = decode_reducer_state(&value).map_err(ConversionError::from)?;
             let AdminDocumentTarget::Group { group_id } = state.target else {
@@ -140,81 +134,63 @@ impl ListJoinOperation {
                         .requests
                         .last()
                         .map(|entry| (entry.request.group_id, entry.request.request_id));
-                    return Ok(self.finish(last));
+                    return Ok(Next::Done(self.page(last)));
                 }
             }
         }
         Ok(match next {
             Some(key) => self.read(Some(key)),
-            None => self.finish(None),
+            None => Next::Done(self.page(None)),
         })
     }
 
-    fn finish(&mut self, next_start_after: Option<(Ulid, Ulid)>) -> Effects {
-        self.state = State::Done;
-        self.output = Some(Ok(JoinRequestsPage {
+    fn page(&mut self, next_start_after: Option<(Ulid, Ulid)>) -> JoinRequestsPage {
+        JoinRequestsPage {
             requests: std::mem::take(&mut self.requests),
             next_start_after,
-        }));
-        smallvec![]
+        }
     }
 }
 
-impl EffectOperation for ListJoinOperation {
+impl Operation for ListJoinOperation {
     type Output = JoinRequestsPage;
     type Error = ListJoinError;
-    fn start(&mut self) -> Effects {
-        if self.state != State::Init {
-            return self.fail(ListJoinError::UnexpectedEvent);
-        }
+
+    fn first(&mut self) -> Result<Next<JoinRequestsPage>, ListJoinError> {
         if self.input.auth.path_restrictions.is_some() || self.input.auth.user_id.is_nil() {
-            return self.fail(ListJoinError::Unauthorized);
+            return Err(ListJoinError::Unauthorized);
         }
-        if let Some(group_id) = self.input.group_id {
-            self.state = State::Auth;
-            return smallvec![Effect::SubOperation(boxed_suboperation(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: self.input.auth.clone(),
-                    path: format!("/{}/g/{group_id}/admin/users/**", self.input.auth.realm_id),
-                    required_permission: Permission::WRITE,
-                }),
-                |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
-            ))];
+        let Some(group_id) = self.input.group_id else {
+            return Ok(self.read(None));
+        };
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.input.auth.clone(),
+            path: format!("/{}/g/{group_id}/admin/users/**", self.input.auth.realm_id),
+            required_permission: Permission::WRITE,
+        });
+        let child = boxed_suboperation(check, |allowed| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<JoinRequestsPage>, ListJoinError> {
+        let IoResult::Event(event) = result else {
+            return Err(ListJoinError::UnexpectedEvent);
+        };
+        match *event {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                match allowed? {
+                    true => Ok(self.read(None)),
+                    false => Err(ListJoinError::Unauthorized),
+                }
+            }
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => self.collect(values, next_start_after),
+            _ => Err(ListJoinError::UnexpectedEvent),
         }
-        self.read(None)
-    }
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error.into()),
-            (
-                State::Auth,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => self.read(None),
-                Ok(false) => self.fail(ListJoinError::Unauthorized),
-                Err(error) => self.fail(error.into()),
-            },
-            (
-                State::Read,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => match self.collect(values, next_start_after) {
-                Ok(effects) => effects,
-                Err(error) => self.fail(error),
-            },
-            _ => self.fail(ListJoinError::UnexpectedEvent),
-        }
-    }
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Done | State::Failed)
-    }
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListJoinError::NotFinished)?
-    }
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -291,17 +267,21 @@ mod tests {
             start_after: None,
             limit: 10,
         });
-        operation.start();
+        let answer = |event| IoResult::Event(Box::new(event));
+        let mut turn = operation.first();
         if group_id.is_some() {
-            operation.step(Event::SubOperation(
-                SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-            ));
+            let allowed = SubOperationEvent::AuthorizationResult { allowed: Ok(true) };
+            turn = operation.next(answer(Event::SubOperation(allowed)));
         }
-        operation.step(Event::Storage(StorageEvent::IterResult {
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
+        let page = Event::Storage(StorageEvent::IterResult {
             values: vec![group_entry()],
             next_start_after: None,
-        }));
-        operation.finalize().unwrap().requests
+        });
+        match operation.next(answer(page)) {
+            Ok(Next::Done(page)) => page.requests,
+            other => panic!("expected a page, got {other:?}"),
+        }
     }
 
     #[test]
@@ -313,5 +293,31 @@ mod tests {
         // A local user with the same ULID is someone else.
         let twin = UserId::local(foreign_user().user_ulid, realm());
         assert!(listed(twin, None).is_empty());
+    }
+
+    #[test]
+    fn cursor_group_included() {
+        // The cursor's group may hold later requests, so the first scan starts at it, inclusive.
+        let group_id = Ulid::from_bytes([3; 16]);
+        let mut operation = ListJoinOperation::new(ListJoinInput {
+            auth: AuthContext {
+                user_id: foreign_user(),
+                realm_id: realm(),
+                path_restrictions: None,
+                session: None,
+            },
+            group_id: None,
+            pending_only: false,
+            start_after: Some((group_id, Ulid::from_bytes([5; 16]))),
+            limit: 10,
+        });
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+            panic!("expected the scan");
+        };
+        let start = reducer_state_key(&AdminDocumentTarget::Group { group_id });
+        assert!(matches!(
+            *effect,
+            Effect::Storage(StorageEffect::Iter { start: Some(IterStart::At(key)), .. }) if key == start
+        ));
     }
 }
