@@ -17,7 +17,7 @@ use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
-use aruna_operations::node::startup::RecoveryStatus;
+use aruna_operations::node::recovery::RecoveryStatus;
 use aruna_operations::node::usage_publish::publish_refresh_snapshots;
 use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
