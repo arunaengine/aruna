@@ -557,7 +557,8 @@ mod tests {
 
     fn spool_plan(reference: bool) -> SpoolSourceOperation {
         use aruna_core::structs::execution::staging::StagingStrategy;
-        use aruna_core::structs::storage::blob::{BackendRef, EncodingClass};
+        use aruna_core::structs::storage::blob::BackendRef;
+        use aruna_core::structs::storage::format::EncodingClass;
         use std::time::UNIX_EPOCH;
         let user = keep().user_id;
         let version = match reference {
@@ -596,7 +597,8 @@ mod tests {
     }
 
     fn spooled(size: u64) -> (BackendLocation, [u8; 32], u64) {
-        use aruna_core::structs::storage::blob::{BackendRef, StoredFormat};
+        use aruna_core::structs::storage::blob::BackendRef;
+        use aruna_core::structs::storage::format::StoredFormat;
         let location = BackendLocation {
             backend: BackendRef::node_default(),
             storage_class: None,

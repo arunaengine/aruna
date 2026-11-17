@@ -92,7 +92,8 @@ impl Operation for AcceptDelegationOperation {
     type Error = DelegateError;
 
     fn start(&mut self) -> Effects {
-        if let Err(error) = self.signed.verify(self.realm_id, self.node_id, self.now) {
+        let verified = (self.signed.verify(self.realm_id, self.node_id, self.now)).map(|_| ());
+        if let Err(error) = verified {
             return self.finish(Err(error.into()), smallvec![]);
         }
         let mut config = GetConfigOperation::new(self.realm_id);
