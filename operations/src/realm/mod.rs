@@ -27,24 +27,36 @@ pub mod set_portal;
 pub mod set_provider;
 pub mod set_quota;
 
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::Value;
+use aruna_core::calls::{IoCall, IoResult};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::Effect;
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmId;
+
+use crate::sync::replicate_documents::replicate_documents_effect;
 
 /// Commits one realm config write may try. Background placement and sync writes change the same
 /// document; each attempt rereads, validates and reapplies its change to the newer document.
 const COMMIT_ATTEMPTS: usize = 3;
 
-/// The auth document and admin state values a realm role change reads in one batch; any other
-/// event is refused with what was expected and the event's label.
-pub(crate) fn role_reads(event: Event) -> Result<[Option<Value>; 2], (&'static str, &'static str)> {
-    let got = event.label();
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(("Event::Storage(StorageEvent::BatchReadResult)", got));
+/// The call that announces the realm authorization document of `realm_id`, for a role change
+/// whose admin events did not reach the outbox.
+pub(crate) fn announce_call(actor: &Actor, realm_id: RealmId) -> Option<IoCall> {
+    let document = DocumentTarget::RealmAuthorization { realm_id };
+    match replicate_documents_effect(actor.realm_id, actor.node_id, vec![document]) {
+        Effect::SubOperation(child) => Some(IoCall::Child(child)),
+        _ => None,
+    }
+}
+
+/// The outcome of [`announce_call`]: the failure reason, or the label of another answer.
+pub(crate) fn announced(result: IoResult) -> Result<Result<(), String>, &'static str> {
+    let IoResult::Event(event) = result else {
+        return Err(result.label());
     };
-    let Ok([(_, auth_doc), (_, reducer_state)]) = <[_; 2]>::try_from(values) else {
-        let expected =
-            "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values";
-        return Err((expected, got));
-    };
-    Ok([auth_doc, reducer_state])
+    match *event {
+        Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => Ok(result),
+        other => Err(other.label()),
+    }
 }

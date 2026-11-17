@@ -8,9 +8,7 @@ use aruna_core::admin_documents::{
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
@@ -30,7 +28,6 @@ use crate::auth::epoch_due::DueMarks;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AssignRolesInput {
@@ -129,37 +126,24 @@ impl AssignRolesOperation {
                 calls,
             });
         }
-        let announce = replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![DocumentTarget::RealmAuthorization {
-                realm_id: document.realm_id,
-            }],
-        );
-        let Effect::SubOperation(child) = announce else {
-            return Err(AssignRolesError::NotFinished);
-        };
+        let announce = super::announce_call(&self.input.actor, document.realm_id);
+        let announce = announce.ok_or(AssignRolesError::NotFinished)?;
         self.document = Some(document);
         self.step = Step::Announce;
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(announce))
     }
 
     fn announced(
         &mut self,
         result: IoResult,
     ) -> Result<Next<RealmAuthorizationDocument>, AssignRolesError> {
-        let IoResult::Event(event) = result else {
-            return Err(AssignRolesError::NotFinished);
-        };
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = *event else {
-            return Err(AssignRolesError::UnexpectedEvent {
+        let outcome =
+            super::announced(result).map_err(|got| AssignRolesError::UnexpectedEvent {
                 state: "Announce".to_string(),
                 expected: "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
-            });
-        };
-        result.map_err(AssignRolesError::TopicAnnouncement)?;
+            })?;
+        outcome.map_err(AssignRolesError::TopicAnnouncement)?;
         self.document
             .take()
             .map(Next::Done)
