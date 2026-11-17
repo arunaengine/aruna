@@ -153,15 +153,6 @@ impl RealmRoleOperation {
         }
     }
 
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn validate_role(&self) -> Result<(), RealmRoleError> {
         if reserved_role_name(&self.input.role.name) {
             return Err(RealmRoleError::ReservedRoleName);
@@ -543,7 +534,7 @@ impl Operation for RealmRoleOperation {
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
+                auth_context: AuthContext::from(&self.input.actor),
                 path: format!(
                     "/{}/admin/roles/{}",
                     self.input.realm_id, self.input.role.role_id

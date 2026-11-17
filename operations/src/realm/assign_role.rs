@@ -149,15 +149,6 @@ impl AssignRolesOperation {
         }
     }
 
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
     fn handle_authorization(&mut self, event: Event) -> Effects {
         let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
@@ -522,7 +513,7 @@ impl Operation for AssignRolesOperation {
 
         smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
+                auth_context: AuthContext::from(&self.input.actor),
                 path: format!(
                     "/{}/admin/roles/{}",
                     self.input.realm_id, self.input.user_id
