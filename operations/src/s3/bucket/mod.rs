@@ -15,6 +15,7 @@ pub mod holders;
 pub mod key;
 pub mod linked;
 pub mod list;
+pub(crate) mod local_search;
 pub mod metadata;
 pub mod placement;
 pub mod release;

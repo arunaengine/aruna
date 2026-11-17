@@ -107,9 +107,8 @@ use crate::placement::{
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::search::{
-    BucketPage, BucketSearchHit, SearchBucketsInput, search_local_buckets,
-};
+use crate::s3::bucket::local_search::search_local_buckets;
+use crate::s3::bucket::search::{BucketPage, BucketSearchHit, SearchBucketsInput};
 use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
 };

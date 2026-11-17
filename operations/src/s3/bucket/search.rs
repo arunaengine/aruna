@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
@@ -29,11 +29,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
-use crate::driver::{DriverContext, drive};
-use crate::s3::object::search_scan::{open_position, seal_position};
+use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchBucketsInput {
@@ -415,108 +411,8 @@ impl SearchBucketsOperation {
     }
 }
 
-/// Runs one node's bucket search, dropping hits denied by realm/group policies.
-/// Policy state is read once per candidate group; unreadable groups stay invisible,
-/// and scans continue so hidden buckets cannot shorten the page.
-pub async fn search_local_buckets(
-    context: &DriverContext,
-    input: SearchBucketsInput,
-) -> Result<BucketPage, SearchBucketsError> {
-    search_with_budget(context, input, SearchBucketsOperation::MAX_SCAN_ROWS).await
-}
-
-async fn search_with_budget(
-    context: &DriverContext,
-    input: SearchBucketsInput,
-    max_scan_rows: usize,
-) -> Result<BucketPage, SearchBucketsError> {
-    if input
-        .extras
-        .as_ref()
-        .is_some_and(|extras| !extras_valid(extras))
-    {
-        return Err(SearchBucketsError::Extras);
-    }
-    let limit = input.limit.clamp(1, SearchBucketsOperation::MAX_LIMIT);
-    let mut evaluators: HashMap<(RealmId, GroupId), PolicyEvaluator> = HashMap::new();
-    let mut visible: Vec<BucketSearchHit> = Vec::with_capacity(limit);
-    // A cut scan's position comes back sealed, as it may name a bucket the caller cannot read.
-    let opened = (input.start_after.as_ref()).map(|after| open_position(after));
-    let Ok(opened) = opened.transpose() else {
-        return Ok(BucketPage {
-            retired: true,
-            ..BucketPage::default()
-        });
-    };
-    let mut start_after = opened.map(Key::from);
-    let mut scanned_rows = 0;
-    let budget = max_scan_rows.min(SearchBucketsOperation::MAX_SCAN_ROWS);
-    loop {
-        let remaining = budget.saturating_sub(scanned_rows);
-        let output = drive(
-            SearchBucketsOperation::with_budget(
-                SearchBucketsInput {
-                    start_after,
-                    ..input.clone()
-                },
-                remaining,
-            ),
-            context,
-        )
-        .await?;
-        scanned_rows += output.scanned_rows;
-        let pending = output
-            .hits
-            .iter()
-            .map(|hit| hit.group_id)
-            .filter(|group_id| !evaluators.contains_key(&(input.realm_id, *group_id)))
-            .map(|group_id| (input.realm_id, group_id))
-            .collect::<Vec<_>>();
-        evaluators.extend(PolicyEvaluator::load_bulk(context, pending).await?);
-        for mut hit in output.hits {
-            if !policy_allows(&evaluators, &input, &hit) {
-                continue;
-            }
-            if input.database {
-                hit.public = anonymous_reads(context, &input, &hit).await;
-            }
-            visible.push(hit);
-            if visible.len() >= limit {
-                return Ok(BucketPage {
-                    hits: visible,
-                    ..BucketPage::default()
-                });
-            }
-        }
-        match output.next_start_after {
-            Some(key) if scanned_rows >= budget => {
-                let scanned_to = seal_position(&key).map_err(|_| SearchBucketsError::Position)?;
-                return Ok(BucketPage {
-                    hits: visible,
-                    scanned_to: Some(scanned_to),
-                    retired: false,
-                });
-            }
-            Some(key) => start_after = Some(key),
-            None => {
-                return Ok(BucketPage {
-                    hits: visible,
-                    ..BucketPage::default()
-                });
-            }
-        }
-    }
-}
-
-/// Whether a caller's policy context may join a bucket search: an MCP tool's operation and
-/// parameters only, so it adds a check and never stands in for the mandatory bucket read.
-fn extras_valid(extras: &PolicyRequestExtras) -> bool {
-    let tool = extras.operation.strip_prefix("mcp:");
-    tool.is_some_and(|tool| !tool.is_empty()) && extras.headers.is_empty() && extras.body.is_none()
-}
-
 /// The path a candidate's READ is checked on: the asked key inside the bucket, else its root.
-fn candidate_path(
+pub(super) fn candidate_path(
     input: &SearchBucketsInput,
     group_id: GroupId,
     node_id: NodeId,
@@ -526,45 +422,6 @@ fn candidate_path(
         Some(key) => object_permission_path(input.realm_id, group_id, node_id, bucket, key),
         None => bucket_permission_path(input.realm_id, group_id, node_id, bucket),
     }
-}
-
-/// Whether a caller without a login may read the bucket, deny policies included.
-async fn anonymous_reads(
-    context: &DriverContext,
-    input: &SearchBucketsInput,
-    hit: &BucketSearchHit,
-) -> bool {
-    let path = bucket_permission_path(input.realm_id, hit.group_id, hit.node_id, &hit.bucket);
-    let anonymous = AuthContext::anonymous(input.realm_id);
-    let extras = PolicyRequestExtras::operation("s3.ListBuckets");
-    crate::auth::request_authorization::authorize(
-        context,
-        input.realm_id,
-        &anonymous,
-        &path,
-        &Permission::READ,
-        extras,
-    )
-    .await
-    .is_ok()
-}
-
-/// Evaluates the loaded policies for one hit on the path the RBAC check used,
-/// under the S3 bucket-read action so one policy covers both read surfaces. A
-/// group with no loaded evaluator fails closed.
-fn policy_allows(
-    evaluators: &HashMap<(RealmId, GroupId), PolicyEvaluator>,
-    input: &SearchBucketsInput,
-    hit: &BucketSearchHit,
-) -> bool {
-    let path = candidate_path(input, hit.group_id, hit.node_id, &hit.bucket);
-    let mandatory = PolicyRequestExtras::operation("s3.ListBuckets");
-    let checks = std::iter::once(mandatory).chain(input.extras.clone());
-    let evaluator = evaluators.get(&(input.realm_id, hit.group_id));
-    checks.into_iter().all(|extras| {
-        let request = policy_request_with(&path, &Permission::READ, Some(&input.auth), extras);
-        evaluator.is_some_and(|evaluator| evaluator.evaluate(&request).is_ok())
-    })
 }
 
 impl Operation for SearchBucketsOperation {
@@ -630,6 +487,8 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
+    use crate::driver::DriverContext;
+    use crate::s3::bucket::local_search::{extras_valid, search_local_buckets, search_with_budget};
 
     fn scan_input(query: &str, limit: usize) -> SearchBucketsInput {
         let realm_id = RealmId::from_bytes([9u8; 32]);
@@ -1073,17 +932,17 @@ mod tests {
             params: [("cursor".to_string(), "c".to_string())].into(),
             ..PolicyRequestExtras::operation(operation)
         };
-        assert!(super::extras_valid(&tool("mcp:list_buckets")));
+        assert!(extras_valid(&tool("mcp:list_buckets")));
         for operation in ["s3.ListBuckets", "mcp:", "rest"] {
-            assert!(!super::extras_valid(&tool(operation)), "{operation}");
+            assert!(!extras_valid(&tool(operation)), "{operation}");
         }
         let mut headers = tool("mcp:list_buckets");
         headers.headers.insert("x".to_string(), "y".to_string());
-        assert!(!super::extras_valid(&headers));
+        assert!(!extras_valid(&headers));
         let body = PolicyRequestExtras {
             body: Some(serde_json::json!({})),
             ..tool("mcp:list_buckets")
         };
-        assert!(!super::extras_valid(&body));
+        assert!(!extras_valid(&body));
     }
 }
