@@ -2263,5 +2263,118 @@ mod tests {
             assert!(empty.step(waits(0)).is_empty());
             assert_eq!(empty.finalize(), Ok(0));
         }
+
+        fn park(keys: Vec<BucketKeyRef>) -> ParkJobOperation {
+            ParkJobOperation::new(b"job".to_vec(), job(Ulid::from_parts(1, 1)), keys, 100)
+        }
+
+        fn records_read(settings: &BucketEncryption, record: Option<BucketKeyRecord>) -> Event {
+            Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (
+                        b"bucket".to_vec().into(),
+                        Some(settings.to_bytes().unwrap().into()),
+                    ),
+                    (
+                        key().key().into(),
+                        record.map(|record| record.to_bytes().unwrap().into()),
+                    ),
+                ],
+            })
+        }
+
+        #[test]
+        fn stale_key_polls_later() {
+            // A key that is no longer the bucket's key leaves the job due after the poll delay.
+            let mut operation = park(vec![key()]);
+            operation.start();
+            let read = operation.step(started());
+            assert!(matches!(
+                read.as_slice(),
+                [Effect::Storage(StorageEffect::BatchRead {
+                    txn_id: Some(_),
+                    ..
+                })]
+            ));
+            let written = operation.step(records_read(&BucketEncryption::default(), None));
+            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice()
+            else {
+                panic!("expected the job write, got {written:?}");
+            };
+            assert_eq!(writes.len(), 1, "no wait row for a stale key");
+            let batch = Event::Storage(StorageEvent::BatchWriteResult {
+                entries: Vec::new(),
+            });
+            assert_eq!(operation.step(batch).as_slice(), [commit()]);
+            assert!(operation.step(committed()).is_empty());
+            let due = 100 + REPLICATION_POLL_AFTER.as_millis() as u64;
+            assert_eq!(operation.finalize(), Ok(Some(due)));
+        }
+
+        #[test]
+        fn park_errors_abort() {
+            let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
+            let timeout = || {
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                })
+            };
+            let mut checking = park(vec![key()]);
+            checking.start();
+            checking.step(started());
+            assert_eq!(checking.step(timeout()).as_slice(), [abort.clone()]);
+            assert_eq!(
+                checking.finalize(),
+                Err(BlobQueueError::Storage(StorageError::Timeout))
+            );
+            let mut starting = park(vec![key()]);
+            starting.start();
+            assert!(starting.step(timeout()).is_empty());
+            assert!(starting.finalize().is_err());
+        }
+
+        #[test]
+        fn locked_keys_stay_parked() {
+            // After the commit each key's status is read; no unlocked key leaves the job parked.
+            let mut operation = park(vec![key()]);
+            operation.state = ParkState::KeyStatus { index: 0 };
+            let locked = Event::Blob(BlobEvent::KeyStatus {
+                generations: Vec::new(),
+            });
+            assert!(operation.step(locked).is_empty());
+            assert_eq!(operation.finalize(), Ok(None));
+            let mut unlocked = park(vec![key()]);
+            unlocked.state = ParkState::KeyStatus { index: 0 };
+            let missing = Event::Blob(BlobEvent::Error(
+                aruna_core::errors::BlobError::HandleMissing,
+            ));
+            assert!(unlocked.step(missing).is_empty());
+            assert_eq!(unlocked.finalize(), Ok(None));
+        }
+
+        #[test]
+        fn park_contract() {
+            let checking = || {
+                let mut operation = park(vec![key()]);
+                operation.start();
+                operation.step(started());
+                operation
+            };
+            let refused = rejects_events(checking, sample_events, |event| {
+                matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }))
+            });
+            let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
+            assert!(
+                refused
+                    .iter()
+                    .all(|(_, effects, _)| effects.as_slice() == [abort.clone()])
+            );
+            let mut open = checking();
+            check_abort(&mut open, &[abort]);
+            rejects_finalize(open);
+            let mut fresh = park(vec![key()]);
+            check_abort(&mut fresh, &[]);
+            rejects_finalize(fresh);
+        }
     }
 }
