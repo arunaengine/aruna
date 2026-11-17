@@ -12,10 +12,12 @@ use crate::jobs::plugin_work::tests::ready_copy;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::retire_work;
+use crate::plugins::rows::values_result;
 use crate::plugins::rows::write_rows;
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::worker::sweep_marks;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::calls::IoCall;
 
 /// The current version of the copy's source object `in/a.txt`.
 async fn source_version(ctx: &DriverContext) -> Ulid {
@@ -107,21 +109,21 @@ fn mark_work_ended() {
         key: Some(b"mark".to_vec()),
         deleted: false,
     };
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
     // A gone work row ends the mark, which goes in the same transaction.
-    let delete = Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, b"mark".to_vec())]);
+    let delete = delete_call(vec![(PLUGIN_WORK_KEYSPACE, b"mark".to_vec())]);
     assert_eq!(
-        plan.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Ask(delete)
+        plan.next(values_result(vec![None])).unwrap(),
+        Next::Call(delete)
     );
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(true));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(true));
     let mut check = MarkEnded {
         lookup: WorkLookup::new(mark.install_id, mark.work_id),
         key: None,
         deleted: false,
     };
     assert_eq!(
-        check.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Finish(true)
+        check.next(values_result(vec![None])).unwrap(),
+        Next::Done(true)
     );
 }

@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{ADMIN_AUDIT_KEYSPACE, PLUGIN_HOOKS_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{HOOK_RETENTION_MS, HOOK_ROW, HOOK_TIME_ROW};
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, AuditIndex, audit_prefix};
@@ -11,8 +13,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
 use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, StoreError, Turn, decode, done, row, unexpected,
-    values,
+    Row, Scan, StoreError, decode, delete_call, done, page_call, page_of, read_call, row, values,
 };
 
 /// How long a node keeps the audit rows of the secret uses it served, like finished runs.
@@ -25,12 +26,12 @@ const AUDIT_CURSOR: &[u8] = b"c";
 
 /// One page of at most `page` use audit rows past their retention, deleted with its cursor in
 /// one transaction; answers how many records went and whether older rows may follow.
-pub(crate) fn prune_uses(now_ms: u64, page: usize) -> RowsOperation<PruneUses> {
-    RowsOperation::transaction(PruneUses {
+pub(crate) fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
+    PruneUses {
         cutoff: now_ms.saturating_sub(USE_AUDIT_RETENTION),
         page,
         phase: UsesPhase::Cursor,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -48,32 +49,34 @@ enum UsesPhase {
     Writing((usize, bool)),
 }
 
-impl Plan for PruneUses {
+impl Operation for PruneUses {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        let cursor = vec![(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec())];
-        Ok(Turn::Ask(Ask::Read(cursor)))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        let cursor = vec![(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec())];
+        Ok(Next::Call(read_call(cursor)))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         let prefix = audit_prefix(AuditIndex::Realm);
         match std::mem::replace(&mut self.phase, UsesPhase::Writing((0, false))) {
             UsesPhase::Cursor => {
                 let [after] = values::<1>(answer)?;
                 self.phase = UsesPhase::Page;
-                Ok(Turn::Ask(Ask::Page {
-                    space: ADMIN_AUDIT_KEYSPACE,
+                Ok(Next::Call(page_call(
+                    ADMIN_AUDIT_KEYSPACE,
                     prefix,
                     after,
-                    limit: self.page,
-                }))
+                    self.page,
+                )))
             }
             UsesPhase::Page => {
-                let Answer::Page(rows, next) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, next) = page_of(answer)?;
                 let (mut dropped, mut count, mut checked, mut young) = (Vec::new(), 0, None, false);
                 for (key, value) in rows {
                     let id = (key.get(prefix.len()..)).and_then(|id| <[u8; 16]>::try_from(id).ok());
@@ -94,16 +97,16 @@ impl Plan for PruneUses {
                     checked.map(|key| row(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec(), key));
                 let outcome = (count, !young && next.is_some());
                 self.phase = UsesPhase::Deleting(cursor.into_iter().collect(), outcome);
-                Ok(Turn::Ask(Ask::Delete(dropped)))
+                Ok(Next::Call(delete_call(dropped)))
             }
             UsesPhase::Deleting(cursor, outcome) => {
                 done(answer)?;
                 self.phase = UsesPhase::Writing(outcome);
-                Ok(Turn::Ask(Ask::Write(cursor)))
+                Ok(Next::Call(IoCall::Write(cursor)))
             }
             UsesPhase::Writing(outcome) => {
                 done(answer)?;
-                Ok(Turn::Finish(outcome))
+                Ok(Next::Done(outcome))
             }
         }
     }
@@ -111,18 +114,18 @@ impl Plan for PruneUses {
 
 /// Deletes the webhook delivery ids past their retention, and every one of a removing
 /// install; answers how many went.
-pub(crate) fn prune_hooks(config: &RealmConfigDocument, now_ms: u64) -> RowsOperation<PruneHooks> {
+pub(crate) fn prune_hooks(config: &RealmConfigDocument, now_ms: u64) -> PruneHooks {
     let mut removing: Vec<Ulid> = (config.installs.iter())
         .filter(|install| install.state == InstallState::Removing)
         .map(|install| install.install_id)
         .collect();
     removing.reverse();
-    RowsOperation::direct(PruneHooks {
+    PruneHooks {
         cutoff: now_ms.saturating_sub(HOOK_RETENTION_MS),
         removing,
         phase: HooksPhase::Times,
         pruned: 0,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -145,42 +148,35 @@ enum HooksPhase {
 }
 
 impl PruneHooks {
-    fn times() -> Ask {
-        Ask::Page {
-            space: PLUGIN_HOOKS_KEYSPACE,
-            prefix: vec![HOOK_TIME_ROW],
-            after: None,
-            limit: PAGE,
-        }
+    fn times() -> IoCall {
+        page_call(PLUGIN_HOOKS_KEYSPACE, vec![HOOK_TIME_ROW], None, PAGE)
     }
 
     /// The scan of the next removing install, or the outcome once none is left.
-    fn next_removing(&mut self) -> Turn<usize> {
+    fn next_removing(&mut self) -> Next<usize> {
         let Some(install_id) = self.removing.pop() else {
-            return Turn::Finish(self.pruned);
+            return Next::Done(self.pruned);
         };
         let prefix = [&[HOOK_ROW][..], &install_id.to_bytes()].concat();
         let scan = Scan::new(PLUGIN_HOOKS_KEYSPACE, prefix);
         let ask = scan.ask();
         self.phase = HooksPhase::Removing(scan);
-        Turn::Ask(ask)
+        Next::Call(ask)
     }
 }
 
-impl Plan for PruneHooks {
+impl Operation for PruneHooks {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
-        Ok(Turn::Ask(Self::times()))
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(Self::times()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, HooksPhase::DeletingRemoved) {
             HooksPhase::Times => {
-                let Answer::Page(rows, next) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, next) = page_of(answer)?;
                 let total = rows.len();
                 let old: Vec<Vec<u8>> = (rows.into_iter())
                     .map(|(key, _)| key)
@@ -193,13 +189,13 @@ impl Plan for PruneHooks {
                 let mut keys: Vec<_> = ids.map(|key| (PLUGIN_HOOKS_KEYSPACE, key)).collect();
                 keys.extend(old.into_iter().map(|key| (PLUGIN_HOOKS_KEYSPACE, key)));
                 self.phase = HooksPhase::DeletingOld(more);
-                Ok(Turn::Ask(Ask::Delete(keys)))
+                Ok(Next::Call(delete_call(keys)))
             }
             HooksPhase::DeletingOld(more) => {
                 done(answer)?;
                 if more {
                     self.phase = HooksPhase::Times;
-                    return Ok(Turn::Ask(Self::times()));
+                    return Ok(Next::Call(Self::times()));
                 }
                 Ok(self.next_removing())
             }
@@ -207,7 +203,7 @@ impl Plan for PruneHooks {
                 let Some(rows) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = HooksPhase::Removing(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 let (mut ids, mut times) = (Vec::new(), Vec::new());
                 for (key, value) in rows {
@@ -219,7 +215,7 @@ impl Plan for PruneHooks {
                 }
                 self.pruned += ids.len();
                 ids.append(&mut times);
-                Ok(Turn::Ask(Ask::Delete(ids)))
+                Ok(Next::Call(delete_call(ids)))
             }
             HooksPhase::DeletingRemoved => {
                 done(answer)?;
