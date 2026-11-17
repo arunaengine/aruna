@@ -3,16 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE,
     LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
     TRANSITION_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -21,8 +20,7 @@ use aruna_core::structs::storage::format::{Compression, CompressionMigration};
 use aruna_core::structs::storage::linked_job::LinkedJob;
 use aruna_core::structs::storage::transition::EncryptionTransition;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -44,8 +42,18 @@ pub enum StartMoveError {
     RuleChanged,
     #[error("a re-mapping or duplicate cleanup of the bucket runs")]
     JobRunning,
-    #[error("unexpected event: {0:?}")]
-    Unexpected(Box<Event>),
+    #[error("the storage move did not start: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for StartMoveError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// The move record that starts or resumes a move of the keys under `prefix`. An unfinished
@@ -119,17 +127,10 @@ pub fn check_movable(
     Ok(stored.map(CompressionMigration::from_bytes).transpose()?)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum StartMoveState {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Finish,
-}
+type Step = Result<Next<CompressionMigration>, StartMoveError>;
 
-/// Writes a move record for the keys of `bucket` under `prefix` and wakes the migration task.
+/// Writes a move record for the keys of `bucket` under `prefix` and wakes the migration task
+/// once the record committed.
 #[derive(Debug, PartialEq)]
 pub struct StartMoveOperation {
     bucket: String,
@@ -142,9 +143,8 @@ pub struct StartMoveOperation {
     /// Values read when the caller's access to the renamed files was checked; the move
     /// starts only while they are unchanged.
     guards: Vec<(String, Key, Option<Value>)>,
-    state: StartMoveState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<CompressionMigration, StartMoveError>>,
+    /// The record written; the write answer follows.
+    output: Option<CompressionMigration>,
 }
 
 impl StartMoveOperation {
@@ -156,8 +156,6 @@ impl StartMoveOperation {
             now_ms,
             renaming: None,
             guards: Vec::new(),
-            state: StartMoveState::Init,
-            txn_id: None,
             output: None,
         }
     }
@@ -181,51 +179,32 @@ impl StartMoveOperation {
         self
     }
 
-    fn fail(&mut self, error: StartMoveError) -> Effects {
-        self.state = StartMoveState::Finish;
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn write(&mut self, mut values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn write(&mut self, mut values: Vec<Option<Value>>) -> Step {
         let seen = values.split_off(values.len().saturating_sub(self.guards.len()));
         let expected = self.guards.iter().map(|(.., value)| value);
-        if seen.len() != self.guards.len() || !seen.iter().map(|(_, value)| value).eq(expected) {
-            return self.fail(StartMoveError::RuleChanged);
+        if seen.len() != self.guards.len() || !seen.iter().eq(expected) {
+            return Err(StartMoveError::RuleChanged);
         }
-        let total = values.pop().and_then(|(_, value)| value);
-        let total = match total.as_deref().map(RenameTotal::from_bytes).transpose() {
-            Ok(total) => total,
-            Err(error) => return self.fail(error.into()),
-        };
+        let total = values.pop().flatten();
+        let total = total.as_deref().map(RenameTotal::from_bytes).transpose()?;
         // A re-mapping or duplicate cleanup of the bucket holds it until it ends.
-        let linked = values.pop().and_then(|(_, value)| value);
-        match linked.as_deref().map(LinkedJob::from_bytes).transpose() {
-            Ok(Some(job)) if job.is_active() => return self.fail(StartMoveError::JobRunning),
-            Ok(_) => {}
-            Err(error) => return self.fail(error.into()),
+        let linked = values.pop().flatten();
+        if let Some(job) = linked.as_deref().map(LinkedJob::from_bytes).transpose()?
+            && job.is_active()
+        {
+            return Err(StartMoveError::JobRunning);
         }
-        match self.rows(values, total) {
-            Ok(writes) => {
-                self.state = StartMoveState::Write;
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            Err(error) => self.fail(error),
-        }
+        let writes = self.rows(values, total)?;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     /// The rows of the move; `planned` is the total an earlier start of a rename stored.
     fn rows(
         &mut self,
-        values: Vec<(Key, Option<Value>)>,
+        values: Vec<Option<Value>>,
         planned: Option<RenameTotal>,
     ) -> Result<Vec<(String, Key, Value)>, StartMoveError> {
-        let Ok([info, settings, transition, stored]) =
-            <[_; 4]>::try_from(values).map(|values| values.map(|(_, value)| value))
-        else {
+        let Ok([info, settings, transition, stored]) = <[_; 4]>::try_from(values) else {
             return Err(StartMoveError::NotFinished);
         };
         let info = info.ok_or(StartMoveError::NoSuchBucket)?;
@@ -265,82 +244,43 @@ impl StartMoveOperation {
                 total.to_bytes()?.into(),
             ));
         }
-        self.output = Some(Ok(record));
+        self.output = Some(record);
         Ok(writes)
     }
 }
 
-impl EffectOperation for StartMoveOperation {
+impl Operation for StartMoveOperation {
     type Output = CompressionMigration;
     type Error = StartMoveError;
 
-    fn start(&mut self) -> Effects {
-        self.state = StartMoveState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        let guards = (self.guards.iter()).map(|(space, key, _)| (space.clone(), key.clone()));
+        let mut reads = move_reads(&self.bucket);
+        let key: Key = self.bucket.as_bytes().to_vec().into();
+        reads.push((LINKED_JOB_KEYSPACE.to_string(), key.clone()));
+        reads.push((RENAME_TOTAL_KEYSPACE.to_string(), key));
+        reads.extend(guards);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (
-                StartMoveState::Start,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = StartMoveState::Read;
-                let guards = self
-                    .guards
-                    .iter()
-                    .map(|(space, key, _)| (space.clone(), key.clone()));
-                let mut reads = move_reads(&self.bucket);
-                let key: Key = self.bucket.as_bytes().to_vec().into();
-                reads.push((LINKED_JOB_KEYSPACE.to_string(), key.clone()));
-                reads.push((RENAME_TOTAL_KEYSPACE.to_string(), key));
-                reads.extend(guards);
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (StartMoveState::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.write(values)
-            }
-            (StartMoveState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(StartMoveError::NotFinished);
-                };
-                self.state = StartMoveState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (StartMoveState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = StartMoveState::Finish;
-                smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                    key: TaskKey::MigrateCompression,
-                    after: Duration::ZERO,
-                })]
-            }
-            (_, event) => self.fail(StartMoveError::Unexpected(Box::new(event))),
-        }
+    fn next(&mut self, result: IoResult) -> Step {
+        let Some(record) = self.output.take() else {
+            return self.write(result.values()?);
+        };
+        result.done()?;
+        let wake = TaskEffect::ShortenTimer {
+            key: TaskKey::MigrateCompression,
+            after: Duration::ZERO,
+        };
+        let calls = vec![IoCall::Effect(Box::new(Effect::Task(wake)))];
+        Ok(Next::Then {
+            output: record,
+            calls,
+        })
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == StartMoveState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            StartMoveState::Finish => self.output.unwrap_or(Err(StartMoveError::NotFinished)),
-            _ => Err(StartMoveError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
@@ -426,8 +366,7 @@ mod tests {
                 operation = operation.renaming((asker(), node()), grant(), 3);
             }
             let info = Some(info.to_bytes().unwrap().into());
-            let values = vec![(Key::from(vec![]), info), (vec![].into(), None)];
-            let values = [values, vec![(vec![].into(), None), (vec![].into(), None)]].concat();
+            let values = vec![info, None, None, None];
             let writes = operation.rows(values, None).unwrap();
             let asked = writes
                 .iter()
@@ -462,8 +401,7 @@ mod tests {
             let mut operation = operation.renaming((asker(), node()), grant(), 3);
             let info = Some(info.to_bytes().unwrap().into());
             let stored = Some(running.to_bytes().unwrap().into());
-            let values = vec![(vec![].into(), info), (vec![].into(), None)];
-            let values = [values, vec![(vec![].into(), None), (vec![].into(), stored)]].concat();
+            let values = vec![info, None, None, stored];
             let total = RenameTotal {
                 started_at_ms,
                 total: 10,
@@ -489,21 +427,16 @@ mod tests {
         let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7)
             .renaming((asker(), node()), grant(), 0)
             .with_guards(vec![guard]);
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(1),
-        }));
-        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-            panic!("expected the reads, got {effects:?}")
+        assert!(operation.transaction());
+        let first = operation.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &first else {
+            panic!("expected the reads, got {first:?}")
         };
         assert_eq!(reads.last().map(|(space, _)| space.as_str()), Some("rules"));
-        let mut values: Vec<(Key, Option<Value>)> = vec![(vec![].into(), None); 6];
-        values.push((vec![1].into(), Some(vec![3].into())));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        assert!(matches!(
-            operation.output,
-            Some(Err(StartMoveError::RuleChanged))
-        ));
+        let mut values: Vec<Option<Value>> = vec![None; 6];
+        values.push(Some(vec![3].into()));
+        let refused = operation.next(IoResult::Values(values));
+        assert_eq!(refused, Err(StartMoveError::RuleChanged));
     }
 
     #[test]
