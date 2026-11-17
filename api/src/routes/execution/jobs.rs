@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
@@ -29,7 +30,6 @@ use aruna_operations::jobs::service::{
     read_report_routed, resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};

@@ -25,8 +25,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
-use crate::node::read_info::ReadInfoOperation;
 use crate::placement::process_placements::load_realm_config;
+use aruna_core::node_state::ReadInfoOperation;
 
 /// How long an issued delegation is valid.
 pub const DELEGATION_SECS: u64 = 15;

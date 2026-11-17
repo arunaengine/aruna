@@ -24,7 +24,7 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::node::drain_state::OPERATOR_DRAIN_KEY;
+use aruna_core::node_state::OPERATOR_DRAIN_KEY;
 
 /// The newest advertisement revision not yet handed to replication. It is written in the same
 /// transaction as that revision, so a failure after the commit only delays the publish.

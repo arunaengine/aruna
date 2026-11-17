@@ -29,7 +29,7 @@ use crate::jobs::records::{
     AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation, load_kind_complete,
 };
 use crate::jobs::store::iter_prefix_page;
-use crate::node::read_info::ReadInfoOperation;
+use aruna_core::node_state::ReadInfoOperation;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;

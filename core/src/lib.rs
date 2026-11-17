@@ -33,6 +33,7 @@ pub mod keyspaces;
 pub mod link;
 pub mod metadata;
 pub mod metrics;
+pub mod node_state;
 pub mod node_vault;
 pub mod onboarding;
 pub mod operation;

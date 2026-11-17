@@ -53,10 +53,10 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
-use crate::node::drain_state::DrainStateOperation;
-use crate::node::read_info::ReadInfoOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
+use aruna_core::node_state::DrainStateOperation;
+use aruna_core::node_state::ReadInfoOperation;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);

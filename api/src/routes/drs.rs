@@ -9,6 +9,7 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
@@ -26,7 +27,6 @@ use aruna_operations::distribution::ticket::{
 };
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
-use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;

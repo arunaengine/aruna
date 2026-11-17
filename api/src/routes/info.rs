@@ -15,6 +15,7 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
@@ -31,7 +32,6 @@ use aruna_operations::federation::totals::data_totals;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
-use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,

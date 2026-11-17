@@ -36,8 +36,8 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::blob::holders::GetHoldersOperation;
 use crate::driver::{DriverContext, drive};
 use crate::node::heartbeat::{fresh_heartbeats, live_telemetry};
-use crate::node::read_info::ReadInfoOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
+use aruna_core::node_state::ReadInfoOperation;
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";

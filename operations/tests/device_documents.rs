@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmNodeKind;
@@ -22,7 +23,6 @@ use aruna_operations::device::realm_documents::{fetch_realm_documents, realm_rem
 use aruna_operations::driver::drive;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::node::node_info::seed_info_document;
-use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };

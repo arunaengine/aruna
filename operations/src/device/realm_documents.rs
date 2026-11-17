@@ -38,9 +38,9 @@ use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
 use crate::node::node_info::write_info_document;
-use crate::node::read_info::ReadInfoOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
+use aruna_core::node_state::ReadInfoOperation;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a

@@ -16,9 +16,9 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
 use crate::metadata::api::load_realm_config;
-use crate::node::drain_state::DrainStateOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::node_state::DrainStateOperation;
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.

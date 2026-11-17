@@ -46,13 +46,13 @@ use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
-use crate::node::drain_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
 use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
 use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -940,10 +940,10 @@ pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::drain_state::DrainStateOperation;
     use crate::node::info_write::PUBLISH_OWED_KEY;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::node_state::DrainStateOperation;
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::record::{

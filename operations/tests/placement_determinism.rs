@@ -9,6 +9,7 @@ use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -23,7 +24,6 @@ use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
 use aruna_operations::node::node_info::seed_info_document;
-use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::mutate_placement::{
