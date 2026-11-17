@@ -15,14 +15,14 @@ use aruna_core::keyspaces::{
     PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
-    ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
-    JobErrorKind, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord, JobRecordEnvelope,
-    JobRecordError, JobResultPayload, JobState, JobTransitionError, LaunchRecord, RunCrateStatus,
-    attempt_control_key, cleanup_dedup_key, cleanup_job_id, crate_dedup_key, crate_job_id,
-    due_index_key, encode_dedup_value, job_active_key, job_entry_key, job_entry_prefix,
-    job_owner_cursor, job_prune_key, job_record_key, job_wait_key, lease_index_key,
-    owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key, parse_owner_key,
-    rocrate_plan_key, run_crate_key, validate_transition, workspace_credential_id,
+    ActiveJobKind, AttemptControl, AttemptIntent, ClaimGuard, GLOBAL_DEDUP_PREFIX, JobClaim,
+    JobError, JobErrorKind, JobExecutionClass, JobId, JobPayload, JobProgress, JobRecord,
+    JobRecordEnvelope, JobRecordError, JobResultPayload, JobState, JobTransitionError,
+    LaunchRecord, RunCrateStatus, attempt_control_key, cleanup_dedup_key, cleanup_job_id,
+    crate_dedup_key, crate_job_id, due_index_key, encode_dedup_value, job_active_key,
+    job_entry_key, job_entry_prefix, job_owner_cursor, job_prune_key, job_record_key, job_wait_key,
+    lease_index_key, owner_index_key, owner_index_prefix, parse_dedup_value, parse_entry_key,
+    parse_owner_key, rocrate_plan_key, run_crate_key, validate_transition, workspace_credential_id,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::storage_purge::StoragePurgeCheckpoint;
@@ -53,44 +53,6 @@ pub use state::*;
 
 pub(super) type JobWrites = Vec<(KeySpace, Key, Value)>;
 pub(super) type JobDeletes = Vec<(KeySpace, Key)>;
-
-/// The claim row a page import guards on, so lease renewals and progress flushes,
-/// which rewrite only the job record, never conflict with a page commit.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClaimGuard {
-    pub claim_token: Ulid,
-    pub created_at_ms: u64,
-}
-
-impl ClaimGuard {
-    pub(crate) fn of(record: &JobRecord) -> Option<Self> {
-        let claim = record.claim.as_ref().filter(|_| !record.is_settled())?;
-        Some(Self {
-            claim_token: claim.claim_token,
-            created_at_ms: record.created_at_ms,
-        })
-    }
-
-    fn write(record: &JobRecord) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
-        let Some(guard) = Self::of(record) else {
-            return Ok(None);
-        };
-        let value = ByteView::from(guard.to_bytes()?);
-        Ok(Some((
-            JOB_CLAIM_KEYSPACE.to_string(),
-            job_record_key(record.job_id),
-            value,
-        )))
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ArtifactTombstone {

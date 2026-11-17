@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::keyspaces::JOB_CLAIM_KEYSPACE;
+use crate::types::{KeySpace, Value};
 
 const ATTEMPT_FENCE_DOMAIN: &[u8] = b"aruna-attempt-fence-v1";
 
@@ -792,6 +794,44 @@ pub fn job_record_key(job_id: JobId) -> Key {
     bytes.extend_from_slice(RECORD_KEY_PREFIX);
     bytes.extend_from_slice(&job_id.to_bytes());
     ByteView::from(bytes)
+}
+
+/// The claim row a page import guards on, so lease renewals and progress flushes,
+/// which rewrite only the job record, never conflict with a page commit.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClaimGuard {
+    pub claim_token: Ulid,
+    pub created_at_ms: u64,
+}
+
+impl ClaimGuard {
+    pub fn of(record: &JobRecord) -> Option<Self> {
+        let claim = record.claim.as_ref().filter(|_| !record.is_settled())?;
+        Some(Self {
+            claim_token: claim.claim_token,
+            created_at_ms: record.created_at_ms,
+        })
+    }
+
+    pub fn write(record: &JobRecord) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+        let Some(guard) = Self::of(record) else {
+            return Ok(None);
+        };
+        let value = ByteView::from(guard.to_bytes()?);
+        Ok(Some((
+            JOB_CLAIM_KEYSPACE.to_string(),
+            job_record_key(record.job_id),
+            value,
+        )))
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 /// Side-row key holding the run-crate obligation status for an execution job.

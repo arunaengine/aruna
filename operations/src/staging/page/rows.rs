@@ -9,7 +9,6 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::jobs::store::ClaimGuard;
 use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
@@ -22,6 +21,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, JOB_CLAIM_KEYSPACE, PURGE_FENCE_KEYSPACE,
     S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
+use aruna_core::structs::execution::job::ClaimGuard;
 use aruna_core::structs::execution::job::{
     JobId, StagingJobCheckpoint, StagingJobError, job_record_key,
 };

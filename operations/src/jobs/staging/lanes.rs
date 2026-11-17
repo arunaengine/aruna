@@ -704,8 +704,8 @@ mod tests {
     // The run after a conflict checks every guard again: a claim lost meanwhile stops it.
     #[tokio::test]
     async fn retry_rechecks_guards() {
-        use crate::jobs::store::ClaimGuard;
         use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::ClaimGuard;
         use aruna_core::structs::execution::job::job_record_key;
         let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
         let input = page_input(&ctx, &spec).await;
@@ -805,9 +805,9 @@ mod tests {
     #[tokio::test]
     async fn waiting_rechecks_guards() {
         use crate::driver::drive;
-        use crate::jobs::store::ClaimGuard;
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::JOB_CLAIM_KEYSPACE;
+        use aruna_core::structs::execution::job::ClaimGuard;
         use aruna_core::structs::execution::job::job_record_key;
         let (ctx, spec, _dir) = job_context(UNUSED.to_string(), &[("a", "ta")], None).await;
         let input = page_input(&ctx, &spec).await;
