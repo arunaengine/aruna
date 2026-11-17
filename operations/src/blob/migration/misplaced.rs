@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{encrypting, move_routing, place, read_earlier, renames, source_key, stays};
+use super::drain::{encrypting, move_routing, read_earlier};
+use super::{place, renames, source_key, stays};
 use crate::blob::records::blob_location_read;
 use crate::driver::DriverContext;
 use aruna_core::effects::StorageEffect;
@@ -69,7 +70,7 @@ pub async fn count_misplaced(
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
     loop {
-        let (versions, next) = crate::jobs::store::query::iter_prefix_page(
+        let (versions, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(scan.clone().into()),
@@ -164,7 +165,7 @@ async fn read(
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("could not read {key_space}: {other:?}")),
+        other => Err(format!("could not read {key_space}: {}", other.label())),
     }
 }
 
@@ -183,7 +184,7 @@ async fn read_location(
                 .map_err(|error| error.to_string()),
             None => Ok(None),
         },
-        other => Err(format!("could not read a location: {other:?}")),
+        other => Err(format!("could not read a location: {}", other.label())),
     }
 }
 
@@ -271,7 +272,7 @@ pub async fn rename_page(
     let prefix = object_prefix(rule.import_id);
     let mut start = None::<Key>;
     loop {
-        let (rows, next) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             IMPORTED_OBJECT_KEYSPACE,
             Some(prefix.clone()),
@@ -422,7 +423,10 @@ async fn batch(
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
-        other => Err(format!("could not read the plan's records: {other:?}")),
+        other => Err(format!(
+            "could not read the plan's records: {}",
+            other.label()
+        )),
     }
 }
 

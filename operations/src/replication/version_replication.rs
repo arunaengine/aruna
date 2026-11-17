@@ -3,15 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::enforcement::PolicyEvaluator;
-use crate::auth::permission_rules::{
-    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
-};
+use crate::auth::permission_rules::PermissionRules;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
@@ -19,13 +16,13 @@ use crate::placement::policy::{
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectMetadata, ReferenceAdvance, ReplicationMode, SyncOrigin,
-    VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
+    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
+    VersionReplicationMessage, VersionReplicationRequest,
 };
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
@@ -64,12 +61,16 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ReplicationFailure, ReplicationItemError, ReplicationItemKind,
     ReplicationNegotiationResult, ReplicationSuboperationResult,
 };
+use aruna_core::structs::storage::replication_queue::{
+    ReferenceAdvance, ReplicationMode, SyncOrigin,
+};
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;
@@ -89,11 +90,11 @@ pub(crate) enum SourceAuthorizationError {
 }
 
 pub(crate) struct SourceAuthorization {
-    group_id: GroupId,
-    source_node_id: NodeId,
-    auth_context: AuthContext,
-    permissions: PermissionRules,
-    policies: PolicyEvaluator,
+    pub(super) group_id: GroupId,
+    pub(super) source_node_id: NodeId,
+    pub(super) auth_context: AuthContext,
+    pub(super) permissions: PermissionRules,
+    pub(super) policies: PolicyEvaluator,
 }
 
 // Compiled rules and evaluators are derived state; identity fields decide equality.
@@ -117,33 +118,6 @@ impl std::fmt::Debug for SourceAuthorization {
 }
 
 impl SourceAuthorization {
-    pub(crate) async fn load(
-        context: &DriverContext,
-        auth_context: AuthContext,
-        group_id: GroupId,
-        source_node_id: NodeId,
-    ) -> Result<Self, SourceAuthorizationError> {
-        let permissions = drive(
-            PermissionRulesOperation::new(PermissionRulesConfig {
-                auth_context: auth_context.clone(),
-                path: format!("/{}/g/{group_id}", auth_context.realm_id),
-            }),
-            context,
-        )
-        .await
-        .map_err(permission_error)?;
-        let policies = PolicyEvaluator::load(context, auth_context.realm_id, Some(group_id))
-            .await
-            .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
-        Ok(Self {
-            group_id,
-            source_node_id,
-            auth_context,
-            permissions,
-            policies,
-        })
-    }
-
     pub(crate) fn group_id(&self) -> GroupId {
         self.group_id
     }
@@ -168,16 +142,6 @@ impl SourceAuthorization {
         self.policies
             .evaluate(&request)
             .map_err(|_| SourceAuthorizationError::Denied)
-    }
-}
-
-fn permission_error(error: AuthorizationError) -> SourceAuthorizationError {
-    match error {
-        AuthorizationError::DocNotFound
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::InvalidRealmId => SourceAuthorizationError::Denied,
-        other => SourceAuthorizationError::Unavailable(other.to_string()),
     }
 }
 
@@ -264,24 +228,6 @@ struct SyncTransferContext {
     distribution: Option<Publication>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ReplicateScopeTarget {
-    Bucket,
-    Prefix(String),
-    Object { key: String },
-    Version { key: String, version_id: Ulid },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicateScopeInput {
-    pub bucket: String,
-    pub target: ReplicateScopeTarget,
-    pub target_node_id: NodeId,
-    pub auth_context: AuthContext,
-    pub replicate_delete_markers: bool,
-    pub mode: ReplicationMode,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicateScopeResult {
     pub replicated: u64,
@@ -312,11 +258,11 @@ pub enum ReplicateScopeError {
     ScopeLimit { limit: usize },
     #[error("operation did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -387,7 +333,7 @@ impl Operation for ReplicateScopeOperation {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(value) = value else {
@@ -413,14 +359,14 @@ impl Operation for ReplicateScopeOperation {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let ReplicateScopeTarget::Object { key } = &self.input.target else {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "ReplicateScopeTarget::Object",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 debug!(
@@ -437,7 +383,7 @@ impl Operation for ReplicateScopeOperation {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
 
@@ -486,7 +432,7 @@ impl Operation for ReplicateScopeOperation {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::IterResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
 
@@ -555,7 +501,7 @@ impl Operation for ReplicateScopeOperation {
                     return self.fail(ReplicateScopeError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::SubOperation(SubOperationEvent::ReplicationItemResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
 
@@ -658,11 +604,11 @@ pub enum ReplicateObjectError {
     PartCountMismatch { expected: usize, actual: usize },
     #[error("operation did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("plaintext_required")]
     PlaintextRefused,
@@ -1527,7 +1473,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let settings = match BucketEncryption::from_row(value.as_deref()) {
@@ -1597,7 +1543,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1642,7 +1588,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1652,7 +1598,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         if self.reference_advance.is_some() {
@@ -1710,7 +1656,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
-                received: event,
+                received: (event).label(),
             });
         };
         match result {
@@ -1733,7 +1679,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         }
         match parse_read(event, BucketInfo::from_bytes) {
@@ -1886,7 +1832,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -1944,7 +1890,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::WriteFinished)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -2401,7 +2347,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(value) = value else {
@@ -2531,7 +2477,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(value) = value else {
@@ -2588,7 +2534,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let (copy, subject) = match split_serve_reads(values) {
@@ -2618,7 +2564,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.multipart_summary = value
@@ -2642,7 +2588,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -2673,7 +2619,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let current_lookup = value
@@ -2709,7 +2655,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ConnectionEstablished)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.stream_id = Some(stream_id);
@@ -2734,7 +2680,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event,
+                received: (event).label(),
             });
         };
         debug!(
@@ -2753,7 +2699,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageReceived)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -2765,10 +2711,11 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "VersionReplicationMessage::VersionNegotiationResponse",
-                received: Event::Blob(BlobEvent::MessageReceived {
+                received: (Event::Blob(BlobEvent::MessageReceived {
                     stream_id: self.stream_id.expect("stream id available"),
                     payload,
-                }),
+                }))
+                .label(),
             });
         };
 
@@ -2865,7 +2812,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let settings = match BucketEncryption::from_row(value.as_deref()) {
@@ -2933,7 +2880,7 @@ impl ReplicateObjectOperation {
                 return self.fail(ReplicateObjectError::InvalidStateEvent {
                     state: self.state_name(),
                     expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                    received: other,
+                    received: (other).label(),
                 });
             }
         };
@@ -2994,7 +2941,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -3004,7 +2951,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let location = match value.map(|value| BackendLocation::from_bytes(&value)) {
@@ -3046,7 +2993,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -3059,7 +3006,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Task(TaskEvent::TimerScheduled)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -3069,7 +3016,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ReplicationFinished)",
-                received: event,
+                received: (event).label(),
             });
         };
         debug!(
@@ -3092,7 +3039,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageReceived)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -3124,10 +3071,11 @@ impl ReplicateObjectOperation {
             Ok(_) => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "VersionReplicationMessage::VersionApplyComplete|VersionApplyRejected",
-                received: Event::Blob(BlobEvent::MessageReceived {
+                received: (Event::Blob(BlobEvent::MessageReceived {
                     stream_id: self.stream_id.expect("stream id available"),
                     payload,
-                }),
+                }))
+                .label(),
             }),
             Err(err) => self.fail(err.into()),
         }
@@ -3146,7 +3094,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::DeleteFinished|Error)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -3158,7 +3106,7 @@ impl ReplicateObjectOperation {
             other => self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -3168,7 +3116,7 @@ impl ReplicateObjectOperation {
             return self.fail(ReplicateObjectError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ConnectionClosed)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.state = ReplicateObjectState::Finish;
@@ -3193,10 +3141,7 @@ mod tests {
         target_key,
     };
     use crate::driver::DriverContext;
-    use crate::replication::protocol::{
-        ReferenceAdvance, ReplicationMode, SyncOrigin, VersionReplicationMessage,
-        VersionReplicationRequest,
-    };
+    use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -3231,6 +3176,9 @@ mod tests {
     use aruna_core::structs::storage::replication::{
         ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
         ReplicationSuboperationResult,
+    };
+    use aruna_core::structs::storage::replication_queue::{
+        ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
     use aruna_core::types::Effects;
@@ -4559,8 +4507,8 @@ mod tests {
     fn page_matches_single() {
         // A reference page carries exactly the manifest a single delivery of the job sends.
         use crate::replication::page::build::reference_manifest;
-        use crate::replication::queue::BlobJobRecord;
         use aruna_core::structs::storage::distribution::OriginalEpoch;
+        use aruna_core::structs::storage::replication_queue::BlobJobRecord;
         let version_id = Ulid::generate();
         let publication = Publication {
             set_id: Ulid::from_bytes([4; 16]),

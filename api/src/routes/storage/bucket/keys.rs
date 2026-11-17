@@ -23,16 +23,15 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::holders::lookup_keys;
-use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
-use aruna_operations::s3::bucket::key_grant::{GrantError, GrantHolderOperation, GrantInput};
-use aruna_operations::s3::bucket::key_lock::{LockBucketOperation, LockError, LockInput};
-use aruna_operations::s3::bucket::key_removal::{
+use aruna_operations::s3::bucket::holders::LookupKeysOperation;
+use aruna_operations::s3::bucket::key::extend::{ExtendBucketOperation, ExtendError, ExtendInput};
+use aruna_operations::s3::bucket::key::grant::{GrantError, GrantHolderOperation, GrantInput};
+use aruna_operations::s3::bucket::key::lock::{LockBucketOperation, LockError, LockInput};
+use aruna_operations::s3::bucket::key::removal::{
     RemovalError, RemovalInput, RemoveHolderOperation,
 };
-use aruna_operations::s3::bucket::key_unlock::{
-    UnlockBucketOperation, UnlockError, UnlockInput, unlock_and_wake,
-};
+use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
+use aruna_operations::s3::bucket::key::wake::activate_and_wake;
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
 use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
@@ -311,7 +310,7 @@ pub async fn unlock_bucket(
     let operation = UnlockBucketOperation::new(input, private_key);
     let origin = (state.get_realm_id(), state.get_node_id());
     let context = state.get_ctx();
-    let status = unlock_and_wake(&context, operation, origin, state.rocrate_limits())
+    let status = activate_and_wake(&context, operation, origin, state.rocrate_limits())
         .await
         .map_err(|error| match error {
             UnlockError::Settings(error) => settings_refusal(error),
@@ -351,13 +350,13 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let input = SealMissingInput {
         bucket: bucket.to_string(),
         group_id,
@@ -566,13 +565,13 @@ pub async fn grant_holder(
     }
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let mut lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let mut lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), [user_id]),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        [user_id],
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let lookup = lookups.remove(&user_id).unwrap_or(KeyLookup::Unavailable);
     let has_recovery = match &lookup {
         KeyLookup::Keys(keys) => Some(keys.iter().any(|key| key.has_recovery)),
@@ -659,13 +658,13 @@ pub async fn remove_holder(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let input = RemovalInput {
         bucket,
         group_id,

@@ -10,6 +10,7 @@ use aruna_core::metadata::MetadataQuadOp;
 use aruna_core::metadata::ProfileValidationCompleteness;
 use aruna_core::metadata::ProfileValidationState;
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::is_rocrate_specification;
 use aruna_core::profile_shapes::CRAQLE_BASE_IRI;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;

@@ -49,7 +49,7 @@ use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::blob_request::BlobRequest;
 use crate::placement::policy::GateOperation;
 use crate::placement::policy::{GateContext, PolicyGateError};
-use crate::replication::queue::complete_put;
+use crate::replication::live_queue::complete_put;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::imports::discovery::read_discovery;
 use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
@@ -1454,7 +1454,7 @@ async fn candidates(
     let mut rows = Vec::new();
     let mut after = None;
     loop {
-        let page = super::store::query::iter_prefix_page(
+        let page = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(prefix.clone().into()),
@@ -2053,7 +2053,7 @@ async fn sharing_now(
     let mut found = std::collections::BTreeSet::new();
     let mut after = None;
     loop {
-        let page = super::store::query::iter_prefix_page(
+        let page = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BACKEND_IMPORT_KEYSPACE,
             Some(rule.group_id.to_bytes().to_vec().into()),

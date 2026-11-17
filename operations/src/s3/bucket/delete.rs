@@ -84,11 +84,11 @@ pub enum DeleteBucketError {
     NotEmpty,
     #[error("Transaction id missing")]
     TransactionMissing,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: DeleteBucketState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
@@ -188,7 +188,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -209,7 +209,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let mut values = values.into_iter().map(|(_, value)| value);
@@ -249,7 +249,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -277,7 +277,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -310,7 +310,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -357,7 +357,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let incoming = self.state == DeleteBucketState::ScanInRelationships;
@@ -434,7 +434,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         match BucketEncryption::from_row(value.as_deref()) {
@@ -472,7 +472,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(&key_space) = self.key_spaces.last() else {
@@ -524,7 +524,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         for (_, value) in values {
@@ -563,7 +563,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let mut writes: Vec<(String, Key, Value)> = Vec::new();
@@ -671,7 +671,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.read_encryption()
@@ -682,7 +682,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -808,7 +808,7 @@ impl DeleteBucketOperation {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -877,7 +877,7 @@ impl Operation for DeleteBucketOperation {
                 received => self.emit_error(DeleteBucketError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                    received,
+                    received: received.label(),
                 }),
             },
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
@@ -889,7 +889,7 @@ impl Operation for DeleteBucketOperation {
                 (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::WriteResult)",
-                    received: event,
+                    received: (event).label(),
                 }),
             },
             DeleteBucketState::ReadMembers => match (event, self.txn_id) {
@@ -899,7 +899,7 @@ impl Operation for DeleteBucketOperation {
                 (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::ReadResult)",
-                    received: event,
+                    received: (event).label(),
                 }),
             },
             DeleteBucketState::QueueNotices => match (event, self.txn_id) {
@@ -909,7 +909,7 @@ impl Operation for DeleteBucketOperation {
                 (event, _) => self.emit_error(DeleteBucketError::InvalidStateEvent {
                     state: self.state.clone(),
                     expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                    received: event,
+                    received: (event).label(),
                 }),
             },
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),

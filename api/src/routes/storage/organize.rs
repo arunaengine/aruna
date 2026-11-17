@@ -17,7 +17,8 @@ use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::linked::{
-    BucketJob, BucketJobOperation, LinkedAction, LinkedError, read_bucket_job, rename_total,
+    BucketJob, BucketJobOperation, LinkedAction, LinkedError, RenameTotalOperation,
+    ShownJobOperation,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
 use aruna_operations::s3::imports::discovery::bucket_access;
@@ -650,7 +651,7 @@ pub async fn get_job(
 ) -> ServerResult<Json<Option<OrganizeJob>>> {
     let (rule, ..) = caller(&state, auth, (&group_id, &import_id)).await?;
     let context = state.get_ctx();
-    let job = read_bucket_job(&context, &rule.bucket)
+    let job = drive(ShownJobOperation::new(&rule.bucket), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     match job {
@@ -668,7 +669,8 @@ async fn shown(
 ) -> ServerResult<OrganizeJob> {
     let total = match &job {
         BucketJob::Rename(record, _) => {
-            let total = rename_total(context, bucket, record.started_at_ms).await;
+            let read = RenameTotalOperation::new(bucket, record.started_at_ms);
+            let total = drive(read, context).await;
             total.map_err(|error| ServerError::InternalError(error.into()))?
         }
         _ => None,
@@ -838,7 +840,7 @@ async fn file_keys(
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
-    let intents = aruna_operations::jobs::store::query::iter_prefix_page(
+    let intents = aruna_operations::storage_read::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(
@@ -861,7 +863,7 @@ async fn file_keys(
         keys.push(intent.key);
     }
     // A pending write to the path names its key too.
-    let intents = aruna_operations::jobs::store::query::iter_prefix_page(
+    let intents = aruna_operations::storage_read::iter_prefix_page(
         &context.storage_handle,
         aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE,
         Some(aruna_core::structs::storage::backend_import::intent_prefix(

@@ -60,11 +60,11 @@ pub enum HeadObjectError {
         current: HeadObjectState,
         expected: HeadObjectState,
     },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: HeadObjectState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -176,7 +176,7 @@ impl HeadObjectOperation {
             LookupError::InvalidEvent(received) => HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected,
-                received,
+                received: received.label(),
             },
             LookupError::Missing => HeadObjectError::HeadObjectFailed,
         }
@@ -228,7 +228,7 @@ impl HeadObjectOperation {
             self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             })
         }
     }
@@ -238,7 +238,7 @@ impl HeadObjectOperation {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -267,7 +267,7 @@ impl HeadObjectOperation {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -533,7 +533,7 @@ impl HeadObjectOperation {
             self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             })
         }
     }
@@ -552,7 +552,7 @@ impl HeadObjectOperation {
             other => self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }
@@ -585,7 +585,7 @@ impl HeadObjectOperation {
             other => self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: other,
+                received: (other).label(),
             }),
         }
     }

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::replication::dht_registration::dht_registration_effect;
+use crate::blob::holders::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -27,10 +27,11 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use crate::blob::release::release_renamed;
+use crate::blob::trail::DropTrailOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{backend_key, parse_read};
-use crate::jobs::store::query::iter_prefix_page;
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use crate::storage_read::iter_prefix_page;
 use aruna_core::time::unix_timestamp_millis;
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
@@ -77,7 +78,7 @@ async fn drop_rows(
     };
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(false),
-        other => Err(format!("could not drop rows: {other:?}")),
+        other => Err(format!("could not drop rows: {}", other.label())),
     }
 }
 
@@ -206,7 +207,10 @@ async fn read_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("could not read the cleanup cursor: {other:?}")),
+        other => Err(format!(
+            "could not read the cleanup cursor: {}",
+            other.label()
+        )),
     }
 }
 
@@ -229,7 +233,10 @@ async fn store_cursor(context: &DriverContext, cursor: Option<Key>) -> Result<()
         Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
             Ok(())
         }
-        other => Err(format!("could not store the cleanup cursor: {other:?}")),
+        other => Err(format!(
+            "could not store the cleanup cursor: {}",
+            other.label()
+        )),
     }
 }
 
@@ -361,7 +368,10 @@ async fn delete_cleanup_rows(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected cleanup delete event: {other:?}")),
+        other => Err(format!(
+            "unexpected cleanup delete event: {}",
+            other.label()
+        )),
     }
 }
 
@@ -473,7 +483,7 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             }
         }
         BlobCleanupWork::SettleMove { version, intents } => {
-            match crate::blob::migration::settle_move(context, &version, &intents).await {
+            match crate::blob::migration::drain::settle_move(context, &version, &intents).await {
                 Ok(true) => RowOutcome::Done,
                 Ok(false) => RowOutcome::Kept,
                 Err(error) => {
@@ -504,9 +514,8 @@ async fn run_cleanup_work(context: &DriverContext, work: BlobCleanupWork) -> Row
             bucket,
             incarnation,
         } => {
-            match crate::blob::trail::drop_trail(context, group_id, bucket.as_deref(), incarnation)
-                .await
-            {
+            let drop = DropTrailOperation::new(group_id, bucket.as_deref(), incarnation);
+            match drive(drop, context).await {
                 Ok(()) => RowOutcome::Done,
                 Err(error) => {
                     warn!(%error, "Delete trail of a removed bucket could not be dropped");
@@ -762,7 +771,7 @@ mod tests {
     use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
     use crate::blob::cleanup_rows::{MAX_CLEANUP_RETRIES, PendingCleanup};
     use crate::driver::DriverContext;
-    use crate::jobs::store::query::iter_prefix_page;
+    use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

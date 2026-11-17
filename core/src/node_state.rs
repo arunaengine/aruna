@@ -358,6 +358,65 @@ mod info_tests {
         check_abort(&mut operation, &[]);
         rejects_finalize(operation);
     }
+
+    #[test]
+    fn install_writes_changes() {
+        let (same, changed) = (document(node(1)), document(node(2)));
+        let mut stale = changed.clone();
+        stale.updated_at_ms = 7;
+        let mut operation = InstallInfoOperation::new(vec![same.clone(), changed.clone()]);
+        let stored = vec![
+            Some(postcard::to_allocvec(&same).unwrap()),
+            Some(postcard::to_allocvec(&stale).unwrap()),
+        ];
+        let write = Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![(
+                NODE_INFO_KEYSPACE.to_string(),
+                Key::from(node_info_key(node(2))),
+                Value::from(changed.to_bytes().unwrap()),
+            )],
+            txn_id: None,
+        });
+        let written = Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        });
+        check_trace(
+            &mut operation,
+            &[reads(&[node(1), node(2)])],
+            vec![(answer(stored), vec![write]), (written, vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+        // Stored rows that match write nothing; an unreadable row stops the install.
+        let mut unchanged = InstallInfoOperation::new(vec![same.clone()]);
+        unchanged.start();
+        let row = Some(postcard::to_allocvec(&same).unwrap());
+        assert!(unchanged.step(answer(vec![row])).is_empty());
+        assert_eq!(unchanged.finalize(), Ok(()));
+        let mut garbled = InstallInfoOperation::new(vec![same]);
+        garbled.start();
+        garbled.step(answer(vec![Some(vec![0xff; 3])]));
+        assert!(matches!(garbled.finalize(), Err(NodeInfoError::Decode(_))));
+    }
+
+    #[test]
+    fn install_rejects_stray() {
+        let started = || {
+            let mut operation = InstallInfoOperation::new(vec![document(node(1))]);
+            operation.start();
+            operation
+        };
+        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::Error { .. }));
+        for (label, effects, error) in rejects_events(started, sample_events, expected) {
+            assert!(effects.is_empty(), "{label}");
+            assert_eq!(error, NodeInfoError::UnexpectedEvent, "{label}");
+        }
+        let mut open = started();
+        check_abort(&mut open, &[]);
+        rejects_finalize(open);
+        let mut empty = InstallInfoOperation::new(Vec::new());
+        assert!(empty.start().is_empty());
+        assert_eq!(empty.finalize(), Ok(()));
+    }
 }
 
 /// The single durable departure-report row of this node.
@@ -457,65 +516,6 @@ impl Operation for DrainStateOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
-    }
-
-    #[test]
-    fn install_writes_changes() {
-        let (same, changed) = (document(node(1)), document(node(2)));
-        let mut stale = changed.clone();
-        stale.updated_at_ms = 7;
-        let mut operation = InstallInfoOperation::new(vec![same.clone(), changed.clone()]);
-        let stored = vec![
-            Some(postcard::to_allocvec(&same).unwrap()),
-            Some(postcard::to_allocvec(&stale).unwrap()),
-        ];
-        let write = Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![(
-                NODE_INFO_KEYSPACE.to_string(),
-                Key::from(node_info_key(node(2))),
-                Value::from(changed.to_bytes().unwrap()),
-            )],
-            txn_id: None,
-        });
-        let written = Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        });
-        check_trace(
-            &mut operation,
-            &[reads(&[node(1), node(2)])],
-            vec![(answer(stored), vec![write]), (written, vec![])],
-        );
-        assert_eq!(operation.finalize(), Ok(()));
-        // Stored rows that match write nothing; an unreadable row stops the install.
-        let mut unchanged = InstallInfoOperation::new(vec![same.clone()]);
-        unchanged.start();
-        let row = Some(postcard::to_allocvec(&same).unwrap());
-        assert!(unchanged.step(answer(vec![row])).is_empty());
-        assert_eq!(unchanged.finalize(), Ok(()));
-        let mut garbled = InstallInfoOperation::new(vec![same]);
-        garbled.start();
-        garbled.step(answer(vec![Some(vec![0xff; 3])]));
-        assert!(matches!(garbled.finalize(), Err(NodeInfoError::Decode(_))));
-    }
-
-    #[test]
-    fn install_rejects_stray() {
-        let started = || {
-            let mut operation = InstallInfoOperation::new(vec![document(node(1))]);
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::Error { .. }));
-        for (label, effects, error) in rejects_events(started, sample_events, expected) {
-            assert!(effects.is_empty(), "{label}");
-            assert_eq!(error, NodeInfoError::UnexpectedEvent, "{label}");
-        }
-        let mut open = started();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
-        let mut empty = InstallInfoOperation::new(Vec::new());
-        assert!(empty.start().is_empty());
-        assert_eq!(empty.finalize(), Ok(()));
     }
 }
 

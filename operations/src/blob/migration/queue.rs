@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::MIGRATION_CONTINUE;
+use crate::blob::migration::drain::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::DriverContext;
+use crate::driver::drive;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
-use aruna_core::errors::ConversionError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -25,14 +25,13 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, SealPlan, UnlockStatus,
+    BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, UnlockStatus,
 };
-use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
-    EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
+    EncryptionTransition, TransitionState, cleanup_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, TxnId};
 use aruna_storage::StorageHandle;
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
@@ -59,7 +58,7 @@ pub(crate) async fn resume_transitions(
             .await
             .map_err(|e| e.to_string())?;
         let txn_id = transaction.id().ok_or("missing wake transaction")?;
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             TRANSITION_KEYSPACE,
             None,
@@ -83,7 +82,7 @@ pub(crate) async fn resume_transitions(
             };
             match storage.send_storage_effect(write).await {
                 Event::Storage(StorageEvent::WriteResult { .. }) => resumed = true,
-                other => return Err(format!("could not resume transition: {other:?}")),
+                other => return Err(format!("could not resume transition: {}", other.label())),
             }
         }
         let event = storage
@@ -94,7 +93,7 @@ pub(crate) async fn resume_transitions(
             Event::Storage(StorageEvent::TransactionCommitted { .. })
         ) {
             transaction.unknown();
-            return Err(format!("transition wake was not stored: {event:?}"));
+            return Err(format!("transition wake was not stored: {}", event.label()));
         }
         transaction.finish();
         match cursor {
@@ -127,7 +126,7 @@ pub async fn process_transitions(context: &DriverContext) -> Result<Option<Durat
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     let mut after = None;
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             TRANSITION_QUEUE_KEYSPACE,
             None,
@@ -159,35 +158,6 @@ pub async fn process_transitions(context: &DriverContext) -> Result<Option<Durat
     }
 }
 
-/// The rows that start converting a bucket's plain copies after encryption is enabled. The
-/// enabling transaction writes them with its settings, then wakes `TaskKey::MigrateCompression`.
-pub fn encrypt_rows(
-    bucket: &str,
-    settings: &BucketEncryption,
-    record: &BucketKeyRecord,
-    compression: Compression,
-    now_ms: u64,
-) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-    let plan = SealPlan::capture(settings, record).map_err(ConversionError::from)?;
-    let target = TransitionTarget { compression, plan };
-    let generation = settings.storage_generation;
-    let kind = TransitionKind::Encrypt;
-    let transition = EncryptionTransition::new(kind, None, target, generation, now_ms);
-    let key: Key = bucket.as_bytes().to_vec().into();
-    Ok(vec![
-        (
-            TRANSITION_KEYSPACE.to_string(),
-            key.clone(),
-            transition.to_bytes()?.into(),
-        ),
-        (
-            TRANSITION_QUEUE_KEYSPACE.to_string(),
-            key,
-            Vec::new().into(),
-        ),
-    ])
-}
-
 async fn read_record(
     storage: &StorageHandle,
     bucket: &str,
@@ -202,7 +172,10 @@ async fn read_record(
             .map(|value| EncryptionTransition::from_bytes(value.as_ref()))
             .transpose()
             .map_err(|error| error.to_string()),
-        other => Err(format!("could not read transition progress: {other:?}")),
+        other => Err(format!(
+            "could not read transition progress: {}",
+            other.label()
+        )),
     }
 }
 
@@ -227,7 +200,7 @@ async fn advance(
         record.state = TransitionState::Running;
     }
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::jobs::store::query::iter_prefix_page(
+    let (versions, next) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
@@ -323,7 +296,7 @@ async fn settle(
     let mut after = None;
     let mut left = 0u64;
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             TRANSITION_CLEANUP_KEYSPACE,
             Some(prefix.clone()),
@@ -368,7 +341,8 @@ async fn finish(
     if let Some(source) = record.source
         && record.target.plan.map(|plan| plan.key) != Some(source)
     {
-        crate::replication::parking::wake_parked(context, source, now)
+        let wake = crate::replication::parking::WakeParkedOperation::new(source, now);
+        drive(wake, context)
             .await
             .map_err(|error| error.to_string())?;
         if let Some(tasks) = context.task_handle.as_ref() {
@@ -378,7 +352,12 @@ async fn finish(
             {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {}
                 Event::Task(TaskEvent::Error { message, .. }) => return Err(message),
-                other => return Err(format!("could not schedule the copy drain: {other:?}")),
+                other => {
+                    return Err(format!(
+                        "could not schedule the copy drain: {}",
+                        other.label()
+                    ));
+                }
             }
         }
     }
@@ -442,7 +421,7 @@ async fn pending_on_source(
     };
     let (mut after, mut count) = (None, 0u64);
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             PENDING_LOCATION_KEYSPACE,
             None,
@@ -488,7 +467,12 @@ async fn forget_removed(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a cleanup transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a cleanup transaction: {}",
+                other.label()
+            ));
+        }
     };
     let staged = stage_forget(storage, txn_id, prefix_len, keys).await;
     let Ok(left) = staged else {
@@ -502,7 +486,10 @@ async fn forget_removed(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(left),
-        other => Err(format!("removed copies were not forgotten: {other:?}")),
+        other => Err(format!(
+            "removed copies were not forgotten: {}",
+            other.label()
+        )),
     }
 }
 
@@ -531,7 +518,12 @@ async fn stage_forget(
         };
         match storage.send_storage_effect(delete).await {
             Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-            other => return Err(format!("could not forget a removed copy: {other:?}")),
+            other => {
+                return Err(format!(
+                    "could not forget a removed copy: {}",
+                    other.label()
+                ));
+            }
         }
     }
     Ok(left)
@@ -545,7 +537,7 @@ async fn queued_deletes(
 ) -> Result<HashSet<Vec<u8>>, String> {
     let (mut after, mut queued) = (None, HashSet::new());
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             BLOB_CLEANUP_KEYSPACE,
             None,
@@ -580,7 +572,7 @@ async fn exists(
     };
     match storage.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        other => Err(format!("could not read {key_space}: {other:?}")),
+        other => Err(format!("could not read {key_space}: {}", other.label())),
     }
 }
 
@@ -595,7 +587,12 @@ async fn store(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a progress transaction: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not start a progress transaction: {}",
+                other.label()
+            ));
+        }
     };
     let staged = stage(storage, txn_id, bucket, record).await;
     if !matches!(staged, Ok(true)) {
@@ -609,7 +606,10 @@ async fn store(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        other => Err(format!("transition progress was not stored: {other:?}")),
+        other => Err(format!(
+            "transition progress was not stored: {}",
+            other.label()
+        )),
     }
 }
 
@@ -630,7 +630,12 @@ async fn stage(
             value: Some(value), ..
         }) => EncryptionTransition::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
-        other => return Err(format!("could not read transition progress: {other:?}")),
+        other => {
+            return Err(format!(
+                "could not read transition progress: {}",
+                other.label()
+            ));
+        }
     };
     if stored.started_at_ms != record.started_at_ms || stored.kind != record.kind {
         return Ok(false);
@@ -676,7 +681,12 @@ async fn stage(
             Event::Storage(
                 StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
             ) => {}
-            other => return Err(format!("could not store transition progress: {other:?}")),
+            other => {
+                return Err(format!(
+                    "could not store transition progress: {}",
+                    other.label()
+                ));
+            }
         }
     }
     Ok(true)
@@ -693,7 +703,7 @@ async fn source_versions(
         .map_err(|e| e.to_string())?
         .into();
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             BLOB_VERSIONS_KEYSPACE,
             Some(prefix.clone()),
@@ -754,7 +764,7 @@ async fn envelopes_on_source(
         .into();
     let (mut after, mut count) = (None, 0);
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             ABE_VERSION_KEYSPACE,
             Some(prefix.clone()),
@@ -788,7 +798,7 @@ async fn envelopes_on_source(
     let prefix: Key = source.bucket_id.to_bytes().to_vec().into();
     let mut after = None;
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             ABE_COPY_KEYSPACE,
             Some(prefix.clone()),
@@ -819,7 +829,7 @@ async fn reclaim_uploads(
     };
     let (mut after, mut count) = (None, 0);
     loop {
-        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
+        let (rows, cursor) = crate::storage_read::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
             None,
@@ -843,7 +853,8 @@ async fn reclaim_uploads(
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
                 other => {
                     return Err(format!(
-                        "could not remove stale upload envelopes: {other:?}"
+                        "could not remove stale upload envelopes: {}",
+                        other.label()
                     ));
                 }
             }
@@ -878,7 +889,7 @@ async fn retire_source(
             value: Some(value), ..
         }) => BucketKeyRecord::from_bytes(value.as_ref()).map_err(|e| e.to_string())?,
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(Vec::new()),
-        other => return Err(format!("could not read the source key: {other:?}")),
+        other => return Err(format!("could not read the source key: {}", other.label())),
     };
     let vault = key.vault_entry.take().or(record.source_vault);
     key.state = KeyState::Retired;
@@ -901,7 +912,10 @@ async fn retire_source(
 mod tests {
     use super::*;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::encryption::{BucketEncryption, SealPlan};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -1534,7 +1548,7 @@ mod tests {
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
         let reclaimed = reclaim_uploads(storage, &record).await;
-        let (left, _) = crate::jobs::store::query::iter_prefix_page(
+        let (left, _) = crate::storage_read::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
             None,

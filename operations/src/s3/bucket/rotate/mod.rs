@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::bucket::key::rows::{
-    Row, SettingsError, authority_read, copy_targets, generation_rows, group_bucket_key,
+    Row, SettingsError, authority_read, copy_targets, full_scan, generation_rows, group_bucket_key,
     parse_authority, uploads_open,
 };
 use aruna_core::compute::SharedSecret;
@@ -97,10 +97,10 @@ pub enum ChangeError {
     /// Replacing an unfinished transition would strand the copies it still has to move.
     #[error("the bucket's stored copies are still moving to a new encryption")]
     TransitionRunning,
-    #[error("unexpected event in state {state:?}: {received:?}")]
+    #[error("unexpected event in state {state:?}: {received}")]
     InvalidStateEvent {
         state: ChangeState,
-        received: Box<Event>,
+        received: &'static str,
     },
     #[error("the encryption change did not finish")]
     NotFinished,
@@ -242,17 +242,7 @@ impl ChangeEncryptionOperation {
             return self.fail(ChangeError::Unchanged);
         }
         self.state = ChangeState::CheckUploads;
-        self.scan(UPLOAD_KEYSPACE, None)
-    }
-
-    fn scan(&self, key_space: &str, prefix: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
+        smallvec![full_scan(UPLOAD_KEYSPACE, None, self.txn_id)]
     }
 
     /// Writes that captured the old plan fail at publication on the storage generation; open
@@ -322,7 +312,7 @@ impl ChangeEncryptionOperation {
         if self.new_generation() {
             self.state = ChangeState::ReadGrants;
             let prefix = key.bucket_id.to_bytes().to_vec().into();
-            return self.scan(BUCKET_HOLDER_KEYSPACE, Some(prefix));
+            return smallvec![full_scan(BUCKET_HOLDER_KEYSPACE, Some(prefix), self.txn_id)];
         }
         self.write_rows(None, Vec::new())
     }
@@ -559,7 +549,7 @@ impl Operation for ChangeEncryptionOperation {
             (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
             (state, received) => self.fail(ChangeError::InvalidStateEvent {
                 state,
-                received: Box::new(received),
+                received: received.label(),
             }),
         }
     }

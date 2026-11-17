@@ -13,7 +13,7 @@ use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
-pub use super::plan::PageError;
+use super::plan::PageError;
 use super::plan::{
     PageGuards, PageItem, Plan, check_guards, guard_reads, page_items, page_rows, plan_items,
     previous_reads,
@@ -204,7 +204,7 @@ impl PageApplyOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(PageError::UnexpectedEvent {
                 state: state_name(state),
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

@@ -14,22 +14,21 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, ensure_confined_path};
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::replication::parking::awaiting_jobs;
+use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
-    consent_delete, consent_write, read_consent, relationship_consent, source_encrypted,
-    store_consent,
+    ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
+    consent_write, relationship_consent,
 };
-use aruna_operations::replication::protocol::ReplicationMode;
-use aruna_operations::replication::queue::{QueueBlobOperation, relationship_job_stats};
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeTarget,
-};
+use aruna_operations::replication::queue::JobStatsOperation;
+use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::sync::mirror_repair::{
     KickRepairOperation, MirrorRecordOperation, StoreStatusOperation, SyncMirrorIntent,
     delete_sync_mirror, request_mirror_create,
@@ -467,7 +466,7 @@ pub async fn create_sync(
     if plaintext {
         let consent = consent_write(relationship_consent(relationship.id), auth.user_id)
             .map_err(|error| ServerError::InternalError(error.into()))?;
-        store_consent(&context, consent)
+        drive(ConsentStoreOperation::new(consent), &context)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?;
     }
@@ -1013,7 +1012,7 @@ pub async fn delete_sync(
         clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
     }
     let consent = consent_delete(relationship_consent(relationship.id));
-    if let Err(error) = store_consent(&context, consent).await {
+    if let Err(error) = drive(ConsentStoreOperation::new(consent), &context).await {
         warn!(%error, relationship_id = %relationship.id, "Failed to remove a plaintext copy request");
     }
 
@@ -1360,7 +1359,7 @@ async fn load_relationship(
 }
 
 async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, Option<u64>)> {
-    let (pending, oldest) = relationship_job_stats(&state.get_ctx(), id)
+    let (pending, oldest) = drive(JobStatsOperation::new(id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((
@@ -1463,11 +1462,15 @@ async fn annotate(
 ) -> ServerResult<()> {
     let id = parse_id(&response.id)?;
     let context = state.get_ctx();
-    let consent = read_consent(&context, relationship_consent(id)).await;
+    let consent = drive(
+        ConsentReadOperation::new(relationship_consent(id)),
+        &context,
+    )
+    .await;
     response.plaintext = consent
         .map_err(|error| ServerError::InternalError(error.into()))?
         .is_some();
-    let awaiting = awaiting_jobs(&context, id).await;
+    let awaiting = drive(AwaitingJobsOperation::new(id), &context).await;
     response.status.awaiting_key =
         awaiting.map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(())
@@ -1476,7 +1479,7 @@ async fn annotate(
 /// An encrypted source refuses a target bucket of this node that does not encrypt.
 async fn refuse_plain_target(state: &ServerState, source: &str, target: &str) -> ServerResult<()> {
     let context = state.get_ctx();
-    let encrypted = |bucket| source_encrypted(&context, bucket);
+    let encrypted = |bucket| drive(EncryptionCheckOperation::new(bucket, false), &context);
     let source = encrypted(source)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;

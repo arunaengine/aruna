@@ -37,11 +37,11 @@ pub enum ListUserError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListUserState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("credential owner index is inconsistent")]
     IndexInconsistent,
@@ -90,7 +90,7 @@ impl ListUserOperation {
             return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.txn_id = Some(txn_id);
@@ -107,7 +107,7 @@ impl ListUserOperation {
             return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let index = match decode_index(value.as_ref()) {
@@ -147,7 +147,7 @@ impl ListUserOperation {
             return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         if values.len() != self.access_keys.len() {
@@ -185,7 +185,7 @@ impl ListUserOperation {
             return self.emit_error(ListUserError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             });
         };
         self.txn_id = None;

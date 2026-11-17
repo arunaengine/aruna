@@ -26,7 +26,7 @@ pub async fn restore_lifecycle_timers(
     storage: &aruna_storage::StorageHandle,
     task_handle: &aruna_tasks::TaskHandle,
 ) {
-    let pending = crate::jobs::store::query::iter_prefix_page(
+    let pending = crate::storage_read::iter_prefix_page(
         storage,
         aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
         None,

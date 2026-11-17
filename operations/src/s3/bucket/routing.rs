@@ -47,11 +47,11 @@ pub enum PutRoutingError {
     NoTransactionFound,
     #[error("PutBucketRouting did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -124,7 +124,7 @@ impl Operation for PutRoutingOperation {
                     return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let inputs = match result {
@@ -163,7 +163,7 @@ impl Operation for PutRoutingOperation {
                     return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = Some(txn_id);
@@ -179,7 +179,7 @@ impl Operation for PutRoutingOperation {
                     return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(value) = value else {
@@ -212,7 +212,7 @@ impl Operation for PutRoutingOperation {
                     return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
@@ -226,7 +226,7 @@ impl Operation for PutRoutingOperation {
                     return self.fail(PutRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = None;
@@ -270,11 +270,11 @@ pub enum GetRoutingError {
     NoSuchBucket,
     #[error("GetBucketRouting did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -334,7 +334,7 @@ impl Operation for GetRoutingOperation {
                     return self.fail(GetRoutingError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(value) = value else {

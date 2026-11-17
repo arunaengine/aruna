@@ -37,8 +37,9 @@ use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, Re
 use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::store::query::{batch_delete, iter_prefix_page};
+use crate::jobs::store::query::batch_delete;
 use crate::realm::load_config::load_realm_config;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
 /// Domain of the stable witness order.

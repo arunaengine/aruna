@@ -59,13 +59,13 @@ use self::reader::HiddenRangeReader;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document, validate_document};
 use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
-use super::store::query::list_job_entries;
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{drive, node_routing};
 use crate::forward::transport::MetadataWriteError;
 use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::jobs::store::query::list_job_entries;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -75,7 +75,7 @@ use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::{BucketScope, MembershipQuery};
+use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use crate::s3::object::delete::pinned::version_pins;
@@ -83,6 +83,7 @@ use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation}
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 use aruna_core::metadata::AuthToken;
+use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_core::time::unix_timestamp_millis;
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;

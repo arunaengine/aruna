@@ -321,7 +321,7 @@ impl CreateS3Operation {
         self.fail(S3SessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            received,
+            received: received.label(),
         })
     }
 }
@@ -338,11 +338,17 @@ impl Operation for CreateS3Operation {
         if let Event::Storage(StorageEvent::Error { error }) = &event {
             return self.fail(error.clone().into());
         }
-        match self.state.clone() {
+        match &mut self.state {
             CreateSessionState::StartTransaction => self.transaction_started(event),
             CreateSessionState::ReadIndex => self.index_read(event),
-            CreateSessionState::ReadSessions { index } => self.sessions_read(event, index),
-            CreateSessionState::DeleteSessions { index } => self.sessions_deleted(event, index),
+            CreateSessionState::ReadSessions { index } => {
+                let index = std::mem::take(index);
+                self.sessions_read(event, index)
+            }
+            CreateSessionState::DeleteSessions { index } => {
+                let index = std::mem::take(index);
+                self.sessions_deleted(event, index)
+            }
             CreateSessionState::WriteSession => self.session_written(event),
             CreateSessionState::CommitTransaction => self.transaction_committed(event),
             CreateSessionState::Init | CreateSessionState::Finish | CreateSessionState::Error => {

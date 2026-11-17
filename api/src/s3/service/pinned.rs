@@ -4,9 +4,10 @@
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipQuery};
+use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 use aruna_operations::s3::object::delete::pinned::{
     PinnedError, ReleaseGuards, refuse_pinned, version_pins,

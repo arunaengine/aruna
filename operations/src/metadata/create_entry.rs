@@ -9,6 +9,7 @@ use aruna_core::MetaResourceId;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 
 use crate::document_repository::{GetConfigError, GetConfigOperation};

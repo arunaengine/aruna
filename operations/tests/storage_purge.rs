@@ -41,6 +41,7 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::blob::pause::{PausePurgeOperation, PausedOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::put_purge_checkpoint;
@@ -50,7 +51,7 @@ use aruna_operations::jobs::store::state::{
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::fence_store::acquire_purge_fence;
+use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
     CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
@@ -256,13 +257,8 @@ async fn scoped_fence_isolates() {
         bucket: "bucket".to_string(),
         prefix: "blocked/".to_string(),
     };
-    acquire_purge_fence(
-        &context.driver.storage_handle,
-        JobId::from_bytes([0xC3; 16]),
-        &scope,
-    )
-    .await
-    .unwrap();
+    let acquire = AcquireFenceOperation::new(JobId::from_bytes([0xC3; 16]), scope.clone());
+    drive(acquire, &context.driver).await.unwrap();
 
     assert!(matches!(
         drive(
@@ -565,9 +561,8 @@ async fn purge_resumes_cleanly() {
     };
     let prefix_job_id = JobId::from_bytes([0xA1; 16]);
     let prefix_job = claimed_job(context.driver.clone(), prefix_job_id, prefix_spec.clone()).await;
-    acquire_purge_fence(&context.driver.storage_handle, prefix_job_id, &prefix_scope)
-        .await
-        .unwrap();
+    let acquire = AcquireFenceOperation::new(prefix_job_id, prefix_scope.clone());
+    drive(acquire, &context.driver).await.unwrap();
     put_purge_checkpoint(
         &context.driver.storage_handle,
         prefix_job_id,
@@ -1013,9 +1008,8 @@ async fn aborted_purge_releases() {
     aruna_operations::blob::purge::plan_files(&context.driver, job.job_id.as_ulid(), &found)
         .await
         .unwrap();
-    aruna_operations::blob::purge::set_paused(&context.driver, job.job_id.as_ulid(), true)
-        .await
-        .unwrap();
+    let pause = PausePurgeOperation::new(job.job_id.as_ulid(), true);
+    drive(pause, &context.driver).await.unwrap();
     job.cancel.cancel();
 
     let outcome = run_storage_purge(&job, &spec, true).await;
@@ -1023,8 +1017,8 @@ async fn aborted_purge_releases() {
     assert!(matches!(outcome, JobRunOutcome::Cancelled));
     let storage = &context.driver.storage_handle;
     assert_eq!(releases(storage).await, [location]);
-    let paused = aruna_operations::blob::purge::is_paused(&context.driver, job.job_id.as_ulid());
-    assert!(!paused.await.unwrap());
+    let paused = PausedOperation::new(job.job_id.as_ulid());
+    assert!(!drive(paused, &context.driver).await.unwrap());
 }
 
 /// The version ids of the seeded linked key.
@@ -1248,7 +1242,7 @@ async fn purge_releases_copies() {
     let mut released = releases(storage).await;
     released.sort_by_key(|file| file.backend_path.clone());
     assert_eq!(released, [location, copy]);
-    let (left, _) = aruna_operations::jobs::store::query::iter_prefix_page(
+    let (left, _) = aruna_operations::storage_read::iter_prefix_page(
         storage,
         aruna_core::keyspaces::RENAMED_ROW_KEYSPACE,
         None,

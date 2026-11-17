@@ -90,6 +90,28 @@ impl Operation for CheckPermissionsOperation {
     }
 }
 
+/// Checks that `auth_context` holds `required_permission` on `path`, as a sub-operation that
+/// answers with an authorization result event.
+pub(crate) fn permission_check(
+    auth_context: AuthContext,
+    path: String,
+    required_permission: Permission,
+) -> aruna_core::effects::Effect {
+    let config = CheckPermissionsConfig {
+        auth_context,
+        path,
+        required_permission,
+    };
+    aruna_core::effects::Effect::SubOperation(aruna_core::operation::boxed_suboperation(
+        CheckPermissionsOperation::new(config),
+        |result| {
+            Event::SubOperation(aruna_core::events::SubOperationEvent::AuthorizationResult {
+                allowed: result,
+            })
+        },
+    ))
+}
+
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, HashSet};

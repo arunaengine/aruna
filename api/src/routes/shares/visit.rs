@@ -22,8 +22,9 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::distribution::nonce::SpendNonceOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
-use aruna_operations::s3::object::get::{GetObjectInput, get_object_routed};
+use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::read::get_object_routed;
 use aruna_operations::shares::lifecycle::{
     OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
 };

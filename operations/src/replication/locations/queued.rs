@@ -3,13 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::LocationSummaryError;
-use crate::replication::queue::BlobJobRecord;
-use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use std::collections::BTreeSet;
@@ -121,7 +121,7 @@ impl Operation for QueuedNodesOperation {
                     self.state = QueuedState::Error;
                     self.output = Some(Err(LocationSummaryError::Unexpected {
                         state: "queued_scan",
-                        event: format!("{event:?}"),
+                        event: event.label().to_string(),
                     }));
                     return smallvec![];
                 };
@@ -163,12 +163,14 @@ impl Operation for QueuedNodesOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::QueuedNodesOperation;
-    use crate::replication::queue::BlobJobRecord;
-    use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
     use crate::tests::locations::{auth, node_id};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::id::NodeId;
     use aruna_core::operation::Operation;
+    use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+    use aruna_core::structs::storage::replication_queue::{
+        ReplicateScopeInput, ReplicateScopeTarget,
+    };
     use ulid::Ulid;
 
     fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobJobRecord {
@@ -187,7 +189,7 @@ mod pure_tests {
                 target_node_id: target_node,
                 auth_context: auth(),
                 replicate_delete_markers: markers,
-                mode: crate::replication::protocol::ReplicationMode::OnDemand,
+                mode: aruna_core::structs::storage::replication_queue::ReplicationMode::OnDemand,
             },
             None,
             0,

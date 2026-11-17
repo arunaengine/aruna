@@ -122,12 +122,13 @@ use aruna_operations::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput as DOSI, delete_objects,
 };
 use aruna_operations::s3::object::delete::{DeleteObjectInput as DOI, DeleteObjectOperation};
-use aruna_operations::s3::object::get::{
-    GetObjectInput as GOI, TokenRead, get_object_info, get_object_keyed, get_object_token,
-};
+use aruna_operations::s3::object::get::GetObjectInput as GOI;
 use aruna_operations::s3::object::head::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListBucketOperation};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
+use aruna_operations::s3::object::read::{
+    TokenRead, get_object_info, get_object_keyed, get_object_token,
+};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
 use aruna_operations::sync::mirror_repair::{

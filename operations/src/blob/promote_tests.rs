@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::blob::unlocked::{drop_mismatch, promote_unlocked, read_value};
 use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
@@ -680,6 +681,7 @@ fn claim_mismatch_unregistered() {
 
 pub(crate) mod received {
     use super::*;
+    use crate::blob::unlocked::{drop_mismatch, promote_unlocked, read_value};
     use crate::driver::{DriverContext, drive};
     use crate::s3::object::copy::sealed::{SealedCopyInput, SealedCopyOperation};
     use crate::s3::object::copy::test::{full_context, seed_authority, seed_bucket};
@@ -855,7 +857,7 @@ pub(crate) mod received {
             BLOB_LOCATIONS_KEYSPACE,
             PATHS_INDEX_KEYSPACE,
         ] {
-            let (rows, _) = crate::jobs::store::query::iter_prefix_page(
+            let (rows, _) = crate::storage_read::iter_prefix_page(
                 &context.storage_handle,
                 space,
                 None,

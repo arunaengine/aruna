@@ -61,11 +61,11 @@ pub enum PutCompressionError {
     Mapped,
     #[error("PutBucketCompression did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -114,7 +114,7 @@ impl PutCompressionOperation {
         self.bucket.as_bytes().to_vec().into()
     }
 
-    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, received: &'static str) -> Effects {
         let state = match self.state {
             PutCompressionState::Init => "Init",
             PutCompressionState::StartTransaction => "StartTransaction",
@@ -131,7 +131,7 @@ impl PutCompressionOperation {
         self.fail(PutCompressionError::InvalidStateEvent {
             state,
             expected,
-            received,
+            received: received.label(),
         })
     }
 
@@ -511,7 +511,7 @@ impl Operation for MigrationStatusOperation {
             received => Err(PutCompressionError::InvalidStateEvent {
                 state: "ReadMigration",
                 expected: "ReadResult",
-                received,
+                received: received.label(),
             }),
         });
         smallvec![]

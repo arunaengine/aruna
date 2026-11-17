@@ -42,7 +42,7 @@ pub mod session;
 pub mod shard;
 pub mod shares;
 pub mod staging;
-mod storage_read;
+pub mod storage_read;
 pub mod sync;
 pub mod tasks;
 #[cfg(any(test, feature = "test-hooks"))]

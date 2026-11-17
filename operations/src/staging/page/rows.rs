@@ -9,7 +9,6 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::UsageUpdateError;
 use crate::storage_read::StorageReadError;
@@ -40,6 +39,9 @@ use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
+};
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};

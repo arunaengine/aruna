@@ -34,7 +34,6 @@ use super::executor::{
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
 use super::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait};
-use super::store::query::iter_prefix_page;
 use super::store::state::{
     ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
     fail_job, flush_progress, handoff_external_attempt, read_job_record, release_job, renew_lease,
@@ -46,6 +45,7 @@ use super::{
     JOB_HEARTBEAT_MS,
 };
 use crate::driver::DriverContext;
+use crate::storage_read::iter_prefix_page;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RETRY_AFTER_MS: u64 = 1_000;

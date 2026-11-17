@@ -34,9 +34,8 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{
-    Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation, load_access,
-};
+use super::read::load_access;
+use super::{Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation};
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
@@ -48,14 +47,13 @@ use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::GateOperation;
 use crate::realm::peer_trust::is_sync_eligible;
-use crate::replication::queue::complete_put;
+use crate::replication::live_queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest, get_object_routed,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::get_object_routed;
 use aruna_core::metadata::AuthToken;
 use aruna_core::time::unix_timestamp_millis;
 
@@ -366,7 +364,7 @@ pub async fn publish_release(
 const ROW_PAGE: usize = 256;
 
 /// Every release row of `bucket` this node holds, in key order.
-pub(crate) async fn release_rows(
+async fn release_rows(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Vec<(Ulid, ReleasePointer)>, PublishError> {
@@ -386,7 +384,7 @@ pub(crate) async fn release_rows(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(PublishError::Unavailable(format!("{other:?}"))),
+            other => return Err(PublishError::Unavailable(other.label().to_string())),
         };
         for (key, value) in values {
             let Some(bytes) = key.get(prefix.len()..) else {
@@ -525,7 +523,7 @@ async fn file_guards(
     };
     let values = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => return Err(PublishError::Unavailable(format!("{other:?}"))),
+        other => return Err(PublishError::Unavailable(other.label().to_string())),
     };
     if values.iter().any(|(_, value)| value.is_none()) {
         return Err(PublishError::Conflict(CHANGED.to_string()));

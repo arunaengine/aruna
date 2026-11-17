@@ -70,7 +70,8 @@ use crate::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
 use crate::metadata::forward::read::export_rocrate_routed;
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use aruna_core::jobs::WaitTarget;
 use aruna_core::managed_copy::{
@@ -2160,9 +2161,14 @@ async fn holder_allows(
         return Ok(true);
     }
     let auth = &spec.auth_context;
-    crate::replication::plaintext::is_holder(driver, auth.realm_id, bucket, auth.user_id)
+    let holder = crate::replication::plaintext::HolderCheckOperation::new(
+        auth.realm_id,
+        bucket,
+        auth.user_id,
+    );
+    drive(holder, driver)
         .await
-        .map_err(ExportFailure::Retryable)
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))
 }
 
 /// The bucket of a candidate read on this node.

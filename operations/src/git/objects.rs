@@ -7,13 +7,15 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
+use crate::replication::bao_read::BaoReadOutput;
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{GetObjectInput, get_object_routed};
+use crate::s3::object::get::GetObjectInput;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::get_object_routed;
 use aruna_core::NodeId;
 use aruna_core::git::{
     GitPack, GitPackRecord, GitRecord, LOCAL_OBJECTS, MAX_PACK_BYTES, StoredObject, git_pack_key,

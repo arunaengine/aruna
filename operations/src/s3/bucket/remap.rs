@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::linked::JobStep;
+use super::job_progress::JobStep;
 use super::rename::{JOB_CHANGED, RenameError, RenameInput, RenameKeysOperation, check_target};
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::query::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::identity::auth::Permission;

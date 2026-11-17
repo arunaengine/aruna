@@ -20,27 +20,24 @@ use aruna_core::structs::storage::multipart::{
 use aruna_core::structs::storage::replication::{
     ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
 };
+use aruna_core::structs::storage::replication_queue::{
+    ReferenceAdvance, ReplicationMode, SyncOrigin,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
 
 const VERSION_REPLICATION_MAGIC: &[u8; 4] = b"vrp1";
 
-pub const MAX_REPLICATION_PARTS: usize = 10_000;
-pub const MAX_REPLICATION_SOURCES: usize = 4;
-pub const MAX_REPLICATION_METADATA: usize = 128;
-pub const MAX_REPLICATION_HASHES: usize = 7;
+const MAX_REPLICATION_PARTS: usize = 10_000;
+const MAX_REPLICATION_SOURCES: usize = 4;
+const MAX_REPLICATION_METADATA: usize = 128;
+const MAX_REPLICATION_HASHES: usize = 7;
 pub const MAX_KEY_BYTES: usize = 128;
 pub const MAX_VALUE_BYTES: usize = 4 * 1024;
-pub const MAX_HASH_BYTES: usize = 64;
-pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_MANIFEST_WORK: usize = 4 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReferenceAdvance {
-    pub generation: u64,
-    pub predecessor: Ulid,
-}
+const MAX_HASH_BYTES: usize = 64;
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MANIFEST_WORK: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionReplicationManifest {
@@ -240,12 +237,6 @@ impl VersionReplicationManifest {
 
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SyncOrigin {
-    pub relationship_id: Ulid,
-    pub hop_count: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -692,12 +683,6 @@ impl VersionReplicationMessage {
         }
         Ok(message)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ReplicationMode {
-    Live,
-    OnDemand,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

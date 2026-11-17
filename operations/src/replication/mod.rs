@@ -2,16 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod bao_read;
-pub mod bootstrap;
-pub(crate) mod dht_registration;
+pub(crate) mod bao_read;
+pub(crate) mod bootstrap;
+pub(crate) mod catch_up;
+pub(crate) mod drain;
 mod error;
-pub mod incoming;
+pub(crate) mod incoming;
+pub mod live_queue;
 pub mod locations;
+pub(crate) mod managed_read;
 pub mod members;
-pub mod page;
+mod obligations;
+pub(crate) mod page;
 pub mod parking;
 pub mod plaintext;
 pub mod protocol;
 pub mod queue;
-pub mod version_replication;
+mod retire;
+mod source_rules;
+pub(crate) mod version_replication;

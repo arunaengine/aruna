@@ -6,78 +6,37 @@
 // A queued job names only the member; what it publishes comes from the record this node
 // holds when it sends, so an ended coordinatorship publishes nothing.
 
+use aruna_core::structs::storage::replication_queue::MemberTarget;
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
-use aruna_core::effects::IterStart;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
+use aruna_core::keyspaces::{
+    DISTRIBUTION_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
 };
-use aruna_core::types::{Key, Value};
-use serde::{Deserialize, Serialize};
+use aruna_core::types::{Effects, Key, Value};
+use smallvec::smallvec;
+use thiserror::Error;
 use ulid::Ulid;
 
-use super::protocol::ReplicationMode;
-use super::queue::{BlobJobRecord, LiveObligationRecord, queued_prefixes};
-use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
-use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{
+    BlobJobRecord, LiveObligationRecord, queued_prefixes,
+};
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 
 /// Queue rows one check reads per page, and pages it reads before it counts the queue as owing.
 const FANOUT_PAGE: usize = 1024;
 const FANOUT_PAGES: usize = 16;
 /// Queue pages one copy lag count reads.
 const LAG_PAGES: usize = 4;
-
-/// The member of a distributed bucket a queued job publishes to.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct MemberTarget {
-    pub set_id: Ulid,
-    pub member_id: Ulid,
-}
-
-/// This node's record of a set, if it holds one.
-pub(crate) async fn read_record(
-    context: &DriverContext,
-    set_id: Ulid,
-) -> Result<Option<DistributionView>, String> {
-    let read = StorageEffect::Read {
-        key_space: DISTRIBUTION_KEYSPACE.to_string(),
-        key: set_id.to_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| DistributionView::from_bytes(value.as_ref()))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected record answer {other:?}")),
-    }
-}
-
-/// The binding of a local bucket and this node's record of its set; `None` for an ordinary
-/// bucket, a missing bucket or a record that has not arrived.
-pub(crate) async fn bound_record(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<(DistributionBinding, DistributionSnapshot)>, String> {
-    let binding = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => info.distribution,
-        Err(GetBucketError::NotFound) => None,
-        Err(error) => return Err(error.to_string()),
-    };
-    let Some(binding) = binding else {
-        return Ok(None);
-    };
-    let Some(view) = read_record(context, binding.set_id).await? else {
-        return Ok(None);
-    };
-    Ok(Some((binding, view.head.snapshot)))
-}
 
 /// What this member publishes of `key` to `target` now, and the target's node: `None` once
 /// this member does not coordinate the key's range, or the target no longer holds it.
@@ -98,76 +57,6 @@ pub(crate) fn member_publication(
     Some((snapshot.publication(range, delivery), delivery.node_id))
 }
 
-/// Whether this node still owes a publication of a key in `range` of the set: a queued member
-/// job or a live obligation that has not become jobs yet. A queue longer than one check reads
-/// counts as owing, so the caller looks again later.
-pub(crate) async fn owes_fanout(
-    context: &DriverContext,
-    bucket: &str,
-    set_id: Ulid,
-    range: &KeyRange,
-) -> Result<bool, String> {
-    let [live, _, obligations] = queued_prefixes(bucket).map_err(|error| error.to_string())?;
-    let owed = |key_space: &str, value: &[u8]| match key_space == REPLICATION_OBLIGATION_KEYSPACE {
-        true => LiveObligationRecord::from_bytes(value).is_ok_and(|o| range.contains(&o.key)),
-        false => BlobJobRecord::from_bytes(value).is_ok_and(|job| {
-            let key = match &job.input.target {
-                ReplicateScopeTarget::Version { key, .. } => Some(key),
-                _ => None,
-            };
-            let member = job
-                .distribution
-                .as_ref()
-                .is_some_and(|t| t.set_id == set_id);
-            member && key.is_some_and(|key| range.contains(key))
-        }),
-    };
-    for (key_space, prefix) in [live, obligations] {
-        let (mut start, mut read) = (None, false);
-        for _ in 0..FANOUT_PAGES {
-            let (values, more) = queue_page(context, key_space, &prefix, start).await?;
-            if values.iter().any(|(_, value)| owed(key_space, value)) {
-                return Ok(true);
-            }
-            match (more, values.last()) {
-                (true, Some((last, _))) => start = Some(last.clone()),
-                _ => {
-                    read = true;
-                    break;
-                }
-            }
-        }
-        if !read {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// One page of a queue's rows under `prefix` after `start`, and whether more follow.
-async fn queue_page(
-    context: &DriverContext,
-    key_space: &str,
-    prefix: &[u8],
-    start: Option<Key>,
-) -> Result<(Vec<(Key, Value)>, bool), String> {
-    let iter = StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: Some(prefix.to_vec().into()),
-        start: start.map(IterStart::After),
-        limit: FANOUT_PAGE,
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after.is_some())),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected queue answer {other:?}")),
-    }
-}
-
 /// What a coordinator still owes one member of one range.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CopyLag {
@@ -175,76 +64,6 @@ pub struct CopyLag {
     pub pending: u64,
     /// When the oldest of them was written, in Unix milliseconds.
     pub oldest_ms: Option<u64>,
-}
-
-/// The versions `coordinator` still owes, by range it coordinates and receiving member, from at
-/// most [`LAG_PAGES`] pages of each queue; false when a queue held more, so counts are lower
-/// bounds.
-pub async fn copy_lag(
-    context: &DriverContext,
-    snapshot: &DistributionSnapshot,
-    coordinator: Ulid,
-) -> Result<(BTreeMap<(Ulid, Ulid), CopyLag>, bool), String> {
-    let set_id = snapshot.set_id();
-    let [live, _, obligations] =
-        queued_prefixes(&snapshot.config.bucket).map_err(|error| error.to_string())?;
-    let mut lag: BTreeMap<(Ulid, Ulid), CopyLag> = BTreeMap::new();
-    let mut add = |range_id: Ulid, member_id: Ulid, written_ms: u64| {
-        let entry = lag.entry((range_id, member_id)).or_default();
-        entry.pending += 1;
-        entry.oldest_ms = Some(entry.oldest_ms.map_or(written_ms, |ms| ms.min(written_ms)));
-    };
-    let mut counted = true;
-    for (key_space, prefix) in [live, obligations] {
-        let mut start = None;
-        let mut more = true;
-        for _ in 0..LAG_PAGES {
-            let (values, next) = queue_page(context, key_space, &prefix, start).await?;
-            for (_, value) in &values {
-                if key_space == REPLICATION_OBLIGATION_KEYSPACE {
-                    let Ok(owed) = LiveObligationRecord::from_bytes(value) else {
-                        continue;
-                    };
-                    // An obligation whose member jobs are queued is counted through them.
-                    if owed.continuation.as_ref().is_some_and(|c| c.members_done) {
-                        continue;
-                    }
-                    let Some((range, deliveries)) = snapshot.key_deliveries(coordinator, &owed.key)
-                    else {
-                        continue;
-                    };
-                    for delivery in deliveries {
-                        add(
-                            range.range_id,
-                            delivery.member_id,
-                            owed.version_id.timestamp_ms(),
-                        );
-                    }
-                    continue;
-                }
-                let Ok(job) = BlobJobRecord::from_bytes(value) else {
-                    continue;
-                };
-                let (Some(target), ReplicateScopeTarget::Version { key, .. }) =
-                    (&job.distribution, &job.input.target)
-                else {
-                    continue;
-                };
-                let range = snapshot.range_for(key);
-                let range = range.filter(|range| range.coordinator == coordinator);
-                if let Some(range) = range.filter(|_| target.set_id == set_id) {
-                    add(range.range_id, target.member_id, job.owed_since_ms());
-                }
-            }
-            more = next;
-            match (next, values.last()) {
-                (true, Some((last, _))) => start = Some(last.clone()),
-                _ => break,
-            }
-        }
-        counted &= !more;
-    }
-    Ok((lag, counted))
 }
 
 /// The publications of one committed version to the members holding its key's range, while
@@ -286,10 +105,498 @@ pub(crate) fn member_jobs(
         .collect()
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum RecordError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("unexpected event while reading the set record: {0}")]
+    UnexpectedEvent(String),
+    #[error("the set record read did not finish")]
+    NotFinished,
+}
+
+fn record_read(set_id: Ulid) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: DISTRIBUTION_KEYSPACE.to_string(),
+        key: set_id.to_bytes().to_vec().into(),
+        txn_id: None,
+    })
+}
+
+fn decode_record(value: Option<Value>) -> Result<Option<DistributionView>, RecordError> {
+    Ok(value
+        .map(|value| DistributionView::from_bytes(value.as_ref()))
+        .transpose()?)
+}
+
+/// This node's record of a set, if it holds one.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReadRecordOperation {
+    set_id: Ulid,
+    output: Option<Result<Option<DistributionView>, RecordError>>,
+}
+
+impl ReadRecordOperation {
+    pub(crate) fn new(set_id: Ulid) -> Self {
+        Self {
+            set_id,
+            output: None,
+        }
+    }
+}
+
+impl Operation for ReadRecordOperation {
+    type Output = Option<DistributionView>;
+    type Error = RecordError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![record_read(self.set_id)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match (&self.output, event) {
+            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => decode_record(value),
+            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, event) => Err(RecordError::UnexpectedEvent(event.label().to_string())),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, RecordError> {
+        self.output.unwrap_or(Err(RecordError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// A local bucket's binding and this node's record of its set.
+pub(crate) type BoundRecord = (DistributionBinding, DistributionSnapshot);
+
+#[derive(Debug, PartialEq)]
+enum BoundState {
+    Init,
+    ReadBucket,
+    ReadRecord(Box<DistributionBinding>),
+    Finish,
+    Error,
+}
+
+/// The binding of a local bucket and this node's record of its set; `None` for an ordinary
+/// bucket, a missing bucket or a record that has not arrived.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BoundRecordOperation {
+    bucket: String,
+    state: BoundState,
+    output: Option<Result<Option<BoundRecord>, RecordError>>,
+}
+
+impl BoundRecordOperation {
+    pub(crate) fn new(bucket: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            state: BoundState::Init,
+            output: None,
+        }
+    }
+
+    fn done(&mut self, result: Result<Option<BoundRecord>, RecordError>) -> Effects {
+        self.state = match result {
+            Ok(_) => BoundState::Finish,
+            Err(_) => BoundState::Error,
+        };
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
+        let info = match value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()
+        {
+            Ok(info) => info,
+            Err(error) => return self.done(Err(error.into())),
+        };
+        let Some(binding) = info.and_then(|info| info.distribution) else {
+            return self.done(Ok(None));
+        };
+        let read = record_read(binding.set_id);
+        self.state = BoundState::ReadRecord(Box::new(binding));
+        smallvec![read]
+    }
+}
+
+impl Operation for BoundRecordOperation {
+    type Output = Option<BoundRecord>;
+    type Error = RecordError;
+
+    fn start(&mut self) -> Effects {
+        self.state = BoundState::ReadBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (std::mem::replace(&mut self.state, BoundState::Error), event) {
+            (
+                BoundState::ReadBucket | BoundState::ReadRecord(_),
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.done(Err(error.into())),
+            (BoundState::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.bucket_read(value)
+            }
+            (
+                BoundState::ReadRecord(binding),
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => {
+                let record = decode_record(value)
+                    .map(|view| view.map(|view| (*binding, view.head.snapshot)));
+                self.done(record)
+            }
+            (_, event) => self.done(Err(RecordError::UnexpectedEvent(event.label().to_string()))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, BoundState::Finish | BoundState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, RecordError> {
+        self.output.unwrap_or(Err(RecordError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Reads the member job queue and the live obligations of a bucket page by page, at most
+/// `limit` pages of each.
+#[derive(Debug, PartialEq)]
+struct QueueWalk {
+    queues: [(&'static str, Vec<u8>); 2],
+    limit: usize,
+    index: usize,
+    pages: usize,
+    start: Option<Key>,
+}
+
+/// What a queue walk does after one page.
+enum WalkStep {
+    Read(Effect),
+    /// The current queue still has rows behind its last page, but its page budget is spent.
+    Cut,
+    /// Every queue was read to its end.
+    Done,
+}
+
+impl QueueWalk {
+    fn new(bucket: &str, limit: usize) -> Result<Self, ConversionError> {
+        let [live, _, obligations] = queued_prefixes(bucket)?;
+        Ok(Self {
+            queues: [live, obligations],
+            limit,
+            index: 0,
+            pages: 0,
+            start: None,
+        })
+    }
+
+    fn key_space(&self) -> &'static str {
+        self.queues[self.index.min(1)].0
+    }
+
+    fn read(&self) -> Effect {
+        let (key_space, prefix) = &self.queues[self.index.min(1)];
+        Effect::Storage(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: Some(prefix.clone().into()),
+            start: self.start.clone().map(IterStart::After),
+            limit: FANOUT_PAGE,
+            txn_id: None,
+        })
+    }
+
+    /// Moves on after a page whose last row is `last`; `more` when rows remain behind it.
+    fn advance(&mut self, last: Option<Key>, more: bool) -> WalkStep {
+        self.pages += 1;
+        match last {
+            Some(last) if more && self.pages < self.limit => {
+                self.start = Some(last);
+                WalkStep::Read(self.read())
+            }
+            _ if more => WalkStep::Cut,
+            _ => self.next_queue(),
+        }
+    }
+
+    /// Starts the next queue, or reports that every queue was read.
+    fn next_queue(&mut self) -> WalkStep {
+        self.index += 1;
+        self.pages = 0;
+        self.start = None;
+        match self.index < self.queues.len() {
+            true => WalkStep::Read(self.read()),
+            false => WalkStep::Done,
+        }
+    }
+}
+
+/// The rows of one queue page and whether more follow; any other event, or one after the
+/// answer, is refused.
+fn queue_page(answered: bool, event: Event) -> Result<(Vec<(Key, Value)>, bool), RecordError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) if !answered => Ok((values, next_start_after.is_some())),
+        Event::Storage(StorageEvent::Error { error }) if !answered => Err(error.into()),
+        event => Err(RecordError::UnexpectedEvent(event.label().to_string())),
+    }
+}
+
+/// Whether this node still owes a publication of a key in `range` of the set: a queued member
+/// job or a live obligation that has not become jobs yet. A queue longer than one check reads
+/// counts as owing, so the caller looks again later.
+#[derive(Debug, PartialEq)]
+pub(crate) struct OwesFanoutOperation {
+    set_id: Ulid,
+    range: KeyRange,
+    walk: Option<QueueWalk>,
+    output: Option<Result<bool, RecordError>>,
+}
+
+impl OwesFanoutOperation {
+    pub(crate) fn new(bucket: &str, set_id: Ulid, range: KeyRange) -> Self {
+        let (walk, output) = match QueueWalk::new(bucket, FANOUT_PAGES) {
+            Ok(walk) => (Some(walk), None),
+            Err(error) => (None, Some(Err(error.into()))),
+        };
+        Self {
+            set_id,
+            range,
+            walk,
+            output,
+        }
+    }
+
+    fn owed(&self, key_space: &str, value: &[u8]) -> bool {
+        if key_space == REPLICATION_OBLIGATION_KEYSPACE {
+            return LiveObligationRecord::from_bytes(value)
+                .is_ok_and(|obligation| self.range.contains(&obligation.key));
+        }
+        BlobJobRecord::from_bytes(value).is_ok_and(|job| {
+            let key = match &job.input.target {
+                ReplicateScopeTarget::Version { key, .. } => Some(key),
+                _ => None,
+            };
+            let member = (job.distribution.as_ref()).is_some_and(|t| t.set_id == self.set_id);
+            member && key.is_some_and(|key| self.range.contains(key))
+        })
+    }
+
+    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Effects {
+        let Some(key_space) = self.walk.as_ref().map(QueueWalk::key_space) else {
+            return self.finish(Err(RecordError::NotFinished));
+        };
+        if values.iter().any(|(_, value)| self.owed(key_space, value)) {
+            return self.finish(Ok(true));
+        }
+        let last = values.last().map(|(key, _)| key.clone());
+        match self.walk.as_mut().map(|walk| walk.advance(last, more)) {
+            Some(WalkStep::Read(effect)) => smallvec![effect],
+            // A queue longer than the check reads counts as owing.
+            Some(WalkStep::Cut) => self.finish(Ok(true)),
+            Some(WalkStep::Done) => self.finish(Ok(false)),
+            None => self.finish(Err(RecordError::NotFinished)),
+        }
+    }
+
+    fn finish(&mut self, result: Result<bool, RecordError>) -> Effects {
+        self.output = Some(result);
+        smallvec![]
+    }
+}
+
+impl Operation for OwesFanoutOperation {
+    type Output = bool;
+    type Error = RecordError;
+
+    fn start(&mut self) -> Effects {
+        self.walk.iter().map(QueueWalk::read).collect()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match queue_page(self.output.is_some(), event) {
+            Ok((values, more)) => self.page_read(values, more),
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<bool, RecordError> {
+        self.output.unwrap_or(Err(RecordError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Copy lag per range this node coordinates and per receiving member.
+pub type LagMap = BTreeMap<(Ulid, Ulid), CopyLag>;
+
+/// The versions `coordinator` still owes, by range it coordinates and receiving member, from at
+/// most `LAG_PAGES` pages of each queue; false when a queue held more, so counts are lower bounds.
+#[derive(Debug, PartialEq)]
+pub struct CopyLagOperation {
+    snapshot: DistributionSnapshot,
+    coordinator: Ulid,
+    walk: Option<QueueWalk>,
+    lag: LagMap,
+    counted: bool,
+    output: Option<Result<(LagMap, bool), RecordError>>,
+}
+
+impl CopyLagOperation {
+    pub fn new(snapshot: DistributionSnapshot, coordinator: Ulid) -> Self {
+        let (walk, output) = match QueueWalk::new(&snapshot.config.bucket, LAG_PAGES) {
+            Ok(walk) => (Some(walk), None),
+            Err(error) => (None, Some(Err(error.into()))),
+        };
+        Self {
+            snapshot,
+            coordinator,
+            walk,
+            lag: LagMap::new(),
+            counted: true,
+            output,
+        }
+    }
+
+    fn add(&mut self, range_id: Ulid, member_id: Ulid, written_ms: u64) {
+        let entry = self.lag.entry((range_id, member_id)).or_default();
+        entry.pending += 1;
+        entry.oldest_ms = Some(entry.oldest_ms.map_or(written_ms, |ms| ms.min(written_ms)));
+    }
+
+    fn count(&mut self, key_space: &str, value: &[u8]) {
+        if key_space == REPLICATION_OBLIGATION_KEYSPACE {
+            let Ok(owed) = LiveObligationRecord::from_bytes(value) else {
+                return;
+            };
+            // An obligation whose member jobs are queued is counted through them.
+            if owed.continuation.as_ref().is_some_and(|c| c.members_done) {
+                return;
+            }
+            let Some((range, deliveries)) =
+                self.snapshot.key_deliveries(self.coordinator, &owed.key)
+            else {
+                return;
+            };
+            let (range_id, written_ms) = (range.range_id, owed.version_id.timestamp_ms());
+            for delivery in deliveries {
+                self.add(range_id, delivery.member_id, written_ms);
+            }
+            return;
+        }
+        let Ok(job) = BlobJobRecord::from_bytes(value) else {
+            return;
+        };
+        let (Some(target), ReplicateScopeTarget::Version { key, .. }) =
+            (&job.distribution, &job.input.target)
+        else {
+            return;
+        };
+        let set_id = self.snapshot.set_id();
+        let range = (self.snapshot.range_for(key))
+            .filter(|range| range.coordinator == self.coordinator)
+            .filter(|_| target.set_id == set_id)
+            .map(|range| range.range_id);
+        if let Some(range_id) = range {
+            self.add(range_id, target.member_id, job.owed_since_ms());
+        }
+    }
+
+    fn page_read(&mut self, values: Vec<(Key, Value)>, more: bool) -> Effects {
+        let Some(key_space) = self.walk.as_ref().map(QueueWalk::key_space) else {
+            return self.finish(Err(RecordError::NotFinished));
+        };
+        for (_, value) in &values {
+            self.count(key_space, value);
+        }
+        let last = values.last().map(|(key, _)| key.clone());
+        let Some(walk) = self.walk.as_mut() else {
+            return self.finish(Err(RecordError::NotFinished));
+        };
+        let mut step = walk.advance(last, more);
+        if let WalkStep::Cut = step {
+            // The counts become lower bounds; the next queue is still read.
+            self.counted = false;
+            step = walk.next_queue();
+        }
+        match step {
+            WalkStep::Read(effect) => smallvec![effect],
+            WalkStep::Cut | WalkStep::Done => {
+                let lag = std::mem::take(&mut self.lag);
+                let counted = self.counted;
+                self.finish(Ok((lag, counted)))
+            }
+        }
+    }
+
+    fn finish(&mut self, result: Result<(LagMap, bool), RecordError>) -> Effects {
+        self.output = Some(result);
+        smallvec![]
+    }
+}
+
+impl Operation for CopyLagOperation {
+    type Output = (LagMap, bool);
+    type Error = RecordError;
+
+    fn start(&mut self) -> Effects {
+        self.walk.iter().map(QueueWalk::read).collect()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match queue_page(self.output.is_some(), event) {
+            Ok((values, more)) => self.page_read(values, more),
+            Err(error) => self.finish(Err(error)),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<(LagMap, bool), RecordError> {
+        self.output.unwrap_or(Err(RecordError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::distribution::test_record::{binding, member, replicated};
+    use crate::driver::{DriverContext, drive};
 
     #[test]
     fn publishes_while_coordinating() {
@@ -318,7 +625,9 @@ mod tests {
         // A queued member job or obligation of a key in the range keeps it owing.
         use crate::distribution::test_store::{open, range};
         use aruna_core::structs::identity::auth::AuthContext;
-        use aruna_core::types::{Key, Value};
+        use aruna_core::types::{Effects, Key, Value};
+        use smallvec::smallvec;
+        use thiserror::Error;
         let (_dir, storage_handle) = open();
         let context = DriverContext {
             storage_handle,
@@ -335,7 +644,10 @@ mod tests {
         let (lower, upper) = (range(1, "", Some("m")), range(2, "m", None));
         let owes = |range: KeyRange| {
             let context = &context;
-            async move { owes_fanout(context, "spire", set_id, &range).await.unwrap() }
+            async move {
+                let owes = OwesFanoutOperation::new("spire", set_id, range);
+                drive(owes, context).await.unwrap()
+            }
         };
         assert!(!owes(lower.clone()).await);
         let realm_id = snapshot.statements[0].statement.realm_id;
@@ -357,7 +669,9 @@ mod tests {
             let context = &context;
             async move { context.storage_handle.send_storage_effect(effect).await }
         };
-        let entry = super::super::queue::live_obligation_entry(&obligation).unwrap();
+        let entry =
+            aruna_core::structs::storage::replication_queue::live_obligation_entry(&obligation)
+                .unwrap();
         write(entry.clone()).await;
         assert!(owes(lower.clone()).await, "an obligation is still owed");
         assert!(!owes(upper.clone()).await, "another range owes nothing");
@@ -369,7 +683,7 @@ mod tests {
         context.storage_handle.send_storage_effect(delete).await;
         let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
         let job = &jobs[0];
-        let key = super::super::queue::blob_job_key(job).unwrap();
+        let key = aruna_core::structs::storage::replication_queue::blob_job_key(job).unwrap();
         let value = job.to_bytes().unwrap().into();
         let job_space = aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE.to_string();
         write((job_space, key, value)).await;
@@ -380,12 +694,12 @@ mod tests {
     #[tokio::test]
     async fn counts_copy_lag() {
         // Obligations count for every member until their jobs are queued, then the jobs count.
-        use super::super::queue::{
-            LiveReplicationContinuation, blob_job_key, live_obligation_entry,
-        };
         use crate::distribution::test_store::open;
         use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
+        use aruna_core::structs::storage::replication_queue::{
+            LiveReplicationContinuation, blob_job_key, live_obligation_entry,
+        };
         let (_dir, storage_handle) = open();
         let context = DriverContext {
             storage_handle,
@@ -431,14 +745,18 @@ mod tests {
         context.storage_handle.send_storage_effect(write).await;
 
         let lower = snapshot.config.ranges[0].range_id;
-        let (lag, counted) = copy_lag(&context, &snapshot, member(1)).await.unwrap();
+        let (lag, counted) = drive(CopyLagOperation::new(snapshot.clone(), member(1)), &context)
+            .await
+            .unwrap();
         assert!(counted);
         let expected = CopyLag {
             pending: 2,
             oldest_ms: Some(1_000),
         };
         assert_eq!(lag, BTreeMap::from([((lower, member(2)), expected)]));
-        let (lag, _) = copy_lag(&context, &snapshot, member(2)).await.unwrap();
+        let (lag, _) = drive(CopyLagOperation::new(snapshot.clone(), member(2)), &context)
+            .await
+            .unwrap();
         assert!(
             lag.is_empty(),
             "the other coordinator owes nothing of the lower range"
@@ -474,5 +792,112 @@ mod tests {
             })
         );
         assert!(member_jobs(&binding(&snapshot, 2, 5), &snapshot, &obligation, 9).is_empty());
+    }
+
+    mod transitions {
+        use super::*;
+        use aruna_core::operation_check::{
+            check_abort, rejects_events, rejects_finalize, sample_events,
+        };
+
+        fn page(rows: usize, more: bool) -> Event {
+            Event::Storage(StorageEvent::IterResult {
+                values: (0..rows)
+                    .map(|index| (vec![index as u8].into(), Vec::new().into()))
+                    .collect(),
+                next_start_after: more.then(|| vec![0xff].into()),
+            })
+        }
+
+        fn timeout() -> Event {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        }
+
+        #[test]
+        fn record_reads_contract() {
+            let set_id = Ulid::from_parts(1, 1);
+            let mut missing = ReadRecordOperation::new(set_id);
+            assert_eq!(missing.start().as_slice(), [record_read(set_id)]);
+            missing.step(Event::Storage(StorageEvent::ReadResult {
+                key: Vec::new().into(),
+                value: None,
+            }));
+            assert_eq!(missing.finalize(), Ok(None));
+            // A plain or missing bucket has no record; a storage error fails.
+            let mut plain = BoundRecordOperation::new("plain");
+            plain.start();
+            assert!(
+                plain
+                    .step(Event::Storage(StorageEvent::ReadResult {
+                        key: Vec::new().into(),
+                        value: None,
+                    }))
+                    .is_empty()
+            );
+            assert_eq!(plain.finalize(), Ok(None));
+            let mut failed = BoundRecordOperation::new("b");
+            failed.start();
+            failed.step(timeout());
+            assert_eq!(
+                failed.finalize(),
+                Err(RecordError::Storage(StorageError::Timeout))
+            );
+            let reading = || {
+                let mut operation = BoundRecordOperation::new("b");
+                operation.start();
+                operation
+            };
+            let refused = rejects_events(reading, sample_events, |event| {
+                matches!(event, Event::Storage(StorageEvent::ReadResult { .. }))
+            });
+            assert_eq!(refused.len(), sample_events().len() - 1);
+            let mut open = reading();
+            check_abort(&mut open, &[]);
+            rejects_finalize(open);
+        }
+
+        #[test]
+        fn fanout_budget_owes() {
+            // Empty queues owe nothing; a queue longer than the page budget counts as owing.
+            let range = crate::distribution::test_store::range(1, "", None);
+            let set_id = Ulid::from_parts(1, 1);
+            let mut empty = OwesFanoutOperation::new("spire", set_id, range.clone());
+            assert_eq!(empty.start().len(), 1);
+            assert_eq!(
+                empty.step(page(0, false)).len(),
+                1,
+                "the obligations follow"
+            );
+            assert!(empty.step(page(0, false)).is_empty());
+            assert_eq!(empty.finalize(), Ok(false));
+            let mut long = OwesFanoutOperation::new("spire", set_id, range);
+            long.start();
+            for _ in 1..FANOUT_PAGES {
+                assert_eq!(long.step(page(1, true)).len(), 1);
+            }
+            assert!(long.step(page(1, true)).is_empty());
+            assert_eq!(long.finalize(), Ok(true));
+        }
+
+        #[test]
+        fn lag_cut_continues() {
+            // A cut queue makes the counts lower bounds, and the next queue is still read.
+            let (snapshot, _) = replicated(true, 1);
+            let mut operation = CopyLagOperation::new(snapshot, member(1));
+            operation.start();
+            for _ in 1..LAG_PAGES {
+                operation.step(page(1, true));
+            }
+            assert_eq!(operation.step(page(1, true)).len(), 1);
+            assert!(operation.step(page(0, false)).is_empty());
+            let (lag, counted) = operation.finalize().unwrap();
+            assert!(lag.is_empty() && !counted);
+            let mut failed = CopyLagOperation::new(replicated(true, 1).0, member(1));
+            failed.start();
+            failed.step(timeout());
+            assert!(failed.finalize().is_err());
+        }
     }
 }

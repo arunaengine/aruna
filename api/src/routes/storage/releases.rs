@@ -9,8 +9,9 @@ use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
 use aruna_operations::s3::bucket::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError, release_view};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
+use aruna_operations::s3::bucket::release::read::{release_members, release_view};
+use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};

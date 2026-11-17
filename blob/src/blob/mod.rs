@@ -23,6 +23,7 @@ mod framed_parts;
 mod frames;
 mod group;
 mod in_place;
+mod inbound;
 mod io;
 mod local_spool;
 pub mod pithos;
@@ -34,6 +35,7 @@ mod source;
 mod unlock;
 
 pub use group::{BackendClaim, GroupHold};
+pub use inbound::{InboundError, refuse_stream};
 pub use registry::{BackendRegistry, NodeBackend};
 
 #[cfg(test)]

@@ -134,7 +134,7 @@ impl ObserveSourceOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(ObserveError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

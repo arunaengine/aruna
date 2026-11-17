@@ -394,8 +394,8 @@ mod tests {
     use super::*;
     use crate::jobs::store::key_wait::park_job;
     use crate::jobs::store::query::insert_job;
-    use crate::jobs::store::query::iter_prefix_page;
     use crate::jobs::store::state::{ClaimOutcome, claim_job};
+    use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
     use aruna_core::structs::execution::job::JobPayload;

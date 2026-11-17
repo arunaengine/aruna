@@ -3,7 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, copy_targets, parse_authority};
+use crate::s3::bucket::key::rows::{
+    SettingsError, authority_read, copy_targets, full_scan, parse_authority,
+};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -46,11 +48,11 @@ pub enum SealMissingError {
     Key(#[from] BucketKeyError),
     #[error(transparent)]
     Blob(#[from] BlobError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("sealing the missing copies did not finish")]
     NotFinished,
@@ -112,13 +114,7 @@ impl SealMissingOperation {
 
     fn scan(&mut self, step: SealStep, key_space: &str, prefix: Vec<u8>) -> Effects {
         self.step = step;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
+        smallvec![full_scan(key_space, Some(prefix.into()), self.txn_id)]
     }
 
     fn read_grants(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
@@ -284,7 +280,7 @@ impl Operation for SealMissingOperation {
             (state, received) => self.fail(SealMissingError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

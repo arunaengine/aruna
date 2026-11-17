@@ -65,11 +65,11 @@ pub enum CreateBucketError {
         current: CreateBucketState,
         expected: CreateBucketState,
     },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: CreateBucketState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error(transparent)]
     UsageUpdateError(#[from] UsageUpdateError),
@@ -144,7 +144,7 @@ impl CreateBucketOperation {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -189,7 +189,7 @@ impl CreateBucketOperation {
             received => Err(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -224,7 +224,7 @@ impl CreateBucketOperation {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let mut values = values.into_iter().map(|(_, value)| value);
@@ -295,7 +295,7 @@ impl CreateBucketOperation {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some((backend_id, provider)) = self.provider.clone() else {
@@ -354,7 +354,7 @@ impl CreateBucketOperation {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -419,7 +419,7 @@ impl CreateBucketOperation {
             return self.emit_error(CreateBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             });
         };
 

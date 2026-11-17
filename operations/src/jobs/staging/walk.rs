@@ -49,7 +49,7 @@ use crate::distribution::guard::{
 };
 use crate::driver::drive;
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::jobs::store::query::{batch_delete, iter_prefix_page};
+use crate::jobs::store::query::batch_delete;
 use crate::jobs::store::read_state;
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::staging::list_source::{
@@ -60,6 +60,7 @@ use crate::staging::page::import::{
     PreparePageOperation,
 };
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+use crate::storage_read::iter_prefix_page;
 
 /// Entries one listing request reads.
 const STAGING_PAGE_SIZE: usize = 1000;

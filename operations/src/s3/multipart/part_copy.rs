@@ -5,12 +5,11 @@
 use crate::driver::{DriverContext, drive};
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
-use crate::s3::fence_store::ensure_write_allowed;
+use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
 use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_source,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
+use crate::s3::object::read::{TokenRead, read_source};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
@@ -78,9 +77,12 @@ pub async fn upload_part_token(
     input: PartCopyInput,
     token: Option<TokenRead>,
 ) -> Result<PartCopyResult, PartCopyError> {
-    ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
-        .await
-        .map_err(|error| PartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
+    drive(
+        FenceCheckOperation::new(&input.dest_bucket, &input.dest_key),
+        context,
+    )
+    .await
+    .map_err(|error| PartCopyError::UploadPart(UploadPartError::PurgeFence(error)))?;
     let destination_upload = validate_destination_upload(context, &input).await?;
 
     let source_input = GetObjectInput {

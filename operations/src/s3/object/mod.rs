@@ -15,14 +15,16 @@ mod lookup;
 #[path = "managed_copy_tests.rs"]
 mod managed_copy_tests;
 pub mod metadata;
+pub mod metadata_drain;
 pub mod origin;
 pub mod pages;
 pub mod placement;
 pub mod put;
+pub mod read;
 mod refresh_mint;
 mod refresh_observe;
 pub mod search;
-pub mod search_scan;
+pub(crate) mod search_scan;
 pub mod source;
 pub mod versions;
 pub mod visible;

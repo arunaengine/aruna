@@ -36,11 +36,11 @@ pub enum PutCorsError {
     NoTransactionFound,
     #[error("PutBucketCors did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -109,7 +109,7 @@ impl Operation for PutCorsOperation {
                     return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = Some(txn_id);
@@ -125,7 +125,7 @@ impl Operation for PutCorsOperation {
                     return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
@@ -156,7 +156,7 @@ impl Operation for PutCorsOperation {
                     return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
@@ -170,7 +170,7 @@ impl Operation for PutCorsOperation {
                     return self.fail(PutCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = None;
@@ -216,11 +216,11 @@ pub enum GetCorsError {
     CorsNotFound,
     #[error("GetBucketCors did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -280,7 +280,7 @@ impl Operation for GetCorsOperation {
                     return self.fail(GetCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
 
@@ -335,11 +335,11 @@ pub enum DeleteCorsError {
     NoTransactionFound,
     #[error("DeleteBucketCors did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 
@@ -406,7 +406,7 @@ impl Operation for DeleteCorsOperation {
                     return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = Some(txn_id);
@@ -422,7 +422,7 @@ impl Operation for DeleteCorsOperation {
                     return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
@@ -453,7 +453,7 @@ impl Operation for DeleteCorsOperation {
                     return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::WriteResult)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 let Some(txn_id) = self.txn_id else {
@@ -467,7 +467,7 @@ impl Operation for DeleteCorsOperation {
                     return self.fail(DeleteCorsError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                        received: event,
+                        received: (event).label(),
                     });
                 };
                 self.txn_id = None;

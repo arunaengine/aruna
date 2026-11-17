@@ -14,20 +14,13 @@ use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::types::{Effects, Key};
 use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
-use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use super::revoke::{RevokeUserError, RevokeUserOperation};
-use crate::driver::{DriverContext, drive};
 
 /// Credentials read per storage page.
 const PAGE: usize = 256;
-/// A cutoff stays in the realm's revocation set for 366 days, so hourly sweeps delete every
-/// credential it ends long before then. A node offline for that whole time can miss it.
-pub const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CutoffSweepConfig {
@@ -100,7 +93,7 @@ impl CutoffSweepOperation {
         let error = CutoffSweepError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label().to_string(),
         };
         self.finish(Err(error))
     }
@@ -230,35 +223,6 @@ impl Operation for CutoffSweepOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
-}
-
-/// Sweeps once per `SWEEP_INTERVAL` until shutdown; a failed sweep is retried at the next one.
-pub fn spawn_cutoff_sweep(
-    context: Arc<DriverContext>,
-    shutdown: &Shutdown,
-    realm_id: RealmId,
-    node_id: NodeId,
-) {
-    let token = shutdown.token();
-    shutdown.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => return,
-                _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
-            }
-            let now = aruna_core::time::unix_timestamp_secs();
-            let config = CutoffSweepConfig {
-                realm_id,
-                node_id,
-                now,
-            };
-            match drive(CutoffSweepOperation::new(config), context.as_ref()).await {
-                Ok(0) => {}
-                Ok(revoked) => tracing::info!(revoked, "Deleted S3 credentials of cut-off owners"),
-                Err(error) => warn!(error = %error, "S3 credential cutoff sweep failed"),
-            }
-        }
-    });
 }
 
 #[cfg(test)]

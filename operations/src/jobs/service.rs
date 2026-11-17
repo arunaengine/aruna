@@ -43,7 +43,6 @@ use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
 use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_requested};
 use super::store::key_wait::read_key_waits;
-use super::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use super::store::state::{read_artifact_tombstone, read_job_record};
 use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{
@@ -56,6 +55,7 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::load_realm_config;
@@ -1627,8 +1627,8 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::query::insert_job;
     use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
+    use super::crate::jobs::store::query::insert_job;
     use super::*;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,

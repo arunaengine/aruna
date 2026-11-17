@@ -164,6 +164,22 @@ pub enum SubOperationEvent {
     VersionRekeyed {
         outcome: RekeyOutcome,
     },
+    /// A kept bucket key audit record was stored and its retry timer row removed.
+    AuditStored {
+        result: Result<(), String>,
+    },
+    /// The key directory answer for one user.
+    KeysLooked {
+        lookup: crate::structs::storage::holders::KeyLookup,
+    },
+    /// Whether a bucket sealed a missing key copy for a holder's new user key.
+    CopySealed {
+        sealed: bool,
+    },
+    /// Whether one parked copy job woke; the row of its wait is gone either way.
+    CopyWoken {
+        result: Result<bool, String>,
+    },
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
         reason: String,
@@ -982,6 +998,10 @@ impl Event {
                     KeyRequestsFailed,
                     ReissuePaged,
                     VersionRekeyed,
+                    AuditStored,
+                    KeysLooked,
+                    CopySealed,
+                    CopyWoken,
                     NotificationsFailed,
                 }
             ),

@@ -61,11 +61,11 @@ pub enum RemovalError {
     NotAdmin,
     #[error("removing this holder breaks the recovery rule")]
     RecoveryConfirmationRequired,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the removal did not finish")]
     NotFinished,
@@ -359,7 +359,7 @@ impl Operation for RemoveHolderOperation {
             (state, received) => self.fail(RemovalError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

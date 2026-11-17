@@ -34,11 +34,11 @@ pub enum UnlockLimitError {
     /// The calling user lost the group admin role before the change committed.
     #[error("the caller is no group admin")]
     NotAdmin,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the unlock limit change did not finish")]
     NotFinished,
@@ -206,7 +206,7 @@ impl Operation for UnlockLimitOperation {
             (state, received) => self.fail(UnlockLimitError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

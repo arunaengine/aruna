@@ -674,6 +674,7 @@ pub(crate) fn version_row(written: &BackendLocation, version: &str) -> (String, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::s3::fence_done;
     use aruna_core::keyspaces::BLOB_LOCATIONS_KEYSPACE;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::HASH_BLAKE3;
@@ -771,16 +772,6 @@ mod tests {
         };
         assert_eq!(key_space, BACKEND_IMPORT_KEYSPACE);
         operation.step(read(Some(vec![1])))
-    }
-
-    /// Answers the rows and the commit of a fenced intent write.
-    fn fence_done(operation: &mut PutObjectOperation) -> Effects {
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_parts(77, 7),
-        }))
     }
 
     fn written(path: String, ulid: Ulid) -> BackendLocation {

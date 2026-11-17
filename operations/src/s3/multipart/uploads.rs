@@ -35,11 +35,11 @@ pub enum ListUploadsError {
     ConversionError(#[from] ConversionError),
     #[error("multipart upload scan budget exhausted")]
     ScanBudgetExceeded,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListUploadsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -160,7 +160,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -201,7 +201,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -307,7 +307,7 @@ impl ListUploadsOperation {
             return self.emit_error(ListUploadsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -362,8 +362,8 @@ impl Operation for ListUploadsOperation {
 mod test {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::tests::s3::seed_upload;
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_storage::storage;
@@ -411,17 +411,6 @@ mod test {
             backend_upload: None,
             encryption: None,
         }
-    }
-
-    async fn seed_upload(storage_handle: &storage::StorageHandle, record: &MultipartUpload) {
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: UPLOAD_KEYSPACE.to_string(),
-                key: record.upload_id.to_bytes().to_vec().into(),
-                value: record.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
-            .await;
     }
 
     fn input(bucket: &str, max_uploads: usize) -> ListUploadsInput {

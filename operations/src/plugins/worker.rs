@@ -80,7 +80,7 @@ use crate::metadata::projector::dot_applied;
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_core::plugin_runs::{Decisions, EventBatch};
+use aruna_core::plugin_runs::{Decisions, EventBatch, Outcome};
 
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;

@@ -11,10 +11,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_operations::driver::drive;
+use aruna_operations::s3::bucket::checked_rename::authorized_rename;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::rename::{
-    RenameError, RenameInput, RenameItem, RenamePlan, authorized_rename,
-};
+use aruna_operations::s3::bucket::rename::{RenameError, RenameInput, RenameItem, RenamePlan};
 use axum::Json;
 use axum::extract::{Path, State};
 use serde::{Deserialize, Serialize};

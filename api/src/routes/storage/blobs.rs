@@ -13,6 +13,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     CopyOrigin, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::driver::{drive, drive_until};
@@ -20,14 +22,11 @@ use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
     RelationshipNodesOperation, RemoteLocationOperation,
 };
-use aruna_operations::replication::plaintext::{consent_required, is_holder};
+use aruna_operations::replication::plaintext::{EncryptionCheckOperation, HolderCheckOperation};
 use aruna_operations::replication::protocol::{
-    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
 };
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeTarget,
-};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
@@ -236,13 +235,14 @@ pub(crate) async fn plaintext_holder(
     user: aruna_core::UserId,
 ) -> ServerResult<bool> {
     let context = state.get_ctx();
-    let encrypted = consent_required(&context, bucket)
+    let encrypted = drive(EncryptionCheckOperation::new(bucket, true), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     if !encrypted {
         return Ok(false);
     }
-    match is_holder(&context, state.get_realm_id(), bucket, user).await {
+    let holder = HolderCheckOperation::new(state.get_realm_id(), bucket, user);
+    match drive(holder, &context).await {
         Ok(true) => Ok(true),
         Ok(false) => Err(ServerError::Refused(
             StatusCode::FORBIDDEN,

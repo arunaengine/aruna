@@ -425,7 +425,7 @@ async fn local_is_device(context: &Arc<DriverContext>) -> bool {
     let Some(net_handle) = context.net_handle.as_ref() else {
         return false;
     };
-    crate::replication::bao_read::local_is_user(context, *net_handle.realm_id()).await
+    crate::replication::managed_read::local_is_user(context, *net_handle.realm_id()).await
 }
 
 #[cfg(test)]

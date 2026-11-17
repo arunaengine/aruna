@@ -9,12 +9,13 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
 use crate::blob::migration::queue::resume_transitions;
-use crate::blob::promote::{PromoteError, promote_unlocked};
-use crate::driver::DriverContext;
+use crate::blob::promote::PromoteError;
+use crate::blob::unlocked::promote_unlocked;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::JobMutationError;
 use crate::jobs::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait, wake_key_waits};
-use crate::jobs::store::query::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -66,7 +67,8 @@ pub async fn wake_unlocked(
         resumed = resumed.and(resume_transitions(context, key).await);
     }
     // Copies waiting for this source key run after promotion, so pending sources are hashed.
-    let copies = crate::replication::parking::wake_parked(context, key, now_ms).await;
+    let wake = crate::replication::parking::WakeParkedOperation::new(key, now_ms);
+    let copies = drive(wake, context).await;
     let envelopes = crate::s3::abe_copies::complete_copies(context, key, origin).await;
     queued.map_err(|error| KeyWakeError::Jobs(JobMutationError::Storage(error)))?;
     resumed.map_err(KeyWakeError::Transition)?;

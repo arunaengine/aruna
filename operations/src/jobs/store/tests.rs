@@ -1294,7 +1294,7 @@ async fn filter_scans_pages() {
         vec![(
             JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, 2_000, job_id(2)),
-            empty_value(),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
         )],
         None,
     )
@@ -1349,7 +1349,7 @@ async fn internal_jobs_hidden() {
         vec![(
             JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, record.created_at_ms, job_id),
-            empty_value(),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
         )],
         None,
     )
@@ -1399,7 +1399,7 @@ async fn cleanup_jobs_hidden() {
         vec![(
             JOB_INDEX_KEYSPACE.to_string(),
             owner_index_key(owner, record.created_at_ms, job_id),
-            empty_value(),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
         )],
         None,
     )
@@ -1555,7 +1555,7 @@ async fn run_delete_rules() {
         vec![(
             JOB_ENTRY_KEYSPACE.to_string(),
             job_entry_key(finished.job_id, b"row"),
-            empty_value(),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
         )],
         None,
     )

@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::key_wake::wake_unlocked;
 use crate::s3::bucket::audit_retry::{AUDIT_ATTEMPTS, retry_effect, retry_timer};
 use crate::s3::bucket::key::lock::{answers_timer, lock_timer};
 use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
@@ -16,7 +14,6 @@ use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRecord, BucketKeyRef, HolderOrigin, KeyState, KeyTicket,
@@ -71,11 +68,11 @@ pub enum UnlockError {
     /// The caller is a holder, but no copy of this generation was sealed to them yet.
     #[error("the caller holds no sealed copy of this key generation")]
     NoCopy,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the unlock did not finish")]
     NotFinished,
@@ -464,7 +461,7 @@ impl Operation for UnlockBucketOperation {
             (state, received) => self.fail(UnlockError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -494,26 +491,6 @@ impl Operation for UnlockBucketOperation {
         }
         effects
     }
-}
-
-/// Unlocks, then resumes the work that waited for this key; a failed resume is only reported.
-pub async fn unlock_and_wake(
-    context: &DriverContext,
-    operation: UnlockBucketOperation,
-    origin: (RealmId, NodeId),
-    limits: &RoCrateLimits,
-) -> Result<UnlockStatus, UnlockError> {
-    let status = drive(operation, context).await?;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
-    if let Err(error) = wake_unlocked(context, status.key, now_ms, origin, limits).await {
-        tracing::warn!(
-            bucket_id = %status.key.bucket_id,
-            generation = status.key.generation,
-            error = %error,
-            "Failed to resume work waiting for an unlocked key"
-        );
-    }
-    Ok(status)
 }
 
 #[cfg(test)]

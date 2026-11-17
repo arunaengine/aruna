@@ -26,8 +26,8 @@ use thiserror::Error;
 use super::{PAGE_BYTES, PAGE_RECORDS};
 use crate::connectors::root_record::{hydrated, named_root};
 use crate::replication::protocol::VersionReplicationManifest;
-use crate::replication::queue::BlobJobRecord;
-use crate::replication::version_replication::ReplicateScopeTarget;
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 
 /// What a page does with one queued job.
 #[derive(Clone, Debug, PartialEq)]
@@ -294,7 +294,7 @@ impl Operation for PageBuildOperation {
             }
             (BuildState::Finish | BuildState::Error, _) => return smallvec![],
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(BuildError::UnexpectedEvent(format!("{event:?}"))),
+            (_, event) => Err(BuildError::UnexpectedEvent(event.label().to_string())),
         };
         result.unwrap_or_else(|error| {
             self.state = BuildState::Error;

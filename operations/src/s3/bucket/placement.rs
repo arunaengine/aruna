@@ -8,7 +8,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
@@ -19,7 +19,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::permission_check;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
@@ -178,17 +178,11 @@ impl PutPlacementOperation {
     }
 
     fn authorize(&self, path: String) -> Effects {
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.input.auth_context.clone(),
+        smallvec![permission_check(
+            self.input.auth_context.clone(),
             path,
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+            Permission::WRITE,
+        )]
     }
 
     fn fail(&mut self, error: PutPlacementError) -> Effects {

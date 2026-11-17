@@ -159,7 +159,7 @@ impl TouchS3Operation {
         self.fail(S3SessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            received,
+            received: received.label(),
         })
     }
 

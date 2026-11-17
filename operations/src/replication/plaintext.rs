@@ -3,24 +3,47 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::key_wake::read_row;
-use crate::jobs::store::query::iter_prefix_page;
-use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::bucket::key::rows::{authority_read, parse_authority};
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
-    PLAINTEXT_COPY_KEYSPACE,
+    PLAINTEXT_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState,
 };
-use aruna_core::types::Key;
+use aruna_core::types::{Effects, Key, Value};
+use smallvec::smallvec;
+use thiserror::Error;
 use ulid::Ulid;
+
+use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
+
+/// Key rows one page of the retained key scan reads.
+const KEY_PAGE: usize = 64;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PlaintextError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("the plaintext request row does not decode: {0}")]
+    Request(String),
+    #[error("Bucket not found")]
+    NoBucket,
+    #[error(transparent)]
+    Authority(#[from] SettingsError),
+    #[error("unexpected event in a plaintext check: {0}")]
+    UnexpectedEvent(String),
+    #[error("the plaintext check did not finish")]
+    NotFinished,
+}
 
 /// Row of the plaintext request of an explicit copy job.
 pub fn job_consent(job_key: &[u8]) -> Vec<u8> {
@@ -33,8 +56,9 @@ pub fn relationship_consent(id: Ulid) -> Vec<u8> {
 }
 
 /// The write of a plaintext request by `requester`.
-pub fn consent_write(row: Vec<u8>, requester: UserId) -> Result<Effect, String> {
-    let value = postcard::to_allocvec(&requester).map_err(|error| error.to_string())?;
+pub fn consent_write(row: Vec<u8>, requester: UserId) -> Result<Effect, PlaintextError> {
+    let value = postcard::to_allocvec(&requester)
+        .map_err(|error| PlaintextError::Request(error.to_string()))?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: PLAINTEXT_COPY_KEYSPACE.to_string(),
         key: Key::from(row),
@@ -51,129 +75,421 @@ pub fn consent_delete(row: Vec<u8>) -> Effect {
     })
 }
 
-/// Runs a consent write or delete.
-pub async fn store_consent(context: &DriverContext, effect: Effect) -> Result<(), String> {
-    let Effect::Storage(effect) = effect else {
-        return Err("not a storage effect".to_string());
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
+/// Writes or deletes one plaintext request row, from [`consent_write`] or [`consent_delete`].
+#[derive(Debug, PartialEq)]
+pub struct ConsentStoreOperation {
+    effect: Option<Effect>,
+    output: Option<Result<(), PlaintextError>>,
+}
+
+impl ConsentStoreOperation {
+    pub fn new(effect: Effect) -> Self {
+        Self {
+            effect: Some(effect),
+            output: None,
         }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
     }
 }
 
-/// Who asked for a plaintext copy in `row`, if anyone did.
-pub async fn read_consent(context: &DriverContext, row: Vec<u8>) -> Result<Option<UserId>, String> {
-    let value = read_row(&context.storage_handle, PLAINTEXT_COPY_KEYSPACE, row).await?;
-    value
-        .map(|value| postcard::from_bytes(&value).map_err(|error| error.to_string()))
-        .transpose()
+impl Operation for ConsentStoreOperation {
+    type Output = ();
+    type Error = PlaintextError;
+
+    fn start(&mut self) -> Effects {
+        self.effect.take().into_iter().collect()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match (&self.output, event) {
+            (
+                None,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+                ),
+            ) => Ok(()),
+            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<(), PlaintextError> {
+        self.output.unwrap_or(Err(PlaintextError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
-/// Whether `bucket` on this node encrypts its objects.
-pub async fn source_encrypted(context: &DriverContext, bucket: &str) -> Result<bool, String> {
-    let row = bucket.as_bytes().to_vec();
-    let settings = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row).await?;
-    BucketEncryption::from_row(settings.as_deref())
-        .map(|settings| settings.is_encrypted())
-        .map_err(|error| error.to_string())
-}
-
-/// Whether plaintext copying needs consent for new or retained encrypted objects.
-pub async fn consent_required(context: &DriverContext, bucket: &str) -> Result<bool, String> {
-    let row = bucket.as_bytes().to_vec();
-    let settings = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row).await?;
-    let settings =
-        BucketEncryption::from_row(settings.as_deref()).map_err(|error| error.to_string())?;
-    if settings.is_encrypted() {
-        return Ok(true);
-    }
-    let Some(bucket_id) = settings.bucket_id else {
-        return Ok(false);
-    };
-    let mut start_after = None;
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            BUCKET_KEY_KEYSPACE,
-            Some(bucket_id.to_bytes().to_vec().into()),
-            start_after,
-            64,
-            None,
-        )
-        .await?;
-        for (_, value) in rows {
-            let record = BucketKeyRecord::from_bytes(&value).map_err(|error| error.to_string())?;
-            if record.state != KeyState::Retired {
-                return Ok(true);
-            }
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => return Ok(false),
-        }
-    }
+#[derive(Debug, PartialEq)]
+enum HolderState {
+    Init,
+    ReadConsent,
+    ReadBucket,
+    ReadAuthority,
+    ReadGrant,
+    Finish,
+    Error,
 }
 
 /// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
 /// admin, or an explicit holder, of any home realm. Losing the admin role ends it at once (D30).
-pub async fn is_holder(
-    context: &DriverContext,
+/// With [`Self::with_consent`] the plaintext request row must also be the user's own.
+#[derive(Debug, PartialEq)]
+pub struct HolderCheckOperation {
     realm_id: RealmId,
-    bucket: &str,
+    bucket: String,
     user: UserId,
-) -> Result<bool, String> {
-    let info = drive(GetBucketOperation::new(bucket.to_string()), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let group_id = info.group_id;
-    let read = authority_read(bucket, realm_id, group_id, None);
-    let Effect::Storage(read) = read else {
-        return Err("not a storage read".to_string());
-    };
-    let values = match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected storage event: {other:?}")),
-    };
-    let state = parse_authority(values, realm_id, group_id).map_err(|error| error.to_string())?;
-    if state.info.created_by == user || state.admins.contains(&user) {
-        return Ok(true);
-    }
-    let Some(bucket_id) = state.settings.bucket_id else {
-        return Ok(false);
-    };
-    let row = [&bucket_id.to_bytes()[..], &user.to_storage_key()].concat();
-    let grant = read_row(&context.storage_handle, BUCKET_HOLDER_KEYSPACE, row).await?;
-    let grant = grant
-        .map(|value| BucketHolder::from_bytes(&value))
-        .transpose();
-    let grant = grant.map_err(|error| error.to_string())?;
-    Ok(grant.is_some_and(|grant| grant.origin == HolderOrigin::Explicit))
+    consent: Option<Vec<u8>>,
+    group_id: Option<Ulid>,
+    state: HolderState,
+    output: Option<Result<bool, PlaintextError>>,
 }
 
-/// Whether a job of `requester` may copy encrypted items of `bucket` as plaintext now: the
-/// request in `row` must be theirs, and they must still hold the bucket key.
-pub async fn plaintext_allowed(
-    context: &DriverContext,
-    realm_id: RealmId,
-    bucket: &str,
-    requester: UserId,
-    row: Vec<u8>,
-) -> Result<bool, String> {
-    if read_consent(context, row).await? != Some(requester) {
-        return Ok(false);
+impl HolderCheckOperation {
+    pub fn new(realm_id: RealmId, bucket: &str, user: UserId) -> Self {
+        Self {
+            realm_id,
+            bucket: bucket.to_string(),
+            user,
+            consent: None,
+            group_id: None,
+            state: HolderState::Init,
+            output: None,
+        }
     }
-    is_holder(context, realm_id, bucket, requester).await
+
+    /// Also requires the plaintext request in `row` to be the user's.
+    pub fn with_consent(mut self, row: Vec<u8>) -> Self {
+        self.consent = Some(row);
+        self
+    }
+
+    fn done(&mut self, result: Result<bool, PlaintextError>) -> Effects {
+        self.state = match result {
+            Ok(_) => HolderState::Finish,
+            Err(_) => HolderState::Error,
+        };
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn read_bucket(&mut self) -> Effects {
+        self.state = HolderState::ReadBucket;
+        smallvec![read(S3_BUCKET_KEYSPACE, self.bucket.as_bytes().to_vec())]
+    }
+
+    fn consent_read(&mut self, value: Option<Value>) -> Effects {
+        match decode_requester(value.as_deref()) {
+            Ok(Some(requester)) if requester == self.user => self.read_bucket(),
+            Ok(_) => self.done(Ok(false)),
+            Err(error) => self.done(Err(error)),
+        }
+    }
+
+    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
+        let Some(value) = value else {
+            return self.done(Err(PlaintextError::NoBucket));
+        };
+        let group_id = match BucketInfo::from_bytes(&value) {
+            Ok(info) => info.group_id,
+            Err(error) => return self.done(Err(error.into())),
+        };
+        self.group_id = Some(group_id);
+        self.state = HolderState::ReadAuthority;
+        smallvec![authority_read(&self.bucket, self.realm_id, group_id, None)]
+    }
+
+    fn authority_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let Some(group_id) = self.group_id else {
+            return self.done(Err(PlaintextError::NotFinished));
+        };
+        let state = match parse_authority(values, self.realm_id, group_id) {
+            Ok(state) => state,
+            Err(error) => return self.done(Err(error.into())),
+        };
+        if state.info.created_by == self.user || state.admins.contains(&self.user) {
+            return self.done(Ok(true));
+        }
+        let Some(bucket_id) = state.settings.bucket_id else {
+            return self.done(Ok(false));
+        };
+        self.state = HolderState::ReadGrant;
+        let row = [&bucket_id.to_bytes()[..], &self.user.to_storage_key()].concat();
+        smallvec![read(BUCKET_HOLDER_KEYSPACE, row)]
+    }
+
+    fn grant_read(&mut self, value: Option<Value>) -> Effects {
+        let grant = value
+            .map(|value| BucketHolder::from_bytes(&value))
+            .transpose();
+        match grant {
+            Ok(grant) => self.done(Ok(
+                grant.is_some_and(|grant| grant.origin == HolderOrigin::Explicit)
+            )),
+            Err(error) => self.done(Err(error.into())),
+        }
+    }
+}
+
+impl Operation for HolderCheckOperation {
+    type Output = bool;
+    type Error = PlaintextError;
+
+    fn start(&mut self) -> Effects {
+        match &self.consent {
+            Some(row) => {
+                self.state = HolderState::ReadConsent;
+                smallvec![read(PLAINTEXT_COPY_KEYSPACE, row.clone())]
+            }
+            None => self.read_bucket(),
+        }
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (
+                HolderState::ReadConsent
+                | HolderState::ReadBucket
+                | HolderState::ReadAuthority
+                | HolderState::ReadGrant,
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.done(Err(error.into())),
+            (HolderState::ReadConsent, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.consent_read(value)
+            }
+            (HolderState::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.bucket_read(value)
+            }
+            (
+                HolderState::ReadAuthority,
+                Event::Storage(StorageEvent::BatchReadResult { values }),
+            ) => self.authority_read(values),
+            (HolderState::ReadGrant, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.grant_read(value)
+            }
+            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
+                event.label().to_string(),
+            ))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, HolderState::Finish | HolderState::Error)
+    }
+
+    fn finalize(self) -> Result<bool, PlaintextError> {
+        self.output.unwrap_or(Err(PlaintextError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Who asked for a plaintext copy in `row`, if anyone did.
+#[derive(Debug, PartialEq)]
+pub struct ConsentReadOperation {
+    row: Vec<u8>,
+    output: Option<Result<Option<UserId>, PlaintextError>>,
+}
+
+impl ConsentReadOperation {
+    pub fn new(row: Vec<u8>) -> Self {
+        Self { row, output: None }
+    }
+}
+
+impl Operation for ConsentReadOperation {
+    type Output = Option<UserId>;
+    type Error = PlaintextError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![read(PLAINTEXT_COPY_KEYSPACE, self.row.clone())]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.output = Some(match (&self.output, event) {
+            (None, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                decode_requester(value.as_deref())
+            }
+            (None, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
+            (_, event) => Err(PlaintextError::UnexpectedEvent(event.label().to_string())),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Option<UserId>, PlaintextError> {
+        self.output.unwrap_or(Err(PlaintextError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum EncryptionState {
+    Init,
+    ReadSettings,
+    ReadKeys,
+    Finish,
+    Error,
+}
+
+/// Whether `bucket` on this node encrypts its objects. With `retained` it also answers true
+/// while a key that is not retired remains, since retained objects still need consent.
+#[derive(Debug, PartialEq)]
+pub struct EncryptionCheckOperation {
+    bucket: String,
+    retained: bool,
+    bucket_id: Option<Ulid>,
+    state: EncryptionState,
+    output: Option<Result<bool, PlaintextError>>,
+}
+
+impl EncryptionCheckOperation {
+    pub fn new(bucket: &str, retained: bool) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            retained,
+            bucket_id: None,
+            state: EncryptionState::Init,
+            output: None,
+        }
+    }
+
+    fn done(&mut self, result: Result<bool, PlaintextError>) -> Effects {
+        self.state = match result {
+            Ok(_) => EncryptionState::Finish,
+            Err(_) => EncryptionState::Error,
+        };
+        self.output = Some(result);
+        smallvec![]
+    }
+
+    fn read_keys(&mut self, after: Option<Key>) -> Effects {
+        let Some(bucket_id) = self.bucket_id else {
+            return self.done(Ok(false));
+        };
+        self.state = EncryptionState::ReadKeys;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BUCKET_KEY_KEYSPACE.to_string(),
+            prefix: Some(bucket_id.to_bytes().to_vec().into()),
+            start: after.map(IterStart::After),
+            limit: KEY_PAGE,
+            txn_id: None,
+        })]
+    }
+
+    fn settings_read(&mut self, value: Option<Value>) -> Effects {
+        let settings = match BucketEncryption::from_row(value.as_deref()) {
+            Ok(settings) => settings,
+            Err(error) => return self.done(Err(error.into())),
+        };
+        if settings.is_encrypted() || !self.retained {
+            return self.done(Ok(settings.is_encrypted()));
+        }
+        self.bucket_id = settings.bucket_id;
+        self.read_keys(None)
+    }
+
+    fn keys_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        for (_, value) in values {
+            match BucketKeyRecord::from_bytes(&value) {
+                Ok(record) if record.state != KeyState::Retired => return self.done(Ok(true)),
+                Ok(_) => {}
+                Err(error) => return self.done(Err(error.into())),
+            }
+        }
+        match next {
+            Some(next) => self.read_keys(Some(next)),
+            None => self.done(Ok(false)),
+        }
+    }
+}
+
+impl Operation for EncryptionCheckOperation {
+    type Output = bool;
+    type Error = PlaintextError;
+
+    fn start(&mut self) -> Effects {
+        self.state = EncryptionState::ReadSettings;
+        smallvec![read(
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.bucket.as_bytes().to_vec()
+        )]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (
+                EncryptionState::ReadSettings | EncryptionState::ReadKeys,
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.done(Err(error.into())),
+            (
+                EncryptionState::ReadSettings,
+                Event::Storage(StorageEvent::ReadResult { value, .. }),
+            ) => self.settings_read(value),
+            (
+                EncryptionState::ReadKeys,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.keys_read(values, next_start_after),
+            (_, event) => self.done(Err(PlaintextError::UnexpectedEvent(
+                event.label().to_string(),
+            ))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, EncryptionState::Finish | EncryptionState::Error)
+    }
+
+    fn finalize(self) -> Result<bool, PlaintextError> {
+        self.output.unwrap_or(Err(PlaintextError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+fn read(key_space: &str, key: Vec<u8>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    })
+}
+
+fn decode_requester(value: Option<&[u8]>) -> Result<Option<UserId>, PlaintextError> {
+    value
+        .map(|value| {
+            postcard::from_bytes(value).map_err(|error| PlaintextError::Request(error.to_string()))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
@@ -271,10 +587,15 @@ pub(crate) mod tests {
         let context = crate::testing::test_context(storage);
         bucket(&context).await;
         let realm = RealmId::from_bytes([3; 32]);
-        assert!(source_encrypted(&context, "sealed").await.unwrap());
+        let encrypted = EncryptionCheckOperation::new("sealed", false);
+        assert!(drive(encrypted, &context).await.unwrap());
         for (seed, holder) in [(1, true), (2, true), (3, true), (4, false)] {
             assert_eq!(
-                is_holder(&context, realm, "sealed", user(seed)).await,
+                drive(
+                    HolderCheckOperation::new(realm, "sealed", user(seed)),
+                    &context
+                )
+                .await,
                 Ok(holder)
             );
         }
@@ -282,38 +603,62 @@ pub(crate) mod tests {
         let row = relationship_consent(Ulid::from_bytes([6; 16]));
         // No request, or a request of another user, never permits plaintext.
         assert!(
-            !plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
-                .await
-                .unwrap()
-        );
-        store_consent(&context, consent_write(row.clone(), user(4)).unwrap())
+            !drive(
+                HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone()),
+                &context,
+            )
             .await
-            .unwrap();
-        assert!(
-            !plaintext_allowed(&context, realm, "sealed", user(4), row.clone())
-                .await
-                .unwrap()
+            .unwrap()
         );
+        drive(
+            ConsentStoreOperation::new(consent_write(row.clone(), user(4)).unwrap()),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(
-            !plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
-                .await
-                .unwrap()
-        );
-        store_consent(&context, consent_write(row.clone(), user(1)).unwrap())
+            !drive(
+                HolderCheckOperation::new(realm, "sealed", user(4)).with_consent(row.clone()),
+                &context,
+            )
             .await
-            .unwrap();
-        assert!(
-            plaintext_allowed(&context, realm, "sealed", user(1), row.clone())
-                .await
-                .unwrap()
+            .unwrap()
         );
-        store_consent(&context, consent_delete(row.clone()))
-            .await
-            .unwrap();
         assert!(
-            !plaintext_allowed(&context, realm, "sealed", user(1), row)
-                .await
-                .unwrap()
+            !drive(
+                HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone()),
+                &context,
+            )
+            .await
+            .unwrap()
+        );
+        drive(
+            ConsentStoreOperation::new(consent_write(row.clone(), user(1)).unwrap()),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            drive(
+                HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone()),
+                &context,
+            )
+            .await
+            .unwrap()
+        );
+        drive(
+            ConsentStoreOperation::new(consent_delete(row.clone())),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !drive(
+                HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row),
+                &context,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -343,7 +688,11 @@ pub(crate) mod tests {
         context.storage_handle.send_storage_effect(write).await;
         for (seed, holder) in [(1, false), (7, true)] {
             assert_eq!(
-                is_holder(&context, local, "sealed", foreign(seed)).await,
+                drive(
+                    HolderCheckOperation::new(local, "sealed", foreign(seed)),
+                    &context
+                )
+                .await,
                 Ok(holder)
             );
         }
@@ -351,18 +700,220 @@ pub(crate) mod tests {
         // Plaintext still needs the consent of that holder; a non-holder's consent never counts.
         let row = relationship_consent(Ulid::from_bytes([6; 16]));
         let allowed = async |user| {
-            plaintext_allowed(&context, local, "sealed", user, row.clone())
-                .await
-                .unwrap()
+            drive(
+                HolderCheckOperation::new(local, "sealed", user).with_consent(row.clone()),
+                &context,
+            )
+            .await
+            .unwrap()
         };
         assert!(!allowed(foreign(7)).await);
-        store_consent(&context, consent_write(row.clone(), foreign(1)).unwrap())
-            .await
-            .unwrap();
+        drive(
+            ConsentStoreOperation::new(consent_write(row.clone(), foreign(1)).unwrap()),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(!allowed(foreign(1)).await && !allowed(foreign(7)).await);
-        store_consent(&context, consent_write(row.clone(), foreign(7)).unwrap())
-            .await
-            .unwrap();
+        drive(
+            ConsentStoreOperation::new(consent_write(row.clone(), foreign(7)).unwrap()),
+            &context,
+        )
+        .await
+        .unwrap();
         assert!(allowed(foreign(7)).await);
+    }
+
+    fn read_result(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn timeout() -> Event {
+        Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        })
+    }
+
+    fn info(created_by: UserId) -> Vec<u8> {
+        BucketInfo {
+            group_id: Ulid::from_bytes([4; 16]),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Default::default(),
+            distribution: None,
+        }
+        .to_bytes()
+        .unwrap()
+    }
+
+    #[test]
+    fn foreign_request_stops() {
+        // A request of another user answers false before the bucket is read.
+        let realm = RealmId::from_bytes([3; 32]);
+        let row = relationship_consent(Ulid::from_bytes([6; 16]));
+        let mut operation =
+            HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone());
+        let theirs = postcard::to_allocvec(&user(2)).unwrap();
+        let start = [read(PLAINTEXT_COPY_KEYSPACE, row)];
+        check_trace(
+            &mut operation,
+            &start,
+            vec![(read_result(Some(theirs)), vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(false));
+    }
+
+    #[test]
+    fn holder_read_order() {
+        let realm = RealmId::from_bytes([3; 32]);
+        let row = relationship_consent(Ulid::from_bytes([6; 16]));
+        let mut operation =
+            HolderCheckOperation::new(realm, "sealed", user(1)).with_consent(row.clone());
+        let mine = postcard::to_allocvec(&user(1)).unwrap();
+        let group_id = Ulid::from_bytes([4; 16]);
+        let steps = vec![
+            (
+                read_result(Some(mine)),
+                vec![read(S3_BUCKET_KEYSPACE, b"sealed".to_vec())],
+            ),
+            (
+                read_result(Some(info(user(1)))),
+                vec![authority_read("sealed", realm, group_id, None)],
+            ),
+        ];
+        check_trace(&mut operation, &[read(PLAINTEXT_COPY_KEYSPACE, row)], steps);
+        // A missing bucket fails instead of answering that nobody holds its key.
+        let mut missing = HolderCheckOperation::new(realm, "gone", user(1));
+        missing.start();
+        missing.step(read_result(None));
+        assert_eq!(missing.finalize(), Err(PlaintextError::NoBucket));
+    }
+
+    #[test]
+    fn errors_fail_checks() {
+        let realm = RealmId::from_bytes([3; 32]);
+        let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
+        holder.start();
+        holder.step(timeout());
+        assert_eq!(
+            holder.finalize(),
+            Err(PlaintextError::Storage(StorageError::Timeout))
+        );
+        let mut consent = ConsentReadOperation::new(b"row".to_vec());
+        consent.start();
+        consent.step(read_result(Some(vec![0xff; 40])));
+        assert!(matches!(
+            consent.finalize(),
+            Err(PlaintextError::Request(_))
+        ));
+        let mut store = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
+        store.start();
+        store.step(timeout());
+        assert_eq!(
+            store.finalize(),
+            Err(PlaintextError::Storage(StorageError::Timeout))
+        );
+        let mut keys = EncryptionCheckOperation::new("plain", true);
+        keys.start();
+        let retained = BucketEncryption {
+            bucket_id: Some(Ulid::from_bytes([5; 16])),
+            ..Default::default()
+        };
+        let effects = keys.step(read_result(Some(retained.to_bytes().unwrap())));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { .. })]
+        ));
+        keys.step(timeout());
+        assert_eq!(
+            keys.finalize(),
+            Err(PlaintextError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn encryption_check_modes() {
+        // Without `retained` the settings decide alone; an unencrypted bucket without keys is plain.
+        let mut settings = EncryptionCheckOperation::new("plain", false);
+        settings.start();
+        assert!(settings.step(read_result(None)).is_empty());
+        assert_eq!(settings.finalize(), Ok(false));
+        let mut retained = EncryptionCheckOperation::new("plain", true);
+        retained.start();
+        assert!(retained.step(read_result(None)).is_empty());
+        assert_eq!(retained.finalize(), Ok(false));
+    }
+
+    #[test]
+    fn operations_reject_events() {
+        let realm = RealmId::from_bytes([3; 32]);
+        let read_or_error = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        let holder = || {
+            let mut operation = HolderCheckOperation::new(realm, "sealed", user(1));
+            operation.start();
+            operation
+        };
+        assert!(!rejects_events(holder, sample_events, read_or_error).is_empty());
+        let consent = || {
+            let mut operation = ConsentReadOperation::new(b"row".to_vec());
+            operation.start();
+            operation
+        };
+        assert!(!rejects_events(consent, sample_events, read_or_error).is_empty());
+        let encryption = || {
+            let mut operation = EncryptionCheckOperation::new("b", true);
+            operation.start();
+            operation
+        };
+        assert!(!rejects_events(encryption, sample_events, read_or_error).is_empty());
+        let store = || {
+            let mut operation = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
+            operation.start();
+            operation
+        };
+        let refused = rejects_events(store, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. }
+                        | StorageEvent::DeleteResult { .. }
+                        | StorageEvent::Error { .. }
+                )
+            )
+        });
+        assert!(!refused.is_empty());
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        // Every check only reads, so no phase has cleanup.
+        let realm = RealmId::from_bytes([3; 32]);
+        let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
+        holder.start();
+        check_abort(&mut holder, &[]);
+        rejects_finalize(holder);
+        let mut consent = ConsentReadOperation::new(b"row".to_vec());
+        check_abort(&mut consent, &[]);
+        rejects_finalize(consent);
+        let mut encryption = EncryptionCheckOperation::new("b", false);
+        encryption.start();
+        check_abort(&mut encryption, &[]);
+        rejects_finalize(encryption);
+        let mut store = ConsentStoreOperation::new(consent_delete(b"row".to_vec()));
+        store.start();
+        check_abort(&mut store, &[]);
+        rejects_finalize(store);
     }
 }

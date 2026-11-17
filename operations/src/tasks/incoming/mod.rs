@@ -51,7 +51,7 @@ use crate::blob::hidden::{
     HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, process_hidden_sweep, restore_hidden_sweep,
 };
 use crate::blob::holders::RefreshHoldersOperation;
-use crate::blob::reclaim::{
+use crate::blob::reclaim_sweep::{
     RECLAIM_SWEEP_AFTER, RECLAIM_SWEEP_RETRY, process_reclaim_batch, restore_reclaim_sweep,
 };
 use crate::device::drain::{
@@ -110,7 +110,7 @@ use crate::placement::process_placements::{PlacementReconcileStatus, process_sha
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
 };
-use crate::replication::queue::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
+use crate::replication::drain::{REPLICATION_RETRY_AFTER, process_blob_batch, restore_blob_timer};
 use crate::s3::bucket::key::lock::LockBucketOperation;
 use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
 use crate::sync::document_outbox::{read_outbox_records, read_outbox_tails, restore_outbox_timers};
@@ -865,7 +865,8 @@ impl OperationsTaskHandler {
                 let start = (self.migration_cursor.lock())
                     .expect("migration cursor mutex poisoned")
                     .clone();
-                let run = crate::blob::migration::process_migrations(&self.context, start).await;
+                let run =
+                    crate::blob::migration::drain::process_migrations(&self.context, start).await;
                 let after = match run {
                     Ok(run) => {
                         *(self.migration_cursor.lock()).expect("migration cursor mutex poisoned") =
@@ -911,7 +912,7 @@ impl OperationsTaskHandler {
                 };
                 let key = BucketKeyRef::new(bucket_id, generation);
                 let origin = (*net_handle.realm_id(), net_handle.node_id());
-                let promoted = crate::blob::promote::promote_unlocked(
+                let promoted = crate::blob::unlocked::promote_unlocked(
                     &self.context,
                     key,
                     origin,
@@ -923,9 +924,10 @@ impl OperationsTaskHandler {
                 }
             }),
             key @ TaskKey::RecordAudit { .. } => Box::pin(async move {
-                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, store_record};
+                use crate::s3::bucket::audit_retry::{AUDIT_RETRY, StoreAuditOperation};
                 // The key change already applies; only its record waits for storage.
-                if let Err(error) = store_record(&self.context, &key).await {
+                let store = StoreAuditOperation::new(key.clone());
+                if let Err(error) = drive(store, &self.context).await {
                     warn!(error = %error, "Bucket key audit record still not stored");
                     self.keep_retrying(key, AUDIT_RETRY).await;
                 }

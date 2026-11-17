@@ -13,9 +13,10 @@ use aruna_core::structs::storage::bucket_metadata::{BucketMetadata, validate_met
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_operations::distribution::change::change_metadata;
 use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::metadata::{
-    DescriptionError, PutMetadataError, PutMetadataOperation, bucket_metadata, dataset_description,
+use aruna_operations::s3::bucket::dataset::{
+    DescriptionError, bucket_metadata, dataset_description,
 };
+use aruna_operations::s3::bucket::metadata::{PutMetadataError, PutMetadataOperation};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};

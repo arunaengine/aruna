@@ -130,86 +130,166 @@ async fn newer_intent_restarts() {
     );
 }
 
-/// Member 1 coordinates both shards; member 2 keeps a copy of each and catches up.
-fn catching_up() -> DistributionSnapshot {
-    use crate::distribution::test_record::{member, replicated};
-    use aruna_core::structs::storage::distribution::MemberState;
-    let (mut snapshot, _) = replicated(true, 1);
-    snapshot.config.ranges[1].coordinator = member(1);
-    snapshot.config.ranges[1].replicas = vec![member(2)];
-    let target = (snapshot.config.members.iter_mut()).find(|m| m.member_id == member(2));
-    target.unwrap().state = MemberState::CatchingUp;
-    snapshot
+fn cursor_row(value: Option<Vec<u8>>) -> Event {
+    Event::Storage(StorageEvent::ReadResult {
+        key: b"cursor".to_vec().into(),
+        value: value.map(Into::into),
+    })
 }
 
-fn walker(snapshot: &DistributionSnapshot) -> SetWalk {
-    SetWalk {
-        realm_id: RealmId::from_bytes([9; 32]),
-        local: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-        set_id: snapshot.set_id(),
-    }
+#[test]
+fn reads_stored_cursor() {
+    let stored = BootstrapCursor::start([3; 32], 7);
+    let start = Effect::Storage(StorageEffect::Read {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        key: b"cursor".to_vec().into(),
+        txn_id: None,
+    });
+    let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+    let steps = vec![(cursor_row(Some(stored.to_bytes().unwrap())), vec![])];
+    aruna_core::operation_check::check_trace(&mut operation, &[start], steps);
+    assert_eq!(operation.finalize(), Ok(Some(stored)));
 }
 
-#[tokio::test]
-async fn ranges_take_turns() {
-    // A drain whose budget ends before a range starts the next drain at that range.
-    use crate::distribution::test_record::member;
-    let (_dir, handle) = open();
-    let context = context(&handle);
-    let snapshot = catching_up();
-    let walk = walker(&snapshot);
-    let local = snapshot.member(member(1)).unwrap();
-    let target = snapshot.member(member(2)).unwrap();
-    let second = &snapshot.config.ranges[1];
-    let key = bootstrap_key(walk.set_id, target.member_id, second.range_id);
-    for _ in 0..2 {
-        let mut budget = 1;
-        let outcome = walk
-            .walk(&context, &snapshot, local, target, &mut budget)
-            .await;
-        assert_eq!(outcome.unwrap(), Outcome::Waiting);
-    }
-    assert!(
-        get(&handle, BOOTSTRAP_KEYSPACE, key).await.is_some(),
-        "the second range had its turn"
+#[test]
+fn cursor_read_outcomes() {
+    let read = |event: Event| {
+        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+        operation.start();
+        operation.step(event);
+        operation.finalize()
+    };
+    assert_eq!(read(cursor_row(None)), Ok(None));
+    assert!(matches!(
+        read(cursor_row(Some(vec![0xff]))),
+        Err(BootstrapError::Conversion(_))
+    ));
+    let failed = Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    });
+    assert_eq!(
+        read(failed),
+        Err(BootstrapError::Storage(StorageError::Timeout))
     );
 }
 
-#[tokio::test]
-async fn child_keeps_cursor() {
-    // A split child with a cursor of its own is never seeded from its ancestor again.
-    use crate::distribution::test_record::member;
-    let (_dir, handle) = open();
-    let context = context(&handle);
-    let snapshot = catching_up();
-    let walk = walker(&snapshot);
-    let target = snapshot.member(member(2)).unwrap();
-    let parent = snapshot.config.ranges[0].clone();
-    let child = KeyRange {
-        range_id: Ulid::from_bytes([42; 16]),
-        lineage: Some(parent.range_id),
-        ..parent.clone()
+#[test]
+fn cursor_read_contract() {
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
     };
-    let store = |range_id: Ulid, cursor: BootstrapCursor| {
-        let key = bootstrap_key(walk.set_id, target.member_id, range_id);
-        let write = StorageEffect::Write {
-            key_space: BOOTSTRAP_KEYSPACE.to_string(),
-            key: key.into(),
-            value: cursor.to_bytes().unwrap().into(),
-            txn_id: None,
-        };
-        let handle = handle.clone();
-        async move { handle.send_storage_effect(write).await }
+    let make = || {
+        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+        operation.start();
+        operation
     };
-    store(parent.range_id, BootstrapCursor::start(target.intent, 3)).await;
-    let seeded = walk.seed_child(&context, &snapshot, target, &child).await;
-    assert_eq!(seeded.unwrap().map(|c| c.watermark), Some(3));
-    let mut progressed = BootstrapCursor::start(target.intent, 3);
-    progressed.done = true;
-    store(child.range_id, progressed.clone()).await;
-    let again = walk.seed_child(&context, &snapshot, target, &child).await;
-    assert_eq!(again.unwrap(), None);
-    let key = bootstrap_key(walk.set_id, target.member_id, child.range_id);
-    let kept = get(&handle, BOOTSTRAP_KEYSPACE, key).await.unwrap();
-    assert_eq!(BootstrapCursor::from_bytes(&kept).unwrap(), progressed);
+    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::ReadResult { .. }));
+    let refused = rejects_events(make, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let mut fresh = ReadCursorOperation::new(b"cursor".to_vec());
+    check_abort(&mut fresh, &[]);
+    rejects_finalize(fresh);
+}
+
+/// A cursor row of `member` for the set of [`set`].
+fn cursor_key(member: u8) -> Key {
+    bootstrap_key(
+        set(),
+        Ulid::from_bytes([member; 16]),
+        Ulid::from_bytes([1; 16]),
+    )
+    .into()
+}
+
+fn cursor_page(members: &[u8]) -> Event {
+    Event::Storage(StorageEvent::IterResult {
+        values: (members.iter())
+            .map(|member| (cursor_key(*member), Vec::<u8>::new().into()))
+            .collect(),
+        next_start_after: None,
+    })
+}
+
+#[test]
+fn clears_set_cursors() {
+    let scan = Effect::Storage(StorageEffect::Iter {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        prefix: Some(bootstrap_prefix(set()).into()),
+        start: None,
+        limit: 2,
+        txn_id: None,
+    });
+    let delete = Effect::Storage(StorageEffect::BatchDelete {
+        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(4))],
+        txn_id: None,
+    });
+    let deleted = Event::Storage(StorageEvent::BatchDeleteResult {
+        entries: Vec::new(),
+    });
+    let mut operation = ClearCursorsOperation::new(set(), None, 2);
+    let steps = vec![(cursor_page(&[4]), vec![delete]), (deleted, vec![])];
+    aruna_core::operation_check::check_trace(&mut operation, &[scan], steps);
+    assert_eq!(operation.finalize(), Ok(true));
+}
+
+#[test]
+fn keeps_walked_cursors() {
+    // Only the cursors of members no longer walked go; a full page is not all of them.
+    let walked = vec![Ulid::from_bytes([4; 16])];
+    let mut operation = ClearCursorsOperation::new(set(), Some(walked.clone()), 2);
+    operation.start();
+    let delete = Effect::Storage(StorageEffect::BatchDelete {
+        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(5))],
+        txn_id: None,
+    });
+    assert_eq!(operation.step(cursor_page(&[4, 5])).as_slice(), [delete]);
+    let mut kept = ClearCursorsOperation::new(set(), Some(walked), 2);
+    kept.start();
+    assert!(kept.step(cursor_page(&[4])).is_empty());
+    assert_eq!(kept.finalize(), Ok(true));
+    let mut full = ClearCursorsOperation::new(set(), Some(vec![Ulid::from_bytes([5; 16])]), 1);
+    full.start();
+    assert!(full.step(cursor_page(&[5])).is_empty());
+    assert_eq!(full.finalize(), Ok(false));
+}
+
+#[test]
+fn cursor_clear_contract() {
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
+    };
+    let make = || {
+        let mut operation = ClearCursorsOperation::new(set(), None, 2);
+        operation.start();
+        operation
+    };
+    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
+    let refused = rejects_events(make, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let deleting = || {
+        let mut operation = ClearCursorsOperation::new(set(), None, 2);
+        operation.start();
+        operation.step(cursor_page(&[4]));
+        operation
+    };
+    let accepted = |event: &Event| {
+        matches!(
+            event,
+            Event::Storage(StorageEvent::BatchDeleteResult { .. })
+        )
+    };
+    let refused = rejects_events(deleting, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let failed = Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    });
+    let mut scanning = make();
+    scanning.step(failed);
+    assert_eq!(
+        scanning.finalize(),
+        Err(BootstrapError::Storage(StorageError::Timeout))
+    );
+    let mut fresh = ClearCursorsOperation::new(set(), None, 2);
+    check_abort(&mut fresh, &[]);
+    rejects_finalize(fresh);
 }

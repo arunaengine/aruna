@@ -16,11 +16,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::s3::bucket::release::read::load_access;
 use crate::s3::bucket::release::view::{FilePage, ReleaseViewOperation, ViewConfig, ViewError};
 use crate::s3::bucket::release::{
-    BucketScope, MembersConfig, MembersOutput, MembershipQuery, ReleaseMembersOperation,
-    load_access,
+    BucketScope, MembersConfig, MembersOutput, ReleaseMembersOperation,
 };
+use aruna_core::structs::storage::release::MembershipQuery;
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PinnedError {
@@ -103,7 +104,8 @@ async fn release_guards(
             Ok(vec![(BUCKET_RELEASE_KEYSPACE.to_string(), key, value)])
         }
         other => Err(PinnedError::Unchecked(format!(
-            "the release marker could not be read: {other:?}"
+            "the release marker could not be read: {}",
+            other.label()
         ))),
     }
 }

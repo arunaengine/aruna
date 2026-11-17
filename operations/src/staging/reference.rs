@@ -17,7 +17,6 @@ use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::driver::{DriverContext, drive};
-use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
@@ -52,6 +51,7 @@ use aruna_core::structs::storage::distribution::hint::{SetHint, with_hint};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::replication_queue::build_live_obligation;
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -845,7 +845,6 @@ mod tests {
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::{DriverContext, drive};
     use crate::node::usage_rebuild::RebuildStatsOperation;
-    use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::StorageEffect;
@@ -864,6 +863,9 @@ mod tests {
         BlobHeadKey, BlobVersion, CurrentVersionPointer, HashIndex,
     };
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::replication_queue::{
+        LiveObligationRecord, live_obligation_key,
+    };
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};

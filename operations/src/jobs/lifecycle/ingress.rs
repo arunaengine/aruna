@@ -55,14 +55,16 @@ use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::load_realm_config;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
+use crate::s3::bucket::dataset::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
-use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
+use crate::s3::bucket::release::read::release_members;
+use crate::s3::bucket::release::{BucketScope, MembershipCaller};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;
+use aruna_core::structs::storage::release::MembershipQuery;
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
@@ -1290,7 +1292,7 @@ async fn cached_projection(
     context: &DriverContext,
     family: &JobFamilyId,
 ) -> Result<Option<ProjectionCache>, String> {
-    let (page, _) = crate::jobs::store::query::iter_prefix_page(
+    let (page, _) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         FAMILY_PROJECTION_KEYSPACE,
         Some(family_prefix(family)),
@@ -1365,7 +1367,7 @@ async fn admit_with_quota(
 /// Whether this node already holds a claim for `family`, which makes the
 /// admission a replay that settles inside its own transaction.
 async fn has_claim(context: &DriverContext, family: &JobFamilyId) -> Result<bool, SubmitJobError> {
-    let (page, _) = crate::jobs::store::query::iter_prefix_page(
+    let (page, _) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         FAMILY_RECORD_KEYSPACE,
         Some(kind_prefix(family, JobRecordKind::Claim)),

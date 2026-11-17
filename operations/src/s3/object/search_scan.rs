@@ -638,7 +638,9 @@ fn storage_event_error(event: Event) -> SearchObjectsError {
         Event::Storage(StorageEvent::Error { error }) => {
             SearchObjectsError::Storage(error.to_string())
         }
-        event => SearchObjectsError::Storage(format!("unexpected storage event: {event:?}")),
+        event => {
+            SearchObjectsError::Storage(format!("unexpected storage event: {}", event.label()))
+        }
     }
 }
 

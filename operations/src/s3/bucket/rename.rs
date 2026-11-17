@@ -3,10 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::error::AuthorizeError;
-use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
-use crate::replication::queue::queued_prefixes;
 use crate::s3::imports::cron::is_running;
 use crate::s3::imports::validate_folder;
 use crate::s3::purge_fence::fence_key;
@@ -24,7 +21,6 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
 use aruna_core::structs::storage::blob::{
@@ -34,6 +30,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::structs::storage::replication_queue::queued_prefixes;
 use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
@@ -132,43 +129,6 @@ pub fn check_target(to: &str) -> Result<(), String> {
 /// Where `key` goes when the folder `from` becomes `to`; `None` outside `from`.
 pub fn renamed_key(from: &str, to: &str, key: &str) -> Option<String> {
     key.strip_prefix(from).map(|rest| format!("{to}{rest}"))
-}
-
-/// Plans or applies a rename only with WRITE, by role and policy, on every old and new key.
-/// A denial answers `Forbidden` before any key is shown or moved.
-pub async fn authorized_rename(
-    context: &DriverContext,
-    auth: &AuthContext,
-    input: RenameInput,
-) -> Result<RenamePlan, RenameError> {
-    let scope = (input.realm_id, input.group_id, input.node_id);
-    let access = BucketAccess::load(context, auth, scope, &input.bucket)
-        .await
-        .map_err(access_error)?;
-    let allowed = |key: &str| access.allows(Some(key), &Permission::WRITE);
-    let permits = |from: &str, to: &str| allowed(from) && allowed(to);
-    let keys = input.keys.clone().unwrap_or_default();
-    let moved = |key: &String| renamed_key(&input.from, &input.to, key);
-    if !keys
-        .iter()
-        .all(|key| moved(key).is_none_or(|to| permits(key, &to)))
-    {
-        return Err(RenameError::Forbidden);
-    }
-    let plan = drive(RenameKeysOperation::new(input), context).await?;
-    match plan.items.iter().all(|item| permits(&item.from, &item.to)) {
-        true => Ok(plan),
-        false => Err(RenameError::Forbidden),
-    }
-}
-
-/// A denial by role or policy is a verdict; other failures are not.
-fn access_error(error: AuthorizeError) -> RenameError {
-    match error {
-        AuthorizeError::PermissionDenied | AuthorizeError::Policy(_) => RenameError::Forbidden,
-        AuthorizeError::Storage(error) => RenameError::Storage(error),
-        AuthorizeError::CheckFailed(message) => RenameError::Authorization(message),
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

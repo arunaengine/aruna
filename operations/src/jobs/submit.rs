@@ -1087,7 +1087,7 @@ mod tests {
     }
 
     async fn count_keyspace(storage: &StorageHandle, key_space: &str) -> usize {
-        crate::jobs::store::query::iter_prefix_page(storage, key_space, None, None, 64, None)
+        crate::storage_read::iter_prefix_page(storage, key_space, None, None, 64, None)
             .await
             .expect("scan")
             .0

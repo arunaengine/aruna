@@ -537,7 +537,7 @@ async fn fill(
     aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id).await;
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
-    aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(
+    aruna_operations::s3::sweeps::spawn_recovery_sweep(
         driver_ctx.clone(),
         origin,
         &acquired.shutdown,
@@ -573,7 +573,7 @@ async fn open_managed_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::time::unix_timestamp_millis;
     use aruna_operations::jobs::key_wake::wake_unlocked;
-    use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
+    use aruna_operations::s3::bucket::key::startup::OpenManagedOperation;
 
     let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
     for (key, reason) in &keys.failed {
@@ -613,12 +613,12 @@ async fn record_restart_locks(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::s3::bucket::audit_retry::resume_records;
-    use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
+    use aruna_operations::s3::bucket::audit_retry::ResumeAuditOperation;
+    use aruna_operations::s3::bucket::key::restart::RestartScanOperation;
     use aruna_operations::s3::restart_notice::RestartNoticeOperation;
 
     // Records kept by retry timers before the stop join the trail before it is read.
-    match resume_records(driver_ctx).await {
+    match drive(ResumeAuditOperation::default(), driver_ctx).await {
         Ok(0) => {}
         Ok(stored) => info!(records = stored, "Stored kept bucket key audit records"),
         Err(error) => warn!(error = %error, "Kept bucket key audit records not read"),
