@@ -19,9 +19,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::export::GrantRecord;
 use crate::jobs::import::{upload_key, upload_stale};
 use crate::jobs::store::decode_job_record;
+use aruna_core::transfer::GrantRecord;
 
 type Writes = Vec<(String, Key, Value)>;
 

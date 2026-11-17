@@ -2973,7 +2973,7 @@ async fn unheld_copy_skipped() {
         entities: vec![entity(&candidates[..1])],
         ..Default::default()
     };
-    let refused = crate::federation::export::GrantError::NotHolder("remote".to_string());
+    let refused = aruna_core::transfer::GrantError::NotHolder("remote".to_string());
     assert!(matches!(
         probe_sources(&ctx, &spec, &mut checkpoint, &BTreeMap::new()).await,
         Err(ExportFailure::Permanent(message)) if message == refused.to_string()

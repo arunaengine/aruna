@@ -1199,7 +1199,7 @@ pub(crate) struct ExportFacts {
     pub(crate) revision: Ulid,
     pub(crate) dataset_digest: [u8; 32],
     pub(crate) versions: Vec<aruna_core::transfer::SelectedVersion>,
-    pub(crate) sources: Vec<crate::federation::export::PinnedSource>,
+    pub(crate) sources: Vec<aruna_core::transfer::PinnedSource>,
     pub(crate) artifact: ArtifactRef,
 }
 
@@ -1232,7 +1232,7 @@ impl ExportCheckpoint {
                     return None;
                 };
                 (candidate.resolved_version == Some(version_id)).then(|| {
-                    crate::federation::export::PinnedSource {
+                    aruna_core::transfer::PinnedSource {
                         bucket: bucket.clone(),
                         key: key.clone(),
                         path: permission_path.clone(),
