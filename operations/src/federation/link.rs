@@ -13,12 +13,11 @@ use aruna_core::federation::{FederationError, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff, check_handoff};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::link::{
-    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, link_secret,
+    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, fresh_local,
+    link_secret,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::identity::auth::{
-    Actor, AuthContext, NodeCapabilities, Permission, SessionKind,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
@@ -84,17 +83,6 @@ fn config_read(auth: &AuthContext) -> (String, ByteView) {
         realm_id: auth.realm_id,
     };
     (target.storage_keyspace().to_string(), target.storage_key())
-}
-
-/// An unrestricted portal session of a local account whose primary login was at most
-/// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
-pub fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
-    let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
-    portal
-        && auth.path_restrictions.is_none()
-        && auth.user_id.realm_id == auth.realm_id
-        && !auth.user_id.is_nil()
-        && auth_time.is_some_and(|login| login.saturating_add(MAX_LINK_SECS) >= now)
 }
 
 /// An active account that is not a service account.
@@ -609,7 +597,7 @@ mod tests {
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
     use aruna_core::handoff::secret_nonce;
-    use aruna_core::structs::identity::auth::SessionRef;
+    use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
     use ed25519_dalek::SigningKey;

@@ -44,7 +44,7 @@ use tracing::info;
 
 use self::stage::Batch;
 use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
-use crate::federation::link::fresh_local;
+use aruna_core::link::fresh_local;
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 

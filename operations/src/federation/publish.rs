@@ -11,7 +11,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::federation::{RealmDescriptor, RegistrationMode, Signed};
+use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -24,8 +24,6 @@ use url::Url;
 
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// Delay of the first publication after a settings change, so renames reach the registry at once.
-pub(crate) const PUBLISH_SOON: Duration = Duration::from_secs(5);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
 const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
