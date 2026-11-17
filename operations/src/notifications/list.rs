@@ -3,18 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, notification_inbox_cursor, notification_inbox_prefix, parse_inbox_key,
 };
-use aruna_core::types::{Effects, Key, Value};
-use byteview::ByteView;
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
+
+use crate::notifications::unexpected;
 
 pub const LIST_MAX_LIMIT: usize = 200;
 
@@ -31,19 +30,11 @@ pub struct ListNotificationsOutput {
     pub next_cursor: Option<Vec<u8>>,
 }
 
+/// Reads one page of a recipient's inbox, newest first, and one row more to know whether
+/// another page follows.
 #[derive(Debug, PartialEq)]
 pub struct ListNotificationsOperation {
     input: ListNotificationsInput,
-    state: ListNotificationsState,
-    output: Option<Result<ListNotificationsOutput, ListNotificationsError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ListNotificationsState {
-    Init,
-    List,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -54,61 +45,31 @@ pub enum ListNotificationsError {
     ConversionError(#[from] ConversionError),
     #[error("invalid cursor")]
     InvalidCursor,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("list notifications did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for ListNotificationsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            error => Self::Io(error),
+        }
+    }
 }
 
 impl ListNotificationsOperation {
     pub fn new(mut input: ListNotificationsInput) -> Self {
         input.limit = input.limit.clamp(1, LIST_MAX_LIMIT);
-        Self {
-            input,
-            state: ListNotificationsState::Init,
-            output: None,
-        }
+        Self { input }
     }
 
-    fn fail(&mut self, error: ListNotificationsError) -> Effects {
-        self.state = ListNotificationsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn storage_error_fails(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(ListNotificationsError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn handle_list(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
-        };
-        match self.collect(values) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn collect(&mut self, values: Vec<(Key, Value)>) -> Result<Effects, ListNotificationsError> {
-        let mut records = Vec::with_capacity(values.len());
-        for (key, value) in values {
+    fn collect(
+        &self,
+        rows: Vec<(Key, Value)>,
+    ) -> Result<ListNotificationsOutput, ListNotificationsError> {
+        let mut records = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
             let (recipient, created_at_ms, notification_id) = parse_inbox_key(&key)?;
             let record = NotificationRecord::from_bytes(&value)?;
             if recipient != self.input.recipient
@@ -135,69 +96,41 @@ impl ListNotificationsOperation {
         } else {
             None
         };
-
-        self.state = ListNotificationsState::Finish;
-        self.output = Some(Ok(ListNotificationsOutput {
+        Ok(ListNotificationsOutput {
             records,
             next_cursor,
-        }));
-        Ok(smallvec![])
+        })
     }
 }
 
-impl EffectOperation for ListNotificationsOperation {
+impl Operation for ListNotificationsOperation {
     type Output = ListNotificationsOutput;
     type Error = ListNotificationsError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         if matches!(&self.input.cursor, Some(cursor) if cursor.len() != 24) {
-            return self.fail(ListNotificationsError::InvalidCursor);
+            return Err(ListNotificationsError::InvalidCursor);
         }
-
-        self.state = ListNotificationsState::List;
         let prefix = notification_inbox_prefix(self.input.recipient);
-        let start = self.input.cursor.as_ref().map(|cursor| {
+        let after = self.input.cursor.as_ref().map(|cursor| {
             let mut key = Vec::with_capacity(72);
             key.extend_from_slice(prefix.as_ref());
             key.extend_from_slice(cursor);
-            IterStart::After(ByteView::from(key))
+            Key::from(key)
         });
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start,
+        Ok(Next::Call(IoCall::Page {
+            space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            prefix,
+            after,
             limit: self.input.limit.saturating_add(1),
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.storage_error_fails(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            ListNotificationsState::List => self.handle_list(event),
-            ListNotificationsState::Init
-            | ListNotificationsState::Finish
-            | ListNotificationsState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match result {
+            IoResult::Page { rows, .. } => Ok(Next::Done(self.collect(rows)?)),
+            other => Err(unexpected("IoResult::Page", &other).into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListNotificationsState::Finish | ListNotificationsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListNotificationsError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -206,7 +139,8 @@ mod tests {
     use super::*;
     use crate::driver::drive;
     use crate::tests::notifications::{context_with_storage, seed, user};
-    use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use ulid::Ulid;
 
@@ -420,24 +354,64 @@ mod tests {
     #[test]
     fn list_clamps_limit() {
         let recipient = user(1, 1);
-        let mut zero = ListNotificationsOperation::new(ListNotificationsInput {
-            recipient,
-            cursor: None,
-            limit: 0,
-        });
-        match zero.start().first() {
-            Some(Effect::Storage(StorageEffect::Iter { limit, .. })) => assert_eq!(*limit, 2),
-            other => panic!("unexpected effect: {other:?}"),
+        for (limit, asked) in [(0, 2), (10_000, 201)] {
+            let mut list = ListNotificationsOperation::new(ListNotificationsInput {
+                recipient,
+                cursor: None,
+                limit,
+            });
+            match list.first() {
+                Ok(Next::Call(IoCall::Page { limit, .. })) => assert_eq!(limit, asked),
+                other => panic!("unexpected call: {other:?}"),
+            }
         }
+    }
 
-        let mut huge = ListNotificationsOperation::new(ListNotificationsInput {
+    #[test]
+    fn cursor_pages_after() {
+        let recipient = user(1, 1);
+        let cursor = vec![7u8; 24];
+        let mut list = ListNotificationsOperation::new(ListNotificationsInput {
             recipient,
-            cursor: None,
-            limit: 10_000,
+            cursor: Some(cursor.clone()),
+            limit: 1,
         });
-        match huge.start().first() {
-            Some(Effect::Storage(StorageEffect::Iter { limit, .. })) => assert_eq!(*limit, 201),
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        let prefix = notification_inbox_prefix(recipient);
+        let after = Key::from([prefix.as_ref(), cursor.as_slice()].concat());
+        assert_eq!(
+            list.first(),
+            Ok(Next::Call(IoCall::Page {
+                space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+                prefix,
+                after: Some(after),
+                limit: 2,
+            }))
+        );
+        let first = record(recipient, 20);
+        let second = record(recipient, 10);
+        let row = |record: &NotificationRecord| {
+            let key = notification_inbox_key(
+                record.recipient,
+                record.created_at_ms,
+                record.notification_id,
+            );
+            (key, Value::from(record.to_bytes().unwrap()))
+        };
+        let page = IoResult::Page {
+            rows: vec![row(&first), row(&second)],
+            next: None,
+        };
+        let cursor = notification_inbox_cursor(first.created_at_ms, first.notification_id);
+        assert_eq!(
+            list.next(page),
+            Ok(Next::Done(ListNotificationsOutput {
+                records: vec![first],
+                next_cursor: Some(cursor),
+            }))
+        );
+        assert!(matches!(
+            list.next(IoResult::Done),
+            Err(ListNotificationsError::Io(IoError::Unexpected { .. }))
+        ));
     }
 }

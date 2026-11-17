@@ -28,7 +28,6 @@ use crate::notifications::list::{
 };
 use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unread::{SCAN_MAX_ROWS, UNREAD_COUNT_CAP};
 use crate::notifications::watch::authorization::{
     authorize_notification, list_authorized_subscriptions,
 };
@@ -39,6 +38,11 @@ use crate::notifications::watch::records::{
     WatchSubscriptionError,
 };
 use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
+
+/// The unread count a holder reports before it marks the count as capped.
+const UNREAD_COUNT_CAP: usize = 100;
+/// The inbox rows one unread count examines at most.
+const SCAN_MAX_ROWS: usize = 2_000;
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the
