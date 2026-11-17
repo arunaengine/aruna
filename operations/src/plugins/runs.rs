@@ -208,7 +208,9 @@ impl Plan for Unfinished {
 
 /// The rows that save a run: its record, and its queue row marked for attention or, once it
 /// ended, removed.
-pub(crate) fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
+pub(crate) fn saved_rows(
+    run: &PluginRun,
+) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
     let mut rows = vec![row(
         PLUGIN_RUNS_KEYSPACE,
         run_key(run.install_id, run.run_id),

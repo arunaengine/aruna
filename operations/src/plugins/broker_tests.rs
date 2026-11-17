@@ -14,6 +14,7 @@ use crate::metadata::create_document::{
 };
 use crate::metadata::materialization_queue::process_materialization_batch;
 use crate::metadata::projector::drain_projection_queue;
+use crate::plugins::dataset::merge_into;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::store::Txn;

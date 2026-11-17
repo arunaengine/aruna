@@ -18,6 +18,7 @@ use ulid::Ulid;
 use super::account::read_user;
 use super::grants::{InstallScope, accesses, covers, parse_grants, patterns_for};
 use super::install::read_config;
+use super::unavailable;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
@@ -195,10 +196,6 @@ pub(crate) async fn check_call(
 
 fn denied(message: &str) -> HostError {
     HostError::new(ErrorKind::Denied, message)
-}
-
-pub(crate) fn unavailable(message: impl Into<String>) -> HostError {
-    HostError::new(ErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]

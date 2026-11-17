@@ -15,9 +15,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::broker::short_path;
-use super::check::unavailable;
 use super::marks::is_marked;
 use super::rows::{StoreError, decode, delete_rows, scan_rows};
+use super::unavailable;
 use super::work::{
     SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
     install_at, read_work, summary_of, update_work, work_scan, work_state,

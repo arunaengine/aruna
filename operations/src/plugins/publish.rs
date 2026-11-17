@@ -547,8 +547,10 @@ impl Operation for PublishEntryOperation {
             EntryState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, document), (_, state)] = values.as_slice() else {
-                        return self
-                            .unexpected("realm config and reducer state", "StorageEvent::BatchReadResult");
+                        return self.unexpected(
+                            "realm config and reducer state",
+                            "StorageEvent::BatchReadResult",
+                        );
                     };
                     match self.emit_write(document.clone(), state.clone()) {
                         Ok(effects) => effects,

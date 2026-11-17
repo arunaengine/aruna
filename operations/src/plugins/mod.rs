@@ -11,6 +11,7 @@ pub mod cleanup;
 pub mod clock;
 pub mod copies;
 pub mod creates;
+pub mod dataset;
 pub mod decide;
 pub mod dispatch;
 pub mod entry;
@@ -48,12 +49,19 @@ pub mod waiting;
 pub mod work;
 pub mod worker;
 
+use aruna_plugins::broker::{ErrorKind, HostError};
+
 #[cfg(test)]
 #[path = "delivery_tests.rs"]
 mod delivery_tests;
 #[cfg(test)]
 #[path = "events_tests.rs"]
 mod events_tests;
+
+/// A host call that cannot be answered now; the guest may try again.
+pub(crate) fn unavailable(message: impl Into<String>) -> HostError {
+    HostError::new(ErrorKind::Unavailable, message)
+}
 
 /// Management nodes that must hold a copy before a publish is answered: a majority, and at
 /// least two once the realm has two. Plain copies with acknowledgements, no vote.
