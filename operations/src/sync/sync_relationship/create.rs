@@ -32,10 +32,9 @@ enum CreateState {
     Done(Result<(), SyncRelationshipError>),
 }
 
-/// Stores the outgoing record of a new relationship in one transaction. The staged reconcile
-/// record is rewritten in the same transaction, so a concurrent rollback claim fails at commit;
-/// a missing or changed record means the create was rolled back. A transaction conflict starts
-/// the whole attempt again, up to three times.
+/// Stores the outgoing record and rewrites the staged reconcile record in one transaction, so a
+/// concurrent rollback claim fails at commit; a missing or changed record means a rollback.
+/// A transaction conflict starts the attempt again, up to three times.
 #[derive(Debug, PartialEq)]
 pub struct CreateRelationshipOperation {
     relationship: SyncRelationship,

@@ -1,3 +1,7 @@
+//! Runs the mirror repair operations and the drain against real storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
 use super::drain::ensure_target_write;
 use super::settle::{RollbackClaim, SettleReconcileOperation};
 use super::*;
