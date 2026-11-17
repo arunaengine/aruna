@@ -23,10 +23,10 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::repository::StorageReadError;
 use crate::metadata::timestamp_index::delete_index_keys;
-use crate::metadata::timestamp_index::enumerate_updated;
+use crate::metadata::updated_page::{UpdatedPageError, UpdatedPageOperation};
 use crate::storage_read::parse_storage_scan;
 
 /// Registry rows evaluated per rebuild batch, and index rows per scan batch.
@@ -127,6 +127,16 @@ pub enum VisibilityError {
 impl From<StorageReadError> for VisibilityError {
     fn from(error: StorageReadError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<UpdatedPageError> for VisibilityError {
+    fn from(error: UpdatedPageError) -> Self {
+        Self::Storage(match error {
+            UpdatedPageError::Storage(error) => StorageReadError::Storage(error),
+            UpdatedPageError::Conversion(error) => StorageReadError::Conversion(error),
+            error => StorageReadError::Storage(StorageError::ReadError(error.to_string())),
+        })
     }
 }
 
@@ -569,7 +579,11 @@ async fn pass_bounded(
             return Ok(PassOutcome::Cancelled);
         }
         let cursor = pass.cursor.clone().map(Key::from);
-        let page = enumerate_updated(context, 0, u64::MAX, cursor, bounds.batch).await?;
+        let page = drive(
+            UpdatedPageOperation::new(0, u64::MAX, cursor, bounds.batch),
+            context,
+        )
+        .await?;
         let evaluators = build_evaluators(context, &page.records).await;
         let visible: Vec<&MetadataRegistryRecord> = page
             .records

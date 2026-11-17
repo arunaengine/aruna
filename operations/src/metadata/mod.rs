@@ -44,6 +44,7 @@ pub mod timestamp_index;
 pub(crate) mod timestamp_sweep;
 pub mod update_document;
 pub mod update_entry;
+pub(crate) mod updated_page;
 pub mod visibility_index;
 pub mod warmup;
 
