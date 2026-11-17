@@ -23,7 +23,7 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::object::copy::{
     CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
 };
-use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -40,6 +40,7 @@ use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::routes::rocrate_import::map_head_error;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -953,7 +954,7 @@ async fn stage_one(
         &context,
     )
     .await
-    .map_err(head_error)?;
+    .map_err(map_head_error)?;
     // A stored source deduplicates inline whatever was asked. A reference is
     // either queued for its pull or kept as a reference, which moves no byte.
     if head.location.is_none() && item.strategy == SessionInputStrategy::Snapshot {
@@ -1067,17 +1068,6 @@ async fn queue_copy(
         job_id: result.job_id.to_string(),
         source_node_id: node_id.to_string(),
     })
-}
-
-/// A missing object reads as 404 like a missing bucket; anything else is the
-/// node's own failure.
-fn head_error(error: HeadObjectError) -> ServerError {
-    match error {
-        HeadObjectError::NoSuchKey
-        | HeadObjectError::NoSuchVersion
-        | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    }
 }
 
 #[utoipa::path(

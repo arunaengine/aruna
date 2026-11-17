@@ -51,80 +51,37 @@ pub trait ApplyChecksums {
     fn apply_checksums(&mut self, checksums: EncodedChecksums);
 }
 
-impl ApplyChecksums for PutObjectOutput {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-        self.checksum_type = checksums.checksum_type;
-    }
+/// Implements [`ApplyChecksums`] for outputs with the five digest fields, and the checksum type
+/// for those listed after `;`.
+macro_rules! apply_checksums {
+    ($($plain:ty),*; $($typed:ty),*) => {
+        $(impl ApplyChecksums for $plain {
+            fn apply_checksums(&mut self, checksums: EncodedChecksums) {
+                self.checksum_crc32 = checksums.checksum_crc32;
+                self.checksum_crc32c = checksums.checksum_crc32c;
+                self.checksum_crc64nvme = checksums.checksum_crc64nvme;
+                self.checksum_sha1 = checksums.checksum_sha1;
+                self.checksum_sha256 = checksums.checksum_sha256;
+            }
+        })*
+        $(impl ApplyChecksums for $typed {
+            fn apply_checksums(&mut self, checksums: EncodedChecksums) {
+                self.checksum_crc32 = checksums.checksum_crc32;
+                self.checksum_crc32c = checksums.checksum_crc32c;
+                self.checksum_crc64nvme = checksums.checksum_crc64nvme;
+                self.checksum_sha1 = checksums.checksum_sha1;
+                self.checksum_sha256 = checksums.checksum_sha256;
+                self.checksum_type = checksums.checksum_type;
+            }
+        })*
+    };
 }
 
-impl ApplyChecksums for HeadObjectOutput {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-        self.checksum_type = checksums.checksum_type;
-    }
-}
-
-impl ApplyChecksums for GetObjectOutput {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-        self.checksum_type = checksums.checksum_type;
-    }
-}
-
-impl ApplyChecksums for CompleteMultipartUploadOutput {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-        self.checksum_type = checksums.checksum_type;
-    }
-}
-
-impl ApplyChecksums for UploadPartOutput {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-    }
-}
-
-impl ApplyChecksums for CopyObjectResult {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-        self.checksum_type = checksums.checksum_type;
-    }
-}
-
-impl ApplyChecksums for CopyPartResult {
-    fn apply_checksums(&mut self, checksums: EncodedChecksums) {
-        self.checksum_crc32 = checksums.checksum_crc32;
-        self.checksum_crc32c = checksums.checksum_crc32c;
-        self.checksum_crc64nvme = checksums.checksum_crc64nvme;
-        self.checksum_sha1 = checksums.checksum_sha1;
-        self.checksum_sha256 = checksums.checksum_sha256;
-    }
-}
+apply_checksums!(
+    UploadPartOutput, CopyPartResult;
+    PutObjectOutput, HeadObjectOutput, GetObjectOutput, CompleteMultipartUploadOutput,
+    CopyObjectResult
+);
 
 pub enum ChecksumSelection {
     Requested(Option<ChecksumAlgorithm>),

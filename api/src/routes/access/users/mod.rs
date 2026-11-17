@@ -11,7 +11,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
 use crate::auth::{RealmAuth, TokenAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::onboarding::authorize_onboarding_admin;
+use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
@@ -31,15 +31,11 @@ use aruna_operations::device::remove_node::{
 use aruna_operations::driver::drive;
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::onboarding::consume_secret::{
-    ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
-};
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
-use aruna_operations::onboarding::inspect_secret::{
-    InspectSecretError, InspectSecretInput, InspectSecretOperation,
-};
+use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::read_authorization::{
@@ -320,26 +316,6 @@ impl From<User> for RegisterUserResponse {
             name: value.name,
             id: value.user_id.to_string(),
         }
-    }
-}
-
-fn map_consume_error(error: ConsumeSecretError) -> ServerError {
-    match error {
-        ConsumeSecretError::NotFound
-        | ConsumeSecretError::Expired
-        | ConsumeSecretError::AlreadyClaimed
-        | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
-    }
-}
-
-fn map_inspect_error(error: InspectSecretError) -> ServerError {
-    match error {
-        InspectSecretError::NotFound
-        | InspectSecretError::Expired
-        | InspectSecretError::AlreadyClaimed
-        | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
     }
 }
 

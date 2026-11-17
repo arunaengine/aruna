@@ -1916,7 +1916,7 @@ fn map_read_error(error: ReadSourceError) -> ServerError {
     }
 }
 
-fn map_resolution_error(error: SourceResolutionError) -> ServerError {
+pub(crate) fn map_resolution_error(error: SourceResolutionError) -> ServerError {
     match error {
         SourceResolutionError::NotFound => ServerError::NotFound,
         SourceResolutionError::InvalidSourcePath

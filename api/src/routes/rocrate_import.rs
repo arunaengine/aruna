@@ -854,7 +854,8 @@ fn validate_source_path(path: &str) -> ServerResult<()> {
     Ok(())
 }
 
-fn map_head_error(error: HeadObjectError) -> ServerError {
+/// A missing object reads as 404 like a missing bucket; anything else is the node's own failure.
+pub(crate) fn map_head_error(error: HeadObjectError) -> ServerError {
     match error {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion
