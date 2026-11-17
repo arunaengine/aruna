@@ -11,7 +11,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::format::Compression;
@@ -92,6 +92,7 @@ fn group_backend(group_id: GroupId) -> GroupStorage {
         created_by: UserId::default(),
         disabled: false,
         cleanup: CleanupStrategy::Retain,
+        updated_at: SystemTime::UNIX_EPOCH,
     }
 }
 
@@ -236,21 +237,23 @@ fn snapshot_effects_order() {
             txn_id: None,
         })
     };
-    let inputs_start = inputs.start().into_vec();
-    let mut steps = vec![(
-        answer(&read(S3_BUCKET_KEYSPACE, b"b"), &rows),
-        inputs_start.clone(),
-    )];
-    let mut pending = inputs_start;
+    // The snapshot runs the inputs operation inline, so it waits on the same effects in turn.
+    let bucket = read(S3_BUCKET_KEYSPACE, b"b");
+    assert_eq!(
+        operation.start().into_vec(),
+        vec![read(S3_BUCKET_KEYSPACE, b"b")]
+    );
+    let mut expected = inputs.start().into_vec();
+    let mut effects = operation.step(answer(&bucket, &rows)).into_vec();
     while !inputs.is_complete() {
-        let event = answer(&pending[0], &rows);
-        pending = inputs.step(event.clone()).into_vec();
-        steps.push((event, pending.clone()));
+        assert_eq!(effects, expected);
+        let event = answer(&expected[0], &rows);
+        expected = inputs.step(answer(&expected[0], &rows)).into_vec();
+        effects = operation.step(event).into_vec();
     }
     let usage = usage_read(&[("cold".to_string(), 10)]);
-    steps.last_mut().unwrap().1 = vec![usage.clone()];
-    steps.push((answer(&usage, &rows), Vec::new()));
-    check_trace(&mut operation, &[read(S3_BUCKET_KEYSPACE, b"b")], steps);
+    assert_eq!(effects, vec![usage_read(&[("cold".to_string(), 10)])]);
+    assert!(operation.step(answer(&usage, &rows)).is_empty());
     assert!(operation.is_complete());
     assert!(operation.finalize().is_ok());
 }

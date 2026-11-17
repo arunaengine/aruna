@@ -5,6 +5,7 @@
 use super::*;
 use crate::auth::UnrestrictedAuth;
 use crate::tests::assistant::{setup_state, spawn_mock};
+use aruna_core::structs::identity::auth::AuthContext;
 use axum::Router;
 use axum::routing::post;
 use serde::Deserialize;

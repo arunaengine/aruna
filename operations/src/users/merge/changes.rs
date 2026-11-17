@@ -7,8 +7,8 @@ use super::{Account, Documents, MergeError, MergeOutcome, MergeState, MergeUsers
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, Next};
 use aruna_core::document::{DocumentChange, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE};
 use aruna_core::storage_entries::{subject_index_key, subject_index_value, sync_revision_entry};
@@ -16,13 +16,11 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, RoleId, TxnId, Value};
+use aruna_core::types::{GroupId, RoleId, Value};
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, counted_attributes,
     validate_attribute_count,
 };
-use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
 
@@ -34,15 +32,14 @@ impl MergeUsersOperation {
     /// Stages every change of the merge; the batch read answered group states, then claims.
     pub(super) fn stage_all(
         &mut self,
-        txn_id: TxnId,
-        values: Vec<(ByteView, Option<Value>)>,
-    ) -> Result<Effects, MergeError> {
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<MergeOutcome>, MergeError> {
         let secondary_ids = self.secondary_ids();
         let mut documents = self.documents.take().ok_or(MergeError::NotFinished)?;
         let (group_states, rest) = values.split_at(self.groups.len().min(values.len()));
         let (secondaries, claims) = rest.split_at((secondary_ids.len() * 3).min(rest.len()));
         for (user_id, chunk) in secondary_ids.iter().zip(secondaries.chunks(3)) {
-            let [(_, user), (_, state), (_, revision)] = chunk else {
+            let [user, state, revision] = chunk else {
                 return Err(MergeError::NotFinished);
             };
             let user = User::from_bytes(user.as_ref().ok_or(MergeError::NotFound)?)?;
@@ -75,11 +72,10 @@ impl MergeUsersOperation {
         self.stage_groups(group_states, &documents.config, &mut outcome, &plans)?;
         self.stage_devices(&mut documents, &mut outcome)?;
         self.outcome = Some(outcome);
-        self.state = MergeState::Write { txn_id };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: std::mem::take(&mut self.batch.writes),
-            txn_id: Some(txn_id),
-        })])
+        self.state = MergeState::Write;
+        Ok(Next::Call(IoCall::Write(std::mem::take(
+            &mut self.batch.writes,
+        ))))
     }
 
     fn placement(
@@ -235,11 +231,11 @@ impl MergeUsersOperation {
     fn stage_claims(
         &mut self,
         subjects: &[String],
-        values: &[(ByteView, Option<Value>)],
+        values: &[Option<Value>],
     ) -> Result<(), MergeError> {
         let (survivor, merged) = (self.survivor_id(), self.merged_id());
         for (subject_id, pair) in subjects.iter().zip(values.chunks(2)) {
-            let [(_, claims), (_, index)] = pair else {
+            let [claims, index] = pair else {
                 return Err(MergeError::NotFinished);
             };
             let claims = match (claims, index) {
@@ -309,7 +305,7 @@ impl MergeUsersOperation {
 
     fn stage_groups(
         &mut self,
-        states: &[(ByteView, Option<Value>)],
+        states: &[Option<Value>],
         config: &RealmConfigDocument,
         outcome: &mut MergeOutcome,
         plans: &[(Vec<RoleId>, Vec<RoleId>)],
@@ -318,7 +314,7 @@ impl MergeUsersOperation {
         let actor = self.acting(merged);
         let mut groups = std::mem::take(&mut self.groups);
         outcome.groups = groups.len();
-        for ((group, (_, state)), (handed, held)) in groups.iter_mut().zip(states).zip(plans) {
+        for ((group, state), (handed, held)) in groups.iter_mut().zip(states).zip(plans) {
             let group_id: GroupId = group.group_id;
             let mut change = Change::new(state.as_ref(), AdminDocumentTarget::Group { group_id })?;
             change.move_roles(&actor, &mut group.roles, (handed, held), (survivor, merged))?;

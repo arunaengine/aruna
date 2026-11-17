@@ -550,12 +550,12 @@ async fn complete(
     let JobRunOutcome::Succeeded(result) = outcome else {
         return Ok(());
     };
-    let storage = &fixture.context.storage_handle;
-    let record = aruna_operations::jobs::store::state::read_job_record(storage, ctx.job_id, None)
-        .await?
-        .ok_or("job missing")?;
+    let record =
+        aruna_operations::jobs::store::state::read_job_record(&fixture.context, ctx.job_id, None)
+            .await?
+            .ok_or("job missing")?;
     aruna_operations::jobs::store::state::complete_job(
-        storage,
+        &fixture.context,
         ctx.job_id,
         ctx.claim_token,
         result.clone(),
@@ -802,8 +802,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     require_import(outcome)?;
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
-    let storage = &fixture.context.storage_handle;
-    let (link, _) = list_links(storage, doc_id(2))
+    let (link, _) = list_links(&fixture.context, doc_id(2))
         .await?
         .pop()
         .ok_or("the import kept no pull link")?;
@@ -820,7 +819,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let (current, _) = list_links(storage, doc_id(2)).await?.remove(0);
+            let (current, _) = list_links(&fixture.context, doc_id(2)).await?.remove(0);
             if let Some(job) = current.active_job {
                 return Ok::<_, Box<dyn std::error::Error>>(job);
             }
@@ -829,7 +828,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
                     paused: Some(paused),
                     ..LinkPatch::default()
                 };
-                let (current, _) = list_links(storage, doc_id(2)).await?.remove(0);
+                let (current, _) = list_links(&fixture.context, doc_id(2)).await?.remove(0);
                 Box::pin(change_link(
                     &fixture.context,
                     &current,
@@ -841,7 +840,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
         }
     })
     .await??;
-    let record = aruna_operations::jobs::store::state::read_job_record(storage, job, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(&fixture.context, job, None)
         .await?
         .ok_or("pull job missing")?;
     let JobPayload::ImportRoCrate(update) = record.payload.clone() else {
@@ -852,7 +851,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     replay_event_log(fixture.context.as_ref()).await?;
     process_materialization_batch(fixture.context.as_ref()).await?;
 
-    let (pulled, _) = list_links(storage, doc_id(2)).await?.remove(0);
+    let (pulled, _) = list_links(&fixture.context, doc_id(2)).await?.remove(0);
     assert_eq!(pulled.active_job, None);
     assert_eq!(pulled.remote.record_id.as_deref(), Some(second.id.as_str()));
     assert_eq!(pulled.remote.identifier, second.identifier);

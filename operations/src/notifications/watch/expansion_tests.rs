@@ -176,3 +176,47 @@ fn queued_page_publishes() {
     quiet.first().unwrap();
     assert_eq!(quiet.next(listed), Ok(Next::Done(ExpandOutcome::default())));
 }
+
+/// Valid retry rows expand one at a time; a malformed row stays queued and keeps the marker.
+#[test]
+fn drain_defers_failures() {
+    let config = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    let mut drain = RetryDrainOperation::new(REALM, config, node());
+    assert!(matches!(drain.first(), Ok(Next::Call(IoCall::Effect(_)))));
+    let (key, value) = retry_row(1, b"cursor");
+    let malformed = (
+        Key::from(watch_retry_key(REALM, event(2).event_id)),
+        Value::from(vec![1]),
+    );
+    let scanned = IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: vec![(key, value), malformed],
+        next_start_after: None,
+    })));
+    assert!(matches!(
+        drain.next(scanned),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let expanded = IoResult::Child(ChildOutcome::new(Ok::<_, ExpandError>(
+        ExpandOutcome::default(),
+    )));
+    assert!(
+        matches!(drain.next(expanded), Ok(Next::Call(IoCall::Child(_)))),
+        "the malformed row keeps the realm's marker"
+    );
+    let marked = IoResult::Child(ChildOutcome::new(Ok::<_, InterestError>(true)));
+    assert_eq!(
+        drain.next(marked),
+        Err(RetryDrainError(
+            "watch retry drain deferred work".to_string()
+        ))
+    );
+
+    let config = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    let mut empty = RetryDrainOperation::new(REALM, config, node());
+    empty.first().unwrap();
+    let none = IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    })));
+    assert_eq!(empty.next(none), Ok(Next::Done(())));
+}

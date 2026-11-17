@@ -8,27 +8,25 @@ use aruna_core::auth::{
     revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
     valid_revocation_expiry, valid_token_hash,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{
     AdminDocumentError, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
 };
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
-use tracing::warn;
 
+use crate::auth::epoch_due::DueMarks;
 use crate::sync::outbox_record::{admin_outbox_prefix, revocation_index_entry};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
@@ -72,72 +70,12 @@ pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> Re
     }
 }
 
-/// Appends one bearer token hash to the realm's revocation set. Rides the admin
-/// document machinery of the other realm config settings, so the revocation
-/// replicates realm-wide instead of denying the token on this node only.
+/// Appends one bearer token hash to the realm's revocation set. Rides the admin document
+/// machinery of the other realm config settings, so the revocation replicates realm-wide instead
+/// of denying the token on this node only. The write runs in a transaction of its own.
 #[derive(Debug, PartialEq)]
 pub struct RevokeTokenOperation {
     config: RevokeTokenConfig,
-    txn_id: Option<TxnId>,
-    state: RevokeTokenState,
-    output: Option<Result<RealmConfigDocument, RevokeTokenError>>,
-    cutoff_raised: bool,
-    /// Runs inside the caller's transaction, which the caller commits or aborts.
-    joined: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum RevokeTokenState {
-    Init,
-    StartTransaction,
-    ReadCurrent,
-    ReadOutboxCapacity {
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-        pending_deletes: Vec<(KeySpace, Key)>,
-        pending_live: BTreeMap<String, BTreeSet<UserId>>,
-    },
-    ReadOutboxRecords {
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-        pending_deletes: Vec<(KeySpace, Key)>,
-        pending_live: BTreeMap<String, BTreeSet<UserId>>,
-        index_keys: Vec<Key>,
-        next_start_after: Option<Key>,
-    },
-    DeletePendingOutbox {
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-    },
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-        schedule_drain: bool,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-        schedule_drain: bool,
-    },
-    CommitNoop {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -156,8 +94,6 @@ pub enum RevokeTokenError {
     InvalidTokenExpiry,
     #[error("token revocation capacity reached")]
     CapacityReached,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -168,25 +104,184 @@ pub enum RevokeTokenError {
     },
 }
 
+impl From<IoError> for RevokeTokenError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RevokeToken".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl RevokeTokenOperation {
     pub fn new(config: RevokeTokenConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl Operation for RevokeTokenOperation {
+    type Output = RealmConfigDocument;
+    type Error = RevokeTokenError;
+
+    fn first(&mut self) -> Result<Next<RealmConfigDocument>, RevokeTokenError> {
+        let write = RevocationWrite::new(self.config.clone());
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    /// A capacity refusal still committed the canonical set, so it ends the run only now.
+    fn next(&mut self, result: IoResult) -> Result<Next<RealmConfigDocument>, RevokeTokenError> {
+        let revoked = result.child::<Revoked, RevokeTokenError>()??;
+        revoked.result().map(Next::Done)
+    }
+}
+
+/// What a revocation wrote: the realm config, whether an admin event reached the outbox, whether
+/// the user's cutoff moved, and whether capacity refused the revocation.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Revoked {
+    pub document: RealmConfigDocument,
+    pub outbox: bool,
+    pub cutoff_raised: bool,
+    pub refused: bool,
+}
+
+impl Revoked {
+    /// The realm config, or the capacity refusal.
+    pub(crate) fn result(self) -> Result<RealmConfigDocument, RevokeTokenError> {
+        match self.refused {
+            true => Err(RevokeTokenError::CapacityReached),
+            false => Ok(self.document),
+        }
+    }
+}
+
+/// Runs a [`Revocation`] in its own write transaction, marks key epochs due when the user's
+/// cutoff moved, and wakes the outbox drain after the commit.
+#[derive(Debug, PartialEq)]
+struct RevocationWrite {
+    revocation: Revocation,
+    marks: Option<DueMarks>,
+    revoked: Option<Revoked>,
+}
+
+impl RevocationWrite {
+    fn new(config: RevokeTokenConfig) -> Self {
         Self {
-            config,
-            txn_id: None,
-            state: RevokeTokenState::Init,
-            output: None,
-            cutoff_raised: false,
-            joined: false,
+            revocation: Revocation::new(config),
+            marks: None,
+            revoked: None,
         }
     }
 
-    /// Writes the revocation inside `txn_id`, so it commits or aborts with the caller's changes.
-    /// The caller schedules the outbox drain and marks epochs due after its commit.
-    pub fn joined(config: RevokeTokenConfig, txn_id: TxnId) -> Self {
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<Revoked>, RevokeTokenError> {
+        let output = self.revoked.take().ok_or(RevokeTokenError::NotFinished)?;
+        if !output.outbox {
+            return Ok(Next::Done(output));
+        }
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
+    }
+}
+
+impl Operation for RevocationWrite {
+    type Output = Revoked;
+    type Error = RevokeTokenError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<Revoked>, RevokeTokenError> {
+        Ok(Next::Call(self.revocation.first()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Revoked>, RevokeTokenError> {
+        if let Some(marks) = &mut self.marks {
+            return match marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            };
+        }
+        if let Some(call) = self.revocation.next(result)? {
+            return Ok(Next::Call(call));
+        }
+        let revoked = self.revocation.outcome()?;
+        // A new or later user cutoff ends READ for the account, so its buckets need new epochs.
+        if revoked.outbox && revoked.cutoff_raised {
+            let marks = DueMarks::new(None, aruna_core::time::unix_timestamp_millis());
+            let first = marks.first();
+            self.marks = Some(marks);
+            self.revoked = Some(revoked);
+            return Ok(Next::Call(first));
+        }
+        self.revoked = Some(revoked);
+        self.finish()
+    }
+}
+
+/// What a revocation waits for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stage {
+    Read,
+    Capacity,
+    Records,
+    PendingDelete,
+    Write,
+    StaleDelete,
+    Done,
+}
+
+/// The reads and writes of one revocation, run in the transaction of whoever folds them in: the
+/// realm config and its admin state, this node's pending outbox revocations for the capacity, then
+/// the revocation and the canonical set. A merge folds it into its own transaction.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Revocation {
+    config: RevokeTokenConfig,
+    stage: Stage,
+    pages: PrefixPages,
+    document: Option<RealmConfigDocument>,
+    reducer_state: Option<AdminDocumentState>,
+    revocation_index: Option<RevocationIndex>,
+    apply_event: bool,
+    write_canonical: bool,
+    index_keys: Vec<Key>,
+    pending_deletes: Vec<(KeySpace, Key)>,
+    pending_live: BTreeMap<String, BTreeSet<UserId>>,
+    deletes: Vec<(KeySpace, Key)>,
+    outbox: bool,
+    cutoff_raised: bool,
+    refused: bool,
+}
+
+impl Revocation {
+    pub(crate) fn new(config: RevokeTokenConfig) -> Self {
+        let prefix = admin_outbox_prefix(config.actor.node_id);
         Self {
-            txn_id: Some(txn_id),
-            joined: true,
-            ..Self::new(config)
+            pages: PrefixPages::new(OUTBOX_INDEX_KEYSPACE, prefix, REVOCATIONS_PER_ORIGIN),
+            config,
+            stage: Stage::Read,
+            document: None,
+            reducer_state: None,
+            revocation_index: None,
+            apply_event: false,
+            write_canonical: false,
+            index_keys: Vec::new(),
+            pending_deletes: Vec::new(),
+            pending_live: BTreeMap::new(),
+            deletes: Vec::new(),
+            outbox: false,
+            cutoff_raised: false,
+            refused: false,
         }
     }
 
@@ -202,31 +297,91 @@ impl RevokeTokenOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = RevokeTokenState::ReadCurrent;
+    /// The read of the realm config and its admin state.
+    pub(crate) fn first(&self) -> IoCall {
         let document = self.document_ref();
         let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])
+    }
+
+    /// The call after `result`, or `None` once the revocation is written; then read [`Self::outcome`].
+    pub(crate) fn next(&mut self, result: IoResult) -> Result<Option<IoCall>, RevokeTokenError> {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = aruna_core::rows::values::<2>(result)?;
+                self.emit_read_result(document, reducer).map(Some)
+            }
+            Stage::Capacity => {
+                let rows = self.pages.take(result)?;
+                if rows.is_empty() {
+                    return match self.pages.done() {
+                        true => self.finish_capacity(),
+                        false => Ok(Some(self.pages.call())),
+                    };
+                }
+                self.index_keys = rows.into_iter().map(|(key, _)| key).collect();
+                let reads = (self.index_keys.iter())
+                    .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key.clone()))
+                    .collect();
+                self.stage = Stage::Records;
+                Ok(Some(IoCall::Read(reads)))
+            }
+            Stage::Records => {
+                let IoResult::Values(values) = result else {
+                    return Err(RevokeTokenError::NotFinished);
+                };
+                self.collect_pending(values)?;
+                if !self.pages.done() {
+                    self.stage = Stage::Capacity;
+                    return Ok(Some(self.pages.call()));
+                }
+                self.finish_capacity()
+            }
+            Stage::PendingDelete => {
+                done(result)?;
+                self.after_capacity()
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::StaleDelete;
+                Ok(Some(IoCall::Delete(std::mem::take(&mut self.deletes))))
+            }
+            Stage::Write | Stage::StaleDelete => {
+                done(result)?;
+                self.stage = Stage::Done;
+                Ok(None)
+            }
+            Stage::Done => Err(RevokeTokenError::NotFinished),
+        }
+    }
+
+    /// What the finished revocation wrote.
+    pub(crate) fn outcome(&mut self) -> Result<Revoked, RevokeTokenError> {
+        if self.stage != Stage::Done {
+            return Err(RevokeTokenError::NotFinished);
+        }
+        Ok(Revoked {
+            document: self.document.take().ok_or(RevokeTokenError::NotFinished)?,
+            outbox: self.outbox,
+            cutoff_raised: self.cutoff_raised,
+            refused: self.refused,
+        })
     }
 
     fn emit_read_result(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, RevokeTokenError> {
+    ) -> Result<IoCall, RevokeTokenError> {
         if !valid_token_hash(&self.config.token_hash) {
             return Err(RevokeTokenError::InvalidTokenHash);
         }
@@ -271,42 +426,13 @@ impl RevokeTokenOperation {
         let existing_expiry = materialized.get(&self.config.token_hash).copied();
         let apply_event =
             !existing_expiry.is_some_and(|expires_at| expires_at >= self.config.expires_at);
-        self.emit_capacity_read(
-            document,
-            reducer_state,
-            revocation_index,
-            apply_event,
-            canonical_changed,
-        )
-    }
-
-    fn emit_capacity_read(
-        &mut self,
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-    ) -> Result<Effects, RevokeTokenError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(RevokeTokenError::MissingTransaction);
-        };
-        self.state = RevokeTokenState::ReadOutboxCapacity {
-            document,
-            reducer_state,
-            revocation_index,
-            apply_event,
-            write_canonical,
-            pending_deletes: Vec::new(),
-            pending_live: BTreeMap::new(),
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
-            prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
-            start: None,
-            limit: REVOCATIONS_PER_ORIGIN,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document);
+        self.reducer_state = Some(reducer_state);
+        self.revocation_index = Some(revocation_index);
+        self.apply_event = apply_event;
+        self.write_canonical = canonical_changed;
+        self.stage = Stage::Capacity;
+        Ok(self.pages.call())
     }
 
     fn pending_revocation(&self, record: &DocumentOutboxRecord) -> Option<(String, u64, UserId)> {
@@ -334,22 +460,23 @@ impl RevokeTokenOperation {
             .then_some((token_hash.clone(), *expires_at, *token_owner))
     }
 
-    fn collect_pending(
-        &self,
-        index_keys: Vec<Key>,
-        values: Vec<(Key, Option<Value>)>,
-        pending_deletes: &mut Vec<(KeySpace, Key)>,
-        pending_live: &mut BTreeMap<String, BTreeSet<UserId>>,
-    ) -> Result<(), RevokeTokenError> {
+    /// Sorts the outbox records of one index page into pending revocations and stale rows.
+    fn collect_pending(&mut self, values: Vec<Option<Value>>) -> Result<(), RevokeTokenError> {
+        let index_keys = std::mem::take(&mut self.index_keys);
         if index_keys.len() != values.len() {
             return Err(RevokeTokenError::UnexpectedEvent {
-                state: format!("{:?}", self.state),
+                state: "ReadOutboxRecords".to_string(),
                 expected: "one outbox value for every revocation index key",
                 got: "a different number of outbox values",
             });
         }
-
-        for (index_key, (outbox_key, value)) in index_keys.into_iter().zip(values) {
+        let (mut pending_deletes, mut pending_live) = (
+            std::mem::take(&mut self.pending_deletes),
+            std::mem::take(&mut self.pending_live),
+        );
+        for (index_key, value) in index_keys.into_iter().zip(values) {
+            // The outbox record shares the key of its index row.
+            let outbox_key = index_key.clone();
             let Some(value) = value else {
                 pending_deletes.push((OUTBOX_INDEX_KEYSPACE.to_string(), index_key));
                 continue;
@@ -381,22 +508,22 @@ impl RevokeTokenOperation {
                     .insert(token_owner);
             }
         }
+        self.pending_deletes = pending_deletes;
+        self.pending_live = pending_live;
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn finish_capacity(
-        &mut self,
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-        mut pending_deletes: Vec<(KeySpace, Key)>,
-        pending_live: BTreeMap<String, BTreeSet<UserId>>,
-    ) -> Result<Effects, RevokeTokenError> {
+    /// Decides the capacity once every pending revocation is known; a refusal still stores the
+    /// canonical set and its cleanup.
+    fn finish_capacity(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        let mut pending_deletes = std::mem::take(&mut self.pending_deletes);
         pending_deletes.sort();
         pending_deletes.dedup();
+        let pending_live = &self.pending_live;
+        let revocation_index = self
+            .revocation_index
+            .as_ref()
+            .ok_or(RevokeTokenError::NotFinished)?;
 
         let origin = self.config.actor.node_id;
         let existing_origin = revocation_index.origin(&self.config.token_hash);
@@ -419,90 +546,39 @@ impl RevokeTokenOperation {
                         && revocation_index.origin(hash) != Some(origin)
                 })
                 .count();
-        let capacity_reached = apply_event
+        let capacity_reached = self.apply_event
             && !same_origin
             && (live_count.saturating_add(pending_count) >= origin_cap
                 || (self.config.admission == RevokeTokenAdmission::SelfService
                     && owner_count >= OWNER_CAP));
-
         if capacity_reached {
-            let error = RevokeTokenError::CapacityReached;
-            self.output = Some(Err(error));
-            if pending_deletes.is_empty() {
-                return self.emit_after_capacity(
-                    document,
-                    reducer_state,
-                    revocation_index,
-                    false,
-                    true,
-                );
-            }
-            self.state = RevokeTokenState::DeletePendingOutbox {
-                document,
-                reducer_state,
-                revocation_index,
-                apply_event: false,
-                write_canonical: true,
-            };
-            let Some(txn_id) = self.txn_id else {
-                return Err(RevokeTokenError::MissingTransaction);
-            };
-            return Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: pending_deletes,
-                txn_id: Some(txn_id),
-            })]);
+            self.refused = true;
+            self.apply_event = false;
+            self.write_canonical = true;
         }
-
         if pending_deletes.is_empty() {
-            return self.emit_after_capacity(
-                document,
-                reducer_state,
-                revocation_index,
-                apply_event,
-                write_canonical,
-            );
+            return self.after_capacity();
         }
-
-        let Some(txn_id) = self.txn_id else {
-            return Err(RevokeTokenError::MissingTransaction);
-        };
-        self.state = RevokeTokenState::DeletePendingOutbox {
-            document,
-            reducer_state,
-            revocation_index,
-            apply_event,
-            write_canonical,
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: pending_deletes,
-            txn_id: Some(txn_id),
-        })])
+        self.stage = Stage::PendingDelete;
+        Ok(Some(IoCall::Delete(pending_deletes)))
     }
 
-    fn emit_after_capacity(
-        &mut self,
-        document: RealmConfigDocument,
-        reducer_state: AdminDocumentState,
-        revocation_index: RevocationIndex,
-        apply_event: bool,
-        write_canonical: bool,
-    ) -> Result<Effects, RevokeTokenError> {
-        if apply_event || write_canonical {
-            self.emit_write(document, reducer_state, revocation_index, apply_event)
-        } else {
-            Ok(self.emit_commit_noop(document))
+    fn after_capacity(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        if self.apply_event || self.write_canonical {
+            return self.emit_write();
         }
+        self.stage = Stage::Done;
+        Ok(None)
     }
 
-    fn emit_write(
-        &mut self,
-        mut document: RealmConfigDocument,
-        mut reducer_state: AdminDocumentState,
-        mut revocation_index: RevocationIndex,
-        apply_event: bool,
-    ) -> Result<Effects, RevokeTokenError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(RevokeTokenError::MissingTransaction);
+    fn emit_write(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        let apply_event = self.apply_event;
+        let (Some(mut document), Some(mut reducer_state), Some(mut revocation_index)) = (
+            self.document.take(),
+            self.reducer_state.take(),
+            self.revocation_index.take(),
+        ) else {
+            return Err(RevokeTokenError::NotFinished);
         };
         let previous_reducer_state = reducer_state.clone();
         let admin_event = apply_event.then(|| {
@@ -552,405 +628,20 @@ impl RevokeTokenOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        if self.output.is_none() {
-            self.output = Some(Ok(document.clone()));
-        }
-        self.state = RevokeTokenState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-            schedule_drain: apply_event,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn emit_commit_noop(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RevokeTokenError::MissingTransaction);
-        };
-        if self.output.is_none() {
-            self.output = Some(Ok(document.clone()));
-        }
-        if self.joined {
-            self.state = RevokeTokenState::Finish;
-            return smallvec![];
-        }
-        self.state = RevokeTokenState::CommitNoop { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn emit_commit(&mut self, document: RealmConfigDocument, schedule_drain: bool) -> Effects {
-        if schedule_drain {
-            self.emit_commit_transaction(document)
-        } else {
-            self.emit_commit_noop(document)
-        }
-    }
-
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RevokeTokenError::MissingTransaction);
-        };
-        if self.joined {
-            self.state = RevokeTokenState::Finish;
-            return smallvec![];
-        }
-        self.state = RevokeTokenState::CommitTransaction { document };
-        if self.cutoff_raised {
-            return smallvec![crate::auth::epoch_due::mark_due(None, txn_id)];
-        }
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: RevokeTokenError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RevokeTokenState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RevokeTokenError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-}
-
-impl EffectOperation for RevokeTokenOperation {
-    type Output = RealmConfigDocument;
-    type Error = RevokeTokenError;
-
-    fn start(&mut self) -> Effects {
-        if let (true, Some(txn_id)) = (self.joined, self.txn_id) {
-            return self.emit_read_current(txn_id);
-        }
-        self.state = RevokeTokenState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let (RevokeTokenState::CommitTransaction { .. }, Some(txn_id)) =
-            (&self.state, self.txn_id)
-            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-        match &self.state {
-            RevokeTokenState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", other.label()),
-            },
-            RevokeTokenState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            "a batch read with other rows",
-                        );
-                    };
-                    match self.emit_read_result(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", other.label()),
-            },
-            RevokeTokenState::ReadOutboxCapacity {
-                document,
-                reducer_state,
-                revocation_index,
-                apply_event,
-                write_canonical,
-                pending_deletes,
-                pending_live,
-            } => {
-                let document = document.clone();
-                let reducer_state = reducer_state.clone();
-                let revocation_index = revocation_index.clone();
-                let apply_event = apply_event.clone();
-                let write_canonical = write_canonical.clone();
-                let pending_deletes = pending_deletes.clone();
-                let pending_live = pending_live.clone();
-                match event {
-                    Event::Storage(StorageEvent::IterResult {
-                        values,
-                        next_start_after,
-                    }) => {
-                        if values.is_empty() && next_start_after.is_none() {
-                            return match self.finish_capacity(
-                                document,
-                                reducer_state,
-                                revocation_index,
-                                apply_event,
-                                write_canonical,
-                                pending_deletes,
-                                pending_live,
-                            ) {
-                                Ok(effects) => effects,
-                                Err(error) => self.fail(error),
-                            };
-                        }
-                        let index_keys: Vec<_> = values.into_iter().map(|(key, _)| key).collect();
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(RevokeTokenError::MissingTransaction);
-                        };
-                        let reads = index_keys
-                            .iter()
-                            .cloned()
-                            .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key))
-                            .collect();
-                        self.state = RevokeTokenState::ReadOutboxRecords {
-                            document,
-                            reducer_state,
-                            revocation_index,
-                            apply_event,
-                            write_canonical,
-                            pending_deletes,
-                            pending_live,
-                            index_keys,
-                            next_start_after,
-                        };
-                        smallvec![Effect::Storage(StorageEffect::BatchRead {
-                            reads,
-                            txn_id: Some(txn_id),
-                        })]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("outbox capacity iteration result", other.label())
-                    }
-                }
-            }
-            RevokeTokenState::ReadOutboxRecords {
-                document,
-                reducer_state,
-                revocation_index,
-                apply_event,
-                write_canonical,
-                pending_deletes,
-                pending_live,
-                index_keys,
-                next_start_after,
-            } => {
-                let document = document.clone();
-                let reducer_state = reducer_state.clone();
-                let revocation_index = revocation_index.clone();
-                let apply_event = apply_event.clone();
-                let write_canonical = write_canonical.clone();
-                let mut pending_deletes = pending_deletes.clone();
-                let mut pending_live = pending_live.clone();
-                let index_keys = index_keys.clone();
-                let next_start_after = next_start_after.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                        if let Err(error) = self.collect_pending(
-                            index_keys,
-                            values,
-                            &mut pending_deletes,
-                            &mut pending_live,
-                        ) {
-                            return self.fail(error);
-                        }
-                        if let Some(start_after) = next_start_after {
-                            let Some(txn_id) = self.txn_id else {
-                                return self.fail(RevokeTokenError::MissingTransaction);
-                            };
-                            self.state = RevokeTokenState::ReadOutboxCapacity {
-                                document,
-                                reducer_state,
-                                revocation_index,
-                                apply_event,
-                                write_canonical,
-                                pending_deletes,
-                                pending_live,
-                            };
-                            smallvec![Effect::Storage(StorageEffect::Iter {
-                                key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
-                                prefix: Some(admin_outbox_prefix(self.config.actor.node_id)),
-                                start: Some(IterStart::After(start_after)),
-                                limit: REVOCATIONS_PER_ORIGIN,
-                                txn_id: Some(txn_id),
-                            })]
-                        } else {
-                            match self.finish_capacity(
-                                document,
-                                reducer_state,
-                                revocation_index,
-                                apply_event,
-                                write_canonical,
-                                pending_deletes,
-                                pending_live,
-                            ) {
-                                Ok(effects) => effects,
-                                Err(error) => self.fail(error),
-                            }
-                        }
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("outbox record batch read result", other.label())
-                    }
-                }
-            }
-            RevokeTokenState::DeletePendingOutbox {
-                document,
-                reducer_state,
-                revocation_index,
-                apply_event,
-                write_canonical,
-            } => {
-                let document = document.clone();
-                let reducer_state = reducer_state.clone();
-                let revocation_index = revocation_index.clone();
-                let apply_event = apply_event.clone();
-                let write_canonical = write_canonical.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => match self
-                        .emit_after_capacity(
-                            document,
-                            reducer_state,
-                            revocation_index,
-                            apply_event,
-                            write_canonical,
-                        ) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    },
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("pending outbox cleanup result", other.label()),
-                }
-            }
-            RevokeTokenState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-                schedule_drain,
-            } => {
-                let document = document.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                let schedule_drain = schedule_drain.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                        let Some(txn_id) = self.txn_id else {
-                            return self.fail(RevokeTokenError::MissingTransaction);
-                        };
-                        if !stale_conflict_deletes.is_empty() {
-                            self.state = RevokeTokenState::DeleteAdminConflicts {
-                                document,
-                                schedule_drain,
-                            };
-                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                                deletes: stale_conflict_deletes,
-                                txn_id: Some(txn_id),
-                            })];
-                        }
-                        self.emit_commit(document, schedule_drain)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch write result", other.label()),
-                }
-            }
-            RevokeTokenState::DeleteAdminConflicts {
-                document,
-                schedule_drain,
-            } => {
-                let document = document.clone();
-                let schedule_drain = schedule_drain.clone();
-                match event {
-                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                        self.emit_commit(document, schedule_drain)
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("storage batch delete result", other.label()),
-                }
-            }
-            RevokeTokenState::CommitNoop { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = RevokeTokenState::Finish;
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", other.label()),
-            },
-            RevokeTokenState::CommitTransaction { document } => {
-                let document = document.clone();
-                match event {
-                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                        self.txn_id = None;
-                        self.state = RevokeTokenState::ScheduleSyncDrain { document };
-                        smallvec![schedule_drain_effect()]
-                    }
-                    Event::Storage(StorageEvent::Error { error }) => {
-                        self.txn_id = None;
-                        self.fail(error.into())
-                    }
-                    other => self.unexpected_event("transaction commit result", other.label()),
-                }
-            }
-            RevokeTokenState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = RevokeTokenState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule token revocation outbox drain; durable outbox remains retryable");
-                    self.state = RevokeTokenState::Finish;
-                    smallvec![]
-                }
-                other => self
-                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
-            },
-            RevokeTokenState::Finish | RevokeTokenState::Error | RevokeTokenState::Init => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RevokeTokenState::Finish | RevokeTokenState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RevokeTokenError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        if self.joined {
-            self.txn_id = None;
-            return smallvec![];
-        }
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        self.document = Some(document);
+        self.deletes = stale_conflict_deletes;
+        self.outbox = apply_event;
+        self.stage = Stage::Write;
+        Ok(Some(IoCall::Write(writes)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        AdminDocumentState, AdminDocumentTarget, DOCUMENT_STATE_KEYSPACE, Event,
-        REVOCATIONS_PER_ORIGIN, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
-        RevokeTokenOperation, StorageEffect, StorageEvent, reducer_state_key,
+        AdminDocumentState, AdminDocumentTarget, DOCUMENT_STATE_KEYSPACE, REVOCATIONS_PER_ORIGIN,
+        Revocation, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
+        RevokeTokenOperation, reducer_state_key,
     };
     use crate::document_repository::GetConfigOperation;
     use crate::driver::{DriverContext, drive};
@@ -960,8 +651,12 @@ mod tests {
     use aruna_core::admin_documents::AdminDocumentOperation;
     use aruna_core::auth::MAX_TOKEN_LIFETIME;
     use aruna_core::auth::bearer_token_hash;
+    use aruna_core::calls::{IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::storage_entries::reducer_state_entry;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
@@ -1172,32 +867,49 @@ mod tests {
         assert!(read.token_revoked(&token_hash, 1_000));
     }
 
+    /// A caller's write transaction that folds a revocation in and then commits or fails.
+    #[derive(Debug, PartialEq)]
+    struct Folded {
+        revocation: Revocation,
+        commit: bool,
+    }
+
+    impl Operation for Folded {
+        type Output = ();
+        type Error = RevokeTokenError;
+
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
+        }
+
+        fn first(&mut self) -> Result<Next<()>, RevokeTokenError> {
+            Ok(Next::Call(self.revocation.first()))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, RevokeTokenError> {
+            if let Some(call) = self.revocation.next(result)? {
+                return Ok(Next::Call(call));
+            }
+            self.revocation.outcome()?.result()?;
+            match self.commit {
+                true => Ok(Next::Done(())),
+                false => Err(RevokeTokenError::NotFinished),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn revocation_follows_caller() {
-        // Inside the caller's transaction the revocation commits or aborts with the caller.
+        // Folded into the caller's transaction, the revocation commits or aborts with the caller.
         let (_dir, context, actor) = setup_realm().await;
-        let start = || async {
-            match context
-                .storage_handle
-                .send_storage_effect(StorageEffect::StartTransaction { read: false })
-                .await
-            {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-                other => panic!("unexpected event: {other:?}"),
-            }
-        };
         for commit in [false, true] {
             let token_hash = bearer_token_hash(&format!("joined-{commit}"));
-            let txn_id = start().await;
             let config = revocation(&actor, &token_hash, 2_000, 1_000);
-            drive(RevokeTokenOperation::joined(config, txn_id), &context)
-                .await
-                .unwrap();
-            let end = match commit {
-                true => StorageEffect::CommitTransaction { txn_id },
-                false => StorageEffect::AbortTransaction { txn_id },
+            let folded = Folded {
+                revocation: Revocation::new(config),
+                commit,
             };
-            context.storage_handle.send_storage_effect(end).await;
+            assert_eq!(drive(folded, &context).await.is_ok(), commit);
             let read = drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .unwrap();

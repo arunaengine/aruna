@@ -220,7 +220,7 @@ fn unexpected_results_fail() {
 
 fn watch(seed: u64) -> WatchSubscription {
     let mut watch = WatchSubscription::new(owner(), prefix(), mask(), 1_000);
-    watch.watch_id = Ulid::from_parts(seed, seed);
+    watch.watch_id = Ulid::from_parts(seed, u128::from(seed));
     watch
 }
 

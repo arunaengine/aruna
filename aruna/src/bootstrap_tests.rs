@@ -23,7 +23,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::interest::publish_watch_interest;
+use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
@@ -401,7 +401,11 @@ async fn restart_stays_quiet() {
             .await
             .unwrap();
         assert!(!targets.contains(&target));
-        assert!(!publish_watch_interest(&context, node_id).await.unwrap());
+        assert!(
+            !drive(PublishInterestOperation::new(Some(node_id)), &context)
+                .await
+                .unwrap()
+        );
         assert!(read_marker(&context, realm_id).await.is_none());
         let batch = read_outbox_records(&context.storage_handle, &[], None, 8)
             .await
@@ -606,7 +610,11 @@ async fn publication_retries() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
 
-    assert!(publish_watch_interest(&context, node_id).await.is_err());
+    assert!(
+        drive(PublishInterestOperation::new(Some(node_id)), &context)
+            .await
+            .is_err()
+    );
     assert!(read_marker(&context, realm_id).await.is_some());
 
     write_config(&context, realm_id, node_id).await;
@@ -636,7 +644,11 @@ async fn publication_retries() {
     );
     OutboxDrainer::new(restarted.clone()).run_once().await;
     assert!(net.sync_topic_exists(topic).unwrap());
-    assert!(publish_watch_interest(&restarted, node_id).await.unwrap());
+    assert!(
+        drive(PublishInterestOperation::new(Some(node_id)), &restarted)
+            .await
+            .unwrap()
+    );
     assert!(read_marker(&restarted, realm_id).await.is_none());
 
     net.shutdown().await;

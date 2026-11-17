@@ -12,17 +12,19 @@ mod tests;
 
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect, VaultQuery};
+use aruna_core::effects::VaultQuery;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::storage_entries::{reducer_state_key, subject_index_key, sync_revision_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Role};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -31,19 +33,20 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::vault::VaultRecords;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, RoleId, TxnId, Value};
+use aruna_core::types::{RoleId, Value};
 use aruna_core::user::validation::UserAttributeError;
 use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::info;
 
 use self::stage::Batch;
-use crate::auth::revoke_token::{RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation};
+use crate::auth::epoch_due::DueMarks;
+use crate::auth::revoke_token::{
+    Revocation, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
+};
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::link::fresh_local;
@@ -179,46 +182,53 @@ pub enum MergeError {
     },
 }
 
+impl From<IoError> for MergeError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "Merge".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
+/// Where a merge stands. The checks before the transaction run in the outer operation; the
+/// transaction runs as a child of the same type in [`Phase::Write`].
 #[derive(Debug, Clone, PartialEq)]
 enum MergeState {
-    Init,
     ReadAccounts,
     CheckVault,
     /// The merged account has a vault; it may stay only as an unchanged copy of the survivor's.
     CheckCopy {
         merged: Vec<[u8; 32]>,
     },
-    StartTransaction,
-    ReadDocuments {
-        txn_id: TxnId,
-    },
-    ScanGroups {
-        txn_id: TxnId,
-    },
-    ReadDetails {
-        txn_id: TxnId,
-    },
-    Write {
-        txn_id: TxnId,
-    },
-    DeleteStale {
-        txn_id: TxnId,
-    },
-    ReadFence {
-        txn_id: TxnId,
-    },
-    Commit {
-        txn_id: TxnId,
-    },
-    ScheduleDrain,
+    /// The outer operation waits for the merge transaction.
+    Transaction,
     /// The cutoff of a repeat, alone in its own transaction.
     Cutoff,
     /// The cutoff of a merge, written first inside the merge transaction.
-    JoinedCutoff {
-        txn_id: TxnId,
-    },
-    Finish,
-    Error,
+    JoinedCutoff,
+    ReadDocuments,
+    ScanGroups,
+    ReadDetails,
+    Write,
+    DeleteStale,
+    ReadFence,
+    Marks,
+}
+
+/// Whether the operation runs the checks or the merge transaction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Phase {
+    Check,
+    Write,
 }
 
 /// The documents the merge transaction read, before any change.
@@ -246,9 +256,12 @@ struct Account {
     revision: Option<Value>,
 }
 
+/// Merges one account into another: checks both logins and the vault outside any transaction,
+/// then cuts off the merged account's credentials and moves its documents in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct MergeUsersOperation {
     config: MergeUsersConfig,
+    phase: Phase,
     state: MergeState,
     documents: Option<Documents>,
     groups: Vec<GroupAuthorizationDocument>,
@@ -256,20 +269,27 @@ pub struct MergeUsersOperation {
     survivor_groups: Vec<HashMap<RoleId, Role>>,
     batch: Batch,
     outcome: Option<MergeOutcome>,
-    output: Option<Result<MergeOutcome, MergeError>>,
+    pages: PrefixPages,
+    revocation: Option<Revocation>,
+    marks: Option<DueMarks>,
 }
+
+type MergeTurn = Result<Next<MergeOutcome>, MergeError>;
 
 impl MergeUsersOperation {
     pub fn new(config: MergeUsersConfig) -> Self {
         Self {
             config,
-            state: MergeState::Init,
+            phase: Phase::Check,
+            state: MergeState::ReadAccounts,
             documents: None,
             groups: Vec::new(),
             survivor_groups: Vec::new(),
             batch: Batch::default(),
             outcome: None,
-            output: None,
+            pages: PrefixPages::new(AUTH_KEYSPACE, Vec::new(), SCAN_PAGE),
+            revocation: None,
+            marks: None,
         }
     }
 
@@ -288,22 +308,7 @@ impl MergeUsersOperation {
         }
     }
 
-    fn fail(&mut self, error: MergeError) -> Effects {
-        let cleanup = self.abort();
-        self.state = MergeState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(MergeError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn begin(&mut self) -> Result<Effects, MergeError> {
+    fn begin(&mut self) -> MergeTurn {
         let realm_id = self.config.actor.realm_id;
         if self.config.actor.user_id != self.survivor_id()
             || !fresh_local(
@@ -318,23 +323,20 @@ impl MergeUsersOperation {
             return Err(MergeError::OtherRealm);
         }
         self.state = MergeState::ReadAccounts;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: [self.survivor_id(), self.merged_id()]
-                .iter()
-                .map(user_read)
-                .collect(),
-            txn_id: None,
-        })])
+        let reads = [self.survivor_id(), self.merged_id()]
+            .iter()
+            .map(user_read)
+            .collect();
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn accept_accounts(
-        &mut self,
-        values: &[(ByteView, Option<Value>)],
-    ) -> Result<Effects, MergeError> {
-        let [survivor, merged] = parse_users(values)?;
+    fn accept_accounts(&mut self, values: Vec<Option<Value>>) -> MergeTurn {
+        let [survivor, merged] = parse_users(&values)?;
         if plan::check_accounts(&survivor, &merged)? {
             self.outcome = Some(self.empty_outcome(true));
-            return Ok(self.cutoff(None));
+            self.state = MergeState::Cutoff;
+            let cutoff = RevokeTokenOperation::new(self.cutoff_config());
+            return Ok(Next::Call(IoCall::child(cutoff)));
         }
         if !self.config.merged_live {
             return Err(MergeError::TokenInvalid);
@@ -347,14 +349,12 @@ impl MergeUsersOperation {
             return Err(MergeError::StaleLogin);
         }
         self.state = MergeState::CheckVault;
-        Ok(smallvec![self.read_vault(
-            self.merged_id(),
-            self.config.merged_token.clone()
-        )])
+        let read = self.read_vault(self.merged_id(), self.config.merged_token.clone());
+        Ok(Next::Call(read))
     }
 
     /// Reads the digests of a user's saved vault payloads from its holders.
-    fn read_vault(&self, user_id: UserId, auth_token: Option<AuthToken>) -> Effect {
+    fn read_vault(&self, user_id: UserId, auth_token: Option<AuthToken>) -> IoCall {
         let read = ReadVaultOperation::new(ReadVaultConfig {
             node_id: self.config.actor.node_id,
             realm_id: self.config.actor.realm_id,
@@ -362,7 +362,7 @@ impl MergeUsersOperation {
             query: VaultQuery::Heads { auth_token },
             deadline: self.config.vault_deadline,
         });
-        Effect::SubOperation(boxed_suboperation(read, |result| {
+        IoCall::Child(boxed_suboperation(read, |result| {
             Event::SubOperation(SubOperationEvent::VaultHeld {
                 result: result
                     .map(|records| match records {
@@ -378,15 +378,18 @@ impl MergeUsersOperation {
         }))
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.state = MergeState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    /// Hands the merge itself to a child of the same type that runs in one write transaction.
+    fn transaction(&mut self) -> Next<MergeOutcome> {
+        self.state = MergeState::Transaction;
+        let write = Self {
+            phase: Phase::Write,
+            ..Self::new(self.config.clone())
+        };
+        Next::Call(IoCall::child(write))
     }
 
-    fn read_documents(&mut self, txn_id: TxnId) -> Effects {
-        self.state = MergeState::ReadDocuments { txn_id };
+    fn read_documents(&mut self) -> Next<MergeOutcome> {
+        self.state = MergeState::ReadDocuments;
         let realm_id = self.config.actor.realm_id;
         let mut reads: Vec<_> = [self.survivor_id(), self.merged_id()]
             .iter()
@@ -413,23 +416,19 @@ impl MergeUsersOperation {
             ),
             state_read(&AdminDocumentTarget::Realm { realm_id }),
         ]);
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        Next::Call(IoCall::Read(reads))
     }
 
     fn accept_documents(
         &mut self,
-        txn_id: TxnId,
-        values: Vec<(ByteView, Option<Value>)>,
-    ) -> Result<Effects, MergeError> {
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<MergeOutcome>, MergeError> {
         let [survivor, merged] = parse_users(&values[..2.min(values.len())])?;
         // A merge that finished meanwhile is reported by the next request as a repeat.
         if plan::check_accounts(&survivor, &merged)? {
             return Err(MergeError::Inactive);
         }
-        let value = |index: usize| values.get(index).and_then(|(_, value)| value.clone());
+        let value = |index: usize| values.get(index).cloned().flatten();
         let config = value(6)
             .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
             .transpose()?
@@ -459,28 +458,13 @@ impl MergeUsersOperation {
             realm_state: value(9),
             secondaries: Vec::new(),
         });
-        Ok(self.scan_groups(txn_id, None))
+        self.state = MergeState::ScanGroups;
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn scan_groups(&mut self, txn_id: TxnId, after: Option<ByteView>) -> Effects {
-        self.state = MergeState::ScanGroups { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: AUTH_KEYSPACE.to_string(),
-            prefix: None,
-            start: after.map(IterStart::After),
-            limit: SCAN_PAGE,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn accept_groups(
-        &mut self,
-        txn_id: TxnId,
-        values: Vec<(ByteView, Value)>,
-        next: Option<ByteView>,
-    ) -> Result<Effects, MergeError> {
+    fn accept_groups(&mut self, result: IoResult) -> Result<Next<MergeOutcome>, MergeError> {
         let merged = self.merged_id();
-        for (key, value) in values {
+        for (key, value) in self.pages.take(result)? {
             // The realm's own authorization document shares the keyspace under its longer key.
             if key.len() != 16 {
                 continue;
@@ -495,10 +479,10 @@ impl MergeUsersOperation {
                 self.survivor_groups.push(document.roles);
             }
         }
-        if let Some(after) = next {
-            return Ok(self.scan_groups(txn_id, Some(after)));
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
         }
-        self.state = MergeState::ReadDetails { txn_id };
+        self.state = MergeState::ReadDetails;
         let mut reads: Vec<_> = self
             .groups
             .iter()
@@ -521,10 +505,7 @@ impl MergeUsersOperation {
             reads.push((SUBJECT_CLAIMS_KEYSPACE.to_string(), key.clone()));
             reads.push((SUBJECT_INDEX_KEYSPACE.to_string(), key));
         }
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn secondary_ids(&self) -> Vec<UserId> {
@@ -556,72 +537,57 @@ impl MergeUsersOperation {
         }
     }
 
-    fn after_write(&mut self, txn_id: TxnId) -> Effects {
+    fn after_write(&mut self) -> MergeTurn {
         if !self.batch.deletes.is_empty() {
-            self.state = MergeState::DeleteStale { txn_id };
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: std::mem::take(&mut self.batch.deletes),
-                txn_id: Some(txn_id),
-            })];
+            self.state = MergeState::DeleteStale;
+            return Ok(Next::Call(IoCall::Delete(std::mem::take(
+                &mut self.batch.deletes,
+            ))));
         }
-        self.read_fence(txn_id)
+        Ok(self.read_fence())
     }
 
     /// Takes the buckets' fences inside the transaction, so a departing holder's close
     /// rejects or conflicts the merge.
-    fn read_fence(&mut self, txn_id: TxnId) -> Effects {
+    fn read_fence(&mut self) -> Next<MergeOutcome> {
         if self.batch.fence.is_empty() {
-            return self.commit(txn_id);
+            return self.mark();
         }
-        self.state = MergeState::ReadFence { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.batch.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
+        self.state = MergeState::ReadFence;
+        Next::Call(IoCall::Read(self.batch.fence.reads()))
     }
 
     /// The merged account loses READ everywhere, so encrypted buckets are marked for a new epoch.
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = MergeState::Commit { txn_id };
-        smallvec![crate::auth::epoch_due::mark_due(None, txn_id)]
+    fn mark(&mut self) -> Next<MergeOutcome> {
+        self.state = MergeState::Marks;
+        let marks = DueMarks::new(None, aruna_core::time::unix_timestamp_millis());
+        let first = marks.first();
+        self.marks = Some(marks);
+        Next::Call(first)
     }
 
-    /// Cuts off every credential of the merged account issued before the merge, on every node.
-    /// Inside `txn_id` it commits with the merge, so no merge ever lands without it.
-    fn cutoff(&mut self, txn_id: Option<TxnId>) -> Effects {
+    /// The cutoff of every credential of the merged account issued before the merge.
+    fn cutoff_config(&self) -> RevokeTokenConfig {
         let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
         let merged = self.merged_id();
-        let config = RevokeTokenConfig {
+        RevokeTokenConfig {
             actor: self.acting(merged),
             token_hash: user_cutoff_hash(&merged),
             expires_at: user_cutoff_expiry(cutoff),
             token_owner: merged,
             admission: RevokeTokenAdmission::Privileged,
             now: self.config.now,
-        };
-        let operation = match txn_id {
-            Some(txn_id) => {
-                self.state = MergeState::JoinedCutoff { txn_id };
-                RevokeTokenOperation::joined(config, txn_id)
-            }
-            None => {
-                self.state = MergeState::Cutoff;
-                RevokeTokenOperation::new(config)
-            }
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            operation,
-            |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
-                result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
+        }
     }
 
-    fn finish(&mut self) -> Effects {
-        let outcome = self
-            .outcome
-            .take()
-            .unwrap_or_else(|| self.empty_outcome(true));
+    /// Wakes the outbox drain after the commit; a failed timer leaves the outbox retryable.
+    fn committed(&mut self) -> MergeTurn {
+        let output = self.outcome.take().ok_or(MergeError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
+    }
+
+    fn finish(&mut self, outcome: MergeOutcome) -> MergeTurn {
         info!(
             survivor = %outcome.survivor,
             merged = %outcome.merged,
@@ -633,108 +599,106 @@ impl MergeUsersOperation {
             repeated = outcome.repeated,
             "Merged account into surviving account"
         );
-        self.state = MergeState::Finish;
-        self.output = Some(Ok(outcome));
-        smallvec![]
+        Ok(Next::Done(outcome))
     }
 
-    fn step_storage(&mut self, event: Event) -> Result<Effects, MergeError> {
-        match (self.state.clone(), event) {
-            (
-                MergeState::ReadAccounts,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.accept_accounts(&values),
-            (
-                MergeState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => Ok(self.cutoff(Some(txn_id))),
-            (
-                MergeState::JoinedCutoff { txn_id },
-                Event::SubOperation(SubOperationEvent::TokenRevoked { result }),
-            ) => match result {
-                Ok(()) => Ok(self.read_documents(txn_id)),
-                Err(error) => Err(MergeError::Cutoff(error)),
-            },
-            (
-                MergeState::ReadDocuments { txn_id },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.accept_documents(txn_id, values),
-            (
-                MergeState::ScanGroups { txn_id },
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.accept_groups(txn_id, values, next_start_after),
-            (
-                MergeState::ReadDetails { txn_id },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.stage_all(txn_id, values),
-            (
-                MergeState::Write { txn_id },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => Ok(self.after_write(txn_id)),
-            (
-                MergeState::DeleteStale { txn_id },
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => Ok(self.read_fence(txn_id)),
-            (
-                MergeState::ReadFence { txn_id },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                if !self.batch.fence.admits(&values) {
+    fn vault_held(event: Box<Event>) -> Result<Vec<[u8; 32]>, MergeError> {
+        match *event {
+            Event::SubOperation(SubOperationEvent::VaultHeld { result }) => {
+                result.map_err(MergeError::Vault)
+            }
+            other => Err(MergeError::UnexpectedEvent {
+                state: "CheckVault".to_string(),
+                expected: "the vault read result",
+                got: other.label(),
+            }),
+        }
+    }
+
+    fn check_step(&mut self, result: IoResult) -> MergeTurn {
+        match (self.state.clone(), result) {
+            (MergeState::ReadAccounts, IoResult::Values(values)) => self.accept_accounts(values),
+            (MergeState::CheckVault, IoResult::Event(event)) => {
+                let merged = Self::vault_held(event)?;
+                if merged.is_empty() {
+                    return Ok(self.transaction());
+                }
+                self.state = MergeState::CheckCopy { merged };
+                let token = self.config.survivor_token.clone();
+                Ok(Next::Call(self.read_vault(self.survivor_id(), token)))
+            }
+            (MergeState::CheckCopy { merged }, IoResult::Event(event)) => {
+                let held = Self::vault_held(event)?;
+                if !merged.iter().all(|digest| held.contains(digest)) {
+                    return Err(MergeError::VaultPresent);
+                }
+                Ok(self.transaction())
+            }
+            (MergeState::Cutoff, result) => {
+                result
+                    .child::<RealmConfigDocument, RevokeTokenError>()?
+                    .map_err(|error| MergeError::Cutoff(error.to_string()))?;
+                let outcome = self.outcome.take().ok_or(MergeError::NotFinished)?;
+                self.finish(outcome)
+            }
+            (MergeState::Transaction, result) => {
+                let outcome = result.child::<MergeOutcome, MergeError>()??;
+                self.finish(outcome)
+            }
+            (_, result) => Err(MergeError::UnexpectedEvent {
+                state: format!("{:?}", self.state),
+                expected: "the result of the current merge step",
+                got: result.label(),
+            }),
+        }
+    }
+
+    fn write_step(&mut self, result: IoResult) -> MergeTurn {
+        match (self.state.clone(), result) {
+            (MergeState::JoinedCutoff, result) => {
+                let revocation = self.revocation.as_mut().ok_or(MergeError::NotFinished)?;
+                let cutoff = |error: RevokeTokenError| MergeError::Cutoff(error.to_string());
+                if let Some(call) = revocation.next(result).map_err(cutoff)? {
+                    return Ok(Next::Call(call));
+                }
+                revocation
+                    .outcome()
+                    .and_then(|revoked| revoked.result())
+                    .map_err(cutoff)?;
+                Ok(self.read_documents())
+            }
+            (MergeState::ReadDocuments, IoResult::Values(values)) => self.accept_documents(values),
+            (MergeState::ScanGroups, result) => self.accept_groups(result),
+            (MergeState::ReadDetails, IoResult::Values(values)) => self.stage_all(values),
+            (MergeState::Write, result) => {
+                done(result)?;
+                self.after_write()
+            }
+            (MergeState::DeleteStale, result) => {
+                done(result)?;
+                Ok(self.read_fence())
+            }
+            (MergeState::ReadFence, IoResult::Values(values)) => {
+                let keys = self.batch.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.batch.fence.admits(&rows) {
                     return Err(MergeError::PlacementFenced);
                 }
-                Ok(self.commit(txn_id))
+                Ok(self.mark())
             }
-            (
-                MergeState::Commit { txn_id },
-                event @ Event::SubOperation(SubOperationEvent::EpochsMarked { .. }),
-            ) => crate::auth::epoch_due::marked(&event, txn_id)
-                .unwrap_or(Err(StorageError::WriteError("epoch marking".to_string())))
-                .map_err(MergeError::from),
-            (
-                MergeState::Commit { .. },
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.state = MergeState::ScheduleDrain;
-                Ok(smallvec![schedule_drain_effect()])
+            (MergeState::Marks, result) => {
+                let marks = self.marks.as_mut().ok_or(MergeError::NotFinished)?;
+                match marks.next(result, true) {
+                    Ok(Some(call)) => Ok(Next::Call(call)),
+                    Ok(None) => self.committed(),
+                    Err(_) => Err(StorageError::WriteError("epoch marking".to_string()).into()),
+                }
             }
-            (
-                MergeState::ScheduleDrain,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => Ok(self.finish()),
-            (
-                MergeState::CheckVault,
-                Event::SubOperation(SubOperationEvent::VaultHeld { result }),
-            ) => match result {
-                Ok(merged) if merged.is_empty() => Ok(self.start_transaction()),
-                Ok(merged) => {
-                    self.state = MergeState::CheckCopy { merged };
-                    let token = self.config.survivor_token.clone();
-                    Ok(smallvec![self.read_vault(self.survivor_id(), token)])
-                }
-                Err(error) => Err(MergeError::Vault(error)),
-            },
-            (
-                MergeState::CheckCopy { merged },
-                Event::SubOperation(SubOperationEvent::VaultHeld { result }),
-            ) => match result {
-                Ok(held) if merged.iter().all(|digest| held.contains(digest)) => {
-                    Ok(self.start_transaction())
-                }
-                Ok(_) => Err(MergeError::VaultPresent),
-                Err(error) => Err(MergeError::Vault(error)),
-            },
-            (
-                MergeState::Cutoff,
-                Event::SubOperation(SubOperationEvent::TokenRevoked { result }),
-            ) => match result {
-                Ok(()) => Ok(self.finish()),
-                Err(error) => Err(MergeError::Cutoff(error)),
-            },
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Ok(self.unexpected("the event of the current merge step", event)),
+            (_, result) => Err(MergeError::UnexpectedEvent {
+                state: format!("{:?}", self.state),
+                expected: "the result of the current merge step",
+                got: result.label(),
+            }),
         }
     }
 }
@@ -754,8 +718,8 @@ fn state_read(target: &AdminDocumentTarget) -> (String, ByteView) {
     )
 }
 
-fn parse_users(values: &[(ByteView, Option<Value>)]) -> Result<[User; 2], MergeError> {
-    let [(_, survivor), (_, merged)] = values else {
+fn parse_users(values: &[Option<Value>]) -> Result<[User; 2], MergeError> {
+    let [survivor, merged] = values else {
         return Err(MergeError::NotFound);
     };
     let parse = |value: &Option<Value>| -> Result<User, MergeError> {
@@ -764,45 +728,34 @@ fn parse_users(values: &[(ByteView, Option<Value>)]) -> Result<[User; 2], MergeE
     Ok([parse(survivor)?, parse(merged)?])
 }
 
-impl EffectOperation for MergeUsersOperation {
+impl Operation for MergeUsersOperation {
     type Output = MergeOutcome;
     type Error = MergeError;
 
-    fn start(&mut self) -> Effects {
-        self.begin().unwrap_or_else(|error| self.fail(error))
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            MergeState::Init => return self.unexpected("no event before start", event),
-            MergeState::Finish | MergeState::Error => return smallvec![],
-            _ => {}
+    fn transaction(&self) -> TransactionMode {
+        match self.phase {
+            Phase::Check => TransactionMode::None,
+            Phase::Write => TransactionMode::Write,
         }
-        self.step_storage(event)
-            .unwrap_or_else(|error| self.fail(error))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, MergeState::Finish | MergeState::Error)
+    /// Inside the transaction the cutoff comes first, so no merge ever lands without it.
+    fn first(&mut self) -> MergeTurn {
+        if self.phase == Phase::Check {
+            return self.begin();
+        }
+        self.outcome = None;
+        self.state = MergeState::JoinedCutoff;
+        let revocation = Revocation::new(self.cutoff_config());
+        let first = revocation.first();
+        self.revocation = Some(revocation);
+        Ok(Next::Call(first))
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(MergeError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            MergeState::JoinedCutoff { txn_id }
-            | MergeState::ReadDocuments { txn_id }
-            | MergeState::ScanGroups { txn_id }
-            | MergeState::ReadDetails { txn_id }
-            | MergeState::Write { txn_id }
-            | MergeState::DeleteStale { txn_id }
-            | MergeState::ReadFence { txn_id }
-            | MergeState::Commit { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
+    fn next(&mut self, result: IoResult) -> MergeTurn {
+        match self.phase {
+            Phase::Check => self.check_step(result),
+            Phase::Write => self.write_step(result),
         }
     }
 }

@@ -8,7 +8,8 @@ use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
     JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
@@ -20,6 +21,8 @@ use byteview::ByteView;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::jobs::MUTATE_MAX_ATTEMPTS;
 
 #[derive(Debug, PartialEq)]
 pub struct CreateRoCrateConfig {
@@ -226,6 +229,78 @@ pub enum UploadClaimError {
     Storage(String),
 }
 
+impl From<IoError> for UploadClaimError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+/// Claims a stored upload for job `job_id` of `owner` in one write transaction; see
+/// [`claim_upload`]. A record the claim leaves unchanged is not written again.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ClaimUploadOperation {
+    upload_id: Ulid,
+    owner: UserId,
+    job_id: JobId,
+    now_ms: u64,
+    claimed: Option<RoCrateUploadRecord>,
+}
+
+impl ClaimUploadOperation {
+    pub(crate) fn new(upload_id: Ulid, owner: UserId, job_id: JobId, now_ms: u64) -> Self {
+        Self {
+            upload_id,
+            owner,
+            job_id,
+            now_ms,
+            claimed: None,
+        }
+    }
+}
+
+impl Operation for ClaimUploadOperation {
+    type Output = RoCrateUploadRecord;
+    type Error = UploadClaimError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn conflict_retries() -> u32 {
+        MUTATE_MAX_ATTEMPTS - 1
+    }
+
+    fn first(&mut self) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
+        let row = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
+        if let Some(record) = self.claimed.take() {
+            done(result)?;
+            return Ok(Next::Done(record));
+        }
+        let [value] = values::<1>(result)?;
+        let value = value.ok_or(UploadClaimError::NotFound)?;
+        let invalid = |error: postcard::Error| UploadClaimError::Invalid(error.to_string());
+        let mut record: RoCrateUploadRecord = postcard::from_bytes(&value).map_err(invalid)?;
+        if !claim_upload(&mut record, self.owner, self.job_id, self.now_ms)? {
+            return Ok(Next::Done(record));
+        }
+        let value = ByteView::from(postcard::to_allocvec(&record).map_err(invalid)?);
+        let row = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+            value,
+        );
+        self.claimed = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
 /// Claims `record` for job `job_id` of `owner`. A claimed upload stays with its job, also after it
 /// expires; an unclaimed one is claimable until it expires. Returns whether the record changed.
 pub(crate) fn claim_upload(
@@ -252,7 +327,7 @@ pub(crate) fn claim_upload(
 pub(crate) mod tests {
     use super::*;
     use crate::jobs::import::upload_store::{
-        claim_rocrate_upload, read_rocrate_upload, write_rocrate_upload,
+        claim_rocrate_upload, delete_rocrate_upload, read_rocrate_upload, write_rocrate_upload,
     };
     use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;

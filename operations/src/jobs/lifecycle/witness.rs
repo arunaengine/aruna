@@ -6,25 +6,21 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame};
+use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::events::{Event, LaunchDecline};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::{done, values};
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WitnessBudgetRecord,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementDecision;
-use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, TxnId};
 use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -33,11 +29,13 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::build_plan;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
+use super::witness_arm::{
+    ArmFamilyOperation, DEADLINE_KEY_BYTES, WitnessDeadline, deadline_index_key, deadline_key,
+};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::query::batch_delete;
@@ -45,8 +43,6 @@ use crate::realm::load_config::load_realm_config;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
-/// Domain of the stable witness order.
-const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
 /// Families one drain pass considers.
 const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
@@ -55,16 +51,6 @@ pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
 const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
-
-const DEADLINE_KEY_BYTES: usize = 8 + 64;
-
-/// One family's persisted fallback deadline. The row exists while this node may
-/// still have to launch, so a restart resumes the same schedule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WitnessDeadline {
-    pub due_at_ms: u64,
-    pub rank: u32,
-}
 
 /// The bounded plan this witness stored before it launched, with the targets
 /// that already refused this request.
@@ -78,54 +64,6 @@ pub struct WitnessExplain {
     pub stored_at_ms: u64,
 }
 
-/// Kicks the witness queue without persisting a timer of its own.
-pub fn schedule_witness_drain(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ShortenTimer {
-        key: TaskKey::DrainWitnessQueue,
-        after,
-    })
-}
-
-/// Position of `node` in the witness order. The admitting node ranks first,
-/// because it already holds the request; remaining witnesses follow the
-/// domain-separated digest of the immutable identity, identical on every node.
-pub fn witness_rank(
-    holders: &[NodeId],
-    family: &JobFamilyId,
-    node: NodeId,
-    admitting: Option<NodeId>,
-) -> Option<u32> {
-    let admitting = admitting.filter(|first| holders.contains(first));
-    if admitting == Some(node) {
-        return Some(0);
-    }
-    let mut ordered: Vec<([u8; 32], NodeId)> = holders
-        .iter()
-        .filter(|holder| Some(**holder) != admitting)
-        .map(|holder| (rank_key(family, *holder), *holder))
-        .collect();
-    ordered.sort_unstable();
-    let rank = ordered.iter().position(|(_, holder)| *holder == node)? as u32;
-    Some(rank + u32::from(admitting.is_some()))
-}
-
-fn rank_key(family: &JobFamilyId, node: NodeId) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(WITNESS_RANK_DOMAIN);
-    hasher.update(&family.submission_id.0);
-    hasher.update(&family.request_digest);
-    hasher.update(node.as_bytes());
-    *hasher.finalize().as_bytes()
-}
-
-/// Deterministic jitter below a quarter of the base delay, so equal ranks in
-/// different families never fire in lockstep and a replay picks the same value.
-fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
-    let key = rank_key(family, node);
-    let spread = base_delay_ms / 4 + 1;
-    u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
-}
-
 /// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
     let Some((local, realm_id)) = context.node_and_realm() else {
@@ -135,189 +73,6 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
     let operation = ArmFamilyOperation::new(family, local, realm_id, now_ms);
     if let Err(error) = drive(operation, context).await {
         warn!(?family, error = %error, "Witness deadline was not armed");
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum ArmState {
-    Config,
-    Claims,
-    Index,
-    Write,
-    Delete,
-}
-
-/// Arms this node's fallback for one family. Rank zero is due immediately; a
-/// later rank waits `base_delay * rank` plus its own jitter. An earlier existing
-/// deadline is kept, so re-arming can only ever bring a round forward. The deadline is read
-/// and replaced in one write transaction, then the witness drain wakes.
-#[derive(Debug, PartialEq)]
-pub struct ArmFamilyOperation {
-    family: JobFamilyId,
-    local: NodeId,
-    realm_id: RealmId,
-    now_ms: u64,
-    holders: Vec<NodeId>,
-    base_delay_ms: u64,
-    deadline: Option<WitnessDeadline>,
-    deletes: Vec<(String, Key)>,
-    state: ArmState,
-}
-
-type ArmStep = Result<Next<()>, LifecycleError>;
-
-impl ArmFamilyOperation {
-    pub fn new(family: JobFamilyId, local: NodeId, realm_id: RealmId, now_ms: u64) -> Self {
-        Self {
-            family,
-            local,
-            realm_id,
-            now_ms,
-            holders: Vec::new(),
-            base_delay_ms: 0,
-            deadline: None,
-            deletes: Vec::new(),
-            state: ArmState::Config,
-        }
-    }
-
-    /// Ranks this node among the holders; the admitting node goes first.
-    fn rank(&mut self, admitting: Option<NodeId>) -> ArmStep {
-        let family = self.family;
-        let Some(rank) = witness_rank(&self.holders, &family, self.local, admitting) else {
-            debug!(?family, "Node is not a witness for this family");
-            return Ok(Next::Done(()));
-        };
-        let base = self.base_delay_ms;
-        let due_at_ms = match rank {
-            0 => self.now_ms,
-            rank => self.now_ms + base * u64::from(rank) + jitter_ms(&family, self.local, base),
-        };
-        self.deadline = Some(WitnessDeadline { due_at_ms, rank });
-        self.state = ArmState::Index;
-        let row = (
-            DEADLINE_INDEX_KEYSPACE.to_string(),
-            deadline_index_key(&family),
-        );
-        Ok(Next::Call(IoCall::Read(vec![row])))
-    }
-
-    /// Writes the new deadline unless an earlier one is already armed.
-    fn replace(&mut self, existing: Option<WitnessDeadline>) -> ArmStep {
-        let Some(next) = self.deadline else {
-            return Ok(Next::Done(()));
-        };
-        if existing.is_some_and(|existing| existing.due_at_ms <= next.due_at_ms) {
-            return Ok(Next::Done(()));
-        }
-        let family = &self.family;
-        let key = deadline_key(family, next.due_at_ms);
-        let value = Value::from(to_bytes(&next)?.as_slice());
-        let writes = vec![
-            (
-                WITNESS_DEADLINE_KEYSPACE.to_string(),
-                key.clone(),
-                value.clone(),
-            ),
-            (
-                DEADLINE_INDEX_KEYSPACE.to_string(),
-                deadline_index_key(family),
-                value,
-            ),
-        ];
-        if let Some(previous) = existing.map(|previous| deadline_key(family, previous.due_at_ms))
-            && previous != key
-        {
-            self.deletes
-                .push((WITNESS_DEADLINE_KEYSPACE.to_string(), previous));
-        }
-        self.state = ArmState::Write;
-        Ok(Next::Call(IoCall::Write(writes)))
-    }
-}
-
-impl Operation for ArmFamilyOperation {
-    type Output = ();
-    type Error = LifecycleError;
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
-    }
-
-    fn first(&mut self) -> ArmStep {
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
-            self.realm_id,
-        ))))
-    }
-
-    fn next(&mut self, result: IoResult) -> ArmStep {
-        let family = self.family;
-        match std::mem::replace(&mut self.state, ArmState::Config) {
-            ArmState::Config => {
-                let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
-                    Ok(config) => config,
-                    Err(error) => {
-                        warn!(
-                            ?family,
-                            error = %error,
-                            "Realm config unavailable; witness fallback not armed"
-                        );
-                        return Ok(Next::Done(()));
-                    }
-                };
-                let Some(view) = FamilyView::resolve(&config, self.realm_id, family) else {
-                    warn!(
-                        ?family,
-                        "Family placement unresolved; witness fallback not armed"
-                    );
-                    return Ok(Next::Done(()));
-                };
-                self.holders = view.holders().to_vec();
-                self.base_delay_ms = config.compute.witness_delay_ms;
-                self.state = ArmState::Claims;
-                let claims = LoadFamilyOperation::kind(family, JobRecordKind::Claim);
-                Ok(Next::Call(IoCall::child(claims)))
-            }
-            // The node that admitted the family: the committing node of the claim with the
-            // lowest order key, which every holder reduces the same way. An unreadable
-            // claim set leaves the order to the digest alone.
-            ArmState::Claims => {
-                let records = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
-                let admitting = records.ok().and_then(|records| {
-                    records
-                        .iter()
-                        .filter_map(|envelope| match &envelope.record {
-                            JobFamilyRecord::Claim(claim) => Some(claim),
-                            _ => None,
-                        })
-                        .min_by_key(|claim| claim.order_key())
-                        .map(|claim| claim.committing_node_id)
-                });
-                self.rank(admitting)
-            }
-            ArmState::Index => {
-                let [value] = values::<1>(result)?;
-                let existing = value.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok());
-                self.replace(existing)
-            }
-            ArmState::Write => {
-                done(result)?;
-                self.state = ArmState::Delete;
-                Ok(Next::Call(IoCall::Delete(std::mem::take(
-                    &mut self.deletes,
-                ))))
-            }
-            ArmState::Delete => {
-                done(result)?;
-                let due_at_ms = self.deadline.map_or(self.now_ms, |next| next.due_at_ms);
-                let after = Duration::from_millis(due_at_ms.saturating_sub(self.now_ms));
-                let drain = IoCall::Effect(Box::new(schedule_witness_drain(after)));
-                Ok(Next::Then {
-                    output: (),
-                    calls: vec![drain],
-                })
-            }
-        }
     }
 }
 
@@ -391,42 +146,6 @@ mod tests {
     use super::*;
     use crate::tests::records::{Family, context, node};
 
-    fn arming(existing: Option<WitnessDeadline>) -> Result<Next<()>, LifecycleError> {
-        let fixture = Family::new([2u8; 32]);
-        let family = fixture.family();
-        let local = fixture.holder.public();
-        let mut operation = ArmFamilyOperation::new(family, local, fixture.config.realm_id, 1_000);
-        assert_eq!(operation.transaction(), TransactionMode::Write);
-        operation.holders = vec![local];
-        operation.base_delay_ms = 400;
-        let read = operation.rank(Some(local));
-        assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
-        let value = existing.map(|deadline| Value::from(to_bytes(&deadline).unwrap().as_slice()));
-        operation.next(IoResult::Values(vec![value]))
-    }
-
-    // An admitting node arms itself at once; an earlier armed deadline is kept.
-    #[test]
-    fn arms_earliest_deadline() {
-        let Ok(Next::Call(IoCall::Write(rows))) = arming(None) else {
-            panic!("a new deadline is written");
-        };
-        assert_eq!(rows.len(), 2);
-        let armed: WitnessDeadline = from_bytes(&rows[1].2).unwrap();
-        assert_eq!(
-            armed,
-            WitnessDeadline {
-                due_at_ms: 1_000,
-                rank: 0
-            }
-        );
-        let earlier = WitnessDeadline {
-            due_at_ms: 500,
-            rank: 1,
-        };
-        assert_eq!(arming(Some(earlier)), Ok(Next::Done(())));
-    }
-
     #[tokio::test]
     async fn keeps_later_deadlines() {
         // A full pass must re-arm the drain for rows on its next page.
@@ -499,26 +218,6 @@ mod tests {
         .expect("deadline scan");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, deadline_key(&family, second.due_at_ms));
-    }
-
-    #[test]
-    fn schedule_uses_shorten() {
-        let Effect::Task(TaskEffect::ShortenTimer { key, after }) =
-            schedule_witness_drain(Duration::from_secs(1))
-        else {
-            panic!("expected shortened witness timer")
-        };
-        assert_eq!(key, TaskKey::DrainWitnessQueue);
-        assert_eq!(after, Duration::from_secs(1));
-    }
-
-    #[test]
-    fn deadlines_ordered() {
-        let family = JobFamilyId {
-            submission_id: aruna_core::structs::execution::job::SubmissionId([1; 32]),
-            request_digest: [2; 32],
-        };
-        assert!(deadline_key(&family, 1) < deadline_key(&family, 2));
     }
 
     /// One family with a launch by `holder` that no receipt answers.
@@ -1030,17 +729,6 @@ fn empty_plan() -> ExecutionPlan {
         rejected: Vec::new(),
         omitted: 0,
     }
-}
-
-fn deadline_key(family: &JobFamilyId, due_at_ms: u64) -> Key {
-    let mut bytes = Vec::with_capacity(DEADLINE_KEY_BYTES);
-    bytes.extend_from_slice(&due_at_ms.to_be_bytes());
-    bytes.extend_from_slice(&family.to_bytes());
-    Key::from(bytes.as_slice())
-}
-
-fn deadline_index_key(family: &JobFamilyId) -> Key {
-    Key::from(family.to_bytes().as_slice())
 }
 
 fn deadline_family(key: &[u8]) -> Option<JobFamilyId> {

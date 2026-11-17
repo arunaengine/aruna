@@ -30,9 +30,8 @@ use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -91,18 +90,6 @@ pub(crate) fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> E
         key: graph_lifecycle_key(graph_iri),
         txn_id,
     })
-}
-
-pub(crate) fn write_registry_effect(
-    record: &MetadataRegistryRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        key: metadata_registry_key(record.group_id, record.document_id),
-        value: postcard::to_allocvec(record)?.into(),
-        txn_id,
-    }))
 }
 
 pub(crate) fn delete_registry_effect(
@@ -207,21 +194,6 @@ pub(crate) fn write_audit_effect(
         key_space: METADATA_AUDIT_KEYSPACE.to_string(),
         key: metadata_audit_key(record.group_id, record.document_id, audit_id),
         value: postcard::to_allocvec(record)?.into(),
-        txn_id,
-    }))
-}
-
-pub(crate) fn write_create_effect(
-    record: &MetadataRegistryRecord,
-    audit: &MetadataAuditRecord,
-    audit_id: Ulid,
-    outbox: Option<&DocumentOutboxRecord>,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
-
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes,
         txn_id,
     }))
 }
@@ -342,10 +314,6 @@ pub(crate) fn parse_registry_iter(
     parse_storage_iter(event, |bytes| {
         postcard::from_bytes(bytes).map_err(ConversionError::from)
     })
-}
-
-pub(crate) fn empty_effects() -> Effects {
-    smallvec![]
 }
 
 /// Wakes the materialization drain at once.
@@ -477,6 +445,21 @@ mod pure_tests {
 
     fn node(seed: u8) -> NodeId {
         NodeId::from_bytes(&[seed; 32]).expect("node id")
+    }
+
+    fn write_create_effect(
+        record: &MetadataRegistryRecord,
+        audit: &MetadataAuditRecord,
+        audit_id: Ulid,
+        outbox: Option<&DocumentOutboxRecord>,
+        txn_id: Option<TxnId>,
+    ) -> Result<Effect, ConversionError> {
+        let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
+
+        Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id,
+        }))
     }
 
     fn outbox_fixture() -> (

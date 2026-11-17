@@ -234,7 +234,7 @@ async fn capacity_blocks_releases() {
         .await
         .unwrap();
     assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
-    drive(AcknowledgeQuarantineOperation::new(oldest), &ctx)
+    drive(AcknowledgeQuarantineOperation::new(oldest.clone()), &ctx)
         .await
         .unwrap()
         .expect("row is acknowledged");

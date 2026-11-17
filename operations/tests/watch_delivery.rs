@@ -35,7 +35,7 @@ use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::notifications::watch::emit::emit_watch_event;
-use aruna_operations::notifications::watch::interest::refresh_target_interest;
+use aruna_operations::notifications::watch::interest::RefreshInterestOperation;
 use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
@@ -570,7 +570,9 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
         })) => targets,
         other => return Err(format!("unexpected subscription history sync: {other:?}").into()),
     };
-    refresh_target_interest(new_holder_node.context.as_ref(), &reconciled).await;
+    let local_realm = *new_holder_node.net.realm_id();
+    let refresh = RefreshInterestOperation::new(&reconciled, local_realm);
+    drive(refresh, new_holder_node.context.as_ref()).await?;
     for node in &nodes {
         drive(InterestOperation::mark(realm_id), node.context.as_ref()).await?;
     }

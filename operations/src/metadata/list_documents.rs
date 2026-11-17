@@ -92,17 +92,32 @@ mod tests {
     use super::*;
 
     use aruna_core::calls::IoCall;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::ConversionError;
     use aruna_core::handle::Handle;
     use aruna_core::rows::encode;
+    use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::types::Value;
+    use aruna_core::types::{TxnId, Value};
     use aruna_storage::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
-    use crate::metadata::repository::{write_graph_lifecycle, write_registry_effect};
+    use crate::metadata::repository::write_graph_lifecycle;
+
+    fn write_registry_effect(
+        record: &MetadataRegistryRecord,
+        txn_id: Option<TxnId>,
+    ) -> Result<Effect, ConversionError> {
+        Ok(Effect::Storage(StorageEffect::Write {
+            key_space: METADATA_INDEX_KEYSPACE.to_string(),
+            key: metadata_registry_key(record.group_id, record.document_id),
+            value: postcard::to_allocvec(record)?.into(),
+            txn_id,
+        }))
+    }
 
     #[tokio::test]
     async fn lists_across_multiple() {

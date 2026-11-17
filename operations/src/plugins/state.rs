@@ -536,6 +536,10 @@ mod tests {
         let Next::Call(IoCall::Delete(keys)) = plan.next(read).unwrap() else {
             panic!("a matching removal deletes the value");
         };
+        let keys: Vec<_> = keys
+            .iter()
+            .map(|(space, key)| (space.as_str(), key.to_vec()))
+            .collect();
         assert_eq!(keys, [(PLUGIN_STATE_KEYSPACE, value_key(install, "k"))]);
         let Next::Call(IoCall::Write(rows)) = plan.next(IoResult::Done).unwrap() else {
             panic!("the bytes and intent follow");

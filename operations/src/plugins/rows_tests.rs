@@ -47,9 +47,9 @@ fn single_requests() {
     let mut read = ReadRows(Some(read_call(vec![(SPACE, b"a".to_vec())])));
     assert!(matches!(read.first().unwrap(), Next::Call(IoCall::Read(_))));
     assert!(read.first().is_err());
-    let values = vec![Some(b"1".to_vec())];
-    let answer = read.next(values_result(values.clone())).unwrap();
-    assert_eq!(answer, Next::Done(values));
+    let stored = vec![Some(b"1".to_vec())];
+    let answer = read.next(values_result(stored.clone())).unwrap();
+    assert_eq!(answer, Next::Done(stored));
     let mut page = PageRows(Some(page_call(SPACE, Vec::new(), None, 1)));
     page.first().unwrap();
     let answer = page.next(page_result(Vec::new(), None)).unwrap();

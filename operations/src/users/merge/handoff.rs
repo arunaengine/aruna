@@ -7,21 +7,18 @@ use super::stage::{Batch, Change};
 use super::{Coordinator, MergeError, coordinator};
 use aruna_core::NodeId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::decode_reducer_state;
+use aruna_core::rows::done;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, TxnId, Value};
-use byteview::ByteView;
-use smallvec::smallvec;
+use aruna_core::types::Value;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::realm::ensure_config::overlay_reducer_state;
@@ -37,70 +34,78 @@ pub struct HandoffConfig {
     pub node_id: NodeId,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum HandoffState {
-    Init,
-    Authorize,
-    StartTransaction,
-    Read { txn_id: TxnId },
-    Write { txn_id: TxnId },
-    DeleteStale { txn_id: TxnId },
-    Commit { txn_id: TxnId },
-    ScheduleDrain,
-    Finish,
-    Error,
-}
-
+/// Checks the administrator's config permission, then hands the role on in one write.
 #[derive(Debug, PartialEq)]
 pub struct HandoffOperation {
     config: HandoffConfig,
-    state: HandoffState,
-    batch: Batch,
-    output: Option<Result<(), MergeError>>,
+    authorized: bool,
 }
 
 impl HandoffOperation {
     pub fn new(config: HandoffConfig) -> Self {
         Self {
             config,
-            state: HandoffState::Init,
+            authorized: false,
+        }
+    }
+}
+
+impl Operation for HandoffOperation {
+    type Output = ();
+    type Error = MergeError;
+
+    fn first(&mut self) -> Result<Next<()>, MergeError> {
+        let path = format!("/{}/admin/config", self.config.actor.realm_id);
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path,
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, MergeError> {
+        if self.authorized {
+            return result.child::<(), MergeError>()?.map(Next::Done);
+        }
+        if !result.child::<bool, AuthorizationError>()?? {
+            return Err(MergeError::Unauthorized);
+        }
+        self.authorized = true;
+        let write = HandoffWrite::new(self.config.clone());
+        Ok(Next::Call(IoCall::child(write)))
+    }
+}
+
+/// Where the handoff write stands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    DeleteStale,
+}
+
+/// The handoff transaction: reads the realm config and its admin state, then records the new
+/// coordinator and queues the change.
+#[derive(Debug, PartialEq)]
+pub(super) struct HandoffWrite {
+    config: HandoffConfig,
+    stage: Stage,
+    batch: Batch,
+}
+
+impl HandoffWrite {
+    pub(super) fn new(config: HandoffConfig) -> Self {
+        Self {
+            config,
+            stage: Stage::Read,
             batch: Batch::default(),
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: MergeError) -> Effects {
-        let cleanup = self.abort();
-        self.state = HandoffState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn read(&mut self, txn_id: TxnId) -> Effects {
-        self.state = HandoffState::Read { txn_id };
-        let realm_id = self.config.actor.realm_id;
-        let document = DocumentTarget::RealmConfig { realm_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key()
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&AdminDocumentTarget::RealmConfig { realm_id }),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn write(
-        &mut self,
-        txn_id: TxnId,
-        values: &[(ByteView, Option<Value>)],
-    ) -> Result<Effects, MergeError> {
-        let [(_, config), (_, state)] = values else {
+    fn write(&mut self, values: &[Option<Value>]) -> Result<Next<()>, MergeError> {
+        let [config, state] = values else {
             return Err(MergeError::NotFinished);
         };
         let mut config = config
@@ -151,123 +156,61 @@ impl HandoffOperation {
         ));
         self.batch
             .stage(node_id, realm_id, (document, placement), &change)?;
-        self.state = HandoffState::Write { txn_id };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: std::mem::take(&mut self.batch.writes),
-            txn_id: Some(txn_id),
-        })])
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(std::mem::take(
+            &mut self.batch.writes,
+        ))))
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = HandoffState::Commit { txn_id };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn advance(&mut self, event: Event) -> Result<Effects, MergeError> {
-        match (self.state.clone(), event) {
-            (
-                HandoffState::Authorize,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => {
-                if !allowed? {
-                    return Err(MergeError::Unauthorized);
-                }
-                self.state = HandoffState::StartTransaction;
-                Ok(smallvec![Effect::Storage(
-                    StorageEffect::StartTransaction { read: false }
-                )])
-            }
-            (
-                HandoffState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => Ok(self.read(txn_id)),
-            (
-                HandoffState::Read { txn_id },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.write(txn_id, &values),
-            (
-                HandoffState::Write { txn_id },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
-                if self.batch.deletes.is_empty() {
-                    return Ok(self.commit(txn_id));
-                }
-                self.state = HandoffState::DeleteStale { txn_id };
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: std::mem::take(&mut self.batch.deletes),
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (
-                HandoffState::DeleteStale { txn_id },
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => Ok(self.commit(txn_id)),
-            (
-                HandoffState::Commit { .. },
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.state = HandoffState::ScheduleDrain;
-                Ok(smallvec![schedule_drain_effect()])
-            }
-            (
-                HandoffState::ScheduleDrain,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                self.state = HandoffState::Finish;
-                self.output = Some(Ok(()));
-                Ok(smallvec![])
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(MergeError::UnexpectedEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current handoff step",
-                got: event.label(),
-            }),
-        }
+    /// Wakes the outbox drain after the commit; a failed timer leaves the outbox retryable.
+    fn committed() -> Next<()> {
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Next::Then { output: (), calls }
     }
 }
 
-impl EffectOperation for HandoffOperation {
+impl Operation for HandoffWrite {
     type Output = ();
     type Error = MergeError;
 
-    fn start(&mut self) -> Effects {
-        self.state = HandoffState::Authorize;
-        let path = format!("/{}/admin/config", self.config.actor.realm_id);
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path,
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            HandoffState::Init | HandoffState::Finish | HandoffState::Error => smallvec![],
-            _ => self.advance(event).unwrap_or_else(|error| self.fail(error)),
-        }
+    fn first(&mut self) -> Result<Next<()>, MergeError> {
+        let realm_id = self.config.actor.realm_id;
+        let document = DocumentTarget::RealmConfig { realm_id };
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, HandoffState::Finish | HandoffState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(MergeError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            HandoffState::Read { txn_id }
-            | HandoffState::Write { txn_id }
-            | HandoffState::DeleteStale { txn_id }
-            | HandoffState::Commit { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, MergeError> {
+        match self.stage {
+            Stage::Read => {
+                let IoResult::Values(values) = result else {
+                    return Err(MergeError::NotFinished);
+                };
+                self.write(&values)
             }
-            _ => smallvec![],
+            Stage::Write if !self.batch.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::DeleteStale;
+                let deletes = std::mem::take(&mut self.batch.deletes);
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            Stage::Write | Stage::DeleteStale => {
+                done(result)?;
+                Ok(Self::committed())
+            }
         }
     }
 }

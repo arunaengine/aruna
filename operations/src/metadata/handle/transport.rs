@@ -785,25 +785,6 @@ impl MetadataHandle {
         }
     }
 
-    /// The current revision of a realm vault entry from the management node `node_id`.
-    pub(crate) async fn request_realm_secret(
-        &self,
-        node_id: NodeId,
-        reference: aruna_core::realm_vault::RealmSecretRef,
-    ) -> Result<aruna_core::compute::SecretBytes, MetadataReadError> {
-        let request = MetadataTransportMessage::RealmSecret {
-            entry: reference.entry,
-            revision: reference.revision,
-        };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::RealmSecretResult { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
-        }
-    }
-
     /// Hands the management node `node_id` one chunk of a plugin artifact to keep; `true` once
     /// it holds the whole, checked artifact.
     pub(crate) async fn request_store_artifact(
@@ -894,23 +875,6 @@ impl MetadataHandle {
         match send_remote_request(&self.inner, &Span::current(), node_id, request).await {
             Ok(MetadataTransportMessage::SecretReleased { result }) => result,
             _ => Err(unavailable()),
-        }
-    }
-
-    /// The sealed secret of a setting document, opened by the management node `node_id`.
-    pub(crate) async fn request_open(
-        &self,
-        node_id: NodeId,
-        target: aruna_core::document::DocumentTarget,
-        bytes: Vec<u8>,
-    ) -> Result<aruna_core::compute::SecretBytes, MetadataReadError> {
-        let request = MetadataTransportMessage::OpenSetting { target, bytes };
-        match send_remote_request(&self.inner, &Span::current(), node_id, request)
-            .await
-            .map_err(|_| MetadataReadError::Unavailable)?
-        {
-            MetadataTransportMessage::OpenSettingResult { result } => result,
-            _ => Err(MetadataReadError::Unavailable),
         }
     }
 

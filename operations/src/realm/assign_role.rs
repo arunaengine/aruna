@@ -444,7 +444,7 @@ pub mod test {
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
-    use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
+    use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::types::RoleId;

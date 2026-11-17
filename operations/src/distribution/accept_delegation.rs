@@ -67,7 +67,10 @@ impl AcceptDelegationOperation {
     }
 
     /// Spends the nonce once the config names the issuer as an infrastructure node.
-    fn spend(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> Result<IoCall, DelegateError> {
+    fn spend(
+        &mut self,
+        config: Result<RealmConfigDocument, GetConfigError>,
+    ) -> Result<IoCall, DelegateError> {
         let config = config.map_err(|_| DelegateError::Unavailable)?;
         let delegation = &self.signed.delegation;
         if !is_sync_eligible(&config, delegation.issuer) {
@@ -86,7 +89,9 @@ impl Operation for AcceptDelegationOperation {
 
     fn first(&mut self) -> Result<Next<Delegation>, DelegateError> {
         self.signed.verify(self.realm_id, self.node_id, self.now)?;
-        Ok(Next::Call(IoCall::child(GetConfigOperation::new(self.realm_id))))
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Delegation>, DelegateError> {
@@ -109,7 +114,6 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::calls::ChildOutcome;
-    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::storage::distribution::delegation::Payload;
     use ulid::Ulid;
@@ -169,10 +173,7 @@ mod tests {
     #[test]
     fn accepts_once() {
         let mut accept = operation();
-        assert!(matches!(
-            accept.first(),
-            Ok(Next::Call(IoCall::Child(_)))
-        ));
+        assert!(matches!(accept.first(), Ok(Next::Call(IoCall::Child(_)))));
         assert!(matches!(
             accept.next(config(RealmNodeKind::Server)),
             Ok(Next::Call(IoCall::Child(_)))

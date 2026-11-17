@@ -6,12 +6,13 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
@@ -26,11 +27,11 @@ use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
     EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, RETRY_BATCH_CAP,
-    RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit,
+    RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit, valid_retry,
 };
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
-use crate::notifications::watch::digest::{InterestOperation, dirty_marker_write};
+use crate::notifications::watch::digest::{InterestError, InterestOperation, dirty_marker_write};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::WatchSubscriptionError;
@@ -535,6 +536,162 @@ impl Operation for WatchExpandOperation {
     /// One more run after a conflict, as the delivery did before.
     fn conflict_retries() -> u32 {
         1
+    }
+}
+
+/// Why a retry drain left work behind; the realm's interest marker keeps it for the next run.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct RetryDrainError(pub String);
+
+impl From<IoError> for RetryDrainError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum DrainState {
+    #[default]
+    Scan,
+    Expand,
+    Mark,
+}
+
+/// Runs the queued retry rows of one realm, each as an expansion that a lost conflict reruns
+/// once. A malformed row, a row over the byte cap and a failed expansion stay queued, and the
+/// realm's interest marker is set so the next publish run tries them again.
+#[derive(Debug, PartialEq)]
+pub struct RetryDrainOperation {
+    realm_id: RealmId,
+    realm_config: RealmConfigDocument,
+    local: NodeId,
+    state: DrainState,
+    rows: VecDeque<(Vec<u8>, WatchEventRetry)>,
+    failed: bool,
+    error: Option<String>,
+}
+
+type DrainTurn = Result<Next<()>, RetryDrainError>;
+
+impl RetryDrainOperation {
+    pub fn new(realm_id: RealmId, realm_config: RealmConfigDocument, local: NodeId) -> Self {
+        Self {
+            realm_id,
+            realm_config,
+            local,
+            state: DrainState::Scan,
+            rows: VecDeque::new(),
+            failed: false,
+            error: None,
+        }
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>) -> DrainTurn {
+        let realm_id = self.realm_id;
+        if values.len() > RETRY_BATCH_CAP {
+            warn!(%realm_id, "Watch retry queue row cap reached");
+            self.failed = true;
+        }
+        for (key, value) in values.into_iter().take(RETRY_BATCH_CAP) {
+            let key = key.to_vec();
+            if value.len() > RETRY_BYTES_CAP {
+                warn!(%realm_id, "Retaining watch retry row over byte cap");
+                self.failed = true;
+                continue;
+            }
+            match postcard::from_bytes::<WatchEventRetry>(&value) {
+                Ok(retry) if valid_retry(&retry, realm_id, &key) => {
+                    self.rows.push_back((key, retry))
+                }
+                Ok(_) | Err(_) => {
+                    warn!(%realm_id, "Retaining malformed watch retry row");
+                    self.failed = true;
+                }
+            }
+        }
+        self.next_row()
+    }
+
+    fn next_row(&mut self) -> DrainTurn {
+        let Some((key, retry)) = self.rows.pop_front() else {
+            if self.failed {
+                return self.defer("watch retry drain deferred work".to_string());
+            }
+            return Ok(Next::Done(()));
+        };
+        let (realm_id, config, local) = (self.realm_id, self.realm_config.clone(), self.local);
+        let seed = key.clone();
+        let build = move || {
+            let resume = Some((key.clone(), retry.cursor.clone()));
+            let events = retry.events.clone();
+            WatchExpandOperation::new(realm_id, config.clone(), local, events, resume)
+        };
+        let expand = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        self.state = DrainState::Expand;
+        Ok(Next::Call(IoCall::Child(expand)))
+    }
+
+    /// Keeps the realm's interest marker, so the queued work runs again, and fails with `error`.
+    fn defer(&mut self, error: String) -> DrainTurn {
+        self.error = Some(error);
+        self.state = DrainState::Mark;
+        Ok(Next::Call(IoCall::child(InterestOperation::mark(
+            self.realm_id,
+        ))))
+    }
+}
+
+impl Operation for RetryDrainOperation {
+    type Output = ();
+    type Error = RetryDrainError;
+
+    fn first(&mut self) -> DrainTurn {
+        // Sent as an effect, so a failed scan comes back as an event and still keeps the marker.
+        let scan = StorageEffect::Iter {
+            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
+            prefix: Some(watch_retry_prefix(self.realm_id).into()),
+            start: None,
+            limit: RETRY_BATCH_CAP.saturating_add(1),
+            txn_id: None,
+        };
+        Ok(Next::Call(IoCall::from(Effect::Storage(scan))))
+    }
+
+    fn next(&mut self, result: IoResult) -> DrainTurn {
+        match std::mem::take(&mut self.state) {
+            DrainState::Scan => match result.event()? {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => self.scanned(values),
+                Event::Storage(StorageEvent::Error { error }) => self.defer(error.to_string()),
+                other => {
+                    let error = format!("unexpected watch retry scan event: {}", other.label());
+                    self.defer(error)
+                }
+            },
+            DrainState::Expand => {
+                if let Err(error) = result.child::<ExpandOutcome, ExpandError>()? {
+                    let realm_id = self.realm_id;
+                    warn!(%realm_id, %error, "Watch retry row deferred");
+                    self.failed = true;
+                }
+                self.next_row()
+            }
+            DrainState::Mark => {
+                let error = self.error.take().unwrap_or_default();
+                match result.child::<bool, InterestError>()? {
+                    Ok(_) => Err(RetryDrainError(error)),
+                    Err(marker) => {
+                        let realm_id = self.realm_id;
+                        warn!(%realm_id, %marker, "Failed to retain watch retry marker");
+                        Err(RetryDrainError(format!(
+                            "{error}; failed to retain retry marker: {marker}"
+                        )))
+                    }
+                }
+            }
+        }
     }
 }
 

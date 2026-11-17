@@ -525,6 +525,7 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
+    use aruna_operations::driver::DriverContext;
     use aruna_operations::jobs::runtime::JobsRuntime;
     use aruna_operations::jobs::store::query::list_user_jobs;
     use aruna_storage::FjallStorage;
@@ -952,13 +953,22 @@ mod tests {
         assert!(again.old_runs_deleted.is_empty());
         assert_eq!(snapshot(&path), kept);
 
-        let storage = FjallStorage::open(path.to_str().unwrap()).unwrap();
-        let (jobs, _) = list_user_jobs(&storage, user(), None, 10, |_| true)
+        let context = DriverContext {
+            storage_handle: FjallStorage::open(path.to_str().unwrap()).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let (jobs, _) = list_user_jobs(&context, user(), None, 10, |_| true)
             .await
             .unwrap();
         let listed: Vec<JobId> = jobs.iter().map(|job| job.job_id).collect();
         assert_eq!(listed, [kept_job]);
-        let recovered = JobsRuntime::new().recover_stale_jobs(&storage).await;
+        let recovered = JobsRuntime::new().recover_stale_jobs(&context).await;
         assert_eq!(recovered, Ok(0), "startup recovery reads what is left");
     }
 
