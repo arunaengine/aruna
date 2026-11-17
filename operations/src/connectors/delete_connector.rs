@@ -179,14 +179,17 @@ mod tests {
     use crate::connectors::descriptor::build_source_binding;
     use crate::connectors::replace_connector::{ReplaceSourceInput, ReplaceSourceOperation};
     use crate::connectors::repository::{
-        connector_reference_key, connector_reference_write, parse_secret_read, read_secret_effect,
+        connector_reference_key, connector_reference_write, parse_connector_read,
+        read_connector_effect,
     };
     use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
         BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     };
+    use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
     use aruna_core::structs::execution::source_connector::{
         SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -340,123 +343,100 @@ mod tests {
         )
     }
 
-    #[test]
-    fn scan_delete_transaction() {
-        let connector_id = Ulid::from_bytes([2u8; 16]);
+    fn stored_connector(group_id: Ulid, connector_id: Ulid) -> IoResult {
+        let connector = SourceConnector::new(
+            connector_id,
+            group_id,
+            "ftp-source".to_string(),
+            SourceConnectorKind::Ftp,
+            HashMap::new(),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+        );
+        IoResult::Values(vec![Some(connector.to_bytes().unwrap().into())])
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    /// An operation past its connector and secret reads, with the reference scan started.
+    fn scanning(connector_id: Ulid) -> DeleteSourceOperation {
         let group_id = Ulid::from_bytes([1u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
         let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
             group_id,
             connector_id,
         });
-        operation.state = DeleteSourceState::ReadSecret;
-
-        let effects = operation.step(Event::Storage(StorageEvent::VaultResult {
+        assert!(operation.transaction());
+        operation.first().unwrap();
+        let read = operation.next(stored_connector(group_id, connector_id));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Effect(_)))));
+        let secret = event(Event::Storage(StorageEvent::VaultResult {
             entry: SourceConnectorSecret::vault_entry(connector_id),
             secret: Some(connector_secret(connector_id).to_secret().unwrap()),
         }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { txn_id: Some(scan_txn), .. })]
-                if *scan_txn == txn_id
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![],
-            next_start_after: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { txn_id: Some(delete_txn), .. })]
-                if *delete_txn == txn_id
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: vec![],
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::VaultDelete { entry, txn_id: Some(delete_txn) })]
-                if entry.id == connector_id && *delete_txn == txn_id
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: vec![].into(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
-                if *commit_txn == txn_id
-        ));
-    }
-
-    /// An operation inside its transaction with the reference scan started.
-    fn scanning(connector_id: Ulid, txn_id: Ulid) -> DeleteSourceOperation {
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id,
-        });
-        operation.state = DeleteSourceState::StartTransaction;
-        operation.has_secret = true;
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let scan = operation.next(secret);
+        assert!(matches!(scan, Ok(Next::Call(IoCall::Page { .. }))));
         operation
     }
 
-    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> Event {
+    fn reference_rows(connector_id: Ulid, next: Option<Key>) -> IoResult {
         let version_key = VersionKey::new("bucket", "key", Ulid::nil());
-        Event::Storage(StorageEvent::IterResult {
-            values: vec![(
+        IoResult::Page {
+            rows: vec![(
                 connector_reference_key(connector_id, &version_key).unwrap(),
                 Vec::new().into(),
             )],
-            next_start_after: next,
-        })
+            next,
+        }
     }
 
-    fn version_read(version: Option<BlobVersion>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(
-                vec![1].into(),
-                version.map(|version| version.to_bytes().unwrap().into()),
-            )],
-        })
-    }
-
-    fn pruned() -> Event {
-        Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        })
+    fn version_read(version: Option<BlobVersion>) -> IoResult {
+        IoResult::Values(vec![
+            version.map(|version| version.to_bytes().unwrap().into()),
+        ])
     }
 
     #[test]
-    fn reference_aborts_delete() {
+    fn scan_then_delete() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = scanning(connector_id, txn_id);
-
+        let mut operation = scanning(connector_id);
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let records = operation.next(empty);
         assert!(matches!(
-            operation.step(reference_rows(connector_id, None)).as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })]
-                if *read_txn == txn_id
+            records,
+            Ok(Next::Call(IoCall::Delete(deletes))) if deletes.len() == 2
         ));
-        let effects = operation.step(version_read(Some(reference_blob_version(connector_id))));
+        let Ok(Next::Call(IoCall::Effect(secret))) = operation.next(IoResult::Done) else {
+            panic!("expected the secret removal");
+        };
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
+            *secret,
+            Effect::Storage(StorageEffect::VaultDelete { entry, txn_id: None })
+                if entry.id == connector_id
         ));
-
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+        let deleted = event(Event::Storage(StorageEvent::DeleteResult {
+            key: vec![].into(),
+        }));
         assert_eq!(
-            operation.finalize(),
+            operation.next(deleted),
+            Ok(Next::Done(Some(DeleteSourceResult)))
+        );
+    }
+
+    #[test]
+    fn reference_refuses_delete() {
+        let connector_id = Ulid::from_bytes([2u8; 16]);
+        let mut operation = scanning(connector_id);
+        let reads = operation.next(reference_rows(connector_id, None));
+        assert!(matches!(reads, Ok(Next::Call(IoCall::Read(_)))));
+        let live = version_read(Some(reference_blob_version(connector_id)));
+        assert_eq!(
+            operation.next(live),
             Err(DeleteSourceError::ReferencedObjectVersion)
         );
     }
@@ -466,132 +446,40 @@ mod tests {
     #[test]
     fn pending_defers_check() {
         let connector_id = Ulid::from_bytes([2u8; 16]);
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = scanning(connector_id, txn_id);
-
-        operation.step(reference_rows(connector_id, Some(vec![9u8].into())));
+        let mut operation = scanning(connector_id);
+        operation
+            .next(reference_rows(connector_id, Some(vec![9u8].into())))
+            .unwrap();
         assert!(matches!(
-            operation.step(version_read(None)).as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
+            operation.next(version_read(None)),
+            Ok(Next::Call(IoCall::Delete(deletes)))
                 if deletes[0].0 == CONNECTOR_REFERENCE_KEYSPACE
         ));
         assert!(matches!(
-            operation.step(pruned()).as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == CONNECTOR_PRUNE_KEYSPACE
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Write(writes)))
+                if writes[0].0 == CONNECTOR_PRUNE_KEYSPACE
         ));
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: vec![].into(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: commit_txn })]
-                if *commit_txn == txn_id
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
-        operation.step(Event::Task(aruna_core::task::TaskEvent::TimerScheduled {
-            key: aruna_core::task::TaskKey::PruneConnectorReferences,
-            after: std::time::Duration::ZERO,
-        }));
-
-        assert_eq!(
-            operation.finalize(),
-            Err(DeleteSourceError::ReferencesPending)
+        let Ok(Next::Then {
+            output: None,
+            calls,
+        }) = operation.next(IoResult::Done)
+        else {
+            panic!("expected the pending outcome");
+        };
+        assert!(
+            matches!(calls.as_slice(), [IoCall::Effect(wake)] if matches!(**wake, Effect::Task(_))),
+            "the pruning is woken after the commit"
         );
     }
 
     #[test]
-    fn scan_failure_aborts() {
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = scanning(Ulid::from_bytes([2u8; 16]), txn_id);
-
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: vec![].into(),
-        }));
+    fn scan_failure_fails() {
+        let mut operation = scanning(Ulid::from_bytes([2u8; 16]));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
-
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert!(matches!(
-            operation.finalize(),
+            operation.next(IoResult::Done),
             Err(DeleteSourceError::StorageError(StorageError::ReadError(_)))
         ));
-    }
-
-    #[test]
-    fn commit_failure_reports() {
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-        });
-        operation.state = DeleteSourceState::CommitTransaction;
-        operation.txn_id = Some(txn_id);
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::ReadError("commit failed".to_string()),
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.txn_id.is_none());
-        assert_eq!(
-            operation.finalize(),
-            Err(DeleteSourceError::StorageError(StorageError::ReadError(
-                "commit failed".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn invalid_commit_aborts() {
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-        });
-        operation.state = DeleteSourceState::CommitTransaction;
-        operation.txn_id = Some(txn_id);
-
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: vec![].into(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
-
-        operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert!(matches!(
-            operation.finalize(),
-            Err(DeleteSourceError::InvalidStateEvent {
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn abort_emits_transaction() {
-        let txn_id = Ulid::from_bytes([3u8; 16]);
-        let mut operation = DeleteSourceOperation::new(DeleteSourceInput {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            connector_id: Ulid::from_bytes([2u8; 16]),
-        });
-        operation.txn_id = Some(txn_id);
-
-        let effects = operation.abort();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: abort_txn })]
-                if *abort_txn == txn_id
-        ));
-        assert!(operation.txn_id.is_none());
     }
 
     #[tokio::test]
@@ -680,9 +568,10 @@ mod tests {
             group_id: connector.group_id,
             connector_id: connector.connector_id,
         };
-        let mut operation = DeleteSourceOperation::new(input.clone());
+        // Runs the delete by hand: its transaction start, connector read and secret read.
+        let mut operation = DeleteSourceOperation::new(input.clone()).into_machine();
         let mut effects = operation.start();
-        for _ in 0..2 {
+        for _ in 0..3 {
             assert_eq!(effects.len(), 1);
             let event = context.storage_handle.send_effect(effects.remove(0)).await;
             effects = operation.step(event);
@@ -702,13 +591,6 @@ mod tests {
         .await
         .unwrap();
 
-        if matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ) {
-            let event = context.storage_handle.send_effect(effects.remove(0)).await;
-            effects = operation.step(event);
-        }
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::BatchDelete { .. })]
