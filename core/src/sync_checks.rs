@@ -7,6 +7,7 @@ use ulid::Ulid;
 use crate::NodeId;
 use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentEvent, DocumentTarget};
+use crate::repository::RepositoryLink;
 use crate::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
     WatchSubscription, interest_node_id, interest_realm_id,
@@ -373,6 +374,42 @@ pub fn watch_change_applies(
         (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Upsert)
         | (Some(DocumentChangeKind::Delete), _) => false,
     }
+}
+
+/// An upsert must carry the change its row derives; a delete must carry its link's event id.
+pub fn validate_link(
+    target: &DocumentTarget,
+    bytes: Option<&[u8]>,
+    change: &DocumentChange,
+) -> Result<(), String> {
+    let DocumentTarget::RepositoryLink {
+        document_id,
+        link_id,
+    } = target
+    else {
+        return Err("target is not a repository link".to_string());
+    };
+    match bytes {
+        Some(bytes) => {
+            let link = RepositoryLink::from_bytes(bytes).map_err(|error| error.to_string())?;
+            if link.document_id != *document_id || link.link_id != *link_id {
+                return Err("payload does not match its target".to_string());
+            }
+            if *change != link.sync_change(change.placement) {
+                return Err("revision does not match its sync change".to_string());
+            }
+        }
+        None => {
+            let event_id = Ulid::from_parts(change.current.generation, link_id.random());
+            if change.kind != DocumentChangeKind::Delete
+                || change.base.is_some()
+                || change.current.event_id != event_id
+            {
+                return Err("delete does not match its sync change".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `actor_id` is the Irokle actor of `node_id` on `topic_id`, that is, whether that node
