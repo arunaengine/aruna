@@ -5,9 +5,9 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
+use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
 use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
@@ -17,8 +17,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
-use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec, mint_configured_job};
-use crate::notifications::unexpected;
+use crate::jobs::submit::{
+    SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_configured_job,
+};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {
@@ -36,7 +37,7 @@ pub enum EnqueueError {
 /// and a failure is returned so the sender delivers again.
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDeliveriesOperation {
-    waiting: VecDeque<(&'static str, SubmitJobOperation)>,
+    waiting: VecDeque<(&'static str, SubmitJobSpec, JobId)>,
     /// The channel of the submit that runs.
     current: &'static str,
     /// A job id that could not be minted, returned before any submit runs.
@@ -100,21 +101,22 @@ impl EnqueueDeliveriesOperation {
                 workspace_bucket: None,
                 active_cap: None,
             };
-            (operation.waiting).push_back((channel, SubmitJobOperation::new(spec, job_id)));
+            (operation.waiting).push_back((channel, spec, job_id));
         }
         operation
     }
 
-    /// Runs the next submit as a child, or ends once none is left.
+    /// Runs the next submit as a child that a lost conflict reruns, or ends once none is left.
     fn submit(&mut self) -> Next<()> {
-        let Some((channel, submit)) = self.waiting.pop_front() else {
+        let Some((channel, spec, job_id)) = self.waiting.pop_front() else {
             return Next::Done(());
         };
         self.current = channel;
-        Next::Call(IoCall::Child(boxed_suboperation(submit, |result| {
-            let result = result.map(|_| ()).map_err(|error| error.to_string());
-            Event::SubOperation(SubOperationEvent::DeliveryQueued { result })
-        })))
+        let build = move || SubmitJobOperation::new(spec.clone(), job_id);
+        let submit = boxed_retry(build, &job_id.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(submit))
     }
 }
 
@@ -139,16 +141,12 @@ impl Operation for EnqueueDeliveriesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match result {
-            IoResult::Event(Event::SubOperation(SubOperationEvent::DeliveryQueued { result })) => {
-                result.map_err(|reason| EnqueueError::Submit {
-                    channel: self.current,
-                    reason,
-                })?;
-                Ok(self.submit())
-            }
-            other => Err(unexpected("SubOperationEvent::DeliveryQueued", &other).into()),
-        }
+        let submitted = result.child::<SubmitJobResult, SubmitJobError>()?;
+        submitted.map_err(|error| EnqueueError::Submit {
+            channel: self.current,
+            reason: error.to_string(),
+        })?;
+        Ok(self.submit())
     }
 }
 
@@ -179,10 +177,8 @@ mod call_tests {
         config
     }
 
-    fn queued(result: Result<(), String>) -> IoResult {
-        IoResult::Event(Event::SubOperation(SubOperationEvent::DeliveryQueued {
-            result,
-        }))
+    fn queued(result: Result<SubmitJobResult, SubmitJobError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
     }
 
     #[test]
@@ -212,12 +208,20 @@ mod call_tests {
         let mut enqueue =
             EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
         assert!(matches!(enqueue.first(), Ok(Next::Call(IoCall::Child(_)))));
-        assert_eq!(enqueue.next(queued(Ok(()))), Ok(Next::Done(())));
+        assert_eq!(
+            enqueue.next(queued(Ok(SubmitJobResult {
+                job_id: JobId::from_bytes([1; 16]),
+                created: true,
+            }))),
+            Ok(Next::Done(()))
+        );
         let mut failed =
             EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
         failed.first().unwrap();
         assert!(matches!(
-            failed.next(queued(Err("full".to_string()))),
+            failed.next(queued(Err(SubmitJobError::PlacementUnavailable(
+                "full".to_string()
+            )))),
             Err(EnqueueError::Submit {
                 channel: "webhook",
                 ..

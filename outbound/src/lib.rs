@@ -10,7 +10,7 @@ use std::sync::Arc;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::outbound::{HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent};
 
-pub use backoff::Backoffs;
+use backoff::Backoffs;
 pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
 use mail::{MailProfiles, smtp_builder};
 
@@ -55,16 +55,15 @@ impl OutboundHandle {
             OutboundEffect::Mail(request) => OutboundEvent::MailSent {
                 result: self.mail(*request).await,
             },
+            OutboundEffect::Backoff(request) => OutboundEvent::Backoff {
+                stored: self.inner.backoffs.apply(request),
+            },
         }
     }
 
     /// Drops the cached mail sender unless it belongs to the `current` profile revision.
     pub fn refresh_mail(&self, current: Option<ulid::Ulid>) {
         self.inner.mail.refresh(current);
-    }
-
-    pub fn backoffs(&self) -> &Backoffs {
-        &self.inner.backoffs
     }
 
     async fn post(&self, post: HttpPost) -> Result<u16, OutboundError> {

@@ -7,21 +7,13 @@ use aruna_core::UserId;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
 };
-use aruna_core::structs::identity::auth::AuthContext;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::authorization::evaluate_watch_creation;
-use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::records::{
-    WatchSubscriptionError, validated_subscription, watch_delete_replication,
-    watch_upsert_replication,
-};
-use crate::notifications::watch::store::StoreWatchOperation;
+use crate::notifications::watch::records::{WatchSubscriptionError, watch_delete_replication};
+use crate::notifications::watch::store::{CreateWatchOperation, StoreWatchOperation};
 
-/// The one holder-side create path, used by both the local API arm and the holder
-/// RPC. A proxying peer's assertion is not authority, so the holder re-derives
-/// the permission path and checks READ before any durable write.
+/// The one holder-side create path, used by both the local API arm and the holder RPC.
 pub(crate) async fn create_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
@@ -31,35 +23,9 @@ pub(crate) async fn create_holder_watch(
     authorization: WatchAuthorizationBinding,
     now_ms: u64,
 ) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription =
-        validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
-    match evaluate_watch_creation(
-        context,
-        owner.realm_id,
-        &AuthContext {
-            user_id: owner,
-            realm_id: owner.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        &subscription.path_prefix,
-        subscription.event_mask,
-    )
-    .await
-    .map_err(WatchSubscriptionError::Storage)?
-    {
-        WatchAuthorization::Authorized => {}
-        WatchAuthorization::Denied(reason) => {
-            return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
-        }
-        WatchAuthorization::Unavailable(error) => {
-            return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
-        }
-    }
-    let replication = watch_upsert_replication(local_node_id, &subscription)?;
-    let store = StoreWatchOperation::create(subscription.clone(), Some(replication));
-    drive(store, context).await?;
-    Ok(subscription)
+    let watch = (path_prefix, event_mask);
+    let create = CreateWatchOperation::new(local_node_id, owner, watch, authorization, now_ms)?;
+    drive(create, context).await
 }
 
 pub(crate) async fn delete_holder_watch(

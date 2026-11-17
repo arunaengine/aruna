@@ -64,7 +64,7 @@ mod tests {
 
     // A missing row is not found, a row that does not decode fails.
     #[test]
-    fn missing_or_garbage_fails() {
+    fn bad_rows_fail() {
         use aruna_core::calls::{IoResult, Next};
         use aruna_core::operation::Operation;
         let mut inspect = InspectDraftOperation::new(Ulid::nil());

@@ -11,9 +11,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugins::{ArtifactStore, MAX_ARTIFACT, PublishedPlugin};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
@@ -33,12 +33,13 @@ use tracing::{info, warn};
 use super::artifacts::{ArtifactError, managers};
 use super::copies::{chunk_count, chunk_of, store_local};
 use super::copies_needed;
-use super::install::wake_drain;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox_record::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox_record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
 
 #[derive(Debug, Error)]
 pub enum PublishError {
@@ -125,7 +126,6 @@ pub async fn publish_plugin(
         copies,
     });
     let published = drive(write, ctx).await?;
-    wake_drain(ctx).await;
     info!(name = %published.name, version = %published.version, digest = %published.digest, stored, "Published a plugin version");
     Ok(published)
 }
@@ -262,8 +262,8 @@ pub struct PublishEntryConfig {
 }
 
 /// Writes one published plugin version into the realm config in one transaction, after the
-/// caller's realm admin check. An identical entry is kept; another digest for the same version
-/// is refused. [`publish_plugin`] wakes the outbox drain after the commit.
+/// caller's realm admin check, and wakes the outbox drain after the commit. An identical entry
+/// is kept; another digest for the same version is refused.
 #[derive(Debug, PartialEq)]
 pub struct PublishEntryOperation {
     config: PublishEntryConfig,
@@ -299,18 +299,12 @@ pub enum EntryError {
         "{stored} of {needed} needed current management nodes stored the artifact; nothing was published"
     )]
     TooFewCopies { stored: usize, needed: usize },
-    #[error(transparent)]
-    Call(IoError),
 }
 
 /// A lost transaction stays a storage conflict, so callers can tell it from other failures.
 impl From<IoError> for EntryError {
     fn from(error: IoError) -> Self {
-        match error {
-            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
-            IoError::Storage(error) => Self::StorageError(error),
-            other => Self::Call(other),
-        }
+        Self::StorageError(error.into())
     }
 }
 
@@ -336,14 +330,7 @@ impl PublishEntryOperation {
     }
 
     fn authorized(&mut self, result: IoResult) -> Result<IoCall, EntryError> {
-        let event = match result {
-            IoResult::Event(event) => *event,
-            other => return Err(unexpected(other.label())),
-        };
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return Err(unexpected(event.label()));
-        };
-        match allowed {
+        match result.child::<bool, AuthorizationError>()? {
             Ok(true) => {}
             Ok(false) => return Err(EntryError::Unauthorized),
             Err(AuthorizationError::StorageError(error)) => return Err(error.into()),
@@ -442,11 +429,11 @@ impl PublishEntryOperation {
         Ok(Some(IoCall::Write(writes)))
     }
 
+    /// The entry as written or found; the outbox drain wakes once the write committed.
     fn finish(&mut self) -> Result<Next<PublishedPlugin>, EntryError> {
-        let output = self.output.take();
-        output
-            .map(Next::Done)
-            .ok_or(EntryError::Call(IoError::Unfinished))
+        let output = self.output.take().ok_or(IoError::Unfinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
@@ -467,10 +454,7 @@ impl Operation for PublishEntryOperation {
             path: policy_admin_path(self.config.actor.realm_id),
             required_permission: Permission::WRITE,
         });
-        Ok(Next::Call(IoCall::Child(boxed_suboperation(
-            check,
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))))
+        Ok(Next::Call(IoCall::child(check)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, EntryError> {
@@ -496,13 +480,6 @@ impl Operation for PublishEntryOperation {
             }
         }
     }
-}
-
-fn unexpected(got: &'static str) -> EntryError {
-    EntryError::Call(IoError::Unexpected {
-        expected: "an authorization result",
-        got,
-    })
 }
 
 #[cfg(test)]

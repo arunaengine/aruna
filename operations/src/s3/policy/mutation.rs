@@ -5,7 +5,7 @@
 
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation, SubOperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
@@ -27,7 +27,8 @@ use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy::successor::{
-    MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child,
+    mint_outcome,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,7 +88,7 @@ pub struct PolicyMutationOperation {
     state: MutationState,
     resolver: Option<PolicySetResolver>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
-    mint: Option<MintSuccessorOperation>,
+    mint: Option<Box<dyn SubOperation>>,
     output: Option<Result<SuccessorOutcome, PolicyMutationError>>,
 }
 
@@ -182,7 +183,7 @@ impl PolicyMutationOperation {
             intent: None,
             captured_default: None,
         };
-        let mut mint = MintSuccessorOperation::new(plan);
+        let mut mint = mint_child(plan);
         let effects = mint.start();
         self.mint = Some(mint);
         self.state = MutationState::Mint;
@@ -255,7 +256,7 @@ impl EffectOperation for PolicyMutationOperation {
                 let Some(mint) = self.mint.take() else {
                     return self.fail(PolicyMutationError::InvalidEvent);
                 };
-                match mint.finalize() {
+                match mint_outcome(mint.finalize()) {
                     Ok(outcome) => {
                         self.output = Some(Ok(outcome));
                         self.state = MutationState::Finish;
@@ -532,9 +533,8 @@ mod pure_tests {
         operation.step(crate::tests::policy::authority(realm_id()));
         let txn_id = Ulid::from_bytes([5u8; 16]);
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Vec::new().into(), None)],
         }));
 
         let effects = operation.step(Event::Storage(StorageEvent::Error {

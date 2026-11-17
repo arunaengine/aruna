@@ -47,7 +47,7 @@ async fn cleanup_attempt(
     let Some(intent) = intent else {
         return Ok(());
     };
-    let fence = authorize_cleanup(&ctx.driver.storage_handle, for_job, intent, ctx.claim_token)
+    let fence = authorize_cleanup(&ctx.driver, for_job, intent, ctx.claim_token)
         .await
         .map_err(|error| match error {
             JobMutationError::NotFound => JobError::permanent("cleanup parent no longer exists"),
@@ -79,7 +79,7 @@ async fn cleanup_attempt(
                     JobError::retryable(format!("backend tombstone failed: {error}"))
                 })?;
             record_attempt_tombstone(
-                &ctx.driver.storage_handle,
+                &ctx.driver,
                 for_job,
                 ctx.claim_token,
                 intent.attempt_epoch,
@@ -283,6 +283,7 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
             range_turns: Default::default(),
+            handlers: Default::default(),
         }
     }
 
@@ -300,7 +301,7 @@ mod tests {
     }
 
     async fn seed_attempt(
-        storage: &StorageHandle,
+        context: &DriverContext,
         job_id: JobId,
         kind: &str,
         token: Ulid,
@@ -338,8 +339,8 @@ mod tests {
             claim_token: token,
             lease_expires_ms: 10_000,
         });
-        insert_job(storage, &record).await.unwrap();
-        record_attempt_intent(storage, job_id, token, intent(job_id, kind), None, None, 2)
+        insert_job(context, &record).await.unwrap();
+        record_attempt_intent(context, job_id, token, intent(job_id, kind), None, None, 2)
             .await
             .unwrap()
             .record
@@ -387,9 +388,7 @@ mod tests {
         record.state = state;
         record.workspace_mode = mode;
         record.workspace_bucket = Some(bucket.to_string());
-        insert_job(&ctx.driver.storage_handle, &record)
-            .await
-            .unwrap();
+        insert_job(&ctx.driver, &record).await.unwrap();
         drive(
             CreateBucketOperation::new(
                 bucket.to_string(),
@@ -447,8 +446,9 @@ mod tests {
             .is_ok()
     }
 
-    async fn write_access(storage: &StorageHandle, access: &UserAccess) {
-        let _ = storage
+    async fn write_access(context: &DriverContext, access: &UserAccess) {
+        let _ = context
+            .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: access.access_key.as_bytes().into(),
@@ -475,6 +475,7 @@ mod tests {
     async fn revoke_failure_cleans() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let access_key = "malformed-access";
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
@@ -487,7 +488,7 @@ mod tests {
         let backend = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([5; 16]);
-        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "docker", ctx.claim_token).await;
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), access_key).await;
 
@@ -540,10 +541,11 @@ mod tests {
     async fn revoked_revoke_stable() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let mut access = user_access("revoked-access");
         let revoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         access.revoked_at = Some(revoked_at);
-        write_access(&storage, &access).await;
+        write_access(&context, &access).await;
         let ctx = job_context(storage, &[]);
 
         for _ in 0..2 {
@@ -564,11 +566,12 @@ mod tests {
     async fn cleanup_uses_kind() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let docker = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let slurm = StubBackend::new(ExecutorKind::Slurm, vec![Ok(())]);
         let ctx = job_context(storage.clone(), &[docker.clone(), slurm.clone()]);
         let job_id = JobId::from_bytes([8; 16]);
-        let intent = seed_attempt(&storage, job_id, "slurm", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "slurm", ctx.claim_token).await;
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await;
 
@@ -584,13 +587,14 @@ mod tests {
     async fn cleanup_retry_succeeds() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage.clone());
         let backend = StubBackend::new(
             ExecutorKind::Docker,
             vec![Err(BackendError::Unavailable("down".to_string())), Ok(())],
         );
         let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([9; 16]);
-        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "docker", ctx.claim_token).await;
 
         assert!(matches!(
             run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await,

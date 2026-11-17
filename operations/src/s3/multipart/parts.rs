@@ -2,32 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
 const PART_SCAN_LIMIT: usize = 10_000;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListPartsState {
-    Init,
-    StartTransaction,
-    ReadUpload,
-    ReadParts,
-    CommitTransaction,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListPartsError {
@@ -35,24 +22,23 @@ pub enum ListPartsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: ListPartsState,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("The specified upload does not exist.")]
     NoSuchUpload,
     #[error("The specified multipart upload does not match the target object.")]
     UploadTargetMismatch,
     #[error("The multipart upload is no longer open.")]
     UploadNotOpen,
-    #[error("ListParts failed")]
-    ListPartsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("ListParts failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for ListPartsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -72,13 +58,14 @@ pub struct ListPartsResult {
     pub next_part_marker: Option<u16>,
 }
 
+type Step = Result<Next<ListPartsResult>, ListPartsError>;
+
+/// Reads the upload record and its parts in one read snapshot.
 #[derive(Debug, PartialEq)]
 pub struct ListPartsOperation {
     input: ListPartsInput,
-    state: ListPartsState,
-    txn_id: Option<Ulid>,
+    /// The upload record once read; the part page follows.
     upload: Option<MultipartUpload>,
-    output: Option<Result<ListPartsResult, ListPartsError>>,
 }
 
 impl ListPartsOperation {
@@ -87,42 +74,8 @@ impl ListPartsOperation {
     pub fn new(input: ListPartsInput) -> Self {
         Self {
             input,
-            state: ListPartsState::Init,
-            txn_id: None,
             upload: None,
-            output: None,
         }
-    }
-
-    fn emit_error(&mut self, error: ListPartsError) -> Effects {
-        self.state = ListPartsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = ListPartsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListPartsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: (event).label(),
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        self.state = ListPartsState::ReadUpload;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
     }
 
     fn validate_upload_record(&self, record: &MultipartUpload) -> Result<(), ListPartsError> {
@@ -136,65 +89,30 @@ impl ListPartsOperation {
         Ok(())
     }
 
-    fn handle_upload_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(ListPartsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            });
-        };
-
-        let Some(value) = value else {
-            return self.emit_error(ListPartsError::NoSuchUpload);
-        };
-        let record = match MultipartUpload::from_bytes(value.as_ref()) {
-            Ok(record) => record,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        if let Err(err) = self.validate_upload_record(&record) {
-            return self.emit_error(err);
-        }
+    fn upload_read(&mut self, value: Option<Value>) -> Step {
+        let value = value.ok_or(ListPartsError::NoSuchUpload)?;
+        let record = MultipartUpload::from_bytes(value.as_ref())?;
+        self.validate_upload_record(&record)?;
         self.upload = Some(record);
-
-        let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = ListPartsState::ReadParts;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_PART_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        let prefix = MultipartPartKey::prefix(self.input.upload_id)?;
+        Ok(Next::Call(IoCall::Page {
+            space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: PART_SCAN_LIMIT,
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
-    fn handle_parts_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(ListPartsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: (event).label(),
-            });
-        };
-
-        let mut parts = Vec::with_capacity(values.len());
-        for (_key, value) in values {
-            let part = match MultipartPart::from_bytes(value.as_ref()) {
-                Ok(part) => part,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            parts.push(part);
-        }
+    fn parts_read(&self, upload: MultipartUpload, values: Vec<(Key, Value)>) -> Step {
+        let mut parts = (values.into_iter())
+            .map(|(_, value)| MultipartPart::from_bytes(value.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         // Part keys are varint-encoded, so iteration is not numeric order past
         // the 127/255 boundaries; sort in memory to restore ascending order.
         parts.sort_by_key(|part| part.part_number);
         if let Some(marker) = self.input.part_number_marker {
             parts.retain(|part| part.part_number > marker);
         }
-
         let is_truncated = parts.len() > self.input.max_parts;
         parts.truncate(self.input.max_parts);
         // With max_parts=0 the truncation empties `parts`, so fall back to the
@@ -205,75 +123,33 @@ impl ListPartsOperation {
                 .map(|part| part.part_number)
                 .unwrap_or(self.input.part_number_marker.unwrap_or(0))
         });
-
-        let Some(upload) = self.upload.take() else {
-            return self.emit_error(ListPartsError::ListPartsFailed);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListPartsError::NoTransactionFound);
-        };
-
-        self.state = ListPartsState::CommitTransaction;
-        self.output = Some(Ok(ListPartsResult {
+        Ok(Next::Done(ListPartsResult {
             upload,
             parts,
             is_truncated,
             next_part_marker,
-        }));
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListPartsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: (event).label(),
-            });
-        };
-
-        self.state = ListPartsState::Finish;
-        smallvec![]
+        }))
     }
 }
 
-impl EffectOperation for ListPartsOperation {
+impl Operation for ListPartsOperation {
     type Output = ListPartsResult;
     type Error = ListPartsError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Step {
+        let key = self.input.upload_id.to_bytes().to_vec();
+        Ok(Next::Call(read_row(UPLOAD_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListPartsError::StorageError(error));
-        }
-
-        match self.state {
-            ListPartsState::Init => self.handle_init(),
-            ListPartsState::StartTransaction => self.handle_transaction_started(event),
-            ListPartsState::ReadUpload => self.handle_upload_read(event),
-            ListPartsState::ReadParts => self.handle_parts_read(event),
-            ListPartsState::CommitTransaction => self.handle_transaction_committed(event),
-            ListPartsState::Finish | ListPartsState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.upload.take() {
+            Some(upload) => self.parts_read(upload, result.page()?.0),
+            None => self.upload_read(result.value()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListPartsState::Finish | ListPartsState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListPartsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 

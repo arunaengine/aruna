@@ -80,13 +80,11 @@ pub enum CreateConnectorError {
     EmptyValue(String),
     #[error("CreateRepositoryConnector failed")]
     Failed,
-    #[error(transparent)]
-    Io(IoError),
 }
 
 impl From<IoError> for CreateConnectorError {
     fn from(error: IoError) -> Self {
-        error.into_storage().map_or_else(Self::Io, Self::Storage)
+        Self::Storage(error.into())
     }
 }
 

@@ -1000,6 +1000,14 @@ pub enum RecordVerdict {
     MissingEvidence(JobRecordKind),
 }
 
+/// A job record this node is asked to sign as its publisher; see `NetEffect::ExecutionSign`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionClaim {
+    pub realm_id: RealmId,
+    pub record: JobFamilyRecord,
+    pub publisher: NodeId,
+}
+
 /// The authenticated envelope every replicated job record travels in, kept
 /// byte-identical end to end: after a relay the publisher signature is the only
 /// proof of authorship, and key, kind, family, and digest all derive from it.

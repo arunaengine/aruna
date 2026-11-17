@@ -8,21 +8,20 @@ pub mod list;
 pub mod revoke;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     S3_SESSION_KEYSPACE, USER_ACCESS_KEYSPACE, USER_KEYSPACE, USER_OWNER_KEYSPACE,
     USER_SESSION_KEYSPACE,
 };
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use ulid::Ulid;
@@ -94,6 +93,17 @@ pub enum GroupTokensError {
         expected: &'static str,
         got: String,
     },
+    #[error("group token storage failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for GroupTokensError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,6 +167,8 @@ pub(crate) struct TokenScan {
     /// The last key of the current user page, and whether another page follows.
     page_end: Option<(Key, bool)>,
     current: Option<(Key, UserId)>,
+    /// The session ids of the current account, in the order they were read.
+    session_ids: Vec<String>,
     /// Storage pages read so far by this request.
     pages: usize,
     pub(crate) tokens: Vec<GroupToken>,
@@ -181,32 +193,32 @@ impl TokenScan {
             accounts: Vec::new(),
             page_end: None,
             current: None,
+            session_ids: Vec::new(),
             pages: 0,
             tokens: Vec::new(),
             next: None,
         }
     }
 
-    pub(crate) fn start(&mut self) -> Effects {
+    pub(crate) fn start(&mut self) -> IoCall {
         self.step = ScanStep::Config;
-        smallvec![read_config(self.realm_id)]
+        config_read(self.realm_id)
     }
 
-    fn iter(&mut self, step: ScanStep, start: Option<Key>) -> Effects {
+    fn iter(&mut self, step: ScanStep, after: Option<Key>) -> IoCall {
         self.step = step;
         self.pages += 1;
-        let (key_space, prefix) = match step {
-            ScanStep::Credentials => (USER_ACCESS_KEYSPACE, None),
-            ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, None),
-            _ => (USER_KEYSPACE, Some(UserId::storage_prefix(self.realm_id))),
+        let (space, prefix) = match step {
+            ScanStep::Credentials => (USER_ACCESS_KEYSPACE, Key::from(Vec::<u8>::new())),
+            ScanStep::S3Sessions => (S3_SESSION_KEYSPACE, Key::from(Vec::<u8>::new())),
+            _ => (USER_KEYSPACE, UserId::storage_prefix(self.realm_id)),
         };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
+        IoCall::Page {
+            space: space.to_string(),
             prefix,
-            start: start.map(IterStart::After),
+            after,
             limit: PAGE,
-            txn_id: None,
-        })]
+        }
     }
 
     fn full(&self) -> bool {
@@ -217,27 +229,16 @@ impl TokenScan {
         self.pages >= SCAN_PAGES
     }
 
-    fn stop(&mut self, step: ScanStep, after: Key) -> Option<Effects> {
+    fn stop(&mut self, step: ScanStep, after: Key) -> Option<IoCall> {
         self.next = Some(TokenCursor { step, after });
         None
     }
 
-    fn unexpected(&self, expected: &'static str, event: Event) -> GroupTokensError {
-        GroupTokensError::UnexpectedEvent {
-            state: format!("{:?}", self.step),
-            expected,
-            got: format!("{event:?}"),
-        }
-    }
-
-    /// The next effects, or `None` once the page is full or every keyspace was read.
-    pub(crate) fn step(&mut self, event: Event) -> Result<Option<Effects>, GroupTokensError> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(error.into());
-        }
+    /// The next call, or `None` once the page is full or every keyspace was read.
+    pub(crate) fn step(&mut self, result: IoResult) -> Result<Option<IoCall>, GroupTokensError> {
         match self.step {
             ScanStep::Config => {
-                self.config = parse_config(event)?;
+                self.config = parse_config(result.value()?)?;
                 let (step, after) = match self.start.take() {
                     Some(cursor) => (cursor.step, Some(cursor.after)),
                     None => (ScanStep::Users, None),
@@ -245,7 +246,7 @@ impl TokenScan {
                 Ok(Some(self.iter(step, after)))
             }
             ScanStep::Users => {
-                let (values, more) = self.page(event, "user page")?;
+                let (values, more) = result.page()?;
                 self.page_end = values.last().map(|(key, _)| (key.clone(), more.is_some()));
                 for (key, value) in values {
                     let user = User::from_bytes(&value)?;
@@ -257,50 +258,42 @@ impl TokenScan {
                 Ok(self.next_account())
             }
             ScanStep::Owner => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return Err(self.unexpected("session owner index read", event));
-                };
-                let reads: Vec<_> = decode_index(value.as_ref())?
-                    .into_iter()
-                    .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.into_bytes().into()))
-                    .collect();
-                if reads.is_empty() {
+                let index = decode_index(result.value()?.as_ref())?;
+                self.session_ids = index.into_iter().collect();
+                if self.session_ids.is_empty() {
                     return Ok(self.after_account());
                 }
                 self.step = ScanStep::Sessions;
-                Ok(Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: None,
-                })]))
+                let reads = (self.session_ids.iter())
+                    .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
+                    .collect();
+                Ok(Some(IoCall::Read(reads)))
             }
             ScanStep::Sessions => {
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return Err(self.unexpected("session read", event));
-                };
                 let account = self.current.as_ref().map(|(_, account)| *account);
-                for (key, value) in values {
+                let ids = std::mem::take(&mut self.session_ids);
+                for (sid, value) in ids.iter().zip(result.values()?) {
                     let Some(value) = value else { continue };
                     let session = UserSession::from_bytes(&value)?;
-                    if session.sid.as_bytes() == key.as_ref() && Some(session.user_id) == account {
+                    if &session.sid == sid && Some(session.user_id) == account {
                         let token = self.cutoffs().session(session);
                         self.tokens.push(token);
                     }
                 }
                 Ok(self.after_account())
             }
-            ScanStep::Credentials | ScanStep::S3Sessions => self.walk(event),
+            ScanStep::Credentials | ScanStep::S3Sessions => self.walk(result.page()?),
         }
     }
 
-    fn next_account(&mut self) -> Option<Effects> {
+    fn next_account(&mut self) -> Option<IoCall> {
         if let Some((key, account)) = self.accounts.pop() {
             self.current = Some((key, account));
             self.step = ScanStep::Owner;
-            return Some(smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USER_OWNER_KEYSPACE.to_string(),
-                key: owner_key(account),
-                txn_id: None,
-            })]);
+            return Some(IoCall::Read(vec![(
+                USER_OWNER_KEYSPACE.to_string(),
+                owner_key(account),
+            )]));
         }
         match self.page_end.take() {
             Some((last, _)) if self.full() => self.stop(ScanStep::Users, last),
@@ -311,16 +304,15 @@ impl TokenScan {
     }
 
     /// An account's sessions are listed whole, so a page may exceed `limit` by up to one account.
-    fn after_account(&mut self) -> Option<Effects> {
+    fn after_account(&mut self) -> Option<IoCall> {
         match self.current.take() {
             Some((key, _)) if self.full() => self.stop(ScanStep::Users, key),
             _ => self.next_account(),
         }
     }
 
-    fn walk(&mut self, event: Event) -> Result<Option<Effects>, GroupTokensError> {
+    fn walk(&mut self, (values, more): Page) -> Result<Option<IoCall>, GroupTokensError> {
         let step = self.step;
-        let (values, more) = self.page(event, "token page")?;
         for (key, value) in values {
             let token = match step {
                 ScanStep::Credentials => {
@@ -345,16 +337,6 @@ impl TokenScan {
         })
     }
 
-    fn page(&self, event: Event, expected: &'static str) -> Result<Page, GroupTokensError> {
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => Ok((values, next_start_after)),
-            other => Err(self.unexpected(expected, other)),
-        }
-    }
-
     fn cutoffs(&self) -> Cutoffs<'_> {
         Cutoffs {
             config: self.config.as_ref(),
@@ -375,27 +357,17 @@ fn key_time(key_id: &str) -> Option<u64> {
 }
 
 /// Reads the realm configuration that holds the owners' revocation cutoffs.
-pub(crate) fn read_config(realm_id: RealmId) -> Effect {
+pub(crate) fn config_read(realm_id: RealmId) -> IoCall {
     let target = DocumentTarget::RealmConfig { realm_id };
-    Effect::Storage(StorageEffect::Read {
-        key_space: target.storage_keyspace().to_string(),
-        key: target.storage_key(),
-        txn_id: None,
-    })
+    read_row(target.storage_keyspace(), target.storage_key())
 }
 
-pub(crate) fn parse_config(event: Event) -> Result<Option<RealmConfigDocument>, GroupTokensError> {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-            .transpose()?),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(GroupTokensError::UnexpectedEvent {
-            state: "Config".to_string(),
-            expected: "realm config read",
-            got: format!("{other:?}"),
-        }),
-    }
+pub(crate) fn parse_config(
+    value: Option<Value>,
+) -> Result<Option<RealmConfigDocument>, GroupTokensError> {
+    Ok(value
+        .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+        .transpose()?)
 }
 
 /// Turns stored records into listed tokens, revoked when issued before the owner's cutoff.

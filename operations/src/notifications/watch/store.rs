@@ -4,20 +4,24 @@
 
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_USER_CAP, WatchSubscription, watch_subscription_prefix,
+    WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    watch_subscription_prefix,
 };
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
+use crate::notifications::watch::check::{WatchCheckError, WatchCheckOperation};
 use crate::notifications::watch::digest::dirty_marker_write;
+use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
-    WATCH_CAP_REACHED, WatchReplication, WatchSubscriptionError, watch_subscription_target,
+    WatchReplication, WatchSubscriptionError, validated_subscription, watch_subscription_target,
+    watch_upsert_replication,
 };
 use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
 
@@ -189,27 +193,24 @@ impl StoreWatchOperation {
             replication: self.replication.clone(),
             state: RowsState::Count,
         };
-        Next::Call(IoCall::Child(boxed_suboperation(rows, |result| {
-            let result = result.map_err(|error| error.to_string());
-            Event::SubOperation(SubOperationEvent::WatchStored { result })
-        })))
+        Next::Call(IoCall::child(rows))
     }
 
-    /// The typed error of a stored failure; a first conflict runs the rows once more.
-    fn failed(&mut self, error: String) -> Result<Next<bool>, WatchSubscriptionError> {
-        if error == IoError::Conflict.to_string() {
-            if !self.retried {
-                self.retried = true;
-                return Ok(self.rows());
-            }
-            let name = self.change.name();
-            let error = format!("watch subscription {name} conflicted twice");
-            return Err(WatchSubscriptionError::Storage(error));
+    /// A first conflict runs the rows once more.
+    fn failed(
+        &mut self,
+        error: WatchSubscriptionError,
+    ) -> Result<Next<bool>, WatchSubscriptionError> {
+        if error != WatchSubscriptionError::from(IoError::Conflict) {
+            return Err(error);
         }
-        match error == WATCH_CAP_REACHED {
-            true => Err(WatchSubscriptionError::CapExceeded),
-            false => Err(WatchSubscriptionError::Storage(error)),
+        if !self.retried {
+            self.retried = true;
+            return Ok(self.rows());
         }
+        let name = self.change.name();
+        let error = format!("watch subscription {name} conflicted twice");
+        Err(WatchSubscriptionError::Storage(error))
     }
 }
 
@@ -222,20 +223,89 @@ impl Operation for StoreWatchOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
-        match result {
-            IoResult::Event(Event::SubOperation(SubOperationEvent::WatchStored { result })) => {
-                match result {
-                    Ok(true) if self.replication.is_some() => {
-                        Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
-                    }
-                    Ok(changed) => Ok(Next::Done(changed)),
-                    Err(error) => self.failed(error),
-                }
-            }
+        match result.child::<bool, WatchSubscriptionError>()? {
             // The changes are stored; a failed schedule waits for the drain's own re-arm.
-            IoResult::Event(Event::Task(_)) => Ok(Next::Done(true)),
-            other => Err(unexpected("SubOperationEvent::WatchStored", &other).into()),
+            Ok(true) if self.replication.is_some() => Ok(Next::Then {
+                output: true,
+                calls: vec![IoCall::from(schedule_drain_effect())],
+            }),
+            Ok(changed) => Ok(Next::Done(changed)),
+            Err(error) => self.failed(error),
         }
+    }
+}
+
+/// Creates a watch on the holder: the holder checks the owner's READ on the watched path itself,
+/// since a proxying peer's assertion is not authority, then stores the watch and its replication.
+#[derive(Debug, PartialEq)]
+pub struct CreateWatchOperation {
+    subscription: WatchSubscription,
+    replication: Option<WatchReplication>,
+    storing: bool,
+}
+
+impl CreateWatchOperation {
+    pub fn new(
+        local: aruna_core::NodeId,
+        owner: UserId,
+        (path_prefix, event_mask): (String, WatchEventMask),
+        authorization: WatchAuthorizationBinding,
+        now_ms: u64,
+    ) -> Result<Self, WatchSubscriptionError> {
+        let subscription =
+            validated_subscription(owner, path_prefix, event_mask, now_ms, authorization)?;
+        let replication = watch_upsert_replication(local, &subscription)?;
+        Ok(Self {
+            subscription,
+            replication: Some(replication),
+            storing: false,
+        })
+    }
+}
+
+impl Operation for CreateWatchOperation {
+    type Output = WatchSubscription;
+    type Error = WatchSubscriptionError;
+
+    fn first(&mut self) -> Result<Next<WatchSubscription>, WatchSubscriptionError> {
+        let owner = self.subscription.owner;
+        let auth = AuthContext {
+            user_id: owner,
+            realm_id: owner.realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let watch = &self.subscription;
+        let check = WatchCheckOperation::creation(
+            owner.realm_id,
+            &auth,
+            &watch.path_prefix,
+            watch.event_mask,
+        );
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<WatchSubscription>, WatchSubscriptionError> {
+        if self.storing {
+            result.child::<bool, WatchSubscriptionError>()??;
+            return Ok(Next::Done(self.subscription.clone()));
+        }
+        let check = result.child::<WatchAuthorization, WatchCheckError>()?;
+        match check.map_err(|error| WatchSubscriptionError::Storage(error.to_string()))? {
+            WatchAuthorization::Authorized => {}
+            WatchAuthorization::Denied(reason) => {
+                return Err(WatchSubscriptionError::Unauthorized(reason.metric_reason()));
+            }
+            WatchAuthorization::Unavailable(error) => {
+                return Err(WatchSubscriptionError::AuthorizationUnavailable(error));
+            }
+        }
+        self.storing = true;
+        let store = StoreWatchOperation::create(self.subscription.clone(), self.replication.take());
+        Ok(Next::Call(IoCall::child(store)))
     }
 }
 
@@ -258,10 +328,8 @@ mod call_tests {
         }
     }
 
-    fn stored(result: Result<bool, String>) -> IoResult {
-        IoResult::Event(Event::SubOperation(SubOperationEvent::WatchStored {
-            result,
-        }))
+    fn stored(result: Result<bool, WatchSubscriptionError>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
     }
 
     #[test]
@@ -317,7 +385,7 @@ mod call_tests {
     fn conflict_runs_twice() {
         let mut store = StoreWatchOperation::create(subscription(), None);
         assert!(matches!(store.first(), Ok(Next::Call(IoCall::Child(_)))));
-        let conflict = || stored(Err(IoError::Conflict.to_string()));
+        let conflict = || stored(Err(IoError::Conflict.into()));
         assert!(matches!(
             store.next(conflict()),
             Ok(Next::Call(IoCall::Child(_)))
@@ -328,7 +396,7 @@ mod call_tests {
         ));
         let mut capped = StoreWatchOperation::create(subscription(), None);
         capped.first().unwrap();
-        let full = stored(Err(WATCH_CAP_REACHED.to_string()));
+        let full = stored(Err(WatchSubscriptionError::CapExceeded));
         assert_eq!(capped.next(full), Err(WatchSubscriptionError::CapExceeded));
     }
 
@@ -349,7 +417,10 @@ mod call_tests {
         holder.first().unwrap();
         assert_eq!(
             holder.next(stored(Ok(true))),
-            Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
+            Ok(Next::Then {
+                output: true,
+                calls: vec![IoCall::from(schedule_drain_effect())],
+            })
         );
     }
 }

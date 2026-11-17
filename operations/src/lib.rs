@@ -42,6 +42,8 @@ pub mod session;
 pub mod shard;
 pub mod shares;
 pub mod staging;
+#[cfg(test)]
+pub(crate) mod stepper;
 pub mod storage_read;
 pub mod sync;
 pub mod tasks;

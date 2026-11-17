@@ -258,6 +258,7 @@ pub async fn resolve_config(
 ) -> Result<Option<Config>, SetupError> {
     let Settings {
         event_recording: _,
+        hang_limits: _,
         storage_path,
         metadata_storage_path,
         metadata_search_storage,

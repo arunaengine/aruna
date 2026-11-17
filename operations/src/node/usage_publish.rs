@@ -459,8 +459,8 @@ impl Operation for ClearMarkersOperation {
         Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 
@@ -535,7 +535,7 @@ mod tests {
     fn clears_unchanged_markers() {
         // Only markers still at their observed generation are deleted, in one transaction.
         let mut operation = ClearMarkersOperation::new(vec![marker(1), marker(2)]);
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), aruna_core::operation::TransactionMode::Write);
         let reads = vec![
             (NODE_STATS_KEYSPACE.to_string(), marker(1).0),
             (NODE_STATS_KEYSPACE.to_string(), marker(2).0),

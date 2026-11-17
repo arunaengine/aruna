@@ -308,7 +308,7 @@ async fn readback_needs_audit() {
     };
     assert!(!writes.is_empty());
     let refused = read.next(IoResult::Values(Vec::new()));
-    assert!(matches!(refused, Err(OwnerSecretError::Io(_))));
+    assert!(matches!(refused, Err(OwnerSecretError::Storage(_))));
 }
 
 #[tokio::test]

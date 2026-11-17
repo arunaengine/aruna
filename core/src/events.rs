@@ -185,22 +185,6 @@ pub enum SubOperationEvent {
     NotificationsFailed {
         reason: String,
     },
-    /// Whether a watch subscription change was stored, or its failure as text.
-    WatchStored {
-        result: Result<bool, String>,
-    },
-    /// One notification delivery job was queued, or its failure as text.
-    DeliveryQueued {
-        result: Result<(), String>,
-    },
-    /// What a notification inbox upsert stored, or its failure as text.
-    InboxUpserted {
-        result: Result<crate::structs::execution::notification::InboxWriteOutcome, String>,
-    },
-    /// A page of outlived notification deletion times was pruned, or its failure as text.
-    CutoffsPruned {
-        result: Result<(), String>,
-    },
 }
 
 /// How the re-key of one version ended.
@@ -516,6 +500,7 @@ pub enum NetEvent {
     VaultSign(VaultSignEvent),
     SnapshotSign(SnapshotSignEvent),
     StatementSign(StatementSignEvent),
+    ExecutionSign(ExecutionSignEvent),
     Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
     /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
@@ -527,6 +512,8 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
+    /// A local signal or change was taken; nothing is read back.
+    Recorded,
 }
 
 /// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
@@ -591,6 +578,14 @@ pub enum SnapshotSignEvent {
 #[derive(Debug, PartialEq)]
 pub enum StatementSignEvent {
     Signed(Box<crate::structs::storage::distribution::SignedStatement>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::ExecutionSign`]. The adapter signs only a claim
+/// that names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum ExecutionSignEvent {
+    Signed(Box<crate::structs::execution::job::JobRecordEnvelope>),
     Unavailable(String),
 }
 
@@ -929,6 +924,7 @@ impl Event {
                     VaultSign,
                     SnapshotSign,
                     StatementSign,
+                    ExecutionSign,
                     Release,
                     Error,
                     ArtifactStored,
@@ -936,6 +932,7 @@ impl Event {
                     Notification,
                     InboxWoken,
                     Heartbeat,
+                    Recorded,
                 }
             ),
             Event::Metadata(event) => event.label(),
@@ -971,10 +968,6 @@ impl Event {
                     CopySealed,
                     CopyWoken,
                     NotificationsFailed,
-                    WatchStored,
-                    DeliveryQueued,
-                    InboxUpserted,
-                    CutoffsPruned,
                 }
             ),
             Event::Task(event) => variant_label!(
@@ -1012,7 +1005,14 @@ impl Event {
                 }
             ),
             Event::Session(_) => "Event::Session",
-            Event::Outbound(event) => variant_label!(event, OutboundEvent { Posted, MailSent }),
+            Event::Outbound(event) => variant_label!(
+                event,
+                OutboundEvent {
+                    Posted,
+                    MailSent,
+                    Backoff
+                }
+            ),
         }
     }
 }

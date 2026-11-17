@@ -7,8 +7,10 @@ pub mod client;
 pub mod deliver;
 pub mod dispatch;
 pub mod email;
+pub(crate) mod email_job;
 pub mod emit;
 pub mod enqueue;
+pub mod holder;
 pub mod inbox;
 pub mod incoming;
 pub mod list;
@@ -21,19 +23,31 @@ pub mod protocol;
 pub mod prune;
 pub mod routing;
 pub mod send;
+pub mod serve;
 pub mod setting_rows;
 pub mod settings;
 #[cfg(test)]
 mod tests;
+pub mod user_call;
 pub mod watch;
 pub mod webhook;
+pub(crate) mod webhook_job;
 
 use aruna_core::calls::{IoError, IoResult};
+use aruna_core::events::Event;
 
 /// The error for a result that does not answer the call it came for.
 pub(crate) fn unexpected(expected: &'static str, result: &IoResult) -> IoError {
     IoError::Unexpected {
         expected,
         got: result.label(),
+    }
+}
+
+/// The error for an event that does not answer the effect it came for.
+pub(crate) fn unexpected_event(expected: &'static str, event: &Event) -> IoError {
+    IoError::Unexpected {
+        expected,
+        got: event.label(),
     }
 }

@@ -27,7 +27,7 @@ use aruna_core::structs::storage::read_grant::{
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tracing::{debug, warn};
 use ulid::Ulid;

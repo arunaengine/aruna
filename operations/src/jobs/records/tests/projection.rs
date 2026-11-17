@@ -69,6 +69,7 @@ fn run(family: &Family, rows: &[(Key, Value)], cache: Option<Value>, local: Opti
             Ok(Next::Call(call)) => call,
             Ok(Next::Done(projected)) => break Ok(projected),
             Ok(Next::Wait) => panic!("the projection never waits"),
+            Ok(Next::Then { .. }) => panic!("the projection has no calls after its commit"),
             Err(error) => break Err(error),
         };
         let result = match call {

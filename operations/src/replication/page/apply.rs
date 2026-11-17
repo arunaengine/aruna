@@ -4,14 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BlobVersion;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 
 use super::plan::PageError;
 use super::plan::{
@@ -23,19 +20,11 @@ use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ApplyState {
-    Init,
-    StartTransaction,
     ReadGuards,
     /// Reads the versions the replaced heads name.
     ReadPrevious,
     WriteRows,
     UpdateUsage,
-    Commit,
-    Schedule,
-    /// Ends the transaction without a write; the output says whether the page was refused.
-    Abort,
-    Finish,
-    Error,
 }
 
 /// A coordinator's page to this member, sent by the authenticated `publisher`.
@@ -48,81 +37,51 @@ pub struct ApplyInput {
     pub local: NodeId,
 }
 
+type Step = Result<Next<PageAnswer>, PageError>;
+
+/// Applies one reference page on a member in one transaction; the usage snapshot publish is
+/// scheduled after the commit.
 #[derive(Debug, PartialEq)]
 pub struct PageApplyOperation {
     input: ApplyInput,
     state: ApplyState,
-    txn_id: Option<TxnId>,
     items: Vec<PageItem>,
     guards: Option<PageGuards>,
     plans: Vec<Plan>,
     usage: Option<UsageCounterUpdate>,
     answer: Option<PageAnswer>,
-    output: Option<Result<PageAnswer, PageError>>,
 }
 
 impl PageApplyOperation {
     pub fn new(input: ApplyInput) -> Self {
         Self {
             input,
-            state: ApplyState::Init,
-            txn_id: None,
+            state: ApplyState::ReadGuards,
             items: Vec::new(),
             guards: None,
             plans: Vec::new(),
             usage: None,
             answer: None,
-            output: None,
         }
     }
 
-    fn txn(&self) -> Result<TxnId, PageError> {
-        self.txn_id.ok_or(StorageError::TransactionNotFound.into())
-    }
-
-    /// Ends the transaction, if one is open, with `output`.
-    fn end(&mut self, output: Result<PageAnswer, PageError>) -> Effects {
-        self.output = Some(output);
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = ApplyState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => self.settle(),
-        }
-    }
-
-    fn settle(&mut self) -> Effects {
-        self.state = match self.output {
-            Some(Ok(_)) => ApplyState::Finish,
-            _ => ApplyState::Error,
-        };
-        smallvec![]
-    }
-
-    fn read_previous(&mut self, txn_id: TxnId) -> Result<Effects, PageError> {
+    fn read_previous(&mut self) -> Step {
         let reads = previous_reads(&self.input.page, &self.plans)?;
         if reads.is_empty() {
-            return self.write_rows(txn_id, Vec::new());
+            return self.write_rows(Vec::new());
         }
         self.state = ApplyState::ReadPrevious;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn write_rows(
-        &mut self,
-        txn_id: TxnId,
-        previous: Vec<Option<BlobVersion>>,
-    ) -> Result<Effects, PageError> {
+    fn write_rows(&mut self, previous: Vec<Option<BlobVersion>>) -> Step {
         let guards = self.guards.as_ref().ok_or(PageError::NotFinished)?;
         let page = &self.input.page;
         let here = (self.input.realm_id, self.input.local);
         let rows = page_rows(page, &self.items, &self.plans, (guards, previous), here)?;
+        // Nothing to store: the page ends with its answer and the transaction writes nothing.
         if rows.written == 0 {
-            return Ok(self.end(Ok(rows.answer)));
+            return Ok(Next::Done(rows.answer));
         }
         let usage = UsageCounterUpdate::for_group(guards.group_id, rows.delta)
             .in_bucket(&page.bucket, RowChange::Kept)
@@ -131,143 +90,63 @@ impl PageApplyOperation {
         self.usage = Some(usage);
         self.answer = Some(rows.answer);
         self.state = ApplyState::WriteRows;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: rows.writes,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Next::Call(IoCall::Write(rows.writes)))
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = ApplyState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    fn usage_step(&mut self, result: IoResult) -> Step {
+        let usage = self.usage.as_mut().ok_or(PageError::NotFinished)?;
+        if let Some(call) = usage.step_calls(result)? {
+            return Ok(Next::Call(call.into_call()));
+        }
+        let answer = self.answer.take().ok_or(PageError::NotFinished)?;
+        let publish = IoCall::Effect(Box::new(schedule_snapshot_publish()));
+        Ok(Next::Then {
+            output: answer,
+            calls: vec![publish],
+        })
+    }
+}
+
+impl Operation for PageApplyOperation {
+    type Output = PageAnswer;
+    type Error = PageError;
+
+    fn first(&mut self) -> Step {
+        let input = &self.input;
+        self.items = page_items(&input.page, input.publisher, input.realm_id)?;
+        Ok(Next::Call(IoCall::Read(guard_reads(&self.input.page)?)))
     }
 
-    fn step_inner(&mut self, event: Event) -> Result<Effects, PageError> {
-        match (self.state, event) {
-            (
-                ApplyState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = ApplyState::ReadGuards;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: guard_reads(&self.input.page)?,
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (ApplyState::ReadGuards, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            ApplyState::ReadGuards => {
+                let values = (result.values()?.into_iter())
+                    .map(|value| (Key::from(Vec::new()), value))
+                    .collect();
                 let page = &self.input.page;
                 let guards = check_guards(page, self.input.publisher, values)?;
                 self.plans = plan_items(page, &self.items, &guards);
                 self.guards = Some(guards);
-                self.read_previous(self.txn()?)
+                self.read_previous()
             }
-            (
-                ApplyState::ReadPrevious,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let previous = (values.into_iter())
-                    .map(|(_, value)| value.map(|v| BlobVersion::from_bytes(&v)).transpose())
+            ApplyState::ReadPrevious => {
+                let previous = (result.values()?.into_iter())
+                    .map(|value| value.map(|v| BlobVersion::from_bytes(&v)).transpose())
                     .collect::<Result<Vec<_>, _>>()?;
-                self.write_rows(self.txn()?, previous)
+                self.write_rows(previous)
             }
-            (ApplyState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let txn_id = self.txn()?;
+            ApplyState::WriteRows => {
+                result.done()?;
                 self.state = ApplyState::UpdateUsage;
                 let usage = self.usage.as_mut().ok_or(PageError::NotFinished)?;
-                Ok(usage.start(txn_id))
+                Ok(Next::Call(usage.start_calls().into_call()))
             }
-            (ApplyState::UpdateUsage, event @ Event::Storage(_)) => {
-                let txn_id = self.txn()?;
-                let usage = self.usage.as_mut().ok_or(PageError::NotFinished)?;
-                match usage.step(event, txn_id)? {
-                    Some(effects) => Ok(effects),
-                    None => Ok(self.commit(txn_id)),
-                }
-            }
-            (ApplyState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = ApplyState::Schedule;
-                Ok(smallvec![schedule_snapshot_publish()])
-            }
-            (ApplyState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                // A failed commit leaves no transaction to abort; its outcome is retried.
-                self.txn_id = None;
-                Err(error.into())
-            }
-            (ApplyState::Schedule, Event::Task(_)) => {
-                let answer = self.answer.take().ok_or(PageError::NotFinished)?;
-                self.output = Some(Ok(answer));
-                Ok(self.settle())
-            }
-            (ApplyState::Abort, Event::Storage(_)) => Ok(self.settle()),
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(PageError::UnexpectedEvent {
-                state: state_name(state),
-                received: event.label().to_string(),
-            }),
-        }
-    }
-}
-
-fn state_name(state: ApplyState) -> &'static str {
-    match state {
-        ApplyState::Init => "Init",
-        ApplyState::StartTransaction => "StartTransaction",
-        ApplyState::ReadGuards => "ReadGuards",
-        ApplyState::ReadPrevious => "ReadPrevious",
-        ApplyState::WriteRows => "WriteRows",
-        ApplyState::UpdateUsage => "UpdateUsage",
-        ApplyState::Commit => "Commit",
-        ApplyState::Schedule => "Schedule",
-        ApplyState::Abort => "Abort",
-        ApplyState::Finish => "Finish",
-        ApplyState::Error => "Error",
-    }
-}
-
-impl EffectOperation for PageApplyOperation {
-    type Output = PageAnswer;
-    type Error = PageError;
-
-    fn start(&mut self) -> Effects {
-        let input = &self.input;
-        match page_items(&input.page, input.publisher, input.realm_id) {
-            Ok(items) => self.items = items,
-            Err(error) => return self.end(Err(error)),
-        }
-        self.state = ApplyState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if matches!(self.state, ApplyState::Finish | ApplyState::Error) {
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.end(Err(error)),
+            ApplyState::UpdateUsage => self.usage_step(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ApplyState::Finish | ApplyState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PageError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = ApplyState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

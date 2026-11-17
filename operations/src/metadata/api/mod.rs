@@ -71,7 +71,6 @@ use super::summary_cache::summary_cache;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::document_repository::GetConfigOperation;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
@@ -118,9 +117,6 @@ pub mod search_types;
 use self::fanout_types::MetadataFanoutScope;
 use self::fanout_types::MetadataFanoutStats;
 use self::fanout_types::RealmNodeDiscovery;
-use self::links::types::{
-    LinkDocument, LinkHit, LinkNodePage, SetPreviewPage, merge_pages, merge_previews,
-};
 
 #[cfg(test)]
 use self::path_types::PathShardView;

@@ -1,4 +1,5 @@
-//! Declares the HTTP and mail effects that the outbound backend carries out and their answers.
+//! Declares the HTTP, mail and delivery backoff effects that the outbound backend carries out and
+//! their answers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,7 +9,9 @@ use bytes::Bytes;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::UserId;
 use crate::structs::execution::email::SmtpTls;
+use crate::structs::execution::setting::SettingChannel;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboundEffect {
@@ -17,6 +20,33 @@ pub enum OutboundEffect {
     /// Sends one mail with the cached sender of the profile revision, or with a new one built
     /// from the settings when they are given.
     Mail(Box<MailRequest>),
+    /// Reads or changes the in-memory delay of the deliveries to one owner and channel.
+    Backoff(BackoffRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackoffRequest {
+    pub owner: UserId,
+    pub channel: SettingChannel,
+    pub change: BackoffChange,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffChange {
+    Read,
+    /// Stores a delay of `delay_ms` that ends at `until_ms`; the operation decides both.
+    Set {
+        until_ms: u64,
+        delay_ms: u64,
+    },
+    Clear,
+}
+
+/// A stored delivery delay: when it ends and how long it was, so the next one can grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredBackoff {
+    pub until_ms: u64,
+    pub delay_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +57,10 @@ pub enum OutboundEvent {
     },
     MailSent {
         result: Result<(), OutboundError>,
+    },
+    /// The delay stored after the change; none on a node without the outbound backend.
+    Backoff {
+        stored: Option<StoredBackoff>,
     },
 }
 

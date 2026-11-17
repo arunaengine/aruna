@@ -184,7 +184,7 @@ fn store_error_mapping() {
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_store_error(ProviderStoreError::Io(IoError::Unfinished)),
+        map_store_error(IoError::Unfinished.into()),
         ServerError::InternalError(_)
     ));
 }

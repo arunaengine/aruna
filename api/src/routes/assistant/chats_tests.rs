@@ -446,7 +446,7 @@ async fn requires_unrestricted_token() {
 #[test]
 fn maps_store_errors() {
     assert_eq!(
-        map_chat_error(ChatStoreError::Io(IoError::Unfinished))
+        map_chat_error(IoError::Unfinished.into())
             .into_response()
             .status(),
         StatusCode::INTERNAL_SERVER_ERROR

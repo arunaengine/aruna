@@ -176,7 +176,7 @@ impl AdmitSubmissionOperation {
     /// caller's check observed, then reads the projection cache.
     fn read_cache(&mut self, result: IoResult) -> Step {
         let [quota, fence] = values::<2>(result)?;
-        crate::groups::fence::check_group_write(fence.as_deref())?;
+        aruna_core::structs::identity::group_delete::check_group_write(fence.as_deref())?;
         self.quota_revision = match quota {
             Some(value) => from_bytes::<u64>(&value)?,
             None => 0,

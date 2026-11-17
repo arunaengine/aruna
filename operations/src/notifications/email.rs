@@ -8,33 +8,28 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
-use aruna_core::outbound::{OutgoingMail, SmtpSettings};
-use aruna_core::structs::execution::email::{
-    EmailDeliverySpec, EmailPreference, RealmEmailProfile,
-};
-use aruna_core::structs::execution::job::{JobError, JobResultPayload};
+use aruna_core::outbound::SmtpSettings;
+use aruna_core::structs::execution::email::{EmailDeliverySpec, EmailPreference};
+use aruna_core::structs::execution::job::JobError;
 use aruna_core::structs::execution::setting::SettingChannel;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_outbound::Backoffs;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::notifications::email_job::EmailJobOperation;
 use crate::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
-use crate::notifications::send::{SendError, SendOperation};
 use crate::notifications::setting_rows::{
-    ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
+    ReadSettingOperation, SettingValue, SettingWrite, WriteSettingOperation,
 };
-use crate::notifications::settings::{
-    BACKOFF_START_MS, Delivery, MetadataPeers, SettingPeers, SettingWinner, delivery_setting,
-    managers,
-};
-use crate::realm_vault::{PruneCacheOperation, ReadSecretOperation};
+use crate::notifications::settings::{BACKOFF_START_MS, DeliveryOutcome};
+use crate::realm_vault::PruneCacheOperation;
 
 /// Whether a mail sender can be built from `settings`: a valid sender address and host.
 pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
@@ -138,25 +133,18 @@ async fn write_email(
     Ok(EmailPreference::from_bytes(&bytes)?)
 }
 
-/// Sends one notification email when this node's current setting has email on for its
-/// category. A permanent SMTP refusal ends the job; while no management node opens the address,
-/// the job waits without an attempt.
+/// Runs the email job of `spec` until the job is cancelled or the node shuts down.
 pub(crate) async fn run_email_job(ctx: &JobContext, spec: &EmailDeliverySpec) -> JobRunOutcome {
-    let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
-    else {
+    if ctx.driver.metadata_handle.is_none() || ctx.driver.outbound_handle.is_none() {
         return no_transport();
-    };
+    }
     let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
-    let peers = MetadataPeers {
-        ctx: &ctx.driver,
-        local,
-    };
-    let backoffs = outbound.backoffs();
+    let job = EmailJobOperation::new(spec.clone(), local, unix_timestamp_millis());
     tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
         () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
-        outcome = deliver_email(ctx, spec, &peers, backoffs, unix_timestamp_millis()) => outcome,
+        outcome = drive(job, &ctx.driver) => job_outcome(outcome),
     }
 }
 
@@ -168,125 +156,14 @@ pub(crate) fn no_transport() -> JobRunOutcome {
     )
 }
 
-pub(crate) async fn deliver_email(
-    ctx: &JobContext,
-    spec: &EmailDeliverySpec,
-    peers: &dyn SettingPeers,
-    backoffs: &Backoffs,
-    now_ms: u64,
-) -> JobRunOutcome {
-    let unsent = JobRunOutcome::Succeeded(JobResultPayload::Email { sent: false });
-    if now_ms >= spec.notification.expires_at_ms() {
-        return unsent;
+/// A delivery job's outcome as the job runtime takes it; a failed run may pass on a retry.
+pub(crate) fn job_outcome(outcome: Result<DeliveryOutcome, IoError>) -> JobRunOutcome {
+    match outcome {
+        Ok(DeliveryOutcome::Succeeded(payload)) => JobRunOutcome::Succeeded(payload),
+        Ok(DeliveryOutcome::Failed(error)) => JobRunOutcome::Failed(error),
+        Ok(DeliveryOutcome::DeferredFor(error, delay)) => JobRunOutcome::DeferredFor(error, delay),
+        Err(error) => JobRunOutcome::Failed(JobError::retryable(error.to_string())),
     }
-    let recipient = spec.notification.recipient;
-    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver).await;
-    let config = match config {
-        Ok(config) if config.email.is_none() => {
-            return JobRunOutcome::Failed(JobError::permanent(
-                "email is not configured in this realm",
-            ));
-        }
-        Ok(config) => Some(config),
-        Err(_) => None,
-    };
-    let managers = config.as_ref().map(managers);
-    let record = &spec.notification;
-    let channel = SettingChannel::Email;
-    let delivery = delivery_setting(
-        &ctx.driver,
-        peers,
-        backoffs,
-        record,
-        channel,
-        managers.as_deref(),
-        now_ms,
-    );
-    let winner = match delivery.await {
-        Delivery::Skip => return unsent,
-        Delivery::Wait(error, delay) => return JobRunOutcome::DeferredFor(error, delay),
-        Delivery::Send(winner) => winner,
-    };
-    let (Some(config), Ok(preference)) = (config, EmailPreference::from_bytes(&winner.bytes))
-    else {
-        return unsent;
-    };
-    if !preference.wants(record) {
-        return unsent;
-    }
-    match send_email(ctx, spec, &config, winner).await {
-        Ok(()) => JobRunOutcome::Succeeded(JobResultPayload::Email { sent: true }),
-        Err(error) => JobRunOutcome::Failed(error),
-    }
-}
-
-async fn send_email(
-    ctx: &JobContext,
-    spec: &EmailDeliverySpec,
-    config: &RealmConfigDocument,
-    winner: SettingWinner,
-) -> Result<(), JobError> {
-    let profile = (config.email.as_ref())
-        .ok_or_else(|| JobError::permanent("email is not configured in this realm"))?;
-    let secret = winner
-        .secret
-        .ok_or_else(|| JobError::permanent("the opt-in address is missing"))?;
-    let address = String::from_utf8(secret.expose().to_vec())
-        .map_err(|_| JobError::permanent("the opt-in address is not UTF-8 text"))?;
-    let (subject, body) = spec.text();
-    let mail = OutgoingMail {
-        to: address,
-        subject,
-        body,
-        id: spec.notification.notification_id,
-    };
-    let send = SendOperation::mail(profile.revision, None, mail.clone());
-    match drive(send, &ctx.driver).await {
-        Err(SendError::NoSender) => {}
-        result => return result.map(|_| ()).map_err(job_error),
-    }
-    let settings = smtp_settings(ctx, config, profile).await?;
-    let send = SendOperation::mail(profile.revision, Some(settings), mail);
-    drive(send, &ctx.driver)
-        .await
-        .map(|_| ())
-        .map_err(job_error)
-}
-
-/// A send failure as the job runtime takes it.
-pub(crate) fn job_error(error: SendError) -> JobError {
-    match error {
-        SendError::Failed(message) => JobError::retryable(message),
-        error => JobError::permanent(error.to_string()),
-    }
-}
-
-/// The profile with its password opened or fetched, for a sender that is not cached.
-async fn smtp_settings(
-    ctx: &JobContext,
-    config: &RealmConfigDocument,
-    profile: &RealmEmailProfile,
-) -> Result<SmtpSettings, JobError> {
-    let password = match profile.password {
-        None => None,
-        Some(reference) => {
-            let read = ReadSecretOperation::new(config, reference);
-            let secret = drive(read, &ctx.driver)
-                .await
-                .map_err(|error| JobError::retryable(error.to_string()))?;
-            let text = String::from_utf8(secret.expose().to_vec())
-                .map_err(|_| JobError::permanent("the SMTP password is not UTF-8 text"))?;
-            Some(text)
-        }
-    };
-    Ok(SmtpSettings {
-        host: profile.host.clone(),
-        port: profile.port,
-        tls: profile.tls,
-        username: profile.username.clone(),
-        password,
-        from: profile.from.clone(),
-    })
 }
 
 #[cfg(test)]

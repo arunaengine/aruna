@@ -13,6 +13,7 @@ pub mod auth;
 pub mod backoff;
 pub mod calls;
 pub mod compute;
+pub mod config_authority;
 pub mod crate_merge;
 pub mod credential_encryption;
 pub mod cursor;

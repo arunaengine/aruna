@@ -6,9 +6,8 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::UserAccess;
@@ -112,7 +111,7 @@ impl CutoffSweepOperation {
         if let Some(access_key) = self.pending.pop() {
             self.state = SweepState::Revoke;
             let revoke = RevokeUserOperation::new(access_key);
-            return Next::Call(IoCall::Child(boxed_suboperation(revoke, revoked)));
+            return Next::Call(IoCall::child(revoke));
         }
         if self.pages.done() {
             return Next::Done(self.revoked);
@@ -121,26 +120,16 @@ impl CutoffSweepOperation {
         Next::Call(self.pages.call())
     }
 
+    /// A credential deleted since the page was read is already gone, which is what the sweep
+    /// wants.
     fn handle_revoked(&mut self, result: IoResult) -> Result<Next<usize>, CutoffSweepError> {
-        let Event::SubOperation(SubOperationEvent::TokenRevoked { result }) = result.event()?
-        else {
-            let expected = "SubOperationEvent::TokenRevoked";
-            let got = "another event";
-            return Err(IoError::Unexpected { expected, got }.into());
-        };
-        result.map_err(CutoffSweepError::Revocation)?;
+        match result.child::<UserAccess, RevokeUserError>()? {
+            Ok(_) | Err(RevokeUserError::NotFound) => {}
+            Err(error) => return Err(CutoffSweepError::Revocation(error.to_string())),
+        }
         self.revoked += 1;
         Ok(self.advance())
     }
-}
-
-/// A credential deleted since the page was read is already gone, which is what the sweep wants.
-fn revoked(result: Result<UserAccess, RevokeUserError>) -> Event {
-    let result = match result {
-        Ok(_) | Err(RevokeUserError::NotFound) => Ok(()),
-        Err(error) => Err(error.to_string()),
-    };
-    Event::SubOperation(SubOperationEvent::TokenRevoked { result })
 }
 
 impl Operation for CutoffSweepOperation {
