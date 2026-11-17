@@ -423,4 +423,48 @@ mod call_tests {
             })
         );
     }
+
+    /// The holder checks the owner's READ itself, then stores the watch; a refusal keeps its kind.
+    #[test]
+    fn create_checks_first() {
+        use crate::notifications::watch::paths::WatchAuthorizationDenial;
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::structs::execution::notification_watch::watch_resource_path;
+        let local = crate::tests::locations::node_id(1);
+        let prefix = watch_resource_path(Ulid::from_parts(5, 5), local, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let binding = WatchAuthorizationBinding::default();
+        let new = || {
+            CreateWatchOperation::new(
+                local,
+                user(1, 2),
+                (prefix.clone(), mask),
+                binding.clone(),
+                1,
+            )
+        };
+        let mut create = new().expect("a valid watch");
+        assert!(matches!(create.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let allowed = IoResult::Child(ChildOutcome::new(Ok::<_, WatchCheckError>(
+            WatchAuthorization::Authorized,
+        )));
+        assert!(matches!(
+            create.next(allowed),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let stored = IoResult::Child(ChildOutcome::new(Ok::<_, WatchSubscriptionError>(true)));
+        let Ok(Next::Done(subscription)) = create.next(stored) else {
+            panic!("the stored watch is the output");
+        };
+        assert_eq!(subscription.path_prefix, prefix);
+
+        let mut denied = new().expect("a valid watch");
+        denied.first().unwrap();
+        let refused = WatchAuthorization::Denied(WatchAuthorizationDenial::PermissionDenied);
+        let refused = IoResult::Child(ChildOutcome::new(Ok::<_, WatchCheckError>(refused)));
+        assert!(matches!(
+            denied.next(refused),
+            Err(WatchSubscriptionError::Unauthorized(_))
+        ));
+    }
 }

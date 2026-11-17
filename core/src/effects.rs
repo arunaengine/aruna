@@ -803,6 +803,16 @@ pub enum NetEffect {
     },
     /// Removes a watch a local user just deleted from this node's watch interest.
     RetractInterest(ulid::Ulid),
+    /// Replaces this node's whole watch interest cache with a rebuilt table.
+    ReplaceInterest(Box<crate::structs::execution::notification_watch::WatchInterestTable>),
+    /// Replaces one realm's node map in this node's watch interest cache.
+    UpdateRealmInterest {
+        realm_id: crate::structs::identity::realm::RealmId,
+        nodes: std::collections::HashMap<
+            NodeId,
+            Vec<crate::structs::execution::notification_watch::WatchInterestEntry>,
+        >,
+    },
 }
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter

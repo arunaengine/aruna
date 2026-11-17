@@ -1172,7 +1172,12 @@ impl OperationsTaskHandler {
                         warn!(%error, "Realm usage refresh stopped after an outbox drain");
                     }
                 }
-                refresh_target_interest(self.context.as_ref(), &refresh_targets).await;
+                if let Some(net) = self.context.net_handle.as_ref() {
+                    let refresh = RefreshInterestOperation::new(&refresh_targets, *net.realm_id());
+                    if let Err(error) = drive(refresh, self.context.as_ref()).await {
+                        warn!(%error, "Watch interest refresh stopped after an outbox drain");
+                    }
+                }
                 crate::notifications::email::config_applied(self.context.as_ref(), &targets).await;
                 let project_started = Instant::now();
                 let projected = self

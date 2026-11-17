@@ -4,35 +4,31 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::executor::ProgressReporter;
 use crate::jobs::store::query::find_dedup_plan;
-use crate::jobs::submit::mint_job_id;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
-use crate::tests::notifications::{managers, store_setting};
+use crate::notifications::setting_rows::SettingError;
+use crate::tests::notifications::managers;
 use crate::tests::staging::setup_driver_context;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::outbound::{MailRequest, OutboundEffect, OutboundError, OutboundEvent};
-use aruna_core::structs::execution::email::SmtpTls;
+use aruna_core::outbound::{
+    MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail,
+};
+use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::execution::job::user_dedup_key;
-use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_outbound::{MailBuilder, MailSender, OutboundHandle};
 use ed25519_dalek::SigningKey;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 const ADDRESS: &str = "ada@example.org";

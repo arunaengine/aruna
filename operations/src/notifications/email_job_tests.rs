@@ -181,7 +181,10 @@ fn cached_sender_sends() {
         !format!("{mail:?}").contains(ADDRESS),
         "Debug hides the recipient"
     );
-    assert_eq!(job.next(child::<_, SendError>(Ok(None))), sent_turn());
+    assert_eq!(
+        job.next(child::<Option<u16>, SendError>(Ok(None))),
+        sent_turn()
+    );
 
     for (refusal, kind) in [
         (
@@ -214,7 +217,10 @@ fn sender_built_once() {
     let built = job.next(child::<_, RealmSecretError>(Ok(password)));
     assert!(matches!(built, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(job.state, EmailState::Built);
-    assert_eq!(job.next(child::<_, SendError>(Ok(None))), sent_turn());
+    assert_eq!(
+        job.next(child::<Option<u16>, SendError>(Ok(None))),
+        sent_turn()
+    );
 
     let (mut open, _) = decided(Some(profile(false)), winner(&["share.upload"]));
     open.next(child::<Option<u16>, _>(Err(SendError::NoSender)))

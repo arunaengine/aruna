@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
     WatchInterestDigest, WatchInterestTable, interest_node_id, interest_node_prefix,
-    interest_realm_id,
+    interest_realm_id, interest_realm_prefix,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
@@ -35,6 +35,8 @@ enum TableState {
 /// digests contribute nothing. The output is the table.
 #[derive(Debug, PartialEq)]
 pub struct RebuildTableOperation {
+    /// The digest keys to scan: every realm's, or one realm's.
+    prefix: Vec<u8>,
     table: WatchInterestTable,
     eligible: HashMap<RealmId, Option<HashSet<NodeId>>>,
     rows: VecDeque<(Key, Value)>,
@@ -45,6 +47,7 @@ pub struct RebuildTableOperation {
 impl Default for RebuildTableOperation {
     fn default() -> Self {
         Self {
+            prefix: interest_node_prefix(),
             table: WatchInterestTable::default(),
             eligible: HashMap::new(),
             rows: VecDeque::new(),
@@ -55,11 +58,19 @@ impl Default for RebuildTableOperation {
 }
 
 impl RebuildTableOperation {
+    /// Rebuilds only `realm_id`'s part of the table.
+    pub fn realm(realm_id: RealmId) -> Self {
+        Self {
+            prefix: interest_realm_prefix(realm_id),
+            ..Self::default()
+        }
+    }
+
     fn scan(&mut self, after: Option<Key>) -> Next<WatchInterestTable> {
         self.state = TableState::Scan;
         Next::Call(IoCall::Page {
             space: WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Key::from(interest_node_prefix()),
+            prefix: Key::from(self.prefix.clone()),
             after,
             limit: TABLE_PAGE,
         })

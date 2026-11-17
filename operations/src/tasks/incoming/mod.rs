@@ -90,8 +90,8 @@ use crate::node::node_info::observe_placement;
 use crate::node::usage_publish::restore_usage_timer;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
-use crate::notifications::watch::digest::{InterestOperation, WATCH_PUBLISH_DEBOUNCE};
-use crate::notifications::watch::interest::refresh_target_interest;
+use crate::notifications::watch::digest::InterestOperation;
+use crate::notifications::watch::interest::RefreshInterestOperation;
 use crate::notifications::watch::table::RebuildTableOperation;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
@@ -833,9 +833,7 @@ impl OperationsTaskHandler {
             }),
             TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishWatchInterest => Box::pin(async move {
-                self.publish_watch_interest().await;
-            }),
+            TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),
             TaskKey::DrainJobQueue => Box::pin(async move {
                 self.drain_job_queue().await;
             }),
