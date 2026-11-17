@@ -754,6 +754,40 @@ macro_rules! variant_label {
     };
 }
 
+impl MetadataEvent {
+    /// Names the metadata event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            MetadataEvent {
+                ValidationResult,
+                CreateCrateResult,
+                ApplyRoCrateResult,
+                EntityUpsertResult,
+                GraphPolicySet,
+                GraphPeerAdded,
+                GraphSyncScheduled,
+                GraphPolicyResult,
+                RoCrateExportResult,
+                RoCrateSummaryResult,
+                RoCratePageResult,
+                SearchResult,
+                QueryResult,
+                GraphDeleted,
+                GraphListResult,
+                ContainsGraphResult,
+                ContainsDotResult,
+                VersionedExport,
+                GraphSnapshotResult,
+                SnapshotInstalled,
+                BatchPlanned,
+                BatchMerged,
+                Error,
+            }
+        )
+    }
+}
+
 impl Event {
     /// Names the event variant without its values, for logs and unexpected-event errors.
     pub fn label(&self) -> &'static str {
@@ -867,34 +901,7 @@ impl Event {
                     Error,
                 }
             ),
-            Event::Metadata(event) => variant_label!(
-                event,
-                MetadataEvent {
-                    ValidationResult,
-                    CreateCrateResult,
-                    ApplyRoCrateResult,
-                    EntityUpsertResult,
-                    GraphPolicySet,
-                    GraphPeerAdded,
-                    GraphSyncScheduled,
-                    GraphPolicyResult,
-                    RoCrateExportResult,
-                    RoCrateSummaryResult,
-                    RoCratePageResult,
-                    SearchResult,
-                    QueryResult,
-                    GraphDeleted,
-                    GraphListResult,
-                    ContainsGraphResult,
-                    ContainsDotResult,
-                    VersionedExport,
-                    GraphSnapshotResult,
-                    SnapshotInstalled,
-                    BatchPlanned,
-                    BatchMerged,
-                    Error,
-                }
-            ),
+            Event::Metadata(event) => event.label(),
             Event::SubOperation(event) => variant_label!(
                 event,
                 SubOperationEvent {

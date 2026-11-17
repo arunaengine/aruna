@@ -1510,37 +1510,6 @@ pub enum MetadataEvent {
     },
 }
 
-impl MetadataEvent {
-    /// A stable label for logs and traces.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            MetadataEvent::ValidationResult { .. } => "validation_result",
-            MetadataEvent::CreateCrateResult { .. } => "create_crate_result",
-            MetadataEvent::ApplyRoCrateResult { .. } => "apply_rocrate_result",
-            MetadataEvent::EntityUpsertResult { .. } => "entity_upsert_result",
-            MetadataEvent::GraphPolicySet { .. } => "graph_policy_set",
-            MetadataEvent::GraphPeerAdded { .. } => "graph_peer_added",
-            MetadataEvent::GraphSyncScheduled { .. } => "graph_sync_scheduled",
-            MetadataEvent::GraphPolicyResult { .. } => "graph_policy_result",
-            MetadataEvent::RoCrateExportResult { .. } => "rocrate_export_result",
-            MetadataEvent::VersionedExport { .. } => "versioned_export",
-            MetadataEvent::RoCrateSummaryResult { .. } => "rocrate_summary_result",
-            MetadataEvent::RoCratePageResult { .. } => "rocrate_page_result",
-            MetadataEvent::SearchResult { .. } => "search_result",
-            MetadataEvent::QueryResult { .. } => "query_result",
-            MetadataEvent::GraphDeleted { .. } => "graph_deleted",
-            MetadataEvent::GraphListResult { .. } => "graph_list_result",
-            MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
-            MetadataEvent::ContainsDotResult { .. } => "contains_dot_result",
-            MetadataEvent::BatchPlanned { .. } => "batch_planned",
-            MetadataEvent::BatchMerged { .. } => "batch_merged",
-            MetadataEvent::GraphSnapshotResult { .. } => "graph_snapshot_result",
-            MetadataEvent::SnapshotInstalled { .. } => "snapshot_installed",
-            MetadataEvent::Error { .. } => "error",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MetadataError {
     #[error("channel closed")]

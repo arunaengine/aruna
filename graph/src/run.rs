@@ -72,7 +72,7 @@ impl GraphHandle {
             }
         };
         record_elapsed_ms(&span, "elapsed_ms", started);
-        span.record("result", event.kind());
+        span.record("result", event.label());
         event
     }
 }
@@ -880,7 +880,7 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
             MetadataEvent::Error { graph_iri, error }
         }
     };
-    effect_span.record("result", event.kind());
+    effect_span.record("result", event.label());
     if let MetadataEvent::Error { error, .. } = &event {
         record_error(&effect_span, &error.to_string());
     }
