@@ -205,10 +205,14 @@ async fn stage(context: &DriverContext, relationship: &SyncRelationship, intent:
     .unwrap();
 }
 
+/// Writes `record` as it is, so a test can set its due time and error.
 async fn store_record(context: &DriverContext, record: SyncMirrorRecord) {
-    drive(MirrorRecordOperation::store(record), context)
-        .await
-        .unwrap();
+    let row = (
+        MIRROR_REPAIR_KEYSPACE.to_string(),
+        repair_key(&record.relationship),
+        record.to_bytes().unwrap().into(),
+    );
+    crate::testing::write_entries(&context.storage_handle, vec![row]).await;
 }
 
 async fn settle(context: &DriverContext, record: &SyncMirrorRecord) -> RollbackClaim {
