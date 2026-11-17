@@ -2,19 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::super::handle::QUERY_MAX_BYTES;
 use super::distributed_types::{
     MetadataQueryForm, aggregate_query_results, query_form, query_select_limit,
 };
+use super::fanout::run_metadata_fanout;
 use super::join::{JoinPlan, join_plan, join_rows, merge_stats};
 use super::{
-    ApiQueryMode, Arc, AuthContext, BucketPage, DISTRIBUTED_QUERY_DEADLINE, DriverContext, GroupId,
-    HashMap, Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError,
-    MetadataFanoutOperation, MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall,
-    MetadataQueryResults, MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult,
-    QUERY_MAX_BYTES, QUERY_MAX_ROWS, RealmId, SearchPageCursor, SearchWatermark, Span,
-    fanout_bearer, field, map_read_error, merge_search_hits, metadata_node_call, paginate,
-    query_union_safe, record_elapsed_ms, resume_fetch_limit, run_metadata_fanout,
+    ApiQueryMode, Arc, AuthContext, BucketPage, DISTRIBUTED_QUERY_DEADLINE, GroupId, HashMap,
+    Instant, MAX_PAGINATION_DEPTH, MAX_RESULT_BYTES, MetadataApiError, MetadataFanoutOperation,
+    MetadataFanoutScope, MetadataFanoutStats, MetadataNodeCall, MetadataQueryResults,
+    MetadataReadError, MetadataSearchHit, NodeId, NodeSearchResult, QUERY_MAX_ROWS, RealmId,
+    SearchPageCursor, SearchWatermark, Span, fanout_bearer, field, map_read_error,
+    merge_search_hits, metadata_node_call, paginate, query_union_safe, record_elapsed_ms,
+    resume_fetch_limit,
 };
+use crate::driver::DriverContext;
 use std::collections::BTreeMap;
 
 pub(super) fn record_bucket_result(span: &Span, result: &Result<BucketPage, MetadataReadError>) {

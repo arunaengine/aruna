@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::fanout::run_metadata_fanout;
+use super::list::load_pending_records;
 use super::preflight_types::{
     MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
     MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
@@ -9,20 +11,22 @@ use super::preflight_types::{
     ReferenceRequest, ReferenceTarget, ReferenceTargetExecution, authorized_realm_nodes,
     preflight_fingerprint,
 };
+use super::read::can_read_record;
 use super::{
     ARUNA_DATA_PREFIX, ApiQueryMode, Arc, AuthContext, AuthToken, BLOB_VERSIONS_KEYSPACE, BTreeMap,
     BTreeSet, BlobHeadKey, BlobVersion, BlobVersionState, DISTRIBUTED_QUERY_DEADLINE,
-    DriverContext, GetBucketError, GetBucketOperation, GetNodesOperation, HashMap, HashSet, Key,
+    GetBucketError, GetBucketOperation, GetNodesOperation, HashMap, HashSet, Key,
     MAX_PAGINATION_DEPTH, MetadataApiError, MetadataFanoutOperation, MetadataFanoutScope,
     MetadataFanoutStats, MetadataNodeCall, MetadataReferenceEntry, MetadataReferencesRequest,
     MetadataRegistryRecord, MetadataSearchHit, NodeId, NodeSearchResult, Permission,
     REALM_DISCOVERY_TIMEOUT, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT,
     RealmId, RealmNodeDiscovery, ResolvePathsOperation, SearchCursor, SearchCursorError,
     SearchWatermark, Ulid, Value, VersionKey, W3idIdentifier, bucket_permission_path,
-    can_read_record, deduplicate_fanout_nodes, drive, forwarded_bearer, load_pending_records,
-    map_read_error, metadata_node_call, object_permission_path, paginate, record_preflight_node,
-    resume_fetch_limit, run_metadata_fanout, select_fanout_nodes, warn,
+    deduplicate_fanout_nodes, forwarded_bearer, map_read_error, metadata_node_call,
+    object_permission_path, paginate, record_preflight_node, resume_fetch_limit,
+    select_fanout_nodes, warn,
 };
+use crate::driver::{DriverContext, drive};
 use crate::realm::load_config::load_realm_config;
 
 use super::head_versions::{HeadVersionsError, HeadVersionsOperation};
