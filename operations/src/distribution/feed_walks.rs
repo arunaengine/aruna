@@ -304,3 +304,418 @@ impl Describe {
     }
 }
 
+/// The key changes of one range and the feed rows they settle.
+type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedState {
+    Init,
+    Rows,
+    Locate,
+    States,
+    Exists,
+    MarkBuilding,
+    Describe,
+    Apply,
+    Begin,
+    ReadSettled,
+    DeleteSettled,
+    Commit,
+    Abort,
+    Finish,
+    Error,
+}
+
+/// One feed row waiting for the range lookup of its key.
+#[derive(Debug, PartialEq)]
+struct Parked {
+    row: (Key, Value),
+    set_id: Ulid,
+    key: String,
+    head: Option<HeadEntry>,
+}
+
+/// The batch of one range being applied.
+#[derive(Debug, PartialEq)]
+struct Batch {
+    set_id: Ulid,
+    range_id: Ulid,
+    generation: u64,
+    changes: Vec<KeyChange>,
+    rows: Vec<(Key, Value)>,
+}
+
+/// Applies a page of feed rows to their ranges' indexes, then drops the applied rows that no
+/// writer changed meanwhile. Outputs the dropped row count.
+#[derive(Debug, PartialEq)]
+pub(super) struct FeedWalk {
+    limit: usize,
+    cursor: Option<Vec<u8>>,
+    state: FeedState,
+    rows: VecDeque<(Key, Value)>,
+    parked: Option<Parked>,
+    located: Vec<Located>,
+    batches: BTreeMap<(Ulid, Ulid), RangeBatch>,
+    pending: VecDeque<((Ulid, Ulid), RangeBatch, Option<Value>)>,
+    batch: Option<Batch>,
+    describe: Option<Describe>,
+    settled: Vec<(Key, Value)>,
+    dropped: usize,
+    txn_id: Option<TxnId>,
+    output: Option<Result<usize, FeedError>>,
+}
+
+impl FeedWalk {
+    pub(super) fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
+        Self {
+            limit,
+            cursor,
+            state: FeedState::Init,
+            rows: VecDeque::new(),
+            parked: None,
+            located: Vec::new(),
+            batches: BTreeMap::new(),
+            pending: VecDeque::new(),
+            batch: None,
+            describe: None,
+            settled: Vec::new(),
+            dropped: 0,
+            txn_id: None,
+            output: None,
+        }
+    }
+
+    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+        self.cursor.clone()
+    }
+
+    fn finish(&mut self, output: Result<usize, FeedError>) -> Effects {
+        self.state = match output {
+            Ok(_) => FeedState::Finish,
+            Err(_) => FeedState::Error,
+        };
+        self.output = Some(output);
+        smallvec![]
+    }
+
+    fn fail(&mut self, error: FeedError) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.output = Some(Err(error));
+                self.state = FeedState::Abort;
+                storage(StorageEffect::AbortTransaction { txn_id })
+            }
+            None => self.finish(Err(error)),
+        }
+    }
+
+    fn add(&mut self, range_id: Ulid, parked: Parked) {
+        let batch = self.batches.entry((parked.set_id, range_id)).or_default();
+        batch.0.push(change_of(parked.key, parked.head));
+        batch.1.push(parked.row);
+    }
+
+    /// Sorts the rows into range batches until a key needs its range looked up.
+    fn next_row(&mut self) -> Effects {
+        while let Some((key, value)) = self.rows.pop_front() {
+            let (position, head) = match (Position::decode(&key), decode_feed(&value)) {
+                (Ok(position), Ok(head)) => (position, head),
+                _ => {
+                    warn!("Dropping an undecodable search feed row");
+                    self.settled.push((key, value));
+                    continue;
+                }
+            };
+            let (set_id, name) = (position.set_id, position.key);
+            let parked = Parked {
+                row: (key, value),
+                set_id,
+                key: name,
+                head,
+            };
+            let found = (self.located.iter()).find(|range| range.contains(set_id, &parked.key));
+            if let Some(range_id) = found.map(|range| range.range_id) {
+                self.add(range_id, parked);
+                continue;
+            }
+            let effects = locate_effect(set_id, &parked.key);
+            self.parked = Some(parked);
+            self.state = FeedState::Locate;
+            return effects;
+        }
+        let batches = std::mem::take(&mut self.batches);
+        if batches.is_empty() {
+            return self.settle();
+        }
+        let keys = batches
+            .keys()
+            .map(|(set_id, range_id)| state_key(*set_id, *range_id));
+        let effects = batch_read(SEARCH_INDEX_KEYSPACE, keys.collect::<Vec<_>>());
+        self.pending = (batches.into_iter())
+            .map(|(range, batch)| (range, batch, None))
+            .collect();
+        self.state = FeedState::States;
+        effects
+    }
+
+    /// Applies the next batch whose range has an index; rows of ranges without one settle.
+    fn next_batch(&mut self) -> Effects {
+        while let Some(((set_id, range_id), (changes, rows), state)) = self.pending.pop_front() {
+            let state = match state
+                .map(|value| IndexState::from_bytes(&value))
+                .transpose()
+            {
+                Ok(state) => state,
+                Err(error) => return self.fail(error.into()),
+            };
+            let (generation, changes, rows) = match state {
+                // Without an index the build reads the current heads later.
+                None => {
+                    self.settled.extend(rows);
+                    continue;
+                }
+                Some(IndexState::Ready { generation }) => {
+                    self.batch = Some(Batch {
+                        set_id,
+                        range_id,
+                        generation,
+                        changes,
+                        rows,
+                    });
+                    self.state = FeedState::Exists;
+                    return index(IndexEffect::Exists {
+                        set_id,
+                        range_id,
+                        generation,
+                    });
+                }
+                Some(IndexState::Building { generation, cursor }) => {
+                    // The build reads the heads after its cursor itself, so their rows settle.
+                    let read = |key: &Key| cursor.as_deref().is_some_and(|c| key.as_ref() <= c);
+                    let (read, unread): (Vec<_>, Vec<_>) =
+                        (changes.into_iter().zip(rows)).partition(|(_, (key, _))| read(key));
+                    self.settled.extend(unread.into_iter().map(|(_, row)| row));
+                    let (changes, rows) = read.into_iter().unzip();
+                    (generation, changes, rows)
+                }
+            };
+            self.batch = Some(Batch {
+                set_id,
+                range_id,
+                generation,
+                changes,
+                rows,
+            });
+            return self.describe();
+        }
+        self.settle()
+    }
+
+    fn describe(&mut self) -> Effects {
+        let Some(batch) = self.batch.as_mut() else {
+            return self.fail(FeedError::NotFinished);
+        };
+        let changes = std::mem::take(&mut batch.changes);
+        match Describe::start(batch.set_id, changes) {
+            Ok((describe, effects)) => {
+                self.describe = Some(describe);
+                self.state = FeedState::Describe;
+                effects
+            }
+            Err(changes) => self.apply(changes),
+        }
+    }
+
+    fn apply(&mut self, changes: Vec<KeyChange>) -> Effects {
+        let Some(batch) = self.batch.as_ref() else {
+            return self.fail(FeedError::NotFinished);
+        };
+        self.state = FeedState::Apply;
+        index(IndexEffect::Apply {
+            set_id: batch.set_id,
+            range_id: batch.range_id,
+            generation: batch.generation,
+            changes,
+        })
+    }
+
+    /// Deletes the settled feed rows whose value is still the one applied, in one transaction;
+    /// a conflicting writer leaves them for the next pass.
+    fn settle(&mut self) -> Effects {
+        if self.settled.is_empty() {
+            return self.finish(Ok(0));
+        }
+        self.state = FeedState::Begin;
+        storage(StorageEffect::StartTransaction { read: false })
+    }
+
+    fn step_inner(&mut self, event: Event) -> Effects {
+        match (self.state, event) {
+            (
+                FeedState::Rows,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => {
+                self.cursor = next_start_after.map(|key| key.to_vec());
+                self.rows = values.into();
+                self.next_row()
+            }
+            (FeedState::Locate, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                let Some(parked) = self.parked.take() else {
+                    return self.fail(FeedError::NotFinished);
+                };
+                match located(parked.set_id, &parked.key, &values) {
+                    Ok(Some(range)) => {
+                        let range_id = range.range_id;
+                        self.located.push(range);
+                        self.add(range_id, parked);
+                    }
+                    // A key outside every installed range has no index to feed.
+                    Ok(None) => self.settled.push(parked.row),
+                    Err(error) => return self.fail(error.into()),
+                }
+                self.next_row()
+            }
+            (FeedState::States, event) => match read_values(event, self.pending.len()) {
+                Ok(states) => {
+                    for (entry, state) in self.pending.iter_mut().zip(states) {
+                        entry.2 = state;
+                    }
+                    self.next_batch()
+                }
+                Err(error) => self.fail(error),
+            },
+            (FeedState::Exists, Event::Index(IndexEvent::Exists(true))) => self.describe(),
+            (FeedState::Exists, Event::Index(IndexEvent::Exists(false))) => {
+                let Some(batch) = self.batch.as_ref() else {
+                    return self.fail(FeedError::NotFinished);
+                };
+                let state = IndexState::Building {
+                    generation: batch.generation + 1,
+                    cursor: None,
+                };
+                let key = state_key(batch.set_id, batch.range_id);
+                match state.to_bytes() {
+                    Ok(value) => {
+                        self.state = FeedState::MarkBuilding;
+                        put_row(SEARCH_INDEX_KEYSPACE, key, value)
+                    }
+                    Err(error) => self.fail(error.into()),
+                }
+            }
+            (FeedState::MarkBuilding, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                if let Some(batch) = self.batch.take() {
+                    self.settled.extend(batch.rows);
+                }
+                self.next_batch()
+            }
+            (FeedState::Describe, event) => {
+                let Some(describe) = self.describe.as_mut() else {
+                    return self.fail(FeedError::NotFinished);
+                };
+                match describe.step(event) {
+                    Ok(Ok(effects)) => effects,
+                    Ok(Err(changes)) => {
+                        self.describe = None;
+                        self.apply(changes)
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            (FeedState::Apply, Event::Index(IndexEvent::Applied)) => {
+                if let Some(batch) = self.batch.take() {
+                    self.settled.extend(batch.rows);
+                }
+                self.next_batch()
+            }
+            (FeedState::Apply, Event::Index(IndexEvent::Error(error))) => {
+                if let Some(batch) = self.batch.take() {
+                    let range_id = batch.range_id;
+                    warn!(%range_id, %error, "Range search index update failed");
+                }
+                self.next_batch()
+            }
+            (FeedState::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.txn_id = Some(txn_id);
+                let reads = (self.settled.iter())
+                    .map(|(key, _)| (SEARCH_FEED_KEYSPACE.to_string(), key.clone()))
+                    .collect();
+                self.state = FeedState::ReadSettled;
+                storage(StorageEffect::BatchRead {
+                    reads,
+                    txn_id: Some(txn_id),
+                })
+            }
+            (FeedState::ReadSettled, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                let settled = std::mem::take(&mut self.settled);
+                let deletes: Vec<(String, Key)> = (settled.into_iter().zip(values))
+                    .filter(|((_, seen), (_, now))| now.as_ref().is_some_and(|now| now == seen))
+                    .map(|((key, _), _)| (SEARCH_FEED_KEYSPACE.to_string(), key))
+                    .collect();
+                self.dropped = deletes.len();
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(FeedError::NotFinished);
+                };
+                if deletes.is_empty() {
+                    return self.commit();
+                }
+                self.state = FeedState::DeleteSettled;
+                storage(StorageEffect::BatchDelete {
+                    deletes,
+                    txn_id: Some(txn_id),
+                })
+            }
+            (FeedState::DeleteSettled, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.commit()
+            }
+            (FeedState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                let dropped = self.dropped;
+                self.finish(Ok(dropped))
+            }
+            // A failed commit leaves the rows for the next pass and nothing to abort.
+            (FeedState::Commit, Event::Storage(_)) => self.finish(Ok(0)),
+            (FeedState::Abort, _) => {
+                self.state = FeedState::Error;
+                smallvec![]
+            }
+            (_, event) => self.fail(storage_error(event)),
+        }
+    }
+
+    fn commit(&mut self) -> Effects {
+        match self.txn_id.take() {
+            Some(txn_id) => {
+                self.state = FeedState::Commit;
+                storage(StorageEffect::CommitTransaction { txn_id })
+            }
+            None => self.fail(FeedError::NotFinished),
+        }
+    }
+}
+
+impl Operation for FeedWalk {
+    type Output = usize;
+    type Error = FeedError;
+
+    fn start(&mut self) -> Effects {
+        self.state = FeedState::Rows;
+        iter(SEARCH_FEED_KEYSPACE, self.cursor.clone(), self.limit)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.step_inner(event)
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, FeedState::Finish | FeedState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(FeedError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
+    }
