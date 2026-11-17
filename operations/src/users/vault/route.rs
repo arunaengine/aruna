@@ -22,13 +22,13 @@ use ulid::Ulid;
 use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
 use crate::jobs::store::iter_prefix_page;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
+use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use aruna_core::placement::{holds_placement, target_placement_ref};
 
 /// Why a holder refused a forwarded vault change.

@@ -28,9 +28,9 @@ use ulid::Ulid;
 use super::forward::{PublishRefusal, admit_member, publish_local};
 use super::status::{StatusError, read_view};
 use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// How often and how far apart admission rereads a record that lags the accepted revision.
 const RECORD_POLLS: u32 = 50;

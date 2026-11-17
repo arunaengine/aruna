@@ -5,11 +5,11 @@
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::sync::outbox_record::new_outbox_record;
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::outbox_record::write_outbox_effect;

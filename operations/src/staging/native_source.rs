@@ -38,9 +38,9 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use crate::distribution::delegate::{prune_nonces, spend_nonce};
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
 use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
 use crate::metadata::api::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,

@@ -13,8 +13,9 @@ use aruna_core::structs::identity::group_delete::{
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller, is_sync_eligible};
+use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller};
 use crate::metadata::protocol::MetadataTransportMessage;
+use crate::realm::peer_trust::is_sync_eligible;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;

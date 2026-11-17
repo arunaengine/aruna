@@ -20,8 +20,8 @@ use thiserror::Error;
 use crate::auth::bearer_token::grant_valid;
 use crate::distribution::delegate::{DelegateError, prune_nonces, spend_nonce};
 use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// Seconds a spent nonce outlives its ticket, for clocks that run behind the issuer's.
 const SPENT_MARGIN_SECS: u64 = 60;

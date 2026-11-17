@@ -26,9 +26,9 @@ use super::forward::PublishRefusal;
 use super::sharding::{range_sample, split_point};
 use super::status::{Reach, node_reach, read_view};
 use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::AuthToken;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// The caller of an admin change: its own token context and, for a remote publisher, the
 /// bearer token forwarded there.

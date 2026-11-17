@@ -47,10 +47,10 @@ use tokio::time::Instant;
 use tokio::time::timeout;
 use ulid::Ulid;
 
-use crate::forward::authorize::is_sync_eligible;
 use crate::forward::replay::routed_record_matches;
 use crate::forward::routing::holds_metadata_id;
 use crate::forward::transport::read_error;
+use crate::realm::peer_trust::is_sync_eligible;
 use futures_util::StreamExt;
 
 pub(super) const READ_FANOUT_LIMIT: usize = 8;

@@ -145,7 +145,7 @@ impl CommitOperation {
         let config = RealmConfigDocument::from_bytes(config)?;
         if self.auth.is_some()
             && (!self.certificate.plan.matches_config(&config)
-                || !crate::forward::authorize::is_sync_eligible(&config, self.actor.node_id))
+                || !crate::realm::peer_trust::is_sync_eligible(&config, self.actor.node_id))
         {
             return Err(GroupDeletionError::Conflict(
                 "realm membership changed; retry deletion".into(),

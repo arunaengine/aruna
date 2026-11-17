@@ -20,7 +20,7 @@ use super::coordinator::{authorize, load_group, request_nodes, visible};
 use super::resources::EmptyCheck;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
+use crate::realm::peer_trust::is_sync_eligible;
 
 #[derive(Debug, PartialEq)]
 enum State {

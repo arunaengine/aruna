@@ -24,8 +24,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
+use crate::realm::peer_trust::is_sync_eligible;
 
 /// How long an issued delegation is valid.
 pub const DELEGATION_SECS: u64 = 15;

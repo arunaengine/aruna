@@ -11,7 +11,7 @@ use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use crate::realm::mutate_placement::node_kind;
+use crate::realm::peer_trust::peer_acts_for;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -24,20 +24,6 @@ use aruna_core::types::GroupId;
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
-
-pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
-    node_kind(config, node_id).is_some_and(|kind| kind.is_sync_eligible())
-}
-
-/// A User peer is owner-bound: it may forward only for the owner its realm
-/// config names, whatever token it managed to present. Other kinds are not
-/// owner-bound, so any authenticated caller may travel through them.
-pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
-    match node_kind(config, peer).and_then(|kind| kind.owner()) {
-        Some(owner) => owner == user_id,
-        None => true,
-    }
-}
 
 pub(crate) async fn authorize_forwarded_pid(
     context: &Arc<DriverContext>,

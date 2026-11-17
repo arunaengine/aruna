@@ -5,6 +5,8 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+
+use super::mutate_placement::node_kind;
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -70,6 +72,21 @@ pub fn ensure_peer_trust(
         Some(_) => Err(RealmPeerError::NotTrusted { peer, realm_id }),
         None if node.kind.is_sync_eligible() => Ok(()),
         None => Err(RealmPeerError::NotTrusted { peer, realm_id }),
+    }
+}
+
+/// Whether the realm config lists the node as an infrastructure node that syncs documents.
+pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    node_kind(config, node_id).is_some_and(|kind| kind.is_sync_eligible())
+}
+
+/// A User peer is owner-bound: it may forward only for the owner its realm
+/// config names, whatever token it managed to present. Other kinds are not
+/// owner-bound, so any authenticated caller may travel through them.
+pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
+    match node_kind(config, peer).and_then(|kind| kind.owner()) {
+        Some(owner) => owner == user_id,
+        None => true,
     }
 }
 

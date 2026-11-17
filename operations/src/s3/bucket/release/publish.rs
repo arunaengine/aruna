@@ -43,10 +43,10 @@ use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::forward::authorize::is_sync_eligible;
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::placement::policy::GateOperation;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{
