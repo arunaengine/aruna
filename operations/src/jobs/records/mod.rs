@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::structs::execution::job::JobRecordError;
@@ -40,6 +41,8 @@ pub enum RecordStoreError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
     #[error(transparent)]
     Record(#[from] JobRecordError),
     #[error(transparent)]
@@ -66,6 +69,22 @@ pub enum RecordStoreError {
         expected: &'static str,
         got: &'static str,
     },
+}
+
+impl From<IoError> for RecordStoreError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "call".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            IoError::Codec(error) => Self::Codec(error),
+        }
+    }
 }
 
 impl RecordStoreError {
