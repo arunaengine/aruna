@@ -1466,7 +1466,6 @@ fn handoff_needs_coordinator() {
     };
     let judge = |config: RealmConfigDocument, state: Option<AdminDocumentState>, origin: &Actor| {
         validate_config_authority(Some(&config), &handoff(origin), state.as_ref())
-            .expect("validation runs")
     };
     let management = Some(RealmNodeKind::Management);
     assert!(matches!(
