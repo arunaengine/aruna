@@ -28,7 +28,7 @@ use crate::driver::{DriverContext, drive, drive_until};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// At most this many distribution records are read to find a version's candidate sets.
-const MAX_SETS: usize = 4096;
+pub(crate) const MAX_SETS: usize = 4096;
 /// At most this many candidate sets are looked at for one id.
 const MAX_CANDIDATES: usize = 4;
 /// At most this many members are asked for one id, over all candidate sets.
@@ -149,7 +149,7 @@ fn ready_here(snapshot: &DistributionSnapshot, local: NodeId) -> bool {
 
 /// The snapshots of this node's records that `keep` accepts, at most `wanted` of them, and
 /// whether accepted records were dropped or records left unread because [`MAX_SETS`] were read.
-pub(crate) async fn scan_sets(
+async fn scan_sets(
     context: &DriverContext,
     keep: impl Fn(&DistributionSnapshot) -> bool,
     wanted: usize,
