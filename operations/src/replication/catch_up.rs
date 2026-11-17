@@ -12,9 +12,7 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StatementSignEvent, StorageEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, CATCH_UP_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::distribution::bootstrap::{
-    BootstrapCursor, bootstrap_key, bootstrap_prefix,
-};
+use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
 use aruna_core::structs::storage::distribution::snapshot::RangeFill;
 use aruna_core::structs::storage::distribution::{
     DistributionMember, DistributionSnapshot, KeyRange, Statement, StatementClaim,
@@ -25,7 +23,9 @@ use aruna_storage::StorageHandle;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::bootstrap::{BootstrapPage, PAGE_ROWS, PageConfig, PageProgress, ReadCursorOperation};
+use super::bootstrap::{
+    BootstrapPage, ClearCursorsOperation, PAGE_ROWS, PageConfig, PageProgress, ReadCursorOperation,
+};
 use super::members::ReadRecordOperation;
 use super::queue::schedule_blob_drain;
 use crate::distribution::create::submit;
@@ -478,41 +478,18 @@ impl SetWalk {
     /// Deletes the cursors of members that are no longer walked, such as a member that left,
     /// in one bounded batch per drain.
     async fn clear_departed(&self, context: &DriverContext, walked: &[Ulid]) -> Result<(), String> {
-        let prefix = bootstrap_prefix(self.set_id);
-        let rows = scan(
-            context,
-            BOOTSTRAP_KEYSPACE,
-            (Some(prefix), None),
-            CLEAR_BATCH,
-        )
-        .await?;
-        let departed = |key: &[u8]| {
-            let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
-            member.is_some_and(|id| !walked.iter().any(|walked| walked.to_bytes() == id))
-        };
-        let deletes = (rows.into_iter())
-            .filter(|(key, _)| departed(key))
-            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
-            .collect();
-        delete(context, deletes).await
+        let clear = ClearCursorsOperation::new(self.set_id, Some(walked.to_vec()), CLEAR_BATCH);
+        let cleared = drive(clear, context).await;
+        cleared.map(|_| ()).map_err(|error| error.to_string())
     }
 
     /// Deletes the set's cursors in bounded batches; settled once none is left.
     async fn clear(&self, context: &DriverContext) -> Result<Outcome, String> {
-        let prefix = bootstrap_prefix(self.set_id);
-        let rows = scan(
-            context,
-            BOOTSTRAP_KEYSPACE,
-            (Some(prefix), None),
-            CLEAR_BATCH,
-        )
-        .await?;
-        let settled = rows.len() < CLEAR_BATCH;
-        let deletes = (rows.into_iter())
-            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), Key::from(key)))
-            .collect();
-        delete(context, deletes).await?;
-        Ok(match settled {
+        let clear = ClearCursorsOperation::new(self.set_id, None, CLEAR_BATCH);
+        let all_read = drive(clear, context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(match all_read {
             true => Outcome::Settled,
             false => Outcome::Waiting,
         })

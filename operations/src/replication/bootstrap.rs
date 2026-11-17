@@ -12,7 +12,9 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
-use aruna_core::structs::storage::distribution::bootstrap::{BootstrapCursor, bootstrap_key};
+use aruna_core::structs::storage::distribution::bootstrap::{
+    BootstrapCursor, bootstrap_key, bootstrap_prefix,
+};
 use aruna_core::structs::storage::distribution::inventory::{
     Entry, Position, VersionEntry, range_interval,
 };
@@ -407,6 +409,126 @@ impl Operation for ReadCursorOperation {
 
     fn finalize(self) -> Result<Option<BootstrapCursor>, BootstrapError> {
         self.result.unwrap_or(Err(BootstrapError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClearState {
+    Scan,
+    Delete,
+    Done,
+    Failed,
+}
+
+/// Deletes one page of at most `limit` bootstrap cursors of a set: all of them, or with
+/// `walked` only those of members no longer walked. Answers whether the page held all of them.
+pub struct ClearCursorsOperation {
+    set_id: Ulid,
+    walked: Option<Vec<Ulid>>,
+    limit: usize,
+    all_read: bool,
+    state: ClearState,
+    error: Option<BootstrapError>,
+}
+
+impl ClearCursorsOperation {
+    pub fn new(set_id: Ulid, walked: Option<Vec<Ulid>>, limit: usize) -> Self {
+        Self {
+            set_id,
+            walked,
+            limit,
+            all_read: false,
+            state: ClearState::Scan,
+            error: None,
+        }
+    }
+
+    fn fail(&mut self, error: BootstrapError) -> Effects {
+        self.state = ClearState::Failed;
+        self.error = Some(error);
+        smallvec![]
+    }
+
+    /// Whether the cursor row `key` goes: every row, or one of a member no longer walked.
+    fn goes(&self, key: &[u8]) -> bool {
+        let Some(walked) = &self.walked else {
+            return true;
+        };
+        let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
+        member.is_some_and(|id| !walked.iter().any(|walked| walked.to_bytes() == id))
+    }
+
+    fn scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        self.all_read = values.len() < self.limit;
+        let deletes: Vec<_> = (values.into_iter())
+            .filter(|(key, _)| self.goes(key))
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), key))
+            .collect();
+        if deletes.is_empty() {
+            self.state = ClearState::Done;
+            return smallvec![];
+        }
+        self.state = ClearState::Delete;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })]
+    }
+}
+
+impl Operation for ClearCursorsOperation {
+    type Output = bool;
+    type Error = BootstrapError;
+
+    fn start(&mut self) -> Effects {
+        self.state = ClearState::Scan;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: BOOTSTRAP_KEYSPACE.to_string(),
+            prefix: Some(bootstrap_prefix(self.set_id).into()),
+            start: None,
+            limit: self.limit,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.state, event) {
+            (ClearState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.scanned(values)
+            }
+            (ClearState::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
+                self.state = ClearState::Done;
+                smallvec![]
+            }
+            (
+                ClearState::Scan | ClearState::Delete,
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.fail(error.into()),
+            (ClearState::Done | ClearState::Failed, _) => smallvec![],
+            (state, other) => self.fail(BootstrapError::UnexpectedEvent {
+                state: match state {
+                    ClearState::Scan => "ScanCursors",
+                    _ => "DeleteCursors",
+                },
+                got: other.label(),
+            }),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, ClearState::Done | ClearState::Failed)
+    }
+
+    fn finalize(self) -> Result<bool, BootstrapError> {
+        match (self.state, self.error) {
+            (ClearState::Done, _) => Ok(self.all_read),
+            (_, Some(error)) => Err(error),
+            _ => Err(BootstrapError::NotFinished),
+        }
     }
 
     fn abort(&mut self) -> Effects {

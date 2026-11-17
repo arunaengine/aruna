@@ -190,3 +190,106 @@ fn cursor_read_contract() {
     check_abort(&mut fresh, &[]);
     rejects_finalize(fresh);
 }
+
+/// A cursor row of `member` for the set of [`set`].
+fn cursor_key(member: u8) -> Key {
+    bootstrap_key(
+        set(),
+        Ulid::from_bytes([member; 16]),
+        Ulid::from_bytes([1; 16]),
+    )
+    .into()
+}
+
+fn cursor_page(members: &[u8]) -> Event {
+    Event::Storage(StorageEvent::IterResult {
+        values: (members.iter())
+            .map(|member| (cursor_key(*member), Vec::<u8>::new().into()))
+            .collect(),
+        next_start_after: None,
+    })
+}
+
+#[test]
+fn clears_set_cursors() {
+    let scan = Effect::Storage(StorageEffect::Iter {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        prefix: Some(bootstrap_prefix(set()).into()),
+        start: None,
+        limit: 2,
+        txn_id: None,
+    });
+    let delete = Effect::Storage(StorageEffect::BatchDelete {
+        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(4))],
+        txn_id: None,
+    });
+    let deleted = Event::Storage(StorageEvent::BatchDeleteResult {
+        entries: Vec::new(),
+    });
+    let mut operation = ClearCursorsOperation::new(set(), None, 2);
+    let steps = vec![(cursor_page(&[4]), vec![delete]), (deleted, vec![])];
+    aruna_core::operation_check::check_trace(&mut operation, &[scan], steps);
+    assert_eq!(operation.finalize(), Ok(true));
+}
+
+#[test]
+fn keeps_walked_cursors() {
+    // Only the cursors of members no longer walked go; a full page is not all of them.
+    let walked = vec![Ulid::from_bytes([4; 16])];
+    let mut operation = ClearCursorsOperation::new(set(), Some(walked.clone()), 2);
+    operation.start();
+    let delete = Effect::Storage(StorageEffect::BatchDelete {
+        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(5))],
+        txn_id: None,
+    });
+    assert_eq!(operation.step(cursor_page(&[4, 5])).as_slice(), [delete]);
+    let mut kept = ClearCursorsOperation::new(set(), Some(walked), 2);
+    kept.start();
+    assert!(kept.step(cursor_page(&[4])).is_empty());
+    assert_eq!(kept.finalize(), Ok(true));
+    let mut full = ClearCursorsOperation::new(set(), Some(vec![Ulid::from_bytes([5; 16])]), 1);
+    full.start();
+    assert!(full.step(cursor_page(&[5])).is_empty());
+    assert_eq!(full.finalize(), Ok(false));
+}
+
+#[test]
+fn cursor_clear_contract() {
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
+    };
+    let make = || {
+        let mut operation = ClearCursorsOperation::new(set(), None, 2);
+        operation.start();
+        operation
+    };
+    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
+    let refused = rejects_events(make, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let deleting = || {
+        let mut operation = ClearCursorsOperation::new(set(), None, 2);
+        operation.start();
+        operation.step(cursor_page(&[4]));
+        operation
+    };
+    let accepted = |event: &Event| {
+        matches!(
+            event,
+            Event::Storage(StorageEvent::BatchDeleteResult { .. })
+        )
+    };
+    let refused = rejects_events(deleting, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let failed = Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    });
+    let mut scanning = make();
+    scanning.step(failed);
+    assert_eq!(
+        scanning.finalize(),
+        Err(BootstrapError::Storage(StorageError::Timeout))
+    );
+    let mut fresh = ClearCursorsOperation::new(set(), None, 2);
+    check_abort(&mut fresh, &[]);
+    rejects_finalize(fresh);
+}
