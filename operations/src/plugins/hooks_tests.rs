@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::*;
 use crate::driver::drive;
-use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hook_secret, keys};
+use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, hook_secret};
 use crate::plugins::dispatch::{admit_hook, checks_authorization};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
@@ -72,9 +72,9 @@ async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
 async fn admits_verified() {
     let fixture = Fixture::keyed().await;
     let install = hooked(&fixture).await;
-    let keys = keys();
+    hold_keys(&fixture.ctx);
     let ids = (fixture.actor.realm_id, install.install_id);
-    let admit = |request| admit_hook(&fixture.ctx, (install.receiver, &keys), ids, request, 10);
+    let admit = |request| admit_hook(&fixture.ctx, install.receiver, ids, request, 10);
     // Without a delivery id every request is a run; one id starts one run.
     assert_eq!(admit(request(TOKEN, None)).await, Ok(true));
     assert_eq!(admit(request(TOKEN, None)).await, Ok(true));
@@ -115,8 +115,8 @@ async fn admits_verified() {
 async fn refusals_start_nothing() {
     let fixture = Fixture::keyed().await;
     let install = hooked(&fixture).await;
-    let keys = keys();
-    let place = (install.receiver, &keys);
+    hold_keys(&fixture.ctx);
+    let place = install.receiver;
     let realm_id = fixture.actor.realm_id;
     let admit = |install_id| {
         let ctx = &fixture.ctx;

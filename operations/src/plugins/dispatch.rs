@@ -18,7 +18,7 @@ use aruna_plugins::manifest::SecretKind;
 use aruna_plugins::trigger::{Trigger, TriggerKind};
 use ulid::Ulid;
 
-use super::bound::{ReleaseKeys, check_node_binding, delivery_clash, select, vault_kind};
+use super::bound::{check_node_binding, delivery_clash, select, vault_kind};
 use super::finished::retry_run;
 use super::held::{HeldSecrets, ask_release};
 use super::hooks::{AdmitHook, DROPPED, HookError};
@@ -180,7 +180,7 @@ pub async fn run_again(
 /// `false` for a delivery id the receiver already admitted, which starts nothing.
 pub async fn admit_hook(
     ctx: &DriverContext,
-    (local, keys): (NodeId, &ReleaseKeys),
+    local: NodeId,
     (realm_id, install_id): (RealmId, Ulid),
     mut request: HookRequest,
     now_ms: u64,
@@ -217,7 +217,7 @@ pub async fn admit_hook(
         held: None,
         run_id: None,
     };
-    let ask = |release| ask_release(ctx, &config, (local, keys), release);
+    let ask = |release| ask_release(ctx, &config, local, release);
     let released = HeldSecrets::default().obtain(release, ask).await;
     let (released, fields) = released.map_err(|error| unavailable(error.to_string()))?;
     // A secret edit can make the checked header the delivery id; nothing starts then.

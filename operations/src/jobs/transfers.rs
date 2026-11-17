@@ -30,7 +30,6 @@ use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
-use crate::plugins::bound::ReleaseKeys;
 use crate::plugins::broker::local_object;
 use crate::plugins::broker::unmarked;
 use crate::plugins::check::{authorize_access, authorize_call, matching};
@@ -514,8 +513,7 @@ async fn prepared(
         let fields = SecretFields::new(Default::default());
         return Ok((request, ResponseExposure::Full, fields));
     };
-    let keys = crate::plugins::release::node_keys(&ctx.driver);
-    let place = (config, ctx.owner_node_id, &keys);
+    let place = (config, ctx.owner_node_id);
     let released = release_into(
         &ctx.driver,
         place,
