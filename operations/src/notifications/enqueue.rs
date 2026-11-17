@@ -38,6 +38,8 @@ pub enum EnqueueError {
 pub struct EnqueueDeliveriesOperation {
     waiting: VecDeque<(&'static str, SubmitJobOperation)>,
     current: Option<(&'static str, SubmitJobOperation)>,
+    /// Events still owed to the closing effects of the last finished submit.
+    owed: usize,
     result: Option<Result<(), EnqueueError>>,
 }
 
@@ -74,6 +76,7 @@ impl EnqueueDeliveriesOperation {
         let mut operation = Self {
             waiting: VecDeque::with_capacity(deliveries.len()),
             current: None,
+            owed: 0,
             result: None,
         };
         for (channel, record, payload) in deliveries {
@@ -115,8 +118,17 @@ impl EnqueueDeliveriesOperation {
                 return effects;
             }
             self.settle(channel, submit);
+            if !effects.is_empty() {
+                return self.close(effects);
+            }
         }
         smallvec![]
+    }
+
+    /// Runs the closing effects of a finished submit before the next one starts.
+    fn close(&mut self, effects: Effects) -> Effects {
+        self.owed = effects.len();
+        effects
     }
 
     fn settle(&mut self, channel: &'static str, submit: SubmitJobOperation) {
@@ -144,6 +156,13 @@ impl Operation for EnqueueDeliveriesOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        if self.owed > 0 {
+            self.owed -= 1;
+            return match self.owed {
+                0 => self.next(),
+                _ => smallvec![],
+            };
+        }
         let Some((channel, mut submit)) = self.current.take() else {
             let got = format!("{event:?}");
             let source = SubmitJobError::UnexpectedEvent(got);
@@ -153,14 +172,16 @@ impl Operation for EnqueueDeliveriesOperation {
             }));
             return smallvec![];
         };
-        let mut effects = submit.step(event);
+        let effects = submit.step(event);
         if !submit.is_complete() {
             self.current = Some((channel, submit));
             return effects;
         }
         self.settle(channel, submit);
-        effects.extend(self.next());
-        effects
+        match effects.is_empty() {
+            true => self.next(),
+            false => self.close(effects),
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -211,7 +232,9 @@ mod state_machine_tests {
     #[test]
     fn nothing_to_queue() {
         let notice = record(user(1, 2), NotificationClass::Direct, 1_000);
-        let mut enqueue = EnqueueDeliveriesOperation::new(node_id(1), None, &[notice], 1_000);
+        let config = RealmConfigDocument::new(user(1, 2).realm_id, Vec::new(), 3);
+        let mut enqueue =
+            EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[notice], 1_000);
         assert!(enqueue.start().is_empty());
         assert_eq!(enqueue.finalize(), Ok(()));
     }

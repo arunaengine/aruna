@@ -81,7 +81,7 @@ impl EmitNotificationsOperation {
             },
         };
         warn!(%error, "Dropping notification emission");
-        self.error = Some(error);
+        self.error.get_or_insert(error);
         self.state = EmitNotificationsState::Finish;
         match txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
