@@ -64,6 +64,7 @@ pub mod register;
 pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
+pub mod rows;
 pub mod scheduling;
 pub mod search_enrichment;
 pub mod secret_registers;

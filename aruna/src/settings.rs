@@ -21,6 +21,7 @@ use aruna_core::structs::storage::node_info::{
 };
 use aruna_graph::MetadataSearchStorage;
 use aruna_net::IrohRuntimeConfig;
+use aruna_operations::driver::HangLimits;
 use aruna_storage::{CACHE_BYTES, FjallPersistPolicy};
 
 use crate::config::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
@@ -91,6 +92,8 @@ pub struct Settings {
     /// Records every operation run and its events for replay, from `EVENT_RECORDING`; off by
     /// default.
     pub event_recording: bool,
+    /// How long the runner waits for each adapter kind, from the `HANG_LIMIT_*_SECS` keys.
+    pub hang_limits: HangLimits,
     pub portal_csp_origins: Vec<String>,
     pub p2p_addr: SocketAddr,
     pub additional_relay_urls: Vec<String>,
@@ -267,6 +270,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
     let desktop_cors = desktop_cors_env(env);
     let mcp_enabled = mcp_env(env)?;
     let event_recording = event_recording_env(env)?;
+    let hang_limits = hang_limits_env(env)?;
     let portal_csp_origins = parse_list_env(env, "PORTAL_CSP_EXTRA_ORIGINS");
     let p2p_addr = SocketAddr::from_str(
         &env.var("P2P_SOCKET_ADDRESS")
@@ -355,6 +359,7 @@ pub fn read_settings_from(env: &dyn SettingsEnv) -> Result<Settings, SetupError>
         desktop_cors,
         mcp_enabled,
         event_recording,
+        hang_limits,
         portal_csp_origins,
         p2p_addr,
         additional_relay_urls,
@@ -913,6 +918,40 @@ fn mcp_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
     }
 }
 
+/// The runner's hang limits; each key takes seconds or `off`, unset keys keep the defaults.
+fn hang_limits_env(env: &dyn SettingsEnv) -> Result<HangLimits, SetupError> {
+    let defaults = HangLimits::DEFAULT;
+    Ok(HangLimits {
+        storage: hang_limit_env(env, "HANG_LIMIT_STORAGE_SECS", defaults.storage)?,
+        net: hang_limit_env(env, "HANG_LIMIT_NET_SECS", defaults.net)?,
+        metadata: hang_limit_env(env, "HANG_LIMIT_METADATA_SECS", defaults.metadata)?,
+        task: hang_limit_env(env, "HANG_LIMIT_TASK_SECS", defaults.task)?,
+        staging_source: hang_limit_env(env, "HANG_LIMIT_STAGING_SECS", defaults.staging_source)?,
+    })
+}
+
+fn hang_limit_env(
+    env: &dyn SettingsEnv,
+    key: &'static str,
+    default: Option<Duration>,
+) -> Result<Option<Duration>, SetupError> {
+    let Some(value) = optional_nonempty_env(env, key)? else {
+        return Ok(default);
+    };
+    if normalize_env_value(&value) == "off" {
+        return Ok(None);
+    }
+    match value.parse::<u64>() {
+        Ok(0) => Err(invalid_config_value(
+            key,
+            value,
+            "must be greater than zero or off",
+        )),
+        Ok(seconds) => Ok(Some(Duration::from_secs(seconds))),
+        Err(error) => Err(invalid_config_value(key, value, error)),
+    }
+}
+
 fn event_recording_env(env: &dyn SettingsEnv) -> Result<bool, SetupError> {
     const KEY: &str = "EVENT_RECORDING";
     match env.var(KEY).as_deref().map(normalize_env_value) {
@@ -1453,6 +1492,23 @@ mod tests {
         assert_eq!(raised.fjall_cache_bytes, 4 << 30);
         let error = parse(&[("ARUNA_FJALL_CACHE_MIB", "0")]).unwrap_err();
         assert_eq!(invalid_key(error), "ARUNA_FJALL_CACHE_MIB");
+    }
+
+    #[test]
+    fn hang_limit_conventions() {
+        assert_eq!(parse(&[]).unwrap().hang_limits, HangLimits::DEFAULT);
+        let pairs = [
+            ("HANG_LIMIT_NET_SECS", "90"),
+            ("HANG_LIMIT_TASK_SECS", "off"),
+        ];
+        let limits = parse(&pairs).unwrap().hang_limits;
+        assert_eq!(limits.net, Some(Duration::from_secs(90)));
+        assert_eq!(limits.task, None);
+        assert_eq!(limits.storage, HangLimits::DEFAULT.storage);
+        assert_eq!(
+            invalid_key(parse(&[("HANG_LIMIT_STORAGE_SECS", "0")]).unwrap_err()),
+            "HANG_LIMIT_STORAGE_SECS"
+        );
     }
 
     #[test]
