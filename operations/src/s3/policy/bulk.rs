@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::permission_check;
 use crate::blob::records::HeadAliasContext;
 use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
 use crate::placement::policy::foreign_owner;
@@ -15,7 +15,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
@@ -232,17 +232,11 @@ impl PolicyBulkOperation {
     }
 
     fn authorize(&self, path: String) -> Effects {
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
+        smallvec![permission_check(
+            self.config.auth_context.clone(),
             path,
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+            Permission::WRITE,
+        )]
     }
 
     fn start_capture(&mut self) -> Effects {

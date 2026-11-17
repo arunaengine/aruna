@@ -10,7 +10,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -25,7 +25,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::permission_check;
 use crate::distribution::guard::{GuardError, authority_read, authority_rows, write_authority};
 
 /// Upper bound on one page, so a scan can never walk a whole bucket at once.
@@ -572,17 +572,11 @@ impl Operation for PolicyCoverageOperation {
 
     fn start(&mut self) -> Effects {
         self.state = ScanState::Authorize;
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.input.auth_context.clone(),
-            path: policy_admin_path(self.input.auth_context.realm_id),
-            required_permission: Permission::READ,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        smallvec![permission_check(
+            self.input.auth_context.clone(),
+            policy_admin_path(self.input.auth_context.realm_id),
+            Permission::READ,
+        )]
     }
 
     fn step(&mut self, event: Event) -> Effects {
