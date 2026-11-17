@@ -388,7 +388,7 @@ async fn push_revision(
 }
 
 /// Whether the dataset was deleted, which removes its registry record.
-pub(super) async fn document_gone(
+async fn document_gone(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<bool, LinkError> {

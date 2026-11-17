@@ -1607,7 +1607,7 @@ async fn page_inputs(
 }
 
 /// Whether each capture comes from the node its input names, or from ingress when it names none.
-pub(crate) fn sources_match(
+fn sources_match(
     inputs: &[InputSelection],
     captured: &[CapturedInput],
     ingress: NodeId,

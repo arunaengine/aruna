@@ -208,7 +208,7 @@ async fn observe_revision(
     }
 }
 
-pub(crate) async fn create_draft(
+async fn create_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     destination: &RepositoryDestination,
@@ -417,7 +417,7 @@ pub(super) async fn file_keys(
         .collect())
 }
 
-pub(crate) async fn prepare_draft(
+async fn prepare_draft(
     ctx: &JobContext,
     spec: &ExportRoCrateSpec,
     destination: &RepositoryDestination,

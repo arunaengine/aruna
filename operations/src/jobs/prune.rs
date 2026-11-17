@@ -40,7 +40,7 @@ pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome,
     prune_job_page(context, JOB_PRUNE_PAGE).await
 }
 
-pub(crate) async fn prune_job_page(
+async fn prune_job_page(
     context: &DriverContext,
     page_size: usize,
 ) -> Result<JobPruneOutcome, String> {

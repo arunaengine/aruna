@@ -287,7 +287,7 @@ pub async fn complete_cancelled(
 /// The storage-level success invariant: `Succeeded` commits in the transaction
 /// that reads the attempt control, and only when every output binds the active
 /// ExecutionId, names a reserved version, and the exact output record is durable.
-pub(super) async fn commit_success<G>(
+async fn commit_success<G>(
     storage: &StorageHandle,
     job_id: JobId,
     token: Ulid,

@@ -485,7 +485,7 @@ pub(super) async fn pinned_bucket(
     Ok(bucket_info)
 }
 
-pub(super) async fn load_live_bucket(
+async fn load_live_bucket(
     ctx: &JobContext,
     bucket: &str,
 ) -> Result<BucketInfo, ItemFailure> {

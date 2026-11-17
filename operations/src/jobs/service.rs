@@ -670,7 +670,7 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_crate_obligation(
+async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {

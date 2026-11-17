@@ -243,7 +243,7 @@ pub(super) fn recognize_entities(
     Ok(entities)
 }
 
-pub(super) fn raw_entity_ids(
+fn raw_entity_ids(
     document: &JsonValue,
     keywords: &JsonLdKeywords,
 ) -> Result<Vec<(String, String, Option<String>)>, ExportFailure> {
@@ -290,7 +290,7 @@ pub(super) fn raw_entity_ids(
     Ok(entities)
 }
 
-pub(super) fn raw_local_path(
+fn raw_local_path(
     object: &serde_json::Map<String, JsonValue>,
     keywords: &JsonLdKeywords,
 ) -> Option<String> {
@@ -320,7 +320,7 @@ pub(super) fn expanded_id(id: &str) -> Result<String, ExportFailure> {
         .map_err(|error| ExportFailure::Permanent(error.to_string()))
 }
 
-pub(super) fn term_value(term: &Term) -> Option<String> {
+fn term_value(term: &Term) -> Option<String> {
     match term {
         Term::NamedNode(value) => Some(value.as_str().to_string()),
         Term::Literal(value) => Some(value.value().to_string()),
@@ -403,7 +403,7 @@ pub(super) fn rewrite_ids(value: &mut JsonValue, replacements: &BTreeMap<String,
     rewrite_id_values(value, replacements, &keywords);
 }
 
-pub(super) fn rewrite_id_values(
+fn rewrite_id_values(
     value: &mut JsonValue,
     replacements: &BTreeMap<String, String>,
     keywords: &JsonLdKeywords,
@@ -491,7 +491,7 @@ pub(super) fn snapshot_moment(checkpoint: &ExportCheckpoint) -> Result<u64, Expo
         .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))
 }
 
-pub(super) fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
+fn build_report(checkpoint: &ExportCheckpoint) -> Result<JsonValue, ExportFailure> {
     let event_id = checkpoint
         .winning_event_id
         .ok_or_else(|| ExportFailure::Permanent("snapshot event cursor is missing".to_string()))?;
@@ -645,7 +645,7 @@ pub(super) fn add_report(document: &mut JsonValue) -> Result<(), ExportFailure> 
     Ok(())
 }
 
-pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
+fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> Option<String> {
     graph.iter().find_map(|entity| {
         let entity = entity.as_object()?;
         let (_, id) = keywords.object_id(entity)?;
@@ -664,7 +664,7 @@ pub(super) fn report_root_id(graph: &[JsonValue], keywords: &JsonLdKeywords) -> 
     })
 }
 
-pub(super) fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
+fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) -> Option<&'a str> {
     match value {
         JsonValue::String(value) => Some(value),
         JsonValue::Object(value) => keywords.object_id(value).map(|(_, id)| id),
@@ -675,7 +675,7 @@ pub(super) fn reference_id<'a>(value: &'a JsonValue, keywords: &JsonLdKeywords) 
     }
 }
 
-pub(super) fn property_key(
+fn property_key(
     object: &serde_json::Map<String, JsonValue>,
     keywords: &JsonLdKeywords,
     values: &[&str],
@@ -689,7 +689,7 @@ pub(super) fn property_key(
         .unwrap_or_else(|| safe_term(keywords, compact, values, absolute))
 }
 
-pub(super) fn safe_term(
+fn safe_term(
     keywords: &JsonLdKeywords,
     compact: &str,
     values: &[&str],
@@ -1024,7 +1024,7 @@ pub(super) fn zip_date(modified_ms: u64) -> ZipDateTime {
         .build()
 }
 
-pub(super) fn stream_status(error: &StreamError) -> OpenStatus {
+fn stream_status(error: &StreamError) -> OpenStatus {
     if matches!(
         error.0.downcast_ref::<BlobError>(),
         Some(BlobError::IntegrityCheckFailed(_))

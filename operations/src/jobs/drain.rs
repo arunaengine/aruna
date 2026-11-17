@@ -342,7 +342,7 @@ fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration>
 }
 
 /// Earliest `due/`/`lease/` head as a delay from now, with the lease re-arm floor.
-pub async fn next_drain_delay(storage: &StorageHandle) -> Result<Option<Duration>, String> {
+async fn next_drain_delay(storage: &StorageHandle) -> Result<Option<Duration>, String> {
     let (due, lease) = next_drain_delays(storage).await?;
     Ok(min_delay(due, lease))
 }

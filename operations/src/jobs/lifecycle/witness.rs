@@ -434,7 +434,7 @@ pub enum RoundOutcome {
 
 /// One witness round: suppression, budget, plan, launch, offer. Every step
 /// reads only replicated records plus this node's own view.
-pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) -> RoundOutcome {
+async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) -> RoundOutcome {
     let Some(net) = context.net_handle.as_ref() else {
         return RoundOutcome::Done;
     };

@@ -324,7 +324,7 @@ async fn send_wake(context: &DriverContext, wake: OwedWake) -> bool {
 }
 
 /// One delivery pass with `send` as the transport; true from `send` means acknowledged.
-pub(crate) async fn deliver_with<F, Fut>(
+async fn deliver_with<F, Fut>(
     context: &DriverContext,
     start_after: Option<Key>,
     mut send: F,

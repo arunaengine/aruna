@@ -67,7 +67,7 @@ pub async fn store_pages(
 }
 
 /// The page this node keeps under `digest`, checked against that digest.
-pub async fn local_page(
+async fn local_page(
     context: &DriverContext,
     submission: &SubmissionId,
     digest: &[u8; 32],

@@ -77,7 +77,7 @@ pub async fn wake_unlocked(
 
 /// Local inputs whose exact source version needs a key that is locked here. Remote inputs are
 /// left to their source node; a version without a local alias is left to staging.
-pub(crate) async fn locked_inputs(
+async fn locked_inputs(
     context: &DriverContext,
     inputs: &[CapturedInput],
     node_id: NodeId,

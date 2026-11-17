@@ -202,7 +202,7 @@ async fn manifest_for(
 }
 
 /// The KubeDAL file list of the cached entries, each checked against its BLAKE3 and size.
-pub fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
+fn cache_manifest(entries: &[ViewEntry], cached: &BTreeSet<String>) -> Vec<u8> {
     let files = entries
         .iter()
         .filter(|entry| cached.contains(&entry.key))
