@@ -212,6 +212,19 @@ pub fn count_upload(bucket: &str, uploads: i128, txn_id: TxnId) -> Effect {
     })
 }
 
+/// Counts `uploads` more or fewer open uploads of `bucket` when the transaction commits.
+pub fn upload_count(bucket: &str, uploads: i128) -> IoCall {
+    let delta = BucketDelta {
+        open_uploads: uploads,
+        ..Default::default()
+    };
+    IoCall::AddUsage {
+        space: USAGE_STATS_KEYSPACE.to_string(),
+        deltas: Vec::new(),
+        buckets: vec![(usage_bucket_key(bucket).into(), delta)],
+    }
+}
+
 impl UsageCounterUpdate {
     pub fn for_group(group_id: GroupId, delta: UsageDelta) -> Self {
         Self {

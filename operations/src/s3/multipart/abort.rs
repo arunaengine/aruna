@@ -4,8 +4,9 @@
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
-use crate::s3::usage::count_upload;
+use crate::s3::usage::{count_upload, upload_count};
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
@@ -13,7 +14,8 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BlobCleanupWork, BucketInfo};
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
@@ -89,13 +91,27 @@ impl From<UploadTargetError> for AbortUploadError {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl From<IoError> for AbortUploadError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn<T> = Result<Next<T>, AbortUploadError>;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AbortUploadInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: Ulid,
     /// Wall clock (epoch ms) an in-progress completion lease is judged against.
     pub now_ms: u64,
+}
+
+impl AbortUploadInput {
+    fn upload_key(&self) -> Vec<u8> {
+        self.upload_id.to_bytes().to_vec()
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -629,5 +645,232 @@ impl EffectOperation for AbortUploadOperation {
 
     fn abort(&mut self) -> Effects {
         abort_effects(&mut self.txn_id)
+    }
+}
+
+/// Marks the upload aborting in one transaction; its output is the record it wrote. A failure
+/// before the commit is never a storage error, so the caller reopens only after the commit.
+#[derive(Debug, PartialEq)]
+struct MarkAborting {
+    input: AbortUploadInput,
+    check: StatusCheck,
+    record: Option<MultipartUpload>,
+}
+
+impl Operation for MarkAborting {
+    type Output = MultipartUpload;
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<MultipartUpload> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<MultipartUpload> {
+        if let Some(record) = self.record.take() {
+            result
+                .done()
+                .map_err(|_| AbortUploadError::InvalidOperationState)?;
+            return Ok(Next::Done(record));
+        }
+        let value = (result.value()).map_err(|_| AbortUploadError::InvalidOperationState)?;
+        let value = value.ok_or(AbortUploadError::NoSuchUpload)?;
+        let mut record = MultipartUpload::from_bytes(value.as_ref())?;
+        validate_upload(&record, &self.input.bucket, &self.input.key, self.check)?;
+        record.status = MultipartUploadStatus::Aborting;
+        let row = (
+            UPLOAD_KEYSPACE.to_string(),
+            self.input.upload_key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.record = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DeleteStep {
+    /// Reads the record in the delete transaction, so only the delete that finds it counts.
+    ReadRecord,
+    /// Reads the bucket's distribution binding, whose upload inventory the delete closes.
+    ReadBinding,
+    CountUpload,
+    CountInventory,
+    DeleteRecords,
+    WriteCleanup,
+}
+
+/// Deletes the upload's records and queues its part blobs for cleanup in one transaction.
+#[derive(Debug, PartialEq)]
+struct DeleteRecords {
+    input: AbortUploadInput,
+    parts: Vec<MultipartPart>,
+    step: DeleteStep,
+    inventory: Option<InventoryUpdate>,
+}
+
+impl DeleteRecords {
+    fn new(input: AbortUploadInput, parts: Vec<MultipartPart>) -> Self {
+        Self {
+            input,
+            parts,
+            step: DeleteStep::ReadRecord,
+            inventory: None,
+        }
+    }
+
+    /// A concurrent delete of the record conflicts with this read, so a record is counted
+    /// closed once.
+    fn record_read(&mut self, value: Option<Value>) -> Turn<()> {
+        if value.is_none() {
+            return self.delete_records();
+        }
+        self.step = DeleteStep::ReadBinding;
+        let bucket = self.input.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, bucket)))
+    }
+
+    fn binding_read(&mut self, value: Option<Value>) -> Turn<()> {
+        let bucket = value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()?;
+        self.inventory = bucket
+            .and_then(|bucket| bucket.distribution)
+            .map(|binding| {
+                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+                change.upload = Some((self.input.upload_id, false));
+                InventoryUpdate::new(change)
+            });
+        self.step = DeleteStep::CountUpload;
+        Ok(Next::Call(upload_count(&self.input.bucket, -1)))
+    }
+
+    fn upload_counted(&mut self) -> Turn<()> {
+        let call = self
+            .inventory
+            .as_mut()
+            .and_then(InventoryUpdate::start_calls);
+        match call {
+            Some(call) => {
+                self.step = DeleteStep::CountInventory;
+                Ok(Next::Call(call.into_call()))
+            }
+            None => self.delete_records(),
+        }
+    }
+
+    fn inventory_counted(&mut self, result: IoResult) -> Turn<()> {
+        let inventory = self.inventory.as_mut();
+        let inventory = inventory.ok_or(AbortUploadError::InvalidOperationState)?;
+        match inventory.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.delete_records(),
+        }
+    }
+
+    fn delete_records(&mut self) -> Turn<()> {
+        let delete = delete_records_effect(self.input.upload_id, &self.parts, None)?;
+        self.step = DeleteStep::DeleteRecords;
+        Ok(Next::Call(delete.into()))
+    }
+
+    fn cleanup_records(&mut self) -> Turn<()> {
+        let mut writes = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            let work = BlobCleanupWork::DeleteBlob {
+                location: part.location.clone(),
+            };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                Ulid::generate().to_bytes().to_vec().into(),
+                work.to_bytes()?.into(),
+            ));
+        }
+        self.step = DeleteStep::WriteCleanup;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for DeleteRecords {
+    type Output = ();
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            DeleteStep::ReadRecord => self.record_read(result.value()?),
+            DeleteStep::ReadBinding => self.binding_read(result.value()?),
+            DeleteStep::CountUpload => {
+                result.done()?;
+                self.upload_counted()
+            }
+            DeleteStep::CountInventory => self.inventory_counted(result),
+            DeleteStep::DeleteRecords => {
+                result.event()?;
+                self.cleanup_records()
+            }
+            DeleteStep::WriteCleanup => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// Reopens a marked upload in one transaction; a record already gone stays gone.
+#[derive(Debug, PartialEq)]
+struct ResetUpload {
+    input: AbortUploadInput,
+    read: bool,
+}
+
+impl Operation for ResetUpload {
+    type Output = ();
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.read {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let Some(value) = result.value()? else {
+            return Ok(Next::Done(()));
+        };
+        let mut record = MultipartUpload::from_bytes(value.as_ref())?;
+        record.status = MultipartUploadStatus::Open;
+        let row = (
+            UPLOAD_KEYSPACE.to_string(),
+            self.input.upload_key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.read = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
