@@ -389,7 +389,7 @@ impl Operation for SetEmailOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetEmailState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -431,7 +431,9 @@ impl Operation for SetEmailOperation {
             },
             SetEmailState::WriteDocumentState {
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetEmailError::MissingTransaction);
@@ -447,6 +449,7 @@ impl Operation for SetEmailOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
             SetEmailState::DeleteAdminConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {

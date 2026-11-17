@@ -285,7 +285,7 @@ impl Operation for SetComputeOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetComputeState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -332,7 +332,10 @@ impl Operation for SetComputeOperation {
             SetComputeState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetComputeError::MissingTransaction);
@@ -348,15 +351,21 @@ impl Operation for SetComputeOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            SetComputeState::DeleteAdminConflicts { document } => match event {
+            SetComputeState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            SetComputeState::CommitTransaction { document } => match event {
+            SetComputeState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = SetComputeState::ScheduleSyncDrain { document };
@@ -373,6 +382,7 @@ impl Operation for SetComputeOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             SetComputeState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

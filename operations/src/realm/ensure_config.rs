@@ -518,7 +518,7 @@ impl Operation for EnsureConfigOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             EnsureConfigState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -557,7 +557,10 @@ impl Operation for EnsureConfigOperation {
             EnsureConfigState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(EnsureConfigError::MissingTransaction);
@@ -573,13 +576,17 @@ impl Operation for EnsureConfigOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            EnsureConfigState::DeleteAdminConflicts { document } => match event {
+            EnsureConfigState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
             EnsureConfigState::CommitNoop { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -593,7 +600,9 @@ impl Operation for EnsureConfigOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            EnsureConfigState::CommitTransaction { document } => match event {
+            EnsureConfigState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = EnsureConfigState::ScheduleSyncDrain { document };
@@ -604,6 +613,7 @@ impl Operation for EnsureConfigOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             EnsureConfigState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

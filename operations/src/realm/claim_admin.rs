@@ -335,7 +335,7 @@ impl Operation for ClaimInitialOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ClaimInitialState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -345,6 +345,7 @@ impl Operation for ClaimInitialOperation {
                 self.emit_auth_read(txn_id)
             }
             ClaimInitialState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self
@@ -372,6 +373,10 @@ impl Operation for ClaimInitialOperation {
                 admin_outbox_written,
                 stale_conflict_deletes,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return self
@@ -397,6 +402,9 @@ impl Operation for ClaimInitialOperation {
                 auth_doc,
                 admin_outbox_written,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return self
@@ -410,6 +418,8 @@ impl Operation for ClaimInitialOperation {
                 admin_outbox_written,
                 ..
             } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return self.unexpected_event(
@@ -426,6 +436,7 @@ impl Operation for ClaimInitialOperation {
                 self.emit_auth_announce(auth_doc)
             }
             ClaimInitialState::ScheduleDocumentDrain { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_schedule(event, auth_doc)
             }
             ClaimInitialState::AbortTransaction => {
@@ -439,6 +450,7 @@ impl Operation for ClaimInitialOperation {
                 smallvec![]
             }
             ClaimInitialState::AnnounceAuthDoc { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 let got = format!("{event:?}");
                 let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event
                 else {

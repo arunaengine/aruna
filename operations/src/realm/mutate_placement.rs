@@ -1129,7 +1129,7 @@ impl Operation for MutatePlacementOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             MutatePlacementState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -1182,7 +1182,9 @@ impl Operation for MutatePlacementOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            MutatePlacementState::ReadRegistryReferences { check } => match event {
+            MutatePlacementState::ReadRegistryReferences { check } => {
+                let check = check.clone();
+                match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -1207,8 +1209,11 @@ impl Operation for MutatePlacementOperation {
                 other => {
                     self.unexpected_event("metadata registry scan result", format!("{other:?}"))
                 }
+            }
             },
-            MutatePlacementState::ReadPendingReferences { check } => match event {
+            MutatePlacementState::ReadPendingReferences { check } => {
+                let check = check.clone();
+                match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -1238,11 +1243,15 @@ impl Operation for MutatePlacementOperation {
                 other => {
                     self.unexpected_event("pending projection scan result", format!("{other:?}"))
                 }
+            }
             },
             MutatePlacementState::ReadPendingEvents {
                 check,
                 next_start_after,
-            } => match event {
+            } => {
+                let check = check.clone();
+                let next_start_after = next_start_after.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     for (key, value) in values {
                         let Some(value) = value else {
@@ -1278,11 +1287,15 @@ impl Operation for MutatePlacementOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("pending create event reads", format!("{other:?}")),
+            }
             },
             MutatePlacementState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(MutatePlacementError::MissingTransaction);
@@ -1298,13 +1311,17 @@ impl Operation for MutatePlacementOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            MutatePlacementState::DeleteAdminConflicts { document } => match event {
+            MutatePlacementState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
             MutatePlacementState::CommitTransaction { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {

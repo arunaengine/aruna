@@ -284,7 +284,7 @@ impl Operation for SetPortalOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetPortalState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -331,7 +331,10 @@ impl Operation for SetPortalOperation {
             SetPortalState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetPortalError::MissingTransaction);
@@ -347,15 +350,21 @@ impl Operation for SetPortalOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            SetPortalState::DeleteAdminConflicts { document } => match event {
+            SetPortalState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            SetPortalState::CommitTransaction { document } => match event {
+            SetPortalState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = SetPortalState::ScheduleSyncDrain { document };
@@ -372,6 +381,7 @@ impl Operation for SetPortalOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             SetPortalState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

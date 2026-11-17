@@ -350,7 +350,7 @@ impl Operation for NodeNameOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             NodeNameState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -393,7 +393,9 @@ impl Operation for NodeNameOperation {
             },
             NodeNameState::WriteState {
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(NodeNameError::MissingTransaction);
@@ -409,6 +411,7 @@ impl Operation for NodeNameOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
             NodeNameState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),

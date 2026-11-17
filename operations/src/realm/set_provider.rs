@@ -343,7 +343,7 @@ impl Operation for SetProviderOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             SetProviderState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -390,7 +390,10 @@ impl Operation for SetProviderOperation {
             SetProviderState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetProviderError::MissingTransaction);
@@ -406,15 +409,21 @@ impl Operation for SetProviderOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            SetProviderState::DeleteAdminConflicts { document } => match event {
+            SetProviderState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            SetProviderState::CommitTransaction { document } => match event {
+            SetProviderState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = SetProviderState::ScheduleSyncDrain { document };
@@ -431,6 +440,7 @@ impl Operation for SetProviderOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             SetProviderState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

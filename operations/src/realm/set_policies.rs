@@ -300,7 +300,7 @@ impl Operation for SetPoliciesOperation {
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
-        match self.state.clone() {
+        match &self.state {
             SetPoliciesState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -346,7 +346,10 @@ impl Operation for SetPoliciesOperation {
             SetPoliciesState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetPoliciesError::MissingTransaction);
@@ -362,15 +365,21 @@ impl Operation for SetPoliciesOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            SetPoliciesState::DeleteAdminConflicts { document } => match event {
+            SetPoliciesState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            SetPoliciesState::CommitTransaction { document } => match event {
+            SetPoliciesState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = SetPoliciesState::ScheduleSyncDrain { document };
@@ -387,6 +396,7 @@ impl Operation for SetPoliciesOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             SetPoliciesState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
