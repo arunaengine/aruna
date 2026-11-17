@@ -645,9 +645,6 @@ async fn reemit_evicted_documents(
             return false;
         }
     };
-    if let Some(message) = &outcome.drain_error {
-        warn!(task_id = ?TaskKey::DrainSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
-    }
     if outcome.written > 0 {
         info!(
             count = outcome.written,
