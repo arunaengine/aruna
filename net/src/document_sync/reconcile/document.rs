@@ -13,6 +13,7 @@ use aruna_core::storage_entries::{
     create_projection_entries, shard_manifest_entry, sync_revision_entry,
 };
 use aruna_core::structs::SyncQuarantineIdentity;
+use aruna_core::sync_checks::{EventScreen, screen_event};
 use aruna_core::types::Value;
 use byteview::ByteView;
 use tracing::warn;
@@ -281,43 +282,22 @@ impl DocumentSyncService {
             if !is_config_candidate(&event) {
                 state.flush_config(&self.storage).await?;
             }
-            if self
+            let publisher_allowed = !self
                 .shard_publishers
                 .read()
                 .get(&topic_id)
-                .is_some_and(|policy| !policy.allows(&actor_id, actor_seq))
-            {
-                warn!(
-                    %topic_id,
-                    %actor_id,
-                    "Rejecting shard event from a publisher outside the current holder set"
-                );
-                state.add_rejection(SyncRejection::new(
-                    identity,
-                    event,
-                    "shard publisher is outside the current holder set",
-                ));
-                continue;
-            }
+                .is_some_and(|policy| !policy.allows(&actor_id, actor_seq));
             let target_topic_id = event
                 .target()
                 .sync_topic_id(self.realm_id, &event.placement());
-            if target_topic_id != topic_id {
-                // Heartbeats left on the retired node info topic are republished, so drop them.
-                if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
+            match screen_event(topic_id, target_topic_id, event.target(), publisher_allowed) {
+                EventScreen::Apply => {}
+                EventScreen::Drop => continue,
+                EventScreen::Reject(reason) => {
+                    warn!(%topic_id, %actor_id, %target_topic_id, reason, "Rejecting a document sync event");
+                    state.add_rejection(SyncRejection::new(identity, event, reason));
                     continue;
                 }
-                warn!(
-                    %topic_id,
-                    %target_topic_id,
-                    "Skipping document sync event whose target does not match its topic"
-                );
-                state.add_rejection(SyncRejection::new(
-                    identity,
-                    event,
-                    "event target does not match its topic",
-                ));
-                continue;
             }
             apply_batch_event(self, topic_id, actor_id, identity, event, &mut state).await?;
         }

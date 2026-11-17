@@ -37,7 +37,7 @@ pub(super) async fn apply_link_event(
             reason,
         )))
     };
-    if actor_id != ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor)) {
+    if !published_by(topic_id, actor_id, &change.current.actor) {
         return reject("repository link revision actor is not its publisher".to_string());
     }
     if let Err(reason) = validate_link(&target, bytes.as_deref(), &change) {

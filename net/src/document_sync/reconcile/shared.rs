@@ -10,12 +10,12 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use tracing::warn;
 
 use crate::document_sync::storage::storage_read_from;
-use crate::document_sync::{DocumentSyncService, SyncRejection, node_to_peer};
+use crate::document_sync::{DocumentSyncService, SyncRejection};
 use crate::error::{NetError, Result};
 
 use aruna_core::sync_checks::{
-    validate_node_upsert, validate_register_upsert, validate_usage_upsert, validate_watch_delete,
-    validate_watch_interest, validate_watch_upsert,
+    published_by, shared_verdict, validate_register_upsert, validate_watch_delete,
+    validate_watch_upsert,
 };
 
 pub(super) enum SharedOutcome {
@@ -38,9 +38,7 @@ pub(super) async fn apply_watch_event(
             bytes,
             change,
         } => {
-            let expected_actor =
-                ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
-            if actor_id != expected_actor {
+            if !published_by(topic_id, actor_id, &change.current.actor) {
                 warn!(
                     %topic_id,
                     %owner,
@@ -85,9 +83,7 @@ pub(super) async fn apply_watch_event(
             target: target @ DocumentTarget::WatchSubscription { owner, watch_id },
             change,
         } => {
-            let expected_actor =
-                ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
-            if actor_id != expected_actor {
+            if !published_by(topic_id, actor_id, &change.current.actor) {
                 warn!(
                     %topic_id,
                     %owner,
@@ -131,9 +127,7 @@ pub(super) async fn apply_watch_event(
             bytes,
             change,
         } if register_target(&target) => {
-            let expected_actor =
-                ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
-            let mut reason = match actor_id == expected_actor {
+            let mut reason = match published_by(topic_id, actor_id, &change.current.actor) {
                 true => validate_register_upsert(&target, &bytes, &change)
                     .err()
                     .map(|reason| format!("invalid notification setting: {reason}")),
@@ -190,6 +184,8 @@ pub(super) async fn apply_watch_event(
     }
 }
 
+/// Stores a usage snapshot, watch interest digest or node info document that its own node
+/// published; anything else on the shared realm topic is quarantined.
 pub(super) async fn apply_shared_event(
     service: &DocumentSyncService,
     topic_id: ::irokle::TopicId,
@@ -197,217 +193,35 @@ pub(super) async fn apply_shared_event(
     identity: SyncQuarantineIdentity,
     event: DocumentEvent,
 ) -> Result<SharedOutcome> {
-    if matches!(event.target(), DocumentTarget::NodeUsage { .. }) {
-        return apply_usage_event(service, topic_id, actor_id, identity, event).await;
+    if !matches!(
+        event.target(),
+        DocumentTarget::NodeUsage { .. }
+            | DocumentTarget::WatchInterest { .. }
+            | DocumentTarget::NodeInfo { .. }
+    ) {
+        return Err(NetError::Bootstrap(
+            "shared handler received a non-shared event".to_string(),
+        ));
     }
-    if matches!(event.target(), DocumentTarget::WatchInterest { .. }) {
-        return apply_interest_event(service, topic_id, actor_id, identity, event).await;
+    if let Err(reason) = shared_verdict(topic_id, actor_id, &event) {
+        warn!(%topic_id, target = ?event.target(), %reason, "Rejecting a shared realm document");
+        return Ok(SharedOutcome::Rejected(SyncRejection::new(
+            identity, event, reason,
+        )));
     }
-    if matches!(event.target(), DocumentTarget::NodeInfo { .. }) {
-        return apply_node_event(service, topic_id, actor_id, identity, event).await;
-    }
-    Err(NetError::Bootstrap(
-        "shared handler received a non-shared event".to_string(),
-    ))
-}
-
-async fn apply_usage_event(
-    service: &DocumentSyncService,
-    topic_id: ::irokle::TopicId,
-    actor_id: ::irokle::ActorId,
-    identity: SyncQuarantineIdentity,
-    event: DocumentEvent,
-) -> Result<SharedOutcome> {
-    match event {
-        DocumentEvent::Upsert {
-            event_id,
-            target:
-                target @ DocumentTarget::NodeUsage {
-                    node_id: snapshot_node,
-                    ..
-                },
-            bytes,
-            change,
-        } => {
-            // Shared realm topic: the signed publisher must own the claimed node.
-            let expected_actor = ::irokle::actor_id_for(topic_id, node_to_peer(&snapshot_node));
-            if actor_id != expected_actor {
-                warn!(
-                    %topic_id,
-                    node_id = %snapshot_node,
-                    "Rejecting node usage snapshot: publisher is not the owning node"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    "node usage publisher is not the owning node",
-                )));
-            }
-            if let Err(reason) = validate_usage_upsert(&target, &bytes) {
-                warn!(
-                    %topic_id,
-                    node_id = %snapshot_node,
-                    %reason,
-                    "Rejecting invalid node usage snapshot"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    format!("invalid node usage snapshot: {reason}"),
-                )));
-            }
-            service.apply_upsert(target.clone(), bytes, change).await?;
-            Ok(SharedOutcome::Applied(target))
-        }
-        event => reject_shared_event(topic_id, identity, event),
-    }
-}
-
-async fn apply_interest_event(
-    service: &DocumentSyncService,
-    topic_id: ::irokle::TopicId,
-    actor_id: ::irokle::ActorId,
-    identity: SyncQuarantineIdentity,
-    event: DocumentEvent,
-) -> Result<SharedOutcome> {
-    match event {
-        DocumentEvent::Upsert {
-            event_id,
-            target:
-                target @ DocumentTarget::WatchInterest {
-                    realm_id,
-                    node_id: interest_node,
-                },
-            bytes,
-            change,
-        } => {
-            // Shared realm topic: the signed publisher must own the claimed node.
-            let expected_actor = ::irokle::actor_id_for(topic_id, node_to_peer(&interest_node));
-            if actor_id != expected_actor {
-                warn!(
-                    %topic_id,
-                    realm_id = %realm_id,
-                    node_id = %interest_node,
-                    "Rejecting watch interest digest: publisher is not the owning node"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    "watch interest publisher is not the owning node",
-                )));
-            }
-            if let Err(reason) = validate_watch_interest(&target, &bytes) {
-                warn!(
-                    %topic_id,
-                    realm_id = %realm_id,
-                    node_id = %interest_node,
-                    %reason,
-                    "Rejecting invalid watch interest digest"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    format!("invalid watch interest digest: {reason}"),
-                )));
-            }
-            service.apply_upsert(target.clone(), bytes, change).await?;
-            Ok(SharedOutcome::Applied(target))
-        }
-        event => reject_shared_event(topic_id, identity, event),
-    }
-}
-
-async fn apply_node_event(
-    service: &DocumentSyncService,
-    topic_id: ::irokle::TopicId,
-    actor_id: ::irokle::ActorId,
-    identity: SyncQuarantineIdentity,
-    event: DocumentEvent,
-) -> Result<SharedOutcome> {
-    match event {
-        DocumentEvent::Upsert {
-            event_id,
-            target:
-                target @ DocumentTarget::NodeInfo {
-                    node_id: info_node, ..
-                },
-            bytes,
-            change,
-        } => {
-            // Shared realm topic: the signed publisher must own the claimed node.
-            let expected_actor = ::irokle::actor_id_for(topic_id, node_to_peer(&info_node));
-            if actor_id != expected_actor {
-                warn!(
-                    %topic_id,
-                    node_id = %info_node,
-                    "Rejecting node info document: publisher is not the owning node"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    "node info publisher is not the owning node",
-                )));
-            }
-            if let Err(reason) = validate_node_upsert(&target, &bytes) {
-                warn!(
-                    %topic_id,
-                    node_id = %info_node,
-                    %reason,
-                    "Rejecting invalid node info document"
-                );
-                return Ok(SharedOutcome::Rejected(SyncRejection::new(
-                    identity,
-                    DocumentEvent::Upsert {
-                        event_id,
-                        target,
-                        bytes,
-                        change,
-                    },
-                    format!("invalid node info document: {reason}"),
-                )));
-            }
-            service.apply_upsert(target.clone(), bytes, change).await?;
-            Ok(SharedOutcome::Applied(target))
-        }
-        event => {
-            // Node info documents sync only as owner-validated upserts.
-            warn!(
-                %topic_id,
-                target = ?event.target(),
-                "Skipping unsupported non-upsert node info document event"
-            );
-            Ok(SharedOutcome::Rejected(SyncRejection::new(
-                identity,
-                event,
-                "unsupported non-upsert node info document event",
-            )))
-        }
-    }
+    let DocumentEvent::Upsert {
+        target,
+        bytes,
+        change,
+        ..
+    } = event
+    else {
+        return Err(NetError::Bootstrap(
+            "shared realm document verdict admitted a non-upsert event".to_string(),
+        ));
+    };
+    service.apply_upsert(target.clone(), bytes, change).await?;
+    Ok(SharedOutcome::Applied(target))
 }
 
 /// Notification settings and owner secrets: immutable register writes.
@@ -424,22 +238,4 @@ async fn stored_row(
     let key_space = target.storage_keyspace().to_string();
     let row = storage_read_from(&service.storage, key_space, target.storage_key()).await?;
     Ok(row.map(|row| row.to_vec()))
-}
-
-fn reject_shared_event(
-    topic_id: ::irokle::TopicId,
-    identity: SyncQuarantineIdentity,
-    event: DocumentEvent,
-) -> Result<SharedOutcome> {
-    // Shared realm snapshots sync only as owner-validated upserts.
-    warn!(
-        %topic_id,
-        target = ?event.target(),
-        "Skipping unsupported non-upsert shared document event"
-    );
-    Ok(SharedOutcome::Rejected(SyncRejection::new(
-        identity,
-        event,
-        "unsupported non-upsert shared realm document event",
-    )))
 }

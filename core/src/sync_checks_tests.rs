@@ -245,3 +245,119 @@ fn watch_changes_fence() {
     assert!(!watch_change_applies(Some(Delete), Upsert));
     assert!(!watch_change_applies(Some(Delete), Delete));
 }
+
+fn topic(seed: u8) -> irokle::TopicId {
+    irokle::TopicId::from_bytes([seed; 32])
+}
+
+fn actor(topic_id: irokle::TopicId, node_id: NodeId) -> irokle::ActorId {
+    irokle::actor_id_for(topic_id, irokle::PeerId::from_bytes(*node_id.as_bytes()))
+}
+
+fn change(kind: DocumentChangeKind) -> DocumentChange {
+    DocumentChange {
+        base: None,
+        current: crate::document::DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(1, 1),
+            actor: node(7),
+            updated_at_ms: 1,
+        },
+        kind,
+        placement: crate::structs::placement::record::PlacementRef::NIL,
+    }
+}
+
+fn usage_event(owner: NodeId, bytes: Vec<u8>) -> DocumentEvent {
+    DocumentEvent::Upsert {
+        event_id: Ulid::from_parts(2, 2),
+        target: DocumentTarget::NodeUsage {
+            realm_id: RealmId::from_bytes([2u8; 32]),
+            node_id: owner,
+            group_id: None,
+        },
+        bytes,
+        change: change(DocumentChangeKind::Upsert),
+    }
+}
+
+fn usage_bytes(owner: NodeId) -> Vec<u8> {
+    NodeUsageSnapshot {
+        node_id: owner,
+        counters: Default::default(),
+        replicas: Default::default(),
+        revisions: Default::default(),
+    }
+    .to_bytes()
+    .unwrap()
+}
+
+#[test]
+fn screens_batch_events() {
+    let target = DocumentTarget::RealmConfig {
+        realm_id: RealmId::from_bytes([2u8; 32]),
+    };
+    let info = DocumentTarget::NodeInfo {
+        realm_id: RealmId::from_bytes([2u8; 32]),
+        node_id: node(7),
+    };
+    assert_eq!(
+        screen_event(topic(1), topic(1), &target, true),
+        EventScreen::Apply
+    );
+    assert_eq!(
+        screen_event(topic(1), topic(2), &info, true),
+        EventScreen::Drop
+    );
+    assert!(matches!(
+        screen_event(topic(1), topic(2), &target, true),
+        EventScreen::Reject(_)
+    ));
+    assert!(matches!(
+        screen_event(topic(1), topic(1), &target, false),
+        EventScreen::Reject(_)
+    ));
+}
+
+#[test]
+fn shared_needs_owner() {
+    let owner = node(7);
+    let topic_id = topic(3);
+    assert!(published_by(topic_id, actor(topic_id, owner), &owner));
+    assert!(!published_by(topic_id, actor(topic_id, node(8)), &owner));
+
+    let event = usage_event(owner, usage_bytes(owner));
+    assert_eq!(
+        shared_verdict(topic_id, actor(topic_id, owner), &event),
+        Ok(())
+    );
+    assert_eq!(
+        shared_verdict(topic_id, actor(topic_id, node(8)), &event),
+        Err("node usage publisher is not the owning node".to_string())
+    );
+    let forged = usage_event(owner, usage_bytes(node(9)));
+    assert!(
+        shared_verdict(topic_id, actor(topic_id, owner), &forged)
+            .is_err_and(|reason| reason.starts_with("invalid node usage snapshot"))
+    );
+    let deleted = DocumentEvent::Delete {
+        event_id: Ulid::from_parts(3, 3),
+        target: DocumentTarget::NodeInfo {
+            realm_id: RealmId::from_bytes([2u8; 32]),
+            node_id: owner,
+        },
+        change: change(DocumentChangeKind::Delete),
+    };
+    assert_eq!(
+        shared_verdict(topic_id, actor(topic_id, owner), &deleted),
+        Err("unsupported non-upsert node info document event".to_string())
+    );
+    let other = DocumentEvent::Delete {
+        event_id: Ulid::from_parts(4, 4),
+        target: DocumentTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([2u8; 32]),
+        },
+        change: change(DocumentChangeKind::Delete),
+    };
+    assert!(shared_verdict(topic_id, actor(topic_id, owner), &other).is_err());
+}

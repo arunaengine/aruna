@@ -4,8 +4,9 @@
 
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::UserId;
-use crate::document::{DocumentChange, DocumentChangeKind, DocumentTarget};
+use crate::document::{DocumentChange, DocumentChangeKind, DocumentEvent, DocumentTarget};
 use crate::structs::execution::notification_watch::{
     INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
     WatchSubscription, interest_node_id, interest_realm_id,
@@ -373,6 +374,84 @@ pub fn watch_change_applies(
         | (Some(DocumentChangeKind::Delete), _) => false,
     }
 }
+
+/// Whether `actor_id` is the Irokle actor of `node_id` on `topic_id`, that is, whether that node
+/// signed the event.
+pub fn published_by(
+    topic_id: irokle::TopicId,
+    actor_id: irokle::ActorId,
+    node_id: &NodeId,
+) -> bool {
+    actor_id == irokle::actor_id_for(topic_id, irokle::PeerId::from_bytes(*node_id.as_bytes()))
+}
+
+/// What a reconcile does with one event of a topic batch before its family applies it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EventScreen {
+    Apply,
+    /// Node info left on its retired topic: it is republished, so the event is skipped.
+    Drop,
+    Reject(&'static str),
+}
+
+/// Screens one event of the batch read from `batch_topic`. A shard event from a publisher outside
+/// the current holder set and an event addressed to another topic are refused.
+pub fn screen_event(
+    batch_topic: irokle::TopicId,
+    target_topic: irokle::TopicId,
+    target: &DocumentTarget,
+    publisher_allowed: bool,
+) -> EventScreen {
+    if !publisher_allowed {
+        return EventScreen::Reject("shard publisher is outside the current holder set");
+    }
+    if target_topic == batch_topic {
+        return EventScreen::Apply;
+    }
+    match target {
+        DocumentTarget::NodeInfo { .. } => EventScreen::Drop,
+        _ => EventScreen::Reject("event target does not match its topic"),
+    }
+}
+
+/// Whether a shared realm document may be stored: usage snapshots, watch interest digests and
+/// node info sync only as upserts that the node they describe published, valid for their
+/// target. The error is the rejection reason; a target of another family is refused too.
+pub fn shared_verdict(
+    topic_id: irokle::TopicId,
+    actor_id: irokle::ActorId,
+    event: &DocumentEvent,
+) -> Result<(), String> {
+    let (owner, kind, non_upsert) = match event.target() {
+        DocumentTarget::NodeUsage { node_id, .. } => (node_id, "node usage", SHARED_NON_UPSERT),
+        DocumentTarget::WatchInterest { node_id, .. } => {
+            (node_id, "watch interest", SHARED_NON_UPSERT)
+        }
+        DocumentTarget::NodeInfo { node_id, .. } => (
+            node_id,
+            "node info",
+            "unsupported non-upsert node info document event",
+        ),
+        _ => return Err("not a shared realm document".to_string()),
+    };
+    let DocumentEvent::Upsert { target, bytes, .. } = event else {
+        return Err(non_upsert.to_string());
+    };
+    if !published_by(topic_id, actor_id, owner) {
+        return Err(format!("{kind} publisher is not the owning node"));
+    }
+    match target {
+        DocumentTarget::NodeUsage { .. } => validate_usage_upsert(target, bytes)
+            .map_err(|reason| format!("invalid node usage snapshot: {reason}")),
+        DocumentTarget::WatchInterest { .. } => validate_watch_interest(target, bytes)
+            .map_err(|reason| format!("invalid watch interest digest: {reason}")),
+        _ => validate_node_upsert(target, bytes)
+            .map(|_| ())
+            .map_err(|reason| format!("invalid node info document: {reason}")),
+    }
+}
+
+const SHARED_NON_UPSERT: &str = "unsupported non-upsert shared realm document event";
 
 #[cfg(test)]
 #[path = "sync_checks_tests.rs"]

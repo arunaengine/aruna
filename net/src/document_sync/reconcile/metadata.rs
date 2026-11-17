@@ -11,11 +11,11 @@ use tracing::warn;
 
 use crate::document_sync::{
     DocumentSyncDependency, DocumentSyncService, MetadataPlacementOutcome, PendingCreateApply,
-    SyncRejection, node_to_peer,
+    SyncRejection,
 };
 use crate::error::{NetError, Result};
 
-use aruna_core::sync_checks::{validate_pid_mapping, validate_policy_document};
+use aruna_core::sync_checks::{published_by, validate_pid_mapping, validate_policy_document};
 
 pub(super) enum MetadataOutcome {
     Applied {
@@ -361,8 +361,7 @@ async fn apply_mapping_event(
         ))));
     }
     // The revision actor is the only publisher of its transition.
-    let expected_actor = ::irokle::actor_id_for(topic_id, node_to_peer(&mapping.revision.actor));
-    if actor_id != expected_actor {
+    if !published_by(topic_id, actor_id, &mapping.revision.actor) {
         warn!(
             %topic_id,
             %document_id,
@@ -447,9 +446,7 @@ async fn apply_placement_event(
         ))));
     }
     // The stored actor is the original publisher, including through a relay.
-    let expected_actor =
-        ::irokle::actor_id_for(topic_id, node_to_peer(&document.publication.publisher));
-    if actor_id != expected_actor {
+    if !published_by(topic_id, actor_id, &document.publication.publisher) {
         warn!(
             %topic_id,
             %policy_id,

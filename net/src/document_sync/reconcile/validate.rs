@@ -97,7 +97,7 @@ pub(in crate::document_sync) async fn relay_publisher_allowed(
         .iter()
         .filter(|node| node.kind.is_sync_eligible())
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
-        .any(|node_id| publisher == ::irokle::actor_id_for(topic_id, node_to_peer(&node_id))))
+        .any(|node_id| published_by(topic_id, publisher, &node_id)))
 }
 
 /// Resolves the plan a report names (stored config first, reduced state as
@@ -949,8 +949,7 @@ async fn validate_admin_envelope(
     }
     // A relay hop must itself be a realm node allowed administrative traffic;
     // before config materializes only the origin may publish.
-    let self_published = authenticated_actor_id
-        == ::irokle::actor_id_for(topic_id, node_to_peer(&event.origin_node_id));
+    let self_published = published_by(topic_id, authenticated_actor_id, &event.origin_node_id);
     if !self_published
         && !relay_publisher_allowed(storage, topic_id, authenticated_actor_id, realm_id).await?
     {

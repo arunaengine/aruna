@@ -69,8 +69,7 @@ pub(super) async fn apply_vault_event(
     if !signed {
         return reject("vault record lacks its origin signature");
     }
-    let origin = ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor));
-    if actor_id != origin
+    if !published_by(topic_id, actor_id, &change.current.actor)
         && !relay_publisher_allowed(&service.storage, topic_id, actor_id, realm_id).await?
     {
         return reject("vault record publisher is neither its origin nor a realm relay");

@@ -88,8 +88,8 @@ use aruna_core::structs::{
     quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
 };
 use aruna_core::sync_checks::{
-    node_info_supersedes, validate_node_upsert, validate_pid_mapping, validate_policy_document,
-    validate_usage_upsert, validate_watch_interest, watch_change_applies,
+    node_info_supersedes, published_by, validate_node_upsert, validate_pid_mapping,
+    validate_policy_document, validate_usage_upsert, validate_watch_interest, watch_change_applies,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
