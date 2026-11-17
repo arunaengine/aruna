@@ -1233,7 +1233,7 @@ async fn admit_here(
     // Scheduling and replication are armed only after the claim is durable, so
     // a failed commit never leaves a round pointing at a family that is absent.
     arm_family(context, identity.family(), now_ms).await;
-    super::outbox::kick(context).await;
+    super::outbox::timers::kick(context).await;
     Ok(AcceptedSubmission {
         job_id: admitted.job_id,
         created: admitted.created,

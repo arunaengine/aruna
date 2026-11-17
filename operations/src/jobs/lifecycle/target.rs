@@ -423,7 +423,7 @@ async fn accepted(
         {
             cancel_local_run(context.as_ref(), receipt.physical_job_id).await;
         }
-        super::outbox::kick(context).await;
+        super::outbox::timers::kick(context).await;
         schedule_local(context).await;
     }
     Some(decision)

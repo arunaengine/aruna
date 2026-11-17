@@ -194,7 +194,7 @@ pub async fn publish_state(
             if state == PhysicalExecutionState::Error {
                 arm_family(context, chain.family, unix_timestamp_millis()).await;
             }
-            super::outbox::kick(context).await;
+            super::outbox::timers::kick(context).await;
             true
         }
         Ok(outcome) => {
