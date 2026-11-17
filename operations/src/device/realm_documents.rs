@@ -37,10 +37,9 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
-use crate::node::node_info::write_info_document;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
-use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node_state::InstallInfoOperation;
 
 /// Attempts in which every answering peer served a copy the marker does not
 /// cover before the marker is treated as wrong. The realm agreeing against a
@@ -683,31 +682,14 @@ pub async fn install_group_docs(
 }
 
 async fn install_node_infos(context: &Arc<DriverContext>, documents: &[NodeInfoDocument]) -> bool {
-    for document in documents {
-        let node_id = document.node_id;
-        let read = drive(ReadInfoOperation::new(vec![node_id]), context.as_ref()).await;
-        match read.map(|mut documents| documents.remove(&node_id)) {
-            Ok(Some(stored)) if stored == *document => continue,
-            Ok(_) => {}
-            Err(error) => {
-                warn!(
-                    node_id = %document.node_id,
-                    %error,
-                    "Failed to read a fetched node info document"
-                );
-                return false;
-            }
-        }
-        if let Err(error) = write_info_document(&context.storage_handle, document).await {
-            warn!(
-                node_id = %document.node_id,
-                %error,
-                "Failed to install a fetched node info document"
-            );
-            return false;
+    let install = InstallInfoOperation::new(documents.to_vec());
+    match drive(install, context.as_ref()).await {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(%error, "Failed to install the fetched node info documents");
+            false
         }
     }
-    true
 }
 
 /// The management api urls a realm node last served this device, in the order

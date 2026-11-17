@@ -879,28 +879,6 @@ async fn publish_info(
         .map_err(|error| error.to_string())
 }
 
-pub(crate) async fn write_info_document(
-    storage: &StorageHandle,
-    document: &NodeInfoDocument,
-) -> Result<(), String> {
-    // `to_bytes` validates, so a locally built advertisement that broke its own
-    // bounds never reaches storage or the shared realm topic.
-    let value = Value::from(document.to_bytes().map_err(|error| error.to_string())?);
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_key(document.node_id)),
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info write failed: {}", other.label())),
-    }
-}
-
 async fn node_info_row(
     storage: &StorageHandle,
     node_id: NodeId,
