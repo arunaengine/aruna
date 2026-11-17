@@ -388,6 +388,9 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
     use aruna_core::structs::identity::realm::RealmId;
 
     fn replica() -> ReplicaRecord {
@@ -476,6 +479,88 @@ mod pure_tests {
         );
         replica.state = ReplicaState::LocalOnly;
         assert_eq!(document_state(&replica, &[]), DocumentState::LocalOnly);
+    }
+
+    fn page(values: Vec<(Key, Value)>, next: Option<&[u8]>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: next.map(|key| key.to_vec().into()),
+        })
+    }
+
+    fn row(replica: &ReplicaRecord) -> (Key, Value) {
+        let (_, key, value) = replica_entry(replica).unwrap();
+        (key, value)
+    }
+
+    // Pages are read until the cursor ends; an undecodable row is skipped.
+    #[test]
+    fn lists_every_page() {
+        let held = replica();
+        let mut list = ListReplicasOperation::new();
+        let next = scan_page(DEVICE_REPLICA_KEYSPACE, Some(b"a".to_vec().into()));
+        check_trace(
+            &mut list,
+            &scan_page(DEVICE_REPLICA_KEYSPACE, None),
+            vec![
+                (page(vec![row(&held)], Some(b"a")), next.into_vec()),
+                (
+                    page(vec![(b"b".to_vec().into(), Vec::new().into())], None),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(list.finalize(), Ok(vec![held]));
+    }
+
+    // Replica rows count by their size and graphs by their stored size, over all pages.
+    #[test]
+    fn sums_cache_usage() {
+        let held = replica();
+        let graph = |size: u64| -> (Key, Value) {
+            (b"g".to_vec().into(), size.to_be_bytes().to_vec().into())
+        };
+        let graphs = scan_page(DEVICE_GRAPH_KEYSPACE, None);
+        let next = scan_page(DEVICE_GRAPH_KEYSPACE, Some(b"g".to_vec().into()));
+        let mut usage = CacheUsageOperation::new();
+        check_trace(
+            &mut usage,
+            &scan_page(DEVICE_REPLICA_KEYSPACE, None),
+            vec![
+                (page(vec![row(&held)], None), graphs.into_vec()),
+                (page(vec![graph(4_000)], Some(b"g")), next.into_vec()),
+                (page(vec![graph(6)], None), Vec::new()),
+            ],
+        );
+        assert_eq!(usage.finalize(), Ok(replica_size(&held) + 4_006));
+    }
+
+    // A failed scan fails both operations; other events are refused and nothing finishes early.
+    #[test]
+    fn scan_failures_fail() {
+        let error = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        let mut list = ListReplicasOperation::new();
+        list.start();
+        list.step(error());
+        assert_eq!(list.finalize(), Err(StorageError::Timeout.into()));
+        let mut usage = CacheUsageOperation::new();
+        usage.start();
+        usage.step(page(Vec::new(), None));
+        usage.step(error());
+        assert_eq!(usage.finalize(), Err(StorageError::Timeout.into()));
+
+        let all = sample_events().len();
+        let lists = rejects_events(ListReplicasOperation::new, sample_events, |_| false);
+        let usages = rejects_events(CacheUsageOperation::new, sample_events, |_| false);
+        assert_eq!((lists.len(), usages.len()), (all, all));
+        rejects_finalize(ListReplicasOperation::new());
+        rejects_finalize(CacheUsageOperation::new());
+        assert!(ListReplicasOperation::new().abort().is_empty());
+        assert!(CacheUsageOperation::new().abort().is_empty());
     }
 
     #[test]
