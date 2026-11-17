@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::EVENT_LOG_KEYSPACE;
 use aruna_core::metadata::{
     EVENT_LIMIT, MetadataError, MetadataEventRecord, MetadataRawRevision, RAW_BYTES_LIMIT,
@@ -175,13 +174,13 @@ impl RawEventsOperation {
         let after = self.start.take();
         Ok(Next::Call(match self.txn_id {
             // The caller's transaction is not the runner's, so the page goes out as an effect.
-            Some(txn_id) => IoCall::Effect(Effect::Storage(StorageEffect::Iter {
+            Some(txn_id) => IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
                 key_space: EVENT_LOG_KEYSPACE.to_string(),
                 prefix: Some(prefix),
                 start: after.map(IterStart::After),
                 limit: self.page_limit,
                 txn_id: Some(txn_id),
-            })),
+            }))),
             None => IoCall::Page {
                 space: EVENT_LOG_KEYSPACE.to_string(),
                 prefix,
@@ -211,18 +210,6 @@ impl RawEventsOperation {
     }
 }
 
-/// The rows of an event page read alone or inside the caller's transaction.
-fn page_answer(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), RawReadError> {
-    match result {
-        IoResult::Event(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })) => Ok((values, next_start_after)),
-        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-        other => Ok(page_rows(other)?),
-    }
-}
-
 impl Operation for RawEventsOperation {
     type Output = Vec<MetadataEventRecord>;
     type Error = RawReadError;
@@ -232,7 +219,7 @@ impl Operation for RawEventsOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RawReadError> {
-        let (values, next) = page_answer(result)?;
+        let (values, next) = page_rows(result)?;
         if values.len() > self.page_limit {
             return Err(budget_error("page size limit exceeded"));
         }
@@ -254,6 +241,7 @@ impl Operation for RawEventsOperation {
 pub(crate) mod call_tests {
     use super::*;
     use crate::metadata::raw_revision::tests::test_event;
+    use aruna_core::events::{Event, StorageEvent};
 
     pub(crate) fn event(seed: u64) -> MetadataEventRecord {
         test_event(Ulid::from_parts(1, seed), seed)
@@ -351,14 +339,14 @@ pub(crate) mod call_tests {
         };
         assert_eq!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(iter))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(iter)))))
         );
         let answer = StorageEvent::IterResult {
             values: vec![row(&first)],
             next_start_after: None,
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Storage(answer))),
+            operation.next(IoResult::Event(Box::new(Event::Storage(answer)))),
             Ok(Next::Done(vec![first]))
         );
     }

@@ -7,16 +7,16 @@ use std::collections::VecDeque;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::storage_entries::{metadata_document_key, parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::{call_done, page_rows, read_values};
+use crate::metadata::call_results::{page_rows, read_values};
 
 /// Storage rows read per index page.
 pub(crate) const INDEX_SCAN_BATCH: usize = 256;
@@ -28,30 +28,13 @@ const SWEEP_DELETE_BATCH: usize = 128;
 /// One page of the timestamp index from `start`. The scan may start at a key, which a
 /// page call cannot express, so it goes out as an effect.
 pub(crate) fn scan_call(start: IterStart) -> IoCall {
-    IoCall::Effect(Effect::Storage(StorageEffect::Iter {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
         key_space: UPDATED_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start: Some(start),
         limit: INDEX_SCAN_BATCH,
         txn_id: None,
-    }))
-}
-
-/// The rows of a [`scan_call`] answer and the key to continue after.
-pub(crate) fn scan_answer(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
-    match result {
-        IoResult::Event(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })) => Ok((values, next_start_after)),
-        IoResult::Event(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })) => Err(IoError::Conflict),
-        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => {
-            Err(IoError::Storage(error))
-        }
-        other => page_rows(other),
-    }
+    })))
 }
 
 /// The registry record reads of `documents`, in order.
@@ -284,12 +267,12 @@ impl Operation for TimestampSweepOperation {
     fn next(&mut self, result: IoResult) -> SweepTurn {
         match self.state {
             SweepState::Scan => {
-                let (rows, next) = scan_answer(result)?;
+                let (rows, next) = page_rows(result)?;
                 self.scanned_page(rows, next)
             }
             SweepState::Records => self.read_records(read_values(result)?),
             SweepState::Delete => {
-                call_done(result)?;
+                done(result)?;
                 self.deleted_batch()
             }
         }
@@ -299,6 +282,7 @@ impl Operation for TimestampSweepOperation {
 #[cfg(test)]
 pub(crate) mod state_machine_tests {
     use super::*;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
 
@@ -336,13 +320,13 @@ pub(crate) mod state_machine_tests {
 
     /// An index page answer with `keys`, values unused.
     pub(crate) fn page(keys: &[Key], next: Option<Key>) -> IoResult {
-        IoResult::Event(Event::Storage(StorageEvent::IterResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
             values: keys
                 .iter()
                 .map(|key| (key.clone(), Vec::<u8>::new().into()))
                 .collect(),
             next_start_after: next,
-        }))
+        })))
     }
 
     fn delete_call(keys: &[Key]) -> SweepTurn {
@@ -454,9 +438,9 @@ pub(crate) mod state_machine_tests {
 
     #[test]
     fn storage_errors_fail() {
-        let error = IoResult::Event(Event::Storage(StorageEvent::Error {
+        let error = IoResult::Event(Box::new(Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
-        }));
+        })));
         assert_eq!(
             scanning(None, SWEEP_SCAN_LIMIT).next(error),
             Err(SweepError::Storage(StorageError::Timeout))

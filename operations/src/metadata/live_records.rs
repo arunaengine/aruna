@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE};
 use aruna_core::metadata::{
     GraphLifecycleRecord, MetadataLifecycleRecord, REGISTRY_CANDIDATE_LIMIT,
@@ -84,17 +83,6 @@ impl LiveRecordsOperation {
     }
 }
 
-/// The values of a lifecycle batch read alone or inside the caller's transaction.
-fn batch_values(result: IoResult) -> Result<Vec<Option<Value>>, LiveRecordsError> {
-    match result {
-        IoResult::Event(Event::Storage(StorageEvent::BatchReadResult { values })) => {
-            Ok(values.into_iter().map(|(_, value)| value).collect())
-        }
-        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-        other => Ok(read_values(other)?),
-    }
-}
-
 impl Operation for LiveRecordsOperation {
     type Output = Vec<MetadataRegistryRecord>;
     type Error = LiveRecordsError;
@@ -109,16 +97,16 @@ impl Operation for LiveRecordsOperation {
         let reads = lifecycle_reads(&self.records);
         Ok(Next::Call(match self.txn_id {
             // The caller's transaction is not the runner's, so the read goes out as an effect.
-            Some(txn_id) => IoCall::Effect(Effect::Storage(StorageEffect::BatchRead {
+            Some(txn_id) => IoCall::Effect(Box::new(Effect::Storage(StorageEffect::BatchRead {
                 reads,
                 txn_id: Some(txn_id),
-            })),
+            }))),
             None => IoCall::Read(reads),
         }))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, LiveRecordsError> {
-        let values = batch_values(result)?;
+        let values = read_values(result)?;
         Ok(Next::Done(self.live(values)?))
     }
 }
@@ -193,6 +181,7 @@ fn document_lifecycle_deleted(
 mod call_tests {
     use super::*;
     use crate::metadata::timestamp_sweep::state_machine_tests::{document, record_bytes};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::MetadataDeleteRecord;
     use ulid::Ulid;
 
@@ -260,7 +249,7 @@ mod call_tests {
         };
         assert_eq!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(read))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(read)))))
         );
         let answer = StorageEvent::BatchReadResult {
             values: vec![
@@ -269,7 +258,7 @@ mod call_tests {
             ],
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Storage(answer))),
+            operation.next(IoResult::Event(Box::new(Event::Storage(answer)))),
             Ok(Next::Done(vec![live]))
         );
         let mut failed = LiveRecordsOperation::new(vec![record(1)], Some(txn_id));
@@ -278,7 +267,7 @@ mod call_tests {
             error: StorageError::Timeout,
         });
         assert_eq!(
-            failed.next(IoResult::Event(error)),
+            failed.next(IoResult::Event(Box::new(error))),
             Err(LiveRecordsError::Storage(StorageError::Timeout))
         );
     }

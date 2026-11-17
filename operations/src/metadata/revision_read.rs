@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     RAW_REVISION_KEYSPACE,
@@ -47,24 +46,11 @@ fn row_call(key_space: &str, key: Key, txn_id: Option<TxnId>) -> IoCall {
     let reads = vec![(key_space.to_string(), key)];
     match txn_id {
         // The caller's transaction is not the runner's, so the read goes out as an effect.
-        Some(txn_id) => IoCall::Effect(Effect::Storage(StorageEffect::BatchRead {
+        Some(txn_id) => IoCall::Effect(Box::new(Effect::Storage(StorageEffect::BatchRead {
             reads,
             txn_id: Some(txn_id),
-        })),
+        }))),
         None => IoCall::Read(reads),
-    }
-}
-
-/// The value of [`row_call`]'s answer.
-fn row_answer(result: IoResult) -> Result<Option<Value>, RawReadError> {
-    match result {
-        IoResult::Event(Event::Storage(StorageEvent::BatchReadResult { mut values }))
-            if values.len() == 1 =>
-        {
-            Ok(values.pop().and_then(|(_, value)| value))
-        }
-        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-        other => Ok(read_value(other)?),
     }
 }
 
@@ -196,7 +182,7 @@ impl Operation for RawViewOperation {
             };
             return self.events_turn(turn);
         }
-        let value = row_answer(result)?;
+        let value = read_value(result)?;
         match self.step {
             ViewStep::Status => {
                 self.status = decode(value)?;
@@ -241,6 +227,7 @@ mod call_tests {
     use crate::metadata::raw_events::call_tests::{event, page, page_call, row};
     use aruna_core::calls::IoError;
     use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::metadata::MetadataDeleteRecord;
 
     fn document() -> Ulid {
@@ -346,13 +333,13 @@ mod call_tests {
         };
         assert_eq!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(read))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(read)))))
         );
         let error = Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
         });
         assert_eq!(
-            operation.next(IoResult::Event(error)),
+            operation.next(IoResult::Event(Box::new(error))),
             Err(RawReadError::Storage(StorageError::Timeout))
         );
     }

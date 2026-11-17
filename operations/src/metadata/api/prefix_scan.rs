@@ -5,7 +5,6 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -72,18 +71,6 @@ impl PrefixScanOperation {
     }
 }
 
-/// The rows of a page read as a page call or as an iteration effect.
-fn scan_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), PrefixScanError> {
-    match result {
-        IoResult::Event(Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })) => Ok((values, next_start_after)),
-        IoResult::Event(Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-        other => Ok(page_rows(other)?),
-    }
-}
-
 impl Operation for PrefixScanOperation {
     type Output = ScannedRows;
     type Error = PrefixScanError;
@@ -93,7 +80,7 @@ impl Operation for PrefixScanOperation {
             return Ok(Next::Call(self.page(None)));
         };
         // A page call only continues after a key; starting at one needs the iteration effect.
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
             StorageEffect::Iter {
                 key_space: self.key_space.clone(),
                 prefix: Some(self.prefix.clone()),
@@ -101,11 +88,11 @@ impl Operation for PrefixScanOperation {
                 limit: self.page_limit(),
                 txn_id: None,
             },
-        ))))
+        )))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ScannedRows>, PrefixScanError> {
-        let (values, next) = scan_rows(result)?;
+        let (values, next) = page_rows(result)?;
         self.rows.extend(values);
         if self.rows.len() > self.limit {
             let mut rows = std::mem::take(&mut self.rows);
@@ -122,6 +109,7 @@ impl Operation for PrefixScanOperation {
 #[cfg(test)]
 mod call_tests {
     use super::*;
+    use aruna_core::events::{Event, StorageEvent};
 
     const SPACE: &str = "rows";
 
@@ -169,14 +157,14 @@ mod call_tests {
         };
         assert_eq!(
             operation.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Storage(start))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(start)))))
         );
         let first = StorageEvent::IterResult {
             values: vec![row(1), row(2)],
             next_start_after: Some(key(2)),
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Storage(first))),
+            operation.next(IoResult::Event(Box::new(Event::Storage(first)))),
             page_call(Some(key(2)), 4)
         );
         assert_eq!(
@@ -204,9 +192,9 @@ mod call_tests {
 
     #[test]
     fn errors_fail() {
-        let error = IoResult::Event(Event::Storage(StorageEvent::Error {
+        let error = IoResult::Event(Box::new(Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
-        }));
+        })));
         assert_eq!(
             scanning(2).next(error),
             Err(PrefixScanError::Storage(StorageError::Timeout))

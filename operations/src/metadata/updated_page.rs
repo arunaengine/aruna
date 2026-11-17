@@ -12,8 +12,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::call_results::read_values;
-use crate::metadata::timestamp_sweep::{records_call, scan_answer, scan_call};
+use crate::metadata::call_results::{page_rows, read_values};
+use crate::metadata::timestamp_sweep::{records_call, scan_call};
 
 /// One page of registry records ordered by `updated_at_ms`, plus stale index
 /// keys the caller may sweep.
@@ -154,7 +154,7 @@ impl Operation for UpdatedPageOperation {
 
     fn next(&mut self, result: IoResult) -> PageTurn {
         if self.candidates.is_empty() {
-            let (rows, next) = scan_answer(result)?;
+            let (rows, next) = page_rows(result)?;
             return self.scanned_page(rows, next);
         }
         self.read_records(read_values(result)?)
@@ -290,11 +290,11 @@ mod call_tests {
 
     #[test]
     fn errors_map() {
-        let error = IoResult::Event(aruna_core::events::Event::Storage(
+        let error = IoResult::Event(Box::new(aruna_core::events::Event::Storage(
             aruna_core::events::StorageEvent::Error {
                 error: StorageError::Timeout,
             },
-        ));
+        )));
         assert_eq!(
             whole_window().next(error),
             Err(UpdatedPageError::Storage(StorageError::Timeout))
