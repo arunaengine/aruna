@@ -285,6 +285,33 @@ mod tests {
         assert_eq!(operation.finalize(), Ok(()));
     }
 
+    // A storage failure must not reach the parent as a successful emission.
+    #[test]
+    fn storage_failure_reported() {
+        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+            records: vec![make_record(1, 2)],
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError("boom".to_string()),
+        }));
+        assert!(operation.is_complete());
+        assert!(operation.finalize().is_err());
+
+        let Effect::SubOperation(mut emit) = emit_notifications_effect(vec![make_record(1, 2)])
+        else {
+            panic!("emit is a sub-operation");
+        };
+        emit.start();
+        emit.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::WriteError("boom".to_string()),
+        }));
+        assert_ne!(
+            emit.finalize(),
+            Event::SubOperation(SubOperationEvent::NotificationsEmitted)
+        );
+    }
+
     #[test]
     fn write_error_aborts() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
