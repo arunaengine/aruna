@@ -304,7 +304,8 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_archive_wakes() {
-        use crate::jobs::store::{owed_wakes, register_remote_wait};
+        use crate::driver::drive;
+        use crate::jobs::store::{OwedWakesOperation, WaitRowOperation};
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
@@ -330,9 +331,8 @@ mod tests {
             session: None,
         };
         let job_id = JobId::from_bytes([5; 16]);
-        register_remote_wait(storage, key, waiter, job_id, &auth)
-            .await
-            .unwrap();
+        let register = WaitRowOperation::register(key, waiter, job_id, &auth);
+        drive(register, &context).await.unwrap();
         // A pending row that cannot be decoded makes promotion fail.
         let corrupt = StorageEffect::Write {
             key_space: PENDING_LOCATION_KEYSPACE.to_string(),
@@ -347,7 +347,9 @@ mod tests {
         let result = wake_unlocked(&context, key, 4_000, origin, &limits).await;
 
         assert!(matches!(result, Err(KeyWakeError::Promote(_))));
-        let (owed, _) = owed_wakes(storage, None).await.unwrap();
+        let (owed, _) = drive(OwedWakesOperation::new(None), &context)
+            .await
+            .unwrap();
         assert_eq!(owed.len(), 1);
         assert_eq!((owed[0].waiter, owed[0].job_id), (waiter, job_id));
     }
