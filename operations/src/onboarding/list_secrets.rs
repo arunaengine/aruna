@@ -50,7 +50,7 @@ pub enum ListSecretsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -96,7 +96,7 @@ impl Operation for ListSecretsOperation {
 
         match self.state.clone() {
             ListSecretsState::Iter => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
                     self.state = ListSecretsState::Error;
                     self.output = Some(Err(ListSecretsError::UnexpectedEvent {
@@ -143,7 +143,7 @@ impl Operation for ListSecretsOperation {
                 smallvec![]
             }
             ListSecretsState::ReadStates { records } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     self.state = ListSecretsState::Error;
                     self.output = Some(Err(ListSecretsError::UnexpectedEvent {
@@ -158,7 +158,7 @@ impl Operation for ListSecretsOperation {
                     self.output = Some(Err(ListSecretsError::UnexpectedEvent {
                         state: "ReadStates".to_string(),
                         expected: "state batch read result matching record count",
-                        got: format!("{values:?}"),
+                        got: "a batch of another length",
                     }));
                     return smallvec![];
                 }

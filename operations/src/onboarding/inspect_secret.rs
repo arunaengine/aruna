@@ -59,7 +59,7 @@ pub enum InspectSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -106,7 +106,7 @@ impl Operation for InspectSecretOperation {
 
         match self.state {
             InspectSecretState::ReadRecords => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     self.state = InspectSecretState::Error;
                     self.output = Some(Err(InspectSecretError::UnexpectedEvent {
@@ -121,7 +121,7 @@ impl Operation for InspectSecretOperation {
                     self.output = Some(Err(InspectSecretError::UnexpectedEvent {
                         state: "ReadRecords".to_string(),
                         expected: "record and state batch read result",
-                        got: format!("{values:?}"),
+                        got: "a batch of another length",
                     }));
                     return smallvec![];
                 };

@@ -55,7 +55,7 @@ pub enum GetUserError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("registration did not finish")]
     NotFinished,
@@ -86,7 +86,7 @@ impl GetUserOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(GetUserError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -95,7 +95,7 @@ impl GetUserOperation {
     }
 
     fn handle_auth_result(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(aruna_core::events::SubOperationEvent::AuthorizationResult {
             allowed,
         }) = event
@@ -131,7 +131,7 @@ impl GetUserOperation {
     }
 
     fn accept_existing(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::ReadResult { key, value })",
