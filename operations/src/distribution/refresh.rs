@@ -631,4 +631,122 @@ mod tests {
             (None, 61_000, false)
         );
     }
+    use crate::distribution::test_record::with_settings;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::storage::distribution::DistributionSettings;
+
+    fn pass(cursor: RefreshCursor) -> RefreshRangesOperation {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        RefreshRangesOperation::new(realm_id, node_id, now, cursor)
+    }
+
+    fn records(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: (values.into_iter())
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            next_start_after: next.map(Key::from),
+        })
+    }
+
+    fn record_page(after: Option<Vec<u8>>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: None,
+            start: after.map(|after| IterStart::After(after.into())),
+            limit: SETS_PER_PASS,
+            txn_id: None,
+        })
+    }
+
+    // Records without a refresh interval are skipped; the record cursor moves past the page.
+    #[test]
+    fn skips_unrefreshed_sets() {
+        let (_, plain) = with_settings(true, 0, DistributionSettings::default());
+        let mut operation = pass(RefreshCursor {
+            record: Some(vec![1]),
+            sweep: None,
+        });
+        check_trace(
+            &mut operation,
+            &[record_page(Some(vec![1]))],
+            vec![(
+                records(vec![(vec![2], plain), (vec![3], vec![0xFF])], Some(vec![3])),
+                Vec::new(),
+            )],
+        );
+        let cursor = RefreshCursor {
+            record: Some(vec![3]),
+            sweep: None,
+        };
+        assert_eq!(
+            operation.finalize(),
+            Ok(RefreshPass {
+                busy: false,
+                cursor
+            })
+        );
+    }
+
+    // A set whose bucket is not readable here is skipped, and the pass goes on.
+    #[test]
+    fn unreadable_bucket_skipped() {
+        let settings = DistributionSettings {
+            refresh_secs: Some(60),
+            ..DistributionSettings::default()
+        };
+        let (snapshot, refreshed) = with_settings(true, 0, settings);
+        let mut operation = pass(RefreshCursor::default());
+        operation.start();
+        let effects = operation.step(records(vec![(vec![2], refreshed)], None));
+        let mut bucket = GetBucketOperation::new(snapshot.config.bucket.clone());
+        assert_eq!(effects, bucket.start());
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(failed).is_empty());
+        let pass = operation.finalize().unwrap();
+        assert_eq!((pass.busy, pass.cursor), (false, RefreshCursor::default()));
+    }
+
+    // A failed record page keeps the cursor the pass began at.
+    #[test]
+    fn failed_page_keeps_cursor() {
+        let mut operation = pass(RefreshCursor {
+            record: Some(vec![1]),
+            sweep: Some((Ulid::nil(), "a".to_string())),
+        });
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error.record, Some(vec![1]));
+    }
+
+    // Events outside the record read are refused; nothing is cleaned up before a child runs.
+    #[test]
+    fn rejects_unexpected() {
+        let started = || {
+            let mut operation = pass(RefreshCursor::default());
+            operation.start();
+            operation
+        };
+        let refused = rejects_events(started, sample_events, |event| {
+            matches!(event, Event::Storage(StorageEvent::IterResult { .. }))
+        });
+        assert_eq!(refused.len(), sample_events().len() - 1);
+        let fresh = || pass(RefreshCursor::default());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
+        assert!(started().abort().is_empty());
+        rejects_finalize(started());
+    }
 }
