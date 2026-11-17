@@ -9,7 +9,12 @@ use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
 use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};
+use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::staging::setup_driver_context;
+use aruna_core::egress::EgressPolicy;
+use aruna_core::outbound::{MailRequest, OutboundEffect, OutboundError, OutboundEvent};
+use aruna_outbound::{MailBuilder, MailSender, OutboundHandle};
+use std::sync::{Arc, Mutex};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
@@ -87,12 +92,12 @@ fn share_upload() -> NotificationRecord {
 #[derive(Default)]
 struct FakeSender {
     sent: Mutex<Vec<OutgoingMail>>,
-    answer: Mutex<Option<MailError>>,
+    answer: Mutex<Option<OutboundError>>,
 }
 
 #[async_trait::async_trait]
 impl MailSender for FakeSender {
-    async fn send(&self, mail: OutgoingMail) -> Result<(), MailError> {
+    async fn send(&self, mail: OutgoingMail) -> Result<(), OutboundError> {
         if let Some(error) = self.answer.lock().unwrap().clone() {
             return Err(error);
         }
@@ -101,15 +106,17 @@ impl MailSender for FakeSender {
     }
 }
 
-/// Mail profiles that hand out `sender` and count how often a sender was built.
-fn fake_mail(sender: Arc<FakeSender>) -> (Arc<MailProfiles>, Arc<Mutex<Vec<SmtpSettings>>>) {
+/// An outbound backend that hands out `sender` and counts how often a sender was built.
+fn fake_mail(sender: Arc<FakeSender>) -> (OutboundHandle, Arc<Mutex<Vec<SmtpSettings>>>) {
     let built = Arc::new(Mutex::new(Vec::new()));
     let seen = built.clone();
     let builder: MailBuilder = Arc::new(move |settings: &SmtpSettings| {
         seen.lock().unwrap().push(settings.clone());
         Ok(sender.clone() as Arc<dyn MailSender>)
     });
-    (Arc::new(MailProfiles::new(builder)), built)
+    let http = reqwest::Client::new();
+    let outbound = OutboundHandle::with_mail(http, EgressPolicy::loopback(), builder);
+    (outbound, built)
 }
 
 const PASSWORD: &str = "canary-smtp-31";
@@ -184,7 +191,18 @@ fn profile(revision: u128, password: bool) -> RealmEmailProfile {
     }
 }
 
-fn job_context(context: DriverContext, mail: Arc<MailProfiles>) -> JobContext {
+/// The stored realm config with a job control binding for this node, so jobs can be placed.
+async fn placed_config(context: &DriverContext) -> RealmConfigDocument {
+    let mut config = drive(GetConfigOperation::new(user().realm_id), context)
+        .await
+        .unwrap();
+    config.seed_default_placement();
+    config.seed_job_control(node(), 0);
+    config
+}
+
+fn job_context(mut context: DriverContext, outbound: OutboundHandle) -> JobContext {
+    context.outbound_handle = Some(outbound);
     JobContext {
         driver: Arc::new(context),
         job_id: mint_job_id(
@@ -199,7 +217,6 @@ fn job_context(context: DriverContext, mail: Arc<MailProfiles>) -> JobContext {
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
         range_turns: Default::default(),
-        mail,
     }
 }
 
@@ -324,12 +341,12 @@ async fn on_setting_sends() {
     assert_eq!(settings.password.as_deref(), Some(PASSWORD));
     assert!(!format!("{settings:?}").contains(PASSWORD));
 
-    *sender.answer.lock().unwrap() = Some(MailError::Retryable("SMTP status 451".to_string()));
+    *sender.answer.lock().unwrap() = Some(OutboundError::Retryable("SMTP status 451".to_string()));
     let JobRunOutcome::Failed(error) = run().await else {
         panic!("a transient refusal fails the attempt");
     };
     assert_eq!(error.kind, JobErrorKind::Retryable);
-    *sender.answer.lock().unwrap() = Some(MailError::Permanent("SMTP status 550".to_string()));
+    *sender.answer.lock().unwrap() = Some(OutboundError::Permanent("SMTP status 550".to_string()));
     let JobRunOutcome::Failed(error) = run().await else {
         panic!("a permanent refusal ends the job");
     };
@@ -467,7 +484,9 @@ async fn refresh_drops_stale() {
     let context = staging.driver_context.clone();
     let current = profile(1, true);
     seed_profile(&context, Some(current.clone())).await;
-    let (mail, _) = fake_mail(Arc::new(FakeSender::default()));
+    let (outbound, _) = fake_mail(Arc::new(FakeSender::default()));
+    let mut context = context;
+    context.outbound_handle = Some(outbound.clone());
     let settings = SmtpSettings {
         host: current.host.clone(),
         port: None,
@@ -476,16 +495,31 @@ async fn refresh_drops_stale() {
         password: None,
         from: current.from.clone(),
     };
-    mail.build(current.revision, &settings).unwrap();
-    refresh_mail(&context, user().realm_id, Some(&mail)).await;
-    assert!(
-        mail.cached(current.revision).is_some(),
-        "the current profile stays"
-    );
+    let send = |settings: Option<SmtpSettings>| {
+        let mail = OutgoingMail {
+            to: ADDRESS.to_string(),
+            subject: String::new(),
+            body: String::new(),
+            id: Ulid::from_parts(9, 9),
+        };
+        let request = MailRequest {
+            revision: current.revision,
+            settings,
+            mail,
+        };
+        outbound.run(OutboundEffect::Mail(Box::new(request)))
+    };
+    send(Some(settings)).await;
+    refresh_mail(&context, user().realm_id).await;
+    let cached = OutboundEvent::MailSent { result: Ok(()) };
+    assert_eq!(send(None).await, cached, "the current profile stays");
 
     seed_profile(&context, None).await;
-    refresh_mail(&context, user().realm_id, Some(&mail)).await;
-    assert!(mail.cached(current.revision).is_none());
+    refresh_mail(&context, user().realm_id).await;
+    let dropped = OutboundEvent::MailSent {
+        result: Err(OutboundError::NoSender),
+    };
+    assert_eq!(send(None).await, dropped);
     let row = VaultEntry::new(VaultPurpose::RealmSecret, Ulid::from_parts(3, 3));
     let event = context
         .storage_handle
@@ -501,7 +535,9 @@ async fn skips_without_profile() {
     let context = &staging.driver_context;
     seed_profile(context, None).await;
     let records = [share_upload()];
-    enqueue_emails(context, node(), &records).await.unwrap();
+    let config = placed_config(context).await;
+    let enqueue = EnqueueDeliveriesOperation::new(node(), Some(&config), &records, NOW_MS);
+    drive(enqueue, context).await.unwrap();
     let key = user_dedup_key(user(), &format!("email/{}", records[0].notification_id));
     let queued = find_dedup_plan(&context.storage_handle, user(), &key, None).await;
     assert_eq!(
@@ -524,14 +560,16 @@ async fn enqueue_always_queues() {
     });
     watched.notification_id = Ulid::from_parts(8, 8);
     let records = [share_upload(), watched];
-    enqueue_emails(context, node(), &records).await.unwrap();
+    let config = placed_config(context).await;
+    let enqueue = || EnqueueDeliveriesOperation::new(node(), Some(&config), &records, NOW_MS);
+    drive(enqueue(), context).await.unwrap();
     let key = |id: Ulid| user_dedup_key(user(), &format!("email/{id}"));
     let storage = &context.storage_handle;
     let first = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
         .unwrap()
         .expect("the notice is queued without an opt-in");
-    enqueue_emails(context, node(), &records).await.unwrap();
+    drive(enqueue(), context).await.unwrap();
     let again = find_dedup_plan(storage, user(), &key(records[0].notification_id), None)
         .await
         .unwrap();

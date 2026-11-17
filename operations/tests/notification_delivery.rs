@@ -718,17 +718,16 @@ impl SettingRealm {
             unix_timestamp_millis(),
         );
         let context = self.context(index);
-        let metadata = context.metadata_handle.as_ref().expect("metadata handle");
         let peers = MetadataPeers {
             ctx: context,
             local: self.id(index),
         };
         let managers = self.managers();
         let channel = SettingChannel::Webhook;
-        let backoffs = metadata.setting_backoffs();
+        let backoffs = aruna_outbound::Backoffs::default();
         let now = unix_timestamp_millis();
         let managers = Some(managers.as_slice());
-        delivery_setting(context, &peers, backoffs, &record, channel, managers, now).await
+        delivery_setting(context, &peers, &backoffs, &record, channel, managers, now).await
     }
 
     async fn set(&self, index: usize, owner: UserId, url: &str) -> TestResult<WebhookOutcome> {

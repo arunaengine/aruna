@@ -230,7 +230,7 @@ async fn no_manager_waits() {
 fn backoff_shared_owner() {
     let backoffs = Backoffs::default();
     let other = UserId::local(Ulid::from_bytes([7u8; 16]), owner().realm_id);
-    assert_eq!(backoffs.fail(owner(), SettingChannel::Email, 1_000), 31_000);
+    assert_eq!(backoffs.fail(owner(), SettingChannel::Email, 1_000, next_delay), 31_000);
     // Every notice of the owner and channel waits for the same end.
     assert_eq!(
         backoffs.until(owner(), SettingChannel::Email, 2_000),
@@ -249,12 +249,12 @@ fn backoff_doubles_capped() {
     let backoffs = Backoffs::default();
     let channel = SettingChannel::Webhook;
     let delays: Vec<_> = (0..8)
-        .map(|_| backoffs.fail(owner(), channel, 0) / 1_000)
+        .map(|_| backoffs.fail(owner(), channel, 0, next_delay) / 1_000)
         .collect();
     assert_eq!(delays, [30, 60, 120, 240, 480, 960, 1_800, 1_800]);
     backoffs.clear(owner(), channel);
     assert_eq!(
-        backoffs.fail(owner(), channel, 0),
+        backoffs.fail(owner(), channel, 0, next_delay),
         30_000,
         "an opened secret resets the delay"
     );

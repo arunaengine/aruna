@@ -5,9 +5,12 @@
 use super::*;
 use crate::jobs::store::find_dedup_plan;
 use crate::metadata::api::load_realm_config;
+use crate::notifications::checks::{
+    validate_inbound_batch, validate_inbound_kind, validate_watch_event, verify_node_origin,
+};
 use crate::notifications::client::{
-    create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,
-    list_watches_remote, mark_read_remote, send_notification_request, unread_count_remote,
+    create_watch_remote, delete_watch_remote, deliver_events_remote, list_remote,
+    list_watches_remote, mark_read_remote, unread_count_remote,
 };
 use crate::driver::drive;
 use crate::notifications::inbox::UpsertInboxOperation;
@@ -347,6 +350,20 @@ async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
 
 /// An upload the inbox drops after its bucket's deletion queues no webhook, even beside a
 /// stored record of the same batch.
+/// Delivers `records` to `holder` and returns the written count or the rejection.
+async fn deliver_remote(
+    net: &NetHandle,
+    holder: NodeId,
+    records: Vec<NotificationRecord>,
+) -> Result<u32, String> {
+    let message = NotificationTransportMessage::DeliverBatch { records };
+    match net.notification_request(holder, &message).await? {
+        NotificationTransportMessage::DeliverAck { written } => Ok(written),
+        NotificationTransportMessage::Reject(reason) => Err(reason),
+        _ => Err("unexpected notification response".to_string()),
+    }
+}
+
 #[tokio::test]
 async fn dropped_upload_unqueued() {
     let (a, b, recipient, config) = webhook_pair(72).await;
@@ -721,10 +738,7 @@ async fn empty_batch_rejected() {
     )
     .await;
 
-    let response = send_notification_request(
-        &a.net,
-        b.net.node_id(),
-        NotificationTransportMessage::DeliverBatch { records: vec![] },
+    let response = a.net.notification_request(b.net.node_id(), &NotificationTransportMessage::DeliverBatch { records: vec![] },
     )
     .await
     .expect("request completes");
@@ -765,10 +779,7 @@ async fn user_peer_rejected() {
         "unexpected reject reason: {deliver_error}"
     );
 
-    let list = send_notification_request(
-        &c.net,
-        b.net.node_id(),
-        NotificationTransportMessage::UnreadCount { recipient },
+    let list = c.net.notification_request(b.net.node_id(), &NotificationTransportMessage::UnreadCount { recipient },
     )
     .await
     .expect("request completes");
@@ -1915,10 +1926,7 @@ async fn invalid_events_rejected() {
     )
     .await;
 
-    let empty = send_notification_request(
-        &a.net,
-        b.net.node_id(),
-        NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
+    let empty = a.net.notification_request(b.net.node_id(), &NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
     )
     .await
     .expect("request completes");

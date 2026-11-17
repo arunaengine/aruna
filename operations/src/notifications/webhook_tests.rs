@@ -7,6 +7,7 @@ use super::*;
 use crate::jobs::executor::ProgressReporter;
 use crate::jobs::store::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
+use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};
 use crate::tests::staging::setup_driver_context;
 
@@ -15,7 +16,9 @@ use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::{JobErrorKind, JobProgress};
 use aruna_core::structs::execution::notification::NotificationClass;
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::execution::webhook::{DELIVERY_HEADER, SIGNATURE_HEADER, sign_delivery};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use std::time::Duration;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use axum::http::{HeaderMap, StatusCode};
@@ -305,7 +308,11 @@ async fn enqueue_always_queues() {
     let context = &staging.driver_context;
     let records = [upload(user())];
     let owner = iroh::SecretKey::from_bytes(&[8; 32]).public();
-    enqueue_webhooks(context, owner, &records).await.unwrap();
+    let mut config = RealmConfigDocument::new(user().realm_id, Vec::new(), 3);
+    config.seed_default_placement();
+    config.seed_job_control(owner, 0);
+    let enqueue = || EnqueueDeliveriesOperation::new(owner, Some(&config), &records, NOW_MS);
+    drive(enqueue(), context).await.unwrap();
     let key = format!("webhook/{}", records[0].notification_id);
     let key = user_dedup_key(user(), &key);
     let storage = &context.storage_handle;
@@ -314,7 +321,7 @@ async fn enqueue_always_queues() {
         first.is_some(),
         "the upload is queued without a subscription"
     );
-    enqueue_webhooks(context, owner, &records).await.unwrap();
+    drive(enqueue(), context).await.unwrap();
     let again = find_dedup_plan(storage, user(), &key, None).await.unwrap();
     assert_eq!(again, first);
 }
