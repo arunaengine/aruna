@@ -16,8 +16,8 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use tracing::warn;
 
-use super::LifecycleError;
-use super::outbox::{OUTBOX_DRAIN_BATCH, PublishRecordConfig, PublishRecordOperation};
+use super::{OUTBOX_DRAIN_BATCH, PublishRecordConfig, PublishRecordOperation};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::records::rows::from_bytes;
 use crate::placement::resolve_shard_holders;
 use crate::realm::get_config::GetConfigOperation;
@@ -317,5 +317,5 @@ impl Operation for DrainOutboxOperation {
 }
 
 #[cfg(test)]
-#[path = "outbox_drain_tests.rs"]
+#[path = "drain_tests.rs"]
 mod state_machine_tests;

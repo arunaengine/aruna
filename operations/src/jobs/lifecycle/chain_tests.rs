@@ -151,7 +151,7 @@ fn resolves_execution_chain() {
 }
 
 #[test]
-fn local_job_has_none() {
+fn skips_local_jobs() {
     // No reservation is a purely local job: no chain, no error.
     let mut chain = ExecutionChainOperation::of_job(physical());
     chain.start();
@@ -160,7 +160,7 @@ fn local_job_has_none() {
 }
 
 #[test]
-fn other_attempt_has_none() {
+fn skips_other_attempts() {
     let (_, receipt) = run();
     let mut chain = ExecutionChainOperation::of_attempt(physical(), Ulid::from_bytes([9; 16]));
     chain.start();
@@ -169,7 +169,7 @@ fn other_attempt_has_none() {
 }
 
 #[test]
-fn read_failures_give_none() {
+fn failures_give_none() {
     let (records, receipt) = run();
     // A failed reservation, alias or receipt read leaves the chain unresolved.
     let mut chain = ExecutionChainOperation::of_job(physical());

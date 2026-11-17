@@ -21,7 +21,6 @@ pub mod held;
 pub mod ids;
 pub mod ingress;
 pub mod outbox;
-pub mod outbox_drain;
 pub mod plan;
 pub mod report;
 pub mod reservation;
