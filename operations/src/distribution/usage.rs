@@ -23,8 +23,8 @@ use aruna_core::types::{GroupId, Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::node::usage_stats::usage_complete;
+use crate::driver::{DriverContext, drive};
+use crate::node::realm_usage::UsageCompleteOperation;
 use crate::replication::members::bound_record;
 
 #[derive(Debug, Error, PartialEq)]
@@ -145,7 +145,7 @@ pub async fn held_ranges(
     let (accounts, values) = rows?;
     let set_id = binding.set_id;
     // A node-wide usage rebuild also leaves range counters unconfirmed.
-    let confirmed = usage_complete(context).await?;
+    let confirmed = drive(UsageCompleteOperation::new(), context).await?;
     let ranges = (accounts.iter())
         .map(|(range_id, account)| HeldRange {
             range_id: *range_id,

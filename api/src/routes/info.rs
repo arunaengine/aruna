@@ -31,6 +31,7 @@ use aruna_operations::federation::totals::data_totals;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
+use aruna_operations::node::realm_usage::RealmUsageOperation;
 use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
@@ -2284,13 +2285,15 @@ pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
 ) -> ServerResult<RealmUsage> {
-    aruna_operations::node::usage_stats::load_realm_usage(
-        &state.get_ctx(),
-        state.get_node_id(),
-        scope,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))
+    let context = state.get_ctx();
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let operation = RealmUsageOperation::new(state.get_node_id(), realm_id, scope);
+    let mut totals = drive(operation, context.as_ref())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    totals
+        .pop()
+        .ok_or_else(|| ServerError::InternalError("no realm usage total".into()))
 }
 
 #[utoipa::path(

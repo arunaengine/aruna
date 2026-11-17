@@ -34,7 +34,7 @@ use super::refill::{RefillConfig, RefillOperation};
 use super::sign_statement;
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::mark_dirty;
+use crate::node::usage_publish::mark_dirty;
 
 /// How long a pass that found nothing to do waits before it looks again.
 pub const MAINTAIN_AFTER: Duration = Duration::from_secs(60);

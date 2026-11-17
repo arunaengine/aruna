@@ -22,7 +22,7 @@ use crate::metadata::projector::{
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
-use crate::node::usage_stats::refresh_usage_targets;
+use crate::node::usage_publish::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;

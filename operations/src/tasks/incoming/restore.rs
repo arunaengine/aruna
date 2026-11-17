@@ -324,7 +324,7 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::node::usage_stats::publish_refresh_snapshots(
+        match crate::node::usage_publish::publish_refresh_snapshots(
             &self.context,
             node_id,
             realm_id,

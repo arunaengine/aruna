@@ -8,9 +8,10 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::time::unix_timestamp_secs;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::stats::count_realm_documents;
-use crate::node::usage_stats::{RealmUsageScope, load_realm_usage};
+use crate::node::realm_usage::RealmUsageOperation;
+use crate::node::usage_stats::RealmUsageScope;
 
 /// The realm's totals from the realm usage sum and the live document count. Fails when one
 /// part is unknown, so a caller shows nothing instead of a zero.
@@ -36,7 +37,12 @@ pub async fn realm_totals(
 /// The realm's current objects and data bytes, stored and referenced alike, private data
 /// included, from the realm usage sum.
 pub async fn data_totals(context: &DriverContext, node_id: NodeId) -> Result<(u64, u64), String> {
-    let usage = load_realm_usage(context, node_id, RealmUsageScope::Global).await?;
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let operation = RealmUsageOperation::new(node_id, realm_id, RealmUsageScope::Global);
+    let mut totals = drive(operation, context)
+        .await
+        .map_err(|error| error.to_string())?;
+    let usage = totals.pop().ok_or("no realm usage total")?;
     Ok(data_of(&usage.counters))
 }
 

@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::driver::DriverContext;
 use crate::metadata::projector::{project_create_events, project_logged_events};
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::usage_stats::refresh_usage_targets;
+use crate::node::usage_publish::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
 
@@ -767,7 +767,7 @@ async fn usage_phase(
     if !*pending {
         return PhaseOutcome::default();
     }
-    let result = crate::node::usage_stats::publish_refresh_snapshots(
+    let result = crate::node::usage_publish::publish_refresh_snapshots(
         context.as_ref(),
         config.node_id,
         config.realm_id,
