@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
@@ -16,29 +17,17 @@ pub enum ScanRowsError {
 /// Outputs the values of every row in `key_space` under `prefix`, in key order.
 #[derive(Debug, PartialEq)]
 pub struct ScanRowsOperation {
-    key_space: String,
-    prefix: Option<Key>,
-    limit: usize,
+    pages: PrefixPages,
     rows: Vec<Value>,
 }
 
 impl ScanRowsOperation {
     pub fn new(key_space: &str, prefix: Option<Key>, limit: usize) -> Self {
+        let prefix = prefix.unwrap_or_else(|| Key::from(Vec::new()));
         Self {
-            key_space: key_space.to_string(),
-            prefix,
-            limit,
+            pages: PrefixPages::new(key_space, prefix, limit),
             rows: Vec::new(),
         }
-    }
-
-    fn page(&self, after: Option<Key>) -> Next<Vec<Value>> {
-        Next::Call(IoCall::Page {
-            space: self.key_space.clone(),
-            prefix: self.prefix.clone().unwrap_or_else(|| Key::from(Vec::new())),
-            after,
-            limit: self.limit,
-        })
     }
 }
 
@@ -47,15 +36,15 @@ impl Operation for ScanRowsOperation {
     type Error = ScanRowsError;
 
     fn first(&mut self) -> Result<Next<Vec<Value>>, ScanRowsError> {
-        Ok(self.page(None))
+        Ok(Next::Call(self.pages.call()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Vec<Value>>, ScanRowsError> {
-        let (rows, next) = result.page()?;
+        let rows = self.pages.take(result)?;
         self.rows.extend(rows.into_iter().map(|(_, value)| value));
-        Ok(match next {
-            Some(next) => self.page(Some(next)),
-            None => Next::Done(std::mem::take(&mut self.rows)),
+        Ok(match self.pages.done() {
+            false => Next::Call(self.pages.call()),
+            true => Next::Done(std::mem::take(&mut self.rows)),
         })
     }
 }
@@ -63,6 +52,7 @@ impl Operation for ScanRowsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::IoCall;
 
     fn scan() -> ScanRowsOperation {
         ScanRowsOperation::new("rows", Some(b"p".to_vec().into()), 2)
@@ -89,7 +79,12 @@ mod tests {
             limit: 2,
         };
         assert_eq!(rows.first(), Ok(Next::Call(first)));
-        let second = rows.page(Some(b"b".to_vec().into()));
+        let second = Next::Call(IoCall::Page {
+            space: "rows".to_string(),
+            prefix: b"p".to_vec().into(),
+            after: Some(b"b".to_vec().into()),
+            limit: 2,
+        });
         let first_page = page(&[b"a".as_slice(), b"b".as_slice()], Some(b"b".as_slice()));
         assert_eq!(rows.next(first_page), Ok(second));
         let values: Vec<Value> = [b"a", b"b", b"c"]
