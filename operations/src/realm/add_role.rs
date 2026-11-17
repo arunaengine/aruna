@@ -569,7 +569,7 @@ pub mod test {
             user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm_id),
             realm_id,
         };
-        let mut operation = RealmRoleOperation::new(RealmRoleConfig {
+        let operation = RealmRoleOperation::new(RealmRoleConfig {
             actor: actor.clone(),
             realm_id,
             role: Role {

@@ -3,19 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{
     NODE_SUBJECT_KEY, NodeSubjectRecord, storage_subject,
 };
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::ManagedCopyQuarantine;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 
 use super::subject::{
     SubjectScanConfig, SubjectScanError, SubjectScanMode, SubjectScanOperation, SubjectScanResult,
@@ -36,15 +34,13 @@ pub type SubjectSync = Option<(SubjectScanMode, SubjectScanResult)>;
 
 #[derive(Debug, PartialEq)]
 enum SyncState {
-    Init,
     Config,
     Local,
-    Scan {
-        mode: SubjectScanMode,
-        scan: Box<SubjectScanOperation>,
-    },
-    Done,
+    /// The scan runs as a child with this config.
+    Scan(SubjectScanConfig),
 }
+
+type SyncTurn = Result<Next<SubjectSync>, SubjectScanError>;
 
 /// Reconciles the local subject with the realm's placement map and revalidates the inventory.
 /// A realm without a config, or a node without a subject to scan under, scans nothing.
@@ -55,7 +51,6 @@ pub struct SubjectSyncOperation {
     trigger: SubjectTrigger,
     now_ms: u64,
     state: SyncState,
-    output: Option<Result<SubjectSync, SubjectScanError>>,
 }
 
 impl SubjectSyncOperation {
@@ -65,28 +60,17 @@ impl SubjectSyncOperation {
             node_id,
             trigger,
             now_ms,
-            state: SyncState::Init,
-            output: None,
+            state: SyncState::Config,
         }
     }
 
-    fn finish(&mut self, output: Result<SubjectSync, SubjectScanError>) -> Effects {
-        self.state = SyncState::Done;
-        self.output = Some(output);
-        smallvec![]
-    }
-
-    fn config(&mut self, value: Option<Value>) -> Effects {
-        let config = match value
-            .map(|value| RealmConfigDocument::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(Some(config)) => config,
-            Ok(None) => return self.finish(Ok(None)),
-            Err(error) => return self.finish(Err(error.into())),
+    fn config(&mut self, value: Option<Value>) -> SyncTurn {
+        let Some(value) = value else {
+            return Ok(Next::Done(None));
         };
+        let config = RealmConfigDocument::from_bytes(value.as_ref())?;
         let entry = config.placement_entry(self.node_id);
-        match (self.trigger, entry) {
+        Ok(match (self.trigger, entry) {
             (SubjectTrigger::Observe, Some(entry)) if !entry.draining => self.scan(
                 storage_subject(entry, 1),
                 SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
@@ -98,94 +82,58 @@ impl SubjectSyncOperation {
             // learns about through config sync.
             (SubjectTrigger::Observe, None) => {
                 self.state = SyncState::Local;
-                smallvec![local_read()]
+                Next::Call(IoCall::Read(vec![local_row()]))
             }
             (SubjectTrigger::Reconcile(mode), Some(entry)) => {
                 self.scan(storage_subject(entry, 1), mode)
             }
-            (SubjectTrigger::Reconcile(_), None) => self.finish(Ok(None)),
-        }
+            (SubjectTrigger::Reconcile(_), None) => Next::Done(None),
+        })
     }
 
-    fn local(&mut self, value: Option<Value>) -> Effects {
-        match local_record(value) {
-            Ok(Some(record)) => self.scan(record.subject, SubjectScanMode::Depart),
-            Ok(None) => self.finish(Ok(None)),
-            Err(error) => self.finish(Err(error)),
-        }
-    }
-
-    fn scan(&mut self, observed: PlacementSubject, mode: SubjectScanMode) -> Effects {
-        let mut scan = Box::new(SubjectScanOperation::new(SubjectScanConfig {
+    fn scan(&mut self, observed: PlacementSubject, mode: SubjectScanMode) -> Next<SubjectSync> {
+        let config = SubjectScanConfig {
             realm_id: self.realm_id,
             observed,
             mode,
             now_ms: self.now_ms,
-        }));
-        let effects = scan.start();
-        self.state = SyncState::Scan { mode, scan };
-        self.after_scan(effects)
-    }
-
-    fn after_scan(&mut self, effects: Effects) -> Effects {
-        let complete = matches!(&self.state, SyncState::Scan { scan, .. } if scan.is_complete());
-        if !complete {
-            return effects;
-        }
-        let SyncState::Scan { mode, scan } = std::mem::replace(&mut self.state, SyncState::Done)
-        else {
-            return effects;
         };
-        self.finish(scan.finalize().map(|result| Some((mode, result))))
+        self.state = SyncState::Scan(config.clone());
+        Next::Call(IoCall::child(SubjectScanOperation::new(config)))
     }
 }
 
-impl EffectOperation for SubjectSyncOperation {
+impl Operation for SubjectSyncOperation {
     type Output = SubjectSync;
     type Error = SubjectScanError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> SyncTurn {
         self.state = SyncState::Config;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: self.realm_id.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+        let row = (
+            REALM_CONFIG_KEYSPACE.to_string(),
+            Key::from(self.realm_id.as_bytes().to_vec()),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let SyncState::Scan { scan, .. } = &mut self.state {
-            let effects = scan.step(event);
-            return self.after_scan(effects);
-        }
-        let read = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Some(value),
-            _ => None,
-        };
-        let config = matches!(self.state, SyncState::Config);
-        let local = matches!(self.state, SyncState::Local);
-        match read {
-            Some(value) if config => self.config(value),
-            Some(value) if local => self.local(value),
-            _ if config => self.finish(Err(SubjectScanError::InvalidEvent("ReadRealmConfig"))),
-            _ if local => self.finish(Err(SubjectScanError::InvalidEvent("ReadLocalSubject"))),
-            _ => self.finish(Err(SubjectScanError::InvalidEvent("SubjectSync"))),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(SubjectScanError::InvalidEvent("SubjectSync")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.state {
-            SyncState::Scan { scan, .. } => scan.abort(),
-            _ => smallvec![],
+    fn next(&mut self, result: IoResult) -> SyncTurn {
+        match &self.state {
+            SyncState::Config => {
+                let [value] = values::<1>(result)?;
+                self.config(value)
+            }
+            SyncState::Local => {
+                let [value] = values::<1>(result)?;
+                Ok(match local_record(value)? {
+                    Some(record) => self.scan(record.subject, SubjectScanMode::Depart),
+                    None => Next::Done(None),
+                })
+            }
+            SyncState::Scan(config) => {
+                let mode = config.mode;
+                let scanned = result.child::<SubjectScanResult, SubjectScanError>()??;
+                Ok(Next::Done(Some((mode, scanned))))
+            }
         }
     }
 }
@@ -205,11 +153,7 @@ impl Operation for LocalSubjectOperation {
     type Error = SubjectScanError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
-        let row = (
-            NODE_SUBJECT_KEYSPACE.to_string(),
-            Key::from(NODE_SUBJECT_KEY.to_vec()),
-        );
-        Ok(Next::Call(IoCall::Read(vec![row])))
+        Ok(Next::Call(IoCall::Read(vec![local_row()])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
@@ -222,12 +166,12 @@ impl Operation for LocalSubjectOperation {
     }
 }
 
-fn local_read() -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-        key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-        txn_id: None,
-    })
+/// The row of the subject record this node advertises.
+fn local_row() -> (KeySpace, Key) {
+    (
+        NODE_SUBJECT_KEYSPACE.to_string(),
+        Key::from(NODE_SUBJECT_KEY.to_vec()),
+    )
 }
 
 fn local_record(value: Option<Value>) -> Result<Option<NodeSubjectRecord>, SubjectScanError> {
