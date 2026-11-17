@@ -25,15 +25,16 @@ use tracing::{error, warn};
 use ulid::Ulid;
 
 use super::plaintext::{consent_delete, consent_write, job_consent};
-use super::protocol::ReferenceAdvance;
-use super::records::{
-    BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, blob_job_entry, blob_job_key,
-    blob_job_preferred, live_obligation_entry,
-};
-use super::version_replication::{ReplicateScopeError, ReplicateScopeInput};
+use super::version_replication::ReplicateScopeError;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::plugins::store::StoreError;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
+use aruna_core::structs::storage::replication_queue::{
+    BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, blob_job_entry, blob_job_key,
+    blob_job_preferred, live_obligation_entry,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueBlobResult {
@@ -641,19 +642,12 @@ mod tests {
         read_replication_cursor, reschedule_blob_job, retire_job, scan_due_jobs,
         store_relationship, write_blob_job,
     };
-    use super::super::members::MemberTarget;
     use super::super::obligations::{
         OBLIGATION_BATCH_SIZE, REPLICATION_JOB_LIMIT, REPLICATION_RELATIONSHIP_LIMIT,
         delete_live_obligation, process_live_obligations, read_relationships_limit,
         retire_obligations, write_live_jobs, write_live_obligation,
     };
-    use super::super::protocol::{ReplicationMode, SyncOrigin};
-    use super::super::records::{
-        BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, RelationshipJobTarget,
-        blob_job_entry, blob_job_key, build_live_obligation, continuation_newer,
-        live_obligation_entry, live_obligation_key, queued_prefixes, relationship_job,
-    };
-    use super::super::version_replication::{ReplicateScopeTarget, SourceAuthorizationError};
+    use super::super::version_replication::SourceAuthorizationError;
     use crate::plugins::store::Txn;
     use crate::sync::mirror_repair::store_sync_status;
     use aruna_core::UserId;
@@ -672,6 +666,14 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::replication::{ArunaArn, ReplicationItemError};
+    use aruna_core::structs::storage::replication_queue::MemberTarget;
+    use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
+    use aruna_core::structs::storage::replication_queue::{
+        BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, RelationshipJobTarget,
+        blob_job_entry, blob_job_key, build_live_obligation, continuation_newer,
+        live_obligation_entry, live_obligation_key, queued_prefixes, relationship_job,
+    };
+    use aruna_core::structs::storage::replication_queue::{ReplicationMode, SyncOrigin};
     use aruna_core::structs::{ReferenceHandling, SyncStatusSnapshot, sync_relationship_key};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;

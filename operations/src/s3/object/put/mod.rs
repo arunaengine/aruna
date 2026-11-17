@@ -23,7 +23,6 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::records::build_live_obligation;
 use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
 };
@@ -60,6 +59,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::structs::storage::replication_queue::build_live_obligation;
 use aruna_core::structs::storage::routing::{RoutingError, RoutingSnapshot, resolve_backend};
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -2407,7 +2407,10 @@ mod pure_tests {
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected one obligation write, got {effects:?}")
         };
-        let record = crate::replication::records::LiveObligationRecord::from_bytes(value.as_ref())
+        let record =
+            aruna_core::structs::storage::replication_queue::LiveObligationRecord::from_bytes(
+                value.as_ref(),
+            )
             .expect("obligation decodes");
         assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
     }

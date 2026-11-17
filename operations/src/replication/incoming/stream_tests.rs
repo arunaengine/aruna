@@ -16,7 +16,7 @@ use aruna_storage::FjallStorage;
 use tempfile::tempdir;
 
 use super::*;
-use crate::replication::protocol::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 
 #[tokio::test]
 async fn rejects_foreign_peer() {

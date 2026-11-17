@@ -38,20 +38,15 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
-use super::members::{MemberTarget, bound_record, member_publication};
+use super::members::{bound_record, member_publication};
 use super::obligations::{REPLICATION_PAGE_SIZE, live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
 use super::parking::{PARKED_DUE, park_job};
 use super::plaintext::{HolderCheckOperation, job_consent};
 use super::queue::BlobQueueError;
-use super::records::{
-    BlobJobRecord, blob_job_entry, blob_job_key, blob_job_preferred, merge_due_job,
-    validate_sync_key,
-};
 use super::version_replication::{
-    ReplicateScopeError, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
-    SourceAuthorizationError,
+    ReplicateScopeError, ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
@@ -59,6 +54,12 @@ use crate::plugins::store::{Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
+use aruna_core::structs::storage::replication_queue::{
+    BlobJobRecord, blob_job_entry, blob_job_key, blob_job_preferred, merge_due_job,
+    validate_sync_key,
+};
 
 const REPLICATION_BATCH_SIZE: usize = 64;
 

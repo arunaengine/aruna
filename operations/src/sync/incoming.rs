@@ -688,7 +688,7 @@ async fn run_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replication::protocol::{LocationSummaryRequest, ReferenceAdvance};
+    use crate::replication::protocol::LocationSummaryRequest;
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
@@ -701,6 +701,7 @@ mod tests {
     use aruna_core::structs::identity::auth::PathRestriction;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;

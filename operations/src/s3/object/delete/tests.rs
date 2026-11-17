@@ -66,8 +66,10 @@ fn obligation_keeps_restrictions() {
     let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
         panic!("expected one obligation write, got {effects:?}")
     };
-    let record = crate::replication::records::LiveObligationRecord::from_bytes(value.as_ref())
-        .expect("obligation decodes");
+    let record = aruna_core::structs::storage::replication_queue::LiveObligationRecord::from_bytes(
+        value.as_ref(),
+    )
+    .expect("obligation decodes");
     assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
 }
 

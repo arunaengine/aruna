@@ -6,6 +6,7 @@
 // A queued job names only the member; what it publishes comes from the record this node
 // holds when it sends, so an ended coordinatorship publishes nothing.
 
+use aruna_core::structs::storage::replication_queue::MemberTarget;
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
@@ -20,24 +21,19 @@ use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::protocol::ReplicationMode;
-use super::records::{BlobJobRecord, LiveObligationRecord, queued_prefixes};
-use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{
+    BlobJobRecord, LiveObligationRecord, queued_prefixes,
+};
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 
 /// Queue rows one check reads per page, and pages it reads before it counts the queue as owing.
 const FANOUT_PAGE: usize = 1024;
 const FANOUT_PAGES: usize = 16;
 /// Queue pages one copy lag count reads.
 const LAG_PAGES: usize = 4;
-
-/// The member of a distributed bucket a queued job publishes to.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct MemberTarget {
-    pub set_id: Ulid,
-    pub member_id: Ulid,
-}
 
 /// This node's record of a set, if it holds one.
 pub(crate) async fn read_record(
@@ -355,7 +351,9 @@ mod tests {
             let context = &context;
             async move { context.storage_handle.send_storage_effect(effect).await }
         };
-        let entry = super::super::records::live_obligation_entry(&obligation).unwrap();
+        let entry =
+            aruna_core::structs::storage::replication_queue::live_obligation_entry(&obligation)
+                .unwrap();
         write(entry.clone()).await;
         assert!(owes(lower.clone()).await, "an obligation is still owed");
         assert!(!owes(upper.clone()).await, "another range owes nothing");
@@ -367,7 +365,7 @@ mod tests {
         context.storage_handle.send_storage_effect(delete).await;
         let jobs = member_jobs(&binding(&snapshot, 1, 5), &snapshot, &obligation, 9);
         let job = &jobs[0];
-        let key = super::super::records::blob_job_key(job).unwrap();
+        let key = aruna_core::structs::storage::replication_queue::blob_job_key(job).unwrap();
         let value = job.to_bytes().unwrap().into();
         let job_space = aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE.to_string();
         write((job_space, key, value)).await;
@@ -378,12 +376,12 @@ mod tests {
     #[tokio::test]
     async fn counts_copy_lag() {
         // Obligations count for every member until their jobs are queued, then the jobs count.
-        use super::super::records::{
-            LiveReplicationContinuation, blob_job_key, live_obligation_entry,
-        };
         use crate::distribution::test_store::open;
         use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
+        use aruna_core::structs::storage::replication_queue::{
+            LiveReplicationContinuation, blob_job_key, live_obligation_entry,
+        };
         let (_dir, storage_handle) = open();
         let context = DriverContext {
             storage_handle,

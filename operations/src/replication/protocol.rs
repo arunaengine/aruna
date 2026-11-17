@@ -20,6 +20,9 @@ use aruna_core::structs::storage::multipart::{
 use aruna_core::structs::storage::replication::{
     ArunaArn, ReplicationItemKind, ReplicationNegotiationResult, VersionedObjectArn,
 };
+use aruna_core::structs::storage::replication_queue::{
+    ReferenceAdvance, ReplicationMode, SyncOrigin,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use ulid::Ulid;
@@ -35,12 +38,6 @@ pub const MAX_VALUE_BYTES: usize = 4 * 1024;
 pub const MAX_HASH_BYTES: usize = 64;
 pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_MANIFEST_WORK: usize = 4 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ReferenceAdvance {
-    pub generation: u64,
-    pub predecessor: Ulid,
-}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionReplicationManifest {
@@ -240,12 +237,6 @@ impl VersionReplicationManifest {
 
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SyncOrigin {
-    pub relationship_id: Ulid,
-    pub hop_count: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -692,12 +683,6 @@ impl VersionReplicationMessage {
         }
         Ok(message)
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ReplicationMode {
-    Live,
-    OnDemand,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

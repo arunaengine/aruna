@@ -20,11 +20,12 @@ use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildInput, Built, PageBuildOperation};
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
 use crate::driver::{DriverContext, drive};
-use crate::replication::members::{MemberTarget, bound_record, member_publication};
+use crate::replication::members::{bound_record, member_publication};
 use crate::replication::queue::BlobQueueError;
-use crate::replication::records::BlobJobRecord;
-use crate::replication::version_replication::ReplicateScopeTarget;
 use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 
 /// The error a job carries while single delivery owes it instead of a page.
 pub(crate) const PAGE_SINGLE: &str = "left to single delivery by a reference page";

@@ -29,7 +29,9 @@ use crate::distribution::test_record::{binding, realm, replicated, secret, store
 use crate::distribution::test_store::{context, install, open};
 use crate::replication::drain::drain_batch;
 use crate::replication::page::apply::tests::source;
-use crate::replication::records::{LiveObligationRecord, live_obligation_entry};
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
+};
 
 struct Node {
     _dir: TempDir,

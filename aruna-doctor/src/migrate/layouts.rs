@@ -11,13 +11,13 @@ use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
+use aruna_core::structs::storage::replication_queue::{BlobJobRecord, blob_job_key};
+use aruna_core::structs::storage::replication_queue::{ReferenceAdvance, SyncOrigin};
 use aruna_core::structs::storage::usage::{
     NodeUsageSnapshot, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_PROGRESS_KEY, UsageCounters,
 };
-use aruna_operations::replication::members::MemberTarget;
-use aruna_operations::replication::protocol::{ReferenceAdvance, SyncOrigin};
-use aruna_operations::replication::records::{BlobJobRecord, blob_job_key};
-use aruna_operations::replication::version_replication::ReplicateScopeInput;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -281,8 +281,8 @@ mod tests {
         BackendLocation, BackendRef, CurrentVersionPointer, WriteOwner,
     };
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_operations::replication::protocol::ReplicationMode;
-    use aruna_operations::replication::version_replication::{
+    use aruna_core::structs::storage::replication_queue::ReplicationMode;
+    use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,
     };
     use std::collections::HashMap;

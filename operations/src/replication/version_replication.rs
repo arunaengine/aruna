@@ -20,8 +20,8 @@ use crate::placement::policy::{
 };
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{
-    MaterializedBlobInfo, MultipartObjectMetadata, ReferenceAdvance, ReplicationMode, SyncOrigin,
-    VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
+    MaterializedBlobInfo, MultipartObjectMetadata, VersionReplicationManifest,
+    VersionReplicationMessage, VersionReplicationRequest,
 };
 use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::storage_read::StorageReadError;
@@ -62,6 +62,10 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ReplicationFailure, ReplicationItemError, ReplicationItemKind,
     ReplicationNegotiationResult, ReplicationSuboperationResult,
 };
+use aruna_core::structs::storage::replication_queue::{
+    ReferenceAdvance, ReplicationMode, SyncOrigin,
+};
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::storage::routing::{GroupRoutingInputs, RoutingError};
 use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, resolve_backend};
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
@@ -260,24 +264,6 @@ struct SyncTransferContext {
     writer_auth_context: Option<AuthContext>,
     /// A coordinator's publication to one member of a distributed bucket.
     distribution: Option<Publication>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum ReplicateScopeTarget {
-    Bucket,
-    Prefix(String),
-    Object { key: String },
-    Version { key: String, version_id: Ulid },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicateScopeInput {
-    pub bucket: String,
-    pub target: ReplicateScopeTarget,
-    pub target_node_id: NodeId,
-    pub auth_context: AuthContext,
-    pub replicate_delete_markers: bool,
-    pub mode: ReplicationMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3191,10 +3177,7 @@ mod tests {
         target_key,
     };
     use crate::driver::DriverContext;
-    use crate::replication::protocol::{
-        ReferenceAdvance, ReplicationMode, SyncOrigin, VersionReplicationMessage,
-        VersionReplicationRequest,
-    };
+    use crate::replication::protocol::{VersionReplicationMessage, VersionReplicationRequest};
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
     use aruna_core::errors::BlobError;
@@ -3229,6 +3212,9 @@ mod tests {
     use aruna_core::structs::storage::replication::{
         ReplicationItemError, ReplicationItemKind, ReplicationNegotiationResult,
         ReplicationSuboperationResult,
+    };
+    use aruna_core::structs::storage::replication_queue::{
+        ReferenceAdvance, ReplicationMode, SyncOrigin,
     };
     use aruna_core::structs::storage::routing::GroupRoutingInputs;
     use aruna_core::types::Effects;
@@ -4555,8 +4541,8 @@ mod tests {
     fn page_matches_single() {
         // A reference page carries exactly the manifest a single delivery of the job sends.
         use crate::replication::page::build::reference_manifest;
-        use crate::replication::records::BlobJobRecord;
         use aruna_core::structs::storage::distribution::OriginalEpoch;
+        use aruna_core::structs::storage::replication_queue::BlobJobRecord;
         let version_id = Ulid::generate();
         let publication = Publication {
             set_id: Ulid::from_bytes([4; 16]),

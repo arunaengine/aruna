@@ -3,12 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::records::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 
 use super::queue::{BlobQueueError, schedule_blob_drain};
 
 use super::drain::REPLICATION_POLL_AFTER;
-use super::version_replication::ReplicateScopeTarget;
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
 use crate::storage_read::iter_prefix_page;
@@ -24,6 +23,7 @@ use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKe
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
 };
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use std::collections::BTreeSet;
@@ -421,9 +421,6 @@ async fn abort(storage: &StorageHandle, txn_id: TxnId) {
 mod tests {
     use super::*;
     use crate::replication::drain::next_blob_timer;
-    use crate::replication::protocol::ReplicationMode;
-    use crate::replication::records::blob_job_key;
-    use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
@@ -433,6 +430,11 @@ mod tests {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::{EncryptionMode, public_key_of};
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use aruna_core::structs::storage::replication_queue::ReplicationMode;
+    use aruna_core::structs::storage::replication_queue::blob_job_key;
+    use aruna_core::structs::storage::replication_queue::{
+        ReplicateScopeInput, ReplicateScopeTarget,
+    };
     use std::time::SystemTime;
     use tempfile::TempDir;
 

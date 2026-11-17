@@ -38,16 +38,17 @@ use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::members::{MemberTarget, read_record};
-use super::protocol::ReplicationMode;
+use super::members::read_record;
 use super::queue::schedule_blob_drain;
-use super::records::{BlobJobRecord, blob_job_key};
-use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
 use crate::distribution::create::submit;
 use crate::distribution::lifecycle::settle_marker;
 use crate::distribution::sign_statement;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::GetBucketOperation;
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{BlobJobRecord, blob_job_key};
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 
 /// Inventory rows one page queues at most, one reference page; the next page waits until they
 /// are delivered.

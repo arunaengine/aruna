@@ -25,9 +25,9 @@ use thiserror::Error;
 
 use super::{PAGE_BYTES, PAGE_RECORDS};
 use crate::replication::protocol::VersionReplicationManifest;
-use crate::replication::records::BlobJobRecord;
-use crate::replication::version_replication::ReplicateScopeTarget;
 use crate::staging::root_record::{hydrated, named_root};
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 
 /// What a page does with one queued job.
 #[derive(Clone, Debug, PartialEq)]

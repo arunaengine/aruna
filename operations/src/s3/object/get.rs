@@ -19,11 +19,8 @@ use crate::distribution::source_keep::{SourceKeep, keep_first};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
-use crate::replication::protocol::{
-    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
-};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use crate::replication::records::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
@@ -69,6 +66,10 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::multipart::{
     MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
+};
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
 };
 use aruna_core::structs::storage::usage::UsageDelta;
 use aruna_core::types::Effects;

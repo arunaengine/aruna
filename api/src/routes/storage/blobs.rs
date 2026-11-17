@@ -13,6 +13,8 @@ use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{
     CopyOrigin, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_operations::blob::holders::{GetHoldersError, GetHoldersOperation};
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::driver::{drive, drive_until};
@@ -22,12 +24,9 @@ use aruna_operations::replication::locations::{
 };
 use aruna_operations::replication::plaintext::{EncryptionCheckOperation, HolderCheckOperation};
 use aruna_operations::replication::protocol::{
-    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
+    CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest,
 };
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeTarget,
-};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};

@@ -6,8 +6,7 @@ use crate::connectors::repository::source_connector_key;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate};
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
-use crate::replication::records::LiveObligationRecord;
+use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
     MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
@@ -45,6 +44,8 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;

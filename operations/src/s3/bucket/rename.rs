@@ -8,7 +8,6 @@ use crate::driver::{DriverContext, drive};
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::validate_folder;
 use crate::jobs::store::decode_job_record;
-use crate::replication::records::queued_prefixes;
 use crate::s3::purge_fence::fence_key;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -33,6 +32,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::{CompressionMigration, EncodingClass};
 use aruna_core::structs::storage::group_backend::MAX_KEY_LEN;
 use aruna_core::structs::storage::multipart::MultipartUpload;
+use aruna_core::structs::storage::replication_queue::queued_prefixes;
 use aruna_core::structs::sync_relationship_prefix;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;

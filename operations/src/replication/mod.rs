@@ -15,5 +15,4 @@ pub mod parking;
 pub mod plaintext;
 pub mod protocol;
 pub mod queue;
-pub mod records;
 pub mod version_replication;

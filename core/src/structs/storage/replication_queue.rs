@@ -1,26 +1,64 @@
-//! Stored blob replication jobs and live copy obligations: rows, keys and the jobs a relationship derives.
+//! Stored blob replication jobs and live copy obligations: rows, keys, the scope a job copies
+//! and the jobs a sync relationship derives. The queue rows and the doctor share these formats.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
-use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
-use tracing::error;
 use ulid::Ulid;
 
-use super::members::MemberTarget;
-use super::protocol::{ReferenceAdvance, ReplicationMode, SyncOrigin};
-use super::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
-use crate::driver::now_ms;
+use crate::NodeId;
+use crate::effects::{Effect, StorageEffect};
+use crate::errors::ConversionError;
+use crate::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
+use crate::structs::identity::auth::AuthContext;
+use crate::structs::storage::replication::ArunaArn;
+use crate::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_key};
+use crate::time::unix_timestamp_millis;
+use crate::types::Key;
+use byteview::ByteView;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicationMode {
+    Live,
+    OnDemand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceAdvance {
+    pub generation: u64,
+    pub predecessor: Ulid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SyncOrigin {
+    pub relationship_id: Ulid,
+    pub hop_count: u8,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicateScopeTarget {
+    Bucket,
+    Prefix(String),
+    Object { key: String },
+    Version { key: String, version_id: Ulid },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicateScopeInput {
+    pub bucket: String,
+    pub target: ReplicateScopeTarget,
+    pub target_node_id: NodeId,
+    pub auth_context: AuthContext,
+    pub replicate_delete_markers: bool,
+    pub mode: ReplicationMode,
+}
+
+/// The member of a distributed bucket a queued job publishes to.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct MemberTarget {
+    pub set_id: Ulid,
+    pub member_id: Ulid,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobJobRecord {
@@ -242,9 +280,7 @@ pub fn blob_job_key(record: &BlobJobRecord) -> Result<Key, ConversionError> {
 }
 
 /// Key prefixes of the jobs and live obligations queued for `bucket`.
-pub(crate) fn queued_prefixes(
-    bucket: &str,
-) -> Result<[(&'static str, Vec<u8>); 3], ConversionError> {
+pub fn queued_prefixes(bucket: &str) -> Result<[(&'static str, Vec<u8>); 3], ConversionError> {
     let key = |identity: Vec<u8>| [b"v1".to_vec(), identity].concat();
     Ok([
         (
@@ -262,9 +298,7 @@ pub(crate) fn queued_prefixes(
     ])
 }
 
-pub(super) fn blob_job_entry(
-    record: &BlobJobRecord,
-) -> Result<(String, Key, ByteView), ConversionError> {
+pub fn blob_job_entry(record: &BlobJobRecord) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
         REPLICATION_JOB_KEYSPACE.to_string(),
         blob_job_key(record)?,
@@ -272,7 +306,7 @@ pub(super) fn blob_job_entry(
     ))
 }
 
-pub(super) fn blob_job_preferred(candidate: &BlobJobRecord, current: &BlobJobRecord) -> bool {
+pub fn blob_job_preferred(candidate: &BlobJobRecord, current: &BlobJobRecord) -> bool {
     (candidate.attempts, candidate.due_at_ms) > (current.attempts, current.due_at_ms)
 }
 
@@ -287,7 +321,7 @@ pub fn live_obligation_key(record: &LiveObligationRecord) -> Result<Key, Convers
     Ok(ByteView::from(key))
 }
 
-pub(crate) fn live_obligation_entry(
+pub fn live_obligation_entry(
     record: &LiveObligationRecord,
 ) -> Result<(String, Key, ByteView), ConversionError> {
     Ok((
@@ -297,7 +331,7 @@ pub(crate) fn live_obligation_entry(
     ))
 }
 
-pub(crate) fn live_obligation_effect(
+pub fn live_obligation_effect(
     record: LiveObligationRecord,
     txn_id: Option<Ulid>,
 ) -> Result<Effect, ConversionError> {
@@ -331,14 +365,14 @@ pub fn build_live_obligation(
 }
 
 /// Identifies the object version a replication job is being derived for.
-pub(super) struct RelationshipJobTarget<'a> {
-    bucket: &'a str,
-    key: &'a str,
-    version_id: Ulid,
-    delete_marker: bool,
+pub struct RelationshipJobTarget<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub version_id: Ulid,
+    pub delete_marker: bool,
 }
 
-pub(super) fn relationship_job(
+pub fn relationship_job(
     local_node_id: NodeId,
     target: RelationshipJobTarget<'_>,
     relationship: SyncRelationship,
@@ -419,11 +453,11 @@ fn reverse_target(relationship: &SyncRelationship, source: &ArunaArn) -> bool {
     same_endpoint(&relationship.target, source)
 }
 
-pub(super) fn same_endpoint(left: &ArunaArn, right: &ArunaArn) -> bool {
+pub fn same_endpoint(left: &ArunaArn, right: &ArunaArn) -> bool {
     left == right
 }
 
-pub(super) fn validate_sync_key(
+pub fn validate_sync_key(
     bucket: &str,
     key: &Key,
     relationship: &SyncRelationship,
@@ -436,7 +470,7 @@ pub(super) fn validate_sync_key(
     Ok(())
 }
 
-pub(super) fn continuation_newer(
+pub fn continuation_newer(
     candidate: &LiveReplicationContinuation,
     current: &LiveReplicationContinuation,
 ) -> bool {
@@ -453,7 +487,7 @@ pub(super) fn continuation_newer(
     }
 }
 
-pub(super) fn merge_due_job(
+pub fn merge_due_job(
     jobs: &mut Vec<(Vec<u8>, BlobJobRecord)>,
     key: Vec<u8>,
     job: BlobJobRecord,

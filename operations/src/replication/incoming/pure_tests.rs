@@ -13,10 +13,8 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
 use crate::replication::protocol::{
-    MAX_VALUE_BYTES, MaterializedBlobInfo, ReferenceAdvance, SyncOrigin,
-    VersionReplicationManifest, VersionReplicationMessage,
+    MAX_VALUE_BYTES, MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
 };
-use crate::replication::records::LiveObligationRecord;
 use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
@@ -43,6 +41,8 @@ use aruna_core::structs::storage::multipart::MultipartObjectKey;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
 };
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::storage::replication_queue::{ReferenceAdvance, SyncOrigin};
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingTarget, StorageRoutingRule,
 };
@@ -57,7 +57,7 @@ use ulid::Ulid;
 
 #[tokio::test]
 async fn refused_copy_absent() {
-    use crate::replication::protocol::{ReplicationMode, VersionReplicationRequest};
+    use crate::replication::protocol::VersionReplicationRequest;
     use crate::replication::version_replication::{ReplicateObjectError, ReplicateObjectOperation};
     use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
     use aruna_core::structs::storage::blob::VersionKey;
@@ -65,6 +65,7 @@ async fn refused_copy_absent() {
         BucketEncryption, BucketKeyRef, EncryptionMode,
     };
     use aruna_core::structs::storage::format::PithosLayout;
+    use aruna_core::structs::storage::replication_queue::ReplicationMode;
     let (_source_dir, source_storage) = crate::tests::s3::test_storage();
     let (target_dir, target_storage) = crate::tests::s3::test_storage();
     let target_node = iroh::SecretKey::from_bytes(&[42; 32]).public();

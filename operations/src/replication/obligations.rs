@@ -26,14 +26,14 @@ use tracing::{error, warn};
 use super::drain::abort_cursor;
 use super::members::{bound_record, member_jobs};
 use super::page::{PAGE_BYTES, PAGE_RECORDS};
-use super::protocol::SyncOrigin;
 use super::queue::BlobQueueError;
-use super::records::{
+use crate::driver::DriverContext;
+use aruna_core::structs::storage::replication_queue::SyncOrigin;
+use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, RelationshipJobTarget,
     blob_job_entry, blob_job_key, blob_job_preferred, continuation_newer, live_obligation_entry,
     relationship_job, same_endpoint, validate_sync_key,
 };
-use crate::driver::DriverContext;
 
 pub(super) const REPLICATION_PAGE_SIZE: usize = 512;
 

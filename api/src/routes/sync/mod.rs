@@ -13,6 +13,8 @@ use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, ensure_confined_path};
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
@@ -26,11 +28,7 @@ use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
     consent_write, relationship_consent,
 };
-use aruna_operations::replication::protocol::ReplicationMode;
 use aruna_operations::replication::queue::QueueBlobOperation;
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeTarget,
-};
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
     request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
