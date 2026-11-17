@@ -14,7 +14,8 @@ use crate::server::state::ServerState;
 use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::structs::identity::user::vault::{KEY_ID_BYTES, UserKeyRecord, VaultRecords};
-use aruna_operations::s3::holder_seal::seal_published;
+use aruna_operations::driver::drive;
+use aruna_operations::s3::holder_seal::SealPublishedOperation;
 use aruna_operations::users::vault_write::{VaultAppended, VaultChange};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -150,7 +151,8 @@ pub async fn publish_key(
         VaultAppended::Key(record) => {
             let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
             // Buckets on this node seal the holder's missing copies now; locked ones at unlock.
-            if let Err(error) = seal_published(&state.get_ctx(), realm_id, node_id, &record).await {
+            let seal = SealPublishedOperation::new(realm_id, node_id, (*record).clone());
+            if let Err(error) = drive(seal, &state.get_ctx()).await {
                 tracing::warn!(%error, "could not seal bucket key copies for a new user key");
             }
             Ok((StatusCode::CREATED, Json(key_response(*record))))

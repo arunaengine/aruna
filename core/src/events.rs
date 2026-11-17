@@ -138,6 +138,10 @@ pub enum SubOperationEvent {
     KeysLooked {
         lookup: crate::structs::storage::holders::KeyLookup,
     },
+    /// Whether a bucket sealed a missing key copy for a holder's new user key.
+    CopySealed {
+        sealed: bool,
+    },
 }
 
 /// How the re-key of one version ended.
