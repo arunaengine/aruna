@@ -67,7 +67,7 @@ fn acquire_after(events: Vec<Event>) -> AcquireFenceOperation {
 }
 
 #[test]
-fn check_suspends_covered_keys() {
+fn suspends_covered_keys() {
     let mut covered = FenceCheckOperation::new("bucket", "logs/a");
     assert_eq!(
         covered.start().as_slice(),
@@ -86,7 +86,7 @@ fn check_suspends_covered_keys() {
 }
 
 #[test]
-fn check_errors_and_contract() {
+fn check_contract() {
     let mut storage = FenceCheckOperation::new("bucket", "k");
     storage.start();
     storage.step(failed(StorageError::Timeout));
@@ -157,7 +157,7 @@ fn existing_fence_decides() {
 }
 
 #[test]
-fn conflicts_retry_then_fail() {
+fn conflicts_retry_bounded() {
     let mut operation = acquire_after(Vec::new());
     for attempt in 1..=FENCE_MUTATE_ATTEMPTS {
         operation.step(started());
@@ -229,7 +229,7 @@ fn acquire_contract() {
 }
 
 #[test]
-fn terminal_delete_only_when_owned() {
+fn owned_terminal_delete() {
     let owned = fence(job(1), scope());
     assert_eq!(
         owned_fence_delete(Some(&owned), job(1), &scope()),

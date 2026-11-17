@@ -540,7 +540,7 @@ mod tests {
     }
 
     #[test]
-    fn stores_in_one_transaction() {
+    fn stores_in_transaction() {
         let key = retry_timer(&record());
         let mut operation = StoreAuditOperation::new(key.clone());
         let write = Effect::Storage(StorageEffect::Write {
@@ -626,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn store_abort_and_finalize() {
+    fn store_abort_finalize() {
         let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
         let mut starting = store_after(Vec::new());
         check_abort(&mut starting, &[]);
@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_errors_and_refusals() {
+    fn resume_contract() {
         let mut scanning = ResumeAuditOperation::default();
         scanning.start();
         assert!(scanning.step(storage_error()).is_empty());

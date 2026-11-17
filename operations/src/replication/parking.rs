@@ -1830,7 +1830,7 @@ mod tests {
         }
 
         #[test]
-        fn due_or_gone_job_drops_row() {
+        fn stale_job_skipped() {
             let mut due = parked();
             due.due_at_ms = 3;
             for record in [None, Some(&due)] {
@@ -1849,7 +1849,7 @@ mod tests {
         }
 
         #[test]
-        fn conflicts_retry_then_fail() {
+        fn conflicts_retry_bounded() {
             let conflict = || {
                 Event::Storage(StorageEvent::Error {
                     error: StorageError::TransactionConflict,
@@ -1906,7 +1906,7 @@ mod tests {
         }
 
         #[test]
-        fn wakes_each_row_then_schedules() {
+        fn wakes_then_schedules() {
             let mut operation = WakeParkedOperation::new(key(), 5);
             assert_eq!(operation.start().len(), 1);
             assert!(matches!(
@@ -1935,7 +1935,7 @@ mod tests {
         }
 
         #[test]
-        fn full_page_reads_on() {
+        fn full_page_continues() {
             let mut operation = WakeParkedOperation::new(key(), 5);
             operation.start();
             let page = waits(WAIT_PAGE);
@@ -1982,7 +1982,7 @@ mod tests {
         }
 
         #[test]
-        fn counts_parked_jobs_in_one_batch() {
+        fn counts_parked_batched() {
             let relationship = Ulid::from_parts(1, 1);
             let owner = postcard::to_allocvec(&Some(relationship)).unwrap();
             let other = postcard::to_allocvec(&Some(Ulid::from_parts(2, 2))).unwrap();

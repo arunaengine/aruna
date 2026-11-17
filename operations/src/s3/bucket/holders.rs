@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn asks_each_user_in_turn() {
+    fn asks_users_sequentially() {
         let realm_id = RealmId::from_bytes([3; 32]);
         let mut operation = LookupKeysOperation::new(realm_id, node(), [user(1), user(2)]);
         assert!(matches!(
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn nobody_finishes_at_once() {
+    fn empty_finishes_immediately() {
         let mut operation = LookupKeysOperation::new(RealmId::from_bytes([3; 32]), node(), []);
         assert!(operation.start().is_empty());
         assert_eq!(operation.finalize(), Ok(BTreeMap::new()));

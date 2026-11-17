@@ -404,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_plain_and_missing_buckets() {
+    fn skips_unsealable_buckets() {
         // A plain bucket is never read; a bucket without a record is skipped.
         let mut operation = operation();
         let page = settings_page(

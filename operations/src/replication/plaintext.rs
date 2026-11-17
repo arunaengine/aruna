@@ -139,8 +139,7 @@ enum HolderState {
 
 /// Whether `user` holds the key of `bucket` in realm `realm_id` now: its creator, a current group
 /// admin, or an explicit holder, of any home realm. Losing the admin role ends it at once (D30).
-/// With a request row it answers whether a job of `user` may copy encrypted items as plaintext:
-/// the request must be theirs, and they must still hold the bucket key.
+/// With [`Self::with_consent`] the plaintext request row must also be the user's own.
 #[derive(Debug, PartialEq)]
 pub struct HolderCheckOperation {
     realm_id: RealmId,
@@ -751,7 +750,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn foreign_request_stops_early() {
+    fn foreign_request_stops() {
         // A request of another user answers false before the bucket is read.
         let realm = RealmId::from_bytes([3; 32]);
         let row = relationship_consent(Ulid::from_bytes([6; 16]));
@@ -768,7 +767,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn holder_reads_in_order() {
+    fn holder_read_order() {
         let realm = RealmId::from_bytes([3; 32]);
         let row = relationship_consent(Ulid::from_bytes([6; 16]));
         let mut operation =
@@ -794,7 +793,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checks_fail_on_errors() {
+    fn errors_fail_checks() {
         let realm = RealmId::from_bytes([3; 32]);
         let mut holder = HolderCheckOperation::new(realm, "sealed", user(1));
         holder.start();
