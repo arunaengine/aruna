@@ -39,7 +39,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 /// Upper bound on the heads one pass touches.
-pub const BULK_PAGE_LIMIT: usize = 128;
+const BULK_PAGE_LIMIT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BulkConfig {

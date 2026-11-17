@@ -28,7 +28,7 @@ use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 
 /// The error a job carries while single delivery owes it instead of a page.
-pub(crate) const PAGE_SINGLE: &str = "left to single delivery by a reference page";
+const PAGE_SINGLE: &str = "left to single delivery by a reference page";
 /// Failed attempts that each halve the pages a job travels in.
 const PAGE_SHRINKS: u32 = 4;
 

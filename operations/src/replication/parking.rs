@@ -30,7 +30,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 /// How long a job that no longer waits for a key, and an idle drain, wait before the next look.
-pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
+const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 /// Due time of a parked job: the drain never runs it and never times a wake for it.
 pub(crate) const PARKED_DUE: u64 = u64::MAX;
 const WAIT_PAGE: usize = 256;

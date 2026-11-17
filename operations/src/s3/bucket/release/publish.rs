@@ -360,7 +360,7 @@ pub async fn publish_release(
 const ROW_PAGE: usize = 256;
 
 /// Every release row of `bucket` this node holds, in key order.
-pub(crate) async fn release_rows(
+async fn release_rows(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Vec<(Ulid, ReleasePointer)>, PublishError> {

@@ -1614,7 +1614,7 @@ fn same_bytes(old: &BackendLocation, size: u64, etag: Option<&str>) -> bool {
 }
 
 /// The rename request of the move `record` of `bucket`, if it was started to rename files.
-pub async fn rename_request(
+async fn rename_request(
     context: &crate::driver::DriverContext,
     bucket: &str,
     record: &CompressionMigration,

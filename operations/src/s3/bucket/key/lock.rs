@@ -25,7 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 /// The record of a lock of `ticket`, timed when there is no actor.
-pub fn lock_record(
+fn lock_record(
     ticket: KeyTicket,
     actor: Option<UserId>,
     node_id: NodeId,

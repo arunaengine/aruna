@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 
 /// How long one key directory lookup may wait for the holders of a user's vault.
-pub const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);
+const KEY_LOOKUP_DEADLINE: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LookupError {

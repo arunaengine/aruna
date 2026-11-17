@@ -29,15 +29,15 @@ use ulid::Ulid;
 
 const VERSION_REPLICATION_MAGIC: &[u8; 4] = b"vrp1";
 
-pub const MAX_REPLICATION_PARTS: usize = 10_000;
-pub const MAX_REPLICATION_SOURCES: usize = 4;
-pub const MAX_REPLICATION_METADATA: usize = 128;
-pub const MAX_REPLICATION_HASHES: usize = 7;
+const MAX_REPLICATION_PARTS: usize = 10_000;
+const MAX_REPLICATION_SOURCES: usize = 4;
+const MAX_REPLICATION_METADATA: usize = 128;
+const MAX_REPLICATION_HASHES: usize = 7;
 pub const MAX_KEY_BYTES: usize = 128;
 pub const MAX_VALUE_BYTES: usize = 4 * 1024;
-pub const MAX_HASH_BYTES: usize = 64;
-pub const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_MANIFEST_WORK: usize = 4 * 1024 * 1024;
+const MAX_HASH_BYTES: usize = 64;
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MANIFEST_WORK: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VersionReplicationManifest {

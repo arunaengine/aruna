@@ -362,7 +362,7 @@ pub async fn refresh_reference_metadata(
     refresh_with_context(context.as_ref(), refresh).await
 }
 
-pub async fn refresh_with_context(
+async fn refresh_with_context(
     context: &DriverContext,
     refresh: ReferenceRefresh,
 ) -> Result<(), String> {
@@ -614,7 +614,8 @@ pub async fn restore_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     }
 }
 
-pub async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
+#[cfg(test)]
+async fn jobs_exist(storage: &StorageHandle) -> Result<bool, ReferenceRefreshError> {
     Ok(!first_due(storage, 1).await?.0.is_empty())
 }
 

@@ -300,9 +300,9 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
 
 /// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
 /// Current files one runs lookup reads at most; a larger scope answers incomplete.
-pub const RUN_SCAN_LIMIT: usize = 5000;
+const RUN_SCAN_LIMIT: usize = 5000;
 /// Runs one lookup names at most.
-pub const RUN_LIMIT: usize = 50;
+const RUN_LIMIT: usize = 50;
 
 /// The runs whose results are current files of a bucket under a prefix, newest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

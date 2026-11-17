@@ -186,7 +186,7 @@ impl Operation for ReleaseViewOperation {
 }
 
 /// The files a release crate pins, in key order; entities without a key or version are left out.
-pub fn pinned_files(crate_json: &Value) -> Vec<PinnedFile> {
+fn pinned_files(crate_json: &Value) -> Vec<PinnedFile> {
     let graph = crate_json["@graph"].as_array().into_iter().flatten();
     let mut files: Vec<PinnedFile> = graph
         .filter(|entity| entity["@type"] == "File")
