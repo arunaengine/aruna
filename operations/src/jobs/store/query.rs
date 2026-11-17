@@ -7,7 +7,7 @@ use super::*;
 /// Owner-scoped listing, newest first, with an opaque cursor and record filter.
 /// Scans for `limit` records plus one live lookahead.
 pub async fn list_user_jobs(
-    storage: &StorageHandle,
+    context: &DriverContext,
     user_id: UserId,
     cursor: Option<Vec<u8>>,
     limit: usize,
@@ -26,7 +26,7 @@ pub async fn list_user_jobs(
     let mut page_cursor = None;
     loop {
         let (values, _) = iter_prefix_page(
-            storage,
+            &context.storage_handle,
             JOB_INDEX_KEYSPACE,
             Some(prefix.clone()),
             start_after,
@@ -44,7 +44,7 @@ pub async fn list_user_jobs(
                 parse_owner_key(key.as_ref()).map_err(|error| error.to_string())?;
             resume = Some(key);
             let record = if value.is_empty() {
-                read_job_record(storage, job_id, None).await?
+                read_job_record(context, job_id, None).await?
             } else {
                 JobRecord::from_bytes(value.as_ref()).ok()
             };
@@ -69,13 +69,13 @@ pub async fn list_user_jobs(
 }
 
 pub async fn list_job_entries(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     last_key: Option<Vec<u8>>,
     limit: usize,
 ) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
     let (values, next) = iter_prefix_page(
-        storage,
+        &context.storage_handle,
         JOB_ENTRY_KEYSPACE,
         Some(job_entry_prefix(job_id)),
         last_key.map(|key| job_entry_key(job_id, &key)),
@@ -96,12 +96,12 @@ pub async fn list_job_entries(
 }
 
 pub(crate) async fn job_entry_deletes(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     limit: usize,
 ) -> Result<(JobDeletes, bool), String> {
     let (values, next) = iter_prefix_page(
-        storage,
+        &context.storage_handle,
         JOB_ENTRY_KEYSPACE,
         Some(job_entry_prefix(job_id)),
         None,
@@ -120,7 +120,7 @@ pub(crate) async fn job_entry_deletes(
 
 /// One bounded page of a staging job's queue, manifest and lane rows; `true` while more remain.
 pub(crate) async fn staging_row_deletes(
-    storage: &StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     limit: usize,
 ) -> Result<(JobDeletes, bool), String> {
@@ -137,7 +137,7 @@ pub(crate) async fn staging_row_deletes(
             return Ok((deletes, true));
         }
         let (values, next) =
-            iter_prefix_page(storage, key_space, Some(prefix.clone()), None, room, None).await?;
+            iter_prefix_page(&context.storage_handle, key_space, Some(prefix.clone()), None, room, None).await?;
         more |= next.is_some();
         deletes.extend(
             values
@@ -149,24 +149,24 @@ pub(crate) async fn staging_row_deletes(
 }
 
 pub async fn find_dedup_job(
-    storage: &StorageHandle,
+    context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
     txn_id: Option<TxnId>,
 ) -> Result<Option<JobId>, String> {
-    Ok(find_dedup_plan(storage, created_by, dedup_key, txn_id)
+    Ok(find_dedup_plan(context, created_by, dedup_key, txn_id)
         .await?
         .map(|(job_id, _)| job_id))
 }
 
 pub async fn find_dedup_plan(
-    storage: &StorageHandle,
+    context: &DriverContext,
     created_by: UserId,
     dedup_key: &[u8],
     txn_id: Option<TxnId>,
 ) -> Result<Option<(JobId, [u8; 32])>, String> {
     match read_raw(
-        storage,
+        context,
         DEDUP_INDEX_KEYSPACE,
         dedup_index_key(created_by, dedup_key),
         txn_id,
@@ -182,11 +182,11 @@ pub async fn find_dedup_plan(
 
 /// Earliest `(timestamp, job_id)` under a schedule-index prefix.
 pub async fn first_schedule_entry(
-    storage: &StorageHandle,
+    context: &DriverContext,
     prefix: &[u8],
 ) -> Result<Option<(u64, JobId)>, String> {
     let (values, _) = iter_prefix_page(
-        storage,
+        &context.storage_handle,
         SCHEDULE_INDEX_KEYSPACE,
         Some(ByteView::from(prefix.to_vec())),
         None,
@@ -200,7 +200,7 @@ pub async fn first_schedule_entry(
                 Ok(parsed) => Ok(Some(parsed)),
                 Err(error) => {
                     warn!(error = %error, "Deleting malformed job schedule index row");
-                    delete_raw(storage, SCHEDULE_INDEX_KEYSPACE, key, None).await?;
+                    delete_raw(context, SCHEDULE_INDEX_KEYSPACE, key, None).await?;
                     Ok(None)
                 }
             }
@@ -211,14 +211,13 @@ pub async fn first_schedule_entry(
 
 // --- low-level storage plumbing ------------------------------------------------
 
-pub async fn insert_job(storage: &StorageHandle, record: &JobRecord) -> Result<(), String> {
+pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
     let writes = job_insert_entries(record).map_err(|error| error.to_string())?;
-    batch_write(storage, writes, None).await
+    batch_write(context, writes, None).await
 }
 
-pub(super) async fn start_write_txn(storage: &StorageHandle) -> Result<TxnId, String> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+pub(super) async fn start_write_txn(context: &DriverContext) -> Result<TxnId, String> {
+    match context.storage_handle.send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
@@ -233,9 +232,8 @@ pub(super) enum CommitResult {
     Failed(String),
 }
 
-pub(super) async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> CommitResult {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+pub(super) async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> CommitResult {
+    match context.storage_handle.send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => CommitResult::Committed,
@@ -254,12 +252,12 @@ pub(crate) enum CommitStep {
 
 /// Commits one write transaction, sleeping between bounded conflict retries.
 pub(crate) async fn commit_write(
-    storage: &StorageHandle,
+    context: &DriverContext,
     txn_id: TxnId,
     attempt: u32,
     exhausted: &str,
 ) -> Result<CommitStep, JobMutationError> {
-    match commit_txn(storage, txn_id).await {
+    match commit_txn(context, txn_id).await {
         CommitResult::Committed => Ok(CommitStep::Committed),
         CommitResult::Conflict if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
             tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
@@ -270,9 +268,8 @@ pub(crate) async fn commit_write(
     }
 }
 
-pub(super) async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    if let Event::Storage(StorageEvent::Error { error }) = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+pub(super) async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
+    if let Event::Storage(StorageEvent::Error { error }) = context.storage_handle.send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await
     {
         warn!(error = %error, "Failed to abort job mutation transaction");
@@ -280,13 +277,12 @@ pub(super) async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
 }
 
 pub(super) async fn read_raw(
-    storage: &StorageHandle,
+    context: &DriverContext,
     key_space: &str,
     key: Key,
     txn_id: Option<TxnId>,
 ) -> Result<Option<Value>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
+    match context.storage_handle.send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
             key,
             txn_id,
@@ -300,15 +296,14 @@ pub(super) async fn read_raw(
 }
 
 pub(super) async fn batch_write(
-    storage: &StorageHandle,
+    context: &DriverContext,
     writes: JobWrites,
     txn_id: Option<TxnId>,
 ) -> Result<(), String> {
     if writes.is_empty() {
         return Ok(());
     }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
+    match context.storage_handle.send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
@@ -318,15 +313,14 @@ pub(super) async fn batch_write(
 }
 
 pub(crate) async fn batch_delete(
-    storage: &StorageHandle,
+    context: &DriverContext,
     deletes: JobDeletes,
     txn_id: Option<TxnId>,
 ) -> Result<(), String> {
     if deletes.is_empty() {
         return Ok(());
     }
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
+    match context.storage_handle.send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
@@ -336,13 +330,12 @@ pub(crate) async fn batch_delete(
 }
 
 pub(super) async fn delete_raw(
-    storage: &StorageHandle,
+    context: &DriverContext,
     key_space: &str,
     key: Key,
     txn_id: Option<TxnId>,
 ) -> Result<(), String> {
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
+    match context.storage_handle.send_storage_effect(StorageEffect::Delete {
             key_space: key_space.to_string(),
             key,
             txn_id,
