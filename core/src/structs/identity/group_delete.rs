@@ -229,6 +229,17 @@ pub enum GroupWriteError {
     Taken,
 }
 
+/// A storage fault or conflict stays a storage error; any other runner failure is unexpected.
+impl From<crate::calls::IoError> for GroupWriteError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            crate::calls::IoError::Storage(error) => Self::Storage(error),
+            _ => Self::Unexpected,
+        }
+    }
+}
+
 pub fn check_group_write(value: Option<&[u8]>) -> Result<(), GroupWriteError> {
     if let Some(value) = value {
         return match GroupDeleteRecord::from_bytes(value)?.phase {
