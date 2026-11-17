@@ -221,7 +221,7 @@ mod tests {
     use ulid::Ulid;
 
     use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
-    use super::crate::jobs::store::query::insert_job;
+    use crate::jobs::store::query::insert_job;
     use super::*;
 
     const TOKEN: Ulid = Ulid(0x5EA1);

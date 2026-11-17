@@ -252,7 +252,7 @@ pub(crate) fn claim_upload(
 pub(crate) mod tests {
     use super::*;
     use crate::jobs::import::upload_store::{
-        claim_rocrate_upload, read_rocrate_upload, write_rocrate_upload,
+        claim_rocrate_upload, delete_rocrate_upload, read_rocrate_upload, write_rocrate_upload,
     };
     use aruna_core::structs::execution::job::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;

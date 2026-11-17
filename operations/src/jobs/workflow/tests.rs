@@ -783,7 +783,7 @@ async fn finalize_renews_lease() {
     let backend = StubBackend::new(StubReconcile::NotFound);
 
     let task = tokio::spawn(supervise_and_finalize(
-        ctx,
+        ctx.clone(),
         job_id,
         token,
         backend.clone(),
@@ -1252,7 +1252,7 @@ async fn walltime_fails_job() {
     spec.resources.max_walltime_ms = Some(0);
 
     supervise_and_finalize(
-        ctx,
+        ctx.clone(),
         job_id,
         token,
         backend.clone(),
@@ -1288,7 +1288,7 @@ async fn arms_missing_start() {
     spec.resources.max_walltime_ms = Some(0);
 
     supervise_and_finalize(
-        ctx,
+        ctx.clone(),
         job_id,
         token,
         backend.clone(),
@@ -1352,7 +1352,7 @@ async fn reconcile_skips_submit() {
     let backend = StubBackend::new(StubReconcile::NotFound);
 
     reconcile::resume_attempt(
-        ctx,
+        ctx.clone(),
         job_id,
         token,
         backend.clone(),
@@ -1844,8 +1844,8 @@ async fn claimed_execution(
         1,
         None,
     );
-    insert_job(context, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(context, job_id, node_id(7), 2).await.unwrap()
+    insert_job(&context, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node_id(7), 2).await.unwrap()
     else {
         panic!("claim failed");
     };

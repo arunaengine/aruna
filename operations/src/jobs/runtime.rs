@@ -1312,7 +1312,7 @@ mod tests {
         let token = claimed.claim.as_ref().unwrap().claim_token;
 
         run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             token,
             (CancellationToken::new(), None),
@@ -1354,7 +1354,7 @@ mod tests {
             .unwrap();
 
         run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             token,
             (CancellationToken::new(), None),
@@ -1379,7 +1379,7 @@ mod tests {
         let stale_token = claimed.claim.as_ref().unwrap().claim_token;
         let cancel = CancellationToken::new();
         let execution = tokio::spawn(run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             stale_token,
             (cancel.clone(), None),
@@ -1589,7 +1589,7 @@ mod tests {
             "shutdown must wait for the active claim producer"
         );
 
-        runtime.spawn(ctx, claimed);
+        runtime.spawn(ctx.clone(), claimed);
         drop(producer);
         tokio::time::timeout(Duration::from_secs(30), shutdown)
             .await

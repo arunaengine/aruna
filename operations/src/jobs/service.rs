@@ -1714,7 +1714,7 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
-    use super::crate::jobs::store::query::insert_job;
+    use crate::jobs::store::query::insert_job;
     use super::*;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
