@@ -10,27 +10,21 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::outbound::{OutgoingMail, SmtpSettings};
 use aruna_core::structs::execution::email::{
-    EMAIL_CATEGORIES, EmailDeliverySpec, EmailPreference, RealmEmailProfile,
+    EmailDeliverySpec, EmailPreference, RealmEmailProfile,
 };
 use aruna_core::structs::execution::job::{JobError, JobResultPayload};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_outbound::Backoffs;
-use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
 use crate::notifications::send::{SendError, SendOperation};
 use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
@@ -41,7 +35,6 @@ use crate::notifications::settings::{
 };
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm_vault::{prune_secret_cache, read_realm_secret};
-use crate::storage_read::{StorageReadError, parse_storage_read};
 
 /// Whether a mail sender can be built from `settings`: a valid sender address and host.
 pub fn check_smtp(settings: &SmtpSettings) -> Result<(), String> {
@@ -78,22 +71,6 @@ pub async fn refresh_mail(context: &DriverContext, realm_id: RealmId) {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum EmailError {
-    #[error(transparent)]
-    Setting(#[from] SettingError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    #[error("choose at least one of these categories: {}", EMAIL_CATEGORIES.join(", "))]
-    InvalidCategories,
-    #[error("the address is not the verified email address of this account")]
-    NotVerified,
-    #[error("email is not configured in this realm")]
-    NotConfigured,
-}
-
 /// The caller's current opt-in as this node received it; `None` when email is off.
 pub async fn read_email(
     ctx: &DriverContext,
@@ -115,20 +92,18 @@ pub async fn set_email(
     address: String,
     categories: BTreeSet<String>,
 ) -> Result<EmailPreference, EmailError> {
-    let config = realm_config(ctx, owner).await?;
-    if config.email.is_none() {
-        return Err(EmailError::NotConfigured);
-    }
-    let known = (categories.iter()).all(|category| EMAIL_CATEGORIES.contains(&category.as_str()));
-    if categories.is_empty() || !known {
-        return Err(EmailError::InvalidCategories);
-    }
     let address = address.trim().to_string();
-    if !verified(ctx, owner, &address).await? || !aruna_outbound::valid_address(&address) {
-        return Err(EmailError::NotVerified);
-    }
-    let address = Some(SecretBytes::new(address.into_bytes()));
-    write_email(ctx, local, owner, categories, address).await
+    let opt_in = EmailOptIn {
+        owner,
+        local,
+        address_valid: aruna_outbound::valid_address(&address),
+        address,
+        categories,
+        write_id: Ulid::generate(),
+        event_id: Ulid::generate(),
+        now_ms: unix_timestamp_millis(),
+    };
+    drive(SetEmailOperation::new(opt_in), ctx).await
 }
 
 /// Turns email off with a newer register write; queued emails then send nothing.
@@ -161,32 +136,6 @@ async fn write_email(
     };
     let bytes = drive(WriteSettingOperation::new(write), ctx).await?;
     Ok(EmailPreference::from_bytes(&bytes)?)
-}
-
-async fn realm_config(
-    ctx: &DriverContext,
-    owner: UserId,
-) -> Result<RealmConfigDocument, SettingError> {
-    drive(GetConfigOperation::new(owner.realm_id), ctx)
-        .await
-        .map_err(|error| SettingError::Config(error.to_string()))
-}
-
-/// Whether `address` is the address the account's sign-in provider verified.
-async fn verified(ctx: &DriverContext, owner: UserId, address: &str) -> Result<bool, EmailError> {
-    let read = StorageEffect::Read {
-        key_space: USER_KEYSPACE.to_string(),
-        key: owner.to_bytes().into(),
-        txn_id: None,
-    };
-    let event = ctx.storage_handle.send_effect(Effect::Storage(read)).await;
-    let user = match parse_storage_read(event, User::from_bytes) {
-        Ok(user) => user,
-        Err(StorageReadError::Storage(error)) => return Err(error.into()),
-        Err(StorageReadError::Conversion(error)) => return Err(error.into()),
-    };
-    let hash = user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned());
-    Ok(hash.is_some_and(|hash| hash == email_hash(address)))
 }
 
 /// Sends one notification email when this node's current setting has email on for its
