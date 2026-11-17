@@ -722,8 +722,9 @@ pub(crate) async fn spawn_keyed_joiner(
 /// Stores a pending server identity with a chosen node key and a delegation the seed's realm key
 /// signs. Startup then refreshes the enrollment with it, as after a restart during onboarding.
 async fn store_pending_joiner(dir: &TempDir, seed: &SeedNode, net_key: [u8; 32]) -> TestResult<()> {
-    use aruna::identity::{
-        BootOrigin, IdentityStore, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+    use aruna::identity::IdentityStore;
+    use aruna_core::structs::identity::node_state::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
     use base64::Engine;
     use ed25519_dalek::Signer;

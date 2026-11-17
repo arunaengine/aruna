@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::identity::PersistedNodeState;
 use aruna_core::auth::ONBOARDING_SECRET_KEY;
 use aruna_core::document::{DocumentNetEvent, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
@@ -12,6 +11,7 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE}
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
 };
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::driver::{DriverContext, drive};
