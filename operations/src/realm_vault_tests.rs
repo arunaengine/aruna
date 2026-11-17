@@ -5,11 +5,14 @@
 
 use super::*;
 use aruna_core::UserId;
+use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultKey, RealmVaultPurpose};
 use aruna_core::structs::identity::realm::RealmId;
 use ed25519_dalek::SigningKey;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tempfile::TempDir;
+
+use crate::tests::policy::realm_view;
 
 const SECRET: &[u8] = b"canary-9e41";
 
@@ -98,50 +101,247 @@ fn serves_infrastructure_only() {
     );
 }
 
-#[tokio::test]
-async fn opens_caches_refetches() {
-    let (_dir, ctx) = context();
+fn stored(value: Option<Vec<u8>>) -> Event {
+    Event::Storage(StorageEvent::ReadResult {
+        key: Vec::new().into(),
+        value: value.map(Into::into),
+    })
+}
+
+fn opened(result: Result<SecretBytes, RealmVaultError>) -> Event {
+    Event::Storage(StorageEvent::RealmOpened { result })
+}
+
+fn cached(row: Option<Vec<u8>>, reference: RealmSecretRef) -> Event {
+    Event::Storage(StorageEvent::VaultResult {
+        entry: cache_entry(reference),
+        secret: row.map(SecretBytes::new),
+    })
+}
+
+/// The cache row of `reference`, as a fetch writes it.
+fn cache_row(reference: RealmSecretRef) -> Vec<u8> {
+    [
+        &[reference.entry.purpose.tag()][..],
+        &reference.revision.to_bytes(),
+        SECRET,
+    ]
+    .concat()
+}
+
+fn manager_answer(result: Result<SecretBytes, MetadataReadError>) -> Event {
+    let message = MetadataTransportMessage::RealmSecretResult { result };
+    let frame = crate::metadata::protocol::encode_message(&message).unwrap();
+    Event::Net(aruna_core::events::NetEvent::MetadataAnswer(Box::new(
+        aruna_core::events::MetadataAnswer {
+            peer: node(1),
+            elapsed: Duration::from_secs(1),
+            result: Ok(frame),
+        },
+    )))
+}
+
+#[test]
+fn key_holder_opens() {
+    // A key holder opens the record itself and neither caches nor fetches.
     let (config, reference) = realm_config(2);
-    let fetches = AtomicUsize::new(0);
-    let fetches = &fetches;
-    let fetch = || async move {
-        fetches.fetch_add(1, Ordering::SeqCst);
-        Ok(SecretBytes::new(SECRET.to_vec()))
+    let mut operation = ReadSecretOperation::new(&config, reference);
+    let record = current_record(&config, reference).unwrap();
+    let open = Effect::Storage(StorageEffect::RealmOpen(Box::new(record_sealed(
+        &config, record,
+    ))));
+    let secret = SecretBytes::new(SECRET.to_vec());
+    check_trace(
+        &mut operation,
+        &[open],
+        vec![(opened(Ok(secret.clone())), vec![])],
+    );
+    assert_eq!(operation.finalize(), Ok(secret));
+}
+
+#[test]
+fn fetches_then_caches() {
+    // Without the keys and a cached row, the management node is asked and its answer cached.
+    let (config, reference) = realm_config(2);
+    let mut operation = ReadSecretOperation::new(&config, reference);
+    operation.start();
+    let effects = operation.step(opened(Err(RealmVaultError::NoKey)));
+    assert_eq!(
+        effects.as_slice(),
+        &[read_secret(cache_entry(reference), None)]
+    );
+    let effects = operation.step(cached(None, reference));
+    let Some(Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(request))) =
+        effects.first()
+    else {
+        panic!("a cache miss asks the management node, got {effects:?}");
     };
+    assert_eq!(request.peer, node(1));
+    let effects = operation.step(manager_answer(Ok(SecretBytes::new(SECRET.to_vec()))));
+    let write = write_secret(
+        cache_entry(reference),
+        SecretBytes::new(cache_row(reference)),
+        None,
+    );
+    assert_eq!(effects.as_slice(), &[write]);
+    operation.step(Event::Storage(StorageEvent::WriteResult {
+        key: Vec::new().into(),
+    }));
+    assert_eq!(operation.finalize().unwrap().expose(), SECRET);
+}
 
-    // A key holder opens the record itself and caches nothing.
-    let (_holder_dir, holder) = context();
-    let keys = aruna_core::realm_vault::RealmKeys::derive(&SigningKey::from_bytes(&[5u8; 32]));
-    holder.storage_handle.open_realm(keys);
-    let opened = secret_from(&holder, &config, reference, fetch)
-        .await
-        .unwrap();
-    assert_eq!(opened.expose(), SECRET);
-    assert_eq!(fetches.load(Ordering::SeqCst), 0);
+#[test]
+fn cache_answers_current() {
+    // A cached row of the current revision answers; a rotated revision misses and fetches.
+    let (config, reference) = realm_config(2);
+    let mut operation = ReadSecretOperation::new(&config, reference);
+    operation.start();
+    operation.step(opened(Err(RealmVaultError::NoKey)));
+    assert!(
+        operation
+            .step(cached(Some(cache_row(reference)), reference))
+            .is_empty()
+    );
+    assert_eq!(operation.finalize().unwrap().expose(), SECRET);
 
-    // Other nodes fetch once, then answer from the node vault cache.
-    for _ in 0..2 {
-        let read = secret_from(&ctx, &config, reference, fetch).await.unwrap();
-        assert_eq!(read.expose(), SECRET);
-    }
-    assert_eq!(fetches.load(Ordering::SeqCst), 1);
-
-    // A rotation misses the cache and fetches again.
     let (rotated, newer) = realm_config(3);
-    secret_from(&ctx, &rotated, newer, fetch).await.unwrap();
-    assert_eq!(fetches.load(Ordering::SeqCst), 2);
+    let mut operation = ReadSecretOperation::new(&rotated, newer);
+    operation.start();
+    operation.step(opened(Err(RealmVaultError::NoKey)));
+    let effects = operation.step(cached(Some(cache_row(reference)), newer));
+    assert!(matches!(
+        effects.first(),
+        Some(Effect::Net(
+            aruna_core::effects::NetEffect::MetadataRequest(_)
+        ))
+    ));
+}
 
-    // A reference ahead of the replicated config waits for replication.
-    let ahead = secret_from(&ctx, &config, newer, fetch).await;
-    assert!(matches!(ahead, Err(RealmSecretError::NotReplicated)));
+#[test]
+fn read_failures_end() {
+    // A reference ahead of the config waits for replication; refusals and odd events fail.
+    let (config, _) = realm_config(2);
+    let (_, newer) = realm_config(3);
+    let mut ahead = ReadSecretOperation::new(&config, newer);
+    assert!(ahead.start().is_empty());
+    assert_eq!(ahead.finalize(), Err(RealmSecretError::NotReplicated));
+
+    let (config, reference) = realm_config(2);
+    let mut refused = ReadSecretOperation::new(&config, reference);
+    refused.start();
+    refused.step(opened(Err(RealmVaultError::NoKey)));
+    refused.step(cached(None, reference));
+    assert!(
+        refused
+            .step(manager_answer(Err(MetadataReadError::Forbidden)))
+            .is_empty()
+    );
+    assert!(matches!(
+        refused.finalize(),
+        Err(RealmSecretError::Unavailable(_))
+    ));
+
+    let mut odd = ReadSecretOperation::new(&config, reference);
+    odd.start();
+    assert!(odd.step(stored(None)).is_empty());
+    assert!(odd.finalize().is_err());
+}
+
+#[test]
+fn read_rejects_unstarted() {
+    // Before start every event fails the read; abort has nothing to clean up.
+    let (config, reference) = realm_config(2);
+    let make = || ReadSecretOperation::new(&config, reference);
+    for (label, effects, _) in rejects_events(make, sample_events, |_| false) {
+        assert!(effects.is_empty(), "{label} emitted effects");
+    }
+    let mut operation = make();
+    operation.start();
+    assert!(operation.abort().is_empty());
+    rejects_finalize(operation);
+}
+
+#[test]
+fn serves_peer_secret() {
+    // A management node answers a server peer with the opened current revision.
+    let (config, reference) = realm_config(2);
+    let request = ServeRequest::Secret(reference);
+    let mut operation = ServeSecretOperation::new(config.realm_id, node(1), node(2), request);
+    let read = read_effect(
+        &DocumentTarget::RealmConfig {
+            realm_id: config.realm_id,
+        },
+        None,
+    );
+    let record = current_record(&config, reference).unwrap();
+    let open = Effect::Storage(StorageEffect::RealmOpen(Box::new(record_sealed(
+        &config, record,
+    ))));
+    let (config_row, _) = realm_view(&config, UserId::nil(config.realm_id));
+    let secret = SecretBytes::new(SECRET.to_vec());
+    check_trace(
+        &mut operation,
+        &[read],
+        vec![
+            (stored(Some(config_row.to_vec())), vec![open]),
+            (opened(Ok(secret.clone())), vec![]),
+        ],
+    );
+    assert_eq!(operation.finalize(), Ok(Ok(secret)));
+}
+
+#[test]
+fn serve_refusals_answer() {
+    // A device peer is refused before anything opens; a node without keys is unavailable.
+    let (config, reference) = realm_config(2);
+    let (config_row, _) = realm_view(&config, UserId::nil(config.realm_id));
+    let serve = |peer| {
+        let request = ServeRequest::Secret(reference);
+        let mut operation = ServeSecretOperation::new(config.realm_id, node(1), peer, request);
+        operation.start();
+        operation
+    };
+    let mut device = serve(node(3));
+    assert!(device.step(stored(Some(config_row.to_vec()))).is_empty());
+    assert_eq!(device.finalize(), Ok(Err(MetadataReadError::Forbidden)));
+    let mut keyless = serve(node(2));
+    keyless.step(stored(Some(config_row.to_vec())));
+    keyless.step(opened(Err(RealmVaultError::NoKey)));
+    assert_eq!(keyless.finalize(), Ok(Err(MetadataReadError::Unavailable)));
+}
+
+#[test]
+fn serve_rejects_unstarted() {
+    // Before start every event fails the serve; abort has nothing to clean up.
+    let (config, reference) = realm_config(2);
+    let make = || {
+        ServeSecretOperation::new(
+            config.realm_id,
+            node(1),
+            node(2),
+            ServeRequest::Secret(reference),
+        )
+    };
+    for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
+        assert!(effects.is_empty(), "{label} emitted effects");
+        assert_eq!(error, MetadataReadError::Unavailable, "{label}");
+    }
+    let mut operation = make();
+    operation.start();
+    assert!(operation.abort().is_empty());
+    rejects_finalize(operation);
 }
 
 #[tokio::test]
 async fn prunes_stale_rows() {
     let (_dir, ctx) = context();
     let (config, reference) = realm_config(2);
-    let fetch = || async { Ok(SecretBytes::new(SECRET.to_vec())) };
-    secret_from(&ctx, &config, reference, fetch).await.unwrap();
+    let write = write_secret(
+        cache_entry(reference),
+        SecretBytes::new(cache_row(reference)),
+        None,
+    );
+    ctx.storage_handle.send_effect(write).await;
     assert_eq!(prune_secret_cache(&ctx, &config).await, Ok(0));
 
     let (rotated, _) = realm_config(3);
@@ -266,11 +466,24 @@ mod settings {
         assert_eq!(open(node(2), &off).err(), Some(MetadataReadError::NotFound));
     }
 
-    #[tokio::test]
-    async fn open_needs_key() {
-        let (_dir, context) = context();
+    #[test]
+    fn setting_needs_key() {
+        // A management node without the realm keys cannot open a setting for a peer.
+        let config = config();
         let (target, bytes) = email(1, true);
-        let served = serve_open(&context, node(2), target, bytes);
-        assert_eq!(served.await.err(), Some(MetadataReadError::Unavailable));
+        let request = ServeRequest::Setting { target, bytes };
+        let mut operation = ServeSecretOperation::new(config.realm_id, node(1), node(2), request);
+        operation.start();
+        let (config_row, _) = realm_view(&config, UserId::nil(config.realm_id));
+        let effects = operation.step(stored(Some(config_row.to_vec())));
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::RealmOpen(_)))
+        ));
+        operation.step(opened(Err(RealmVaultError::NoKey)));
+        assert_eq!(
+            operation.finalize(),
+            Ok(Err(MetadataReadError::Unavailable))
+        );
     }
 }

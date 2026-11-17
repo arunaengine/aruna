@@ -47,7 +47,7 @@ use crate::notifications::settings::{
     BACKOFF_START_MS, Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
     delivery_setting, local_setting, managers, write_setting,
 };
-use crate::realm_vault::{prune_secret_cache, read_realm_secret};
+use crate::realm_vault::{ReadSecretOperation, prune_secret_cache};
 use crate::storage_read::{StorageReadError, parse_storage_read};
 
 /// Time one SMTP exchange may take; the job runtime retries a timed out attempt.
@@ -574,7 +574,8 @@ async fn mail_sender(
     let password = match profile.password {
         None => None,
         Some(reference) => {
-            let secret = read_realm_secret(&ctx.driver, config, reference)
+            let read = ReadSecretOperation::new(config, reference);
+            let secret = drive(read, &ctx.driver)
                 .await
                 .map_err(|error| JobError::retryable(error.to_string()))?;
             let text = String::from_utf8(secret.expose().to_vec())

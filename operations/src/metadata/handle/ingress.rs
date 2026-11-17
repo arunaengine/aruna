@@ -1195,13 +1195,39 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::RealmSecret { entry, revision } => {
                 let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
-                let served = crate::realm_vault::serve_realm_secret(context, peer, request);
-                let result = Box::pin(served).await;
+                let request = crate::realm_vault::ServeRequest::Secret(request);
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm_vault::ServeSecretOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
             MetadataTransportMessage::OpenSetting { target, bytes } => {
-                let served = crate::realm_vault::serve_open(context, peer, target, bytes);
-                let result = Box::pin(served).await;
+                let request = crate::realm_vault::ServeRequest::Setting { target, bytes };
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm_vault::ServeSecretOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
             MetadataTransportMessage::StoreArtifact { chunk } => {
