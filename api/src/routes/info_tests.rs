@@ -34,9 +34,8 @@ use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::placement::allocate_handle::{
-    HandleAllocationError, allocate_placement_binding,
-};
+use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::provision::allocate_placement_binding;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::RealmPresence;
