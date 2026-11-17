@@ -5,8 +5,9 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::events::Event;
+use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
 use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
@@ -36,7 +37,7 @@ pub enum EnqueueError {
 /// and a failure is returned so the sender delivers again.
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDeliveriesOperation {
-    waiting: VecDeque<(&'static str, SubmitJobOperation)>,
+    waiting: VecDeque<(&'static str, SubmitJobSpec, JobId)>,
     /// The channel of the submit that runs.
     current: &'static str,
     /// A job id that could not be minted, returned before any submit runs.
@@ -100,18 +101,22 @@ impl EnqueueDeliveriesOperation {
                 workspace_bucket: None,
                 active_cap: None,
             };
-            (operation.waiting).push_back((channel, SubmitJobOperation::new(spec, job_id)));
+            (operation.waiting).push_back((channel, spec, job_id));
         }
         operation
     }
 
-    /// Runs the next submit as a child, or ends once none is left.
+    /// Runs the next submit as a child that a lost conflict reruns, or ends once none is left.
     fn submit(&mut self) -> Next<()> {
-        let Some((channel, submit)) = self.waiting.pop_front() else {
+        let Some((channel, spec, job_id)) = self.waiting.pop_front() else {
             return Next::Done(());
         };
         self.current = channel;
-        Next::Call(IoCall::child(submit))
+        let build = move || SubmitJobOperation::new(spec.clone(), job_id);
+        let submit = boxed_retry(build, &job_id.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(submit))
     }
 }
 
@@ -173,7 +178,7 @@ mod call_tests {
     }
 
     fn queued(result: Result<SubmitJobResult, SubmitJobError>) -> IoResult {
-        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+        IoResult::Child(ChildOutcome::new(result))
     }
 
     #[test]
