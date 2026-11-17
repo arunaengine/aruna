@@ -35,7 +35,6 @@ use crate::users::update_user::{
 };
 
 /// Commit conflicts a link or unlink rereads ownership for before it gives up.
-const LINK_RETRIES: u8 = 3;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LinkLoginError {
@@ -230,46 +229,14 @@ fn link_error(error: UpdateUserError) -> LinkLoginError {
     }
 }
 
-/// Runs the replicated alias change, restarting it on a commit conflict so ownership is reread.
-#[derive(Debug, PartialEq)]
-struct AliasUpdate {
-    input: UpdateUserInput,
-    update: UpdateUserOperation,
-    retries: u8,
-}
-
-impl AliasUpdate {
-    fn new(input: UpdateUserInput) -> Self {
-        let update = UpdateUserOperation::new(input.clone());
-        Self {
-            input,
-            update,
-            retries: 0,
-        }
-    }
-
-    /// The effects of this event, and the result once the update finished.
-    fn step(&mut self, event: Event) -> (Effects, Option<Result<User, LinkLoginError>>) {
-        let effects = self.update.step(event);
-        if !self.update.is_complete() {
-            return (effects, None);
-        }
-        let update = std::mem::replace(
-            &mut self.update,
-            UpdateUserOperation::new(self.input.clone()),
-        );
-        match update.finalize() {
-            Err(UpdateUserError::StorageError(StorageError::TransactionConflict))
-                if self.retries < LINK_RETRIES =>
-            {
-                self.retries += 1;
-                // The conflicted commit already ended its transaction; its abort would fail
-                // the restarted update with an unknown transaction.
-                (self.update.start(), None)
-            }
-            result => (effects, Some(result.map_err(link_error))),
-        }
-    }
+/// Whether a link change lost a transaction conflict that a fresh run may avoid.
+fn lost_conflict(error: &LinkLoginError) -> bool {
+    matches!(
+        error,
+        LinkLoginError::Update(UpdateUserError::StorageError(
+            StorageError::TransactionConflict
+        )) | LinkLoginError::Storage(StorageError::TransactionConflict)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -284,7 +251,7 @@ pub struct LinkLoginConfig {
 
 #[derive(Debug, PartialEq)]
 enum LinkState {
-    Update(Box<AliasUpdate>),
+    Update(Box<UpdateUserOperation>),
     Done,
 }
 
@@ -354,24 +321,24 @@ impl Operation for LinkLoginOperation {
         if let Err(error) = checked {
             return self.finish(Err(error.into()));
         }
-        let mut update = Box::new(AliasUpdate::new(self.input()));
-        let effects = update.update.start();
+        let mut update = Box::new(UpdateUserOperation::new(self.input()));
+        let effects = update.start();
         self.state = LinkState::Update(update);
         effects
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, LinkState::Done) {
-            LinkState::Update(mut update) => match update.step(event) {
-                (effects, None) => {
+            LinkState::Update(mut update) => {
+                let effects = update.step(event);
+                if !update.is_complete() {
                     self.state = LinkState::Update(update);
-                    effects
+                    return effects;
                 }
-                (effects, Some(result)) => {
-                    self.finish(result);
-                    effects
-                }
-            },
+                // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
+                self.finish((*update).finalize().map_err(link_error));
+                effects
+            }
             LinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
@@ -384,9 +351,13 @@ impl Operation for LinkLoginOperation {
         self.output.unwrap_or(Err(LinkLoginError::NotFinished))
     }
 
+    fn is_conflict(error: &Self::Error) -> bool {
+        lost_conflict(error)
+    }
+
     fn abort(&mut self) -> Effects {
         match &mut self.state {
-            LinkState::Update(update) => update.update.abort(),
+            LinkState::Update(update) => update.abort(),
             LinkState::Done => smallvec![],
         }
     }
@@ -406,7 +377,7 @@ enum UnlinkState {
     Read,
     Authorize,
     Cutoff(Box<RevokeTokenOperation>),
-    Update(Box<AliasUpdate>),
+    Update(Box<UpdateUserOperation>),
     Done,
 }
 
@@ -469,7 +440,7 @@ impl UnlinkLoginOperation {
 
     fn update(&mut self) -> Effects {
         let config = &self.config;
-        let mut update = Box::new(AliasUpdate::new(UpdateUserInput {
+        let mut update = Box::new(UpdateUserOperation::new(UpdateUserInput {
             actor: config.actor.clone(),
             auth_context: config.auth_context.clone(),
             self_realm_id: config.actor.realm_id,
@@ -481,7 +452,7 @@ impl UnlinkLoginOperation {
             alias: Some(AliasChange::Remove(config.alias)),
             subject: None,
         }));
-        let effects = update.update.start();
+        let effects = update.start();
         self.state = UnlinkState::Update(update);
         effects
     }
@@ -558,16 +529,16 @@ impl Operation for UnlinkLoginOperation {
                     }
                 }
             }
-            UnlinkState::Update(mut update) => match update.step(event) {
-                (effects, None) => {
+            UnlinkState::Update(mut update) => {
+                let effects = update.step(event);
+                if !update.is_complete() {
                     self.state = UnlinkState::Update(update);
-                    effects
+                    return effects;
                 }
-                (effects, Some(result)) => {
-                    self.finish(result);
-                    effects
-                }
-            },
+                // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
+                self.finish((*update).finalize().map_err(link_error));
+                effects
+            }
             UnlinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
@@ -580,10 +551,14 @@ impl Operation for UnlinkLoginOperation {
         self.output.unwrap_or(Err(LinkLoginError::NotFinished))
     }
 
+    fn is_conflict(error: &Self::Error) -> bool {
+        lost_conflict(error)
+    }
+
     fn abort(&mut self) -> Effects {
         match &mut self.state {
             UnlinkState::Cutoff(revoke) => revoke.abort(),
-            UnlinkState::Update(update) => update.update.abort(),
+            UnlinkState::Update(update) => update.abort(),
             _ => smallvec![],
         }
     }

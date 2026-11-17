@@ -16,7 +16,7 @@ use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::auth::bearer_token::decode_bearer_token;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,
     UnlinkLoginConfig, UnlinkLoginOperation,
@@ -188,14 +188,18 @@ pub async fn create_link(
     Json(request): Json<LinkRequest>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
     let auth_time = bearer_auth_time(&state, bearer).await?;
-    let link = LinkLoginOperation::new(LinkLoginConfig {
+    let seed = auth.user_id.to_bytes();
+    let config = LinkLoginConfig {
         actor: actor(&state, &auth),
         auth_context: auth,
         auth_time,
         confirmation: request.confirmation,
         now: unix_timestamp_secs(),
-    });
-    let user = drive(link, &state.get_ctx()).await.map_err(link_refused)?;
+    };
+    let link = || LinkLoginOperation::new(config.clone());
+    let user = drive_retry(link, &state.get_ctx(), &seed)
+        .await
+        .map_err(link_refused)?;
     Ok(Json(linked_logins(&user)))
 }
 
@@ -280,14 +284,15 @@ pub async fn delete_link(
             .map_err(|_| ServerError::BadRequestReason("malformed user id".to_string()))
     };
     let (user_id, alias) = (parse(&user_id)?, parse(&login)?);
-    let unlink = UnlinkLoginOperation::new(UnlinkLoginConfig {
+    let config = UnlinkLoginConfig {
         actor: actor(&state, &auth),
         auth_context: auth,
         user_id,
         alias,
         now: unix_timestamp_secs(),
-    });
-    let user = drive(unlink, &state.get_ctx())
+    };
+    let unlink = || UnlinkLoginOperation::new(config.clone());
+    let user = drive_retry(unlink, &state.get_ctx(), &user_id.to_bytes())
         .await
         .map_err(link_refused)?;
     Ok(Json(linked_logins(&user)))
