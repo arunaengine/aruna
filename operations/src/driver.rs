@@ -4,20 +4,24 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::FuturesUnordered;
 use std::any::{type_name, type_name_of_val};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
@@ -409,6 +413,21 @@ impl DeadlineAbort {
     }
 }
 
+/// Stops normal effects after the run deadline and queues the operation's cleanup when the
+/// policy allows it.
+fn expire(
+    executable: &mut dyn Drive,
+    queue: &mut VecDeque<Effect>,
+    state: &mut RunState,
+    abort_policy: DeadlineAbort,
+) {
+    state.mark_expired();
+    queue.clear();
+    if abort_policy.allows(state.committed, executable.abort_after_commit()) {
+        extend_unblocked(queue, executable.abort(), &state.tracker);
+    }
+}
+
 /// How often the effect loop re-reads the deadline. The suboperation loop
 /// re-checks every effect; the parent marks expiry once and then dispatches its
 /// cleanup effects under the cleanup deadline.
@@ -481,6 +500,268 @@ impl Drive for SubRun<'_> {
     }
 }
 
+/// Whether a group refuses `effect`: storage must see transaction work in emission order, and a
+/// group runs only plain effects and sub operations.
+fn refused_member(effect: &Effect) -> bool {
+    match effect {
+        Effect::Group(_) => true,
+        Effect::Storage(storage_effect) => match storage_effect {
+            StorageEffect::StartTransaction { .. }
+            | StorageEffect::CommitTransaction { .. }
+            | StorageEffect::AbortTransaction { .. }
+            | StorageEffect::AddUsage { .. }
+            | StorageEffect::AddCounters { .. }
+            | StorageEffect::BeginUsageRebuild { .. }
+            | StorageEffect::FinishUsageRebuild { .. } => true,
+            StorageEffect::Read { txn_id, .. }
+            | StorageEffect::BatchRead { txn_id, .. }
+            | StorageEffect::Write { txn_id, .. }
+            | StorageEffect::BatchWrite { txn_id, .. }
+            | StorageEffect::Delete { txn_id, .. }
+            | StorageEffect::BatchDelete { txn_id, .. }
+            | StorageEffect::Iter { txn_id, .. }
+            | StorageEffect::IterRange { txn_id, .. }
+            | StorageEffect::Last { txn_id, .. }
+            | StorageEffect::VaultWrite { txn_id, .. }
+            | StorageEffect::VaultRead { txn_id, .. }
+            | StorageEffect::VaultDelete { txn_id, .. } => txn_id.is_some(),
+            StorageEffect::SyncAll => false,
+        },
+        _ => false,
+    }
+}
+
+/// Dispatches one effect through the adapters, as the effect loop does for a single effect.
+fn adapter_dispatch(
+    context: &DriverContext,
+    depth: usize,
+) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'_, Event> {
+    move |effect, until| {
+        Box::pin(effect_adapters::dispatch_effect_until(
+            effect, context, depth, until,
+        ))
+    }
+}
+
+/// When group members stop: at `at` every member still running ends as unfinished, except a
+/// managed one while `protect_managed` holds, as for a single effect.
+#[derive(Clone, Copy)]
+struct MemberStop {
+    at: Option<Instant>,
+    protect_managed: bool,
+}
+
+/// The members of one group: waiting ones in emission order and at most `limit` running. Each
+/// started member keeps its backend hold in the run state until the parent operation ends.
+struct GroupRun<'a, D> {
+    dispatch: D,
+    context: &'a DriverContext,
+    stop: MemberStop,
+    limit: usize,
+    added: usize,
+    waiting: VecDeque<(usize, Effect)>,
+    running: FuturesUnordered<BoxFuture<'a, (usize, GroupResult)>>,
+}
+
+impl<'a, D> GroupRun<'a, D>
+where
+    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
+{
+    fn new(dispatch: D, context: &'a DriverContext, limit: usize, stop: MemberStop) -> Self {
+        Self {
+            dispatch,
+            context,
+            stop,
+            limit: limit.max(1),
+            added: 0,
+            waiting: VecDeque::new(),
+            running: FuturesUnordered::new(),
+        }
+    }
+
+    /// Queues members; their indices continue the emission order.
+    fn add(&mut self, members: impl IntoIterator<Item = Effect>) {
+        for member in members {
+            self.waiting.push_back((self.added, member));
+            self.added += 1;
+        }
+    }
+
+    /// Starts waiting members while fewer than `limit` run.
+    fn fill(&mut self, holds: &mut Vec<GroupHold>) {
+        while self.running.len() < self.limit
+            && let Some((index, member)) = self.waiting.pop_front()
+        {
+            let run = self.start(index, member, holds);
+            self.running.push(run);
+        }
+    }
+
+    fn start(
+        &self,
+        index: usize,
+        member: Effect,
+        holds: &mut Vec<GroupHold>,
+    ) -> BoxFuture<'a, (usize, GroupResult)> {
+        if refused_member(&member) {
+            warn!(index, "Effect group refused a transaction effect or nested group");
+            return Box::pin(std::future::ready((index, GroupResult::Refused)));
+        }
+        let protected = self.stop.protect_managed && managed_effect(&member);
+        let cut_at = self.stop.at.filter(|_| !protected);
+        if cut_at.is_some_and(|at| at <= Instant::now()) {
+            return Box::pin(std::future::ready((index, GroupResult::Unfinished)));
+        }
+        hold_backends(self.context, &member, holds);
+        let dispatch = (self.dispatch)(member, self.stop.at);
+        Box::pin(async move {
+            let result = match cut_at {
+                Some(at) => tokio::time::timeout_at(at, dispatch).await.ok(),
+                None => Some(dispatch.await),
+            };
+            let result = result.map_or(GroupResult::Unfinished, |event| {
+                GroupResult::Done(Box::new(event))
+            });
+            (index, result)
+        })
+    }
+
+    /// The next finished member; `None` once no member runs.
+    async fn next(&mut self) -> Option<(usize, GroupResult)> {
+        self.running.next().await
+    }
+
+    /// Starts nothing more and waits for the started members, which always finish or stop at
+    /// their deadline, like a single effect.
+    async fn drain(&mut self) {
+        self.waiting.clear();
+        while self.next().await.is_some() {}
+    }
+}
+
+/// How a group ended for the effect loop.
+enum GroupEnd {
+    /// The operation saw the group's last event and asked for these effects.
+    Stepped(Effects),
+    /// The run deadline cut members off; the loop runs the expiry path.
+    Expired,
+    /// The cleanup deadline cut members off; cleanup stops.
+    CleanupExpired,
+}
+
+/// Runs one group for the effect loop and steps the operation with its events. Members stop at
+/// the cleanup deadline after expiry, otherwise at the earlier of the run and group deadline.
+async fn run_group<'a, D>(
+    executable: &mut dyn Drive,
+    group: EffectGroup,
+    dispatch: D,
+    context: &'a DriverContext,
+    deadline: Option<tokio::time::Instant>,
+    state: &mut RunState,
+) -> GroupEnd
+where
+    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
+{
+    let EffectGroup {
+        members,
+        limit,
+        form,
+    } = group;
+    let stop = match (state.expired, form) {
+        (true, _) => MemberStop {
+            at: state.cleanup_deadline,
+            protect_managed: false,
+        },
+        (false, GroupForm::All { deadline: wait }) => MemberStop {
+            at: [deadline, wait.and_then(|wait| Instant::now().checked_add(wait))]
+                .into_iter()
+                .flatten()
+                .min(),
+            protect_managed: true,
+        },
+        (false, GroupForm::Window) => MemberStop {
+            at: deadline,
+            protect_managed: true,
+        },
+    };
+    let mut run = GroupRun::new(dispatch, context, limit, stop);
+    run.add(members);
+    trace!(members = run.added, "Running effect group");
+    let expired = state.expired;
+    let cut_end = match expired {
+        true => GroupEnd::CleanupExpired,
+        false => GroupEnd::Expired,
+    };
+    if let GroupForm::Window = form {
+        return run_window(executable, &mut run, &mut state.holds, cut_end).await;
+    }
+    let results = run_all(&mut run, &mut state.holds).await;
+    // An unfinished member past the group deadline is a result; past the run deadline the
+    // run has expired, as after a single effect that timed out.
+    let unfinished = results
+        .iter()
+        .any(|result| matches!(result, GroupResult::Unfinished));
+    if unfinished && (expired || deadline.is_some_and(|deadline| deadline <= Instant::now())) {
+        return cut_end;
+    }
+    match executable.is_complete() {
+        true => GroupEnd::Stepped(Effects::new()),
+        false => GroupEnd::Stepped(executable.step(Event::Group(GroupEvent::Finished { results }))),
+    }
+}
+
+/// Runs every member of an all-at-once group and returns the results in emission order.
+async fn run_all<'a, D>(run: &mut GroupRun<'a, D>, holds: &mut Vec<GroupHold>) -> Vec<GroupResult>
+where
+    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
+{
+    let mut results: Vec<GroupResult> = std::iter::repeat_with(|| GroupResult::Unfinished)
+        .take(run.added)
+        .collect();
+    loop {
+        run.fill(holds);
+        let Some((index, result)) = run.next().await else {
+            return results;
+        };
+        if let Some(slot) = results.get_mut(index) {
+            *slot = result;
+        }
+    }
+}
+
+/// Steps the operation with each window member result as it arrives and adds the effects it
+/// returns as new members. Once no member runs or waits, steps it with `GroupEvent::Closed`.
+/// A complete operation is not stepped again, but the members it asked for still run.
+async fn run_window<'a, D>(
+    executable: &mut dyn Drive,
+    run: &mut GroupRun<'a, D>,
+    holds: &mut Vec<GroupHold>,
+    cut_end: GroupEnd,
+) -> GroupEnd
+where
+    D: Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event>,
+{
+    loop {
+        run.fill(holds);
+        let Some((index, result)) = run.next().await else {
+            break;
+        };
+        // Window members stop only at the run or cleanup deadline.
+        if matches!(result, GroupResult::Unfinished) {
+            run.drain().await;
+            return cut_end;
+        }
+        if !executable.is_complete() {
+            let effects = executable.step(Event::Group(GroupEvent::Member { index, result }));
+            run.add(effects);
+        }
+    }
+    match executable.is_complete() {
+        true => GroupEnd::Stepped(Effects::new()),
+        false => GroupEnd::Stepped(executable.step(Event::Group(GroupEvent::Closed))),
+    }
+}
+
 /// Runs the effect queue to completion or to its deadline and returns the run
 /// state for finalization. Only a parent names `expiry_log`, so suboperation
 /// expiry stays quiet.
@@ -513,12 +794,30 @@ async fn drive_effects(
                 && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
                 && !managed_effect(&effect)
             {
-                state.mark_expired();
-                queue.clear();
                 // Suppress aborts after commit. Dropping `state.holds` releases
                 // backend reservations.
-                if abort_policy.allows(state.committed, executable.abort_after_commit()) {
-                    extend_unblocked(&mut queue, executable.abort(), &state.tracker);
+                expire(executable, &mut queue, &mut state, abort_policy);
+                continue;
+            }
+            if let Effect::Group(group) = effect {
+                let dispatch = adapter_dispatch(context, depth);
+                match run_group(executable, group, dispatch, context, deadline, &mut state).await {
+                    GroupEnd::Stepped(effects) => {
+                        extend_unblocked(&mut queue, effects, &state.tracker);
+                    }
+                    GroupEnd::Expired => {
+                        if let Some(operation) = expiry_log {
+                            warn!(
+                                operation = %operation,
+                                "Operation deadline expired in an effect group; running its abort path"
+                            );
+                        }
+                        expire(executable, &mut queue, &mut state, abort_policy);
+                    }
+                    GroupEnd::CleanupExpired => {
+                        queue.clear();
+                        break;
+                    }
                 }
                 continue;
             }
@@ -558,28 +857,20 @@ async fn drive_effects(
                     match tokio::time::timeout_at(deadline, dispatch).await {
                         Ok(event) => event,
                         Err(_) => {
-                            state.mark_expired();
                             if let Some(operation) = expiry_log {
                                 warn!(
                                     operation = %operation,
                                     "Operation deadline expired; running its abort path"
                                 );
                             }
-                            queue.clear();
                             if commit {
+                                state.mark_expired();
+                                queue.clear();
                                 Event::Storage(StorageEvent::Error {
                                     error: StorageError::CommitFailed,
                                 })
                             } else {
-                                if abort_policy
-                                    .allows(state.committed, executable.abort_after_commit())
-                                {
-                                    extend_unblocked(
-                                        &mut queue,
-                                        executable.abort(),
-                                        &state.tracker,
-                                    );
-                                }
+                                expire(executable, &mut queue, &mut state, abort_policy);
                                 continue;
                             }
                         }
