@@ -215,3 +215,65 @@ async fn own_changes_skipped() {
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/other"]);
 }
+
+/// A created dataset event of a fixed group at `anchor_ms`.
+fn plain_event(anchor_ms: u64) -> SourceEvent {
+    SourceEvent {
+        kind: SourceKind::DatasetCreated,
+        group_id: Ulid::from_parts(1, 9),
+        path: "/r/g/x/meta/a@d".into(),
+        resource: "d".into(),
+        revision: "e".into(),
+        source: format!("dataset_created/{anchor_ms}"),
+        actor: None,
+        anchor_ms,
+        journaled_ms: anchor_ms,
+    }
+}
+
+#[test]
+fn outbox_counts_gaps() {
+    let install = Ulid::from_parts(1, 1);
+    let mut outbox = Outbox::new(9, BTreeMap::from([(install, 1)]));
+    outbox.offer((install, 1), b"j1", &plain_event(5), false, 2).unwrap();
+    // The bound is reached, then a stale row counts too.
+    outbox.offer((install, 1), b"j2", &plain_event(6), false, 2).unwrap();
+    outbox.offer((install, 1), b"j3", &plain_event(4), true, 2).unwrap();
+    outbox.lost_range(install, (SourceKind::DataUploaded, GapReason::Pruned), (1, 3));
+    let Ask::Read(reads) = outbox.gap_ask() else {
+        panic!("gap rows are read once each");
+    };
+    assert_eq!(reads.len(), 3);
+    let full = gap_key(install, SourceKind::DatasetCreated, GapReason::Full);
+    let mut kept = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+    kept.add(1);
+    let values: Vec<_> = (reads.iter())
+        .map(|(_, key)| (*key == full).then(|| encode(&kept).unwrap()))
+        .collect();
+    let rows = outbox.rows(values).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].0, PLUGIN_OUTBOX_KEYSPACE);
+    let counted: GapRow = (rows.iter())
+        .find(|(_, key, _)| key.to_vec() == full)
+        .map(|(_, _, value)| decode(value).unwrap())
+        .unwrap();
+    assert_eq!((counted.count, counted.earliest_ms, counted.latest_ms), (2, 1, 6));
+    let short = Outbox::new(9, BTreeMap::new());
+    assert!(Outbox::new(9, BTreeMap::new()).rows(vec![None]).is_err());
+    assert_eq!(short.rows(Vec::new()).unwrap(), Vec::new());
+}
+
+#[test]
+fn counting_pages() {
+    let (first, second) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
+    let mut counting = Counting::new(BTreeSet::from([first, second]), 5);
+    let Some(Ask::Page { prefix, limit, .. }) = counting.ask() else {
+        panic!("each install's queue is counted");
+    };
+    assert_eq!((prefix, limit), (first.to_bytes().to_vec(), 5));
+    counting.take(Answer::Page(vec![(vec![1], Vec::new())], None)).unwrap();
+    counting.take(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(counting.ask(), None);
+    assert!(counting.take(Answer::Page(Vec::new(), None)).is_err());
+    assert_eq!(counting.counted(), BTreeMap::from([(first, 1), (second, 0)]));
+}
