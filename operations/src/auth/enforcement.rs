@@ -651,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_in_one_read() {
+    fn loads_one_read() {
         // The realm row alone, or with the group and its authorization row; no realm denies.
         let realm_id = RealmId([3u8; 32]);
         let group_id = Ulid::from_bytes([4u8; 16]);
