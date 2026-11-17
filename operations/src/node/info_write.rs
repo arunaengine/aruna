@@ -417,7 +417,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn unchanged_rows_write_nothing() {
+    fn unchanged_writes_nothing() {
         // No row, or a change that alters nothing durable, writes nothing.
         for (row, change) in [(None, leaving()), (Some(document(2)), snapshots())] {
             let mut operation = reading(change);
