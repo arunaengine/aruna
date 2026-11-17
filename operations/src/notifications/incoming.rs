@@ -37,7 +37,7 @@ use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
 };
-use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
+use crate::notifications::watch::subscriptions::create_holder_watch;
 
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -222,27 +222,6 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
             }
         }
-        NotificationTransportMessage::DeleteWatch { owner, watch_id } => {
-            if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
-                return NotificationTransportMessage::Reject(reason);
-            }
-
-            match delete_holder_watch(
-                context,
-                local_node_id,
-                owner,
-                watch_id,
-                unix_timestamp_millis(),
-            )
-            .await
-            {
-                Ok(()) => {
-                    let _ = drive(InterestOperation::publish(), context).await;
-                    NotificationTransportMessage::WatchDeleted
-                }
-                Err(error) => NotificationTransportMessage::Reject(error.to_string()),
-            }
-        }
         NotificationTransportMessage::ListWatches { owner } => {
             if let Err(reason) = verify_recipient_holder(&owner, &realm_config, local_node_id) {
                 return NotificationTransportMessage::Reject(reason);
@@ -274,8 +253,9 @@ async fn build_response(
                 Err(error) => NotificationTransportMessage::Reject(error),
             }
         }
-        // The trigger table answers a delivery.
+        // The trigger table answers a delivery and a watch deletion.
         NotificationTransportMessage::DeliverBatch { .. }
+        | NotificationTransportMessage::DeleteWatch { .. }
         | NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
         | NotificationTransportMessage::UnreadCountResult { .. }

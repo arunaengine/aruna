@@ -20,6 +20,7 @@ use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
 use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
 };
+use crate::notifications::watch::remove::RemoveWatchOperation;
 
 /// What the timer shell knows when a timer fires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,25 +157,33 @@ pub trait PeerRun: Operation + Sized {
 pub enum PeerOperation {
     /// A notification batch delivered to the inbox this node holds.
     DeliverNotifications(DeliverBatchOperation),
+    /// A watch deleted on the node that holds its owner's inbox.
+    RemoveWatch(RemoveWatchOperation),
 }
 
 /// The operation that answers `input`, or `None` while its protocol or request kind is not
 /// converted; the shell then answers the frame with its own code.
 pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
     match input.alpn {
-        Alpn::Notification => match postcard::from_bytes(input.frame) {
-            Ok(NotificationTransportMessage::DeliverBatch { records }) => {
-                let deliver = DeliverInput {
-                    peer: input.peer,
-                    local: input.local_node,
-                    local_realm: input.local_realm,
-                    now_ms: input.now_ms,
-                };
-                let operation = DeliverBatchOperation::new(deliver, records);
-                Some(PeerOperation::DeliverNotifications(operation))
+        Alpn::Notification => {
+            let deliver = DeliverInput {
+                peer: input.peer,
+                local: input.local_node,
+                local_realm: input.local_realm,
+                now_ms: input.now_ms,
+            };
+            match postcard::from_bytes(input.frame) {
+                Ok(NotificationTransportMessage::DeliverBatch { records }) => {
+                    let operation = DeliverBatchOperation::new(deliver, records);
+                    Some(PeerOperation::DeliverNotifications(operation))
+                }
+                Ok(NotificationTransportMessage::DeleteWatch { owner, watch_id }) => {
+                    let operation = RemoveWatchOperation::new(deliver, owner, watch_id);
+                    Some(PeerOperation::RemoveWatch(operation))
+                }
+                _ => None,
             }
-            _ => None,
-        },
+        }
         Alpn::Dht
         | Alpn::Bao
         | Alpn::DocumentSync
@@ -193,6 +202,13 @@ impl PeerRun for DeliverBatchOperation {
     }
 }
 
+impl PeerRun for RemoveWatchOperation {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
+        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+    }
+}
+
 impl Operation for PeerOperation {
     type Output = Vec<u8>;
     type Error = PeerFailure;
@@ -200,18 +216,21 @@ impl Operation for PeerOperation {
     fn start(&mut self) -> Effects {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.start(),
+            PeerOperation::RemoveWatch(operation) => operation.start(),
         }
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.step(event),
+            PeerOperation::RemoveWatch(operation) => operation.step(event),
         }
     }
 
     fn is_complete(&self) -> bool {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.is_complete(),
+            PeerOperation::RemoveWatch(operation) => operation.is_complete(),
         }
     }
 
@@ -220,12 +239,16 @@ impl Operation for PeerOperation {
             PeerOperation::DeliverNotifications(operation) => {
                 DeliverBatchOperation::answer(operation.finalize())
             }
+            PeerOperation::RemoveWatch(operation) => {
+                RemoveWatchOperation::answer(operation.finalize())
+            }
         }
     }
 
     fn abort(&mut self) -> Effects {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.abort(),
+            PeerOperation::RemoveWatch(operation) => operation.abort(),
         }
     }
 }
