@@ -52,6 +52,7 @@ pub enum Event {
     Task(TaskEvent),
     Search(),
     Stream(),
+    Index(crate::key_index::IndexEvent),
 }
 
 #[derive(Debug, PartialEq)]

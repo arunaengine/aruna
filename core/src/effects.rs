@@ -52,6 +52,7 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    Index(Box<crate::key_index::IndexEffect>),
 }
 
 #[derive(Debug, PartialEq)]

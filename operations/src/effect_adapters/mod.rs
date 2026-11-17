@@ -12,6 +12,7 @@ mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::key_index::{IndexError, IndexEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -113,6 +114,10 @@ pub(crate) async fn dispatch_effect_until(
             }
         }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
+        Effect::Index(index_effect) => Event::Index(match context.storage_handle.range_indexes() {
+            Some(indexes) => indexes.execute(*index_effect).await,
+            None => IndexEvent::Error(IndexError::Unavailable),
+        }),
         Effect::Search() => {
             warn!(
                 depth,
@@ -161,6 +166,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
     }
 }
 
@@ -176,5 +182,6 @@ fn event_kind(event: &Event) -> &'static str {
         Event::Task(_) => "task",
         Event::Search() => "search",
         Event::Stream() => "stream",
+        Event::Index(_) => "index",
     }
 }

@@ -1107,6 +1107,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
     }
 }
 pub(crate) fn unique_endpoint_addrs(
