@@ -176,3 +176,193 @@ impl Operation for HeadVersionsOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use aruna_core::effects::IterStart;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    const BUCKET: &str = "bucket";
+
+    fn prefix() -> Key {
+        BlobHeadKey::bucket_prefix(BUCKET).unwrap().into()
+    }
+
+    fn version_id(seed: u8) -> Ulid {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn head(name: &str, seed: u8) -> (Key, Value) {
+        let key = BlobHeadKey::new(BUCKET, name).to_bytes().unwrap();
+        let pointer = CurrentVersionPointer::new(version_id(seed))
+            .to_bytes()
+            .unwrap();
+        (key.into(), pointer.into())
+    }
+
+    fn version_key(name: &str, seed: u8) -> VersionKey {
+        VersionKey::new(BUCKET, name, version_id(seed))
+    }
+
+    fn version() -> BlobVersion {
+        BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default())
+    }
+
+    fn scan_effect(limit: usize) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(prefix()),
+            start: None::<IterStart>,
+            limit,
+            txn_id: None,
+        })
+    }
+
+    fn reads_effect(keys: &[VersionKey]) -> Effect {
+        Effect::Storage(StorageEffect::BatchRead {
+            reads: keys
+                .iter()
+                .map(|key| {
+                    let row = key.to_bytes().unwrap();
+                    (BLOB_VERSIONS_KEYSPACE.to_string(), Key::from(row))
+                })
+                .collect(),
+            txn_id: None,
+        })
+    }
+
+    fn heads(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: next,
+        })
+    }
+
+    fn versions(values: Vec<Option<Value>>) -> Event {
+        let values = values
+            .into_iter()
+            .map(|value| (Key::from(Vec::new()), value))
+            .collect();
+        Event::Storage(StorageEvent::BatchReadResult { values })
+    }
+
+    fn stored() -> Option<Value> {
+        Some(version().to_bytes().unwrap().into())
+    }
+
+    fn after_heads(rows: Vec<(Key, Value)>) -> HeadVersionsOperation {
+        let mut operation = HeadVersionsOperation::new(prefix(), 2);
+        operation.start();
+        operation.step(heads(rows, None));
+        operation
+    }
+
+    #[test]
+    fn reads_versions_batch() {
+        let mut operation = HeadVersionsOperation::new(prefix(), 2);
+        check_trace(
+            &mut operation,
+            &[scan_effect(3)],
+            vec![
+                (
+                    heads(vec![head("a", 1), head("b", 2)], None),
+                    vec![reads_effect(&[version_key("a", 1), version_key("b", 2)])],
+                ),
+                (versions(vec![stored(), stored()]), vec![]),
+            ],
+        );
+        let expected = vec![
+            (version_key("a", 1), version()),
+            (version_key("b", 2), version()),
+        ];
+        assert_eq!(operation.finalize(), Ok((expected, true)));
+    }
+
+    #[test]
+    fn cut_scan_incomplete() {
+        // More heads than the limit read the first ones and report the scope as cut.
+        let mut operation = after_heads(vec![head("a", 1), head("b", 2), head("c", 3)]);
+        operation.step(versions(vec![stored(), stored()]));
+        let (found, complete) = operation.finalize().unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(!complete);
+    }
+
+    #[test]
+    fn empty_prefix_complete() {
+        let mut operation = after_heads(Vec::new());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize(), Ok((Vec::new(), true)));
+    }
+
+    #[test]
+    fn missing_rows_unavailable() {
+        // A storage error, a missing version row or a short batch never answers partly.
+        let mut failed_scan = HeadVersionsOperation::new(prefix(), 2);
+        failed_scan.start();
+        failed_scan.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(failed_scan.finalize(), Err(HeadVersionsError::Unavailable));
+
+        for answer in [
+            versions(vec![None]),
+            versions(Vec::new()),
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            }),
+        ] {
+            let mut operation = after_heads(vec![head("a", 1)]);
+            assert!(operation.step(answer).is_empty());
+            assert_eq!(operation.finalize(), Err(HeadVersionsError::Unavailable));
+        }
+    }
+
+    #[test]
+    fn broken_rows_invalid() {
+        let bad_head = (head("a", 1).0, Value::from(vec![0xff]));
+        let operation = after_heads(vec![bad_head]);
+        assert!(matches!(
+            operation.finalize(),
+            Err(HeadVersionsError::Invalid(_))
+        ));
+
+        let mut bad_version = after_heads(vec![head("a", 1)]);
+        bad_version.step(versions(vec![Some(vec![0xff].into())]));
+        assert!(matches!(
+            bad_version.finalize(),
+            Err(HeadVersionsError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let reading = || after_heads(vec![head("a", 1)]);
+        let accepted =
+            |event: &Event| matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }));
+        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert_eq!(error, HeadVersionsError::Unavailable);
+        }
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = HeadVersionsOperation::new(prefix(), 2);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(HeadVersionsOperation::new(prefix(), 2));
+        rejects_finalize(after_heads(vec![head("a", 1)]));
+    }
+}
