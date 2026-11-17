@@ -4,6 +4,7 @@
 
 pub mod checks;
 pub mod client;
+pub mod deliver;
 pub mod dispatch;
 pub mod email;
 pub mod emit;

@@ -8,12 +8,15 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::events::Event;
 use aruna_core::operation::Operation;
 use aruna_core::task::TaskKey;
 use aruna_core::types::Effects;
 use thiserror::Error;
 
+use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
 use crate::notifications::prune::{
     NOTIFICATION_RETRY_AFTER, PRUNE_PAGE_SIZE, PruneNotificationsOperation,
@@ -133,6 +136,7 @@ pub struct PeerInput<'a> {
     pub alpn: Alpn,
     pub peer: NodeId,
     pub local_node: NodeId,
+    pub local_realm: RealmId,
     pub now_ms: u64,
     /// The frame body without its length prefix, at most the protocol's frame bound.
     pub frame: &'a [u8],
@@ -150,21 +154,43 @@ pub trait PeerRun: Operation + Sized {
 
 /// The operation that answers one peer request frame.
 #[derive(Debug, PartialEq)]
-pub enum PeerOperation {}
+pub enum PeerOperation {
+    /// A notification batch delivered to the inbox this node holds.
+    DeliverNotifications(DeliverBatchOperation),
+}
 
 /// The operation that answers `input`, or `None` while its protocol or request kind is not
 /// converted; the shell then answers the frame with its own code.
 pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
     match input.alpn {
+        Alpn::Notification => match postcard::from_bytes(input.frame) {
+            Ok(NotificationTransportMessage::DeliverBatch { records }) => {
+                let deliver = DeliverInput {
+                    peer: input.peer,
+                    local: input.local_node,
+                    local_realm: input.local_realm,
+                    now_ms: input.now_ms,
+                };
+                let operation = DeliverBatchOperation::new(deliver, records);
+                Some(PeerOperation::DeliverNotifications(operation))
+            }
+            _ => None,
+        },
         Alpn::Dht
         | Alpn::Bao
         | Alpn::DocumentSync
         | Alpn::Metadata
         | Alpn::NativeReference
-        | Alpn::Notification
         | Alpn::Shard
         | Alpn::JobControl
         | Alpn::Heartbeat => None,
+    }
+}
+
+impl PeerRun for DeliverBatchOperation {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
+        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
     }
 }
 
@@ -173,23 +199,35 @@ impl Operation for PeerOperation {
     type Error = PeerFailure;
 
     fn start(&mut self) -> Effects {
-        match *self {}
+        match self {
+            PeerOperation::DeliverNotifications(operation) => operation.start(),
+        }
     }
 
-    fn step(&mut self, _event: Event) -> Effects {
-        match *self {}
+    fn step(&mut self, event: Event) -> Effects {
+        match self {
+            PeerOperation::DeliverNotifications(operation) => operation.step(event),
+        }
     }
 
     fn is_complete(&self) -> bool {
-        match *self {}
+        match self {
+            PeerOperation::DeliverNotifications(operation) => operation.is_complete(),
+        }
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self {}
+        match self {
+            PeerOperation::DeliverNotifications(operation) => {
+                DeliverBatchOperation::answer(operation.finalize())
+            }
+        }
     }
 
     fn abort(&mut self) -> Effects {
-        match *self {}
+        match self {
+            PeerOperation::DeliverNotifications(operation) => operation.abort(),
+        }
     }
 }
 
@@ -260,18 +298,46 @@ mod tests {
         assert!(operation.abort().is_empty());
     }
 
+    fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput<'_> {
+        let node = crate::tests::locations::node_id(1);
+        PeerInput {
+            alpn,
+            peer: node,
+            local_node: node,
+            local_realm: RealmId::from_bytes([1; 32]),
+            now_ms: 1_000,
+            frame,
+        }
+    }
+
     #[test]
     fn unconverted_peers_absent() {
-        let local_node = crate::tests::locations::node_id(1);
         for alpn in Alpn::ALL {
-            let input = PeerInput {
-                alpn,
-                peer: local_node,
-                local_node,
-                now_ms: 1_000,
-                frame: &[],
-            };
-            assert!(peer_operation(input).is_none());
+            if alpn != Alpn::Notification {
+                assert!(peer_operation(peer_input(alpn, &[])).is_none());
+            }
         }
+        let list = NotificationTransportMessage::ListWatches {
+            owner: crate::tests::notifications::user(1, 2),
+        };
+        let frame = postcard::to_allocvec(&list).unwrap();
+        assert!(peer_operation(peer_input(Alpn::Notification, &frame)).is_none());
+        assert!(peer_operation(peer_input(Alpn::Notification, &[0xff])).is_none());
+    }
+
+    #[test]
+    fn delivery_frame_named() {
+        let delivery = NotificationTransportMessage::DeliverBatch {
+            records: Vec::new(),
+        };
+        let frame = postcard::to_allocvec(&delivery).unwrap();
+        let mut operation = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
+        assert!(operation.start().is_empty());
+        let answer = operation.finalize().expect("an empty batch is answered");
+        let decoded: NotificationTransportMessage = postcard::from_bytes(&answer).unwrap();
+        assert_eq!(
+            decoded,
+            NotificationTransportMessage::Reject("empty batch".to_string())
+        );
     }
 }
