@@ -723,42 +723,62 @@ impl Operation for AddUserOperation {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             AddUserState::Auth => self.handle_authorization(event),
             AddUserState::StartTransaction => self.handle_start_transaction(event),
-            AddUserState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
+            AddUserState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_auth_read(event, txn_id)
+            },
             AddUserState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_deletes,
                 newly_added,
-            } => self.handle_auth_write(
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                let newly_added = newly_added.clone();
+                self.handle_auth_write(
                 event,
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 stale_conflict_deletes,
                 newly_added,
-            ),
+            )
+            },
             AddUserState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
-            } => self.handle_conflict_deletes(
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
+                self.handle_conflict_deletes(
                 event,
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
-            ),
+            )
+            },
             AddUserState::ReadBucketFence {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 newly_added,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
                 self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, newly_added)
             }
             AddUserState::CommitTransaction {
@@ -766,16 +786,30 @@ impl Operation for AddUserOperation {
                 admin_outbox_written,
                 newly_added,
                 ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let newly_added = newly_added.clone();
+                self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added)
+            },
             AddUserState::ScheduleDocumentDrain {
                 auth_doc,
                 newly_added,
-            } => self.handle_drain_schedule(event, auth_doc, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let newly_added = newly_added.clone();
+                self.handle_drain_schedule(event, auth_doc, newly_added)
+            },
             AddUserState::AnnounceAuthDoc {
                 auth_doc,
                 newly_added,
-            } => self.handle_auth_announce(event, auth_doc, newly_added),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let newly_added = newly_added.clone();
+                self.handle_auth_announce(event, auth_doc, newly_added)
+            },
             AddUserState::EmitNotifications { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)
             }
             AddUserState::Init | AddUserState::Finish | AddUserState::Error => {

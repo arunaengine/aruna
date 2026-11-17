@@ -180,7 +180,7 @@ impl Operation for GetUserOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
-        match self.state.clone() {
+        match &self.state {
             GetUserState::Auth => self.handle_auth_result(event),
             GetUserState::ReadExistingUser => self.accept_existing(event),
             GetUserState::Init | GetUserState::Finish | GetUserState::Error => {

@@ -341,7 +341,7 @@ impl Operation for SetGroupOperation {
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
-        match self.state.clone() {
+        match &self.state {
             SetGroupState::Auth => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -400,7 +400,10 @@ impl Operation for SetGroupOperation {
             SetGroupState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(SetGroupError::MissingTransaction);
@@ -416,15 +419,21 @@ impl Operation for SetGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            SetGroupState::DeleteAdminConflicts { document } => match event {
+            SetGroupState::DeleteAdminConflicts { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(document)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            SetGroupState::ReadBucketFence { document } => match event {
+            SetGroupState::ReadBucketFence { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     if self.fence.admits(&values) {
                         self.emit_commit(document)
@@ -434,8 +443,11 @@ impl Operation for SetGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
+            }
             },
-            SetGroupState::CommitTransaction { document } => match event {
+            SetGroupState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = SetGroupState::ScheduleSyncDrain { document };
@@ -451,6 +463,7 @@ impl Operation for SetGroupOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             SetGroupState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

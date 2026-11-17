@@ -137,7 +137,7 @@ impl Operation for RecoverInitialOperation {
             return self.fail(error.into());
         }
 
-        match self.state.clone() {
+        match &self.state {
             RecoverInitialState::StartTransaction => {
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return self.unexpected("transaction started", event);
@@ -152,6 +152,7 @@ impl Operation for RecoverInitialOperation {
                 })]
             }
             RecoverInitialState::ReadRecords { txn_id } => {
+                let txn_id = txn_id.clone();
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
                     return self.unexpected("onboarding secret iteration result", event);
                 };
@@ -184,6 +185,8 @@ impl Operation for RecoverInitialOperation {
                 })]
             }
             RecoverInitialState::ReadStates { txn_id, records } => {
+                let txn_id = txn_id.clone();
+                let records = records.clone();
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return self.unexpected("onboarding secret states", event);
                 };
@@ -225,6 +228,7 @@ impl Operation for RecoverInitialOperation {
                 })]
             }
             RecoverInitialState::DeleteRecords { txn_id } => {
+                let txn_id = txn_id.clone();
                 if !matches!(
                     event,
                     Event::Storage(StorageEvent::BatchDeleteResult { .. })
@@ -234,6 +238,7 @@ impl Operation for RecoverInitialOperation {
                 self.write_replacement(txn_id)
             }
             RecoverInitialState::WriteReplacement { txn_id } => {
+                let txn_id = txn_id.clone();
                 if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
                     return self.unexpected("replacement secret write result", event);
                 }

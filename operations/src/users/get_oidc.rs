@@ -270,17 +270,32 @@ impl Operation for GetOidcOperation {
             Ok(event) => event,
             Err(effects) => return effects,
         };
-        match self.state.clone() {
+        match &self.state {
             GetOidcState::StartTransaction => self.handle_start_txn(event),
-            GetOidcState::ReadSubjectIndex { txn_id } => self.accept_subject(event, txn_id),
-            GetOidcState::ReadExistingUser { txn_id } => self.accept_existing(event, txn_id),
+            GetOidcState::ReadSubjectIndex { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_subject(event, txn_id)
+            },
+            GetOidcState::ReadExistingUser { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_existing(event, txn_id)
+            },
             GetOidcState::FollowMerge {
                 txn_id,
                 start,
                 current,
                 seen,
-            } => self.accept_primary(event, (txn_id, start, current, seen)),
-            GetOidcState::CommitTransaction { user } => self.handle_commit_transaction(event, user),
+            } => {
+                let txn_id = txn_id.clone();
+                let start = start.clone();
+                let current = current.clone();
+                let seen = seen.clone();
+                self.accept_primary(event, (txn_id, start, current, seen))
+            },
+            GetOidcState::CommitTransaction { user } => {
+                let user = user.clone();
+                self.handle_commit_transaction(event, user)
+            },
             GetOidcState::Init | GetOidcState::Finish | GetOidcState::Error => {
                 smallvec![]
             }

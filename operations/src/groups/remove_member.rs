@@ -695,42 +695,62 @@ impl Operation for RemoveFromOperation {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             RemoveFromState::Auth => self.handle_authorization(event),
             RemoveFromState::StartTransaction => self.handle_start_transaction(event),
-            RemoveFromState::ReadAdminState { txn_id } => self.handle_auth_read(event, txn_id),
+            RemoveFromState::ReadAdminState { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_auth_read(event, txn_id)
+            },
             RemoveFromState::WriteAdminState {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 conflict_delete_keys,
                 was_member,
-            } => self.handle_auth_write(
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let conflict_delete_keys = conflict_delete_keys.clone();
+                let was_member = was_member.clone();
+                self.handle_auth_write(
                 event,
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 conflict_delete_keys,
                 was_member,
-            ),
+            )
+            },
             RemoveFromState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
-            } => self.handle_conflict_deletes(
+            } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
+                self.handle_conflict_deletes(
                 event,
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
-            ),
+            )
+            },
             RemoveFromState::ReadBucketFence {
                 txn_id,
                 auth_doc,
                 admin_outbox_written,
                 was_member,
             } => {
+                let txn_id = txn_id.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
                 self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, was_member)
             }
             RemoveFromState::CommitTransaction {
@@ -738,12 +758,22 @@ impl Operation for RemoveFromOperation {
                 admin_outbox_written,
                 was_member,
                 ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let was_member = was_member.clone();
+                self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member)
+            },
             RemoveFromState::ScheduleDocumentDrain {
                 auth_doc,
                 was_member,
-            } => self.handle_drain_schedule(event, auth_doc, was_member),
+            } => {
+                let auth_doc = auth_doc.clone();
+                let was_member = was_member.clone();
+                self.handle_drain_schedule(event, auth_doc, was_member)
+            },
             RemoveFromState::EmitNotifications { auth_doc } => {
+                let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)
             }
             RemoveFromState::Init | RemoveFromState::Finish | RemoveFromState::Error => {

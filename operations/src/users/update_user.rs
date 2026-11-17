@@ -775,41 +775,68 @@ impl Operation for UpdateUserOperation {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             UpdateUserState::Auth => self.handle_auth_result(event),
             UpdateUserState::StartTransaction => self.handle_start_transaction(event),
-            UpdateUserState::ReadStateRevision { txn_id } => self.accept_admin_state(event, txn_id),
+            UpdateUserState::ReadStateRevision { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.accept_admin_state(event, txn_id)
+            },
             UpdateUserState::WriteStateRevision {
                 txn_id,
                 user,
                 admin_outbox_written,
                 stale_conflict_deletes,
-            } => self.handle_write_user(
+            } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                self.handle_write_user(
                 event,
                 txn_id,
                 user,
                 admin_outbox_written,
                 stale_conflict_deletes,
-            ),
+            )
+            },
             UpdateUserState::DeleteAdminConflicts {
                 txn_id,
                 user,
                 admin_outbox_written,
-            } => self.accept_conflict_delete(event, txn_id, user, admin_outbox_written),
+            } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.accept_conflict_delete(event, txn_id, user, admin_outbox_written)
+            },
             UpdateUserState::ReadBucketFence {
                 txn_id,
                 user,
                 admin_outbox_written,
-            } => self.handle_bucket_fence(event, txn_id, user, admin_outbox_written),
+            } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_bucket_fence(event, txn_id, user, admin_outbox_written)
+            },
             UpdateUserState::CommitTransaction {
                 user,
                 admin_outbox_written,
                 ..
-            } => self.handle_commit_transaction(event, user, admin_outbox_written),
+            } => {
+                let user = user.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_commit_transaction(event, user, admin_outbox_written)
+            },
             UpdateUserState::ScheduleDocumentDrain { user } => {
+                let user = user.clone();
                 self.schedule_outbox_drain(event, user)
             }
-            UpdateUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
+            UpdateUserState::AnnounceUser { user } => {
+                let user = user.clone();
+                self.handle_announce_user(event, user)
+            },
             UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => {
                 let got = format!("{event:?}");
                 self.unexpected_event("no event", got)

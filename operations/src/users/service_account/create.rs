@@ -343,18 +343,31 @@ impl Operation for CreateServiceOperation {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return self.fail(error.into());
         }
-        match self.state.clone() {
+        match &self.state {
             CreateServiceState::Authorize => self.handle_authorized(event),
             CreateServiceState::StartTransaction => self.handle_started(event),
-            CreateServiceState::ReadConfig { txn_id } => self.handle_config(event, txn_id),
+            CreateServiceState::ReadConfig { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_config(event, txn_id)
+            },
             CreateServiceState::WriteUser { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.handle_written(event, txn_id, user)
             }
             CreateServiceState::ReadFence { txn_id, user } => {
+                let txn_id = txn_id.clone();
+                let user = user.clone();
                 self.handle_fence(event, txn_id, user)
             }
-            CreateServiceState::Commit { user } => self.handle_committed(event, user),
-            CreateServiceState::ScheduleDrain { user } => self.handle_drain(event, user),
+            CreateServiceState::Commit { user } => {
+                let user = user.clone();
+                self.handle_committed(event, user)
+            },
+            CreateServiceState::ScheduleDrain { user } => {
+                let user = user.clone();
+                self.handle_drain(event, user)
+            },
             CreateServiceState::Init => self.unexpected("no event before start", event),
             CreateServiceState::Finish | CreateServiceState::Error => smallvec![],
         }

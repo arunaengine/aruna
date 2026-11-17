@@ -389,7 +389,7 @@ impl Operation for ReadPolicyOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             ReadPolicyState::ReadLocal => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     let [(_, policy_value), (_, config_value), (_, auth_value)] = values.as_slice()
@@ -414,7 +414,9 @@ impl Operation for ReadPolicyOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
                 other => self.unexpected_event("local policy read", format!("{other:?}")),
             },
-            ReadPolicyState::Fetch { asked } => match event {
+            ReadPolicyState::Fetch { asked } => {
+                let asked = asked.clone();
+                match event {
                 Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
                     PolicyFetchEvent::Fetched {
                         publisher,
@@ -428,13 +430,17 @@ impl Operation for ReadPolicyOperation {
                     }
                 },
                 other => self.unexpected_event("policy fetch result", format!("{other:?}")),
+            }
             },
-            ReadPolicyState::ReadGroupAuth { pending } => match event {
+            ReadPolicyState::ReadGroupAuth { pending } => {
+                let pending = pending.clone();
+                match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     self.handle_group_auth(*pending, value)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
                 other => self.unexpected_event("group authorization read", format!("{other:?}")),
+            }
             },
             ReadPolicyState::Init | ReadPolicyState::Finish | ReadPolicyState::Error => {
                 smallvec![]

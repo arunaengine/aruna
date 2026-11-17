@@ -430,12 +430,18 @@ impl Operation for CreateSessionOperation {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return self.emit_error(error.into());
         }
-        match self.state.clone() {
+        match &self.state {
             CreateSessionState::Init => self.start(),
             CreateSessionState::StartTransaction => self.handle_started(event),
             CreateSessionState::ReadOwnerIndex => self.handle_index(event),
-            CreateSessionState::ReadSessions { index } => self.handle_sessions(event, index),
-            CreateSessionState::DeleteStale { index } => self.handle_deleted(event, index),
+            CreateSessionState::ReadSessions { index } => {
+                let index = index.clone();
+                self.handle_sessions(event, index)
+            },
+            CreateSessionState::DeleteStale { index } => {
+                let index = index.clone();
+                self.handle_deleted(event, index)
+            },
             CreateSessionState::WriteSession => self.handle_written(event),
             CreateSessionState::CommitTransaction => self.handle_committed(event),
             CreateSessionState::Finish | CreateSessionState::Error => smallvec![],

@@ -643,7 +643,7 @@ impl Operation for RevokeTokenOperation {
         {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
-        match self.state.clone() {
+        match &self.state {
             RevokeTokenState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
@@ -676,7 +676,15 @@ impl Operation for RevokeTokenOperation {
                 write_canonical,
                 pending_deletes,
                 pending_live,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                let pending_deletes = pending_deletes.clone();
+                let pending_live = pending_live.clone();
+                match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -724,6 +732,7 @@ impl Operation for RevokeTokenOperation {
                 other => {
                     self.unexpected_event("outbox capacity iteration result", format!("{other:?}"))
                 }
+            }
             },
             RevokeTokenState::ReadOutboxRecords {
                 document,
@@ -735,7 +744,17 @@ impl Operation for RevokeTokenOperation {
                 mut pending_live,
                 index_keys,
                 next_start_after,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                let pending_deletes = pending_deletes.clone();
+                let pending_live = pending_live.clone();
+                let index_keys = index_keys.clone();
+                let next_start_after = next_start_after.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     if let Err(error) = self.collect_pending(
                         index_keys,
@@ -784,6 +803,7 @@ impl Operation for RevokeTokenOperation {
                 other => {
                     self.unexpected_event("outbox record batch read result", format!("{other:?}"))
                 }
+            }
             },
             RevokeTokenState::DeletePendingOutbox {
                 document,
@@ -791,7 +811,13 @@ impl Operation for RevokeTokenOperation {
                 revocation_index,
                 apply_event,
                 write_canonical,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let reducer_state = reducer_state.clone();
+                let revocation_index = revocation_index.clone();
+                let apply_event = apply_event.clone();
+                let write_canonical = write_canonical.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => match self
                     .emit_after_capacity(
                         document,
@@ -807,12 +833,17 @@ impl Operation for RevokeTokenOperation {
                 other => {
                     self.unexpected_event("pending outbox cleanup result", format!("{other:?}"))
                 }
+            }
             },
             RevokeTokenState::WriteDocumentState {
                 document,
                 stale_conflict_deletes,
                 schedule_drain,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                let schedule_drain = schedule_drain.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(RevokeTokenError::MissingTransaction);
@@ -831,16 +862,21 @@ impl Operation for RevokeTokenOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
             RevokeTokenState::DeleteAdminConflicts {
                 document,
                 schedule_drain,
-            } => match event {
+            } => {
+                let document = document.clone();
+                let schedule_drain = schedule_drain.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit(document, schedule_drain)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
             RevokeTokenState::CommitNoop { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -854,7 +890,9 @@ impl Operation for RevokeTokenOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            RevokeTokenState::CommitTransaction { document } => match event {
+            RevokeTokenState::CommitTransaction { document } => {
+                let document = document.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = RevokeTokenState::ScheduleSyncDrain { document };
@@ -865,6 +903,7 @@ impl Operation for RevokeTokenOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             RevokeTokenState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

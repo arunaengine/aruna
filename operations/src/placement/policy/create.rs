@@ -345,7 +345,7 @@ impl Operation for CreatePolicyOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             CreatePolicyState::Authorize => match event {
                 Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
                     match allowed {
@@ -404,7 +404,9 @@ impl Operation for CreatePolicyOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
-            CreatePolicyState::ReadFence { pending } => match event {
+            CreatePolicyState::ReadFence { pending } => {
+                let pending = pending.clone();
+                match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     if !fence::admits(value.as_ref(), pending.generation) {
                         return self.fail(CreatePolicyError::PlacementFenced);
@@ -413,8 +415,11 @@ impl Operation for CreatePolicyOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement fence read", format!("{other:?}")),
+            }
             },
-            CreatePolicyState::Sign { pending } => match event {
+            CreatePolicyState::Sign { pending } => {
+                let pending = pending.clone();
+                match event {
                 Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
                     match self.bind_publication(*pending, *publication) {
                         Ok(effects) => effects,
@@ -427,6 +432,7 @@ impl Operation for CreatePolicyOperation {
                 other => {
                     self.unexpected_event("policy publication signature", format!("{other:?}"))
                 }
+            }
             },
             CreatePolicyState::Write => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.emit_commit(),

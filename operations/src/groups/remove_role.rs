@@ -666,11 +666,16 @@ impl Operation for RemoveGroupOperation {
             return next.unwrap_or_else(|error| self.fail(error.into()));
         }
 
-        match self.state.clone() {
+        match &self.state {
             RemoveGroupState::Auth => self.handle_authorization(event),
             RemoveGroupState::StartTransaction => self.handle_start_transaction(event),
-            RemoveGroupState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
+            RemoveGroupState::GetGroup { txn_id } => {
+                let txn_id = txn_id.clone();
+                self.handle_get_group(event, txn_id)
+            },
             RemoveGroupState::GetAdminState { txn_id, group } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
                 self.handle_auth_read(event, txn_id, group)
             }
             RemoveGroupState::WriteDocState {
@@ -679,33 +684,59 @@ impl Operation for RemoveGroupOperation {
                 auth_doc,
                 admin_outbox_written,
                 conflict_delete_keys,
-            } => self.handle_document_write(
+            } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                let conflict_delete_keys = conflict_delete_keys.clone();
+                self.handle_document_write(
                 event,
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
                 conflict_delete_keys,
-            ),
+            )
+            },
             RemoveGroupState::DeleteAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
-            } => self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written),
+            } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written)
+            },
             RemoveGroupState::ReadBucketFence {
                 txn_id,
                 group,
                 auth_doc,
                 admin_outbox_written,
-            } => self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written),
+            } => {
+                let txn_id = txn_id.clone();
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written)
+            },
             RemoveGroupState::CommitTransaction {
                 group,
                 auth_doc,
                 admin_outbox_written,
                 ..
-            } => self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written),
+            } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
+                let admin_outbox_written = admin_outbox_written.clone();
+                self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written)
+            },
             RemoveGroupState::ScheduleDocumentDrain { group, auth_doc } => {
+                let group = group.clone();
+                let auth_doc = auth_doc.clone();
                 self.handle_drain_schedule(event, group, auth_doc)
             }
             RemoveGroupState::Init | RemoveGroupState::Finish | RemoveGroupState::Error => {

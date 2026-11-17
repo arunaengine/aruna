@@ -389,7 +389,7 @@ impl Operation for UpdateGroupOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        match &self.state {
             UpdateGroupState::AuthGroupAdmin => self.handle_auth(event, true),
             UpdateGroupState::AuthRealmAdmin => self.handle_auth(event, false),
             UpdateGroupState::StartTransaction => match event {
@@ -427,7 +427,10 @@ impl Operation for UpdateGroupOperation {
             UpdateGroupState::WriteGroupState {
                 group,
                 stale_conflict_deletes,
-            } => match event {
+            } => {
+                let group = group.clone();
+                let stale_conflict_deletes = stale_conflict_deletes.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(UpdateGroupError::MissingTransaction);
@@ -443,15 +446,21 @@ impl Operation for UpdateGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+            }
             },
-            UpdateGroupState::DeleteAdminConflicts { group } => match event {
+            UpdateGroupState::DeleteAdminConflicts { group } => {
+                let group = group.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
                     self.emit_commit_transaction(group)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+            }
             },
-            UpdateGroupState::ReadBucketFence { group } => match event {
+            UpdateGroupState::ReadBucketFence { group } => {
+                let group = group.clone();
+                match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     if self.fence.admits(&values) {
                         self.emit_commit(group)
@@ -461,8 +470,11 @@ impl Operation for UpdateGroupOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
+            }
             },
-            UpdateGroupState::CommitTransaction { group } => match event {
+            UpdateGroupState::CommitTransaction { group } => {
+                let group = group.clone();
+                match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.output = Some(Ok(group.clone()));
@@ -479,6 +491,7 @@ impl Operation for UpdateGroupOperation {
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            }
             },
             UpdateGroupState::ScheduleOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {

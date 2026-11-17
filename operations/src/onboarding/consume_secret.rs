@@ -110,7 +110,7 @@ impl Operation for ConsumeSecretOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match &self.state {
             ConsumeSecretState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -140,6 +140,7 @@ impl Operation for ConsumeSecretOperation {
                 })]
             }
             ConsumeSecretState::ReadRecords { txn_id } => {
+                let txn_id = txn_id.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
                     return fail(
@@ -271,6 +272,8 @@ impl Operation for ConsumeSecretOperation {
                 })]
             }
             ConsumeSecretState::WriteConsumed { txn_id, record } => {
+                let txn_id = txn_id.clone();
+                let record = record.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
@@ -293,6 +296,8 @@ impl Operation for ConsumeSecretOperation {
                 record,
                 consumed_now,
             } => {
+                let record = record.clone();
+                let consumed_now = consumed_now.clone();
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
