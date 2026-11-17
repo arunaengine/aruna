@@ -10,7 +10,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::NetHandle;

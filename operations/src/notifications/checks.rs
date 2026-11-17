@@ -4,8 +4,8 @@
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
-use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, parse_watch_path, watch_resource_path,
 };

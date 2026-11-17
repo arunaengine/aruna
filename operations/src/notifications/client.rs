@@ -5,7 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::execution::notification::NotificationRecord;
-use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };

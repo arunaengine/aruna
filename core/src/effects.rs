@@ -731,7 +731,7 @@ pub enum NetEffect {
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one notification request frame to a holder and reads its answer frame.
-    Notification(Box<crate::structs::execution::notification_transport::NotificationRequest>),
+    Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.
     WakeInbox(Vec<crate::UserId>),
 }

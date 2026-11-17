@@ -1205,7 +1205,7 @@ async fn oversized_message_refused() {
         })
         .expect("encodes")
         .len();
-    let count = aruna_core::structs::execution::notification_transport::MAX_NOTIFICATION_SIZE
+    let count = aruna_core::structs::execution::notification::MAX_NOTIFICATION_SIZE
         / per_record.max(1)
         + 1_000;
     let records = vec![sample; count];

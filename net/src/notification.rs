@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::execution::notification_transport::{
+use aruna_core::structs::execution::notification::{
     MAX_NOTIFICATION_SIZE, NotificationTransportMessage,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};

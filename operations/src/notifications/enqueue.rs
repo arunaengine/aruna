@@ -31,10 +31,9 @@ pub enum EnqueueError {
     NotFinished,
 }
 
-/// Queues the deliveries of held notices, whatever the settings say now: the job decides from
-/// the setting when it runs. Share uploads get a webhook job, notices of an email category get
-/// an email job unless the realm has no email profile. A job already queued for the notice is
-/// kept; a failure is returned so the sender delivers again.
+/// Queues a webhook job per share upload and an email job per email-category notice unless the
+/// realm has no email profile; the job reads the setting when it runs. A queued job is kept,
+/// and a failure is returned so the sender delivers again.
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDeliveriesOperation {
     waiting: VecDeque<(&'static str, SubmitJobOperation)>,

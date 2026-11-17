@@ -452,10 +452,7 @@ pub enum NetEvent {
     Error(NetError),
     /// The holder's answer frame, or why none came.
     Notification(
-        Result<
-            Box<crate::structs::execution::notification_transport::NotificationTransportMessage>,
-            String,
-        >,
+        Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
     ),
     InboxWoken,
 }

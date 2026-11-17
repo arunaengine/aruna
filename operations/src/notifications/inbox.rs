@@ -126,11 +126,9 @@ impl UpsertState {
     }
 }
 
-/// Idempotent holder-local upsert: existing primary keys are skipped inside the write
-/// transaction, so a duplicate never clobbers a concurrent mark-read's `read_at_ms`. A bucket
-/// deletion is never stored: it removes the notices about its bucket and keeps its time, so a
-/// notice from before it that arrives late is dropped too. An upsert in its own transaction
-/// runs once more after a conflict.
+/// Idempotent holder-local upsert that skips stored keys, so a duplicate keeps a mark-read. A
+/// bucket deletion removes its bucket's notices and keeps its time to drop late ones. An upsert
+/// in its own transaction runs once more after a conflict.
 #[derive(Debug, PartialEq)]
 pub struct UpsertInboxOperation {
     records: Vec<NotificationRecord>,

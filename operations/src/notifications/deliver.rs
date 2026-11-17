@@ -8,7 +8,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationRecord;
-use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
@@ -60,11 +60,9 @@ enum DeliverState {
     Failed(DeliverError),
 }
 
-/// Stores a peer's batch in this holder's inbox and queues its deliveries. Only a sync-eligible
-/// node of this realm may deliver, every record must be valid and held here, and a bucket
-/// notice must come from the node that holds the bucket. Every attempt queues the held records,
-/// so a delivery a failed queue left behind is queued when the sender delivers again. The
-/// output is the answer frame.
+/// Stores a sync-eligible peer's valid batch held here and queues its deliveries on every
+/// attempt, so a delivery a failed queue left behind is queued on the next one. A bucket notice
+/// must come from the bucket's node. The output is the answer frame.
 #[derive(Debug, PartialEq)]
 pub struct DeliverBatchOperation {
     input: DeliverInput,
@@ -345,7 +343,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn empty_and_foreign_rejected() {
+    fn stray_batches_rejected() {
         let mut empty = DeliverBatchOperation::new(input(), Vec::new());
         assert!(empty.start().is_empty());
         assert_eq!(rejected(empty), "empty batch");

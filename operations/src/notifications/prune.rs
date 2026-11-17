@@ -1310,7 +1310,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn future_row_stops_index() {
+    fn future_row_stops() {
         let future = record(user(1, 2), NotificationClass::Direct, NOW_MS);
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
         operation.start();

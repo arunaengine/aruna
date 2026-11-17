@@ -13,7 +13,7 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
-use aruna_core::structs::execution::notification_transport::{
+use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -103,11 +103,9 @@ impl DrainState {
     }
 }
 
-/// One drain run over a read snapshot of the outbox, page by page, so a dead holder cannot hide
-/// healthy records behind it while rows appended during the run wait for the next run. Records
-/// for this node go into the local inbox and queue their deliveries; the others go to their
-/// holder, one attempt per holder and run. Rows stay until delivered; expired ones are dropped.
-/// The output is when the drain runs again.
+/// One drain run over a read snapshot, page by page, so a dead holder hides no healthy record.
+/// Local records go to the inbox, others to their holder once per run; rows stay until
+/// delivered, expired ones are dropped. The output is when the drain runs again.
 #[derive(Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     local: Option<NodeId>,
