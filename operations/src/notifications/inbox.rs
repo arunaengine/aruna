@@ -875,7 +875,7 @@ mod call_tests {
     }
 
     #[test]
-    fn within_uses_caller_transaction() {
+    fn within_caller_transaction() {
         let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
         assert!(!upsert.transaction());
         assert!(matches!(
