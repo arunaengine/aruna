@@ -4,20 +4,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::execution::job::JobId;
 use aruna_plugins::broker::{ErrorKind, Field, HostError, JobStatus, ObjectInfo, ObjectPage};
 use base64::Engine;
 use serde_json::Value;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::broker::short_path;
 use super::check::unavailable;
 use super::marks::is_marked;
+use super::rows::{delete_rows, scan_rows};
+use super::store::{StoreError, decode};
 use super::work::{
-    SendBoundary, Summary, WorkKind, WorkRow, WorkState, read_work, reconcile, summary_of,
-    work_state,
+    SendBoundary, Summary, WorkChange, WorkKind, WorkRow, WorkState, dedup_key, index_key,
+    install_at, read_work, summary_of, update_work, work_scan, work_state,
 };
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::service::find_dedup_job;
 use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
 
 /// Outputs of one page.
@@ -32,7 +39,7 @@ pub async fn job_row(
 ) -> Result<WorkRow, HostError> {
     let missing = || HostError::new(ErrorKind::NotFound, format!("the install has no job {id}"));
     let work_id = Ulid::from_string(id).map_err(|_| missing())?;
-    let row = read_work(ctx, install.install_id, work_id).await;
+    let row = drive(read_work(install.install_id, work_id), ctx).await;
     let row = row.map_err(|error| unavailable(error.0))?;
     row.filter(|row| row.account == install.account)
         .ok_or_else(missing)
@@ -118,7 +125,10 @@ pub async fn job_outputs(
             output.key.as_str(),
             output.version_id,
         );
-        let marked = is_marked(ctx, version).await;
+        let marked = match is_marked(version) {
+            Ok(marked) => drive(marked, ctx).await,
+            Err(error) => Err(error),
+        };
         objects.push(ObjectInfo {
             path: format!("{}/{}", output.bucket, output.key),
             size: output.size,
@@ -154,6 +164,143 @@ pub async fn cancel_job(
         Ok(_) | Err(JobMutationError::NotFound) => Ok(()),
         Err(error) => Err(unavailable(error.to_string())),
     }
+}
+
+/// Keeps the summary of every work whose job finished, so its status outlives the job record;
+/// a reserved work first takes the job its dedup key names. Answers how many settled.
+pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let mut settled = 0;
+    for (key, value) in drive(scan_rows(work_scan()), ctx).await? {
+        let row: WorkRow = decode(&value)?;
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let job = match (row.state, row.job) {
+            (WorkState::Dispatched, Some(job)) => job,
+            (WorkState::Reserved, _) => match reconcile(ctx, install_id, &row).await? {
+                Some(job) => job,
+                None => continue,
+            },
+            _ => continue,
+        };
+        let record = read_job_record(&ctx.storage_handle, job, None).await;
+        let record = record.map_err(StoreError)?;
+        let Some(summary) = summary_of(record.as_ref()) else {
+            continue;
+        };
+        let change = WorkChange::Settled(Box::new(summary), now_ms);
+        let changed = drive(update_work((install_id, row.work_id), change), ctx);
+        if changed.await?.is_some() {
+            settled += 1;
+        }
+    }
+    Ok(settled)
+}
+
+/// Records the job of a reserved work whose submission committed but whose answer was lost; the
+/// job is found by the work's dedup key. `None` while no job was submitted.
+pub(crate) async fn reconcile(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    row: &WorkRow,
+) -> Result<Option<JobId>, StoreError> {
+    let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
+    let Some((job, _)) = found.map_err(|error| StoreError(error.to_string()))? else {
+        return Ok(None);
+    };
+    let change = WorkChange::Dispatched(job);
+    drive(update_work((install_id, row.work_id), change), ctx).await?;
+    Ok(Some(job))
+}
+
+/// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
+/// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
+pub async fn retire_work(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let storage = &ctx.storage_handle;
+    let mut dropped = Vec::new();
+    for (key, value) in drive(scan_rows(work_scan()), ctx).await? {
+        let Some(install_id) = install_at(&key) else {
+            continue;
+        };
+        let kept = (config.installs.iter()).any(|install| {
+            install.install_id == install_id && install.state != InstallState::Removing
+        });
+        if kept {
+            continue;
+        }
+        let mut row: WorkRow = decode(&value)?;
+        if row.state == WorkState::Reserved {
+            match reconcile(ctx, install_id, &row).await? {
+                Some(job) => (row.job, row.state) = (Some(job), WorkState::Dispatched),
+                None => {
+                    dropped.extend([index_key(install_id, row.work_id), key]);
+                    continue;
+                }
+            }
+        }
+        let Some(job) = row.job.filter(|_| row.state != WorkState::Settled) else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        let record = read_job_record(storage, job, None)
+            .await
+            .map_err(StoreError)?;
+        let Some(record) = record else {
+            dropped.extend([index_key(install_id, row.work_id), key]);
+            continue;
+        };
+        // A settled job keeps its outcome; the settle step stores it before the row goes.
+        if row.cancel || record.is_settled() {
+            continue;
+        }
+        match set_cancel_requested(storage, job, now_ms).await {
+            Ok(_) => {
+                let change = WorkChange::Cancelling(job);
+                drive(update_work((install_id, row.work_id), change), ctx).await?;
+            }
+            Err(JobMutationError::NotFound) => {
+                dropped.extend([index_key(install_id, row.work_id), key]);
+            }
+            Err(error) => warn!(%error, "A removed install's plugin work did not accept a cancel"),
+        }
+    }
+    let count = dropped.len() / 2;
+    let dropped = (dropped.into_iter()).map(|key| (PLUGIN_WORK_KEYSPACE, key));
+    drive(delete_rows(dropped.collect()), ctx).await?;
+    Ok(count)
+}
+
+/// At most `limit` works of an install after the work `after`, oldest first, and the id of the
+/// last one when more may follow.
+pub async fn list_work(
+    ctx: &DriverContext,
+    install_id: Ulid,
+    after: Option<Ulid>,
+    limit: usize,
+) -> Result<(Vec<WorkRow>, Option<Ulid>), StoreError> {
+    let txn = Txn::direct(ctx);
+    let prefix = [&[WORK_INDEX][..], &install_id.to_bytes()].concat();
+    let after = after.map(|work_id| index_key(install_id, work_id));
+    let (rows, next) = txn
+        .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
+        .await?;
+    // The cursor is the last index row read, whatever row it leads to.
+    let last = (rows.last()).and_then(|(index, _)| work_at(index));
+    let mut works = Vec::with_capacity(rows.len());
+    for (index, key) in rows {
+        let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
+            continue;
+        };
+        let row = decode::<WorkRow>(&value)?;
+        if index.ends_with(&row.work_id.to_bytes()) {
+            works.push(row);
+        }
+    }
+    Ok((works, next.and(last)))
 }
 
 fn fill(status: &mut JobStatus, summary: Summary) {

@@ -649,204 +649,160 @@ impl Summary {
     }
 }
 
-/// Keeps the summary of every work whose job finished, so its status outlives the job record;
-/// a reserved work first takes the job its dedup key names. Answers how many settled.
-pub async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
-    let txn = Txn::direct(ctx);
-    let mut settled = 0;
-    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
-        let row: WorkRow = decode(&value)?;
-        let Some(install_id) = install_at(&key) else {
-            continue;
-        };
-        let job = match (row.state, row.job) {
-            (WorkState::Dispatched, Some(job)) => job,
-            (WorkState::Reserved, _) => match reconcile(ctx, install_id, &row).await? {
-                Some(job) => job,
-                None => continue,
-            },
-            _ => continue,
-        };
-        let record = read_job_record(&ctx.storage_handle, job, None).await;
-        let record = record.map_err(StoreError)?;
-        let Some(summary) = summary_of(record.as_ref()) else {
-            continue;
-        };
-        let changed = update_work(ctx, (install_id, row.work_id), |row| {
-            if row.state == WorkState::Dispatched {
-                // The paths and an upload's answer stay answerable after the job record is pruned.
-                let (source, target) = (row.source.clone(), row.target.clone());
-                let (status, reply) = match &row.boundary {
-                    Some(SendBoundary::Sent { status, reply, .. }) => {
-                        (Some(*status), reply.clone())
-                    }
-                    _ => (None, None),
-                };
-                row.state = WorkState::Settled;
-                row.summary = Some(Summary {
-                    source,
-                    target,
-                    status,
-                    reply,
-                    ..summary
-                });
-                row.settled_ms = Some(now_ms);
-            }
-        });
-        if changed.await?.is_some() {
-            settled += 1;
-        }
-    }
-    Ok(settled)
-}
-
-/// Records the job of a reserved work whose submission committed but whose answer was lost; the
-/// job is found by the work's dedup key. `None` while no job was submitted.
-pub(crate) async fn reconcile(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    row: &WorkRow,
-) -> Result<Option<JobId>, StoreError> {
-    let found = find_dedup_job(ctx, row.account, &dedup_key(row.work_id)).await;
-    let Some((job, _)) = found.map_err(|error| StoreError(error.to_string()))? else {
-        return Ok(None);
-    };
-    dispatched(ctx, (install_id, row.work_id), job).await?;
-    Ok(Some(job))
+/// Reads every work row.
+pub fn work_scan() -> Scan {
+    Scan::new(PLUGIN_WORK_KEYSPACE, vec![WORK_ROW])
 }
 
 /// Deletes the rows nobody can ask for again: settled and delivered, no cancel open, kept past
 /// the run retention, and their run record pruned.
-pub async fn prune_work(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
-    let txn = Txn::direct(ctx);
-    let mut dropped = Vec::new();
-    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
+pub fn prune_work(now_ms: u64) -> RowsOperation<PruneWork> {
+    RowsOperation::direct(PruneWork {
+        now_ms,
+        phase: PrunePhase::Scanning(work_scan()),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PruneWork {
+    now_ms: u64,
+    phase: PrunePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum PrunePhase {
+    Scanning(Scan),
+    /// Reads the run of each aged work; holds the index and row keys of each, in that order.
+    Runs(Vec<[Vec<u8>; 2]>),
+    Deleting(usize),
+}
+
+impl Plan for PruneWork {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
+        match &self.phase {
+            PrunePhase::Scanning(scan) => Ok(Turn::Ask(scan.ask())),
+            _ => Err(StoreError("prune started twice".into())),
+        }
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+        match std::mem::replace(&mut self.phase, PrunePhase::Deleting(0)) {
+            PrunePhase::Scanning(mut scan) => {
+                let Some(rows) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = PrunePhase::Scanning(scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let (aged, runs) = aged_work(rows, self.now_ms)?;
+                self.phase = PrunePhase::Runs(aged);
+                Ok(Turn::Ask(Ask::Read(runs)))
+            }
+            PrunePhase::Runs(aged) => {
+                let Answer::Values(runs) = answer else {
+                    return Err(unexpected(answer));
+                };
+                let dropped: Vec<_> = (aged.into_iter().zip(runs))
+                    .filter(|(_, run)| run.is_none())
+                    .flat_map(|(keys, _)| keys.map(|key| (PLUGIN_WORK_KEYSPACE, key)))
+                    .collect();
+                self.phase = PrunePhase::Deleting(dropped.len() / 2);
+                Ok(Turn::Ask(Ask::Delete(dropped)))
+            }
+            PrunePhase::Deleting(count) => {
+                done(answer)?;
+                Ok(Turn::Finish(count))
+            }
+        }
+    }
+}
+
+/// The index and row keys of the works among `rows` nobody can ask for again once their run is
+/// gone, and the run key of each, in the same order.
+fn aged_work(rows: Rows, now_ms: u64) -> Result<WorkRuns, StoreError> {
+    let (mut aged, mut runs) = (Vec::new(), Vec::new());
+    for (key, value) in rows {
         let row: WorkRow = decode(&value)?;
         let (Some(install_id), Some(Identity::Call { run_id, .. })) =
             (install_at(&key), identity_at(&key))
         else {
             continue;
         };
-        let aged = (row.settled_ms)
+        let kept = (row.settled_ms)
             .is_some_and(|settled| settled.saturating_add(RUN_RETENTION_MS) <= now_ms);
-        if row.state != WorkState::Settled || !row.notified || row.cancel || !aged {
+        if row.state != WorkState::Settled || !row.notified || row.cancel || !kept {
             continue;
         }
-        let run = run_key(install_id, run_id);
-        if txn.read(PLUGIN_RUNS_KEYSPACE, &run).await?.is_none() {
-            dropped.push(index_key(install_id, row.work_id));
-            dropped.push(key);
-        }
+        runs.push((PLUGIN_RUNS_KEYSPACE, run_key(install_id, run_id)));
+        aged.push([index_key(install_id, row.work_id), key]);
     }
-    let count = dropped.len() / 2;
-    transact(ctx, async |txn: &Txn<'_>| {
-        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
-    })
-    .await?;
-    Ok(count)
+    Ok((aged, runs))
 }
 
-/// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
-pub async fn holds_job(ctx: &DriverContext, spec: &PluginWorkSpec) -> Result<bool, StoreError> {
-    let row = read_work(ctx, spec.install_id, spec.work_id).await?;
-    Ok(row.is_some_and(|row| row.state != WorkState::Settled))
-}
-
-/// Asks the jobs of removed installs to cancel and deletes their rows once each job is settled
-/// and kept; a row stays as long as its cancel was not accepted. Answers how many rows went.
-pub async fn retire_work(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    now_ms: u64,
-) -> Result<usize, StoreError> {
-    let storage = &ctx.storage_handle;
-    let txn = Txn::direct(ctx);
-    let mut dropped = Vec::new();
-    for (key, value) in txn.scan(PLUGIN_WORK_KEYSPACE, &[WORK_ROW]).await? {
-        let Some(install_id) = install_at(&key) else {
-            continue;
-        };
-        let kept = (config.installs.iter()).any(|install| {
-            install.install_id == install_id && install.state != InstallState::Removing
-        });
-        if kept {
-            continue;
-        }
-        let mut row: WorkRow = decode(&value)?;
-        if row.state == WorkState::Reserved {
-            match reconcile(ctx, install_id, &row).await? {
-                Some(job) => (row.job, row.state) = (Some(job), WorkState::Dispatched),
-                None => {
-                    dropped.extend([index_key(install_id, row.work_id), key]);
-                    continue;
-                }
-            }
-        }
-        let Some(job) = row.job.filter(|_| row.state != WorkState::Settled) else {
-            dropped.extend([index_key(install_id, row.work_id), key]);
-            continue;
-        };
-        let record = read_job_record(storage, job, None)
-            .await
-            .map_err(StoreError)?;
-        let Some(record) = record else {
-            dropped.extend([index_key(install_id, row.work_id), key]);
-            continue;
-        };
-        // A settled job keeps its outcome; the settle step stores it before the row goes.
-        if row.cancel || record.is_settled() {
-            continue;
-        }
-        match set_cancel_requested(storage, job, now_ms).await {
-            Ok(_) => {
-                let accepted = update_work(ctx, (install_id, row.work_id), |row| {
-                    row.job = Some(job);
-                    row.state = WorkState::Dispatched;
-                    row.cancel = true;
-                });
-                accepted.await?;
-            }
-            Err(JobMutationError::NotFound) => {
-                dropped.extend([index_key(install_id, row.work_id), key]);
-            }
-            Err(error) => warn!(%error, "A removed install's plugin work did not accept a cancel"),
-        }
-    }
-    let count = dropped.len() / 2;
-    transact(ctx, async |txn: &Txn<'_>| {
-        txn.delete(PLUGIN_WORK_KEYSPACE, dropped).await
-    })
-    .await?;
-    Ok(count)
-}
+type WorkRuns = (Vec<[Vec<u8>; 2]>, Vec<(&'static str, Vec<u8>)>);
 
 /// At most `limit` works of an install after the work `after`, oldest first, and the id of the
 /// last one when more may follow.
-pub async fn list_work(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    after: Option<Ulid>,
-    limit: usize,
-) -> Result<(Vec<WorkRow>, Option<Ulid>), StoreError> {
-    let txn = Txn::direct(ctx);
-    let prefix = [&[WORK_INDEX][..], &install_id.to_bytes()].concat();
-    let after = after.map(|work_id| index_key(install_id, work_id));
-    let (rows, next) = txn
-        .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
-        .await?;
-    // The cursor is the last index row read, whatever row it leads to.
-    let last = (rows.last()).and_then(|(index, _)| work_at(index));
-    let mut works = Vec::with_capacity(rows.len());
-    for (index, key) in rows {
-        let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
-            continue;
-        };
-        let row = decode::<WorkRow>(&value)?;
-        if index.ends_with(&row.work_id.to_bytes()) {
-            works.push(row);
+pub fn list_work(install_id: Ulid, after: Option<Ulid>, limit: usize) -> RowsOperation<ListWork> {
+    RowsOperation::direct(ListWork {
+        page: Some(Ask::Page {
+            space: PLUGIN_WORK_KEYSPACE,
+            prefix: [&[WORK_INDEX][..], &install_id.to_bytes()].concat(),
+            after: after.map(|work_id| index_key(install_id, work_id)),
+            limit,
+        }),
+        indexes: Vec::new(),
+        next: None,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ListWork {
+    page: Option<Ask>,
+    /// The index rows read, whose rows are read next.
+    indexes: Vec<Vec<u8>>,
+    next: Option<Ulid>,
+}
+
+impl Plan for ListWork {
+    type Output = (Vec<WorkRow>, Option<Ulid>);
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        let page = self.page.take().ok_or_else(|| StoreError("listed twice".into()))?;
+        Ok(Turn::Ask(page))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        match answer {
+            Answer::Page(rows, next) => {
+                // The cursor is the last index row read, whatever row it leads to.
+                let last = (rows.last()).and_then(|(index, _)| work_at(index));
+                self.next = next.and(last);
+                let reads = (rows.iter())
+                    .map(|(_, key)| (PLUGIN_WORK_KEYSPACE, key.clone()))
+                    .collect();
+                self.indexes = rows.into_iter().map(|(index, _)| index).collect();
+                Ok(Turn::Ask(Ask::Read(reads)))
+            }
+            Answer::Values(values) => {
+                let mut works = Vec::with_capacity(values.len());
+                for (index, value) in self.indexes.iter().zip(values) {
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let row = decode::<WorkRow>(&value)?;
+                    if index.ends_with(&row.work_id.to_bytes()) {
+                        works.push(row);
+                    }
+                }
+                Ok(Turn::Finish((works, self.next)))
+            }
+            other => Err(unexpected(other)),
         }
     }
-    Ok((works, next.and(last)))
 }
 
 /// The state a work shows: from its summary once settled, else from its job record.
