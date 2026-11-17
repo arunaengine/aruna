@@ -505,26 +505,21 @@ async fn list_page(
         StagingStrategy::Snapshot => SNAPSHOT_PAGE_SIZE,
         StagingStrategy::Reference | StagingStrategy::Sync => STAGING_PAGE_SIZE,
     };
-    let list = || {
-        drive(
-            ListStagingOperation::new(ListStagingInput {
-                group_id: spec.group_id,
-                connector_id: spec.connector_id,
-                source_path: walk.source_path.clone(),
-                request: ListRequest {
-                    cursor: walk.cursor.clone(),
-                    lower: segment.and_then(|segment| segment.lower.clone()),
-                    stop: segment.and_then(|segment| segment.stop.clone()),
-                    limit,
-                    recursive: flat,
-                    files_only: flat,
-                },
-            }),
-            &ctx.driver,
-        )
+    let input = ListStagingInput {
+        group_id: spec.group_id,
+        connector_id: spec.connector_id,
+        source_path: walk.source_path.clone(),
+        request: ListRequest {
+            cursor: walk.cursor.clone(),
+            lower: segment.and_then(|segment| segment.lower.clone()),
+            stop: segment.and_then(|segment| segment.stop.clone()),
+            limit,
+            recursive: flat,
+            files_only: flat,
+        },
     };
-    let transient = |error: &ListStagingError| (!lasting_list(error)).then(|| error.to_string());
-    retried((&ctx.cancel, &ctx.shutdown), spec, transient, list)
+    let transient = |error: &ListStagingError| !lasting_list(error);
+    retried(ctx, spec, input, ListStagingOperation::new, transient)
         .await
         .map_err(list_failure)
 }
@@ -1071,18 +1066,13 @@ async fn head_observation(
     source_path: &str,
     source: &mut Option<PageSource>,
 ) -> Result<SourceMetadata, ItemFailure> {
-    let transient = |error: &HeadSourceError| (!lasting_head(error)).then(|| error.to_string());
-    let head = || {
-        drive(
-            HeadSourceOperation::new(HeadSourceInput {
-                group_id: spec.group_id,
-                connector_id: spec.connector_id,
-                source_path: source_path.to_string(),
-            }),
-            &ctx.driver,
-        )
+    let input = HeadSourceInput {
+        group_id: spec.group_id,
+        connector_id: spec.connector_id,
+        source_path: source_path.to_string(),
     };
-    let result = retried((&ctx.cancel, &ctx.shutdown), spec, transient, head)
+    let transient = |error: &HeadSourceError| !lasting_head(error);
+    let result = retried(ctx, spec, input, HeadSourceOperation::new, transient)
         .await
         .map_err(|error| match lasting_head(&error) {
             true => ItemFailure::Stage(error.to_string()),
