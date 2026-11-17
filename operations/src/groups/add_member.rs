@@ -6,13 +6,15 @@ use aruna_core::UserId;
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::done;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
@@ -21,21 +23,20 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, RoleId, TxnId};
+use aruna_core::types::{GroupId, Key, KeySpace, RoleId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::epoch_due::DueMarks;
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::replicate_documents::replicate_documents_effect;
+use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,73 +47,25 @@ pub struct AddUserInput {
     pub role_ids: HashSet<RoleId>,
 }
 
-#[derive(PartialEq)]
+/// The written document, whether admin events reached the outbox, and whether the user is a new
+/// member.
+type AddedMember = (GroupAuthorizationDocument, bool, bool);
+
+/// What the member addition waits for after the caller check.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Check,
+    Write,
+    Announce,
+}
+
+/// Checks the caller, adds the member in a write transaction that reruns after a lost conflict,
+/// then wakes the outbox drain or announces the document, and notifies a new member.
+#[derive(Debug, PartialEq)]
 pub struct AddUserOperation {
     input: AddUserInput,
-    /// Bucket the authorization rows publish onto, read inside the write
-    /// transaction.
-    fence: aruna_core::placement::fence::WriteFence,
-    state: AddUserState,
-    conflicts: u8,
-    output: Option<Result<GroupAuthorizationDocument, AddUserError>>,
-}
-
-impl std::fmt::Debug for AddUserOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AddUserOperation")
-            .field("input", &self.input)
-            .field("state", &self.state)
-            .field("output", &self.output)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum AddUserState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadAdminState {
-        txn_id: TxnId,
-    },
-    WriteAdminState {
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-        newly_added: bool,
-    },
-    DeleteAdminConflicts {
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    },
-    ReadBucketFence {
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    },
-    ScheduleDocumentDrain {
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    },
-    AnnounceAuthDoc {
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    },
-    EmitNotifications {
-        auth_doc: GroupAuthorizationDocument,
-    },
-    Finish,
-    Error,
+    step: Step,
+    added: Option<(GroupAuthorizationDocument, bool)>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -127,8 +80,6 @@ pub enum AddUserError {
     TopicAnnouncement(String),
     #[error("the group's bucket cut over to a new holder set; retry the change")]
     PlacementFenced,
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Role not found")]
@@ -141,114 +92,213 @@ pub enum AddUserError {
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding user to group did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: AddUserState,
+        state: String,
         expected: &'static str,
         got: &'static str,
     },
+}
+
+impl From<IoError> for AddUserError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "AddUser".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl AddUserOperation {
     pub fn new(input: AddUserInput) -> Self {
         AddUserOperation {
             input,
-            fence: Default::default(),
-            state: AddUserState::Init,
-            conflicts: 0,
-            output: None,
+            step: Step::Check,
+            added: None,
         }
     }
 
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                AddUserState::StartTransaction,
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                got,
-            );
-        };
-        match self.emit_auth_read(txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
+    fn change(&mut self) -> Next<GroupAuthorizationDocument> {
+        self.step = Step::Write;
+        let input = self.input.clone();
+        let seed = self.input.user_id.to_bytes();
+        let build = move || MemberAddition::new(input.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Next::Call(IoCall::Child(child))
     }
 
-    fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected_event(
-                AddUserState::Auth,
-                "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                got,
-            );
-        };
-
-        match self.emit_start_transaction(allowed) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_start_transaction(
+    fn written(
         &mut self,
-        auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, AddUserError> {
-        if auth_result? {
-            self.state = AddUserState::StartTransaction;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::StartTransaction { read: false }
-            )])
-        } else {
-            Err(AddUserError::Unauthorized)
+        result: IoResult,
+    ) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {
+        let (auth_doc, outbox, newly_added) = result.child::<AddedMember, AddUserError>()??;
+        if outbox {
+            // A failed drain timer leaves the durable outbox retryable.
+            let drain = IoCall::Effect(Box::new(schedule_drain_effect()));
+            return Ok(self.finish(auth_doc, newly_added, Some(drain)));
+        }
+        let document = DocumentTarget::GroupAuthorization {
+            group_id: auth_doc.group_id,
+        };
+        let announce = crate::realm::announce_call(&self.input.actor, document);
+        let announce = announce.ok_or(AddUserError::NotFinished)?;
+        self.added = Some((auth_doc, newly_added));
+        self.step = Step::Announce;
+        Ok(Next::Call(announce))
+    }
+
+    fn announced(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {
+        let outcome =
+            crate::realm::announced(result).map_err(|got| AddUserError::UnexpectedEvent {
+                state: "Announce".to_string(),
+                expected: "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
+                got,
+            })?;
+        outcome.map_err(AddUserError::TopicAnnouncement)?;
+        let (auth_doc, newly_added) = self.added.take().ok_or(AddUserError::NotFinished)?;
+        Ok(self.finish(auth_doc, newly_added, None))
+    }
+
+    /// The document, with the drain wake and a new member's notice made after it; their failures
+    /// are only logged, as the change is already durable.
+    fn finish(
+        &self,
+        auth_doc: GroupAuthorizationDocument,
+        newly_added: bool,
+        drain: Option<IoCall>,
+    ) -> Next<GroupAuthorizationDocument> {
+        let mut calls: Vec<IoCall> = drain.into_iter().collect();
+        calls.extend(self.added_notice(&auth_doc, newly_added));
+        if calls.is_empty() {
+            return Next::Done(auth_doc);
+        }
+        Next::Then {
+            output: auth_doc,
+            calls,
         }
     }
 
-    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, AddUserError> {
-        self.state = AddUserState::ReadAdminState { txn_id };
-        let target = AdminDocumentTarget::Group {
-            group_id: self.input.group_id,
-        };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    AUTH_KEYSPACE.to_string(),
-                    ByteView::from(self.input.group_id.to_bytes()),
+    /// The notice to a member the change newly added.
+    fn added_notice(
+        &self,
+        auth_doc: &GroupAuthorizationDocument,
+        newly_added: bool,
+    ) -> Option<IoCall> {
+        if newly_added {
+            let records = route_resource_event(
+                &ResourceEvent::GroupMemberAdded {
+                    group_id: self.input.group_id,
+                    affected_user: self.input.user_id,
+                    actor_user_id: self.input.actor.user_id,
+                },
+                RoutingContext {
+                    group_auth: Some(auth_doc),
+                    realm_auth: None,
+                    realm_id: self.input.actor.realm_id,
+                },
+                unix_timestamp_millis(),
+            );
+            if let (false, Effect::SubOperation(child)) =
+                (records.is_empty(), emit_notifications_effect(records))
+            {
+                return Some(IoCall::Child(child));
+            }
+        }
+        None
+    }
+}
+
+impl Operation for AddUserOperation {
+    type Output = GroupAuthorizationDocument;
+    type Error = AddUserError;
+
+    fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {
+        if self.input.user_id.is_nil() {
+            return Err(AddUserError::InvalidUserId);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: AuthContext::from(&self.input.actor),
+                path: format!(
+                    "/{}/g/{}/admin/users/{}",
+                    self.input.actor.realm_id, self.input.group_id, self.input.user_id
                 ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    ByteView::from(*self.input.actor.realm_id.as_bytes()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
+                required_permission: Permission::WRITE,
+            },
+        ))))
     }
 
-    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
-            Ok(values) => values,
-            Err((expected, got)) => {
-                return self.unexpected_event(self.state.clone(), expected, got);
+    fn next(&mut self, result: IoResult) -> Result<Next<GroupAuthorizationDocument>, AddUserError> {
+        match self.step {
+            Step::Check => {
+                if !result.child::<bool, AuthorizationError>()?? {
+                    return Err(AddUserError::Unauthorized);
+                }
+                Ok(self.change())
             }
-        };
-        match self.emit_auth_write(txn_id, auth_doc, reducer_state, realm_config) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+            Step::Write => self.written(result),
+            Step::Announce => self.announced(result),
+        }
+    }
+}
+
+/// What the member addition transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+    Fence,
+    Marks,
+}
+
+/// Reads the group's documents, writes the assignments, takes the bucket fence, and marks the
+/// group's key epochs due when a DENY role is assigned, in one write transaction.
+#[derive(Debug, PartialEq)]
+struct MemberAddition {
+    input: AddUserInput,
+    stage: Stage,
+    /// Bucket the authorization rows publish onto, read inside the write transaction.
+    fence: WriteFence,
+    deny: bool,
+    written: Option<AddedMember>,
+    deletes: Vec<(KeySpace, Key)>,
+    marks: DueMarks,
+}
+
+impl MemberAddition {
+    fn new(input: AddUserInput) -> Self {
+        let marks = DueMarks::new(Some(input.group_id), unix_timestamp_millis());
+        Self {
+            input,
+            stage: Stage::Read,
+            fence: Default::default(),
+            deny: false,
+            written: None,
+            deletes: Vec::new(),
+            marks,
         }
     }
 
     fn emit_auth_write(
         &mut self,
-        txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
         realm_config_value: Option<ByteView>,
-    ) -> Result<Effects, AddUserError> {
+    ) -> Result<Next<AddedMember>, AddUserError> {
         let mut auth_doc = super::parse_auth_record(auth_doc)?.ok_or(AddUserError::DocNotFound)?;
         let role_ids = sorted_role_ids(&self.input.role_ids);
         for role_id in &role_ids {
@@ -344,473 +394,110 @@ impl AddUserOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = AddUserState::WriteAdminState {
-            txn_id,
-            auth_doc,
-            admin_outbox_written: !admin_events.is_empty(),
-            stale_conflict_deletes,
-            newly_added,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn handle_auth_write(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-        newly_added: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchWriteResult)",
-                got,
-            );
-        };
-
-        if !stale_conflict_deletes.is_empty() {
-            self.state = AddUserState::DeleteAdminConflicts {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-            };
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes: stale_conflict_deletes,
-                txn_id: Some(txn_id),
-            })];
-        }
-
-        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written, newly_added)
-    }
-
-    fn handle_conflict_deletes(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchDeleteResult)",
-                got,
-            );
-        };
-
-        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written, newly_added)
-    }
-
-    /// Takes the bucket's fence inside the transaction before committing, so a
-    /// departing holder's close rejects or conflicts this write.
-    fn emit_commit_transaction(
-        &mut self,
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    ) -> Effects {
-        if self.fence.is_empty() {
-            return self.emit_commit(txn_id, auth_doc, admin_outbox_written, newly_added);
-        }
-        self.state = AddUserState::ReadBucketFence {
-            txn_id,
-            auth_doc,
-            admin_outbox_written,
-            newly_added,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_bucket_fence(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
-        };
-        if !self.fence.admits(&values) {
-            return self.fail(AddUserError::PlacementFenced);
-        }
-        self.emit_commit(txn_id, auth_doc, admin_outbox_written, newly_added)
-    }
-
-    fn emit_commit(
-        &mut self,
-        txn_id: TxnId,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    ) -> Effects {
         // An assigned DENY rule can narrow the member's existing READ scopes.
-        let deny = self.input.role_ids.iter().any(|id| {
+        self.deny = self.input.role_ids.iter().any(|id| {
             auth_doc
                 .roles
                 .get(id)
                 .is_some_and(|r| r.permissions.values().any(|p| *p == Permission::DENY))
         });
-        self.state = AddUserState::CommitTransaction {
-            txn_id,
-            auth_doc,
-            admin_outbox_written,
-            newly_added,
-        };
-        if deny {
-            return smallvec![crate::auth::epoch_due::mark_due(
-                Some(self.input.group_id),
-                txn_id
-            )];
+        self.written = Some((auth_doc, !admin_events.is_empty(), newly_added));
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    /// Takes the bucket's fence inside the transaction before committing, so a departing
+    /// holder's close rejects or conflicts this write.
+    fn after_writes(&mut self) -> Result<Next<AddedMember>, AddUserError> {
+        if self.fence.is_empty() {
+            return self.after_fence();
         }
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.stage = Stage::Fence;
+        Ok(Next::Call(IoCall::Read(self.fence.reads())))
     }
 
-    fn handle_commit_transaction(
-        &mut self,
-        event: Event,
-        auth_doc: GroupAuthorizationDocument,
-        admin_outbox_written: bool,
-        newly_added: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            );
-        };
-        if admin_outbox_written {
-            self.state = AddUserState::ScheduleDocumentDrain {
-                auth_doc,
-                newly_added,
-            };
-            return smallvec![schedule_drain_effect()];
+    fn after_fence(&mut self) -> Result<Next<AddedMember>, AddUserError> {
+        if self.deny {
+            self.stage = Stage::Marks;
+            return Ok(Next::Call(self.marks.first()));
         }
-
-        self.emit_auth_announce(auth_doc, newly_added)
+        self.finish()
     }
 
-    fn handle_drain_schedule(
-        &mut self,
-        event: Event,
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    ) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => {
-                self.emit_membership_notice(auth_doc, newly_added)
-            }
-            other => self.unexpected_event(
-                self.state.clone(),
-                "admin document outbox drain timer schedule",
-                other.label(),
-            ),
-        }
-    }
-
-    fn emit_auth_announce(
-        &mut self,
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    ) -> Effects {
-        self.state = AddUserState::AnnounceAuthDoc {
-            auth_doc: auth_doc.clone(),
-            newly_added,
-        };
-        let document = DocumentTarget::GroupAuthorization {
-            group_id: auth_doc.group_id,
-        };
-        smallvec![replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![document],
-        )]
-    }
-
-    fn handle_auth_announce(
-        &mut self,
-        event: Event,
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    ) -> Effects {
-        let got = event.label();
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-        if let Err(error) = result {
-            return self.fail(AddUserError::TopicAnnouncement(error));
-        }
-        self.emit_membership_notice(auth_doc, newly_added)
-    }
-
-    fn emit_membership_notice(
-        &mut self,
-        auth_doc: GroupAuthorizationDocument,
-        newly_added: bool,
-    ) -> Effects {
-        if newly_added {
-            let records = route_resource_event(
-                &ResourceEvent::GroupMemberAdded {
-                    group_id: self.input.group_id,
-                    affected_user: self.input.user_id,
-                    actor_user_id: self.input.actor.user_id,
-                },
-                RoutingContext {
-                    group_auth: Some(&auth_doc),
-                    realm_auth: None,
-                    realm_id: self.input.actor.realm_id,
-                },
-                unix_timestamp_millis(),
-            );
-            if !records.is_empty() {
-                self.state = AddUserState::EmitNotifications { auth_doc };
-                return smallvec![emit_notifications_effect(records)];
-            }
-        }
-
-        self.state = AddUserState::Finish;
-        self.output = Some(Ok(auth_doc));
-        smallvec![]
-    }
-
-    fn handle_emit_notifications(&mut self, auth_doc: GroupAuthorizationDocument) -> Effects {
-        self.state = AddUserState::Finish;
-        self.output = Some(Ok(auth_doc));
-        smallvec![]
-    }
-
-    fn fail(&mut self, err: AddUserError) -> Effects {
-        self.state = AddUserState::Error;
-        self.output = Some(Err(err));
-        self.abort()
-    }
-
-    fn fail_with_cleanup(&mut self, err: AddUserError, cleanup_effects: Effects) -> Effects {
-        self.state = AddUserState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: AddUserState,
-        expected: &'static str,
-        got: &'static str,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            AddUserError::UnexpectedEvent {
-                state,
-                expected,
-                got,
-            },
-            cleanup_effects,
-        )
-    }
-
-    fn catch_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if error == StorageError::TransactionConflict
-                && matches!(self.state, AddUserState::CommitTransaction { .. })
-                && self.conflicts < super::CONFLICT_RETRIES
-            {
-                return Err(self.restart_after_conflict());
-            }
-            return Err(self.fail(error.into()));
-        }
-
-        Ok(event)
-    }
-
-    /// A conflicted commit already discarded its transaction, so the retry
-    /// opens a fresh one and rereads every row, including the realm config.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.fence = Default::default();
-        self.start()
+    fn finish(&mut self) -> Result<Next<AddedMember>, AddUserError> {
+        self.written
+            .take()
+            .map(Next::Done)
+            .ok_or(AddUserError::NotFinished)
     }
 }
 
-impl EffectOperation for AddUserOperation {
-    type Output = GroupAuthorizationDocument;
-
+impl Operation for MemberAddition {
+    type Output = AddedMember;
     type Error = AddUserError;
 
-    fn start(&mut self) -> Effects {
-        if self.input.user_id.is_nil() {
-            return self.fail(AddUserError::InvalidUserId);
-        }
-
-        self.state = AddUserState::Auth;
-
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: AuthContext::from(&self.input.actor),
-                path: format!(
-                    "/{}/g/{}/admin/users/{}",
-                    self.input.actor.realm_id, self.input.group_id, self.input.user_id
-                ),
-                required_permission: Permission::WRITE,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.catch_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
+    fn conflict_retries() -> u32 {
+        u32::from(super::CONFLICT_RETRIES)
+    }
+
+    fn first(&mut self) -> Result<Next<AddedMember>, AddUserError> {
+        let target = AdminDocumentTarget::Group {
+            group_id: self.input.group_id,
         };
-        if let AddUserState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::auth::epoch_due::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-
-        match &self.state {
-            AddUserState::Auth => self.handle_authorization(event),
-            AddUserState::StartTransaction => self.handle_start_transaction(event),
-            AddUserState::ReadAdminState { txn_id } => {
-                let txn_id = txn_id.clone();
-                self.handle_auth_read(event, txn_id)
-            }
-            AddUserState::WriteAdminState {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-                newly_added,
-            } => {
-                let txn_id = txn_id.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let stale_conflict_deletes = stale_conflict_deletes.clone();
-                let newly_added = newly_added.clone();
-                self.handle_auth_write(
-                    event,
-                    txn_id,
-                    auth_doc,
-                    admin_outbox_written,
-                    stale_conflict_deletes,
-                    newly_added,
-                )
-            }
-            AddUserState::DeleteAdminConflicts {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-            } => {
-                let txn_id = txn_id.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let newly_added = newly_added.clone();
-                self.handle_conflict_deletes(
-                    event,
-                    txn_id,
-                    auth_doc,
-                    admin_outbox_written,
-                    newly_added,
-                )
-            }
-            AddUserState::ReadBucketFence {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-            } => {
-                let txn_id = txn_id.clone();
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let newly_added = newly_added.clone();
-                self.handle_bucket_fence(event, txn_id, auth_doc, admin_outbox_written, newly_added)
-            }
-            AddUserState::CommitTransaction {
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-                ..
-            } => {
-                let auth_doc = auth_doc.clone();
-                let admin_outbox_written = admin_outbox_written.clone();
-                let newly_added = newly_added.clone();
-                self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added)
-            }
-            AddUserState::ScheduleDocumentDrain {
-                auth_doc,
-                newly_added,
-            } => {
-                let auth_doc = auth_doc.clone();
-                let newly_added = newly_added.clone();
-                self.handle_drain_schedule(event, auth_doc, newly_added)
-            }
-            AddUserState::AnnounceAuthDoc {
-                auth_doc,
-                newly_added,
-            } => {
-                let auth_doc = auth_doc.clone();
-                let newly_added = newly_added.clone();
-                self.handle_auth_announce(event, auth_doc, newly_added)
-            }
-            AddUserState::EmitNotifications { auth_doc } => {
-                let auth_doc = auth_doc.clone();
-                self.handle_emit_notifications(auth_doc)
-            }
-            AddUserState::Init | AddUserState::Finish | AddUserState::Error => {
-                smallvec![]
-            }
-        }
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                AUTH_KEYSPACE.to_string(),
+                ByteView::from(self.input.group_id.to_bytes()),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*self.input.actor.realm_id.as_bytes()),
+            ),
+        ])))
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AddUserState::Finish | AddUserState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AddUserError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            AddUserState::ReadAdminState { txn_id }
-            | AddUserState::WriteAdminState { txn_id, .. }
-            | AddUserState::DeleteAdminConflicts { txn_id, .. }
-            | AddUserState::ReadBucketFence { txn_id, .. }
-            | AddUserState::CommitTransaction { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    fn next(&mut self, result: IoResult) -> Result<Next<AddedMember>, AddUserError> {
+        match self.stage {
+            Stage::Read => {
+                let [auth_doc, reducer, realm_config] = aruna_core::rows::values::<3>(result)?;
+                self.emit_auth_write(auth_doc, reducer, realm_config)
             }
-
-            _ => smallvec![],
+            Stage::Write if !self.deletes.is_empty() => {
+                done(result)?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                done(result)?;
+                self.after_writes()
+            }
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(AddUserError::NotFinished);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(AddUserError::PlacementFenced);
+                }
+                self.after_fence()
+            }
+            Stage::Marks => match self.marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            },
         }
     }
 }
@@ -863,16 +550,16 @@ pub mod test {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::reducer::{
         AdminAttributeVersion, AdminConflict, AdminConflictValue, AdminDocumentState,
     };
-    use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
+    use aruna_core::storage_entries::reducer_conflict_key;
     use aruna_core::structs::execution::notification::{
         NotificationOutboxRecord, NotificationRecord,
     };
@@ -880,9 +567,7 @@ pub mod test {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::task::TaskEvent;
-    use aruna_core::task::TaskKey;
-    use aruna_core::types::{RoleId, TxnId};
+    use aruna_core::types::RoleId;
     use aruna_core::{
         AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
@@ -893,7 +578,9 @@ pub mod test {
     use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
-    use crate::groups::add_member::{AddUserError, AddUserInput, AddUserOperation, AddUserState};
+    use crate::groups::add_member::{
+        AddUserError, AddUserInput, AddUserOperation, MemberAddition, Step,
+    };
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 
@@ -1024,53 +711,17 @@ pub mod test {
             role_ids: HashSet::from([role_id]),
         });
 
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Err(AddUserError::InvalidUserId));
+        assert_eq!(operation.first(), Err(AddUserError::InvalidUserId));
     }
 
     #[test]
     fn retries_commit_conflict() {
-        let realm_id = RealmId::from_bytes([6u8; 32]);
-        let group_id = Ulid::from_bytes([7u8; 16]);
-        let actor = Actor {
-            node_id: node(8),
-            user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id),
-            realm_id,
-        };
-        let auth_doc = GroupAuthorizationDocument {
-            group_id,
-            policies: Vec::new(),
-            roles: HashMap::new(),
-        };
-        let mut operation = AddUserOperation::new(AddUserInput {
-            actor,
-            group_id,
-            user_id: UserId::local(Ulid::from_bytes([10u8; 16]), realm_id),
-            role_ids: HashSet::from([Ulid::from_bytes([11u8; 16])]),
-        });
-        let commit = |operation: &mut AddUserOperation| {
-            operation.state = AddUserState::CommitTransaction {
-                txn_id: TxnId::generate(),
-                auth_doc: auth_doc.clone(),
-                admin_outbox_written: true,
-                newly_added: true,
-            };
-            operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }))
-        };
-
-        for _ in 0..crate::groups::CONFLICT_RETRIES {
-            let effects = commit(&mut operation);
-            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-            assert_eq!(operation.state, AddUserState::Auth);
-        }
-        commit(&mut operation);
+        // A lost commit reruns the whole addition, rereading every row, up to the retry bound.
+        let conflict = AddUserError::from(IoError::Conflict);
+        assert!(MemberAddition::is_conflict(&conflict));
         assert_eq!(
-            operation.finalize(),
-            Err(AddUserError::StorageError(
-                StorageError::TransactionConflict
-            ))
+            MemberAddition::conflict_retries(),
+            u32::from(crate::groups::CONFLICT_RETRIES)
         );
     }
 
@@ -1106,23 +757,17 @@ pub mod test {
             role_ids: HashSet::from([role_id]),
         };
         let target = AdminDocumentTarget::Group { group_id };
-        let mut operation = AddUserOperation::new(input);
+        let mut operation = MemberAddition::new(input);
 
-        let effects = operation
-            .emit_auth_write(
-                TxnId::generate(),
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                None,
-                None,
-            )
-            .unwrap();
-        let outbox_records: Vec<DocumentOutboxRecord> = match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
+        let turn =
+            operation.emit_auth_write(Some(auth_doc.to_bytes(&actor).unwrap().into()), None, None);
+        let outbox_records: Vec<DocumentOutboxRecord> = match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => writes
                 .iter()
                 .filter(|(keyspace, _, _)| keyspace == SYNC_OUTBOX_KEYSPACE)
                 .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
                 .collect(),
-            other => panic!("unexpected write effect: {other:?}"),
+            other => panic!("unexpected write call: {other:?}"),
         };
         assert_eq!(outbox_records.len(), 2);
         assert!(
@@ -1203,34 +848,19 @@ pub mod test {
             Default::default(),
         );
         assert_ne!(expected_placement, PlacementRef::NIL);
-        let mut operation = AddUserOperation::new(input);
+        let mut operation = MemberAddition::new(input);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
 
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    group_id.to_bytes().into(),
-                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                ),
-                (
-                    reducer_state_key(&target),
-                    Some(postcard::to_allocvec(&previous_state).unwrap().into()),
-                ),
-                (
-                    realm_id.as_bytes().to_vec().into(),
-                    Some(realm_config.to_bytes(&actor).unwrap().into()),
-                ),
-            ],
-        }));
-        let (updated_auth_doc, reducer_state, outbox_records) = match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
-                assert_eq!(*id, Some(txn_id));
+        assert!(
+            matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 3)
+        );
+        let turn = operation.next(IoResult::Values(vec![
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+            Some(realm_config.to_bytes(&actor).unwrap().into()),
+        ]));
+        let (updated_auth_doc, reducer_state, outbox_records) = match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => {
                 let auth_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == AUTH_KEYSPACE)
@@ -1260,7 +890,7 @@ pub mod test {
                     outbox_records,
                 )
             }
-            other => panic!("unexpected write effect: {other:?}"),
+            other => panic!("unexpected write call: {other:?}"),
         };
         assert_eq!(outbox_records.len(), 1);
         assert_eq!(outbox_records[0].target, document_target);
@@ -1300,42 +930,31 @@ pub mod test {
                 .contains_key(&assignment_path(role_id, conflict_user_id))
         );
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchDelete { deletes, .. }) => {
-                assert_eq!(
-                    deletes,
-                    &vec![(
-                        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
-                        reducer_conflict_key(&target, &assignment_path(role_id, assigned_user_id),),
-                    )]
-                );
-            }
-            other => panic!("unexpected conflict delete effect: {other:?}"),
-        };
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
+        let deletes = vec![(
+            DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+            reducer_conflict_key(&target, &assignment_path(role_id, assigned_user_id)),
+        )];
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(deletes)))
+        );
+        // The group's bucket fence is read inside the transaction before the commit.
         assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::CommitTransaction { .. }))
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Read(reads))) if !reads.is_empty()
         ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::Task(_))));
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-        assert!(!operation.is_complete());
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::NotificationsEmitted));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
+
+        // With admin events queued, the drain wake and the new member's notice follow.
+        let mut checked = AddUserOperation::new(operation.input.clone());
+        checked.step = Step::Write;
+        let written = ChildOutcome::new(Ok::<_, AddUserError>((updated_auth_doc, true, true)));
+        let Ok(Next::Then { calls, .. }) = checked.next(IoResult::Child(written)) else {
+            panic!("expected the document with the calls after the write");
+        };
+        assert!(matches!(
+            calls.as_slice(),
+            [IoCall::Effect(_), IoCall::Child(_)]
+        ));
     }
 
     #[test]
@@ -1351,50 +970,33 @@ pub mod test {
         let role_id = Ulid::from_bytes([36u8; 16]);
         let auth_doc = seeded_user_role(group_id, role_id);
         let reducer_state = role_conflict_state(group_id, role_id);
-        let mut operation = AddUserOperation::new(AddUserInput {
+        let input = AddUserInput {
             actor: actor.clone(),
             group_id,
             user_id: member_id,
             role_ids: HashSet::from([role_id]),
-        });
-        let txn_id = TxnId::generate();
-
-        operation
-            .emit_auth_write(
-                txn_id,
-                Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                Some(postcard::to_allocvec(&reducer_state).unwrap().into()),
-                None,
-            )
-            .unwrap();
-        assert!(matches!(
-            &operation.state,
-            AddUserState::WriteAdminState {
-                newly_added: false,
-                ..
-            }
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::Task(_)]));
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        let result = operation.finalize().unwrap();
+        };
+        let mut operation = MemberAddition::new(input.clone());
+        let turn = operation.emit_auth_write(
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(postcard::to_allocvec(&reducer_state).unwrap().into()),
+            None,
+        );
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let Ok(Next::Done((result, outbox, newly_added))) = operation.next(IoResult::Done) else {
+            panic!("expected the written document");
+        };
+        assert!(!newly_added);
         assert!(!result.roles[&role_id].assigned_users.contains(&member_id));
+
+        // A user who is no new member gets no notice; only the drain wake follows.
+        let mut checked = AddUserOperation::new(input);
+        checked.step = Step::Write;
+        let written = ChildOutcome::new(Ok::<_, AddUserError>((result, outbox, newly_added)));
+        let Ok(Next::Then { calls, .. }) = checked.next(IoResult::Child(written)) else {
+            panic!("expected the drain wake after the write");
+        };
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     #[test]
@@ -1412,26 +1014,19 @@ pub mod test {
         let role = auth_doc.roles.get_mut(&role_id).unwrap();
         role.permissions
             .insert("/test".to_string(), Permission::DENY);
-        let mut operation = AddUserOperation::new(AddUserInput {
+        let mut operation = MemberAddition::new(AddUserInput {
             actor: actor.clone(),
             group_id,
             user_id: member_id,
             role_ids: HashSet::from([role_id]),
         });
-        let txn_id = TxnId::generate();
         let doc = Some(auth_doc.to_bytes(&actor).unwrap().into());
-        operation.emit_auth_write(txn_id, doc, None, None).unwrap();
+        operation.emit_auth_write(doc, None, None).unwrap();
 
-        // The existing DENY role's assignment marks epochs due before its transaction commits.
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let marked = SubOperationEvent::EpochsMarked { result: Ok(()) };
-        let effects = operation.step(Event::SubOperation(marked));
+        // The existing DENY role's assignment marks epochs due inside its transaction.
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: id })] if *id == txn_id
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Page { .. }))
         ));
     }
 
@@ -1693,10 +1288,10 @@ pub mod test {
         net_handle.shutdown().await;
     }
 
-    #[test]
-    fn emit_failure_succeeds() {
+    /// The calls after the write of a new member `user_id`, added by the actor seeded with 13.
+    fn calls_after_write(user_seed: u8) -> Vec<IoCall> {
         let realm_id = RealmId::from_bytes([12u8; 32]);
-        let member_id = UserId::local(Ulid::from_bytes([14u8; 16]), realm_id);
+        let user_id = UserId::local(Ulid::from_bytes([user_seed; 16]), realm_id);
         let group_id = Ulid::from_bytes([15u8; 16]);
         let role_id = Ulid::from_bytes([16u8; 16]);
         let actor = Actor {
@@ -1704,100 +1299,38 @@ pub mod test {
             user_id: UserId::local(Ulid::from_bytes([13u8; 16]), realm_id),
             realm_id,
         };
-        let auth_doc = seeded_user_role(group_id, role_id);
-        let target = AdminDocumentTarget::Group { group_id };
-
+        let mut auth_doc = seeded_user_role(group_id, role_id);
+        let role = auth_doc.roles.get_mut(&role_id).unwrap();
+        role.assigned_users.insert(user_id);
         let mut operation = AddUserOperation::new(AddUserInput {
-            actor: actor.clone(),
+            actor,
             group_id,
-            user_id: member_id,
+            user_id,
             role_ids: HashSet::from([role_id]),
         });
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    group_id.to_bytes().into(),
-                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                ),
-                (reducer_state_key(&target), None),
-                (realm_id.as_bytes().to_vec().into(), None),
-            ],
-        }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-        assert!(!operation.is_complete());
-
-        let effects = operation.step(Event::Search());
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        let result = operation.finalize().unwrap();
-        assert!(result.roles[&role_id].assigned_users.contains(&member_id));
+        operation.step = Step::Write;
+        let written = ChildOutcome::new(Ok::<_, AddUserError>((auth_doc, true, true)));
+        match operation.next(IoResult::Child(written)) {
+            Ok(Next::Then { output, calls }) => {
+                assert!(output.roles[&role_id].assigned_users.contains(&user_id));
+                calls
+            }
+            other => panic!("expected the document with calls after it, got {other:?}"),
+        }
     }
 
     #[test]
-    fn skips_empty_emit() {
-        let realm_id = RealmId::from_bytes([12u8; 32]);
-        let user_id = UserId::local(Ulid::from_bytes([13u8; 16]), realm_id);
-        let group_id = Ulid::from_bytes([15u8; 16]);
-        let role_id = Ulid::from_bytes([16u8; 16]);
-        let actor = Actor {
-            node_id: node(17),
-            user_id,
-            realm_id,
-        };
-        let auth_doc = seeded_user_role(group_id, role_id);
-        let target = AdminDocumentTarget::Group { group_id };
-
-        let mut operation = AddUserOperation::new(AddUserInput {
-            actor: actor.clone(),
-            group_id,
-            user_id,
-            role_ids: HashSet::from([role_id]),
-        });
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+    fn notice_after_drain() {
+        // The notice runs after the commit like the drain wake, so its failure never fails the
+        // addition; an actor adding themselves gets no notice.
+        assert!(matches!(
+            calls_after_write(14).as_slice(),
+            [IoCall::Effect(_), IoCall::Child(_)]
         ));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    group_id.to_bytes().into(),
-                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                ),
-                (reducer_state_key(&target), None),
-                (realm_id.as_bytes().to_vec().into(), None),
-            ],
-        }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(operation.finalize().is_ok());
+        assert!(matches!(
+            calls_after_write(13).as_slice(),
+            [IoCall::Effect(_)]
+        ));
     }
 
     #[tokio::test]

@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::effects::StorageEffect;
+use aruna_core::operation::SubOperation;
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::encryption::{
@@ -12,6 +14,7 @@ use aruna_core::structs::storage::format::{
     Compression, EncodingClass, PithosLayout, StoredFormat,
 };
 use aruna_core::structs::storage::transition::TransitionTarget;
+use aruna_core::types::Effects;
 use std::collections::HashMap;
 use std::sync::Arc;
 use ulid::Ulid;
@@ -90,11 +93,36 @@ fn version(old: &BackendLocation) -> BlobVersion {
     )
 }
 
-fn read_result(value: Option<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: value.map(Into::into),
-    })
+fn read_result(value: Option<Vec<u8>>) -> IoResult {
+    IoResult::Values(vec![value.map(Into::into)])
+}
+
+fn event(event: Event) -> IoResult {
+    IoResult::Event(Box::new(event))
+}
+
+/// The effect a step asks for directly.
+fn asked(step: &Step) -> Option<&Effect> {
+    match step {
+        Ok(Next::Call(IoCall::Effect(effect))) => Some(effect.as_ref()),
+        _ => None,
+    }
+}
+
+/// The effects a child run asks for first: the reads of a read outside the transaction.
+fn inner(step: &mut Step) -> Effects {
+    match step {
+        Ok(Next::Call(IoCall::Child(child))) => child.start(),
+        _ => Effects::new(),
+    }
+}
+
+/// The outcome and the calls after commit of a finished step.
+fn ended(step: Step) -> Result<(RewriteOutcome, Vec<IoCall>), RewriteError> {
+    match step? {
+        Next::Then { output, calls } => Ok((output, calls)),
+        other => panic!("expected an outcome, got {other:?}"),
+    }
 }
 
 fn operation(transition: EncryptionTransition) -> RewriteVersionOperation {
@@ -108,7 +136,7 @@ fn lease(old: &BackendLocation) -> ReadLease {
 }
 
 /// Reads version and location, and answers what the operation asks the adapter first.
-fn located(operation: &mut RewriteVersionOperation, old: &BackendLocation) -> Effects {
+fn located(operation: &mut RewriteVersionOperation, old: &BackendLocation) -> Step {
     located_with(operation, old, |_| None)
 }
 
@@ -117,17 +145,20 @@ fn located_with(
     operation: &mut RewriteVersionOperation,
     old: &BackendLocation,
     answer: impl Fn(&str) -> Option<Vec<u8>>,
-) -> Effects {
-    operation.start();
-    operation.step(read_result(Some(version(old).to_bytes().unwrap())));
-    let effects = operation.step(read_result(Some(old.to_bytes().unwrap())));
+) -> Step {
+    operation.first().unwrap();
+    operation
+        .next(read_result(Some(version(old).to_bytes().unwrap())))
+        .unwrap();
+    let mut step = operation.next(read_result(Some(old.to_bytes().unwrap())));
+    let effects = inner(&mut step);
     let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-        return effects;
+        return step;
     };
     let values = (reads.iter())
-        .map(|(space, key)| (key.clone(), answer(space).map(Into::into)))
+        .map(|(space, _)| answer(space).map(Into::into))
         .collect();
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    operation.next(IoResult::Values(values))
 }
 
 /// Answers the rewrite with `new` and the transaction reads with `settings`.
@@ -136,30 +167,20 @@ fn published(
     old: &BackendLocation,
     new: BackendLocation,
     settings: Vec<u8>,
-) -> Effects {
-    let effects = operation.step(Event::Blob(BlobEvent::CopyRewritten { location: new }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: TxnId::default(),
-    }));
+) -> Step {
+    let rewritten = BlobEvent::CopyRewritten { location: new };
+    let step = operation.next(event(Event::Blob(rewritten)));
+    assert!(matches!(step, Ok(Next::Call(IoCall::Read(_)))));
     let record = operation.transition.to_bytes().unwrap();
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (Vec::new().into(), Some(settings.into())),
-            (Vec::new().into(), Some(record.into())),
-        ],
-    }));
-    if !matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
-    ) {
-        return effects;
+    let values = vec![Some(settings.into()), Some(record.into())];
+    let step = operation.next(IoResult::Values(values));
+    if !matches!(step, Ok(Next::Call(IoCall::Read(_)))) {
+        return step;
     }
-    operation.step(read_result(Some(version(old).to_bytes().unwrap())));
-    operation.step(read_result(None))
+    operation
+        .next(read_result(Some(version(old).to_bytes().unwrap())))
+        .unwrap();
+    operation.next(read_result(None))
 }
 
 /// Asserts a direct rewrite of a plain source and returns its row writes.
@@ -168,25 +189,23 @@ fn rewritten(
     (target, settings): (Option<SealPlan>, Vec<u8>),
 ) -> Vec<(String, Key, Value)> {
     let old = location(None);
-    let effects = located(operation, &old);
-    let [
-        Effect::Blob(BlobEffect::RewriteCopy {
-            lease,
-            target: format,
-            grants_only,
-            ..
-        }),
-    ] = effects.as_slice()
+    let step = located(operation, &old);
+    let Some(Effect::Blob(BlobEffect::RewriteCopy {
+        lease,
+        target: format,
+        grants_only,
+        ..
+    })) = asked(&step)
     else {
-        panic!("expected a rewrite, got {effects:?}")
+        panic!("expected a rewrite, got {step:?}")
     };
     assert!(lease.is_none() && !grants_only);
     assert_eq!(format.encryption, target);
 
     let new = location(target.map(|plan| plan.key.generation));
-    let effects = published(operation, &old, new, settings);
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the row writes, got {effects:?}")
+    let step = published(operation, &old, new, settings);
+    let Ok(Next::Call(IoCall::Write(writes))) = &step else {
+        panic!("expected the row writes, got {step:?}")
     };
     let mut spaces: Vec<&str> = writes.iter().map(|(space, _, _)| space.as_str()).collect();
     // Only a sealed copy has an owner row.
@@ -232,17 +251,16 @@ fn compresses_plain_copy() {
 #[test]
 fn locked_source_waits() {
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
-    let effects = located(&mut operation, &location(Some(1)));
+    let step = located(&mut operation, &location(Some(1)));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::AdmitRead { key, .. })] if key.generation == 1
+        asked(&step),
+        Some(Effect::Blob(BlobEffect::AdmitRead { key, .. })) if key.generation == 1
     ));
 
     let locked = BucketKeyError::Locked(BUCKET_ID);
-    let effects = operation.step(Event::Blob(BlobEvent::Error(locked.into())));
+    let step = operation.next(event(Event::Blob(BlobEvent::Error(locked.into()))));
 
-    assert!(effects.is_empty());
-    assert_eq!(operation.finalize(), Ok(RewriteOutcome::AwaitingKey));
+    assert_eq!(ended(step), Ok((RewriteOutcome::AwaitingKey, Vec::new())));
 }
 
 #[test]
@@ -250,79 +268,71 @@ fn stale_target_discards() {
     // A newer change advanced the storage generation: the new copy is never published.
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
     let old = location(Some(1));
-    located(&mut operation, &old);
-    operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(&old) }));
+    located(&mut operation, &old).unwrap();
+    let admitted = BlobEvent::ReadAdmitted { lease: lease(&old) };
+    operation.next(event(Event::Blob(admitted))).unwrap();
     let newer = BucketEncryption {
         storage_generation: 4,
         ..BucketEncryption::default()
     };
 
-    let effects = published(
+    let step = published(
         &mut operation,
         &old,
         location(None),
         newer.to_bytes().unwrap(),
     );
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: TxnId::default(),
-    }));
+    let (outcome, calls) = ended(step).unwrap();
+    assert_eq!(outcome, RewriteOutcome::Skipped);
     let id = operation.new.as_ref().unwrap().ulid;
-    let effects = operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
-    assert_eq!(effects.as_slice(), [schedule_cleanup_effect()]);
-    assert_eq!(operation.finalize(), Ok(RewriteOutcome::Skipped));
+    let release = Effect::Blob(BlobEffect::ReleaseReservation { id });
+    let cleanup = IoCall::from(schedule_cleanup_effect());
+    assert_eq!(calls, [IoCall::from(release), cleanup]);
 }
 
 #[test]
 fn rotation_keeps_blocks() {
     let mut operation = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
     let old = location(Some(1));
-    located(&mut operation, &old);
+    located(&mut operation, &old).unwrap();
     let admitted = lease(&old);
 
-    let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(&old) }));
+    let step = operation.next(event(Event::Blob(BlobEvent::ReadAdmitted {
+        lease: lease(&old),
+    })));
 
-    let [
-        Effect::Blob(BlobEffect::RewriteCopy {
-            lease, grants_only, ..
-        }),
-    ] = effects.as_slice()
+    let Some(Effect::Blob(BlobEffect::RewriteCopy {
+        lease, grants_only, ..
+    })) = asked(&step)
     else {
-        panic!("expected a rewrite, got {effects:?}")
+        panic!("expected a rewrite, got {step:?}")
     };
     assert!(*grants_only);
     assert_eq!(lease.as_ref().map(|lease| lease.key), Some(admitted.key));
-    let effects = published(&mut operation, &old, location(Some(2)), settings(2, 3));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchWrite { .. })]
-    ));
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
+    let step = published(&mut operation, &old, location(Some(2)), settings(2, 3));
+    assert!(matches!(step, Ok(Next::Call(IoCall::Write(_)))));
+    let step = operation.next(IoResult::Done);
     let owner = CopyOwner::new(ArchiveKey::of(&old), operation.version_key.clone());
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { key_space, key, .. })]
-            if key_space == COPY_OWNER_KEYSPACE && key.as_ref() == owner.key().unwrap()
-    ));
+    let Ok(Next::Call(IoCall::Delete(deletes))) = step else {
+        panic!("expected the owner delete")
+    };
+    let row = (
+        COPY_OWNER_KEYSPACE.to_string(),
+        Key::from(owner.key().unwrap()),
+    );
+    assert_eq!(deletes, [row]);
 }
 
 #[test]
 fn rejects_wrong_event() {
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
-    located(&mut operation, &location(Some(1)));
+    located(&mut operation, &location(Some(1))).unwrap();
 
-    operation.step(read_result(None));
+    let released = BlobEvent::ReservationReleased { id: Ulid::nil() };
+    let step = operation.next(event(Event::Blob(released)));
 
-    assert!(matches!(
-        operation.finalize(),
-        Err(RewriteError::InvalidStateEvent { .. })
-    ));
+    assert!(matches!(step, Err(RewriteError::InvalidStateEvent { .. })));
 }
 
 #[test]
@@ -332,23 +342,23 @@ fn rekey_waits_pending() {
     let archive = ArchiveKey::of(&location(Some(2)));
     let pending = BlobVersion::pending(archive, SystemTime::UNIX_EPOCH, Default::default(), None);
     let mut waiting = rekey();
-    waiting.start();
-    waiting.step(read_result(Some(pending.to_bytes().unwrap())));
-    assert_eq!(waiting.finalize(), Ok(RewriteOutcome::Unfinished));
+    waiting.first().unwrap();
+    let step = waiting.next(read_result(Some(pending.to_bytes().unwrap())));
+    assert_eq!(ended(step).unwrap().0, RewriteOutcome::Unfinished);
     // A deleted version has no envelope left to replace.
     let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
     let mut skipped = rekey();
-    skipped.start();
-    skipped.step(read_result(Some(deleted.to_bytes().unwrap())));
-    assert_eq!(skipped.finalize(), Ok(RewriteOutcome::Skipped));
+    skipped.first().unwrap();
+    let step = skipped.next(read_result(Some(deleted.to_bytes().unwrap())));
+    assert_eq!(ended(step).unwrap().0, RewriteOutcome::Skipped);
 }
 
 #[test]
 fn rekey_waits_transition() {
     // An archive still in an older generation waits for its transition.
     let mut operation = operation(transition(TransitionKind::Rotate, Some(2), Some(2))).rekey();
-    located(&mut operation, &location(Some(1)));
-    assert_eq!(operation.finalize(), Ok(RewriteOutcome::Unfinished));
+    let step = located(&mut operation, &location(Some(1)));
+    assert_eq!(ended(step).unwrap().0, RewriteOutcome::Unfinished);
 }
 
 mod envelopes {
@@ -415,29 +425,37 @@ mod envelopes {
         operation: &mut RewriteVersionOperation,
         (old, answer): (&BackendLocation, impl Fn(&str) -> Option<Vec<u8>>),
         (settings, new, epoch): (Vec<u8>, BackendLocation, u64),
-    ) -> Effects {
-        let mut effects = located_with(operation, old, &answer);
-        if let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() {
-            let AbeEffect::Envelope(plan) = effect.as_ref() else {
-                panic!("expected an envelope, got {effect:?}")
-            };
-            let plan = EnvelopePlan {
-                epoch,
-                ..plan.clone()
-            };
-            let (envelope, _) = create_envelope(plan).unwrap();
-            let event = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
-            effects = operation.step(Event::Blob(event));
+    ) -> Step {
+        let mut step = located_with(operation, old, &answer);
+        let plan = match asked(&step) {
+            Some(Effect::Blob(BlobEffect::Abe(effect))) => match effect.as_ref() {
+                AbeEffect::Envelope(plan) => Some(plan.clone()),
+                other => panic!("expected an envelope, got {other:?}"),
+            },
+            _ => None,
+        };
+        if let Some(plan) = plan {
+            let (envelope, _) = create_envelope(EnvelopePlan { epoch, ..plan }).unwrap();
+            let created = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
+            step = operation.next(event(Event::Blob(created)));
         }
         // A kept envelope is read before the source is admitted.
-        if let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() {
-            effects = operation.step(read_result(answer(key_space)));
+        let effects = inner(&mut step);
+        if let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() {
+            let values = (reads.iter())
+                .map(|(space, _)| answer(space).map(Into::into))
+                .collect();
+            step = operation.next(IoResult::Values(values));
         }
-        if let [Effect::Blob(BlobEffect::AdmitRead { .. })] = effects.as_slice() {
-            effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease(old) }));
+        if matches!(
+            asked(&step),
+            Some(Effect::Blob(BlobEffect::AdmitRead { .. }))
+        ) {
+            let admitted = BlobEvent::ReadAdmitted { lease: lease(old) };
+            step = operation.next(event(Event::Blob(admitted)));
         }
-        let [Effect::Blob(BlobEffect::RewriteCopy { object, .. })] = effects.as_slice() else {
-            panic!("expected a rewrite, got {effects:?}")
+        let Some(Effect::Blob(BlobEffect::RewriteCopy { object, .. })) = asked(&step) else {
+            panic!("expected a rewrite, got {step:?}")
         };
         let pending = operation.pending.as_ref().map(|pending| &pending.source);
         let envelope = operation.envelope.as_ref().or(pending);
@@ -445,21 +463,18 @@ mod envelopes {
             object.as_deref().copied(),
             envelope.map(|envelope| envelope.context.public_key)
         );
-        operation.step(Event::Blob(BlobEvent::CopyRewritten { location: new }));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-            panic!("expected the fence reads, got {effects:?}")
+        let rewritten = BlobEvent::CopyRewritten { location: new };
+        let step = operation.next(event(Event::Blob(rewritten)));
+        let Ok(Next::Call(IoCall::Read(reads))) = &step else {
+            panic!("expected the fence reads, got {step:?}")
         };
         let record = operation.transition.to_bytes().unwrap();
-        let mut values: Vec<(Key, Option<Value>)> = reads
-            .iter()
-            .map(|(space, key)| (key.clone(), answer(space).map(Into::into)))
+        let mut values: Vec<Option<Value>> = (reads.iter())
+            .map(|(space, _)| answer(space).map(Into::into))
             .collect();
-        values[0].1 = Some(settings.into());
-        values[1].1 = Some(record.into());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+        values[0] = Some(settings.into());
+        values[1] = Some(record.into());
+        operation.next(IoResult::Values(values))
     }
 
     /// Drives a version with envelope rows up to its row writes and returns them.
@@ -469,25 +484,22 @@ mod envelopes {
         settings: Vec<u8>,
         new: BackendLocation,
     ) -> Vec<(String, Key, Value)> {
-        fenced(operation, (old, answer), (settings, new, 1));
-        operation.step(read_result(Some(version(old).to_bytes().unwrap())));
-        let effects = operation.step(read_result(None));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-            panic!("expected the row writes, got {effects:?}")
+        fenced(operation, (old, answer), (settings, new, 1)).unwrap();
+        operation
+            .next(read_result(Some(version(old).to_bytes().unwrap())))
+            .unwrap();
+        let step = operation.next(read_result(None));
+        let Ok(Next::Call(IoCall::Write(writes))) = &step else {
+            panic!("expected the row writes, got {step:?}")
         };
         writes.clone()
     }
 
     /// Answers the row writes and the old owner delete; returns the envelope deletes.
     fn deletes(operation: &mut RewriteVersionOperation) -> Vec<(String, Key)> {
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: Vec::new().into(),
-        }));
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] => deletes.clone(),
+        operation.next(IoResult::Done).unwrap();
+        match operation.next(IoResult::Done) {
+            Ok(Next::Call(IoCall::Delete(deletes))) => deletes,
             _ => Vec::new(),
         }
     }
@@ -531,11 +543,8 @@ mod envelopes {
         let mut operation = operation(transition(TransitionKind::Rotate, Some(1), Some(2)));
         let input = (settings(2, 3), location(Some(2)), 2);
         let old = location(Some(1));
-        let effects = fenced(&mut operation, (&old, rows(true, false, 2)), input);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
+        let step = fenced(&mut operation, (&old, rows(true, false, 2)), input);
+        assert!(matches!(step, Err(RewriteError::Blob(_))));
     }
 
     #[test]
@@ -557,18 +566,9 @@ mod envelopes {
             }
         };
         let (old, new) = (location(Some(2)), location(Some(2)));
-        let effects = fenced(&mut operation, (&old, answer), (settings(2, 0), new, 1));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::default(),
-        }));
-        let id = operation.new.as_ref().unwrap().ulid;
-        operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+        let step = fenced(&mut operation, (&old, answer), (settings(2, 0), new, 1));
         // The walk comes back for it instead of passing it with the old object key.
-        assert_eq!(operation.finalize(), Ok(RewriteOutcome::Unfinished));
+        assert_eq!(ended(step).unwrap().0, RewriteOutcome::Unfinished);
     }
 
     #[test]
@@ -711,14 +711,14 @@ mod envelopes {
     }
 
     /// Answers the quota gate's rebuild marker, realm config, local counter and remote scan reads.
-    fn gated(operation: &mut RewriteVersionOperation) -> Effects {
-        operation.step(read_result(None));
-        operation.step(read_result(None));
-        operation.step(read_result(None));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }))
+    fn gated(operation: &mut RewriteVersionOperation) -> Step {
+        for _ in 0..3 {
+            operation.next(read_result(None)).unwrap();
+        }
+        operation.next(IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        })
     }
 
     #[test]
@@ -752,22 +752,15 @@ mod envelopes {
             publish(&mut operation, answer, settings(2, 3), location(Some(2)));
             deletes(&mut operation);
 
-            let effects = gated(&mut operation);
+            let step = gated(&mut operation);
 
-            let aborted = matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            );
-            assert_eq!(aborted, slack == 1);
-            if aborted {
+            let failed = step.is_err();
+            assert_eq!(failed, slack == 1);
+            if failed {
                 // Nothing commits: the old version, copy and envelope rows stay as they were.
-                operation.step(Event::Storage(StorageEvent::TransactionAborted {
-                    txn_id: TxnId::default(),
-                }));
-                let id = operation.new.as_ref().unwrap().ulid;
-                operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
-                let limit = Err(RewriteError::Blob(AbeError::Limit.into()));
-                assert_eq!(operation.finalize(), limit);
+                let limit = RewriteError::Blob(AbeError::Limit.into());
+                assert_eq!(step.err(), Some(limit));
+                assert_eq!(operation.abort().len(), 2);
             }
         }
     }

@@ -4,15 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::{DriverContext, drive};
 use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
-use crate::tests::notifications::{
-    CannedPeers, context, managers, opening, store_setting, temp_storage,
-};
+use crate::tests::notifications::{context, managers, store_setting, temp_storage};
 use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{PeerRequestError, StorageEvent};
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::register::RegisterError;
 use aruna_core::register::RegisterStamp;
@@ -20,7 +20,6 @@ use aruna_core::structs::execution::notification::{NotificationClass, Notificati
 use aruna_core::structs::execution::setting::SettingHead;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::RealmId;
-use std::sync::atomic::Ordering;
 use ulid::Ulid;
 
 const SECRET: &[u8] = b"canary-hook-17";
@@ -88,24 +87,221 @@ fn notice() -> NotificationRecord {
     NotificationRecord::new(owner(), NotificationClass::Direct, kind, 1)
 }
 
-async fn decide(
-    ctx: &DriverContext,
-    peers: &CannedPeers,
-    backoffs: &Backoffs,
-    now_ms: u64,
-) -> Delivery {
-    let managers = managers();
+/// The bytes of an on webhook setting written on another node.
+fn on_setting() -> Vec<u8> {
+    let stamp = RegisterStamp {
+        counter: 1,
+        node_id: node(2),
+        write_id: Ulid::from_bytes([4u8; 16]),
+    };
+    webhook(true)(stamp).unwrap()
+}
+
+/// A decision on `node(9)`, which is no management node.
+fn deciding(managers: Option<Vec<NodeId>>, now_ms: u64) -> DeliveryOperation {
+    let local = (node(9), owner().realm_id);
+    DeliveryOperation::new(notice(), SettingChannel::Webhook, managers, local, now_ms)
+}
+
+fn all_managers() -> Option<Vec<NodeId>> {
+    Some(managers().to_vec())
+}
+
+fn setting(result: Result<Option<Vec<u8>>, SettingError>) -> IoResult {
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+fn backoff(change: BackoffChange) -> Result<Next<Delivery>, IoError> {
+    let request = BackoffRequest {
+        owner: owner(),
+        channel: SettingChannel::Webhook,
+        change,
+    };
+    Ok(Next::Call(IoCall::from(Effect::Outbound(
+        OutboundEffect::Backoff(request),
+    ))))
+}
+
+fn stored(stored: Option<StoredBackoff>) -> IoResult {
+    IoResult::Event(Box::new(Event::Outbound(OutboundEvent::Backoff { stored })))
+}
+
+fn opened(peer: NodeId, result: Result<SecretBytes, MetadataReadError>) -> IoResult {
+    let message = MetadataTransportMessage::OpenSettingResult { result };
+    let answer = MetadataAnswer {
+        peer,
+        elapsed: Duration::ZERO,
+        result: Ok(encode_message(&message).unwrap()),
+    };
+    IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+        answer,
+    )))))
+}
+
+/// The request that asks `peer` to open the on setting.
+fn open_call(peer: NodeId) -> Result<Next<Delivery>, IoError> {
+    let target = SettingChannel::Webhook.target(owner(), Ulid::from_bytes([4u8; 16]));
+    let message = MetadataTransportMessage::OpenSetting {
+        target,
+        bytes: on_setting(),
+    };
+    let request = MetadataRequestEffect {
+        peer,
+        frame: encode_message(&message).unwrap(),
+        timeout: OPEN_TIMEOUT,
+    };
+    Ok(Next::Call(IoCall::from(Effect::Net(
+        NetEffect::MetadataRequest(Box::new(request)),
+    ))))
+}
+
+/// Reads an on setting and no running delay, up to the first manager's request.
+fn asking() -> DeliveryOperation {
+    let mut decide = deciding(all_managers(), NOW_MS);
+    assert!(matches!(decide.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let read = decide.next(setting(Ok(Some(on_setting()))));
+    assert_eq!(read, backoff(BackoffChange::Read));
+    assert_eq!(decide.next(stored(None)), open_call(managers()[0]));
+    decide
+}
+
+#[test]
+fn off_setting_skips() {
+    let mut decide = deciding(all_managers(), NOW_MS);
+    decide.first().unwrap();
+    assert_eq!(
+        decide.next(setting(Ok(None))),
+        Ok(Next::Done(Delivery::Skip))
+    );
+    let expired = notice().expires_at_ms();
+    assert_eq!(
+        deciding(all_managers(), expired).first(),
+        Ok(Next::Done(Delivery::Skip))
+    );
+}
+
+/// A manager that does not open the secret is skipped; the next one in config order opens it
+/// and the delay is cleared.
+#[test]
+fn first_manager_opens() {
+    let mut decide = asking();
+    let refused = opened(managers()[0], Err(MetadataReadError::Unavailable));
+    assert_eq!(decide.next(refused), open_call(managers()[1]));
+    let secret = SecretBytes::new(SECRET.to_vec());
+    let open = decide.next(opened(managers()[1], Ok(secret.clone())));
+    assert_eq!(open, backoff(BackoffChange::Clear));
+    let winner = SettingWinner {
+        bytes: on_setting(),
+        secret: Some(secret),
+    };
+    assert_eq!(
+        decide.next(stored(None)),
+        Ok(Next::Done(Delivery::Send(winner)))
+    );
+}
+
+/// No manager answers: the delay grows from the stored one and the job waits for it.
+#[test]
+fn no_manager_waits() {
+    let mut decide = asking();
+    for (at, peer) in managers().into_iter().enumerate().skip(1) {
+        let failed = IoResult::Event(Box::new(Event::Net(NetEvent::MetadataAnswer(Box::new(
+            MetadataAnswer {
+                peer: managers()[at - 1],
+                elapsed: Duration::ZERO,
+                result: Err(PeerRequestError::TimedOut),
+            },
+        )))));
+        assert_eq!(decide.next(failed), open_call(peer));
+    }
+    let last = opened(managers()[2], Err(MetadataReadError::Unavailable));
+    let until_ms = NOW_MS + 30_000;
+    let set = BackoffChange::Set {
+        until_ms,
+        delay_ms: 30_000,
+    };
+    assert_eq!(decide.next(last), backoff(set));
+    let wait = decide.next(stored(Some(StoredBackoff {
+        until_ms,
+        delay_ms: 30_000,
+    })));
+    assert!(matches!(
+        wait,
+        Ok(Next::Done(Delivery::Wait(_, delay))) if delay == Duration::from_secs(30)
+    ));
+}
+
+/// A running delay asks nobody; an unreadable config or setting counts as no answer.
+#[test]
+fn running_backoff_waits() {
+    let mut decide = deciding(all_managers(), NOW_MS);
+    decide.first().unwrap();
+    decide.next(setting(Ok(Some(on_setting())))).unwrap();
+    let running = Some(StoredBackoff {
+        until_ms: NOW_MS + 20_000,
+        delay_ms: 30_000,
+    });
+    assert!(matches!(
+        decide.next(stored(running)),
+        Ok(Next::Done(Delivery::Wait(_, delay))) if delay == Duration::from_secs(20)
+    ));
+
+    let mut unconfigured = deciding(None, NOW_MS);
+    unconfigured.first().unwrap();
+    unconfigured.next(setting(Ok(Some(on_setting())))).unwrap();
+    let grown = BackoffChange::Set {
+        until_ms: NOW_MS + 60_000,
+        delay_ms: 60_000,
+    };
+    let earlier = Some(StoredBackoff {
+        until_ms: NOW_MS,
+        delay_ms: 30_000,
+    });
+    assert_eq!(unconfigured.next(stored(earlier)), backoff(grown));
+
+    let mut unread = deciding(all_managers(), NOW_MS);
+    unread.first().unwrap();
+    let failed = setting(Err(SettingError::Storage("down".to_string())));
+    assert_eq!(unread.next(failed), backoff(BackoffChange::Read));
+    let first = BackoffChange::Set {
+        until_ms: NOW_MS + 30_000,
+        delay_ms: 30_000,
+    };
+    assert_eq!(unread.next(stored(None)), backoff(first));
+}
+
+/// This node opens the secret itself when it is a manager.
+#[test]
+fn local_manager_serves() {
+    let local = (managers()[0], owner().realm_id);
     let channel = SettingChannel::Webhook;
-    delivery_setting(
-        ctx,
-        peers,
-        backoffs,
-        &notice(),
-        channel,
-        Some(managers.as_slice()),
-        now_ms,
-    )
-    .await
+    let mut decide = DeliveryOperation::new(notice(), channel, all_managers(), local, NOW_MS);
+    decide.first().unwrap();
+    decide.next(setting(Ok(Some(on_setting())))).unwrap();
+    assert!(matches!(
+        decide.next(stored(None)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let served: SecretAnswer = Ok(SecretBytes::new(SECRET.to_vec()));
+    let served = IoResult::Child(ChildOutcome::new(Ok::<_, MetadataReadError>(served)));
+    assert_eq!(decide.next(served), backoff(BackoffChange::Clear));
+    assert!(matches!(
+        decide.next(IoResult::Done),
+        Err(IoError::Unexpected { .. })
+    ));
+}
+
+#[test]
+fn delays_double_capped() {
+    let mut previous = None;
+    let delays: Vec<_> = (0..8)
+        .map(|_| {
+            let delay = next_delay(previous);
+            previous = Some(delay);
+            delay / 1_000
+        })
+        .collect();
+    assert_eq!(delays, [30, 60, 120, 240, 480, 960, 1_800, 1_800]);
 }
 
 async fn outbox_rows(ctx: &DriverContext) -> usize {
@@ -154,128 +350,4 @@ async fn counter_refused() {
         Err(SettingError::Register(RegisterError::CounterLimit))
     );
     assert_eq!(outbox_rows(&ctx).await, 0);
-}
-
-#[tokio::test]
-async fn local_view_decides() {
-    // The highest stamp on this node decides; an opt-out wins only with a higher stamp.
-    let (_dir, storage) = temp_storage();
-    let ctx = context(&storage);
-    let peers = opening(SECRET);
-    let backoffs = Backoffs::default();
-    assert!(matches!(
-        decide(&ctx, &peers, &backoffs, NOW_MS).await,
-        Delivery::Skip
-    ));
-    received(&ctx, 2, node(2), true).await;
-    received(&ctx, 1, node(3), false).await;
-    let Delivery::Send(winner) = decide(&ctx, &peers, &backoffs, NOW_MS).await else {
-        panic!("the newer opt-in decides");
-    };
-    assert_eq!(winner.secret.unwrap().expose(), SECRET);
-    assert_eq!(
-        peers.opens.load(Ordering::SeqCst),
-        1,
-        "one manager opens the secret"
-    );
-    received(&ctx, 3, node(3), false).await;
-    assert!(matches!(
-        decide(&ctx, &peers, &backoffs, NOW_MS).await,
-        Delivery::Skip
-    ));
-    assert_eq!(
-        peers.opens.load(Ordering::SeqCst),
-        1,
-        "an off setting opens nothing"
-    );
-}
-
-#[tokio::test]
-async fn first_manager_opens() {
-    let (_dir, storage) = temp_storage();
-    let ctx = context(&storage);
-    received(&ctx, 1, node(2), true).await;
-    let mut peers = opening(SECRET);
-    peers.secrets.remove(&managers()[0]);
-    let delivery = decide(&ctx, &peers, &Backoffs::default(), NOW_MS).await;
-    assert!(matches!(delivery, Delivery::Send(_)));
-    assert_eq!(
-        peers.opens.load(Ordering::SeqCst),
-        2,
-        "the next manager in config order opens"
-    );
-}
-
-#[tokio::test]
-async fn no_manager_waits() {
-    let (_dir, storage) = temp_storage();
-    let ctx = context(&storage);
-    received(&ctx, 1, node(2), true).await;
-    let peers = CannedPeers::default();
-    let backoffs = Backoffs::default();
-    let Delivery::Wait(_, delay) = decide(&ctx, &peers, &backoffs, NOW_MS).await else {
-        panic!("no manager answers");
-    };
-    assert_eq!(delay, Duration::from_secs(30));
-    assert_eq!(peers.opens.load(Ordering::SeqCst), 3);
-    let Delivery::Wait(_, delay) = decide(&ctx, &peers, &backoffs, NOW_MS + 10_000).await else {
-        panic!("the backoff still runs");
-    };
-    assert_eq!(delay, Duration::from_secs(20));
-    assert_eq!(
-        peers.opens.load(Ordering::SeqCst),
-        3,
-        "a running backoff asks nobody"
-    );
-    let (peers, backoffs, record) = (opening(SECRET), Backoffs::default(), notice());
-    let unreadable = delivery_setting(
-        &ctx,
-        &peers,
-        &backoffs,
-        &record,
-        SettingChannel::Webhook,
-        None,
-        NOW_MS,
-    );
-    assert!(
-        matches!(unreadable.await, Delivery::Wait(..)),
-        "no config means no manager"
-    );
-}
-
-#[test]
-fn backoff_shared_owner() {
-    let backoffs = Backoffs::default();
-    let other = UserId::local(Ulid::from_bytes([7u8; 16]), owner().realm_id);
-    assert_eq!(
-        backoffs.fail(owner(), SettingChannel::Email, 1_000, next_delay),
-        31_000
-    );
-    // Every notice of the owner and channel waits for the same end.
-    assert_eq!(
-        backoffs.until(owner(), SettingChannel::Email, 2_000),
-        Some(31_000)
-    );
-    assert_eq!(backoffs.until(other, SettingChannel::Email, 2_000), None);
-    assert_eq!(
-        backoffs.until(owner(), SettingChannel::Webhook, 2_000),
-        None
-    );
-    assert_eq!(backoffs.until(owner(), SettingChannel::Email, 31_000), None);
-}
-
-#[test]
-fn backoff_doubles_capped() {
-    let backoffs = Backoffs::default();
-    let channel = SettingChannel::Webhook;
-    let delays: Vec<_> = (0..8)
-        .map(|_| backoffs.fail(owner(), channel, 0, next_delay) / 1_000)
-        .collect();
-    assert_eq!(delays, [30, 60, 120, 240, 480, 960, 1_800, 1_800]);
-    backoffs.clear(owner(), channel);
-    assert_eq!(
-        backoffs.fail(owner(), channel, 0, next_delay),
-        30_000,
-        "an opened secret resets the delay"
-    );
 }

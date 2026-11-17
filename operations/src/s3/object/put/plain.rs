@@ -4,6 +4,7 @@
 
 use super::fenced::{Fenced, FencedWrite};
 use super::*;
+use aruna_core::calls::IoCall;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BACKEND_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE,
     IMPORTED_OBJECT_KEYSPACE,
@@ -571,18 +572,29 @@ pub(crate) fn owner_read(target: &PlainTarget) -> Option<Effect> {
 /// owner, since several keys can give the same path.
 pub(crate) fn owns_path(event: Event, key: &str) -> Result<bool, BlobError> {
     match event {
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            let row = ImportedObject::from_bytes(&value)?;
-            Ok(row.key.as_deref() == Some(key))
-        }
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => path_owned(value.as_deref(), key),
         Event::Storage(StorageEvent::Error { error }) => {
             Err(BlobError::ReadError(error.to_string()))
         }
         _ => Err(BlobError::InvalidEffect),
     }
+}
+
+/// The call form of [`owner_read`].
+pub(crate) fn owner_call(target: &PlainTarget) -> Option<IoCall> {
+    let key = object_key(target.import_id, &target.path);
+    target
+        .listed
+        .then(|| aruna_core::rows::read_row(IMPORTED_OBJECT_KEYSPACE, key))
+}
+
+/// Whether the record row `owner_call` read names `key`.
+pub(crate) fn path_owned(value: Option<&[u8]>, key: &str) -> Result<bool, BlobError> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let row = ImportedObject::from_bytes(value)?;
+    Ok(row.key.as_deref() == Some(key))
 }
 
 /// What a plain write commits with its version.

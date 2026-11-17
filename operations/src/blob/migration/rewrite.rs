@@ -4,19 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::records::{blob_location_read, owner_delete_effect, read_version_effect};
+use crate::distribution::inventory::{StagedCall, outside_answer};
+use crate::s3::object::put::abe::keyed;
 use crate::s3::usage::{QuotaGate, StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::NodeId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BUCKET_ENCRYPTION_KEYSPACE, COPY_OWNER_KEYSPACE, MANAGED_COPY_KEYSPACE,
     TRANSITION_CLEANUP_KEYSPACE, TRANSITION_KEYSPACE,
 };
-use aruna_core::managed_copy::{ManagedCopyError, check_serveable, read_effect};
-use aruna_core::operation::EffectOperation;
+use aruna_core::managed_copy::{ManagedCopyError, check_serveable};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::storage::abe::{ObjectEnvelope, PendingCopy};
 use aruna_core::structs::storage::blob::{
@@ -28,14 +31,12 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionKind, cleanup_key};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::time::SystemTime;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RewriteState {
-    Init,
     ReadVersion,
     ReadLocation,
     ReadEnvelope,
@@ -43,7 +44,6 @@ pub enum RewriteState {
     CreateEnvelope,
     Admit,
     Rewrite,
-    StartTransaction,
     ReadSettings,
     CheckVersion,
     CheckCopy,
@@ -53,11 +53,6 @@ pub enum RewriteState {
     DropEnvelope,
     Quota,
     UpdateUsage,
-    Commit,
-    Abort,
-    Release,
-    Finish,
-    Error,
 }
 
 /// What happened to one version.
@@ -96,6 +91,26 @@ pub enum RewriteError {
     },
 }
 
+impl From<IoError> for RewriteError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type Step = Result<Next<RewriteOutcome>, RewriteError>;
+
+/// A read outside the publishing transaction, so the rewrite never holds it open.
+fn outside(call: IoCall) -> IoCall {
+    StagedCall::Outside(call).into_call()
+}
+
+fn parsed<T>(
+    value: Option<Value>,
+    parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
+) -> Result<Option<T>, RewriteError> {
+    Ok(value.map(|value| parse(value.as_ref())).transpose()?)
+}
+
 /// Moves one version of a bucket in a transition to a copy in the target format.
 #[derive(Debug, PartialEq)]
 pub struct RewriteVersionOperation {
@@ -103,7 +118,6 @@ pub struct RewriteVersionOperation {
     transition: EncryptionTransition,
     now: SystemTime,
     state: RewriteState,
-    txn_id: Option<TxnId>,
     version: Option<BlobVersion>,
     old: Option<BackendLocation>,
     new: Option<BackendLocation>,
@@ -125,7 +139,6 @@ pub struct RewriteVersionOperation {
     deletes: Vec<(String, Key)>,
     /// A scoped re-key of the current generation, outside any transition.
     rekey: bool,
-    output: Option<Result<RewriteOutcome, RewriteError>>,
 }
 
 impl RewriteVersionOperation {
@@ -134,8 +147,7 @@ impl RewriteVersionOperation {
             version_key,
             transition,
             now,
-            state: RewriteState::Init,
-            txn_id: None,
+            state: RewriteState::ReadVersion,
             version: None,
             old: None,
             new: None,
@@ -151,7 +163,6 @@ impl RewriteVersionOperation {
             gate: None,
             deletes: Vec::new(),
             rekey: false,
-            output: None,
         }
     }
 
@@ -189,76 +200,40 @@ impl RewriteVersionOperation {
         }
     }
 
-    fn unexpected(&mut self, received: Event) -> Effects {
-        let state = self.state;
-        self.fail(RewriteError::InvalidStateEvent {
-            state,
+    fn unexpected(&self, received: Event) -> RewriteError {
+        RewriteError::InvalidStateEvent {
+            state: self.state,
             received: received.label(),
+        }
+    }
+
+    /// Ends with `outcome` once the transaction commits.
+    fn end(&mut self, outcome: RewriteOutcome) -> Step {
+        self.lease = None;
+        let calls = self.leave();
+        Ok(Next::Then {
+            output: outcome,
+            calls,
         })
     }
 
-    fn fail(&mut self, error: RewriteError) -> Effects {
-        self.output = Some(Err(error));
-        self.leave()
-    }
-
-    fn end(&mut self, outcome: RewriteOutcome) -> Effects {
-        self.output = Some(Ok(outcome));
-        self.leave()
-    }
-
-    fn leave(&mut self) -> Effects {
-        self.lease = None;
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = RewriteState::Abort;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.release()
-    }
-
-    fn release(&mut self) -> Effects {
-        match self.new.as_ref() {
-            Some(new) => {
-                self.state = RewriteState::Release;
-                smallvec![Effect::Blob(BlobEffect::ReleaseReservation {
-                    id: new.ulid
-                })]
-            }
-            None => self.finish(),
-        }
-    }
-
-    /// A written copy that no commit owns goes to the cleanup queue, whose reconcile deletes it.
-    fn finish(&mut self) -> Effects {
-        self.state = match self.output {
-            Some(Ok(_)) => RewriteState::Finish,
-            _ => RewriteState::Error,
+    /// Releases a written copy; one that no commit owns goes to the cleanup queue, whose
+    /// reconcile deletes it.
+    fn leave(&self) -> Vec<IoCall> {
+        let Some(new) = self.new.as_ref() else {
+            return Vec::new();
         };
-        match (self.new.is_some(), self.owns_row) {
-            (true, false) => smallvec![schedule_cleanup_effect()],
-            _ => smallvec![],
+        let release = Effect::Blob(BlobEffect::ReleaseReservation { id: new.ulid });
+        let mut calls = vec![IoCall::from(release)];
+        if !self.owns_row {
+            calls.push(IoCall::from(schedule_cleanup_effect()));
         }
+        calls
     }
 
-    fn read_value<T>(
-        &mut self,
-        event: Event,
-        parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
-    ) -> Result<Option<T>, Effects> {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return Err(self.unexpected(event));
-        };
-        match value.map(|value| parse(value.as_ref())).transpose() {
-            Ok(parsed) => Ok(parsed),
-            Err(error) => Err(self.fail(error.into())),
-        }
-    }
-
-    fn handle_version(&mut self, event: Event) -> Effects {
-        let version = match self.read_value(event, BlobVersion::from_bytes) {
-            Ok(Some(version)) => version,
-            Ok(None) => return self.end(RewriteOutcome::Skipped),
-            Err(effects) => return effects,
+    fn handle_version(&mut self, value: Option<Value>) -> Step {
+        let Some(version) = parsed(value, BlobVersion::from_bytes)? else {
+            return self.end(RewriteOutcome::Skipped);
         };
         let key = match &version.state {
             BlobVersionState::Materialized { .. } => version.location_key(),
@@ -271,15 +246,14 @@ impl RewriteVersionOperation {
         };
         self.version = Some(version);
         self.state = RewriteState::ReadLocation;
-        smallvec![blob_location_read(&key, None)]
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, key.to_bytes());
+        Ok(Next::Call(outside(read)))
     }
 
     /// A sealed source is read only under a lease admitted for its archive.
-    fn handle_location(&mut self, event: Event) -> Effects {
-        let old = match self.read_value(event, BackendLocation::from_bytes) {
-            Ok(Some(old)) => old,
-            Ok(None) => return self.end(RewriteOutcome::Skipped),
-            Err(effects) => return effects,
+    fn handle_location(&mut self, value: Option<Value>) -> Step {
+        let Some(old) = parsed(value, BackendLocation::from_bytes)? else {
+            return self.end(RewriteOutcome::Skipped);
         };
         if old.staging || old.partial || !self.moves(&old) {
             // A sealed archive in another format or generation waits for its transition.
@@ -290,12 +264,13 @@ impl RewriteVersionOperation {
         self.read_envelope()
     }
 
-    fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Effects {
+    fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Step {
         self.state = RewriteState::Admit;
-        smallvec![Effect::Blob(BlobEffect::AdmitRead { key, archive })]
+        let admit = Effect::Blob(BlobEffect::AdmitRead { key, archive });
+        Ok(Next::Call(admit.into()))
     }
 
-    fn handle_admit(&mut self, event: Event) -> Effects {
+    fn handle_admit(&mut self, event: Event) -> Step {
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease }) => {
                 self.lease = Some(lease);
@@ -304,23 +279,21 @@ impl RewriteVersionOperation {
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 self.end(RewriteOutcome::AwaitingKey)
             }
-            Event::Blob(BlobEvent::Error(error)) => self.fail(error.into()),
-            other => self.unexpected(other),
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            other => Err(self.unexpected(other)),
         }
     }
 
     /// A rotation keeps the sealed blocks of an archive; every other change encodes again.
-    fn rewrite(&mut self) -> Effects {
-        let Some(old) = self.old.clone() else {
-            return self.fail(RewriteError::NotFinished);
-        };
+    fn rewrite(&mut self) -> Step {
+        let old = self.old.clone().ok_or(RewriteError::NotFinished)?;
         let target = self.transition.target;
         let sealed = old.format.bucket_key().is_some() && target.plan.is_some();
         let resolved = ResolvedBackend::new(old.backend.clone(), old.storage_class.clone())
             .with_compression(target.compression)
             .with_encryption(target.plan);
         self.state = RewriteState::Rewrite;
-        smallvec![Effect::Blob(BlobEffect::RewriteCopy {
+        let rewrite = Effect::Blob(BlobEffect::RewriteCopy {
             bucket: self.version_key.bucket.clone(),
             key: self.version_key.key.clone(),
             source: old,
@@ -330,60 +303,42 @@ impl RewriteVersionOperation {
             object: (self.envelope.as_ref())
                 .or(self.pending.as_ref().map(|pending| &pending.source))
                 .map(|envelope| Box::new(envelope.context.public_key)),
-        })]
+        });
+        Ok(Next::Call(rewrite.into()))
     }
 
-    fn handle_rewritten(&mut self, event: Event) -> Effects {
+    /// The first publication read opens the transaction.
+    fn handle_rewritten(&mut self, event: Event) -> Step {
         let new = match event {
             Event::Blob(BlobEvent::CopyRewritten { location }) => location,
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 return self.end(RewriteOutcome::AwaitingKey);
             }
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
-            other => return self.unexpected(other),
+            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
+            other => return Err(self.unexpected(other)),
         };
         let same = self.old.as_ref().is_some_and(|old| {
             old.get_blake3() == new.get_blake3() && old.blob_size == new.blob_size
         });
         self.new = Some(new);
         if !same {
-            return self.fail(RewriteError::ContentMismatch);
+            return Err(RewriteError::ContentMismatch);
         }
-        self.state = RewriteState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn handle_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event);
-        };
-        self.txn_id = Some(txn_id);
         self.state = RewriteState::ReadSettings;
         let bucket: Key = self.version_key.bucket.as_bytes().to_vec().into();
         let mut reads = vec![
             (BUCKET_ENCRYPTION_KEYSPACE.to_string(), bucket.clone()),
             (TRANSITION_KEYSPACE.to_string(), bucket),
         ];
-        match self.envelope_reads() {
-            Ok(envelope) => reads.extend(envelope),
-            Err(error) => return self.fail(error),
-        }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        reads.extend(self.envelope_reads()?);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Publishes only while the bucket still writes this transition's target and the
     /// transition was not replaced.
-    fn handle_settings(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
+    fn handle_settings(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
         let Some(([(_, settings), (_, transition)], envelope)) = values.split_first_chunk() else {
-            return self.fail(RewriteError::NotFinished);
+            return Err(RewriteError::NotFinished);
         };
         let settings = BucketEncryption::from_row(settings.as_ref().map(|row| row.as_ref()));
         let stored = transition
@@ -397,31 +352,19 @@ impl RewriteVersionOperation {
                     && self.transition.still_current(&settings)
             }
             (Ok(_), Ok(None)) => false,
-            (Err(error), _) | (_, Err(error)) => return self.fail(error.into()),
+            (Err(error), _) | (_, Err(error)) => return Err(error.into()),
         };
         // A re-key comes back for a version that changed before publication.
-        if !current {
+        if !current || !self.check_envelope(envelope)? {
             return self.end(self.waits(true));
         }
-        match self.check_envelope(envelope) {
-            Ok(true) => {}
-            Ok(false) => return self.end(self.waits(true)),
-            Err(error) => return self.fail(error),
-        }
-        match read_version_effect(&self.version_key, self.txn_id) {
-            Ok(effect) => {
-                self.state = RewriteState::CheckVersion;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        self.state = RewriteState::CheckVersion;
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, self.version_key.to_bytes()?);
+        Ok(Next::Call(read))
     }
 
-    fn handle_check(&mut self, event: Event) -> Effects {
-        let current = match self.read_value(event, BlobVersion::from_bytes) {
-            Ok(current) => current,
-            Err(effects) => return effects,
-        };
+    fn handle_check(&mut self, value: Option<Value>) -> Step {
+        let current = parsed(value, BlobVersion::from_bytes)?;
         if current != self.version {
             return self.end(self.waits(true));
         }
@@ -430,121 +373,80 @@ impl RewriteVersionOperation {
             return self.read_target();
         };
         let key = ManagedCopyKey::new(self.version_key.clone(), old.backend.clone());
-        match read_effect(&key, self.txn_id) {
-            Ok(effect) => {
-                self.state = RewriteState::CheckCopy;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        self.state = RewriteState::CheckCopy;
+        Ok(Next::Call(read_row(MANAGED_COPY_KEYSPACE, key.to_bytes()?)))
     }
 
     /// A governed version moves only while its registration names the old copy and may serve.
-    fn handle_copy(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
-        let copy = match check_serveable(value.as_ref().map(|value| value.as_ref())) {
-            Ok(copy) => copy,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn handle_copy(&mut self, value: Option<Value>) -> Step {
+        let copy = check_serveable(value.as_ref().map(|value| value.as_ref()))?;
         if !(self.old.as_ref()).is_some_and(|old| copy.location.same_object(old)) {
-            return self.fail(ManagedCopyError::Mismatched.into());
+            return Err(ManagedCopyError::Mismatched.into());
         }
         self.copy = Some(copy);
         self.read_target()
     }
 
-    fn read_target(&mut self) -> Effects {
-        match self.new.as_ref().map(BackendLocation::location_key) {
-            Some(Ok(key)) => {
-                self.state = RewriteState::ReadTarget;
-                smallvec![blob_location_read(&key, self.txn_id)]
-            }
-            Some(Err(error)) => self.fail(error.into()),
-            None => self.fail(RewriteError::NotFinished),
-        }
+    fn read_target(&mut self) -> Step {
+        let new = self.new.as_ref().ok_or(RewriteError::NotFinished)?;
+        let key = new.location_key()?.to_bytes();
+        self.state = RewriteState::ReadTarget;
+        Ok(Next::Call(read_row(BLOB_LOCATIONS_KEYSPACE, key)))
     }
 }
 
-impl EffectOperation for RewriteVersionOperation {
+impl Operation for RewriteVersionOperation {
     type Output = RewriteOutcome;
     type Error = RewriteError;
 
-    fn start(&mut self) -> Effects {
-        match read_version_effect(&self.version_key, None) {
-            Ok(effect) => {
-                self.state = RewriteState::ReadVersion;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+    fn first(&mut self) -> Step {
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, self.version_key.to_bytes()?);
+        self.state = RewriteState::ReadVersion;
+        Ok(Next::Call(outside(read)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event
-            && !matches!(self.state, RewriteState::Commit | RewriteState::Abort)
-        {
-            let error = error.clone();
-            return self.fail(error.into());
-        }
+    fn next(&mut self, result: IoResult) -> Step {
         match self.state {
-            RewriteState::Init => self.start(),
-            RewriteState::ReadVersion => self.handle_version(event),
-            RewriteState::ReadLocation => self.handle_location(event),
-            RewriteState::ReadEnvelope => self.handle_envelope(event),
-            RewriteState::KeepEnvelope => self.handle_kept(event),
-            RewriteState::CreateEnvelope => self.handle_created(event),
-            RewriteState::Admit => self.handle_admit(event),
-            RewriteState::Rewrite => self.handle_rewritten(event),
-            RewriteState::StartTransaction => self.handle_started(event),
-            RewriteState::ReadSettings => self.handle_settings(event),
-            RewriteState::CheckVersion => self.handle_check(event),
-            RewriteState::CheckCopy => self.handle_copy(event),
-            RewriteState::ReadTarget => self.handle_target(event),
-            RewriteState::WriteRows => self.handle_rows(event),
-            RewriteState::DropOwner => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.drop_envelope(),
-                other => self.unexpected(other),
-            },
-            RewriteState::DropEnvelope => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.update_usage(),
-                other => self.unexpected(other),
-            },
-            RewriteState::Quota => self.handle_quota(event),
-            RewriteState::UpdateUsage => self.handle_usage(event),
-            RewriteState::Commit => self.handle_commit(event),
-            RewriteState::Abort => match event {
-                Event::Storage(StorageEvent::TransactionAborted { .. })
-                | Event::Storage(StorageEvent::Error { .. }) => self.release(),
-                other => self.unexpected(other),
-            },
-            RewriteState::Release => match event {
-                Event::Blob(BlobEvent::ReservationReleased { .. })
-                | Event::Blob(BlobEvent::Error(_)) => self.finish(),
-                other => self.unexpected(other),
-            },
-            RewriteState::Finish | RewriteState::Error => smallvec![],
+            RewriteState::ReadVersion => self.handle_version(outside_answer(result)?.value()?),
+            RewriteState::ReadLocation => self.handle_location(outside_answer(result)?.value()?),
+            RewriteState::ReadEnvelope => {
+                let values = outside_answer(result)?.values()?;
+                self.handle_envelope(keyed(&values))
+            }
+            RewriteState::KeepEnvelope => self.handle_kept(outside_answer(result)?.value()?),
+            RewriteState::CreateEnvelope => self.handle_created(result.event()?),
+            RewriteState::Admit => self.handle_admit(result.event()?),
+            RewriteState::Rewrite => self.handle_rewritten(result.event()?),
+            RewriteState::ReadSettings => self.handle_settings(keyed(&result.values()?)),
+            RewriteState::CheckVersion => self.handle_check(result.value()?),
+            RewriteState::CheckCopy => self.handle_copy(result.value()?),
+            RewriteState::ReadTarget => self.handle_target(result.value()?),
+            RewriteState::WriteRows => {
+                result.done()?;
+                self.handle_rows()
+            }
+            RewriteState::DropOwner => {
+                result.done()?;
+                self.drop_envelope()
+            }
+            RewriteState::DropEnvelope => {
+                result.done()?;
+                self.update_usage()
+            }
+            RewriteState::Quota => self.handle_quota(result),
+            RewriteState::UpdateUsage => self.handle_usage(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RewriteState::Finish | RewriteState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let complete = self.is_complete();
-        let output = self.output.filter(|_| complete);
-        output.unwrap_or(Err(RewriteError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
+    /// Nothing committed, so no row owns a written copy.
+    fn abort(&mut self) -> Vec<IoCall> {
         self.lease = None;
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+        self.owns_row = false;
+        self.leave()
     }
 }
 #[path = "../rewrite/rows.rs"]

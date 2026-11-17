@@ -5,16 +5,17 @@
 
 use crate::s3::abe_rekey::RekeyProgress;
 use crate::s3::bucket::key::restart::Replay;
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BUCKET_AUDIT_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -22,8 +23,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::key_audit::{AuditAction, BucketAuditRecord};
 use aruna_core::structs::storage::transition::EncryptionTransition;
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
@@ -40,15 +40,22 @@ pub enum KeyStatusError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Blob(#[from] BlobError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error("the status read did not finish")]
     NotFinished,
+    #[error("the status read failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for KeyStatusError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<KeySnapshot>, KeyStatusError>;
 
 /// One bucket's key state as stored on this node, read without a transaction.
 #[derive(Debug, Default, PartialEq)]
@@ -79,7 +86,6 @@ pub struct AbeSnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusStep {
-    Init,
     ReadBucket,
     Transition,
     Records,
@@ -87,8 +93,6 @@ enum StatusStep {
     Copies,
     Audit,
     KeyStatus,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, PartialEq)]
@@ -100,7 +104,6 @@ pub struct KeyStatusOperation {
     snapshot: KeySnapshot,
     /// The audit trail read the same way as at restart, for the lock reasons.
     replay: Replay,
-    output: Option<Result<KeySnapshot, KeyStatusError>>,
 }
 
 impl KeyStatusOperation {
@@ -109,27 +112,18 @@ impl KeyStatusOperation {
             bucket,
             realm_id,
             group_id,
-            step: StatusStep::Init,
+            step: StatusStep::ReadBucket,
             snapshot: KeySnapshot::default(),
             replay: Replay::default(),
-            output: None,
         }
-    }
-
-    fn fail(&mut self, error: impl Into<KeyStatusError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.step = StatusStep::Error;
-        smallvec![]
     }
 
     fn bucket_id(&self) -> Option<Ulid> {
         self.snapshot.settings.bucket_id
     }
 
-    fn scan(&mut self, step: StatusStep, start: Option<Key>) -> Effects {
-        let Some(bucket_id) = self.bucket_id() else {
-            return self.fail(KeyStatusError::NotFinished);
-        };
+    fn scan(&mut self, step: StatusStep, after: Option<Key>) -> Step {
+        let bucket_id = self.bucket_id().ok_or(KeyStatusError::NotFinished)?;
         let key_space = match step {
             StatusStep::Records => BUCKET_KEY_KEYSPACE,
             StatusStep::Grants => BUCKET_HOLDER_KEYSPACE,
@@ -137,20 +131,16 @@ impl KeyStatusOperation {
             _ => KEY_COPY_KEYSPACE,
         };
         self.step = step;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(bucket_id.to_bytes().to_vec().into()),
-            start: start.map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: key_space.to_string(),
+            prefix: bucket_id.to_bytes().to_vec().into(),
+            after,
             limit: SCAN_PAGE,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let state = match parse_authority(values, self.realm_id, self.group_id) {
-            Ok(state) => state,
-            Err(error) => return self.fail(error),
-        };
+    fn read_bucket(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
+        let state = parse_authority(values, self.realm_id, self.group_id)?;
         self.snapshot.info = Some(state.info);
         self.snapshot.settings = state.settings;
         self.snapshot.admins = state.admins;
@@ -166,38 +156,27 @@ impl KeyStatusOperation {
                     .map(|key_space| (key_space.to_string(), id.clone())),
             );
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn read_transition(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let mut values = values.into_iter().map(|(_, value)| value);
-        match values
-            .next()
-            .flatten()
-            .map(|value| EncryptionTransition::from_bytes(&value))
-            .transpose()
-        {
-            Ok(transition) => self.snapshot.transition = transition,
-            Err(error) => return self.fail(error),
-        }
-        match parse_abe(
+    fn read_transition(&mut self, values: Vec<Option<Value>>) -> Step {
+        let mut values = values.into_iter();
+        let transition = values.next().flatten();
+        self.snapshot.transition = (transition.as_deref())
+            .map(EncryptionTransition::from_bytes)
+            .transpose()?;
+        self.snapshot.abe = parse_abe(
             values.next().flatten(),
             values.next().flatten(),
             values.next().flatten(),
-        ) {
-            Ok(abe) => self.snapshot.abe = abe,
-            Err(error) => return self.fail(error),
-        }
+        )?;
         match self.bucket_id() {
             Some(_) => self.scan(StatusStep::Records, None),
-            None => self.finish(),
+            None => Ok(self.finish()),
         }
     }
 
-    fn take_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn take_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
         for (key, value) in values {
             let parsed =
                 match self.step {
@@ -211,9 +190,7 @@ impl KeyStatusOperation {
                     _ if SealedCopy::parse_key(&key).is_err() => Ok(()),
                     _ => SealedCopy::from_bytes(&value).map(|copy| self.snapshot.copies.push(copy)),
                 };
-            if let Err(error) = parsed {
-                return self.fail(error);
-            }
+            parsed?;
         }
         if next.is_some() {
             return self.scan(self.step, next);
@@ -227,76 +204,49 @@ impl KeyStatusOperation {
     }
 
     /// Outcomes pair with their intents, so a failed unlock keeps the lock reason it replaced.
-    fn read_unlocks(&mut self) -> Effects {
+    fn read_unlocks(&mut self) -> Step {
         self.snapshot.locks = self.replay.locks();
-        let Some(bucket_id) = self.bucket_id() else {
-            return self.fail(KeyStatusError::NotFinished);
-        };
+        let bucket_id = self.bucket_id().ok_or(KeyStatusError::NotFinished)?;
         self.step = StatusStep::KeyStatus;
-        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id })]
+        let read = Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id });
+        Ok(Next::Call(IoCall::Effect(Box::new(read))))
     }
 
-    fn finish(&mut self) -> Effects {
-        self.output = Some(Ok(std::mem::take(&mut self.snapshot)));
-        self.step = StatusStep::Finish;
-        smallvec![]
+    fn finish(&mut self) -> Next<KeySnapshot> {
+        Next::Done(std::mem::take(&mut self.snapshot))
     }
 }
 
-impl EffectOperation for KeyStatusOperation {
+impl Operation for KeyStatusOperation {
     type Output = KeySnapshot;
     type Error = KeyStatusError;
 
-    fn start(&mut self) -> Effects {
-        self.step = StatusStep::ReadBucket;
-        smallvec![authority_read(
-            &self.bucket,
-            self.realm_id,
-            self.group_id,
-            None
-        )]
+    fn first(&mut self) -> Step {
+        let reads = authority_keys(&self.bucket, self.realm_id, self.group_id);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (StatusStep::Finish | StatusStep::Error, _) => smallvec![],
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (StatusStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_bucket(values)
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.step {
+            StatusStep::ReadBucket => self.read_bucket(keyless(result.values()?)),
+            StatusStep::Transition => self.read_transition(result.values()?),
+            StatusStep::Records | StatusStep::Grants | StatusStep::Copies | StatusStep::Audit => {
+                let (values, next) = result.page()?;
+                self.take_page(values, next)
             }
-            (StatusStep::Transition, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_transition(values)
-            }
-            (
-                StatusStep::Records | StatusStep::Grants | StatusStep::Copies | StatusStep::Audit,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.take_page(values, next_start_after),
-            (StatusStep::KeyStatus, Event::Blob(BlobEvent::KeyStatus { generations })) => {
-                self.snapshot.unlocks = generations;
-                self.finish()
-            }
-            (state, received) => self.fail(KeyStatusError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            StatusStep::KeyStatus => match result.event()? {
+                Event::Blob(BlobEvent::KeyStatus { generations }) => {
+                    self.snapshot.unlocks = generations;
+                    Ok(self.finish())
+                }
+                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                other => Err(IoError::Unexpected {
+                    expected: "BlobEvent::KeyStatus",
+                    got: other.label(),
+                }
+                .into()),
+            },
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.step, StatusStep::Finish | StatusStep::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(KeyStatusError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -332,8 +282,6 @@ pub struct AuditPageOperation {
     bucket_id: Ulid,
     cursor: Option<Ulid>,
     limit: usize,
-    done: bool,
-    output: Option<Result<AuditPage, KeyStatusError>>,
 }
 
 impl AuditPageOperation {
@@ -342,8 +290,6 @@ impl AuditPageOperation {
             bucket_id,
             cursor,
             limit: limit.max(1),
-            done: false,
-            output: None,
         }
     }
 
@@ -362,54 +308,25 @@ impl AuditPageOperation {
 
 type AuditPage = (Vec<BucketAuditRecord>, Option<Ulid>);
 
-impl EffectOperation for AuditPageOperation {
+impl Operation for AuditPageOperation {
     type Output = AuditPage;
     type Error = KeyStatusError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<AuditPage>, KeyStatusError> {
         let prefix = self.bucket_id.to_bytes().to_vec();
-        let start = self
-            .cursor
-            .map(|cursor| IterStart::After([&prefix[..], &cursor.to_bytes()].concat().into()));
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_AUDIT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start,
+        let after =
+            (self.cursor).map(|cursor| Key::from([&prefix[..], &cursor.to_bytes()].concat()));
+        Ok(Next::Call(IoCall::Page {
+            space: BUCKET_AUDIT_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after,
             limit: self.limit,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.done {
-            return smallvec![];
-        }
-        self.done = true;
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => self.page(values, next_start_after.is_some()),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            received => Err(KeyStatusError::InvalidStateEvent {
-                state: "ReadAudit".to_string(),
-                expected: "IterResult",
-                received: received.label(),
-            }),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(KeyStatusError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<AuditPage>, KeyStatusError> {
+        let (values, next) = result.page()?;
+        Ok(Next::Done(self.page(values, next.is_some())?))
     }
 }
 
@@ -451,35 +368,56 @@ mod tests {
         )
     }
 
-    fn iter(values: Vec<Vec<u8>>, next: Option<&[u8]>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: values
+    fn iter(values: Vec<Vec<u8>>, next: Option<&[u8]>) -> IoResult {
+        IoResult::Page {
+            rows: values
                 .into_iter()
                 .map(|value| (Key::from(Vec::new()), Value::from(value)))
                 .collect(),
-            next_start_after: next.map(|key| Key::from(key.to_vec())),
-        })
+            next: next.map(|key| Key::from(key.to_vec())),
+        }
     }
 
-    fn batch(values: Vec<Option<Vec<u8>>>) -> Event {
-        let values = values
-            .into_iter()
-            .map(|value| (Key::from(Vec::new()), value.map(Value::from)))
-            .collect();
-        Event::Storage(StorageEvent::BatchReadResult { values })
+    fn batch(values: Vec<Option<Vec<u8>>>) -> IoResult {
+        IoResult::Values(
+            values
+                .into_iter()
+                .map(|value| value.map(Value::from))
+                .collect(),
+        )
+    }
+
+    fn authority(rows: Vec<(Key, Option<Value>)>) -> IoResult {
+        IoResult::Values(rows.into_iter().map(|(_, value)| value).collect())
+    }
+
+    fn unlocks() -> IoResult {
+        let status = BlobEvent::KeyStatus {
+            generations: Vec::new(),
+        };
+        IoResult::Event(Box::new(Event::Blob(status)))
+    }
+
+    fn snapshot(turn: Step) -> KeySnapshot {
+        match turn {
+            Ok(Next::Done(snapshot)) => snapshot,
+            other => panic!("expected the snapshot, got {other:?}"),
+        }
+    }
+
+    fn scans(turn: &Step, space: &str) -> bool {
+        matches!(turn, Ok(Next::Call(IoCall::Page { space: scanned, .. })) if scanned == space)
     }
 
     #[test]
     fn plain_bucket_stops() {
         let mut operation = operation();
-        operation.start();
+        let _ = operation.first();
         let rows = authority_rows(&info(), None, &[user(2)]);
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: rows,
-        }));
+        let turn = operation.next(authority(rows));
         assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })]
+            &turn,
+            Ok(Next::Call(IoCall::Read(reads)))
                 if reads.len() == 1 && reads[0].0 == TRANSITION_KEYSPACE
         ));
         // A decrypt that finished its mode change still reports its transition.
@@ -493,9 +431,7 @@ mod tests {
             2,
             7,
         );
-        let effects = operation.step(batch(vec![Some(transition.to_bytes().unwrap())]));
-        assert!(effects.is_empty());
-        let snapshot = operation.finalize().unwrap();
+        let snapshot = snapshot(operation.next(batch(vec![Some(transition.to_bytes().unwrap())])));
         assert_eq!(snapshot.transition, Some(transition));
         assert_eq!(snapshot.settings.mode, EncryptionMode::Off);
         assert_eq!(snapshot.admins, BTreeSet::from([user(2)]));
@@ -506,7 +442,7 @@ mod tests {
     #[test]
     fn reads_every_page() {
         let mut operation = operation();
-        operation.start();
+        let _ = operation.first();
         let settings = BucketEncryption {
             mode: EncryptionMode::NodeManaged,
             bucket_id: Some(BUCKET_ID),
@@ -514,51 +450,36 @@ mod tests {
             ..Default::default()
         };
         let rows = authority_rows(&info(), Some(&settings), &[]);
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: rows,
-        }));
-        assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 4
-        ));
+        let turn = operation.next(authority(rows));
+        assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 4));
         let progress = RekeyProgress {
             prefix: "raw/".to_string(),
             epoch: 3,
             cursor: b"raw/a".to_vec(),
             rekeyed: 5,
         };
-        let effects = operation.step(batch(vec![
+        let turn = operation.next(batch(vec![
             None,
             Some(3_u64.to_be_bytes().to_vec()),
             Some(vec![1]),
             Some(postcard::to_allocvec(&progress).unwrap()),
         ]));
         assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::Iter { key_space, start: None, .. })]
-                if key_space == BUCKET_KEY_KEYSPACE
+            &turn,
+            Ok(Next::Call(IoCall::Page { space, after: None, .. })) if space == BUCKET_KEY_KEYSPACE
         ));
         let record = BucketKeyRecord::new(BucketKeyRef::new(BUCKET_ID, 1), BUCKET_ID, [7; 32], 5);
         let bytes = record.to_bytes().unwrap();
-        let effects = operation.step(iter(vec![bytes.clone()], Some(b"after")));
+        let turn = operation.next(iter(vec![bytes.clone()], Some(b"after")));
         assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(key)), .. })]
-                if key.as_ref() == b"after"
+            &turn,
+            Ok(Next::Call(IoCall::Page { after: Some(key), .. })) if key.as_ref() == b"after"
         ));
-        let effects = operation.step(iter(vec![bytes], None));
-        assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == BUCKET_HOLDER_KEYSPACE
-        ));
-        operation.step(iter(Vec::new(), None));
-        let effects = operation.step(iter(Vec::new(), None));
-        assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == BUCKET_AUDIT_KEYSPACE
-        ));
+        let turn = operation.next(iter(vec![bytes], None));
+        assert!(scans(&turn, BUCKET_HOLDER_KEYSPACE));
+        let _ = operation.next(iter(Vec::new(), None));
+        let turn = operation.next(iter(Vec::new(), None));
+        assert!(scans(&turn, BUCKET_AUDIT_KEYSPACE));
         let event = |at_ms: u64, action, generation| BucketAuditRecord {
             event_id: Ulid::from_parts(at_ms, 1),
             bucket_id: BUCKET_ID,
@@ -584,17 +505,12 @@ mod tests {
             .iter()
             .map(|record| record.to_bytes().unwrap())
             .collect();
-        let effects = operation.step(iter(rows, None));
-        assert_eq!(
-            effects[..],
-            [Effect::Blob(BlobEffect::ReadKeyStatus {
-                bucket_id: BUCKET_ID
-            })]
-        );
-        operation.step(Event::Blob(BlobEvent::KeyStatus {
-            generations: Vec::new(),
-        }));
-        let snapshot = operation.finalize().unwrap();
+        let turn = operation.next(iter(rows, None));
+        let read = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: BUCKET_ID,
+        });
+        assert_eq!(turn, Ok(Next::Call(IoCall::Effect(Box::new(read)))));
+        let snapshot = snapshot(operation.next(unlocks()));
         assert_eq!(snapshot.records, vec![record.clone(), record]);
         let locks = BTreeMap::from([
             (1, (AuditAction::RestartLock, 1)),
@@ -612,7 +528,7 @@ mod tests {
     #[test]
     fn failures_keep_reason() {
         let mut operation = operation();
-        operation.start();
+        let _ = operation.first();
         let settings = BucketEncryption {
             mode: EncryptionMode::VaultLocked,
             bucket_id: Some(BUCKET_ID),
@@ -620,12 +536,10 @@ mod tests {
             ..Default::default()
         };
         let rows = authority_rows(&info(), Some(&settings), &[]);
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: rows,
-        }));
-        operation.step(batch(vec![None; 4]));
+        let _ = operation.next(authority(rows));
+        let _ = operation.next(batch(vec![None; 4]));
         for _ in 0..3 {
-            operation.step(iter(Vec::new(), None));
+            let _ = operation.next(iter(Vec::new(), None));
         }
         // Every record shares one millisecond; storage returns them sorted by key.
         let mut trail = Vec::new();
@@ -660,23 +574,19 @@ mod tests {
             .iter()
             .map(|record| record.to_bytes().unwrap())
             .collect();
-        operation.step(iter(rows, None));
-        operation.step(Event::Blob(BlobEvent::KeyStatus {
-            generations: Vec::new(),
-        }));
-        let snapshot = operation.finalize().unwrap();
+        let _ = operation.next(iter(rows, None));
+        let snapshot = snapshot(operation.next(unlocks()));
         let locks = BTreeMap::from([(1, (AuditAction::TimedLock, 4))]);
         assert_eq!(snapshot.locks, locks);
     }
 
     #[test]
-    fn rejects_foreign_event() {
+    fn rejects_foreign_result() {
         let mut operation = operation();
-        operation.start();
-        operation.step(iter(Vec::new(), None));
+        let _ = operation.first();
         assert!(matches!(
-            operation.finalize(),
-            Err(KeyStatusError::InvalidStateEvent { .. })
+            operation.next(iter(Vec::new(), None)),
+            Err(KeyStatusError::Io(IoError::Unexpected { .. }))
         ));
     }
 
@@ -699,21 +609,23 @@ mod tests {
         };
         let cursor = Ulid::from_parts(1, 1);
         let mut full = AuditPageOperation::new(BUCKET_ID, Some(cursor), 2);
-        let effects = full.start();
         let expected = [&BUCKET_ID.to_bytes()[..], &cursor.to_bytes()].concat();
         assert!(matches!(
-            &effects[..],
-            [Effect::Storage(StorageEffect::Iter { start: Some(IterStart::After(key)), limit: 2, .. })]
+            full.first(),
+            Ok(Next::Call(IoCall::Page { after: Some(key), limit: 2, .. }))
                 if key.as_ref() == expected
         ));
         let rows = vec![record(2).to_bytes().unwrap(), record(3).to_bytes().unwrap()];
-        full.step(iter(rows.clone(), Some(b"more")));
-        let (events, next) = full.finalize().unwrap();
+        let Ok(Next::Done((events, next))) = full.next(iter(rows.clone(), Some(b"more"))) else {
+            panic!("expected the audit page");
+        };
         assert_eq!(events.len(), 2);
         assert_eq!(next, Some(Ulid::from_parts(3, 1)));
         let mut last = AuditPageOperation::new(BUCKET_ID, None, 5);
-        last.start();
-        last.step(iter(rows, None));
-        assert_eq!(last.finalize().unwrap().1, None);
+        let _ = last.first();
+        let Ok(Next::Done((_, next))) = last.next(iter(rows, None)) else {
+            panic!("expected the last audit page");
+        };
+        assert_eq!(next, None);
     }
 }

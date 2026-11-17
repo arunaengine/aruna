@@ -9,6 +9,7 @@ use crate::s3::bucket::key::rows::Row;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::usage::RowChange;
 use crate::s3::usage::StoredDelta;
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
@@ -40,13 +41,13 @@ impl RewriteVersionOperation {
         Ok(copy_row(source.bucket_id, &self.version_key)?.into())
     }
 
-    pub(super) fn read_envelope(&mut self) -> Effects {
+    pub(super) fn read_envelope(&mut self) -> Step {
         // A plain-to-plain rewrite has no envelope rows.
         if self.transition.target.plan.is_none() && self.plain() {
             return self.proceed();
         }
         let (Ok(version), Ok(row)) = (self.version_key.to_bytes(), self.copy_key()) else {
-            return self.fail(RewriteError::NotFinished);
+            return Err(RewriteError::NotFinished);
         };
         let mut reads = vec![
             (ABE_VERSION_KEYSPACE.to_string(), version.into()),
@@ -56,10 +57,7 @@ impl RewriteVersionOperation {
             reads.extend(abe_reads(plan.key));
         }
         self.state = RewriteState::ReadEnvelope;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(outside(IoCall::Read(reads))))
     }
 
     fn plain(&self) -> bool {
@@ -74,10 +72,8 @@ impl RewriteVersionOperation {
     }
 
     /// Admits a sealed source for reading; a plain source is rewritten directly.
-    fn proceed(&mut self) -> Effects {
-        let Some(old) = self.old.as_ref() else {
-            return self.fail(RewriteError::NotFinished);
-        };
+    fn proceed(&mut self) -> Step {
+        let old = self.old.as_ref().ok_or(RewriteError::NotFinished)?;
         match old.format.bucket_key() {
             Some(key) => {
                 let archive = ArchiveKey::of(old);
@@ -89,12 +85,9 @@ impl RewriteVersionOperation {
 
     /// A version with envelope rows, or a plain version moving into a bucket with ABE
     /// parameters, gets its new envelope before the rewrite grants to it.
-    pub(super) fn handle_envelope(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event);
-        };
+    pub(super) fn handle_envelope(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
         let Some(([(_, id), (_, copy)], anchors)) = values.split_first_chunk() else {
-            return self.fail(RewriteError::NotFinished);
+            return Err(RewriteError::NotFinished);
         };
         // Without target parameters a plain version gets a bucket-only copy.
         let admitted = anchors.first().is_some_and(|(_, row)| row.is_some());
@@ -115,10 +108,7 @@ impl RewriteVersionOperation {
         if self.same_generation() {
             return self.keep_envelope();
         }
-        let (parameters, epoch) = match parse_abe(anchors, target.key) {
-            Ok(value) => value,
-            Err(error) => return self.fail(abe_error(error)),
-        };
+        let (parameters, epoch) = parse_abe(anchors, target.key).map_err(abe_error)?;
         // A complete envelope keeps its write id; a pending copy gets its first one.
         let id = id.as_deref().and_then(|id| <[u8; 16]>::try_from(id).ok());
         let plan = EnvelopePlan {
@@ -129,62 +119,49 @@ impl RewriteVersionOperation {
             bucket_public: target.public_key,
         };
         self.state = RewriteState::CreateEnvelope;
-        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(
-            AbeEffect::Envelope(plan)
-        )))]
+        let create = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Envelope(plan))));
+        Ok(Next::Call(create.into()))
     }
 
-    pub(super) fn handle_created(&mut self, event: Event) -> Effects {
+    pub(super) fn handle_created(&mut self, event: Event) -> Step {
         let envelope = match event {
             Event::Blob(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Envelope(envelope) => envelope,
-                other => return self.unexpected(Event::Blob(BlobEvent::Abe(Box::new(other)))),
+                other => {
+                    let other = Event::Blob(BlobEvent::Abe(Box::new(other)));
+                    return Err(self.unexpected(other));
+                }
             },
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
-            other => return self.unexpected(other),
+            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
+            other => return Err(self.unexpected(other)),
         };
         self.envelope = Some(envelope);
         self.proceed()
     }
 
     /// A re-encoding in the same generation keeps the object key, write id and envelope.
-    fn keep_envelope(&mut self) -> Effects {
-        let Some(rows) = self.envelope_rows.as_ref() else {
-            return self.fail(RewriteError::NotFinished);
-        };
+    fn keep_envelope(&mut self) -> Step {
+        let rows = self
+            .envelope_rows
+            .as_ref()
+            .ok_or(RewriteError::NotFinished)?;
         if let Some(id) = rows.id.clone() {
             self.state = RewriteState::KeepEnvelope;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: ABE_ENVELOPE_KEYSPACE.to_string(),
-                key: id,
-                txn_id: None,
-            })];
+            return Ok(Next::Call(outside(read_row(ABE_ENVELOPE_KEYSPACE, id))));
         }
-        match rows
-            .copy
-            .as_deref()
-            .map(PendingCopy::from_bytes)
-            .transpose()
-        {
-            Ok(pending) => {
-                self.pending = pending;
-                self.proceed()
-            }
-            Err(error) => self.fail(abe_error(error)),
-        }
+        let pending = rows.copy.as_deref().map(PendingCopy::from_bytes);
+        self.pending = pending.transpose().map_err(abe_error)?;
+        self.proceed()
     }
 
-    pub(super) fn handle_kept(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event);
-        };
+    pub(super) fn handle_kept(&mut self, value: Option<Value>) -> Step {
         match value.as_deref().map(ObjectEnvelope::from_bytes) {
             Some(Ok(envelope)) => {
                 self.envelope = Some(envelope);
                 self.proceed()
             }
-            Some(Err(error)) => self.fail(abe_error(error)),
-            None => self.fail(abe_error(AbeError::Pending)),
+            Some(Err(error)) => Err(abe_error(error)),
+            None => Err(abe_error(AbeError::Pending)),
         }
     }
 
@@ -317,18 +294,16 @@ impl RewriteVersionOperation {
     }
 
     /// The new envelope charge must fit the group quota before the usage update.
-    pub(super) fn handle_quota(&mut self, event: Event) -> Effects {
-        let (Some(txn_id), Some(gate)) = (self.txn_id, self.gate.as_mut()) else {
-            return self.fail(RewriteError::NotFinished);
-        };
-        match gate.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) if gate.is_exceeded() => self.fail(abe_error(AbeError::Limit)),
+    pub(super) fn handle_quota(&mut self, result: IoResult) -> Step {
+        let gate = self.gate.as_mut().ok_or(RewriteError::NotFinished)?;
+        match gate.step_calls(result) {
+            Ok(Some(call)) => Ok(Next::Call(call)),
+            Ok(None) if gate.is_exceeded() => Err(abe_error(AbeError::Limit)),
             Ok(None) => {
                 self.gate = None;
                 self.update_usage()
             }
-            Err(_) => self.fail(abe_error(AbeError::Unavailable)),
+            Err(_) => Err(abe_error(AbeError::Unavailable)),
         }
     }
 
@@ -356,14 +331,13 @@ impl RewriteVersionOperation {
     }
 
     /// Deletes the replaced envelope rows in the version's transaction.
-    pub(super) fn drop_envelope(&mut self) -> Effects {
+    pub(super) fn drop_envelope(&mut self) -> Step {
         if self.deletes.is_empty() {
             return self.update_usage();
         }
         self.state = RewriteState::DropEnvelope;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Delete(std::mem::take(
+            &mut self.deletes,
+        ))))
     }
 }

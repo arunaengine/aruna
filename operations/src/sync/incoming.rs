@@ -16,15 +16,11 @@ use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
-use crate::replication::protocol::{
-    LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-};
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
-use aruna_core::events::Event;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -36,7 +32,7 @@ use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
@@ -645,9 +641,6 @@ async fn reemit_evicted_documents(
             return false;
         }
     };
-    if let Some(message) = &outcome.drain_error {
-        warn!(task_id = ?TaskKey::DrainSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
-    }
     if outcome.written > 0 {
         info!(
             count = outcome.written,
@@ -748,7 +741,7 @@ mod tests {
     };
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;

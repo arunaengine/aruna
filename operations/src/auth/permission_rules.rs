@@ -4,11 +4,10 @@
 
 use std::collections::HashMap;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::AUTH_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::permission_path::{
     compile_permission_matcher, restrictions_cover_subtree, validate_restriction_limits,
 };
@@ -16,9 +15,8 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use globset::GlobMatcher;
-use smallvec::smallvec;
 use ulid::Ulid;
 
 /// A role that applies to the caller: `direct` when the caller is assigned to
@@ -327,156 +325,15 @@ pub struct PermissionRulesConfig {
 
 /// Reads the realm and group authorization documents once and returns the
 /// caller's rules, so bulk read paths pay O(scopes) storage reads instead of
-/// one permission check per candidate path.
+/// one permission check per candidate path. Both documents come from one batch read.
 #[derive(Debug, PartialEq)]
 pub struct PermissionRulesOperation {
     config: PermissionRulesConfig,
-    txn_id: Option<TxnId>,
-    external_txn: bool,
-    group_id: Option<GroupId>,
-    realm_auth_doc: Option<RealmAuthorizationDocument>,
-    group_auth_doc: Option<GroupAuthorizationDocument>,
-    output: Option<Result<PermissionRules, AuthorizationError>>,
-    state: PermissionRulesState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum PermissionRulesState {
-    Init,
-    StartTransaction,
-    GetRealmDoc,
-    GetGroupDoc,
-    CollectRules,
-    Finish,
-    Error,
-}
-
-impl std::fmt::Display for PermissionRulesState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                PermissionRulesState::Init => "PermissionRulesState::Init",
-                PermissionRulesState::StartTransaction => "PermissionRulesState::StartTransaction",
-                PermissionRulesState::GetRealmDoc => "PermissionRulesState::GetRealmAuthDoc",
-                PermissionRulesState::GetGroupDoc => "PermissionRulesState::GetGroupAuthDoc",
-                PermissionRulesState::CollectRules => "PermissionRulesState::CollectRules",
-                PermissionRulesState::Finish => "PermissionRulesState::Finish",
-                PermissionRulesState::Error => "PermissionRulesState::Error",
-            }
-        )
-    }
 }
 
 impl PermissionRulesOperation {
     pub fn new(config: PermissionRulesConfig) -> Self {
-        PermissionRulesOperation {
-            config,
-            txn_id: None,
-            external_txn: false,
-            group_id: None,
-            realm_auth_doc: None,
-            group_auth_doc: None,
-            output: None,
-            state: PermissionRulesState::Init,
-        }
-    }
-
-    pub fn new_with_txn(config: PermissionRulesConfig, txn_id: TxnId) -> Self {
-        PermissionRulesOperation {
-            config,
-            txn_id: Some(txn_id),
-            external_txn: true,
-            group_id: None,
-            realm_auth_doc: None,
-            group_auth_doc: None,
-            output: None,
-            state: PermissionRulesState::Init,
-        }
-    }
-
-    fn handle_transaction(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        if let (
-            PermissionRulesState::StartTransaction,
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-        ) = (self.state, event)
-        {
-            self.txn_id = Some(txn_id);
-            match self.read_realm_doc() {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::TransactionStart)",
-                got,
-            )
-        }
-    }
-
-    fn handle_realm_auth(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        if let (
-            PermissionRulesState::GetRealmDoc,
-            Event::Storage(StorageEvent::ReadResult { value, .. }),
-        ) = (self.state, event)
-        {
-            match self.store_realm_doc(value) {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
-        }
-    }
-
-    fn handle_group_auth(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        if let (
-            PermissionRulesState::GetGroupDoc,
-            Event::Storage(StorageEvent::ReadResult { value, .. }),
-        ) = (self.state, event)
-        {
-            match self.store_group_doc(value) {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            }
-        } else {
-            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
-        }
-    }
-
-    fn handle_commit(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        if let (
-            PermissionRulesState::CollectRules,
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-        ) = (self.state, event)
-        {
-            if self.txn_id == Some(txn_id) {
-                // The transaction is committed, so no later failure may abort it.
-                self.txn_id = None;
-                match self.emit_rules() {
-                    Ok(effects) => effects,
-                    Err(err) => self.fail(err),
-                }
-            } else {
-                self.unexpected_event(
-                    self.state,
-                    "Event::Storage(StorageEvent::TransactionCommitted)",
-                    got,
-                )
-            }
-        } else {
-            self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            )
-        }
+        PermissionRulesOperation { config }
     }
 
     fn parse_path(path: &str) -> Result<(RealmId, Option<GroupId>), AuthorizationError> {
@@ -497,238 +354,114 @@ impl PermissionRulesOperation {
 
         Ok((realm, group))
     }
-
-    fn read_realm_doc(&mut self) -> Result<Effects, AuthorizationError> {
-        self.state = PermissionRulesState::GetRealmDoc;
-        let (realm, group) = PermissionRulesOperation::parse_path(&self.config.path)?;
-        self.group_id = group;
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: AUTH_KEYSPACE.to_string(),
-            key: (*realm.as_bytes()).into(),
-            txn_id: self.txn_id
-        })])
-    }
-
-    fn store_realm_doc(
-        &mut self,
-        value: Option<byteview::ByteView>,
-    ) -> Result<Effects, AuthorizationError> {
-        self.realm_auth_doc = Some(RealmAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::DocNotFound)?,
-        )?);
-
-        match self.group_id {
-            Some(group) => {
-                self.state = PermissionRulesState::GetGroupDoc;
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    txn_id: self.txn_id,
-                    key_space: AUTH_KEYSPACE.to_string(),
-                    key: group.to_bytes().into(),
-                })])
-            }
-            None => {
-                if self.external_txn {
-                    self.emit_rules()
-                } else {
-                    self.state = PermissionRulesState::CollectRules;
-                    Ok(smallvec![Effect::Storage(
-                        StorageEffect::CommitTransaction {
-                            txn_id: self
-                                .txn_id
-                                .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-                        }
-                    )])
-                }
-            }
-        }
-    }
-
-    fn store_group_doc(
-        &mut self,
-        value: Option<byteview::ByteView>,
-    ) -> Result<Effects, AuthorizationError> {
-        self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| AuthorizationError::DocNotFound)?,
-        )?);
-
-        if self.external_txn {
-            self.emit_rules()
-        } else {
-            self.state = PermissionRulesState::CollectRules;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::CommitTransaction {
-                    txn_id: self
-                        .txn_id
-                        .ok_or_else(|| AuthorizationError::NoTransactionFound)?
-                }
-            )])
-        }
-    }
-
-    fn emit_rules(&mut self) -> Result<Effects, AuthorizationError> {
-        self.state = PermissionRulesState::Finish;
-        let roles = self.collect_roles()?;
-        self.output = Some(Ok(PermissionRules::from_roles(
-            roles,
-            self.config.auth_context.path_restrictions.as_deref(),
-        )?));
-        Ok(smallvec![])
-    }
-
-    fn collect_roles(&mut self) -> Result<Vec<CollectedRole>, AuthorizationError> {
-        let realm_auth_doc = self
-            .realm_auth_doc
-            .as_ref()
-            .ok_or_else(|| AuthorizationError::DocNotFound)?;
-        let realm_id = realm_auth_doc.realm_id;
-        let auth_user = self.config.auth_context.user_id;
-        let mut roles = realm_auth_doc.roles.clone();
-        if let Some(group) = &self.group_auth_doc {
-            roles.extend(group.roles.clone());
-        }
-        Ok(roles
-            .into_values()
-            .filter_map(|role| {
-                // Public roles apply by assigning this realm's exact Everyone
-                // principal. Other nil user ids are not public for this realm.
-                let public = role.is_public(realm_id);
-                let direct = !auth_user.is_nil() && role.assigned_users.contains(&auth_user);
-                (public || direct).then_some(CollectedRole {
-                    role,
-                    direct,
-                    public,
-                })
-            })
-            .collect())
-    }
-
-    fn fail(&mut self, err: AuthorizationError) -> Effects {
-        self.state = PermissionRulesState::Error;
-        self.output = Some(Err(err));
-        self.abort()
-    }
-
-    fn fail_with_cleanup(&mut self, err: AuthorizationError, cleanup_effects: Effects) -> Effects {
-        self.state = PermissionRulesState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: PermissionRulesState,
-        expected: &'static str,
-        got: &'static str,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            AuthorizationError::UnexpectedEvent {
-                state: state.to_string(),
-                expected,
-                got: got.to_string(),
-            },
-            cleanup_effects,
-        )
-    }
-
-    fn fail_on_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            let cleanup = if matches!(self.state, PermissionRulesState::CollectRules)
-                && !matches!(
-                    &error,
-                    aruna_core::errors::StorageError::TransactionConflict
-                        | aruna_core::errors::StorageError::QueueFull
-                        | aruna_core::errors::StorageError::TransactionNotFound
-                ) {
-                smallvec![]
-            } else {
-                self.abort()
-            };
-            return Err(self.fail_with_cleanup(error.into(), cleanup));
-        }
-
-        Ok(event)
-    }
 }
 
-impl EffectOperation for PermissionRulesOperation {
-    type Output = PermissionRules;
+/// The authorization rows a rule collection for `path` reads: the realm document, then the
+/// group document when the path names a group.
+pub(crate) fn rule_reads(path: &str) -> Result<Vec<(KeySpace, Key)>, AuthorizationError> {
+    let (realm, group) = PermissionRulesOperation::parse_path(path)?;
+    let mut reads = vec![(
+        AUTH_KEYSPACE.to_string(),
+        Key::from(realm.as_bytes().to_vec()),
+    )];
+    if let Some(group) = group {
+        reads.push((
+            AUTH_KEYSPACE.to_string(),
+            Key::from(group.to_bytes().to_vec()),
+        ));
+    }
+    Ok(reads)
+}
 
+/// The caller's rules from the rows [`rule_reads`] named, in that order. A missing document
+/// fails the collection.
+pub(crate) fn read_rules(
+    auth_context: &AuthContext,
+    values: Vec<Option<Value>>,
+) -> Result<PermissionRules, AuthorizationError> {
+    let mut values = values.into_iter();
+    let realm = values
+        .next()
+        .flatten()
+        .ok_or(AuthorizationError::DocNotFound)?;
+    let realm = RealmAuthorizationDocument::from_bytes(&realm)?;
+    let group = values
+        .next()
+        .map(|group| {
+            let group = group.ok_or(AuthorizationError::DocNotFound)?;
+            GroupAuthorizationDocument::from_bytes(&group).map_err(AuthorizationError::from)
+        })
+        .transpose()?;
+    let roles = collect_roles(auth_context, &realm, group.as_ref());
+    PermissionRules::from_roles(roles, auth_context.path_restrictions.as_deref())
+}
+
+fn collect_roles(
+    auth_context: &AuthContext,
+    realm_auth_doc: &RealmAuthorizationDocument,
+    group_auth_doc: Option<&GroupAuthorizationDocument>,
+) -> Vec<CollectedRole> {
+    let realm_id = realm_auth_doc.realm_id;
+    let auth_user = auth_context.user_id;
+    let mut roles = realm_auth_doc.roles.clone();
+    if let Some(group) = group_auth_doc {
+        roles.extend(group.roles.clone());
+    }
+    roles
+        .into_values()
+        .filter_map(|role| {
+            // Public roles apply by assigning this realm's exact Everyone
+            // principal. Other nil user ids are not public for this realm.
+            let public = role.is_public(realm_id);
+            let direct = !auth_user.is_nil() && role.assigned_users.contains(&auth_user);
+            (public || direct).then_some(CollectedRole {
+                role,
+                direct,
+                public,
+            })
+        })
+        .collect()
+}
+
+impl Operation for PermissionRulesOperation {
+    type Output = PermissionRules;
     type Error = AuthorizationError;
 
-    fn start(&mut self) -> Effects {
-        if self.external_txn {
-            return match self.read_realm_doc() {
-                Ok(effects) => effects,
-                Err(err) => self.fail(err),
-            };
-        }
-        self.state = PermissionRulesState::StartTransaction;
-
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
+    fn first(&mut self) -> Result<Next<PermissionRules>, AuthorizationError> {
+        Ok(Next::Call(IoCall::Read(rule_reads(&self.config.path)?)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_on_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
+    fn next(&mut self, result: IoResult) -> Result<Next<PermissionRules>, AuthorizationError> {
+        let IoResult::Values(values) = result else {
+            return Err(AuthorizationError::UnexpectedEvent {
+                state: "PermissionRules".to_string(),
+                expected: "IoResult::Values",
+                got: result.label().to_string(),
+            });
         };
-
-        match self.state {
-            PermissionRulesState::StartTransaction => self.handle_transaction(event),
-            PermissionRulesState::GetRealmDoc => self.handle_realm_auth(event),
-            PermissionRulesState::GetGroupDoc => self.handle_group_auth(event),
-            PermissionRulesState::CollectRules => self.handle_commit(event),
-            PermissionRulesState::Finish
-            | PermissionRulesState::Init
-            | PermissionRulesState::Error => {
-                self.unexpected_event(self.state, "no event", event.label())
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PermissionRulesState::Finish | PermissionRulesState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AuthorizationError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        if self.external_txn {
-            return smallvec![];
-        }
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        read_rules(&self.config.auth_context, values).map(Next::Done)
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::operation_check::{rejects_events, sample_events};
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::errors::AuthorizationError;
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission, Role};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use ulid::Ulid;
 
-    use super::{CollectedRole, PermissionRules, PermissionRulesConfig, PermissionRulesOperation};
+    use super::{
+        CollectedRole, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+        collect_roles,
+    };
 
     fn role(permissions: HashMap<String, Permission>, assigned: HashSet<UserId>) -> Role {
         Role {
@@ -1114,10 +847,6 @@ mod pure_tests {
         let realm_id = RealmId([9u8; 32]);
         let other_realm = RealmId([10u8; 32]);
         let group_id = Ulid::from_parts(14, 14);
-        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
-            auth_context: AuthContext::anonymous(realm_id),
-            path: format!("/{realm_id}/g/{group_id}"),
-        });
         let foreign = role(
             HashMap::from([(
                 format!("/{realm_id}/g/{group_id}/data/**"),
@@ -1125,146 +854,54 @@ mod pure_tests {
             )]),
             HashSet::from([UserId::nil(other_realm)]),
         );
-        operation.realm_auth_doc = Some(RealmAuthorizationDocument {
+        let realm = RealmAuthorizationDocument {
             realm_id,
             roles: HashMap::from([(foreign.role_id, foreign)]),
             operation_restrictions: HashMap::new(),
-        });
+        };
 
-        assert!(
-            operation
-                .collect_roles()
-                .expect("roles collected")
-                .is_empty()
-        );
+        assert!(collect_roles(&AuthContext::anonymous(realm_id), &realm, None).is_empty());
     }
 
     #[test]
-    fn reuses_parent_txn() {
+    fn reads_both_documents() {
+        // One batch read names the realm and the group document; a missing one fails.
         let realm_id = RealmId([14u8; 32]);
         let group_id = Ulid::from(15u128);
-        let txn_id = Ulid::from(16u128);
-        let mut operation = PermissionRulesOperation::new_with_txn(
-            PermissionRulesConfig {
-                auth_context: AuthContext::anonymous(realm_id),
-                path: format!("/{realm_id}/g/{group_id}"),
-            },
-            txn_id,
-        );
-
-        let effects = operation.start();
+        let config = || PermissionRulesConfig {
+            auth_context: AuthContext::anonymous(realm_id),
+            path: format!("/{realm_id}/g/{group_id}"),
+        };
+        let mut operation = PermissionRulesOperation::new(config());
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read {
-                key_space,
-                txn_id: Some(read_txn),
-                ..
-            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(reads)))
+                if reads.len() == 2 && reads.iter().all(|(space, _)| space == AUTH_KEYSPACE)
         ));
-
         let realm = RealmAuthorizationDocument::default_realm_doc(realm_id);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read {
-                key_space,
-                txn_id: Some(read_txn),
-                ..
-            })] if key_space == AUTH_KEYSPACE && *read_txn == txn_id
-        ));
-
         let group = GroupAuthorizationDocument::default_group_doc(
             UserId::nil(realm_id),
             realm_id,
             group_id,
         );
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(postcard::to_allocvec(&group).unwrap().into()),
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert!(operation.finalize().is_ok());
-
-        let mut failed = PermissionRulesOperation::new_with_txn(
-            PermissionRulesConfig {
-                auth_context: AuthContext::anonymous(realm_id),
-                path: format!("/{realm_id}/g/{group_id}"),
-            },
-            txn_id,
-        );
-        failed.start();
-        let effects = failed.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        assert!(effects.is_empty());
-        assert!(failed.is_complete());
-        assert!(failed.finalize().is_err());
-    }
-
-    // A state that expects no event must reject one instead of ignoring it.
-    #[test]
-    fn terminal_rejects_event() {
-        let realm_id = RealmId([6u8; 32]);
-        let make = || {
-            PermissionRulesOperation::new(PermissionRulesConfig {
-                auth_context: AuthContext::anonymous(realm_id),
-                path: format!("/{realm_id}/admin"),
-            })
-        };
-        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    AuthorizationError::UnexpectedEvent { .. }
-                        | AuthorizationError::StorageError(_)
-                ),
-                "{error:?}"
-            );
-        }
-    }
-
-    // A completed collection must reject a late event without aborting the
-    // transaction it already committed.
-    #[test]
-    fn finished_rejects_event() {
-        let realm_id = RealmId([16u8; 32]);
-        let txn_id = Ulid::from(17u128);
-        let mut operation = PermissionRulesOperation::new(PermissionRulesConfig {
-            auth_context: AuthContext::anonymous(realm_id),
-            path: format!("/{realm_id}/admin"),
-        });
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let realm = RealmAuthorizationDocument::default_realm_doc(realm_id);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(postcard::to_allocvec(&realm).unwrap().into()),
-        }));
+        let rows = vec![
+            Some(postcard::to_allocvec(&realm).unwrap().into()),
+            Some(postcard::to_allocvec(&group).unwrap().into()),
+        ];
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: committed
-            })] if *committed == txn_id
+            operation.next(IoResult::Values(rows)),
+            Ok(Next::Done(_))
         ));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(operation.is_complete());
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-
-        assert!(effects.is_empty());
+        let mut failed = PermissionRulesOperation::new(config());
+        failed.first().unwrap();
+        let realm = Some(postcard::to_allocvec(&realm).unwrap().into());
+        assert_eq!(
+            failed.next(IoResult::Values(vec![realm, None])),
+            Err(AuthorizationError::DocNotFound)
+        );
         assert!(matches!(
-            operation.finalize(),
+            failed.next(IoResult::Done),
             Err(AuthorizationError::UnexpectedEvent { .. })
         ));
     }

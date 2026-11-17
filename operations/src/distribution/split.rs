@@ -3,20 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect, abort_effects};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     CAPACITY_RESERVATION_KEYSPACE, KEY_SAMPLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE, RANGE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, RangeAccount, RangeCounters, RangeSlot, Rebuild, SAMPLE_SIZE, SampleEntry, account_key,
     generation_key, pending_key, sample_count_key, sample_prefix, slot_key,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -29,9 +28,7 @@ pub enum SplitError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("split received unexpected event: {0:?}")]
-    UnexpectedEvent(Box<Event>),
+    Io(#[from] IoError),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,30 +41,26 @@ pub struct SplitConfig {
     pub right: Ulid,
 }
 
+/// What the pending call of a split does.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum State {
-    Init,
-    Started,
     ReadAccount,
     ReadSample,
     Write,
     Delete,
     Count,
-    Commit,
-    Done,
 }
 
+/// Splits one range's accounting in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct SplitOperation {
     config: SplitConfig,
     state: State,
-    txn_id: Option<TxnId>,
     parent: Option<RangeAccount>,
     /// The bytes this node reserved for the parent at admission.
     reserved: Option<u64>,
     deletes: Vec<(String, Key)>,
     counts: Vec<(Key, RangeCounters)>,
-    result: Option<Result<(), SplitError>>,
 }
 
 /// The counter rows that make up a range's charged total: its own row, or for a split
@@ -97,20 +90,12 @@ impl SplitOperation {
     pub fn new(config: SplitConfig) -> Self {
         Self {
             config,
-            state: State::Init,
-            txn_id: None,
+            state: State::ReadAccount,
             parent: None,
             reserved: None,
             deletes: Vec::new(),
             counts: Vec::new(),
-            result: None,
         }
-    }
-
-    fn finish(&mut self, result: Result<(), SplitError>) -> Effects {
-        self.state = State::Done;
-        self.result = Some(result);
-        abort_effects(&mut self.txn_id)
     }
 
     fn check(&self, parent: &RangeAccount) -> Result<u64, SplitError> {
@@ -246,143 +231,76 @@ impl SplitOperation {
         Ok(writes)
     }
 
-    fn handle(&mut self, event: Event) -> Result<Effects, SplitError> {
+    /// Reads the parent's account and reservation, then its key sample.
+    fn read_account(&mut self, result: IoResult) -> Result<IoCall, SplitError> {
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);
-        match (&self.state, event) {
-            (State::Started, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::ReadAccount;
-                let key = Key::from(account_key(set_id, range_id));
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (RANGE_ACCOUNT_KEYSPACE.to_string(), key.clone()),
-                        (CAPACITY_RESERVATION_KEYSPACE.to_string(), key),
-                    ],
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (State::ReadAccount, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let mut values = values.into_iter().map(|(_, value)| value);
-                let value = values.next().flatten();
-                let value = value.ok_or(SplitError::RangeMissing(range_id))?;
-                let parent = RangeAccount::from_bytes(&value)?;
-                self.check(&parent)?;
-                self.parent = Some(parent);
-                let invalid = || ConversionError::InvalidLength("capacity reservation row".into());
-                let reserved = values.next().flatten().map(|value| {
-                    let bytes = value.as_ref().try_into().map_err(|_| invalid());
-                    bytes.map(u64::from_be_bytes)
-                });
-                self.reserved = reserved.transpose()?;
-                self.state = State::ReadSample;
-                Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: KEY_SAMPLE_KEYSPACE.to_string(),
-                    prefix: Some(sample_prefix(set_id, range_id).into()),
-                    start: None,
-                    limit: usize::from(SAMPLE_SIZE) * 2,
-                    txn_id: self.txn_id,
-                })])
-            }
-            (
-                State::ReadSample,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                // Entries beyond the read would stay behind under the retired parent.
-                if next_start_after.is_some() {
-                    return Err(SplitError::Refused(
-                        range_id,
-                        "the key sample needs a refill",
-                    ));
-                }
-                let writes = self.plan(values)?;
-                self.state = State::Write;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: self.txn_id,
-                })])
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = State::Delete;
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: std::mem::take(&mut self.deletes),
-                    txn_id: self.txn_id,
-                })])
-            }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.state = State::Count;
-                Ok(smallvec![Effect::Storage(StorageEffect::AddCounters {
-                    key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-                    deltas: std::mem::take(&mut self.counts),
-                    txn_id: self.txn_id.unwrap_or_default(),
-                })])
-            }
-            (State::Count, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.commit())
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                Ok(self.finish(Ok(())))
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(SplitError::UnexpectedEvent(Box::new(event))),
-        }
-    }
-
-    fn commit(&mut self) -> Effects {
-        self.state = State::Commit;
-        match self.txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })],
-            None => self.finish(Err(SplitError::Refused(
-                self.config.range_id,
-                "no transaction",
-            ))),
-        }
+        let mut values = result.values()?.into_iter();
+        let value = values.next().flatten();
+        let value = value.ok_or(SplitError::RangeMissing(range_id))?;
+        let parent = RangeAccount::from_bytes(&value)?;
+        self.check(&parent)?;
+        self.parent = Some(parent);
+        let invalid = || ConversionError::InvalidLength("capacity reservation row".into());
+        let reserved = values.next().flatten().map(|value| {
+            let bytes = value.as_ref().try_into().map_err(|_| invalid());
+            bytes.map(u64::from_be_bytes)
+        });
+        self.reserved = reserved.transpose()?;
+        self.state = State::ReadSample;
+        let prefix = sample_prefix(set_id, range_id);
+        let limit = usize::from(SAMPLE_SIZE) * 2;
+        Ok(PrefixPages::new(KEY_SAMPLE_KEYSPACE, prefix, limit).call())
     }
 }
 
-impl EffectOperation for SplitOperation {
+impl Operation for SplitOperation {
     type Output = ();
     type Error = SplitError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Started;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<()>, SplitError> {
+        let key = Key::from(account_key(self.config.set_id, self.config.range_id));
+        Ok(Next::Call(IoCall::Read(vec![
+            (RANGE_ACCOUNT_KEYSPACE.to_string(), key.clone()),
+            (CAPACITY_RESERVATION_KEYSPACE.to_string(), key),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Done {
-            return smallvec![];
-        }
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => {
-                if matches!(self.state, State::Commit) {
-                    self.txn_id = None;
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, SplitError> {
+        let call = match self.state {
+            State::ReadAccount => self.read_account(result)?,
+            State::ReadSample => {
+                let (sample, next) = result.page()?;
+                // Entries beyond the read would stay behind under the retired parent.
+                if next.is_some() {
+                    let range_id = self.config.range_id;
+                    return Err(SplitError::Refused(range_id, "the key sample needs a refill"));
                 }
-                self.finish(Err(error))
+                self.state = State::Write;
+                IoCall::Write(self.plan(sample)?)
             }
-        }
+            State::Write => {
+                done(result)?;
+                self.state = State::Delete;
+                IoCall::Delete(std::mem::take(&mut self.deletes))
+            }
+            State::Delete => {
+                done(result)?;
+                self.state = State::Count;
+                IoCall::AddCounters {
+                    space: RANGE_COUNTER_KEYSPACE.to_string(),
+                    deltas: std::mem::take(&mut self.counts),
+                }
+            }
+            State::Count => {
+                done(result)?;
+                return Ok(Next::Done(()));
+            }
+        };
+        Ok(Next::Call(call))
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<(), SplitError> {
-        let range_id = self.config.range_id;
-        self.result.unwrap_or(Err(SplitError::Refused(
-            range_id,
-            "the split stopped early",
-        )))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
     }
 }
 

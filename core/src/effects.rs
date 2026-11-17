@@ -791,6 +791,18 @@ pub enum NetEffect {
     MetadataRequest(Box<MetadataRequestEffect>),
     /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
     DashboardChanged,
+    /// Records one suppressed watch delivery in this node's watch metrics.
+    RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Notes a watch a local user just created on `holder`, so events reach the holder before
+    /// its interest digest arrives.
+    RegisterInterest {
+        watch_id: ulid::Ulid,
+        realm_id: crate::structs::identity::realm::RealmId,
+        holder: NodeId,
+        entry: crate::structs::execution::notification_watch::WatchInterestEntry,
+    },
+    /// Removes a watch a local user just deleted from this node's watch interest.
+    RetractInterest(ulid::Ulid),
 }
 
 /// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter

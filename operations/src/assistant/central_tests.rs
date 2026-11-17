@@ -90,7 +90,7 @@ fn wrong_result_fails() {
     operation.first().unwrap();
     assert!(matches!(
         operation.next(IoResult::Done),
-        Err(CentralStoreError::Io(IoError::Unexpected { .. }))
+        Err(CentralStoreError::Storage(StorageError::ReadError(_)))
     ));
 }
 

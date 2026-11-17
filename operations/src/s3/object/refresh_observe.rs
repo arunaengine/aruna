@@ -7,10 +7,10 @@ use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
-use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
+use aruna_core::events::{Event, StagingSourceEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
 use thiserror::Error;
 
@@ -100,10 +100,7 @@ impl ObserveSourceOperation {
         };
         self.state = ObserveState::ResolveAccess;
         let resolve = ResolveBindingOperation::new(ResolveBindingInput { source, group_id });
-        let child = boxed_suboperation(resolve, |result| {
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result })
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::child(resolve)))
     }
 }
 
@@ -121,20 +118,19 @@ impl Operation for ObserveSourceOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Step {
-        if self.state == ObserveState::ReadVersion {
-            return self.version_read(result);
+        match self.state {
+            ObserveState::ReadVersion => return self.version_read(result),
+            ObserveState::ResolveAccess => {
+                let access = result.child::<ResolvedSourceAccess, SourceResolutionError>()??;
+                self.state = ObserveState::HeadSource;
+                let head = StagingSourceEffect::Head { access };
+                return Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
+                    head,
+                )))));
+            }
+            ObserveState::HeadSource => {}
         }
         match (self.state, result.event()?) {
-            (
-                ObserveState::ResolveAccess,
-                Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
-            ) => {
-                self.state = ObserveState::HeadSource;
-                let head = StagingSourceEffect::Head { access: result? };
-                Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
-                    head,
-                )))))
-            }
             (
                 ObserveState::HeadSource,
                 Event::StagingSource(StagingSourceEvent::HeadResult { metadata }),

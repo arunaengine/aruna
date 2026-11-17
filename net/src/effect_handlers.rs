@@ -257,9 +257,14 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::Notification(_) => NetEvent::Notification(Err(
             "notification requests must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::WakeInbox(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
-        NetEffect::Heartbeat(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
-        NetEffect::DashboardChanged => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
+        NetEffect::WakeInbox(_)
+        | NetEffect::Heartbeat(_)
+        | NetEffect::DashboardChanged
+        | NetEffect::RecordSuppression(_)
+        | NetEffect::RegisterInterest { .. }
+        | NetEffect::RetractInterest(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
     }
 }
 
@@ -587,6 +592,9 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::WakeInbox(_) => "wake_inbox",
         NetEffect::Heartbeat(_) => "heartbeat",
         NetEffect::DashboardChanged => "dashboard_changed",
+        NetEffect::RecordSuppression(_) => "record_suppression",
+        NetEffect::RegisterInterest { .. } => "register_interest",
+        NetEffect::RetractInterest(_) => "retract_interest",
     }
 }
 

@@ -9,13 +9,13 @@ use crate::distribution::guard::{GuardError, authority_read, authority_rows, wri
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::resolve_set::{PolicySetResolver, ResolveMode, ResolveStep};
 use crate::s3::policy::successor::{
-    CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+    CapturedDefault, SuccessorError, SuccessorOutcome, SuccessorPlan, mint_child, mint_outcome,
 };
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, SubOperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
@@ -181,7 +181,7 @@ pub struct PolicyBulkOperation {
     resolved: BTreeMap<Ulid, PolicyResolution>,
     candidates: Vec<Candidate>,
     index: usize,
-    mint: Option<MintSuccessorOperation>,
+    mint: Option<Box<dyn SubOperation>>,
     /// Outcome of a mint that is still cleaning up.
     settled: Option<Result<SuccessorOutcome, SuccessorError>>,
     /// The status the closing transaction writes once the pass has finished.
@@ -710,7 +710,7 @@ impl PolicyBulkOperation {
             }),
             intent: Some(intent),
         };
-        let mut mint = MintSuccessorOperation::new(plan);
+        let mut mint = mint_child(plan);
         let effects = mint.start();
         self.mint = Some(mint);
         self.state = BulkState::Mint;
@@ -956,7 +956,7 @@ impl EffectOperation for PolicyBulkOperation {
                 let Some(mint) = self.mint.take() else {
                     return self.fail(BulkError::InvalidEvent);
                 };
-                let outcome = mint.finalize();
+                let outcome = mint_outcome(mint.finalize());
                 if effects.is_empty() {
                     return self.record_outcome(outcome);
                 }

@@ -483,6 +483,25 @@ pub(crate) fn batch_realm(records: &[NotificationRecord]) -> Result<RealmId, Str
 
 // The recipient realm is peer-asserted; an empty DeliverBatch has no record to
 // derive it from and must be rejected before any indexing.
+/// The one realm of a watch event batch within the batch cap.
+pub(crate) fn events_realm(events: &[WatchEvent]) -> Result<RealmId, String> {
+    let Some(first) = events.first() else {
+        return Err("empty batch".to_string());
+    };
+    if events.len() > EVENT_BATCH_SIZE {
+        return Err(format!(
+            "watch event batch count {} exceeds cap {}",
+            events.len(),
+            EVENT_BATCH_SIZE
+        ));
+    }
+    let realm_id = first.realm_id;
+    if events.iter().any(|event| event.realm_id != realm_id) {
+        return Err("mixed-realm batch".to_string());
+    }
+    Ok(realm_id)
+}
+
 pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<RealmId, String> {
     match message {
         NotificationTransportMessage::DeliverBatch { records } => batch_realm(records),
@@ -492,23 +511,7 @@ pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<Re
         NotificationTransportMessage::CreateWatch { owner, .. }
         | NotificationTransportMessage::DeleteWatch { owner, .. }
         | NotificationTransportMessage::ListWatches { owner } => Ok(owner.realm_id),
-        NotificationTransportMessage::DeliverWatchEvents { events } => {
-            let Some(first) = events.first() else {
-                return Err("empty batch".to_string());
-            };
-            if events.len() > EVENT_BATCH_SIZE {
-                return Err(format!(
-                    "watch event batch count {} exceeds cap {}",
-                    events.len(),
-                    EVENT_BATCH_SIZE
-                ));
-            }
-            let realm_id = first.realm_id;
-            if events.iter().any(|event| event.realm_id != realm_id) {
-                return Err("mixed-realm batch".to_string());
-            }
-            Ok(realm_id)
-        }
+        NotificationTransportMessage::DeliverWatchEvents { events } => events_realm(events),
         NotificationTransportMessage::DeliverAck { .. }
         | NotificationTransportMessage::ListResult { .. }
         | NotificationTransportMessage::UnreadCountResult { .. }
