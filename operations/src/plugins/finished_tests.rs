@@ -9,6 +9,7 @@ use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
 
 use super::*;
+use crate::plugins::broker::call_intent;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::{list_runs, save_run};
@@ -206,12 +207,12 @@ async fn retry_redoes_undone() {
     let mut run = scope(&fixture, &install).run;
     let (settled, undone) = (Intent::new(1, &[b"put"]), Intent::new(2, &[b"copy"]));
     let ctx = &fixture.ctx;
-    drive(begin(run.run_id, settled.clone()), ctx)
+    drive(begin(run.run_id, call_intent(&settled)), ctx)
         .await
         .unwrap();
-    let reply = settled_row(run.run_id, &settled, "7".into()).unwrap();
+    let reply = settled_row(run.run_id, &call_intent(&settled), "7".into()).unwrap();
     drive(write_rows(vec![reply]), ctx).await.unwrap();
-    let unknown = unknown_row(run.run_id, &undone, "timed out").unwrap();
+    let unknown = unknown_row(run.run_id, &call_intent(&undone), "timed out").unwrap();
     drive(write_rows(vec![unknown]), ctx).await.unwrap();
     let intents = drive(scan_rows(intent_scan(run.run_id)), ctx)
         .await
@@ -228,11 +229,13 @@ async fn retry_redoes_undone() {
     .await
     .unwrap();
     assert_eq!(
-        drive(begin(run.run_id, undone.clone()), ctx).await.unwrap(),
+        drive(begin(run.run_id, call_intent(&undone)), ctx)
+            .await
+            .unwrap(),
         Begun::Fresh
     );
     assert_eq!(
-        drive(begin(run.run_id, settled.clone()), ctx)
+        drive(begin(run.run_id, call_intent(&settled)), ctx)
             .await
             .unwrap(),
         Begun::Settled("7".into())

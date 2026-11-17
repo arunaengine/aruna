@@ -5,12 +5,14 @@
 
 use std::sync::Arc;
 
+use crate::plugins::broker::call_intent;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, RunTrigger, SourceKind};
+use aruna_core::plugin_runs::{StateRemoval, StateWrite};
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{Intent, StatePut, StateRemove};
+use aruna_plugins::broker::Intent;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -56,11 +58,11 @@ async fn fill(ctx: &DriverContext, install_id: Ulid) -> u64 {
     for n in 0..count {
         let key = format!("k{n}");
         used += key.len() + value.len();
-        let put = StatePut {
+        let put = StateWrite {
             key,
             value: value.clone(),
             expected: None,
-            intent: Intent::new(n as u32, &[b"fill"]),
+            intent: call_intent(&Intent::new(n as u32, &[b"fill"])),
         };
         drive(
             put_state(Ulid::from_parts(77, 1), install_id, put.clone()),
@@ -70,11 +72,11 @@ async fn fill(ctx: &DriverContext, install_id: Ulid) -> u64 {
         .unwrap();
     }
     let left = MAX_STATE_BYTES as usize - used - PAD.len() - 8;
-    let pad = StatePut {
+    let pad = StateWrite {
         key: PAD.into(),
         value: vec![0u8; left],
         expected: None,
-        intent: Intent::new(9_000, &[b"pad"]),
+        intent: call_intent(&Intent::new(9_000, &[b"pad"])),
     };
     drive(
         put_state(Ulid::from_parts(77, 1), install_id, pad.clone()),
@@ -195,10 +197,10 @@ async fn retry_delivers_once() {
     let fixture = Fixture::new().await;
     let held = held(&fixture).await;
     let (blob, install) = (&held.blob, &held.install);
-    let free = StateRemove {
+    let free = StateRemoval {
         key: PAD.into(),
         expected: held.pad,
-        intent: Intent::new(9_001, &[b"free"]),
+        intent: call_intent(&Intent::new(9_001, &[b"free"])),
     };
     let freed = drive(
         remove_state(Ulid::from_parts(77, 1), install.install_id, free),

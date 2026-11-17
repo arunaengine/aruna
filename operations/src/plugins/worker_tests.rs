@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::driver::drive;
+use crate::plugins::broker::call_intent;
 use crate::plugins::copies::store_local;
 use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
@@ -197,7 +198,7 @@ async fn finishes_runs() {
     let ok = admitted(&fixture, &install, 1, "echo").await;
     let unsure = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    let unknown = unknown_row(unsure.run_id, &intent, "timed out").unwrap();
+    let unknown = unknown_row(unsure.run_id, &call_intent(&intent), "timed out").unwrap();
     drive(write_rows(vec![unknown]), &fixture.ctx)
         .await
         .unwrap();
@@ -528,7 +529,7 @@ async fn removed_with_intents() {
     let open = admitted(&fixture, &install, 1, "echo").await;
     let clean = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    let unknown = unknown_row(open.run_id, &intent, "timed out").unwrap();
+    let unknown = unknown_row(open.run_id, &call_intent(&intent), "timed out").unwrap();
     drive(write_rows(vec![unknown]), ctx).await.unwrap();
     remove_install(ctx, actor, &auth, install.install_id)
         .await

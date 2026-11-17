@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use crate::plugins::broker::call_intent;
 use crate::plugins::worker::prune_runs;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
@@ -117,10 +118,10 @@ async fn pruned_runs() {
         run.finish(state, None, finished);
         drive(save_run(&run).unwrap(), &ctx).await.unwrap();
         let intent = Intent::new(0, &[b"x"]);
-        drive(begin(run.run_id, intent.clone()), &ctx)
+        drive(begin(run.run_id, call_intent(&intent)), &ctx)
             .await
             .unwrap();
-        let settled = settled_row(run.run_id, &intent, "r".into()).unwrap();
+        let settled = settled_row(run.run_id, &call_intent(&intent), "r".into()).unwrap();
         drive(write_rows(vec![settled]), &ctx).await.unwrap();
         ended.push(run);
     }
@@ -210,7 +211,7 @@ async fn keeps_open_calls() {
     drive(admit(run.clone()), &ctx).await.unwrap();
     run.finish(RunState::Failed, None, 10);
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
-    let unknown = unknown_row(run.run_id, &Intent::new(0, &[b"x"]), "lost").unwrap();
+    let unknown = unknown_row(run.run_id, &call_intent(&Intent::new(0, &[b"x"])), "lost").unwrap();
     drive(write_rows(vec![unknown]), &ctx).await.unwrap();
     assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
     assert!(drive(read_run(install, run.run_id), &ctx).await.is_ok());
@@ -272,7 +273,7 @@ async fn resolved_expire() {
     let mut run = queued(install, 1);
     drive(admit(run.clone()), &ctx).await.unwrap();
     let intent = Intent::new(0, &[b"x"]);
-    let unknown = unknown_row(run.run_id, &intent, "lost").unwrap();
+    let unknown = unknown_row(run.run_id, &call_intent(&intent), "lost").unwrap();
     drive(write_rows(vec![unknown]), &ctx).await.unwrap();
     run.finish(
         RunState::NeedsAttention,
@@ -301,7 +302,11 @@ async fn resolved_expire() {
         drive(read_run(install, run.run_id), &ctx).await,
         Err(RunError::NotFound)
     );
-    assert!(!drive(written(run.run_id, &intent), &ctx).await.unwrap());
+    assert!(
+        !drive(written(run.run_id, &call_intent(&intent)), &ctx)
+            .await
+            .unwrap()
+    );
 }
 
 /// A page answer of `count` queue rows.

@@ -632,7 +632,7 @@ async fn keyed_creates() {
     );
     // A lost reply leaves the call unknown in its run; the next run recovers by the key.
     let lost = "the reply was lost";
-    let unknown = unknown_row(scope.run.run_id, &first.intent, lost).unwrap();
+    let unknown = unknown_row(scope.run.run_id, &call_intent(&first.intent), lost).unwrap();
     drive(write_rows(vec![unknown]), &broker.ctx).await.unwrap();
     let unknown = creator.metadata_create(&cx(), first).await.unwrap_err();
     assert_eq!(unknown.kind, ErrorKind::UnknownOutcome);
