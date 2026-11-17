@@ -2,6 +2,416 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::notification::{
+    DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
+    notification_inbox_key, notification_prune_key, parse_prune_key,
+};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use smallvec::smallvec;
+use thiserror::Error;
+use tracing::warn;
+
+pub const PRUNE_PAGE_SIZE: usize = 512;
+pub const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
+pub const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NotificationPruneOutcome {
+    pub expired: usize,
+    pub capped: usize,
+    pub has_more: bool,
+    pub next_due_after: Option<Duration>,
+}
+
+impl NotificationPruneOutcome {
+    /// When the prune timer runs again: at once while due rows remain, else at the next due
+    /// row, at the latest after the poll interval.
+    pub fn rearm(&self) -> Duration {
+        if self.has_more {
+            return Duration::ZERO;
+        }
+        (self.next_due_after)
+            .unwrap_or(NOTIFICATION_POLL_AFTER)
+            .min(NOTIFICATION_POLL_AFTER)
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PruneError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("unexpected event in {state}: {got}")]
+    UnexpectedEvent { state: &'static str, got: String },
+    #[error("the notification prune did not finish")]
+    NotFinished,
+}
+
+/// One due row of the prune index and the two inbox rows it may name; only one class matches.
+#[derive(Debug, PartialEq)]
+struct Candidate {
+    index: Key,
+    direct: Key,
+    transient: Key,
+}
+
+/// Where a phase continues after its current page.
+#[derive(Debug, Default, PartialEq)]
+struct Scan {
+    next: Option<Key>,
+    stopped: bool,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum PruneState {
+    #[default]
+    Init,
+    IndexPage,
+    IndexRows {
+        candidates: Vec<Candidate>,
+        scan: Scan,
+    },
+    IndexDelete,
+    InboxPage,
+    InboxDelete {
+        next: Option<Key>,
+    },
+    CutoffPage,
+    CutoffStart {
+        keys: Vec<Key>,
+        next: Option<Key>,
+    },
+    CutoffRead {
+        txn_id: TxnId,
+        next: Option<Key>,
+    },
+    CutoffDelete {
+        txn_id: TxnId,
+        next: Option<Key>,
+    },
+    CutoffCommit {
+        txn_id: TxnId,
+        next: Option<Key>,
+    },
+    Done,
+    Failed(PruneError),
+}
+
+impl PruneState {
+    fn name(&self) -> &'static str {
+        match self {
+            PruneState::Init => "init",
+            PruneState::IndexPage => "index page",
+            PruneState::IndexRows { .. } => "index rows",
+            PruneState::IndexDelete => "index delete",
+            PruneState::InboxPage => "inbox page",
+            PruneState::InboxDelete { .. } => "inbox delete",
+            PruneState::CutoffPage => "cutoff page",
+            PruneState::CutoffStart { .. } => "cutoff start",
+            PruneState::CutoffRead { .. } => "cutoff read",
+            PruneState::CutoffDelete { .. } => "cutoff delete",
+            PruneState::CutoffCommit { .. } => "cutoff commit",
+            PruneState::Done => "done",
+            PruneState::Failed(_) => "failed",
+        }
+    }
+
+    fn txn_id(&self) -> Option<TxnId> {
+        match self {
+            PruneState::CutoffRead { txn_id, .. }
+            | PruneState::CutoffDelete { txn_id, .. }
+            | PruneState::CutoffCommit { txn_id, .. } => Some(*txn_id),
+            _ => None,
+        }
+    }
+}
+
+/// One prune run: the due rows of the prune index (at most four pages of them), then a sweep of
+/// the inbox for expired and over-cap transient rows, then a sweep of outlived deletion times.
+#[derive(Debug, PartialEq)]
+pub struct PruneNotificationsOperation {
+    now_ms: u64,
+    page_size: usize,
+    state: PruneState,
+    outcome: NotificationPruneOutcome,
+    /// Index rows processed so far; at four pages the run stops and asks to run again.
+    processed: usize,
+    deletes: Vec<(KeySpace, Key)>,
+    recipient: Option<Vec<u8>>,
+    transient_seen: usize,
+}
+
+impl PruneNotificationsOperation {
+    pub fn new(now_ms: u64, page_size: usize) -> Self {
+        Self {
+            now_ms,
+            page_size,
+            state: PruneState::Init,
+            outcome: NotificationPruneOutcome::default(),
+            processed: 0,
+            deletes: Vec::new(),
+            recipient: None,
+            transient_seen: 0,
+        }
+    }
+
+    fn iter(&self, key_space: &str, start_after: Option<Key>) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: self.page_size,
+            txn_id: None,
+        })]
+    }
+
+    fn fail(&mut self, error: PruneError) -> Effects {
+        let txn_id = self.state.txn_id();
+        self.state = PruneState::Failed(error);
+        match txn_id {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
+    }
+
+    fn unexpected(&mut self, event: Event) -> Effects {
+        let error = match event {
+            Event::Storage(StorageEvent::Error { error }) => PruneError::Storage(error),
+            other => PruneError::UnexpectedEvent {
+                state: self.state.name(),
+                got: format!("{other:?}"),
+            },
+        };
+        self.fail(error)
+    }
+
+    fn index_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        if values.is_empty() {
+            return self.delete_index();
+        }
+        let deletion_cap = self.page_size.saturating_mul(4);
+        let mut candidates = Vec::new();
+        let mut scan = Scan {
+            next,
+            stopped: false,
+        };
+        for (key, _) in values {
+            let (expires_at_ms, recipient, notification_id) = match parse_prune_key(key.as_ref()) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    warn!(%error, key = ?key.as_ref(), "Deleting malformed notification prune index row");
+                    self.deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), key));
+                    continue;
+                }
+            };
+            if expires_at_ms > self.now_ms {
+                let due = expires_at_ms.saturating_sub(self.now_ms);
+                self.outcome.next_due_after = Some(Duration::from_millis(due));
+                scan.stopped = true;
+                break;
+            }
+            // Saturated expiry is future, so the scan stops before unmatched candidates.
+            let inbox_key = |ttl_ms: u64| {
+                let created_ms = expires_at_ms.saturating_sub(ttl_ms);
+                notification_inbox_key(recipient, created_ms, notification_id)
+            };
+            candidates.push(Candidate {
+                index: key,
+                direct: inbox_key(DIRECT_TTL_MS),
+                transient: inbox_key(TRANSIENT_TTL_MS),
+            });
+            self.processed = self.processed.saturating_add(1);
+            if self.processed >= deletion_cap {
+                self.outcome.has_more = true;
+                scan.stopped = true;
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            return self.index_continue(scan);
+        }
+        let space = || NOTIFICATION_INBOX_KEYSPACE.to_string();
+        let reads = (candidates.iter())
+            .flat_map(|row| [(space(), row.direct.clone()), (space(), row.transient.clone())])
+            .collect();
+        self.state = PruneState::IndexRows { candidates, scan };
+        smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None
+        })]
+    }
+
+    fn index_rows(
+        &mut self,
+        candidates: Vec<Candidate>,
+        scan: Scan,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Effects {
+        let exists = |at: usize| values.get(at).is_some_and(|(_, value)| value.is_some());
+        for (at, row) in candidates.into_iter().enumerate() {
+            self.deletes.push((PRUNE_INDEX_KEYSPACE.to_string(), row.index));
+            let inbox = if exists(at * 2) {
+                Some(row.direct)
+            } else if exists(at * 2 + 1) {
+                Some(row.transient)
+            } else {
+                None
+            };
+            match inbox {
+                Some(key) => {
+                    self.deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
+                    self.outcome.expired = self.outcome.expired.saturating_add(1);
+                }
+                None => warn!("Deleting orphan notification prune index row"),
+            }
+        }
+        self.index_continue(scan)
+    }
+
+    fn index_continue(&mut self, scan: Scan) -> Effects {
+        match (scan.stopped, scan.next) {
+            (false, Some(next)) => {
+                self.state = PruneState::IndexPage;
+                self.iter(PRUNE_INDEX_KEYSPACE, Some(next))
+            }
+            _ => self.delete_index(),
+        }
+    }
+
+    fn delete_index(&mut self) -> Effects {
+        let deletes = std::mem::take(&mut self.deletes);
+        if deletes.is_empty() {
+            return self.inbox_next(None);
+        }
+        self.state = PruneState::IndexDelete;
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None
+        })]
+    }
+
+    fn inbox_next(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = PruneState::InboxPage;
+        self.iter(NOTIFICATION_INBOX_KEYSPACE, start_after)
+    }
+
+    fn inbox_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        if values.is_empty() {
+            return self.cutoff_next(None);
+        }
+        let mut deletes = Vec::new();
+        for (key, value) in values {
+            if key.len() != 72 {
+                warn!(key = ?key.as_ref(), "Skipping malformed notification inbox key during prune sweep");
+                continue;
+            }
+            let recipient_prefix = &key.as_ref()[..48];
+            if self.recipient.as_deref() != Some(recipient_prefix) {
+                self.recipient = Some(recipient_prefix.to_vec());
+                self.transient_seen = 0;
+            }
+            let record = match NotificationRecord::from_bytes(value.as_ref()) {
+                Ok(record) => record,
+                Err(error) => {
+                    warn!(%error, key = ?key.as_ref(), "Skipping malformed notification inbox record during prune sweep");
+                    continue;
+                }
+            };
+            let index = || (PRUNE_INDEX_KEYSPACE.to_string(), notification_prune_key(&record));
+            if record.expires_at_ms() <= self.now_ms {
+                deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
+                deletes.push(index());
+                self.outcome.expired = self.outcome.expired.saturating_add(1);
+                continue;
+            }
+            if record.class == NotificationClass::Transient {
+                self.transient_seen = self.transient_seen.saturating_add(1);
+                if self.transient_seen > TRANSIENT_USER_CAP {
+                    deletes.push((NOTIFICATION_INBOX_KEYSPACE.to_string(), key));
+                    deletes.push(index());
+                    self.outcome.capped = self.outcome.capped.saturating_add(1);
+                }
+            }
+        }
+        if deletes.is_empty() {
+            return self.inbox_after(next);
+        }
+        self.state = PruneState::InboxDelete { next };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None
+        })]
+    }
+
+    fn inbox_after(&mut self, next: Option<Key>) -> Effects {
+        match next {
+            Some(next) => self.inbox_next(Some(next)),
+            None => self.cutoff_next(None),
+        }
+    }
+
+    fn cutoff_next(&mut self, start_after: Option<Key>) -> Effects {
+        self.state = PruneState::CutoffPage;
+        self.iter(NOTIFICATION_CUTOFF_KEYSPACE, start_after)
+    }
+
+    fn cutoff_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        let keys: Vec<Key> = (values.into_iter())
+            .filter(|(_, value)| cutoff_expired(Some(value), self.now_ms))
+            .map(|(key, _)| key)
+            .collect();
+        if keys.is_empty() {
+            return self.cutoff_after(next);
+        }
+        self.state = PruneState::CutoffStart { keys, next };
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn cutoff_after(&mut self, next: Option<Key>) -> Effects {
+        match next {
+            Some(next) => self.cutoff_next(Some(next)),
+            None => {
+                self.state = PruneState::Done;
+                smallvec![]
+            }
+        }
+    }
+
+    /// Deletes only the deletion times still outlived when read again inside the transaction,
+    /// so one a bucket deletion renewed meanwhile stays.
+    fn cutoff_read(&mut self, txn_id: TxnId, next: Option<Key>, values: Vec<(Key, Option<Value>)>) -> Effects {
+        let deletes: Vec<(KeySpace, Key)> = (values.into_iter())
+            .filter(|(_, value)| cutoff_expired(value.as_ref(), self.now_ms))
+            .map(|(key, _)| (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key))
+            .collect();
+        if deletes.is_empty() {
+            return self.cutoff_commit(txn_id, next);
+        }
+        self.state = PruneState::CutoffDelete { txn_id, next };
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id)
+        })]
+    }
+
+    fn cutoff_commit(&mut self, txn_id: TxnId, next: Option<Key>) -> Effects {
+        self.state = PruneState::CutoffCommit { txn_id, next };
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
