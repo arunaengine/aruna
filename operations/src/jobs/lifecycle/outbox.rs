@@ -296,7 +296,13 @@ impl Operation for PublishRecordOperation {
                     got: format!("{other:?}"),
                 }),
             },
-            PublishState::Init | PublishState::Finish | PublishState::Error => smallvec![],
+            PublishState::Init | PublishState::Finish | PublishState::Error => {
+                self.fail(LifecycleError::UnexpectedEvent {
+                    state: format!("{:?}", self.state),
+                    expected: "no event",
+                    got: format!("{event:?}"),
+                })
+            }
         }
     }
 
