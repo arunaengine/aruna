@@ -401,3 +401,45 @@ fn apply_decisions() {
     assert_eq!(written.acked, 3);
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish((1, true)));
 }
+
+#[test]
+fn expired_rows_counted() {
+    let install = Ulid::from_parts(1, 1);
+    let row = |queued_ms| ForwardRow {
+        install_id: install,
+        revision: 1,
+        event: SourceEvent {
+            kind: SourceKind::DatasetCreated,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: format!("s{queued_ms}"),
+            actor: None,
+            anchor_ms: queued_ms,
+            journaled_ms: queued_ms,
+        },
+        queued_ms,
+    };
+    let now = SEND_EXPIRY_MS + 10;
+    let mut plan = ExpireRows {
+        install_id: install,
+        now_ms: now,
+        phase: ExpirePhase::Reading,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let (old, kept) = (encode(&row(1)).unwrap(), encode(&row(now)).unwrap());
+    let page = vec![(b"o".to_vec(), old), (b"k".to_vec(), kept.clone())];
+    let Turn::Ask(Ask::Read(reads)) = plan.next(Answer::Page(page, None)).unwrap() else {
+        panic!("the expired row's gap is read");
+    };
+    assert_eq!(reads.len(), 1);
+    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Values(vec![None])).unwrap() else {
+        panic!("the gap is written");
+    };
+    assert_eq!(rows.len(), 1);
+    let deleted = Ask::Delete(vec![(PLUGIN_OUTBOX_KEYSPACE, b"o".to_vec())]);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Ask(deleted));
+    let rest = vec![(b"k".to_vec(), kept)];
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(rest));
+}
