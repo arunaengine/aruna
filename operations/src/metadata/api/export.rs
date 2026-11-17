@@ -158,7 +158,7 @@ pub(super) async fn export_raw_txn(
         crate::metadata::raw_revision::load_raw_view(context, record.document_id, Some(txn_id))
             .await
             .map_err(|error| match error {
-                crate::metadata::raw_revision::RawReadError::LimitExceeded(_) => {
+                crate::metadata::raw_events::RawReadError::LimitExceeded(_) => {
                     MetadataApiError::ServiceUnavailable
                 }
                 error => MetadataApiError::Internal(error.to_string()),

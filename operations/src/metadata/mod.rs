@@ -37,6 +37,7 @@ pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
 mod queue_storage;
+pub(crate) mod raw_events;
 pub mod raw_revision;
 pub mod record_reads;
 pub mod repository;

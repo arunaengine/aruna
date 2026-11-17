@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
@@ -11,61 +11,25 @@ use aruna_core::keyspaces::{
     RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    EVENT_LIMIT, GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
+    GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
     MetadataEventRecord, MetadataLifecycleRecord, MetadataMergedRevision, MetadataRawRevision,
-    RAW_BYTES_LIMIT, apply_raw_event, raw_context_digest, resolve_raw_revision,
+    apply_raw_event, raw_context_digest, resolve_raw_revision,
 };
 use aruna_core::storage_entries::{
-    document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
-    pending_projection_target, raw_revision_key,
+    document_lifecycle_key, event_log_key, graph_lifecycle_key, raw_revision_key,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::TxnId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::raw_events::{
+    RAW_ENCODED_LIMIT, RawEventsOperation, RawLoadBudget, RawReadError, budget_error,
+    validate_raw_entry,
+};
 use crate::metadata::repository::{parse_status_read, read_status_effect};
-
-const RAW_PAGE_SIZE: usize = 1;
-const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
-const RAW_ENCODED_LIMIT: usize = RAW_BYTES_LIMIT as usize;
-
-#[derive(Debug, Default)]
-struct RawLoadBudget {
-    events: usize,
-    encoded_bytes: usize,
-}
-
-impl RawLoadBudget {
-    fn inspect(&mut self, encoded_bytes: usize) -> Result<(), RawReadError> {
-        self.encoded_bytes = self
-            .encoded_bytes
-            .checked_add(encoded_bytes)
-            .ok_or_else(|| budget_error("encoded bytes overflow"))?;
-        if self.encoded_bytes > RAW_ENCODED_LIMIT {
-            return Err(budget_error("encoded byte limit exceeded"));
-        }
-        Ok(())
-    }
-
-    fn accept(&mut self) -> Result<(), RawReadError> {
-        self.events = self
-            .events
-            .checked_add(1)
-            .ok_or_else(|| budget_error("event count overflow"))?;
-        if self.events > RAW_EVENT_LIMIT {
-            return Err(budget_error("event count limit exceeded"));
-        }
-        Ok(())
-    }
-}
-
-fn budget_error(message: &str) -> RawReadError {
-    RawReadError::LimitExceeded(message.to_string())
-}
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
@@ -112,24 +76,6 @@ pub struct MetadataRawView {
     pub revision: MetadataRawRevision,
     pub projection_state: MaterializationState,
     pub projected_event_id: Option<Ulid>,
-}
-
-#[derive(Debug, Error)]
-pub enum RawReadError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
-    #[error("unexpected metadata raw-read event: {0}")]
-    UnexpectedEvent(String),
-    #[error("metadata raw-read limit exceeded: {0}")]
-    LimitExceeded(String),
-    /// The event log itself is inconsistent, so retrying the same read cannot
-    /// help. Kept apart from [`Self::UnexpectedEvent`], which is adapter noise.
-    #[error("inconsistent metadata raw event log: {0}")]
-    InconsistentLog(String),
 }
 
 pub(crate) async fn load_raw_view(
@@ -189,13 +135,9 @@ pub async fn load_raw_revision(
     {
         return Ok(state.revision);
     }
-    let events = load_raw_events(
+    let events = drive(
+        RawEventsOperation::new(document_id, None, None, txn_id, RawLoadBudget::default()),
         context,
-        document_id,
-        None,
-        None,
-        txn_id,
-        RawLoadBudget::default(),
     )
     .await?;
     resolve_raw_revision(&events).map_err(Into::into)
@@ -277,13 +219,15 @@ pub(crate) async fn prepare_raw_event(
         // event must neither rebuild it nor overwrite it.
         Some(state) if state.merged => (state.clone(), false),
         Some(state) if event.event_id > state.last_event_id => {
-            let events = load_raw_events(
+            let events = drive(
+                RawEventsOperation::new(
+                    event.record.document_id,
+                    Some(state.last_event_id),
+                    Some(event.event_id),
+                    None,
+                    RawLoadBudget::default(),
+                ),
                 context,
-                event.record.document_id,
-                Some(state.last_event_id),
-                Some(event.event_id),
-                None,
-                RawLoadBudget::default(),
             )
             .await?;
             if !events
@@ -409,13 +353,15 @@ async fn initial_raw_state(
             vec![event.clone()]
         }
         _ => {
-            load_raw_events(
+            drive(
+                RawEventsOperation::new(
+                    event.record.document_id,
+                    None,
+                    Some(event.event_id),
+                    None,
+                    RawLoadBudget::default(),
+                ),
                 context,
-                event.record.document_id,
-                None,
-                Some(event.event_id),
-                None,
-                RawLoadBudget::default(),
             )
             .await?
         }
@@ -449,13 +395,15 @@ async fn rebuild_raw_state(
     budget.accept()?;
     let mut events = vec![first];
     events.extend(
-        load_raw_events(
+        drive(
+            RawEventsOperation::new(
+                event.record.document_id,
+                Some(start_event_id),
+                Some(end_event_id),
+                None,
+                budget,
+            ),
             context,
-            event.record.document_id,
-            Some(start_event_id),
-            Some(end_event_id),
-            None,
-            budget,
         )
         .await?,
     );
@@ -610,105 +558,10 @@ async fn read_raw_event(
     }
 }
 
-async fn load_raw_events(
-    context: &DriverContext,
-    document_id: Ulid,
-    start_after: Option<Ulid>,
-    event_cursor: Option<Ulid>,
-    txn_id: Option<TxnId>,
-    mut budget: RawLoadBudget,
-) -> Result<Vec<MetadataEventRecord>, RawReadError> {
-    let prefix = event_log_prefix(document_id);
-    let mut start: Option<Key> = start_after.map(|event_id| event_log_key(document_id, event_id));
-    let mut events = Vec::new();
-    loop {
-        let remaining = RAW_EVENT_LIMIT.saturating_sub(budget.events);
-        if remaining == 0 {
-            return Err(budget_error("event count limit exceeded"));
-        }
-        let page_limit = remaining.min(RAW_PAGE_SIZE);
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: EVENT_LOG_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start.take().map(IterStart::After),
-                limit: page_limit,
-                txn_id,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(RawReadError::UnexpectedEvent(other.label().to_string()));
-            }
-        };
-        if values.len() > page_limit {
-            return Err(budget_error("page size limit exceeded"));
-        }
-        if values.is_empty() && next_start_after.is_some() {
-            return Err(budget_error("empty page has continuation"));
-        }
-        let mut reached_cursor = false;
-        for (key, value) in values {
-            budget.inspect(value.len())?;
-            let event: MetadataEventRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_entry(document_id, &key, &event)?;
-            if event_cursor.is_some_and(|cursor| event.event_id > cursor) {
-                reached_cursor = true;
-                break;
-            }
-            budget.accept()?;
-            events.push(event);
-        }
-        if reached_cursor {
-            break;
-        }
-        let Some(next) = next_start_after else {
-            break;
-        };
-        start = Some(next);
-    }
-    Ok(events)
-}
-
-fn validate_raw_entry(
-    document_id: Ulid,
-    key: &[u8],
-    event: &MetadataEventRecord,
-) -> Result<(), RawReadError> {
-    let Some((key_document_id, key_event_id)) = pending_projection_target(key) else {
-        return Err(RawReadError::InconsistentLog(
-            "raw event key has invalid identity".to_string(),
-        ));
-    };
-    if key_document_id != document_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event key belongs to document {key_document_id}"
-        )));
-    }
-    if event.record.document_id != document_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event belongs to document {}",
-            event.record.document_id
-        )));
-    }
-    if event.event_id != key_event_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event key mismatch for {document_id}/{key_event_id}"
-        )));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::raw_events::{RAW_EVENT_LIMIT, RAW_PAGE_SIZE};
     use aruna_core::storage_entries::create_event_entry;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;

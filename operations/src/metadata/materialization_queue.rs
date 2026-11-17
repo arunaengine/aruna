@@ -52,7 +52,8 @@ use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
 };
-use super::raw_revision::{RawReadError, RawStateCache};
+use super::raw_events::RawReadError;
+use super::raw_revision::RawStateCache;
 use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 const MATERIALIZATION_PAGE_SIZE: usize = 512;
