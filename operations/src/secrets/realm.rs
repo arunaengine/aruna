@@ -61,7 +61,7 @@ pub enum RealmSecretError {
     #[error("this node is not a realm management node")]
     NotManagementNode,
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent { state: &'static str, got: &'static str },
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -127,7 +127,7 @@ impl RealmSecretOperation {
     }
 
     fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         self.fail(RealmSecretError::UnexpectedEvent { state, got })
     }
 
@@ -343,10 +343,9 @@ impl Operation for RealmSecretOperation {
             }
             (State::ReadCurrent, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 let [(_, document), (_, reducer), (_, auth)] = values.as_slice() else {
-                    let got = format!("{} values", values.len());
                     return self.fail(RealmSecretError::UnexpectedEvent {
                         state: "ReadCurrent",
-                        got,
+                        got: "a batch of another length",
                     });
                 };
                 match self.write(document.clone(), reducer.clone(), auth.clone()) {

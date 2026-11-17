@@ -45,7 +45,7 @@ pub enum NodeSecretError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent { state: &'static str, got: &'static str },
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -117,7 +117,7 @@ impl NodeSecretOperation {
     }
 
     fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         self.fail(NodeSecretError::UnexpectedEvent { state, got })
     }
 
@@ -381,7 +381,7 @@ impl Operation for NodeSecretsOperation {
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
             other => Err(NodeSecretError::UnexpectedEvent {
                 state: "Iter",
-                got: format!("{other:?}"),
+                got: other.label(),
             }),
         });
         smallvec![]
