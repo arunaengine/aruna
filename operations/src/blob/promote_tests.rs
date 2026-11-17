@@ -4,9 +4,8 @@
 
 use super::*;
 use crate::blob::unlocked::{drop_mismatch, promote_unlocked, read_value};
-use aruna_core::calls::ChildOutcome;
 use aruna_core::events::StorageEvent;
-use aruna_core::operation::{EffectOperation, Runnable, SubOperation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::structs::storage::abe::envelope_charge;
 use aruna_core::structs::storage::blob::{BackendRef, VersionKey};
 use aruna_core::structs::storage::encryption::ReadLease;
@@ -21,73 +20,7 @@ const BLAKE3: [u8; 32] = [9; 32];
 /// The transaction id the page transactions of these tests get.
 const TXN: Ulid = Ulid::from_bytes([7; 16]);
 
-/// Runs a promotion and the page children it starts on the events a test feeds it.
-struct Stepper {
-    machine: Box<dyn SubOperation>,
-    child: Option<Box<dyn SubOperation>>,
-}
-
-impl Stepper {
-    fn new(operation: PromotePendingOperation) -> (Self, Effects) {
-        let mut machine =
-            boxed_suboperation(operation, |result| Event::Child(ChildOutcome::new(result)));
-        let effects = machine.start();
-        let mut stepper = Self {
-            machine,
-            child: None,
-        };
-        let effects = stepper.enter(effects);
-        (stepper, effects)
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let Some(child) = self.child.as_mut() else {
-            let effects = self.machine.step(event);
-            return self.enter(effects);
-        };
-        let mut effects = child.step(event);
-        if !child.is_complete() {
-            return effects;
-        }
-        if let Some(child) = self.child.take() {
-            let next = self.machine.step(child.finalize());
-            effects.extend(self.enter(next));
-        }
-        effects
-    }
-
-    /// Starts a child the promotion asked for and returns the child's first effects.
-    fn enter(&mut self, mut effects: Effects) -> Effects {
-        loop {
-            match effects.pop() {
-                Some(Effect::SubOperation(mut child)) if effects.is_empty() => {
-                    let started = child.start();
-                    if !child.is_complete() {
-                        self.child = Some(child);
-                        return started;
-                    }
-                    effects = self.machine.step(child.finalize());
-                }
-                Some(effect) => {
-                    effects.push(effect);
-                    return effects;
-                }
-                None => return effects,
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.child.is_none() && self.machine.is_complete()
-    }
-
-    fn finish(self) -> Result<Promotion, PromoteError> {
-        let Event::Child(outcome) = self.machine.finalize() else {
-            panic!("the promotion ended without its outcome")
-        };
-        outcome.take().expect("the promotion outcome")
-    }
-}
+type Stepper = crate::stepper::Stepper<Promotion, PromoteError>;
 
 fn committed() -> Event {
     Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
