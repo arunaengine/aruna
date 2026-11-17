@@ -43,6 +43,18 @@ pub enum IoCall {
     Delay(Duration),
 }
 
+/// A sub-operation, group or delay effect becomes its own call; any other effect passes through.
+impl From<Effect> for IoCall {
+    fn from(effect: Effect) -> Self {
+        match effect {
+            Effect::SubOperation(child) => Self::Child(child),
+            Effect::Group(group) => Self::Group(group),
+            Effect::Delay(after) => Self::Delay(after),
+            other => Self::Effect(Box::new(other)),
+        }
+    }
+}
+
 /// The answer to an [`IoCall`].
 #[derive(Debug, PartialEq)]
 pub enum IoResult {
