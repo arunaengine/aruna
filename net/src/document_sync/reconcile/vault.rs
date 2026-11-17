@@ -5,8 +5,9 @@
 
 use aruna_core::keyspaces::{VAULT_RETIRED_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::structs::identity::user::vault::{
-    UserKeyRecord, VaultRevision, head_rows, record_rows, user_record_key,
+    VaultRevision, head_rows, record_rows, user_record_key,
 };
+use aruna_core::sync_checks::check_vault_record;
 
 use super::metadata::MetadataOutcome;
 use super::validate::relay_publisher_allowed;
@@ -38,37 +39,11 @@ pub(super) async fn apply_vault_event(
     else {
         return reject("vault records are upserts");
     };
-    let checked = match target {
-        DocumentTarget::VaultRevision { .. } => VaultRevision::from_bytes(bytes)
-            .ok()
-            .filter(|record| record.validate().is_ok())
-            .map(|record| {
-                let signed = record.origin_signed();
-                (record.target(), record.sync_change(), signed, Some(record))
-            }),
-        DocumentTarget::UserKey { .. } => UserKeyRecord::from_bytes(bytes)
-            .ok()
-            .filter(|record| record.validate().is_ok())
-            .map(|record| {
-                let signed = record.origin_signed();
-                (record.target(), record.sync_change(), signed, None)
-            }),
-        _ => None,
+    let revision = match check_vault_record(target, bytes, change, service.realm_id) {
+        Ok(revision) => revision,
+        Err(reason) => return reject(reason),
     };
-    let Some((expected, expected_change, signed, revision)) = checked else {
-        return reject("vault record is malformed or out of bounds");
-    };
-    let realm_id = match target {
-        DocumentTarget::VaultRevision { realm_id, .. }
-        | DocumentTarget::UserKey { realm_id, .. } => *realm_id,
-        _ => return reject("vault record has another target"),
-    };
-    if expected != *target || expected_change != *change || realm_id != service.realm_id {
-        return reject("vault record does not match its target, change or realm");
-    }
-    if !signed {
-        return reject("vault record lacks its origin signature");
-    }
+    let realm_id = service.realm_id;
     if !published_by(topic_id, actor_id, &change.current.actor)
         && !relay_publisher_allowed(&service.storage, topic_id, actor_id, realm_id).await?
     {

@@ -14,6 +14,7 @@ use crate::structs::execution::notification_watch::{
 };
 use crate::structs::execution::setting::validate_setting;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::vault::{UserKeyRecord, VaultRevision};
 use crate::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_change,
 };
@@ -412,6 +413,48 @@ pub fn validate_link(
     Ok(())
 }
 
+/// Checks a replicated vault revision or user key record: it decodes and validates, addresses
+/// `target` in `realm_id`, carries the change it derives and its origin signature. Returns the
+/// decoded revision for a vault revision; the error is the rejection reason.
+pub fn check_vault_record(
+    target: &DocumentTarget,
+    bytes: &[u8],
+    change: &DocumentChange,
+    realm_id: RealmId,
+) -> Result<Option<VaultRevision>, &'static str> {
+    let checked = match target {
+        DocumentTarget::VaultRevision { .. } => VaultRevision::from_bytes(bytes)
+            .ok()
+            .filter(|record| record.validate().is_ok())
+            .map(|record| {
+                let signed = record.origin_signed();
+                (record.target(), record.sync_change(), signed, Some(record))
+            }),
+        DocumentTarget::UserKey { .. } => UserKeyRecord::from_bytes(bytes)
+            .ok()
+            .filter(|record| record.validate().is_ok())
+            .map(|record| {
+                let signed = record.origin_signed();
+                (record.target(), record.sync_change(), signed, None)
+            }),
+        _ => None,
+    };
+    let Some((expected, expected_change, signed, revision)) = checked else {
+        return Err("vault record is malformed or out of bounds");
+    };
+    let target_realm = match target {
+        DocumentTarget::VaultRevision { realm_id, .. }
+        | DocumentTarget::UserKey { realm_id, .. } => *realm_id,
+        _ => return Err("vault record has another target"),
+    };
+    if expected != *target || expected_change != *change || target_realm != realm_id {
+        return Err("vault record does not match its target, change or realm");
+    }
+    if !signed {
+        return Err("vault record lacks its origin signature");
+    }
+    Ok(revision)
+}
 /// Whether `actor_id` is the Irokle actor of `node_id` on `topic_id`, that is, whether that node
 /// signed the event.
 pub fn published_by(
