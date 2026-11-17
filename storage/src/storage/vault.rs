@@ -275,12 +275,14 @@ mod tests {
         };
         use aruna_core::structs::identity::realm::RealmId;
         let entry = RealmVaultEntry::new(RealmVaultPurpose::NamedSecret, Ulid::from_bytes([5; 16]));
+        let realm_id = RealmId::from_bytes([3u8; 32]);
         let record = RealmVaultRecord {
             entry,
             revision: Ulid::from_bytes([6; 16]),
             sealed: vec![0; 40],
+            changed_by: aruna_core::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
+            changed_at_ms: 1,
         };
-        let realm_id = RealmId::from_bytes([3u8; 32]);
         let effect = StorageEffect::RealmOpen(Box::new(RealmSealed::Record { realm_id, record }));
         let directory = tempfile::tempdir().unwrap();
         let handle = open(directory.path().to_str().unwrap(), Some(1));

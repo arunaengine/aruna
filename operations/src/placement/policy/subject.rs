@@ -3,26 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done, values};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{
-    ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
+    ManagedCopyKey, ManagedCopyQuarantine, ManagedCopyRecord, ManagedCopyState,
 };
-use aruna_core::types::{Effects, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::debug;
 
-use aruna_core::managed_copy::{
-    COPY_PAGE_LIMIT, ManagedCopyError, ManagedCopyPage, scan_effect, transition_effect,
-};
+use aruna_core::managed_copy::{COPY_PAGE_LIMIT, ManagedCopyError};
 
-use super::gate::{GateContext, PolicyGateError, PolicyGateOperation, gate_decision, write_gate};
+use super::gate::{GateContext, PolicyGateError, PolicyGateOutcome, gate_decision, write_gate};
+use super::read::ReadPolicyError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubjectScanMode {
@@ -66,45 +64,42 @@ pub enum SubjectScanError {
 
 #[derive(Debug, PartialEq)]
 enum ScanState {
-    Init,
     ReadRecord,
     WriteRecord,
     Scan,
     Gate,
     Transition,
     Clear,
-    Finish,
-    Error,
 }
+
+type ScanTurn = Result<Next<SubjectScanResult>, SubjectScanError>;
 
 #[derive(Debug, PartialEq)]
 pub struct SubjectScanOperation {
     config: SubjectScanConfig,
     state: ScanState,
-    txn_id: Option<TxnId>,
     record: Option<NodeSubjectRecord>,
-    cursor: Option<Key>,
+    pages: PrefixPages,
     /// Rows of the current page still to decide, in reverse order.
     pending: Vec<ManagedCopyRecord>,
     current: Option<ManagedCopyRecord>,
-    gate: Option<PolicyGateOperation>,
     result: SubjectScanResult,
-    output: Option<Result<SubjectScanResult, SubjectScanError>>,
 }
 
 impl SubjectScanOperation {
     pub fn new(config: SubjectScanConfig) -> Self {
         Self {
             config,
-            state: ScanState::Init,
-            txn_id: None,
+            state: ScanState::ReadRecord,
             record: None,
-            cursor: None,
+            pages: PrefixPages::new(
+                MANAGED_COPY_KEYSPACE,
+                Key::from(Vec::new()),
+                COPY_PAGE_LIMIT,
+            ),
             pending: Vec::new(),
             current: None,
-            gate: None,
             result: SubjectScanResult::default(),
-            output: None,
         }
     }
 
@@ -119,37 +114,28 @@ impl SubjectScanOperation {
         })
     }
 
-    fn write_record(&mut self, record: NodeSubjectRecord, next: ScanState) -> Effects {
-        let value = match record.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn write_record(&mut self, record: NodeSubjectRecord, next: ScanState) -> ScanTurn {
+        let value = record.to_bytes()?;
         self.result.generation = record.subject.generation;
         self.record = Some(record);
         self.state = next;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Write(vec![(
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+            value.into(),
+        )])))
     }
 
-    fn scan_page(&mut self) -> Effects {
+    fn scan_page(&mut self) -> Next<SubjectScanResult> {
         self.state = ScanState::Scan;
-        smallvec![scan_effect(
-            None,
-            self.cursor.clone(),
-            COPY_PAGE_LIMIT,
-            self.txn_id,
-        )]
+        Next::Call(self.pages.call())
     }
 
-    fn next_copy(&mut self) -> Effects {
+    fn next_copy(&mut self) -> ScanTurn {
         let Some(record) = self.pending.pop() else {
-            return match self.cursor.is_some() {
-                true => self.scan_page(),
-                false => self.finish(),
+            return match self.pages.done() {
+                true => self.finish(),
+                false => Ok(self.scan_page()),
             };
         };
         self.result.scanned += 1;
@@ -160,27 +146,22 @@ impl SubjectScanOperation {
         // re-checks the subject alone; ownership is decided when a copy lands.
         match write_gate(self.gate_context().as_ref(), &record.policies, None) {
             Ok(None) => self.decide(record, Ok(())),
-            Ok(Some(mut gate)) => {
-                let effects = gate.start();
-                let complete = gate.is_complete();
-                self.gate = Some(gate);
+            Ok(Some(gate)) => {
                 self.current = Some(record);
                 self.state = ScanState::Gate;
-                match complete {
-                    true => self.finish_gate(),
-                    false => effects,
-                }
+                Ok(Next::Call(IoCall::child(gate)))
             }
             Err(error) => self.decide(record, Err(error)),
         }
     }
 
-    fn finish_gate(&mut self) -> Effects {
-        let (Some(gate), Some(record)) = (self.gate.take(), self.current.take()) else {
-            return self.fail(SubjectScanError::InvalidEvent("Gate"));
-        };
-        let decision = gate
-            .finalize()
+    fn finish_gate(&mut self, result: IoResult) -> ScanTurn {
+        let record = self
+            .current
+            .take()
+            .ok_or(SubjectScanError::InvalidEvent("Gate"))?;
+        let decision = result
+            .child::<PolicyGateOutcome, ReadPolicyError>()?
             .map_err(PolicyGateError::from)
             .and_then(gate_decision);
         self.decide(record, decision)
@@ -192,12 +173,12 @@ impl SubjectScanOperation {
         &mut self,
         record: ManagedCopyRecord,
         decision: Result<(), PolicyGateError>,
-    ) -> Effects {
+    ) -> ScanTurn {
         // Departure records every row unresolved without deciding it, so a
         // decision taken in that mode is a state error, not a quarantine.
         let quarantine = match self.config.mode {
             SubjectScanMode::Revalidate(reason) => reason,
-            SubjectScanMode::Depart => return self.fail(SubjectScanError::InvalidEvent("Decide")),
+            SubjectScanMode::Depart => return Err(SubjectScanError::InvalidEvent("Decide")),
         };
         let state = match decision {
             Ok(()) => ManagedCopyState::Registered,
@@ -212,7 +193,7 @@ impl SubjectScanOperation {
 
     /// A restored copy is rewritten under the subject that just admitted it, so
     /// its row never claims a generation this node no longer advertises.
-    fn transition(&mut self, record: ManagedCopyRecord, state: ManagedCopyState) -> Effects {
+    fn transition(&mut self, record: ManagedCopyRecord, state: ManagedCopyState) -> ScanTurn {
         let generation = match state {
             ManagedCopyState::Registered => self.result.generation,
             _ => record.subject_generation,
@@ -220,29 +201,26 @@ impl SubjectScanOperation {
         if record.state == state && record.subject_generation == generation {
             return self.next_copy();
         }
-        let record = record.stored_under(generation);
-        match transition_effect(&record, state, self.txn_id) {
-            Ok(effect) => {
-                self.state = ScanState::Transition;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+        let mut record = record.stored_under(generation);
+        record.state = state;
+        self.state = ScanState::Transition;
+        Ok(Next::Call(IoCall::Write(vec![copy_row(&record)?])))
     }
 
     /// Serving resumes only once no non-compliant registration remains, and a
     /// departing node never resumes at all.
-    fn finish(&mut self) -> Effects {
-        let Some(record) = self.record.clone() else {
-            return self.fail(SubjectScanError::InvalidEvent("Clear"));
-        };
+    fn finish(&mut self) -> ScanTurn {
+        let record = self
+            .record
+            .clone()
+            .ok_or(SubjectScanError::InvalidEvent("Clear"))?;
         if self.result.quarantined > 0 || matches!(self.config.mode, SubjectScanMode::Depart) {
-            return self.complete();
+            return Ok(self.complete());
         }
         self.write_record(record.cleared(), ScanState::Clear)
     }
 
-    fn complete(&mut self) -> Effects {
+    fn complete(&mut self) -> Next<SubjectScanResult> {
         debug!(
             generation = self.result.generation,
             scanned = self.result.scanned,
@@ -251,43 +229,25 @@ impl SubjectScanOperation {
             departing = matches!(self.config.mode, SubjectScanMode::Depart),
             "Placement subject scan finished"
         );
-        self.output = Some(Ok(self.result.clone()));
-        self.state = ScanState::Finish;
-        smallvec![]
+        Next::Done(self.result.clone())
     }
 
-    fn fail(&mut self, error: SubjectScanError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = ScanState::Error;
-        smallvec![]
-    }
-
-    fn handle_record(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.fail(SubjectScanError::InvalidEvent("ReadRecord"));
-        };
-        let stored = match value
-            .as_ref()
+    fn handle_record(&mut self, value: Option<Value>) -> ScanTurn {
+        let stored = value
             .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
-            .transpose()
-        {
-            Ok(stored) => stored,
-            Err(error) => return self.fail(error.into()),
-        };
+            .transpose()?;
         let Some(stored) = stored else {
             // A node with no record has never advertised: seed it blocked and
             // let this very scan decide whatever inventory already exists.
-            let mut seeded = match NodeSubjectRecord::seed(self.config.observed.clone()) {
-                Ok(seeded) => seeded,
-                Err(error) => return self.fail(PolicyGateError::from(error).into()),
-            };
+            let mut seeded = NodeSubjectRecord::seed(self.config.observed.clone())
+                .map_err(PolicyGateError::from)?;
             seeded.serving_blocked = true;
             seeded.policy_draining = true;
             return self.write_record(seeded, ScanState::WriteRecord);
         };
-        match stored.advance(self.config.observed.clone()) {
-            Ok(Some(advanced)) => self.write_record(advanced, ScanState::WriteRecord),
-            Ok(None) if matches!(self.config.mode, SubjectScanMode::Depart) => {
+        match stored.advance(self.config.observed.clone())? {
+            Some(advanced) => self.write_record(advanced, ScanState::WriteRecord),
+            None if matches!(self.config.mode, SubjectScanMode::Depart) => {
                 // Departure stops new admission even when the subject itself is
                 // unchanged, then records the inventory unresolved.
                 let mut leaving = stored;
@@ -295,101 +255,89 @@ impl SubjectScanOperation {
                 leaving.policy_draining = true;
                 self.write_record(leaving, ScanState::WriteRecord)
             }
-            Ok(None) => {
-                self.record = Some(stored.clone());
+            None => {
                 self.result.generation = stored.subject.generation;
-                match stored.serving_blocked {
-                    true => self.scan_page(),
+                let blocked = stored.serving_blocked;
+                self.record = Some(stored);
+                match blocked {
+                    true => Ok(self.scan_page()),
                     // Nothing changed and nothing is blocked: no copy can have
                     // become non-compliant, so the scan costs nothing.
-                    false => self.complete(),
+                    false => Ok(self.complete()),
                 }
             }
-            Err(error) => self.fail(error.into()),
         }
     }
 
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let page = match ManagedCopyPage::decode(event) {
-            Ok(page) => page,
-            Err(error) => return self.fail(error.into()),
-        };
-        if page.entries.is_empty() {
-            self.cursor = None;
+    fn handle_page(&mut self, result: IoResult) -> ScanTurn {
+        let rows = self.pages.take(result)?;
+        if rows.is_empty() {
             return self.finish();
         }
-        self.cursor = page.cursor;
-        self.pending = page.entries.into_iter().map(|(_, record)| record).collect();
-        self.pending.reverse();
+        let mut pending = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            ManagedCopyKey::from_bytes(key.as_ref()).map_err(ManagedCopyError::from)?;
+            pending.push(ManagedCopyRecord::from_bytes(value.as_ref())?);
+        }
+        pending.reverse();
+        self.pending = pending;
         self.next_copy()
     }
 }
 
-impl EffectOperation for SubjectScanOperation {
+/// The stored row of one managed copy.
+fn copy_row(record: &ManagedCopyRecord) -> Result<(KeySpace, Key, Value), ManagedCopyError> {
+    Ok((
+        MANAGED_COPY_KEYSPACE.to_string(),
+        record.key().to_bytes()?.into(),
+        record.to_bytes()?.into(),
+    ))
+}
+
+impl Operation for SubjectScanOperation {
     type Output = SubjectScanResult;
     type Error = SubjectScanError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> ScanTurn {
         self.state = ScanState::ReadRecord;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: NODE_SUBJECT_KEYSPACE.to_string(),
-            key: Key::from(NODE_SUBJECT_KEY.to_vec()),
-            txn_id: self.txn_id,
-        })]
+        let row = (
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            Key::from(NODE_SUBJECT_KEY.to_vec()),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> ScanTurn {
         match self.state {
-            ScanState::ReadRecord => self.handle_record(event),
-            ScanState::WriteRecord => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.scan_page(),
-                _ => self.fail(SubjectScanError::InvalidEvent("WriteRecord")),
-            },
-            ScanState::Scan => self.handle_page(event),
-            ScanState::Gate => {
-                let Some(gate) = self.gate.as_mut() else {
-                    return self.fail(SubjectScanError::InvalidEvent("Gate"));
-                };
-                let effects = gate.step(event);
-                match gate.is_complete() {
-                    true => self.finish_gate(),
-                    false => effects,
-                }
+            ScanState::ReadRecord => {
+                let [value] = values::<1>(result)?;
+                self.handle_record(value)
             }
-            ScanState::Transition => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.next_copy(),
-                _ => self.fail(SubjectScanError::InvalidEvent("Transition")),
-            },
-            ScanState::Clear => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => self.complete(),
-                _ => self.fail(SubjectScanError::InvalidEvent("Clear")),
-            },
-            ScanState::Init | ScanState::Finish | ScanState::Error => smallvec![],
+            ScanState::WriteRecord => {
+                done(result)?;
+                Ok(self.scan_page())
+            }
+            ScanState::Scan => self.handle_page(result),
+            ScanState::Gate => self.finish_gate(result),
+            ScanState::Transition => {
+                done(result)?;
+                self.next_copy()
+            }
+            ScanState::Clear => {
+                done(result)?;
+                Ok(self.complete())
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ScanState::Finish | ScanState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or(Err(SubjectScanError::InvalidEvent("Finish")))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{SubjectScanConfig, SubjectScanMode, SubjectScanOperation};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use super::{ScanTurn, SubjectScanConfig, SubjectScanMode, SubjectScanOperation};
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{MANAGED_COPY_KEYSPACE, NODE_SUBJECT_KEYSPACE};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
@@ -452,16 +400,15 @@ mod pure_tests {
         })
     }
 
-    fn stored(record: &NodeSubjectRecord) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(record.to_bytes().expect("record encodes").into()),
-        })
+    fn stored(record: &NodeSubjectRecord) -> IoResult {
+        IoResult::Values(vec![Some(
+            record.to_bytes().expect("record encodes").into(),
+        )])
     }
 
-    fn page(records: Vec<ManagedCopyRecord>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: records
+    fn page(records: Vec<ManagedCopyRecord>) -> IoResult {
+        IoResult::Page {
+            rows: records
                 .into_iter()
                 .map(|record| {
                     (
@@ -470,19 +417,31 @@ mod pure_tests {
                     )
                 })
                 .collect(),
-            next_start_after: None,
-        })
+            next: None,
+        }
     }
 
-    fn written(effects: &[Effect]) -> Option<NodeSubjectRecord> {
-        match effects.first() {
-            Some(Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            })) if key_space != MANAGED_COPY_KEYSPACE => {
-                NodeSubjectRecord::from_bytes(value.as_ref()).ok()
-            }
+    fn written(turn: &ScanTurn) -> Option<NodeSubjectRecord> {
+        match turn {
+            Ok(Next::Call(IoCall::Write(rows))) => match rows.as_slice() {
+                [(space, _, value)] if space != MANAGED_COPY_KEYSPACE => {
+                    NodeSubjectRecord::from_bytes(value.as_ref()).ok()
+                }
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    /// The managed copy row a turn writes.
+    fn copy_write(turn: &ScanTurn) -> ManagedCopyRecord {
+        let Ok(Next::Call(IoCall::Write(rows))) = turn else {
+            panic!("expected one copy transition");
+        };
+        let [(_, _, value)] = rows.as_slice() else {
+            panic!("expected one copy transition");
+        };
+        ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes")
     }
 
     #[test]
@@ -493,11 +452,11 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
             "us-east",
         );
-        operation.start();
+        operation.first().unwrap();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        let effects = operation.step(stored(&record));
+        let turn = operation.next(stored(&record));
 
-        let advanced = written(&effects).expect("the record is rewritten first");
+        let advanced = written(&turn).expect("the record is rewritten first");
         assert_eq!(advanced.subject.generation, 2);
         assert!(advanced.serving_blocked);
     }
@@ -509,10 +468,9 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
             "eu-west",
         );
-        operation.start();
+        operation.first().unwrap();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        assert!(operation.step(stored(&record)).is_empty());
-        assert!(operation.is_complete());
+        assert!(matches!(operation.next(stored(&record)), Ok(Next::Done(_))));
     }
 
     #[test]
@@ -523,31 +481,21 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
             "eu-west",
         );
-        operation.start();
+        operation.first().unwrap();
         let mut record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
         record.serving_blocked = true;
-        operation.step(stored(&record));
+        operation.next(stored(&record)).unwrap();
 
         let quarantined = copy(
             ManagedCopyState::Quarantined(ManagedCopyQuarantine::Rejoin),
             Vec::new(),
         );
-        let effects = operation.step(page(vec![quarantined]));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one copy transition");
-        };
-        assert_eq!(
-            ManagedCopyRecord::from_bytes(value.as_ref())
-                .expect("record decodes")
-                .state,
-            ManagedCopyState::Registered
-        );
+        let turn = operation.next(page(vec![quarantined]));
+        assert_eq!(copy_write(&turn).state, ManagedCopyState::Registered);
 
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
+        let turn = operation.next(IoResult::Done);
         assert!(
-            !written(&effects)
+            !written(&turn)
                 .expect("the block is cleared")
                 .serving_blocked
         );
@@ -557,21 +505,14 @@ mod pure_tests {
     fn departure_marks_unresolved() {
         // Departure never restores and is never blocked by what it finds.
         let mut operation = operation(SubjectScanMode::Depart, "eu-west");
-        operation.start();
+        operation.first().unwrap();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        operation.step(stored(&record));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
+        operation.next(stored(&record)).unwrap();
+        operation.next(IoResult::Done).unwrap();
 
-        let effects = operation.step(page(vec![copy(ManagedCopyState::Registered, Vec::new())]));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one copy transition");
-        };
+        let turn = operation.next(page(vec![copy(ManagedCopyState::Registered, Vec::new())]));
         assert_eq!(
-            ManagedCopyRecord::from_bytes(value.as_ref())
-                .expect("record decodes")
-                .state,
+            copy_write(&turn).state,
             ManagedCopyState::UnresolvedDeparted
         );
     }
@@ -581,11 +522,11 @@ mod pure_tests {
         // Departure blocks new admission even when the subject is unchanged, so
         // no governed byte lands here while the inventory is being resolved.
         let mut operation = operation(SubjectScanMode::Depart, "eu-west");
-        operation.start();
+        operation.first().unwrap();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        let effects = operation.step(stored(&record));
+        let turn = operation.next(stored(&record));
 
-        let leaving = written(&effects).expect("the record is rewritten first");
+        let leaving = written(&turn).expect("the record is rewritten first");
         assert!(leaving.serving_blocked && leaving.policy_draining);
     }
 
@@ -597,25 +538,28 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
             "us-east",
         );
-        let mut effects: Vec<Effect> = operation.start().into_iter().collect();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        effects.extend(operation.step(stored(&record)));
-        effects.extend(operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        })));
-        effects.extend(operation.step(page(vec![copy(ManagedCopyState::Registered, Vec::new())])));
+        let turns = [
+            operation.first(),
+            operation.next(stored(&record)),
+            operation.next(IoResult::Done),
+            operation.next(page(vec![copy(ManagedCopyState::Registered, Vec::new())])),
+        ];
 
-        for effect in effects {
-            let Effect::Storage(
-                StorageEffect::Write { key_space, .. } | StorageEffect::Iter { key_space, .. },
-            ) = effect
-            else {
-                continue;
+        for turn in turns {
+            let spaces: Vec<String> = match turn {
+                Ok(Next::Call(IoCall::Write(rows))) => {
+                    rows.into_iter().map(|(space, _, _)| space).collect()
+                }
+                Ok(Next::Call(IoCall::Page { space, .. })) => vec![space],
+                _ => continue,
             };
-            assert!(
-                key_space == MANAGED_COPY_KEYSPACE || key_space == NODE_SUBJECT_KEYSPACE,
-                "the scan touched {key_space}"
-            );
+            for space in spaces {
+                assert!(
+                    space == MANAGED_COPY_KEYSPACE || space == NODE_SUBJECT_KEYSPACE,
+                    "the scan touched {space}"
+                );
+            }
         }
     }
 
@@ -627,21 +571,17 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
             "eu-west",
         );
-        operation.start();
+        operation.first().unwrap();
         let mut record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
         record.subject.generation = 4;
         record.serving_blocked = true;
-        operation.step(stored(&record));
+        operation.next(stored(&record)).unwrap();
 
         let stale = copy(
             ManagedCopyState::Quarantined(ManagedCopyQuarantine::Rejoin),
             Vec::new(),
         );
-        let effects = operation.step(page(vec![stale]));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one copy transition");
-        };
-        let restored = ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes");
+        let restored = copy_write(&operation.next(page(vec![stale])));
         assert_eq!(restored.state, ManagedCopyState::Registered);
         assert_eq!(restored.subject_generation, 4);
     }
@@ -654,12 +594,10 @@ mod pure_tests {
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::SubjectTransition),
             "us-east",
         );
-        operation.start();
+        operation.first().unwrap();
         let record = NodeSubjectRecord::seed(subject("eu-west")).expect("subject is valid");
-        operation.step(stored(&record));
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::new().into(),
-        }));
+        operation.next(stored(&record)).unwrap();
+        operation.next(IoResult::Done).unwrap();
 
         let governed = copy(
             ManagedCopyState::Registered,
@@ -668,11 +606,10 @@ mod pure_tests {
                 digest: [2u8; 32],
             }],
         );
-        let effects = operation.step(page(vec![governed]));
         assert!(
             matches!(
-                effects.first(),
-                Some(Effect::Storage(StorageEffect::Read { .. }))
+                operation.next(page(vec![governed])),
+                Ok(Next::Call(IoCall::Child(_)))
             ),
             "the gate must resolve the rule before the copy is decided"
         );

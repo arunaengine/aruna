@@ -3,95 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
+    WatchEvent, WatchEventDetail, WatchEventKind,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
-use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::notifications::client::{HolderRequestOperation, events_delivered};
-use crate::notifications::placement::filter_local_subscriptions;
-use crate::notifications::watch::digest::InterestOperation;
-use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-use crate::notifications::watch::records::WatchSubscriptionError;
+use crate::notifications::watch::origin::EmitWatchOperation;
 
-/// Post-commit, best-effort emission of an origin watch event. Matches the
-/// in-memory interest table plus local durable subscriptions, then expands for
-/// the local holder or forwards once per remote holder; all failures only warn.
+/// Post-commit, best-effort emission of an origin watch event to the holders this node's
+/// interest table matches and to this node when it holds a matching watch; failures only warn.
 pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
-    // Watches are a user-plane feature; system/anonymous writes carry a nil actor
-    // and are deliberately not emitted.
-    if event.actor == UserId::nil(event.realm_id) {
-        return;
-    }
-
     let Some(net_handle) = context.net_handle.as_ref() else {
         return;
     };
-    let mut holders = net_handle.watch_interest_snapshot().matching_nodes(
-        event.realm_id,
-        &event.path,
-        event.kind,
-    );
-    let local_realm_config =
-        match include_local_holder(context, &event, net_handle.node_id(), &mut holders).await {
-            Ok(realm_config) => Some(realm_config),
-            Err(error) => {
-                warn!(%error, "Failed to scan local watch subscriptions while emitting event");
-                None
-            }
-        };
-    if holders.is_empty() {
-        return;
-    }
-    holders.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    holders.dedup();
-
-    let local_node_id = net_handle.node_id();
-    for holder in holders {
-        if holder == local_node_id {
-            let Some(realm_config) = local_realm_config.as_ref() else {
-                continue;
-            };
-            match expand_watch_events(
-                context,
-                event.realm_id,
-                realm_config,
-                local_node_id,
-                std::slice::from_ref(&event),
-            )
-            .await
-            {
-                Ok((outcome, dropped)) => {
-                    for recipient in outcome.recipients {
-                        net_handle.notify_inbox_activity(recipient);
-                    }
-                    if dropped
-                        && let Err(error) =
-                            drive(InterestOperation::mark(event.realm_id), context).await
-                    {
-                        warn!(%error, "Failed to retract dropped local watch interest");
-                    }
-                }
-                Err(error) => {
-                    warn!(%error, "Failed to expand watch event for local holder");
-                }
-            }
-        } else {
-            let events = vec![event.clone()];
-            let deliver = NotificationTransportMessage::DeliverWatchEvents { events };
-            let answer = drive(HolderRequestOperation::new(holder, deliver), context).await;
-            if let Err(error) = events_delivered(answer) {
-                warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
-            }
-        }
-    }
+    let interest = net_handle.watch_interest_snapshot();
+    let holders = interest.matching_nodes(event.realm_id, &event.path, event.kind);
+    let emit = EmitWatchOperation::new(event, net_handle.node_id(), holders);
+    // Every failure is logged inside the operation.
+    let _ = drive(emit, context).await;
 }
 
 /// Post-commit, best-effort `metadata_created` emission shared by every dataset
@@ -122,46 +54,6 @@ pub(crate) async fn emit_metadata_created(
         },
     )
     .await;
-}
-
-async fn include_local_holder(
-    context: &DriverContext,
-    event: &WatchEvent,
-    local_node_id: aruna_core::NodeId,
-    holders: &mut Vec<aruna_core::NodeId>,
-) -> Result<aruna_core::structs::identity::realm::RealmConfigDocument, String> {
-    let realm_config = drive(GetConfigOperation::new(event.realm_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let list = ListWatchesOperation::new(WatchScope::Realm(event.realm_id));
-    let subscriptions = match drive(list, context).await {
-        Ok(page) => page.subscriptions,
-        Err(WatchSubscriptionError::Storage(error))
-            if error.contains("subscription scan cap reached") =>
-        {
-            if !holders.contains(&local_node_id) {
-                holders.push(local_node_id);
-            }
-            return Ok(realm_config);
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    let (subscriptions, found_stale) =
-        filter_local_subscriptions(subscriptions, &realm_config, local_node_id)
-            .map_err(|error| error.to_string())?;
-    holders.retain(|holder| *holder != local_node_id);
-    if subscriptions.iter().any(|subscription| {
-        subscription.created_at_ms <= event.occurred_at_ms
-            && subscription.event_mask.contains(event.kind)
-            && watch_path_matches(event.kind, &event.path, &subscription.path_prefix)
-    }) {
-        holders.push(local_node_id);
-    }
-    if found_stale && let Err(error) = drive(InterestOperation::mark(event.realm_id), context).await
-    {
-        warn!(%error, "Failed to mark stale watch interest dirty while emitting event");
-    }
-    Ok(realm_config)
 }
 
 #[cfg(test)]

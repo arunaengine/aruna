@@ -179,6 +179,12 @@ impl RecoveryStatus {
         }
     }
 
+    /// The last progress time in milliseconds, finer than the snapshot's seconds.
+    #[cfg(test)]
+    pub(super) fn progress_ms(&self) -> u64 {
+        self.inner.last_progress_ms.load(Ordering::Relaxed)
+    }
+
     pub fn pass_total(&self, outcome: RecoveryOutcome) -> u64 {
         self.inner.passes[outcome.index()].load(Ordering::Relaxed)
     }

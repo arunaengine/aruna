@@ -11,8 +11,10 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::executor::PayloadHandler;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::{retire_work, settle_work};
+use crate::plugins::plugin_work::PluginWorkHandler;
 use crate::plugins::rows::{
     page_call, page_result, read_call, read_rows, values_result, write_rows,
 };
@@ -65,6 +67,11 @@ pub(crate) async fn edit_work(
 fn job(nonce: u64) -> JobId {
     let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap();
     JobId::from_parts(1_700_000_000_000, handle, BucketId::new(0).unwrap(), nonce).unwrap()
+}
+
+/// The job handlers whose holds the prune asks: the plugin work one.
+fn plugin_handlers() -> [std::sync::Arc<dyn PayloadHandler>; 1] {
+    [std::sync::Arc::new(PluginWorkHandler)]
 }
 
 #[tokio::test]
@@ -276,18 +283,16 @@ async fn settles_before_pruning() {
     .unwrap();
     let spec = spec_of(&install, &row);
     let mut job_record = record(spec.clone(), job(1), JobState::Running);
-    insert_job(&fixture.ctx, &job_record)
-        .await
-        .unwrap();
+    insert_job(&fixture.ctx, &job_record).await.unwrap();
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(0));
     assert_eq!(drive(holds_job(&spec), &fixture.ctx).await, Ok(true));
     // The job ended long ago, so its retention passed; the prune keeps it until the row settled.
     job_record.state = JobState::Failed;
     job_record.finished_at_ms = Some(1);
-    insert_job(&fixture.ctx, &job_record)
+    insert_job(&fixture.ctx, &job_record).await.unwrap();
+    let pruned = prune_job_batch(&fixture.ctx, &plugin_handlers())
         .await
         .unwrap();
-    let pruned = prune_job_batch(&fixture.ctx).await.unwrap();
     assert_eq!(pruned.pruned, 0);
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
     let settled = drive(read_work(ids.0, ids.1), &fixture.ctx)
@@ -302,7 +307,10 @@ async fn settles_before_pruning() {
     );
     assert_eq!(drive(holds_job(&spec), &fixture.ctx).await, Ok(false));
     assert_eq!(settle_work(&fixture.ctx, 6).await, Ok(0));
-    assert_eq!(prune_job_batch(&fixture.ctx).await.unwrap().pruned, 1);
+    let pruned = prune_job_batch(&fixture.ctx, &plugin_handlers())
+        .await
+        .unwrap();
+    assert_eq!(pruned.pruned, 1);
     // The job record is gone; the row still answers the paths, also from its summary.
     let read = drive(read_work(ids.0, ids.1), &fixture.ctx)
         .await
@@ -361,7 +369,8 @@ async fn prunes_settled_rows() {
         rows.push((run.run_id, row));
     }
     assert_eq!(settle_work(ctx, 1).await, Ok(2));
-    assert_eq!(prune_job_batch(ctx).await.unwrap().pruned, 2);
+    let pruned = prune_job_batch(ctx, &plugin_handlers()).await.unwrap();
+    assert_eq!(pruned.pruned, 2);
     // Delivered as `job_finished`; an undelivered row is never pruned.
     for (_, row) in &rows {
         let delivered = edit_work(ctx, (install.install_id, row.work_id), |row| {
@@ -468,9 +477,7 @@ async fn reserved_work_settles() {
     .await
     .unwrap();
     let job_record = finished(&install, &row, job(1));
-    insert_job(&fixture.ctx, &job_record)
-        .await
-        .unwrap();
+    insert_job(&fixture.ctx, &job_record).await.unwrap();
     let spec = spec_of(&install, &row);
     assert_eq!(drive(holds_job(&spec), &fixture.ctx).await, Ok(true));
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
@@ -605,9 +612,7 @@ async fn settles_answer() {
     drive(update_work(ids, sent), &fixture.ctx).await.unwrap();
     let mut job_record = record(spec_of(&install, &row), job(1), JobState::Succeeded);
     job_record.finished_at_ms = Some(1);
-    insert_job(&fixture.ctx, &job_record)
-        .await
-        .unwrap();
+    insert_job(&fixture.ctx, &job_record).await.unwrap();
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
     let settled = drive(read_work(ids.0, ids.1), &fixture.ctx)
         .await

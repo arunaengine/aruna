@@ -18,7 +18,7 @@ use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::rows::write_rows;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, ended};
-use aruna_core::plugin_runs::{SourceEvent, SourceKind};
+use aruna_core::plugin_runs::{MAX_ATTEMPTS, SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_plugins::InvokeError;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};

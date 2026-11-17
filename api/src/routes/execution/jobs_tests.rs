@@ -40,6 +40,8 @@ use aruna_operations::jobs::store::state::{
     ClaimOutcome, claim_job, complete_job, transition_to_running,
 };
 use aruna_storage::FjallStorage;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tempfile::TempDir;
@@ -461,7 +463,8 @@ async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8
     insert_job(&context, &import_job(job_id, owner))
         .await
         .unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(&context, job_id, node_id(), 2_000).await.unwrap()
+    let ClaimOutcome::Claimed(record) =
+        claim_job(&context, job_id, node_id(), 2_000).await.unwrap()
     else {
         panic!("job was not claimed")
     };
@@ -513,12 +516,9 @@ async fn list_newest_first() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     for seq in 1..=3u64 {
-        insert_job(
-            &state.get_ctx(),
-            &job_for(job_id(seq), owner, seq * 1000),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &job_for(job_id(seq), owner, seq * 1000))
+            .await
+            .unwrap();
     }
 
     let (_, Json(page1)) = list_jobs(
@@ -737,12 +737,9 @@ async fn artifact_expiry_gone() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([12u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &export_job(job_id, owner, 1),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &export_job(job_id, owner, 1))
+        .await
+        .unwrap();
 
     let response = head_job_artifact(
         State(state),
@@ -823,12 +820,9 @@ async fn names_owner_url() {
         .await;
     let owner = user(2);
     let job_id = JobId::from_bytes([14u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &job_for(job_id, owner, 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, owner, 1000))
+        .await
+        .unwrap();
 
     let (_, Json(response)) = get_job(
         State(state.clone()),
@@ -903,12 +897,9 @@ async fn remote_owner_url() {
 async fn foreign_not_found() {
     let (_dir, state) = build_state().await;
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &job_for(job_id, user(2), 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, user(2), 1000))
+        .await
+        .unwrap();
 
     let result = get_job(
         State(state.clone()),
@@ -1041,9 +1032,7 @@ async fn cancel_is_idempotent() {
     // A prior run keeps repeated cancellation on the live, cancel-requested path.
     let mut record = job_for(job_id, owner, 1000);
     record.has_run = true;
-    insert_job(&state.get_ctx(), &record)
-        .await
-        .unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
 
     let (status, _) = cancel_job(
         State(state.clone()),
@@ -1076,9 +1065,7 @@ async fn cancel_terminal_noop() {
     let mut record = job_for(job_id, owner, 1000);
     record.state = JobState::Succeeded;
     record.finished_at_ms = Some(2000);
-    insert_job(&state.get_ctx(), &record)
-        .await
-        .unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
 
     let (status, _) = cancel_job(
         State(state.clone()),
@@ -1122,12 +1109,9 @@ async fn restricted_token_rejected() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx(),
-        &job_for(job_id, owner, 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, owner, 1000))
+        .await
+        .unwrap();
 
     // The job routes take `UnrestrictedAuth`, so the refusal is the extractor's.
     let refused =

@@ -372,16 +372,6 @@ async fn read_create_event(
     Ok(event)
 }
 
-pub(crate) async fn project_create_event(
-    context: &DriverContext,
-    event: MetadataEventRecord,
-    local_node_id: Option<NodeId>,
-) -> Result<(), MetadataProjectionError> {
-    project_create_events(context, vec![event], local_node_id)
-        .await
-        .map(|_| ())
-}
-
 pub async fn project_create_events(
     context: &DriverContext,
     events: Vec<MetadataEventRecord>,
@@ -1220,7 +1210,7 @@ mod tests {
     use super::*;
     use crate::testing::write_entries;
     use aruna_core::UserId;
-    use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::placement::registry_placement;
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
@@ -1232,6 +1222,16 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
+
+    async fn project_create_event(
+        context: &DriverContext,
+        event: MetadataEventRecord,
+        local_node_id: Option<NodeId>,
+    ) -> Result<(), MetadataProjectionError> {
+        project_create_events(context, vec![event], local_node_id)
+            .await
+            .map(|_| ())
+    }
 
     struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,

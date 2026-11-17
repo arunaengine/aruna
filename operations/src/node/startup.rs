@@ -29,7 +29,7 @@ use crate::node::restore_plan::{
     sync_eligible_node,
 };
 use crate::node::summary_refresh::RefreshUsageOperation;
-use crate::notifications::watch::interest::refresh_target_interest;
+use crate::notifications::watch::interest::RefreshInterestOperation;
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -833,7 +833,12 @@ pub(crate) async fn apply_restored_reconcile(
     if let Err(error) = drive(refresh, context.as_ref()).await {
         warn!(%error, "Realm usage refresh stopped after the shard restore");
     }
-    refresh_target_interest(context, &result.targets).await;
+    if let Some(net) = context.net_handle.as_ref() {
+        let refresh = RefreshInterestOperation::new(&result.targets, *net.realm_id());
+        if let Err(error) = drive(refresh, context.as_ref()).await {
+            warn!(%error, "Watch interest refresh stopped after the shard restore");
+        }
+    }
     crate::notifications::email::config_applied(context, &result.targets).await;
     apply_metadata(context, Some(node_id), result, false).await;
     true
@@ -1382,10 +1387,7 @@ mod tests {
                     && status.pass_total(RecoveryOutcome::Partial) == partial
                 {
                     observed = partial;
-                    let progress = status
-                        .inner
-                        .last_progress_ms
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let progress = status.progress_ms();
                     let remaining = status.snapshot().topics_remaining;
                     if previous == Some((progress, remaining)) {
                         return (partial, progress, remaining);
@@ -1742,13 +1744,7 @@ mod tests {
         assert!(remaining > 0);
 
         wait_partial(&status, partial.saturating_add(3)).await;
-        assert_eq!(
-            status
-                .inner
-                .last_progress_ms
-                .load(std::sync::atomic::Ordering::Relaxed),
-            progress
-        );
+        assert_eq!(status.progress_ms(), progress);
         assert_eq!(status.snapshot().topics_remaining, remaining);
 
         finish_driver(cancelled, driver).await;
