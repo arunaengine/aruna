@@ -17,7 +17,8 @@ use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 use tokio::time::{Duration, Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::executor::{ExecutorBackend, now_ms};
+use crate::executor::ExecutorBackend;
+use aruna_core::time::unix_timestamp_millis;
 use events::{BudgetVerdict, CellBudget, EventRing, SessionEvent};
 
 pub use aruna_core::compute::session::{
@@ -393,7 +394,7 @@ impl Session {
             inner.submits.push_back(now);
             inner.queue.push_back(cell_id.to_string());
             inner.track(cell_id);
-            inner.set_cell(cell_id, CellPhase::Queued, None, now_ms());
+            inner.set_cell(cell_id, CellPhase::Queued, None, unix_timestamp_millis());
             let event = inner.ring.push(
                 EventKind::Cell,
                 &CellFrame {
@@ -443,7 +444,7 @@ impl Session {
                 })
                 .collect();
             for cell_id in dropped {
-                inner.set_cell(&cell_id, CellPhase::Interrupted, None, now_ms());
+                inner.set_cell(&cell_id, CellPhase::Interrupted, None, unix_timestamp_millis());
                 let event = inner.ring.push(
                     EventKind::Cell,
                     &CellFrame {
@@ -592,7 +593,7 @@ impl Session {
                     return;
                 };
                 inner.track(&cell_id);
-                inner.set_cell(&cell_id, phase, execution_count, now_ms());
+                inner.set_cell(&cell_id, phase, execution_count, unix_timestamp_millis());
                 if !phase.is_open() {
                     inner.queue.retain(|queued| queued != &cell_id);
                 }
@@ -799,7 +800,7 @@ fn build_session(config: SessionConfig) -> (Arc<Session>, mpsc::Receiver<HelperR
     let credential_expires_ms = config.credential_expires_ms;
     let session = Arc::new(Session {
         config,
-        started_at_ms: now_ms(),
+        started_at_ms: unix_timestamp_millis(),
         inner: Mutex::new(Inner {
             phase: SessionPhase::Starting,
             ended: None,
@@ -1029,7 +1030,7 @@ fn session_frame<'a>(
 fn deadline_ms(deadline: Instant) -> u64 {
     let now = Instant::now();
     let left = deadline.saturating_duration_since(now);
-    now_ms().saturating_add(left.as_millis().try_into().unwrap_or(u64::MAX))
+    unix_timestamp_millis().saturating_add(left.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

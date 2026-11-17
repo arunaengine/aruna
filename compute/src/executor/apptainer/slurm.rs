@@ -102,13 +102,13 @@ impl SlurmBackend {
                 },
                 backend_ref,
                 started_at_ms: None,
-                finished_at_ms: Some(crate::executor::now_ms()),
+                finished_at_ms: Some(aruna_core::time::unix_timestamp_millis()),
                 detail: None,
             });
         };
         let phase = job_phase(&job, cancel_requested);
         let finished_at_ms = (phase.is_terminal())
-            .then(|| (job.finished_at_ms).unwrap_or_else(crate::executor::now_ms));
+            .then(|| (job.finished_at_ms).unwrap_or_else(aruna_core::time::unix_timestamp_millis));
         Ok(AttemptStatus {
             phase,
             backend_ref,

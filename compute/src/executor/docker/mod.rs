@@ -38,7 +38,8 @@ use super::channel::ChannelStream;
 use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit};
+use aruna_core::time::unix_timestamp_millis;
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -1392,7 +1393,7 @@ fn lost_status(name: &str) -> AttemptStatus {
         },
         backend_ref: name.to_string(),
         started_at_ms: None,
-        finished_at_ms: Some(now_ms()),
+        finished_at_ms: Some(unix_timestamp_millis()),
         detail: None,
     }
 }

@@ -83,14 +83,13 @@ use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
 use aruna_operations::auth::request_authorization::{AuthorizeError, BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{
-    DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
-};
+use aruna_operations::driver::{DriverContext, bucket_snapshot, drive, drive_until, gate_context, routing_snapshot};
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
@@ -1113,7 +1112,7 @@ impl S3 for ArunaS3Service {
         }
         .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = gate_context(&self.state, self.realm_id, unix_timestamp_millis())
             .await
             .map_err(gate_context_error)?;
         let mut operation = PutObjectOperation::new(PutObjectConfig {
@@ -1457,7 +1456,7 @@ impl S3 for ArunaS3Service {
             None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
         }
         .map_err(routing_inputs_error)?;
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = gate_context(&self.state, self.realm_id, unix_timestamp_millis())
             .await
             .map_err(gate_context_error)?;
         let mut operation = CreateMultipartOperation::new(CMPI {
@@ -1878,7 +1877,7 @@ impl S3 for ArunaS3Service {
             .unwrap_or_default();
         validate_part_count(&checksum_request, completed_parts.len())?;
 
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = gate_context(&self.state, self.realm_id, unix_timestamp_millis())
             .await
             .map_err(gate_context_error)?;
         let routing = match bucket_info.as_ref() {
@@ -1913,7 +1912,7 @@ impl S3 for ArunaS3Service {
             object_size,
             created_by: user_access.user_identity,
             quota_ceiling,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone())
@@ -2012,7 +2011,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         });
 
         // A dropped connection must not stop the abort between its transactions.

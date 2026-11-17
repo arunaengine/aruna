@@ -22,7 +22,8 @@ use aruna_core::structs::storage::holders::{
     HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
 };
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::holders::lookup_keys;
 use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
 use aruna_operations::s3::bucket::key_grant::{GrantError, GrantHolderOperation, GrantInput};
@@ -255,7 +256,7 @@ fn unlock_key(body: Bytes) -> ServerResult<SharedSecret> {
 }
 
 fn status_view(status: &UnlockStatus) -> UnlockView {
-    unlock_view(Some(status), now_ms())
+    unlock_view(Some(status), unix_timestamp_millis())
 }
 
 #[utoipa::path(
@@ -307,7 +308,7 @@ pub async fn unlock_bucket(
         caller: auth.user_id,
         key: BucketKeyRef::new(bucket_id, query.generation),
         duration: query.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let operation = UnlockBucketOperation::new(input, private_key);
     let origin = (state.get_realm_id(), state.get_node_id());
@@ -415,7 +416,7 @@ pub async fn extend_unlock(
         generation: request.generation,
         session_id,
         duration: request.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let status = drive(ExtendBucketOperation::new(input), &state.get_ctx())
         .await
@@ -456,7 +457,7 @@ pub async fn lock_bucket(
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<UnlockView>> {
     let group_id = bucket_info(&state, &bucket).await?.group_id;
-    let now_ms = now_ms();
+    let now_ms = unix_timestamp_millis();
     let input = LockInput {
         bucket,
         group_id,
@@ -588,7 +589,7 @@ pub async fn grant_holder(
         user_id,
         granted_by: auth.user_id,
         lookup,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let result = drive(GrantHolderOperation::new(input), &state.get_ctx())
         .await
@@ -677,7 +678,7 @@ pub async fn remove_holder(
         revision,
         confirm_recovery: query.confirm_recovery,
         lookups,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     drive(RemoveHolderOperation::new(input), &state.get_ctx())
         .await

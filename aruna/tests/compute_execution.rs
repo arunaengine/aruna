@@ -10,6 +10,7 @@ use crate::shared;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use aruna_core::time::unix_timestamp_millis;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
 use aruna_core::id::NodeId;
@@ -194,23 +195,19 @@ async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobR
         JobPayload::Execution(spec),
         fixture.seed.user_id,
         node_id,
-        now_ms(),
-        now_ms(),
+        unix_timestamp_millis(),
+        unix_timestamp_millis(),
         None,
     );
     record.captured_inputs = captured_inputs;
     insert_job(&ctx.storage_handle, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, now_ms())
+    let ClaimOutcome::Claimed(claimed) = claim_job(&ctx.storage_handle, job_id, node_id, unix_timestamp_millis())
         .await
         .unwrap()
     else {
         panic!("claim failed");
     };
     (job_id, claimed)
-}
-
-fn now_ms() -> u64 {
-    aruna_core::time::unix_timestamp_millis()
 }
 
 /// The inputs admission captures before a run is claimed. Outputs inherit
@@ -591,7 +588,7 @@ async fn execution_cancel_terminalizes() -> TestResult<()> {
     aruna_operations::jobs::store::set_cancel_requested(
         &fixture.compute_ctx.storage_handle,
         job_id,
-        now_ms(),
+        unix_timestamp_millis(),
     )
     .await
     .unwrap();

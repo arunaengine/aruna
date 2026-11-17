@@ -41,6 +41,7 @@ use aruna_core::structs::storage::storage_purge::{
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::testing::read_value;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::store::{
@@ -372,7 +373,7 @@ async fn scoped_fence_isolates() {
                 object_size: None,
                 created_by: context.user_id,
                 quota_ceiling: None,
-                now_ms: aruna_operations::driver::now_ms(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             }),
             &context.driver,
         )
@@ -844,24 +845,6 @@ async fn write_value(storage: &StorageHandle, keyspace: &str, key: Vec<u8>, valu
             .await,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
-}
-
-async fn read_value(
-    storage: &StorageHandle,
-    keyspace: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read event")
-    };
-    value
 }
 
 /// Stores a current version of `key` that reads a linked file written as backend version `p1`.

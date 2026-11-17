@@ -11,8 +11,9 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::CompressionMigration;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::blob::migration::misplaced::count_misplaced;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::storage_move::{StartMoveError, StartMoveOperation};
 use axum::Json;
@@ -215,7 +216,7 @@ pub async fn start_bucket_move(
         .unwrap_or_default();
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms());
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis());
     let record: CompressionMigration = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;

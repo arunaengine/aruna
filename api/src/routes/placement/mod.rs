@@ -19,7 +19,8 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
-use aruna_operations::driver::{drive, gate_context, now_ms};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::{drive, gate_context};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
@@ -681,7 +682,7 @@ async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> ServerResult<aruna_core::structs::placement::policy::PlacementSubject> {
-    let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
+    let gate = gate_context(&state.get_ctx(), realm_id, unix_timestamp_millis())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
@@ -775,7 +776,7 @@ pub async fn create_placement_policy(
         },
         auth_context: auth,
         policy,
-        created_at_ms: now_ms(),
+        created_at_ms: unix_timestamp_millis(),
     };
     let document = create_policy_routed(
         &state.get_ctx(),
@@ -1058,7 +1059,7 @@ pub async fn put_bucket_placement(
             expected_generation: request.expected_generation,
             auth_context: auth,
             local_node_id: state.get_node_id(),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )
@@ -1283,7 +1284,7 @@ pub async fn mint_object_placement(
                 target_refs: refs_from(request.policies)?,
                 subject,
                 created_at: SystemTime::now(),
-                now_ms: now_ms(),
+                now_ms: unix_timestamp_millis(),
             },
             mint_version(hint),
         ),
@@ -1453,7 +1454,7 @@ async fn run_here(
             subject,
             start_after: decode_cursor(cursor)?,
             limit: request.limit.unwrap_or(BULK_DEFAULT_LIMIT),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
             created_at: SystemTime::now(),
         }),
         &state.get_ctx(),
@@ -1885,7 +1886,7 @@ pub async fn resolve_placement_quarantine(
             auth_context: auth.clone(),
             realm_id: auth.realm_id,
             release,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )

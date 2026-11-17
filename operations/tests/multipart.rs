@@ -29,8 +29,10 @@ use aruna_core::structs::storage::multipart::{
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::testing::read_value;
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
-use aruna_operations::driver::{DriverContext, drive, now_ms};
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
@@ -100,26 +102,6 @@ fn stream_from_bytes(
     BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
         bytes.to_vec(),
     )))
-}
-
-async fn read_value(
-    context: &DriverContext,
-    keyspace: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage event")
-    };
-
-    value
 }
 
 // Completion defers part and duplicate deletes to the blob cleanup queue, which
@@ -227,7 +209,7 @@ async fn complete_upload(
             object_size,
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -341,7 +323,7 @@ async fn completion_persists_parts() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -359,7 +341,7 @@ async fn completion_persists_parts() {
     let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
     let location_key =
         BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
-    let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
+    let blob_location = read_value(&context.driver.storage_handle, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
     assert_eq!(
@@ -369,7 +351,7 @@ async fn completion_persists_parts() {
     );
 
     let blob_head = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_HEAD_KEYSPACE,
         BlobHeadKey::new("bucket-a", "big.bin").to_bytes().unwrap(),
     )
@@ -381,7 +363,7 @@ async fn completion_persists_parts() {
     );
 
     let blob_version = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         VersionKey::new("bucket-a", "big.bin", complete.version_id)
             .to_bytes()
@@ -394,7 +376,7 @@ async fn completion_persists_parts() {
     assert_eq!(blob_version.blob_hash(), Some(&blob_hash));
 
     let hash_path = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             blob_hash,
@@ -414,7 +396,7 @@ async fn completion_persists_parts() {
 
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_KEYSPACE,
             upload_id.to_bytes().to_vec(),
         )
@@ -423,7 +405,7 @@ async fn completion_persists_parts() {
     );
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_PART_KEYSPACE,
             MultipartPartKey::new(upload_id, 1).to_bytes().unwrap(),
         )
@@ -432,7 +414,7 @@ async fn completion_persists_parts() {
     );
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_PART_KEYSPACE,
             MultipartPartKey::new(upload_id, 2).to_bytes().unwrap(),
         )
@@ -448,7 +430,7 @@ async fn completion_persists_parts() {
 
     let summary = MultipartObjectSummary::from_bytes(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::summary(complete.version_id)
                 .to_bytes()
@@ -464,7 +446,7 @@ async fn completion_persists_parts() {
 
     let object_part_1 = MultipartObjectPart::from_bytes(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::part(complete.version_id, 1)
                 .to_bytes()
@@ -479,7 +461,7 @@ async fn completion_persists_parts() {
 
     let object_part_2 = MultipartObjectPart::from_bytes(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::part(complete.version_id, 2)
                 .to_bytes()
@@ -570,7 +552,7 @@ async fn rejects_missing_checksum() {
             object_size: Some(8),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -752,7 +734,7 @@ async fn completion_retains_path() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -763,7 +745,7 @@ async fn completion_retains_path() {
     let complete_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
 
     let blob_head = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_HEAD_KEYSPACE,
         BlobHeadKey::new("bucket-a", "replace.bin")
             .to_bytes()
@@ -778,7 +760,7 @@ async fn completion_retains_path() {
 
     // Verify that the old hash path entry still exists (historical access preserved)
     let old_hash_path = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             initial_hash,
@@ -797,7 +779,7 @@ async fn completion_retains_path() {
     assert!(old_hash_path.is_empty());
 
     let new_hash_path = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         PATHS_INDEX_KEYSPACE,
         HashIndex::new(
             complete_hash,
@@ -918,7 +900,7 @@ async fn completion_deduplicates_multipart() {
         .unwrap();
     let location_key =
         BlobLocationKey::new(blob_hash, EncodingClass::Raw, BackendRef::node_default()).to_bytes();
-    let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, location_key)
+    let blob_location = read_value(&context.driver.storage_handle, BLOB_LOCATIONS_KEYSPACE, location_key)
         .await
         .expect("missing blob location entry");
     assert_eq!(
@@ -1009,7 +991,7 @@ async fn completion_deduplicates_put() {
     assert_eq!(count_blob_files(&context.blob_root), 1);
 
     let blob_head = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_HEAD_KEYSPACE,
         BlobHeadKey::new("bucket-a", "multipart.bin")
             .to_bytes()
@@ -1116,7 +1098,7 @@ async fn completion_reuses_location() {
     assert_eq!(count_blob_files(&context.blob_root), 1);
 
     let blob_head = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_HEAD_KEYSPACE,
         BlobHeadKey::new("bucket-a", "same.bin").to_bytes().unwrap(),
     )
@@ -1134,7 +1116,7 @@ async fn completion_reuses_location() {
         .try_into()
         .unwrap();
     let blob_version = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         VersionKey::new("bucket-a", "same.bin", replacement_complete.version_id)
             .to_bytes()
@@ -1190,7 +1172,7 @@ async fn abort_removes_parts() {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1199,7 +1181,7 @@ async fn abort_removes_parts() {
 
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_KEYSPACE,
             upload_id.to_bytes().to_vec(),
         )
@@ -1208,7 +1190,7 @@ async fn abort_removes_parts() {
     );
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_PART_KEYSPACE,
             MultipartPartKey::new(upload_id, 1).to_bytes().unwrap(),
         )
@@ -1367,7 +1349,7 @@ async fn delete_removes_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1391,7 +1373,7 @@ async fn delete_removes_metadata() {
 
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::summary(complete.version_id)
                 .to_bytes()
@@ -1402,7 +1384,7 @@ async fn delete_removes_metadata() {
     );
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::part(complete.version_id, 1)
                 .to_bytes()
@@ -1413,7 +1395,7 @@ async fn delete_removes_metadata() {
     );
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             OBJECT_METADATA_KEYSPACE,
             MultipartObjectKey::part(complete.version_id, 2)
                 .to_bytes()
@@ -1471,7 +1453,7 @@ async fn run_abort(context: &TestContext, operation: &mut CompleteUploadOperatio
 
 async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<MultipartUpload> {
     read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         UPLOAD_KEYSPACE,
         upload_id.to_bytes().to_vec(),
     )
@@ -1529,7 +1511,7 @@ async fn abort_reopens_upload() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     let mut operation = stall_completion(
         &context,
@@ -1567,7 +1549,7 @@ async fn dropped_completion_retries() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     // The first attempt is abandoned mid-compose and never cleans up.
     drop(
@@ -1616,7 +1598,7 @@ async fn abort_refuses_lease() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
     let _stalled = stall_completion(
         &context,
         completion_input(upload.upload_id, &part, realm_id, node_id, created_by, now),
@@ -1655,7 +1637,7 @@ async fn abort_refuses_lease() {
     assert!(read_upload(&context, upload.upload_id).await.is_none());
     assert!(
         read_value(
-            &context.driver,
+            &context.driver.storage_handle,
             UPLOAD_PART_KEYSPACE,
             MultipartPartKey::new(upload.upload_id, 1)
                 .to_bytes()
@@ -1688,7 +1670,7 @@ async fn sweep_reclaims_upload() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     let mut stale = read_upload(&context, upload.upload_id).await.unwrap();
     stale.status = MultipartUploadStatus::Completing;
@@ -1736,7 +1718,7 @@ async fn sweep_finishes_abort() {
     halted.status = MultipartUploadStatus::Aborting;
     write_upload(&context, &halted).await;
 
-    let outcome = sweep_stale_uploads(&context.driver, now_ms())
+    let outcome = sweep_stale_uploads(&context.driver, unix_timestamp_millis())
         .await
         .unwrap();
 
@@ -1949,7 +1931,7 @@ async fn s3_provider_flow() {
             bucket: "bucket".to_string(),
             key: "aborted.bin".to_string(),
             upload_id: aborted.upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -2048,14 +2030,14 @@ async fn orphan_target_discarded() {
     assert!(!exists(stale.get_full_path().unwrap()).unwrap());
     assert!(exists(late.get_full_path().unwrap()).unwrap());
     let rows = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_CLEANUP_KEYSPACE,
         fresh.ulid.to_bytes().to_vec(),
     )
     .await;
     assert!(rows.is_some());
     let gone = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_CLEANUP_KEYSPACE,
         old.ulid.to_bytes().to_vec(),
     )
@@ -2068,7 +2050,7 @@ async fn bucket_load(context: &TestContext, location: &BackendLocation) -> u64 {
     let mut key = location.backend.key_bytes();
     key.push(0);
     key.extend_from_slice(location.storage_bucket.as_bytes());
-    read_value(&context.driver, BUCKET_STATS_DB, key)
+    read_value(&context.driver.storage_handle, BUCKET_STATS_DB, key)
         .await
         .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
         .unwrap_or(0)
@@ -2218,7 +2200,7 @@ async fn s3_framed_completion() {
     assert_eq!(read_object(&context, &result.location).await, expected);
     assert!(read_upload(&context, upload.upload_id).await.is_none());
     let row = read_value(
-        &context.driver,
+        &context.driver.storage_handle,
         BLOB_CLEANUP_KEYSPACE,
         target.ulid.to_bytes().to_vec(),
     )

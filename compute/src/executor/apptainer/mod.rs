@@ -29,7 +29,8 @@ use super::channel::ChannelStream;
 use super::config::ApptainerConfig;
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
+use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit};
+use aruna_core::time::unix_timestamp_millis;
 
 mod runtime;
 #[cfg(feature = "slurm")]
@@ -1094,7 +1095,7 @@ fn lost_status(directory: &Path) -> AttemptStatus {
         },
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
-        finished_at_ms: Some(now_ms()),
+        finished_at_ms: Some(unix_timestamp_millis()),
         detail: None,
     }
 }
