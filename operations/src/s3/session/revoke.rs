@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn last_session_drops_index() {
+    fn last_drops_index() {
         let key = valid_key();
         let mut operation = RevokeS3Operation::new(config(&key));
         let owner: Key = b"owner".to_vec().into();

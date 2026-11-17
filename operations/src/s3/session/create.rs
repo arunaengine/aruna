@@ -257,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_index_and_fence() {
+    fn reads_index_fence() {
         let mut create = operation();
         let Ok(Next::Call(IoCall::Read(reads))) = create.first() else {
             panic!("expected the owner index and group fence read");

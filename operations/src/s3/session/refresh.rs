@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_session_and_index() {
+    fn reads_session_index() {
         let mut refresh = operation(Duration::from_secs(60));
         let Ok(Next::Call(IoCall::Read(reads))) = refresh.first() else {
             panic!("expected the session and index read");
