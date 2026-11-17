@@ -44,7 +44,7 @@ use super::marks::sweep_marks;
 use super::journal::JOURNAL_PAGE;
 use super::matcher::{match_page, match_targets};
 use super::outbound::Outbound;
-use super::prune::{prune_hooks, prune_uses};
+use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, replay_page, replay_scan};
@@ -251,7 +251,7 @@ impl Worker {
         let config = config.map_err(|error| error.to_string())?;
         let swept = drive(sweep_events(&config, now_ms), &self.ctx).await;
         let swept = swept.map_err(|error| error.to_string())?;
-        let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
+        let hooks = drive(prune_hooks(&config, now_ms), &self.ctx).await;
         let hooks = hooks.map_err(|error| error.to_string())?;
         let retired = retire_work(&self.ctx, &config, now_ms).await;
         Ok(swept + hooks + retired.map_err(|error| error.to_string())?)
@@ -587,6 +587,19 @@ fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
     run.due_ms = now_ms.saturating_add(backoff);
 }
 
+/// Deletes the use audit rows past their retention, a page per transaction; answers how many
+/// records went.
+pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
+    let mut pruned = 0;
+    loop {
+        let (count, more) = drive(prune_uses(now_ms, prune::PAGE), ctx).await?;
+        pruned += count;
+        if !more {
+            return Ok(pruned);
+        }
+    }
+}
+
 /// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
 /// returns the rows read.
 pub(crate) async fn run_replays(
@@ -643,13 +656,13 @@ pub fn spawn_worker(
                 if let Err(error) = drive(prune_runs(now), &worker.ctx).await {
                     warn!(%error, "Could not prune finished plugin runs");
                 }
-                if let Err(error) = prune_journal(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_journal(now), &worker.ctx).await {
                     warn!(%error, "Could not prune the plugin event journal");
                 }
                 if let Err(error) = drive(prune_seen(now), &worker.ctx).await {
                     warn!(%error, "Could not prune plugin event dedup records");
                 }
-                if let Err(error) = prune_uses(&worker.ctx, now).await {
+                if let Err(error) = prune_audit(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin secret use audit rows");
                 }
                 if let Err(error) = drive(prune_work(now), &worker.ctx).await {
