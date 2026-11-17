@@ -4,37 +4,26 @@
 
 use super::{S3SessionError, decode_index};
 use aruna_core::UserId;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
-use ulid::Ulid;
+use aruna_core::types::Key;
 
 const OWNER_SCAN_BATCH: usize = 128;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ListSessionsState {
-    Init,
-    StartTransaction,
-    ScanOwners,
-    ReadSessions,
-    CommitTransaction,
-    Finish,
-    Error,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListPhase {
+    Owners,
+    Sessions,
 }
 
+/// Every session of one user, read in one transaction from the owner index and the sessions.
 #[derive(Debug, PartialEq)]
 pub struct ListSessionsOperation {
     user_identity: UserId,
     access_keys: Vec<String>,
-    sessions: Vec<S3Session>,
-    txn_id: Option<Ulid>,
-    state: ListSessionsState,
-    output: Result<Vec<S3Session>, S3SessionError>,
+    phase: ListPhase,
 }
 
 impl ListSessionsOperation {
@@ -42,183 +31,129 @@ impl ListSessionsOperation {
         Self {
             user_identity,
             access_keys: Vec::new(),
-            sessions: Vec::new(),
-            txn_id: None,
-            state: ListSessionsState::Init,
-            output: Err(S3SessionError::NotFinished),
+            phase: ListPhase::Owners,
         }
     }
 
-    fn fail(&mut self, error: S3SessionError) -> Effects {
-        self.state = ListSessionsState::Error;
-        self.output = Err(error);
-        self.abort()
-    }
-
-    fn start_list(&mut self) -> Effects {
-        if !matches!(self.state, ListSessionsState::Init) {
-            return self.fail(S3SessionError::Failed);
-        }
-        self.state = ListSessionsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionStarted");
-        };
-        self.txn_id = Some(txn_id);
-        self.scan_owners(None)
-    }
-
-    fn scan_owners(&mut self, start: Option<IterStart>) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = ListSessionsState::ScanOwners;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: SESSION_OWNER_KEYSPACE.to_string(),
-            prefix: Some(self.user_identity.to_storage_key().into()),
-            start,
+    fn owners(&self, after: Option<Key>) -> Next<Vec<S3Session>> {
+        Next::Call(IoCall::Page {
+            space: SESSION_OWNER_KEYSPACE.to_string(),
+            prefix: self.user_identity.to_storage_key().into(),
+            after,
             limit: OWNER_SCAN_BATCH,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn owners_scanned(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected(event, "StorageEvent::IterResult");
-        };
-        for (_, value) in values {
-            match decode_index(Some(&value)) {
-                Ok(index) => self.access_keys.extend(index),
-                Err(error) => return self.fail(error),
-            }
-        }
-        match next_start_after {
-            Some(key) => self.scan_owners(Some(IterStart::After(key))),
-            None => self.read_sessions(),
-        }
-    }
-
-    fn read_sessions(&mut self) -> Effects {
-        if self.access_keys.is_empty() {
-            return self.commit();
-        }
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = ListSessionsState::ReadSessions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self
-                .access_keys
-                .iter()
-                .map(|access_key| (
-                    S3_SESSION_KEYSPACE.to_string(),
-                    access_key.as_bytes().into()
-                ))
-                .collect(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn sessions_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event, "StorageEvent::BatchReadResult");
-        };
-        if values.len() != self.access_keys.len() {
-            return self.fail(S3SessionError::IndexInconsistent);
-        }
-        for (key, value) in values {
-            let Some(value) = value else {
-                return self.fail(S3SessionError::IndexInconsistent);
-            };
-            let session = match S3Session::from_bytes(value.as_ref()) {
-                Ok(session) => session,
-                Err(error) => return self.fail(error.into()),
-            };
-            if session.access_key.as_bytes() != key.as_ref()
-                || session.user_identity != self.user_identity
-            {
-                return self.fail(S3SessionError::IndexInconsistent);
-            }
-            self.sessions.push(session);
-        }
-        self.commit()
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = ListSessionsState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionCommitted");
-        };
-        self.txn_id = None;
-        self.output = Ok(std::mem::take(&mut self.sessions));
-        self.state = ListSessionsState::Finish;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, received: Event, expected: &'static str) -> Effects {
-        self.fail(S3SessionError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            received: received.label(),
         })
+    }
+
+    fn owners_read(&mut self, result: IoResult) -> Result<Next<Vec<S3Session>>, S3SessionError> {
+        let (rows, next) = result.page()?;
+        for (_, value) in rows {
+            self.access_keys.extend(decode_index(Some(&value))?);
+        }
+        if next.is_some() {
+            return Ok(self.owners(next));
+        }
+        if self.access_keys.is_empty() {
+            return Ok(Next::Done(Vec::new()));
+        }
+        self.phase = ListPhase::Sessions;
+        let reads = (self.access_keys.iter())
+            .map(|key| (S3_SESSION_KEYSPACE.to_string(), key.as_bytes().into()))
+            .collect();
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn sessions_read(&self, result: IoResult) -> Result<Next<Vec<S3Session>>, S3SessionError> {
+        let values = result.values()?;
+        if values.len() != self.access_keys.len() {
+            return Err(S3SessionError::IndexInconsistent);
+        }
+        let mut sessions = Vec::with_capacity(values.len());
+        for (access_key, value) in self.access_keys.iter().zip(values) {
+            let value = value.ok_or(S3SessionError::IndexInconsistent)?;
+            let session = S3Session::from_bytes(value.as_ref())?;
+            if session.access_key != *access_key || session.user_identity != self.user_identity {
+                return Err(S3SessionError::IndexInconsistent);
+            }
+            sessions.push(session);
+        }
+        Ok(Next::Done(sessions))
     }
 }
 
-impl EffectOperation for ListSessionsOperation {
+impl Operation for ListSessionsOperation {
     type Output = Vec<S3Session>;
     type Error = S3SessionError;
 
-    fn start(&mut self) -> Effects {
-        self.start_list()
+    fn first(&mut self) -> Result<Next<Self::Output>, S3SessionError> {
+        Ok(self.owners(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone().into());
-        }
-        match self.state {
-            ListSessionsState::StartTransaction => self.transaction_started(event),
-            ListSessionsState::ScanOwners => self.owners_scanned(event),
-            ListSessionsState::ReadSessions => self.sessions_read(event),
-            ListSessionsState::CommitTransaction => self.transaction_committed(event),
-            ListSessionsState::Init | ListSessionsState::Finish | ListSessionsState::Error => {
-                self.unexpected(event, "valid session operation event")
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, S3SessionError> {
+        match self.phase {
+            ListPhase::Owners => self.owners_read(result),
+            ListPhase::Sessions => self.sessions_read(result),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListSessionsState::Finish | ListSessionsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    fn user() -> UserId {
+        UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([3; 32]))
+    }
+
+    fn page(after: Option<Key>) -> Next<Vec<S3Session>> {
+        Next::Call(IoCall::Page {
+            space: SESSION_OWNER_KEYSPACE.to_string(),
+            prefix: user().to_storage_key().into(),
+            after,
+            limit: OWNER_SCAN_BATCH,
+        })
+    }
+
+    #[test]
+    fn pages_owner_index() {
+        let mut operation = ListSessionsOperation::new(user());
+        assert_eq!(operation.first(), Ok(page(None)));
+        let more = IoResult::Page {
+            rows: Vec::new(),
+            next: Some(b"k".to_vec().into()),
+        };
+        assert_eq!(operation.next(more), Ok(page(Some(b"k".to_vec().into()))));
+        let end = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(end), Ok(Next::Done(Vec::new())));
+        assert!(operation.transaction());
+    }
+
+    #[test]
+    fn refuses_missing_sessions() {
+        let mut operation = ListSessionsOperation::new(user());
+        operation.access_keys = vec!["one".to_string()];
+        operation.phase = ListPhase::Sessions;
+        let missing = IoResult::Values(vec![None]);
+        assert_eq!(
+            operation.next(missing),
+            Err(S3SessionError::IndexInconsistent)
+        );
+        let short = IoResult::Values(Vec::new());
+        assert_eq!(
+            operation.next(short),
+            Err(S3SessionError::IndexInconsistent)
+        );
     }
 }
