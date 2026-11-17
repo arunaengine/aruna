@@ -17,7 +17,7 @@ use aruna_core::request_policy::{
 };
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, TxnId, Value};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
@@ -115,28 +115,44 @@ impl PolicyLoadOperation {
     pub fn for_request(realm_id: RealmId, request: &PolicyRequest) -> Self {
         Self::new(realm_id, group_from_path(&request.path))
     }
+}
 
-    fn evaluator(
-        &self,
-        values: Vec<Option<Value>>,
-    ) -> Result<PolicyEvaluator, PolicyEnforcementError> {
-        let mut values = values.into_iter();
-        let config = values.next().flatten().ok_or_else(realm_unavailable)?;
-        let config = RealmConfigDocument::from_bytes(&config)
-            .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
-        let realm = compile_scope(&config.request_policies, "realm")?;
-        let group = match self.group_id {
-            Some(_) => {
-                let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
-                else {
-                    return Err(group_unavailable());
-                };
-                Some(group_policies(self.realm_id, &group, &auth)?)
-            }
-            None => None,
-        };
-        Ok(PolicyEvaluator { realm, group })
+/// The rows a policy load reads: the realm config, then the group and its authorization
+/// document when a group is named. A parent can fold them into its own transaction.
+pub(crate) fn policy_reads(realm_id: RealmId, group_id: Option<GroupId>) -> Vec<(KeySpace, Key)> {
+    let config = DocumentTarget::RealmConfig { realm_id };
+    let mut reads = vec![crate::document_repository::read_row(&config)];
+    if let Some(group_id) = group_id {
+        let key = Key::from(group_id.to_bytes().to_vec());
+        reads.push((GROUP_KEYSPACE.to_string(), key.clone()));
+        reads.push((AUTH_KEYSPACE.to_string(), key));
     }
+    reads
+}
+
+/// The evaluator from the rows [`policy_reads`] named, answered in that order. Missing state
+/// fails closed.
+pub(crate) fn read_policies(
+    realm_id: RealmId,
+    group_id: Option<GroupId>,
+    values: Vec<Option<Value>>,
+) -> Result<PolicyEvaluator, PolicyEnforcementError> {
+    let mut values = values.into_iter();
+    let config = values.next().flatten().ok_or_else(realm_unavailable)?;
+    let config = RealmConfigDocument::from_bytes(&config)
+        .map_err(|error| PolicyEnforcementError::Unavailable(error.to_string()))?;
+    let realm = compile_scope(&config.request_policies, "realm")?;
+    let group = match group_id {
+        Some(_) => {
+            let (Some(group), Some(auth)) = (values.next().flatten(), values.next().flatten())
+            else {
+                return Err(group_unavailable());
+            };
+            Some(group_policies(realm_id, &group, &auth)?)
+        }
+        None => None,
+    };
+    Ok(PolicyEvaluator { realm, group })
 }
 
 /// Compiles a group's policy set from its stored group and authorization rows.
@@ -163,15 +179,7 @@ impl Operation for PolicyLoadOperation {
     type Error = PolicyEnforcementError;
 
     fn first(&mut self) -> Result<Next<PolicyEvaluator>, PolicyEnforcementError> {
-        let config = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
-        let mut reads = vec![crate::document_repository::read_row(&config)];
-        if let Some(group_id) = self.group_id {
-            let key = Key::from(group_id.to_bytes().to_vec());
-            reads.push((GROUP_KEYSPACE.to_string(), key.clone()));
-            reads.push((AUTH_KEYSPACE.to_string(), key));
-        }
+        let reads = policy_reads(self.realm_id, self.group_id);
         Ok(Next::Call(IoCall::Read(reads)))
     }
 
@@ -182,7 +190,7 @@ impl Operation for PolicyLoadOperation {
                 result.label()
             )));
         };
-        self.evaluator(values).map(Next::Done)
+        read_policies(self.realm_id, self.group_id, values).map(Next::Done)
     }
 }
 
