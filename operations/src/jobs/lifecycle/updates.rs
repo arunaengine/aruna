@@ -17,7 +17,8 @@ use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
+use super::held::HeldReservations;
+use super::reservation::ReleaseExecutionOperation;
 use super::routing::family_of_alias;
 use super::witness::arm_family;
 use crate::driver::{DriverContext, drive};
@@ -90,8 +91,8 @@ async fn local_reservation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Option<super::reservation::ExecutionReservation> {
-    match job_reservation(context, job_id).await {
-        Ok(reservation) => reservation,
+    match drive(HeldReservations::of_job(job_id), context).await {
+        Ok(held) => held.into_iter().next(),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Execution reservation read failed");
             None
@@ -350,7 +351,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
     let Some(state) = terminal_state(record) else {
         return true;
     };
-    let reservation = match job_reservation(context, record.job_id).await {
+    let held = drive(HeldReservations::of_job(record.job_id), context).await;
+    let reservation = match held.map(|held| held.into_iter().next()) {
         Ok(Some(reservation)) => reservation,
         // No reservation is a purely local execution: it owes nothing here.
         Ok(None) => return true,
@@ -404,7 +406,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
 /// obligation stayed pending, so the caller must run this again.
 pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
     let mut pending = false;
-    for reservation in held_reservations(context).await? {
+    let held = drive(HeldReservations::all(), context).await;
+    for reservation in held.map_err(|error| error.to_string())? {
         let Some(record) =
             read_job_record(&context.storage_handle, reservation.job_id, None).await?
         else {

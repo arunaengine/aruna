@@ -23,7 +23,7 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
-use super::LifecycleError;
+use super::{LifecycleError, family_view};
 use super::ids::workspace_of;
 use crate::jobs::records::keys::{alias_key, family_prefix, record_key, submission_prefix};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
@@ -132,15 +132,6 @@ impl AdmitSubmissionOperation {
             key: config.storage_key(),
             txn_id: None,
         })]
-    }
-
-    fn keep_view(&mut self, value: Option<Value>) -> Result<(), LifecycleError> {
-        let Some(value) = value else {
-            return Err(LifecycleError::RealmConfigMissing);
-        };
-        let config = RealmConfigDocument::from_bytes(&value)?;
-        self.view = FamilyView::resolve(&config, self.config.realm_id, self.family());
-        Ok(())
     }
 
     /// Claims of every request family under this submission, so a replay and an
@@ -389,8 +380,9 @@ impl Operation for AdmitSubmissionOperation {
         match self.state {
             AdmitState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Err(error) = self.keep_view(value) {
-                        return self.fail(error);
+                    match family_view(value, self.config.realm_id, self.family()) {
+                        Ok(view) => self.view = view,
+                        Err(error) => return self.fail(error),
                     }
                     if self.view.is_none() {
                         return self.fail(LifecycleError::NotHolder);

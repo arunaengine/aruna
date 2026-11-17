@@ -54,6 +54,7 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
@@ -1568,10 +1569,9 @@ pub async fn cancel_job_routed(
                 }
                 Err(error) => return Err(error),
             };
-            for reservation in super::lifecycle::reservation::held_reservations(context)
+            for reservation in drive(HeldReservations::all(), context)
                 .await
-                .map_err(JobRouteError::Unavailable)?
-                .into_iter()
+                .map_err(|error| JobRouteError::Unavailable(error.to_string()))?
             {
                 if family_of_alias(context, reservation.logical_job_id).await? == Some(family) {
                     runtime.request_cancel(reservation.job_id);

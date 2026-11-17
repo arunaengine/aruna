@@ -32,8 +32,8 @@ use super::store::{
     JobMutationError, begin_external_running, cancel_running_job, read_job_record,
     record_attempt_intent, transition_to_preparing, transition_to_ready,
 };
-use crate::driver::DriverContext;
-use crate::jobs::lifecycle::reservation::job_reservation;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::updates::publish_progress;
 use crate::placement::policy::subject::read_local_subject;
 use finalize::{cleanup_and_crate, fail_and_crate, finalize_cancel};
@@ -230,8 +230,8 @@ pub async fn run_execution_job(
 
         // A receipted execution already has its identity: the fenced attempt
         // binds that exact ExecutionId so its outputs chain to the receipt.
-        let receipted = match job_reservation(&context, job_id).await {
-            Ok(reservation) => reservation.map(|reservation| reservation.execution_id),
+        let receipted = match drive(HeldReservations::of_job(job_id), &context).await {
+            Ok(held) => held.first().map(|reservation| reservation.execution_id),
             Err(error) => {
                 warn!(job_id = %job_id, %error, "Execution reservation lookup failed");
                 return AttemptOutcome::Stopped;
@@ -524,7 +524,8 @@ async fn stored_site(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<(u64, [u8; 32])>, String> {
-    let Some(reservation) = job_reservation(context, job_id).await? else {
+    let held = drive(HeldReservations::of_job(job_id), context).await;
+    let Some(reservation) = held.map_err(|error| error.to_string())?.into_iter().next() else {
         return Ok(None);
     };
     Ok(match reservation.subject_generation {

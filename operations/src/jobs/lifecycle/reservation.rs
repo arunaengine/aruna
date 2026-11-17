@@ -24,12 +24,11 @@ use smallvec::smallvec;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::LifecycleError;
-use crate::driver::DriverContext;
+use super::{LifecycleError, family_view};
 use crate::jobs::records::keys::{family_prefix, record_key};
 use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::jobs::store::{iter_prefix_page, job_insert_entries};
+use crate::jobs::store::job_insert_entries;
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.
@@ -74,46 +73,6 @@ pub fn fits(
         && envelope
             .max_concurrent
             .is_none_or(|max| concurrent <= u64::from(max))
-}
-
-/// Reservations this node currently holds, oldest key first.
-pub async fn held_reservations(
-    context: &DriverContext,
-) -> Result<Vec<ExecutionReservation>, String> {
-    let mut held = Vec::new();
-    let mut cursor = None;
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            JOB_RESERVATION_KEYSPACE,
-            None,
-            cursor,
-            MAX_RESERVATION_SCAN,
-            None,
-        )
-        .await?;
-        for (_, value) in rows {
-            held.push(
-                from_bytes::<ExecutionReservation>(&value).map_err(|error| error.to_string())?,
-            );
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return Ok(held),
-        }
-    }
-}
-
-/// The reservation of one job's accepted execution, so the local attempt can
-/// bind the exact ExecutionId the receipt named.
-pub async fn job_reservation(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<ExecutionReservation>, String> {
-    Ok(held_reservations(context)
-        .await?
-        .into_iter()
-        .find(|row| row.job_id == job_id))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,15 +160,6 @@ impl ReserveExecutionOperation {
             key: target.storage_key(),
             txn_id: None,
         })]
-    }
-
-    fn keep_view(&mut self, value: Option<Value>) -> Result<(), LifecycleError> {
-        let Some(value) = value else {
-            return Err(LifecycleError::RealmConfigMissing);
-        };
-        let config = RealmConfigDocument::from_bytes(&value)?;
-        self.view = FamilyView::resolve(&config, self.config.realm_id, self.family());
-        Ok(())
     }
 
     fn scan(&mut self, txn_id: TxnId) -> Effects {
@@ -386,8 +336,9 @@ impl Operation for ReserveExecutionOperation {
         match self.state {
             ReserveState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Err(error) = self.keep_view(value) {
-                        return self.fail(error);
+                    match family_view(value, self.config.realm_id, self.family()) {
+                        Ok(view) => self.view = view,
+                        Err(error) => return self.fail(error),
                     }
                     self.state = ReserveState::Begin;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {

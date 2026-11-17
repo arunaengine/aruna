@@ -17,8 +17,9 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::{
     ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
-    ReserveExecutionOperation, fits, held_reservations, job_reservation,
+    ReserveExecutionOperation, fits,
 };
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
 use crate::jobs::lifecycle::updates::chain_for;
@@ -181,7 +182,7 @@ async fn pages_reservations() {
         .await;
 
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -206,7 +207,7 @@ async fn reserves_exact_capacity() {
 
     assert_eq!(refused, LifecycleError::Capacity);
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -225,9 +226,10 @@ async fn persists_receipt_first() {
         .await
         .expect("offer is admitted");
 
-    let reservation = job_reservation(&ctx, spec.job_id)
+    let reservation = drive(HeldReservations::of_job(spec.job_id), &ctx)
         .await
         .expect("reservation scan")
+        .pop()
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(

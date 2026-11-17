@@ -8,8 +8,9 @@ use std::time::Duration;
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::{JobId, JobRecordError};
-use aruna_core::structs::identity::realm::JobFamilyError;
+use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecordError};
+use aruna_core::structs::identity::realm::{JobFamilyError, RealmConfigDocument, RealmId};
+use aruna_core::types::Value;
 use aruna_core::task::TaskEvent;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
@@ -17,9 +18,11 @@ use thiserror::Error;
 use tracing::warn;
 
 use super::records::RecordStoreError;
+use super::records::verify::FamilyView;
 
 pub mod admit;
 pub mod cancel;
+pub mod held;
 pub mod ids;
 pub mod ingress;
 pub mod outbox;
@@ -81,6 +84,17 @@ pub enum LifecycleError {
         expected: &'static str,
         got: String,
     },
+}
+
+/// The family view a realm config row gives; a missing row is `RealmConfigMissing`.
+fn family_view(
+    value: Option<Value>,
+    realm_id: RealmId,
+    family: JobFamilyId,
+) -> Result<Option<FamilyView>, LifecycleError> {
+    let value = value.ok_or(LifecycleError::RealmConfigMissing)?;
+    let config = RealmConfigDocument::from_bytes(&value)?;
+    Ok(FamilyView::resolve(&config, realm_id, family))
 }
 
 #[cfg(test)]
