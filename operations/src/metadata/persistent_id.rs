@@ -489,13 +489,7 @@ mod tests {
         let writes = transition_entries(&Some(route.clone()), &mapping).expect("entries build");
         assert_eq!(outbox_row(&writes).generation, 1);
 
-        let txn_id = start_transaction(&ctx).await.unwrap();
-        assert!(
-            fence_admits(&ctx, &Some(route.clone()), txn_id)
-                .await
-                .unwrap()
-        );
-        abort_transaction(&ctx, txn_id).await;
+        assert!(fence_open(&ctx, &route).await);
 
         crate::placement::process_transitions::close(
             &ctx.storage_handle,
@@ -505,8 +499,23 @@ mod tests {
         )
         .await
         .expect("the departing holder closes the fence");
-        let txn_id = start_transaction(&ctx).await.unwrap();
-        assert!(!fence_admits(&ctx, &Some(route), txn_id).await.unwrap());
-        abort_transaction(&ctx, txn_id).await;
+        assert!(!fence_open(&ctx, &route).await);
+    }
+
+    /// Whether the mapping bucket's write fence still admits the route's generation.
+    async fn fence_open(ctx: &DriverContext, route: &MappingRoute) -> bool {
+        let (key_space, key) =
+            crate::placement::fence::fence_read(&route.realm_id, &route.placement);
+        let read = StorageEffect::Read {
+            key_space,
+            key,
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                crate::placement::fence::admits(value.as_ref(), route.generation)
+            }
+            other => panic!("fence read failed: {}", other.label()),
+        }
     }
 }
