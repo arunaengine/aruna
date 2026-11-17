@@ -310,6 +310,16 @@ pub struct MetadataEventRecord {
     pub occurred_at_ms: u64,
 }
 
+impl MetadataEventRecord {
+    /// Whether the event creates its document (a scaffold or an initial RO-Crate).
+    pub fn is_create(&self) -> bool {
+        matches!(
+            self.payload,
+            MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawRevision {
     /// The displayed revision: the last render that passed profile validation.

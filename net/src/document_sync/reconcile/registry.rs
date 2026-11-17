@@ -703,7 +703,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
         if let Some(accepted) = accepted.as_ref() {
             validate_metadata_event(accepted)?;
         }
-        if event_is_create(event) {
+        if event.is_create() {
             if accepted
                 .as_ref()
                 .is_some_and(|accepted| !same_create_event(accepted, event))
@@ -714,7 +714,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
                 acceptance_to_write = Some(event);
             }
         } else if accepted.as_ref().is_none_or(|accepted| {
-            !event_is_create(accepted) || !accepted.record.same_identity(&event.record)
+            !accepted.is_create() || !accepted.record.same_identity(&event.record)
         }) {
             return Ok(None);
         }
@@ -792,21 +792,13 @@ pub(in crate::document_sync) async fn lifecycle_stale_txn(
 pub(in crate::document_sync) fn validate_metadata_event(event: &MetadataEventRecord) -> Result<()> {
     if !event.record.identity_valid()
         || event.record.last_event_id != event.event_id
-        || event_is_create(event) && event.record.establishing_event_id != event.event_id
+        || event.is_create() && event.record.establishing_event_id != event.event_id
     {
         return Err(NetError::Bootstrap(
             "replicated metadata event has inconsistent event identity".to_string(),
         ));
     }
     Ok(())
-}
-
-pub(in crate::document_sync) fn event_is_create(event: &MetadataEventRecord) -> bool {
-    matches!(
-        &event.payload,
-        aruna_core::metadata::MetadataEventPayload::Scaffold { .. }
-            | aruna_core::metadata::MetadataEventPayload::RoCrate { .. }
-    )
 }
 
 pub(in crate::document_sync) fn same_create_event(

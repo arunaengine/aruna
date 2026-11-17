@@ -33,8 +33,8 @@ use super::cursor::{
     applied_cursor_clock, applied_cursor_value, deferred_topics_key, topic_cursor_key,
 };
 use super::registry::{
-    create_fence_txn, event_is_create, lifecycle_stale_txn, same_create_event,
-    transaction_placement_fence, validate_metadata_event,
+    create_fence_txn, lifecycle_stale_txn, same_create_event, transaction_placement_fence,
+    validate_metadata_event,
 };
 use super::{dependency_available, register_deferred_topic, remove_deferred_topic};
 
@@ -380,7 +380,7 @@ impl DocumentSyncService {
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
                 );
             }
-            if event_is_create(&apply.record) {
+            if apply.record.is_create() {
                 entries.push(
                     create_acceptance_entry(&apply.record)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?,
@@ -531,7 +531,7 @@ impl DocumentSyncService {
                     }
                 };
                 if let Some(event) = &event {
-                    if !event_is_create(event) {
+                    if !event.is_create() {
                         let _ = self
                             .storage
                             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -551,7 +551,7 @@ impl DocumentSyncService {
                 }
                 event
             };
-            if event_is_create(&apply.record) {
+            if apply.record.is_create() {
                 if accepted_create
                     .as_ref()
                     .is_some_and(|accepted| !same_create_event(accepted, &apply.record))
