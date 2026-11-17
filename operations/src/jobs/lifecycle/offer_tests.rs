@@ -74,7 +74,7 @@ fn accepts_receipt() {
 }
 
 #[test]
-fn reports_decline_and_silence() {
+fn reports_declines() {
     let family = Family::new([9u8; 32]);
     let mut declined = offer(&family);
     declined.first().expect("offer");
