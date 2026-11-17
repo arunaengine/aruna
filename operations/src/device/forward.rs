@@ -23,7 +23,7 @@ use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_document::update_metadata_document;
+use crate::metadata::update_entry::update_metadata_document;
 use crate::node::node_info::read_info_documents;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;

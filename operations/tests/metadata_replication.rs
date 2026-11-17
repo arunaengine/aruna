@@ -41,8 +41,8 @@ use aruna_operations::metadata::projector::{project_create_events, replay_event_
 use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use aruna_operations::metadata::update_entry::update_metadata_document;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
     strategy_for_target, subject_bytes,

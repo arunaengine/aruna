@@ -36,8 +36,8 @@ use aruna_operations::metadata::profile::validation::{
 };
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use aruna_operations::metadata::update_entry::update_metadata_document;
 use aruna_operations::metadata::{
     MetadataHandle, materialization_queue::process_materialization_batch,
     projector::drain_projection_queue,

@@ -12,8 +12,8 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::checkpoint_window::{CheckpointWindowError, CheckpointWindowOperation, due};
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use crate::metadata::update_entry::update_metadata_document;
 
 #[derive(Debug, Error)]
 pub enum CheckpointError {

@@ -9,8 +9,8 @@ use crate::jobs::metadata_class::metadata_error_transient;
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use crate::metadata::update_entry::update_metadata_document;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};

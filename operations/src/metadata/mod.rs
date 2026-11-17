@@ -39,6 +39,7 @@ pub mod stats;
 mod summary_cache;
 pub mod timestamp_index;
 pub mod update_document;
+pub mod update_entry;
 pub mod visibility_index;
 
 use std::sync::Arc;
