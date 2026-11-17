@@ -45,10 +45,9 @@ use super::roots::roots_checked;
 use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_publish::wake_publish;
 use crate::replication::members::owes_fanout;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::usage::dirty_rows;
+use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
 
 /// Sets one pass looks at, and purge pages it spends at most.
 const SET_BATCH: usize = 16;
@@ -926,7 +925,8 @@ async fn unbind(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            wake_publish(context).await;
+            // Scheduling the publish is best effort; the committed markers wait for it.
+            let _ = drive(MarkDirtyOperation::wake(), context).await;
             Ok(())
         }
         other => Err(format!("the bucket was not released: {other:?}")),

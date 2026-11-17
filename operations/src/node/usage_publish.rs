@@ -29,7 +29,7 @@ use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::node::realm_usage::RealmUsageOperation;
 use crate::s3::usage::{
-    LoadCountersError, dirty_rows, global_shard_read, global_sum, schedule_snapshot_publish,
+    LoadCountersError, global_shard_read, global_sum, schedule_snapshot_publish,
 };
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -67,7 +67,7 @@ impl PublishedUsage {
     }
 }
 
-pub(crate) async fn read_local_global(
+async fn read_local_global(
     storage: &StorageHandle,
     txn_id: Option<TxnId>,
 ) -> Result<UsageCounters, String> {
@@ -480,31 +480,6 @@ pub(crate) async fn clear_consumed_markers(
         }) => Ok(()),
         other => Err(format!("marker cleanup commit failed: {}", other.label())),
     }
-}
-
-/// Schedules the publish that consumes committed dirty markers.
-pub(crate) async fn wake_publish(ctx: &DriverContext) {
-    if let Some(task_handle) = ctx.task_handle.as_ref() {
-        task_handle.send_effect(schedule_snapshot_publish()).await;
-    }
-}
-
-/// Marks `groups` and the global for the next publish and schedules it.
-pub(crate) async fn mark_dirty(
-    ctx: &DriverContext,
-    groups: impl IntoIterator<Item = GroupId>,
-) -> Result<(), String> {
-    let write = StorageEffect::BatchWrite {
-        writes: dirty_rows(groups, ulid::Ulid::generate()),
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("dirty marker write failed: {}", other.label())),
-    }
-    wake_publish(ctx).await;
-    Ok(())
 }
 
 /// Re-arms the debounced publish task when dirty markers survived a restart.

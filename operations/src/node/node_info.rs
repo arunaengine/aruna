@@ -52,7 +52,9 @@ use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
+use crate::s3::usage::LoadCountersOperation;
 use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -759,11 +761,11 @@ fn node_labels(
 }
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
-    Ok(
-        crate::node::usage_publish::read_local_global(&ctx.storage_handle, None)
-            .await?
-            .stored_bytes,
-    )
+    let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+    let counters = drive(global, ctx)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(counters.stored_bytes)
 }
 
 /// The bytes this node's backends may store, from their quotas.
