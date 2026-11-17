@@ -30,9 +30,8 @@ use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::time::Duration;
 use ulid::Ulid;
 
@@ -93,6 +92,7 @@ pub(crate) fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> E
     })
 }
 
+#[cfg(test)]
 pub(crate) fn write_registry_effect(
     record: &MetadataRegistryRecord,
     txn_id: Option<TxnId>,
@@ -211,6 +211,7 @@ pub(crate) fn write_audit_effect(
     }))
 }
 
+#[cfg(test)]
 pub(crate) fn write_create_effect(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
@@ -342,10 +343,6 @@ pub(crate) fn parse_registry_iter(
     parse_storage_iter(event, |bytes| {
         postcard::from_bytes(bytes).map_err(ConversionError::from)
     })
-}
-
-pub(crate) fn empty_effects() -> Effects {
-    smallvec![]
 }
 
 /// Wakes the materialization drain at once.

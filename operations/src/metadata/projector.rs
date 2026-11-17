@@ -372,6 +372,7 @@ async fn read_create_event(
     Ok(event)
 }
 
+#[cfg(test)]
 pub(crate) async fn project_create_event(
     context: &DriverContext,
     event: MetadataEventRecord,
@@ -1220,7 +1221,7 @@ mod tests {
     use super::*;
     use crate::testing::write_entries;
     use aruna_core::UserId;
-    use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::placement::registry_placement;
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};

@@ -5,7 +5,6 @@
 
 use aruna_core::effects::MetadataRequestEffect;
 use aruna_core::events::{Event, MetadataAnswer, NetEvent, PeerRequestError};
-use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use std::future::{Future, ready};
 use std::pin::Pin;

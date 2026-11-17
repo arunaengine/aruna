@@ -125,13 +125,13 @@ mod call_tests {
         vec![7].into()
     }
 
-    fn page_call(after: Option<Key>, limit: usize) -> Next<ScannedRows> {
-        Next::Call(IoCall::Page {
+    fn page_call(after: Option<Key>, limit: usize) -> Result<Next<ScannedRows>, PrefixScanError> {
+        Ok(Next::Call(IoCall::Page {
             space: SPACE.to_string(),
             prefix: prefix(),
             after,
             limit,
-        })
+        }))
     }
 
     fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
