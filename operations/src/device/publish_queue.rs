@@ -20,6 +20,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::retry::RetryView;
+use super::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::auth::bearer_token::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
@@ -418,12 +419,116 @@ impl Operation for ClaimStateOperation {
     }
 }
 
+/// Moves every failed, retryable queued draft back into the queue at `now_ms`, each only while
+/// it still carries the state the scan read. Outputs how many were moved back.
+#[derive(Debug, PartialEq)]
+pub struct RequeueFailedOperation {
+    now_ms: u64,
+    scan: Option<ScanRowsOperation>,
+    /// Drafts still to move back with their next state, the next one last.
+    pending: Vec<(PublishEntry, PublishState)>,
+    claim: Option<ClaimStateOperation>,
+    requeued: usize,
+    output: Option<Result<usize, ScanRowsError>>,
+}
+
+impl RequeueFailedOperation {
+    pub fn new(now_ms: u64) -> Self {
+        Self {
+            now_ms,
+            scan: None,
+            pending: Vec::new(),
+            claim: None,
+            requeued: 0,
+            output: None,
+        }
+    }
+
+    fn next_claim(&mut self) -> Effects {
+        let Some((entry, state)) = self.pending.pop() else {
+            self.output = Some(Ok(self.requeued));
+            return smallvec![];
+        };
+        let mut claim = ClaimStateOperation::new(entry, state);
+        let effects = claim.start();
+        self.claim = Some(claim);
+        effects
+    }
+}
+
+impl Operation for RequeueFailedOperation {
+    type Output = usize;
+    type Error = ScanRowsError;
+
+    fn start(&mut self) -> Effects {
+        let mut scan = ScanRowsOperation::new(DEVICE_INTAKE_KEYSPACE, None, PUBLISH_PAGE_SIZE);
+        let effects = scan.start();
+        self.scan = Some(scan);
+        effects
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Some(mut claim) = self.claim.take() {
+            let effects = claim.step(event);
+            if !claim.is_complete() {
+                self.claim = Some(claim);
+                return effects;
+            }
+            if claim.finalize() == Ok(true) {
+                self.requeued += 1;
+            }
+            return self.next_claim();
+        }
+        let Some(mut scan) = self.scan.take() else {
+            self.output = Some(Err(ScanRowsError::UnexpectedEvent(event.label())));
+            return smallvec![];
+        };
+        let effects = scan.step(event);
+        if !scan.is_complete() {
+            self.scan = Some(scan);
+            return effects;
+        }
+        let rows = match scan.finalize() {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.output = Some(Err(error));
+                return smallvec![];
+            }
+        };
+        let entries = rows
+            .iter()
+            .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok());
+        self.pending = entries
+            .filter_map(|entry| Some((entry.retry_failed(self.now_ms)?, entry)))
+            .map(|(state, entry)| (entry, state))
+            .collect();
+        self.pending.reverse();
+        self.next_claim()
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(ScanRowsError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match &mut self.claim {
+            Some(claim) => claim.abort(),
+            None => smallvec![],
+        }
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{
-        ClaimError, ClaimStateOperation, PublishEntry, PublishState, entry_with_state,
-        publish_entry, publish_key, read_publish_entry,
+        ClaimError, ClaimStateOperation, PUBLISH_PAGE_SIZE, PublishEntry, PublishState,
+        RequeueFailedOperation, entry_with_state, publish_entry, publish_key, read_publish_entry,
     };
+    use crate::device::scan_rows::ScanRowsOperation;
     use crate::tests::device::record;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -659,6 +764,54 @@ mod pure_tests {
         let refused = rejects_events(fresh, sample_events, |_| false);
         assert_eq!(refused.len(), sample_events().len());
         assert!(matches!(refused[0].2, ClaimError::UnexpectedEvent(_)));
+        rejects_finalize(fresh());
+        assert!(fresh().abort().is_empty());
+    }
+
+    // A failed, retryable draft is claimed again; other drafts are left alone.
+    #[test]
+    fn requeues_failed_drafts() {
+        let mut failed = entry();
+        failed.state = PublishState::Failed {
+            reason: "unreachable".to_string(),
+            retryable: true,
+            document_id: None,
+        };
+        let pending = entry();
+        let next = failed.retry_failed(5).unwrap();
+        let rows = [&pending, &failed].map(|entry| {
+            let (_, key, value) = publish_entry(entry).unwrap();
+            (key, value)
+        });
+        let page = storage(StorageEvent::IterResult {
+            values: rows.to_vec(),
+            next_start_after: None,
+        });
+        let scan = ScanRowsOperation::new(
+            aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE,
+            None,
+            PUBLISH_PAGE_SIZE,
+        )
+        .start();
+        let claim = ClaimStateOperation::new(failed, next).start();
+        let mut requeue = RequeueFailedOperation::new(5);
+        check_trace(&mut requeue, &scan, vec![(page, claim.into_vec())]);
+        assert!(!requeue.is_complete());
+
+        let mut requeue = RequeueFailedOperation::new(5);
+        requeue.start();
+        let empty = storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        });
+        assert!(requeue.step(empty).is_empty());
+        assert_eq!(requeue.finalize(), Ok(0));
+
+        let fresh = || RequeueFailedOperation::new(5);
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
         rejects_finalize(fresh());
         assert!(fresh().abort().is_empty());
     }

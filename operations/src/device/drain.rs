@@ -151,7 +151,7 @@ async fn read_page(
 }
 
 /// Claims a queued draft for `next`; see [`ClaimStateOperation`].
-pub(super) async fn claim_state(
+async fn claim_state(
     context: &Arc<DriverContext>,
     entry: &PublishEntry,
     next: PublishState,
