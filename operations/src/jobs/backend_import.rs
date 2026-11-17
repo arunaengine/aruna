@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
+use aruna_core::effects::{BlobEffect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -12,7 +12,6 @@ use aruna_core::keyspaces::{
     IMPORT_INTENT_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, JOB_STATE_KEYSPACE, PURGE_FENCE_KEYSPACE,
     RENAMED_ROW_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::{JobError, JobId, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
@@ -33,9 +32,8 @@ use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::format::{EncodingClass, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::{RoutingSnapshot, RoutingTarget, RuleSource};
-use aruna_core::types::{Effects, Key, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -49,6 +47,7 @@ use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::imports::discovery::read_discovery;
 use crate::groups::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
 use crate::groups::imports::{read_earlier, read_import};
+use crate::jobs::blob_request::BlobRequest;
 use crate::placement::policy::{GateContext, PolicyGateError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
@@ -2061,98 +2060,10 @@ async fn sharing_now(
     }
 }
 
-/// Emits one listing or hashing effect and hands back the blob adapter's answer.
-#[derive(Debug, PartialEq)]
-pub(crate) struct BlobRequest {
-    state: RequestState,
-    output: Option<Result<BlobEvent, BlobError>>,
-}
-
-#[derive(Debug, PartialEq)]
-enum RequestState {
-    Ready(BlobEffect),
-    Sent(Answer),
-    Done,
-}
-
-/// The one event kind that answers a sent request, besides an error.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Answer {
-    Listed,
-    Hashed,
-}
-
-impl BlobRequest {
-    pub(crate) fn new(effect: BlobEffect) -> Self {
-        Self {
-            state: RequestState::Ready(effect),
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, output: Result<BlobEvent, BlobError>) -> Effects {
-        self.state = RequestState::Done;
-        self.output = Some(output);
-        smallvec![]
-    }
-}
-
-impl Operation for BlobRequest {
-    type Output = BlobEvent;
-    type Error = BlobError;
-
-    fn start(&mut self) -> Effects {
-        let RequestState::Ready(effect) = std::mem::replace(&mut self.state, RequestState::Done)
-        else {
-            return self.finish(Err(BlobError::ReadError("request already sent".into())));
-        };
-        let answer = match &effect {
-            BlobEffect::ListExternal { .. } => Answer::Listed,
-            BlobEffect::HashExternal { .. } => Answer::Hashed,
-            other => {
-                let error = format!("not a listing or hashing request: {other:?}");
-                return self.finish(Err(BlobError::ReadError(error)));
-            }
-        };
-        self.state = RequestState::Sent(answer);
-        smallvec![Effect::Blob(effect)]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let RequestState::Sent(answer) = self.state else {
-            let error = format!("event outside a sent request: {}", event.label());
-            return self.finish(Err(BlobError::ReadError(error)));
-        };
-        match (answer, event) {
-            (_, Event::Blob(BlobEvent::Error(error))) => self.finish(Err(error)),
-            (Answer::Listed, Event::Blob(event @ BlobEvent::ExternalListed { .. }))
-            | (Answer::Hashed, Event::Blob(event @ BlobEvent::ExternalHashed { .. })) => {
-                self.finish(Ok(event))
-            }
-            (_, other) => {
-                let error = format!("unexpected event {}", other.label());
-                self.finish(Err(BlobError::ReadError(error)))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == RequestState::Done
-    }
-
-    fn finalize(self) -> Result<BlobEvent, BlobError> {
-        self.output
-            .unwrap_or_else(|| Err(BlobError::ReadError("no answer".into())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::blob_request::BlobRequest;
     use aruna_core::structs::storage::backend_import::intent_key;
 
     #[test]
