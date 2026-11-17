@@ -445,9 +445,7 @@ impl Operation for UpdateGroupOperation {
                         self.emit_commit_transaction(group)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", other.label())
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             UpdateGroupState::DeleteAdminConflicts { group } => {
@@ -457,9 +455,7 @@ impl Operation for UpdateGroupOperation {
                         self.emit_commit_transaction(group)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", other.label())
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             UpdateGroupState::ReadBucketFence { group } => {
@@ -473,9 +469,7 @@ impl Operation for UpdateGroupOperation {
                         }
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("bucket fence read result", other.label())
-                    }
+                    other => self.unexpected_event("bucket fence read result", other.label()),
                 }
             }
             UpdateGroupState::CommitTransaction { group } => {
@@ -496,9 +490,7 @@ impl Operation for UpdateGroupOperation {
                         }
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", other.label())
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             UpdateGroupState::ScheduleOutboxDrain { .. } => match event {
