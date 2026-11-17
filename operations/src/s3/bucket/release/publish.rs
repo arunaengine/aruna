@@ -37,7 +37,8 @@ use ulid::Ulid;
 use super::{
     Access, BucketScope, MembersConfig, ReleaseError, ReleaseMembersOperation, load_access,
 };
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;

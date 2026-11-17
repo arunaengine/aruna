@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::error::PolicyEnforcementError;
 use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::driver::{DriverContext, drive};
@@ -16,7 +17,6 @@ use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
-use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
@@ -25,15 +25,6 @@ use ulid::Ulid;
 /// age out.
 const POLICY_CACHE_CAPACITY: usize = 256;
 const POLICY_BULK_LIMIT: usize = 1024;
-
-#[derive(Debug, Error, PartialEq)]
-pub enum PolicyEnforcementError {
-    #[error("request denied by policy `{name}`: {reason}")]
-    Denied { name: String, reason: String },
-    /// Policy state could not be read or compiled; fail closed rather than allow.
-    #[error("policy state unavailable: {0}")]
-    Unavailable(String),
-}
 
 type PolicyProgramCache = Mutex<LruCache<[u8; 32], Arc<CompiledPolicySet>>>;
 

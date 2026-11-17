@@ -16,8 +16,9 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::enforcement::PolicyEnforcementError;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::delegate::DelegationInput;
 use crate::driver::{DriverContext, drive};

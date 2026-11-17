@@ -30,7 +30,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::AuthToken;

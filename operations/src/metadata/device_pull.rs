@@ -27,8 +27,9 @@ use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::auth::enforcement::PolicyEnforcementError;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;

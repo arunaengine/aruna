@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::driver::DriverContext;
 use crate::s3::bucket::remap::{RemapScope, job_page};
 use aruna_core::effects::{Effect, StorageEffect};
@@ -520,7 +521,7 @@ async fn job_access(
     match BucketAccess::load(context, &job.auth, scope, bucket).await {
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
         Ok(_) | Err(AuthorizeError::PermissionDenied) => Ok(None),
-        Err(AuthorizeError::Policy(crate::auth::enforcement::PolicyEnforcementError::Denied {
+        Err(AuthorizeError::Policy(crate::auth::error::PolicyEnforcementError::Denied {
             ..
         })) => Ok(None),
         Err(error) => Err(error.to_string()),
@@ -534,7 +535,7 @@ pub(crate) async fn still_admin(
     auth: &aruna_core::structs::identity::auth::AuthContext,
     group_id: GroupId,
 ) -> Result<bool, String> {
-    use crate::auth::enforcement::PolicyEnforcementError;
+    use crate::auth::error::PolicyEnforcementError;
     use crate::auth::request_policy::PolicyRequestExtras;
     let path = format!("/{}/g/{group_id}/admin/**", auth.realm_id);
     let checked = crate::auth::request_authorization::authorize(

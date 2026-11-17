@@ -1667,11 +1667,9 @@ async fn rename_access(
 }
 
 /// A denial ends the rename; policy state that cannot be read is an error to retry.
-fn granted<T>(
-    loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
-) -> Result<Option<T>, String> {
-    use crate::auth::enforcement::PolicyEnforcementError;
-    use crate::auth::request_authorization::AuthorizeError;
+fn granted<T>(loaded: Result<T, crate::auth::error::AuthorizeError>) -> Result<Option<T>, String> {
+    use crate::auth::error::AuthorizeError;
+    use crate::auth::error::PolicyEnforcementError;
     match loaded {
         Ok(access) => Ok(Some(access)),
         Err(AuthorizeError::PermissionDenied)
@@ -2675,8 +2673,8 @@ mod tests {
 
     #[test]
     fn retries_unavailable_policy() {
-        use crate::auth::enforcement::PolicyEnforcementError;
-        use crate::auth::request_authorization::AuthorizeError;
+        use crate::auth::error::AuthorizeError;
+        use crate::auth::error::PolicyEnforcementError;
         let unavailable = PolicyEnforcementError::Unavailable("down".to_string());
         assert!(granted::<()>(Err(AuthorizeError::Policy(unavailable))).is_err());
         let denied = PolicyEnforcementError::Denied {

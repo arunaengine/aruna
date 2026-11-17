@@ -29,7 +29,8 @@ use ulid::Ulid;
 
 use super::api::load_realm_config;
 use super::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive_until};
 use aruna_core::placement::selector::select_top_peers;

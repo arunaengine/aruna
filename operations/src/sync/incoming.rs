@@ -6,9 +6,11 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
 use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::document_repository::GetConfigOperation;

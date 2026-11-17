@@ -31,7 +31,8 @@ use super::transport::{
 use super::{
     MetadataHandle, RollbackRequest, create_sync_bucket, sync_identity_matches, valid_sync_request,
 };
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};

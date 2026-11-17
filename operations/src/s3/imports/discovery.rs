@@ -4,7 +4,8 @@
 
 use super::shared::{Claim, claim_file, read_shared, taken_paths};
 use super::{ImportRuleError, read_earlier, validate_folder};
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::blob::migration::misplaced::{RenamePlan, rename_page};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;

@@ -513,7 +513,7 @@ pub enum MetadataTransportMessage {
     ForwardedVaultChange {
         result: Result<
             crate::users::vault_write::VaultAppended,
-            crate::users::vault_route::VaultRefusal,
+            crate::users::vault_write::VaultRefusal,
         >,
     },
     /// One user's vault heads or key records asked of a holder.

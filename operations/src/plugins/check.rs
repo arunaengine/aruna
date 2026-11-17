@@ -18,7 +18,8 @@ use ulid::Ulid;
 use super::account::read_user;
 use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::install::read_config;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
 

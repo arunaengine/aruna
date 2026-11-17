@@ -56,7 +56,8 @@ use super::rocrate_jsonld::{
 };
 use super::store::{put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::error::PolicyEnforcementError;
 use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };

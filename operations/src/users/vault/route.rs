@@ -14,12 +14,13 @@ use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
     retain_newest_keys, user_record_prefix,
 };
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
+use super::write::{
+    AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
+};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::routing::forward_to_holders;
@@ -30,13 +31,6 @@ use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, Wri
 use crate::metadata::transport_message_kind;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use aruna_core::placement::{holds_placement, target_placement_ref};
-
-/// Why a holder refused a forwarded vault change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum VaultRefusal {
-    Invalid,
-    TooManyKeys,
-}
 
 #[derive(Debug, Error)]
 pub enum VaultRouteError {

@@ -38,8 +38,9 @@ use super::ids::{
 };
 use super::witness::arm_family;
 use super::{LifecycleError, ids};
-use crate::auth::enforcement::PolicyEnforcementError;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::error::PolicyEnforcementError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::{family_prefix, kind_prefix};

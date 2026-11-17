@@ -29,7 +29,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
+use crate::auth::enforcement::PolicyEvaluator;
+use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::search_scan::{open_position, seal_position};

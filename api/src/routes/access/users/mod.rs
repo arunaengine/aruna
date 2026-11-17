@@ -1231,7 +1231,7 @@ pub(crate) async fn authorize_directory(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::auth::enforcement::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::error::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),

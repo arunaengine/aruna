@@ -3,7 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::store::decode_job_record;
 use crate::replication::queue::queued_prefixes;

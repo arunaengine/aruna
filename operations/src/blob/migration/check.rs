@@ -502,7 +502,8 @@ async fn clean_one(
     row: BrokenVersion,
     cleaned: &mut Cleaned,
 ) -> Result<bool, String> {
-    use crate::auth::request_authorization::{AuthorizeError, authorize};
+    use crate::auth::error::AuthorizeError;
+    use crate::auth::request_authorization::authorize;
     use crate::auth::request_policy::PolicyRequestExtras;
     use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
     use aruna_core::structs::identity::auth::Permission;

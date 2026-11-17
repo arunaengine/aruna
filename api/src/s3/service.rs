@@ -87,7 +87,8 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
-use aruna_operations::auth::request_authorization::{AuthorizeError, BucketAccess, authorize};
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::{BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{DriverContext, drive, drive_until, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};

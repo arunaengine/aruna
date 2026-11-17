@@ -39,7 +39,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, BucketAccess};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
 
 /// Rows read per storage page while looking for a bucket's releases.

@@ -51,7 +51,8 @@ use super::submit::{
     schedule_drain_effect,
 };
 use super::workflow::finalize::finalize_followups;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
+use crate::auth::error::AuthorizeError;
+use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;

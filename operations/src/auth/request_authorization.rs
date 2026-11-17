@@ -4,43 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator, enforce_policies};
+use crate::auth::enforcement::{PolicyEvaluator, enforce_policies};
+use crate::auth::error::{AuthorizeError, check_error};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
-use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::types::GroupId;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum AuthorizeError {
-    #[error("permission denied")]
-    PermissionDenied,
-    #[error(transparent)]
-    Policy(#[from] PolicyEnforcementError),
-    /// Storage failed while deciding the request: an infrastructure fault that
-    /// callers must not present as an authorization verdict.
-    #[error(transparent)]
-    Storage(StorageError),
-    #[error("authorization check failed: {0}")]
-    CheckFailed(String),
-}
-
-/// A missing or malformed target is an authorization failure, not an internal error, matching
-/// the choke points that fed this boundary.
-pub(crate) fn check_error(error: AuthorizationError) -> AuthorizeError {
-    match error {
-        AuthorizationError::InvalidRealmId
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::DocNotFound => AuthorizeError::PermissionDenied,
-        AuthorizationError::StorageError(error) => AuthorizeError::Storage(error),
-        other => AuthorizeError::CheckFailed(other.to_string()),
-    }
-}
 
 /// Authorizes one action: ordinary RBAC and public visibility first, then the
 /// realm and group deny/require policies. Neither layer may grant what the

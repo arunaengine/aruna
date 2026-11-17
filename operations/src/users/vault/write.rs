@@ -84,6 +84,13 @@ pub enum VaultAppended {
     Key(Box<UserKeyRecord>),
 }
 
+/// Why a holder refused a forwarded vault change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VaultRefusal {
+    Invalid,
+    TooManyKeys,
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum AppendVaultError {
     #[error(transparent)]
