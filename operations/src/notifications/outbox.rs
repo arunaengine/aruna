@@ -11,7 +11,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{
     InboxWriteOutcome, NotificationOutboxRecord, NotificationRecord,
 };
@@ -65,9 +65,9 @@ enum DrainState {
 
 type Turn = Result<Next<Option<Duration>>, IoError>;
 
-/// One drain run, page by page after a cursor, so a dead holder hides no healthy record. Local
-/// records go to the inbox, others to their holder once per run; rows stay until delivered,
-/// expired ones are dropped. The output is when the drain runs again.
+/// One drain run over a read snapshot, page by page, so a dead holder hides no healthy record.
+/// Local records go to the inbox, others to their holder once per run; rows stay until
+/// delivered, expired ones are dropped. The output is when the drain runs again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     local: Option<NodeId>,
@@ -94,19 +94,14 @@ impl DrainOutboxOperation {
         }
     }
 
-    fn scan(&mut self, state: DrainState, after: Option<Key>, limit: usize) -> Turn {
-        self.state = state;
+    fn read_page(&mut self) -> Turn {
+        self.state = DrainState::Page;
         Ok(Next::Call(IoCall::Page {
             space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
             prefix: Key::from(Vec::new()),
-            after,
-            limit,
+            after: self.start_after.clone(),
+            limit: OUTBOX_BATCH_SIZE + 1,
         }))
-    }
-
-    fn read_page(&mut self) -> Turn {
-        let after = self.start_after.clone();
-        self.scan(DrainState::Page, after, OUTBOX_BATCH_SIZE + 1)
     }
 
     fn delete(&mut self, state: DrainState, keys: Vec<Key>) -> Turn {
@@ -319,8 +314,20 @@ impl DrainOutboxOperation {
         if self.retry {
             return Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)));
         }
-        self.scan(DrainState::Head, None, 2)
+        self.state = DrainState::Head;
+        Ok(Next::Call(head_call()))
     }
+}
+
+/// The check for rows appended during the run; it reads outside the snapshot, as an effect.
+fn head_call() -> IoCall {
+    IoCall::from(Effect::Storage(StorageEffect::Iter {
+        key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+        prefix: None,
+        start: None,
+        limit: 2,
+        txn_id: None,
+    }))
 }
 
 /// Decodes one page read with one row more than `limit`; a malformed row stays for recovery.
@@ -359,6 +366,10 @@ fn head_rearm(values: Vec<(Key, Value)>) -> Option<Duration> {
 impl Operation for DrainOutboxOperation {
     type Output = Option<Duration>;
     type Error = IoError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
 
     fn first(&mut self) -> Turn {
         if self.local.is_none() {
@@ -407,7 +418,16 @@ impl Operation for DrainOutboxOperation {
                 Event::Net(NetEvent::Notification(answer)) => self.answered(holder, keys, answer),
                 other => Err(unexpected_event("NetEvent::Notification", &other)),
             },
-            (DrainState::Head, IoResult::Page { rows, .. }) => Ok(Next::Done(head_rearm(rows))),
+            (DrainState::Head, IoResult::Event(event)) => match *event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    Ok(Next::Done(head_rearm(values)))
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    warn!(%error, "Failed to check for notification outbox records appended during drain");
+                    Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+                }
+                other => Err(unexpected_event("StorageEvent::IterResult", &other)),
+            },
             (_, other) => Err(unexpected("an outbox drain result", &other)),
         }
     }
@@ -540,6 +560,13 @@ mod call_tests {
         })))
     }
 
+    fn head(values: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })))
+    }
+
     fn answer(message: NotificationTransportMessage) -> IoResult {
         IoResult::Event(Box::new(Event::Net(NetEvent::Notification(Ok(Box::new(
             message,
@@ -581,8 +608,9 @@ mod call_tests {
         let (mut operation, key) = at_remote(node_id(2));
         let ack = answer(NotificationTransportMessage::DeliverAck { written: 1 });
         assert_eq!(operation.next(ack), delete_call(key));
-        assert_eq!(operation.next(delete_result()), scan(None, 2));
-        assert_eq!(operation.next(rows(Vec::new())), Ok(Next::Done(None)));
+        assert_eq!(operation.next(delete_result()), Ok(Next::Call(head_call())));
+        assert_eq!(operation.next(head(Vec::new())), Ok(Next::Done(None)));
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
     }
 
     /// A failed delete keeps the rows, goes on with the run and asks for a retry.
@@ -650,8 +678,11 @@ mod call_tests {
         let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
         operation.first().unwrap();
         let malformed = || (Key::from(vec![1]), Value::from(vec![1, 2, 3]));
-        assert_eq!(operation.next(rows(vec![malformed()])), scan(None, 2));
-        let head = rows(vec![
+        assert_eq!(
+            operation.next(rows(vec![malformed()])),
+            Ok(Next::Call(head_call()))
+        );
+        let head = head(vec![
             malformed(),
             (Key::from(vec![2]), Value::from(vec![1])),
         ]);
