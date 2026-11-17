@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::LINK_QUEUE_KEYSPACE;
@@ -18,17 +18,17 @@ use aruna_core::structs::execution::job::{ExportRoCrateSpec, JobId, JobRecord, J
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::task::TaskEvent;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
-use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
 use super::link_store::{change_link, document_links, ensure_lineage, read_link};
 use super::links::{
-    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, id_key, schedule_drain,
+    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, SettleCheckOperation, id_key,
+    queue_row, schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
@@ -89,17 +89,6 @@ pub(crate) async fn queue_rows(
         rows.push(queue_row(link_id, &entry)?);
     }
     Ok(rows)
-}
-
-fn queue_row(
-    link_id: Ulid,
-    entry: &LinkQueueEntry,
-) -> Result<(String, Key, Value), ConversionError> {
-    Ok((
-        LINK_QUEUE_KEYSPACE.to_string(),
-        id_key(link_id),
-        ByteView::from(postcard::to_allocvec(entry)?),
-    ))
 }
 
 async fn scan_queue(
@@ -406,96 +395,18 @@ async fn drop_unchanged(
         .map(|_| None)
 }
 
-/// Deletes the queued check, or with `retry_at` moves it there. A change written since `queued`
-/// was read stays, due no later than `retry_at`; a removed check stays removed.
+/// Deletes the queued check, or with `retry_at` moves it there; see [`SettleCheckOperation`].
 async fn settle_entry(
     context: &DriverContext,
     link_id: Ulid,
     queued: &Value,
     retry_at: Option<u64>,
 ) -> Result<(), LinkError> {
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    };
-    let result = settle_in(context, link_id, queued, retry_at, txn_id).await;
-    if result.is_err() {
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-    }
-    match result {
+    let operation = SettleCheckOperation::new(link_id, queued.clone(), retry_at);
+    match drive(operation, context).await {
         // A conflicting write queued a newer change; its check runs later.
         Err(LinkError::Storage(StorageError::TransactionConflict)) => Ok(()),
         result => result,
-    }
-}
-
-async fn settle_in(
-    context: &DriverContext,
-    link_id: Ulid,
-    queued: &Value,
-    retry_at: Option<u64>,
-    txn_id: TxnId,
-) -> Result<(), LinkError> {
-    let current = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: LINK_QUEUE_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    };
-    let unchanged = current.as_ref() == Some(queued);
-    let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
-    let effect = match (current.as_ref(), retry_at) {
-        (Some(_), None) if unchanged => StorageEffect::Delete {
-            key_space: LINK_QUEUE_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: Some(txn_id),
-        },
-        (Some(current), Some(retry_at)) => {
-            let base = if unchanged { None } else { entry(current) };
-            let Some(mut next) = base.clone().or_else(|| entry(queued)) else {
-                return Err(LinkError::Unexpected("unreadable link queue entry".into()));
-            };
-            next.due_at_ms = base.map_or(retry_at, |base| base.due_at_ms.min(retry_at));
-            let (key_space, key, value) = queue_row(link_id, &next)?;
-            StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: Some(txn_id),
-            }
-        }
-        _ => StorageEffect::AbortTransaction { txn_id },
-    };
-    let aborting = matches!(effect, StorageEffect::AbortTransaction { .. });
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::TransactionAborted { .. }) if aborting => return Ok(()),
-        Event::Storage(StorageEvent::DeleteResult { .. } | StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(LinkError::Unexpected(other.label().to_string())),
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(LinkError::Unexpected(other.label().to_string())),
     }
 }
 
