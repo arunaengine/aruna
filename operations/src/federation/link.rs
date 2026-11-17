@@ -275,7 +275,9 @@ impl Operation for LinkLoginOperation {
 
     fn next(&mut self, result: IoResult) -> LinkTurn {
         // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
-        let user = result.child::<User, UpdateUserError>()?.map_err(link_error)?;
+        let user = result
+            .child::<User, UpdateUserError>()?
+            .map_err(link_error)?;
         Ok(Next::Done(user))
     }
 
@@ -407,7 +409,9 @@ impl Operation for UnlinkLoginOperation {
             }
             UnlinkPhase::Update => {
                 // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
-                let user = result.child::<User, UpdateUserError>()?.map_err(link_error)?;
+                let user = result
+                    .child::<User, UpdateUserError>()?
+                    .map_err(link_error)?;
                 Ok(Next::Done(user))
             }
         }
@@ -421,20 +425,21 @@ impl Operation for UnlinkLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive_retry;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::calls::ChildOutcome;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::types::Effects;
-    use smallvec::smallvec;
+    use crate::users::update_user::{UserWrite, UserWritten};
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
     use aruna_core::handoff::secret_nonce;
+    use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::rows::done;
     use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
+    use aruna_core::types::{Key, KeySpace, Value};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
     use url::Url;
@@ -747,45 +752,56 @@ mod tests {
         assert_eq!(linked, Err(LinkLoginError::CutOff));
     }
 
-    /// Commits `write` outside the link's user update right after its first read inside it.
+    /// Writes its rows in a run of its own, outside any open transaction.
     #[derive(Debug, PartialEq)]
-    struct Racing {
-        update: UpdateUserOperation,
-        write: Option<StorageEffect>,
-        held: Option<Event>,
-    }
+    struct OwnWrite(Vec<(KeySpace, Key, Value)>);
 
-    impl EffectOperation for Racing {
-        type Output = User;
+    impl Operation for OwnWrite {
+        type Output = ();
         type Error = UpdateUserError;
 
-        fn start(&mut self) -> Effects {
-            self.update.start()
+        fn first(&mut self) -> Result<Next<()>, UpdateUserError> {
+            Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.0))))
         }
 
-        fn step(&mut self, event: Event) -> Effects {
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateUserError> {
+            done(result)?;
+            Ok(Next::Done(()))
+        }
+    }
+
+    /// Commits `write` outside the link's user transaction right after its first read inside it.
+    #[derive(Debug, PartialEq)]
+    struct Racing {
+        update: UserWrite,
+        write: Option<(KeySpace, Key, Value)>,
+        held: Option<IoResult>,
+    }
+
+    impl Operation for Racing {
+        type Output = UserWritten;
+        type Error = UpdateUserError;
+
+        fn transaction(&self) -> TransactionMode {
+            self.update.transaction()
+        }
+
+        fn first(&mut self) -> Result<Next<UserWritten>, UpdateUserError> {
+            self.update.first()
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<UserWritten>, UpdateUserError> {
             if let Some(held) = self.held.take() {
-                return self.update.step(held);
+                result.child::<(), UpdateUserError>()??;
+                return self.update.next(held);
             }
-            if matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }))
-                && let Some(write) = self.write.take()
+            if matches!(result, IoResult::Values(_))
+                && let Some(row) = self.write.take()
             {
-                self.held = Some(event);
-                return smallvec![Effect::Storage(write)];
+                self.held = Some(result);
+                return Ok(Next::Call(IoCall::child(OwnWrite(vec![row]))));
             }
-            self.update.step(event)
-        }
-
-        fn is_complete(&self) -> bool {
-            self.update.is_complete()
-        }
-
-        fn finalize(self) -> Result<User, UpdateUserError> {
-            self.update.finalize()
-        }
-
-        fn abort(&mut self) -> Effects {
-            self.update.abort()
+            self.update.next(result)
         }
     }
 
@@ -798,17 +814,18 @@ mod tests {
             .await
             .unwrap();
         let (key_space, key, value) = cutoff_config(&context, now).await;
-        let racing = Racing {
-            update: UpdateUserOperation::new(link(local(2), confirmation, now).input()),
-            write: Some(StorageEffect::Write {
-                key_space,
-                key: key.into(),
-                value: value.into(),
-                txn_id: None,
-            }),
+        let input = link(local(2), confirmation, now).input();
+        let mut first = true;
+        let build = || Racing {
+            update: UserWrite::new(input.clone(), local(2)),
+            write: std::mem::take(&mut first)
+                .then(|| (key_space.clone(), key.clone().into(), value.clone().into())),
             held: None,
         };
-        let linked = drive(racing, &context).await.map_err(link_error);
+        let linked = drive_retry(build, &context, b"racing")
+            .await
+            .map(|(user, _)| user)
+            .map_err(link_error);
         assert_eq!(linked, Err(LinkLoginError::CutOff));
         let row = crate::jobs::key_wake::read_row(
             &context.storage_handle,
