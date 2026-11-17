@@ -935,6 +935,96 @@ pub(crate) fn dirty_rows(
     rows
 }
 
+#[derive(Debug, Error, PartialEq)]
+pub enum MarkDirtyError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("unexpected event while marking usage for a publish: {0}")]
+    UnexpectedEvent(&'static str),
+    #[error("the usage marking has not finished")]
+    Unfinished,
+}
+
+/// Marks groups and the global for the next usage publish, then schedules that publish; the
+/// wake form only schedules the publish that consumes markers a caller already committed.
+/// Scheduling is best effort: a refused timer still ends the run.
+#[derive(Debug, PartialEq)]
+pub struct MarkDirtyOperation {
+    writes: Option<Vec<(String, Key, Value)>>,
+    marking: bool,
+    result: Option<Result<(), MarkDirtyError>>,
+}
+
+impl MarkDirtyOperation {
+    pub fn new(groups: impl IntoIterator<Item = GroupId>, generation: ulid::Ulid) -> Self {
+        Self {
+            writes: Some(dirty_rows(groups, generation)),
+            marking: false,
+            result: None,
+        }
+    }
+
+    pub fn wake() -> Self {
+        Self {
+            writes: None,
+            marking: false,
+            result: None,
+        }
+    }
+}
+
+impl Operation for MarkDirtyOperation {
+    type Output = ();
+    type Error = MarkDirtyError;
+
+    fn start(&mut self) -> Effects {
+        let Some(writes) = self.writes.take() else {
+            return smallvec![schedule_snapshot_publish()];
+        };
+        self.marking = true;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.result.is_some() {
+            self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
+            return smallvec![];
+        }
+        match (std::mem::replace(&mut self.marking, false), event) {
+            (true, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                smallvec![schedule_snapshot_publish()]
+            }
+            (true, Event::Storage(StorageEvent::Error { error })) => {
+                self.result = Some(Err(error.into()));
+                smallvec![]
+            }
+            (false, Event::Task(_)) => {
+                self.result = Some(Ok(()));
+                smallvec![]
+            }
+            (_, event) => {
+                self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.result.unwrap_or(Err(MarkDirtyError::Unfinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2859,6 +2949,7 @@ mod state_machine_tests {
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };
+    use aruna_core::task::TaskEvent;
 
     use super::*;
 
@@ -2898,5 +2989,91 @@ mod state_machine_tests {
         started.start();
         check_abort(&mut started, &[]);
         rejects_finalize(started);
+    }
+
+    #[test]
+    fn marks_then_wakes() {
+        let group = ulid::Ulid::from_parts(6, 6);
+        let generation = ulid::Ulid::from_parts(1, 1);
+        let mut mark = MarkDirtyOperation::new([group], generation);
+        let write = Effect::Storage(StorageEffect::BatchWrite {
+            writes: dirty_rows([group], generation),
+            txn_id: None,
+        });
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishUsageSnapshots,
+            after: SNAPSHOT_PUBLISH_DEBOUNCE,
+        });
+        let written = Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        });
+        check_trace(
+            &mut mark,
+            &[write],
+            vec![
+                (written, vec![schedule_snapshot_publish()]),
+                (scheduled, vec![]),
+            ],
+        );
+        assert_eq!(mark.finalize(), Ok(()));
+        // A refused timer still ends the wake; the markers wait for the next publish.
+        let mut wake = MarkDirtyOperation::wake();
+        let refused = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "no task handle".to_string(),
+        });
+        check_trace(
+            &mut wake,
+            &[schedule_snapshot_publish()],
+            vec![(refused, vec![])],
+        );
+        assert_eq!(wake.finalize(), Ok(()));
+        let mut failed = MarkDirtyOperation::new([group], generation);
+        failed.start();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(
+            failed.finalize(),
+            Err(MarkDirtyError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn marking_rejects_stray() {
+        let marking = || {
+            let mut operation =
+                MarkDirtyOperation::new([ulid::Ulid::from_parts(6, 6)], ulid::Ulid::nil());
+            operation.start();
+            operation
+        };
+        let write = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::BatchWriteResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(marking, sample_events, write) {
+            assert!(effects.is_empty(), "{label}");
+            assert!(
+                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
+                "{label}"
+            );
+        }
+        let waking = || {
+            let mut operation = MarkDirtyOperation::wake();
+            operation.start();
+            operation
+        };
+        let task = |event: &Event| matches!(event, Event::Task(_));
+        for (label, _, error) in rejects_events(waking, sample_events, task) {
+            assert!(
+                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
+                "{label}"
+            );
+        }
+        let mut open = marking();
+        check_abort(&mut open, &[]);
+        rejects_finalize(open);
     }
 }
