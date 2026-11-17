@@ -471,15 +471,7 @@ pub(in crate::document_sync) async fn store_watch_change(
             }
         };
 
-        // Watch ids are immutable and never reused. The first valid upsert wins,
-        // and any delete permanently fences delayed/replayed creates.
-        let apply = match (current.as_ref().map(|local| local.kind), change.kind) {
-            (None, _) => true,
-            (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Delete) => true,
-            (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Upsert)
-            | (Some(DocumentChangeKind::Delete), _) => false,
-        };
-        if !apply {
+        if !watch_change_applies(current.as_ref().map(|local| local.kind), change.kind) {
             let _ = abort_txn(storage, txn_id).await;
             return Ok(false);
         }

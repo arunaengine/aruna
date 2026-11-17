@@ -359,3 +359,33 @@ pub fn validate_pid_mapping(
     }
     Ok(())
 }
+
+/// Whether a watch subscription or setting change applies over the stored revision kind. Watch
+/// ids are never reused: the first upsert wins and any delete fences later creates for good.
+pub fn watch_change_applies(
+    stored: Option<DocumentChangeKind>,
+    incoming: DocumentChangeKind,
+) -> bool {
+    match (stored, incoming) {
+        (None, _) => true,
+        (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Delete) => true,
+        (Some(DocumentChangeKind::Upsert), DocumentChangeKind::Upsert)
+        | (Some(DocumentChangeKind::Delete), _) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_changes_fence() {
+        use DocumentChangeKind::{Delete, Upsert};
+        assert!(watch_change_applies(None, Upsert));
+        assert!(watch_change_applies(None, Delete));
+        assert!(watch_change_applies(Some(Upsert), Delete));
+        assert!(!watch_change_applies(Some(Upsert), Upsert));
+        assert!(!watch_change_applies(Some(Delete), Upsert));
+        assert!(!watch_change_applies(Some(Delete), Delete));
+    }
+}
