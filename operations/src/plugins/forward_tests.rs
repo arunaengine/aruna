@@ -11,8 +11,8 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::worker::match_journal;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
+use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed};
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps

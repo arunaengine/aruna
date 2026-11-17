@@ -64,7 +64,10 @@ fn started() -> Event {
 
 fn read(value: Option<&[u8]>) -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(b"a".to_vec().into(), value.map(|value| value.to_vec().into()))],
+        values: vec![(
+            b"a".to_vec().into(),
+            value.map(|value| value.to_vec().into()),
+        )],
     })
 }
 
@@ -83,7 +86,11 @@ fn read_effect(txn_id: Option<TxnId>) -> Effect {
 
 fn write_effect(txn_id: Option<TxnId>) -> Effect {
     storage(StorageEffect::BatchWrite {
-        writes: vec![(SPACE.to_string(), b"a".to_vec().into(), b"held".to_vec().into())],
+        writes: vec![(
+            SPACE.to_string(),
+            b"a".to_vec().into(),
+            b"held".to_vec().into(),
+        )],
         txn_id,
     })
 }
@@ -166,9 +173,11 @@ fn rejects_unexpected_events() {
         operation.step(started());
         operation
     };
-    let refusals = rejects_events(waiting, sample_events, |event| {
-        matches!(event, Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 1)
-    });
+    let refusals = rejects_events(
+        waiting,
+        sample_events,
+        |event| matches!(event, Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 1),
+    );
     for (label, effects, _) in refusals {
         assert_eq!(effects.as_slice(), [abort_effect()], "{label}");
     }
@@ -178,7 +187,10 @@ fn rejects_unexpected_events() {
         operation
     };
     let refusals = rejects_events(starting, sample_events, |event| {
-        matches!(event, Event::Storage(StorageEvent::TransactionStarted { .. }))
+        matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionStarted { .. })
+        )
     });
     assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
     let committing = || {
@@ -190,7 +202,10 @@ fn rejects_unexpected_events() {
         operation
     };
     let refusals = rejects_events(committing, sample_events, |event| {
-        matches!(event, Event::Storage(StorageEvent::TransactionCommitted { .. }))
+        matches!(
+            event,
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+        )
     });
     assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
 }

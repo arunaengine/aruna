@@ -70,7 +70,8 @@ async fn notify(fixture: &Fixture) -> usize {
 
 /// The `job_finished` runs of `install`, as the job id and how it ended.
 async fn finish_runs(fixture: &Fixture, install: &PluginInstall) -> Vec<(String, String)> {
-    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx)
+        .await
         .unwrap();
     (runs.into_iter())
         .filter_map(|run| match run.trigger {
@@ -90,7 +91,8 @@ async fn delivers_after_success() {
     assert_eq!(notify(&fixture).await, 1);
     let expected = vec![(work_id.to_string(), "succeeded".to_string())];
     assert_eq!(finish_runs(&fixture, &install).await, expected);
-    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx)
+        .await
         .unwrap();
     let RunTrigger::Event(event) = &runs.last().unwrap().trigger else {
         panic!("a job_finished run gets an event");
@@ -113,7 +115,8 @@ async fn holds_failed_runs() {
     let late = RUN_RETENTION_MS * 3;
     assert_eq!(drive(prune_runs(late), &fixture.ctx).await.unwrap(), 0);
     assert_eq!(drive(prune_work(late), &fixture.ctx).await.unwrap(), 0);
-    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx)
+        .await
         .unwrap();
     assert!(row.is_some_and(|row| !row.notified));
 }
@@ -125,7 +128,8 @@ async fn notifies_without_trigger() {
     let work_id = settled(&fixture, &install, RunState::Succeeded).await;
     assert_eq!(notify(&fixture).await, 1);
     assert!(finish_runs(&fixture, &install).await.is_empty());
-    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx)
+        .await
         .unwrap();
     assert!(row.is_some_and(|row| row.notified));
 }
@@ -142,13 +146,16 @@ async fn retry_releases_held() {
     let fixture = Fixture::new().await;
     let install = finisher(&fixture).await;
     let work_id = settled(&fixture, &install, RunState::Failed).await;
-    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(waits_for(&row, Some(RunState::Failed)), Some(row.run_id));
     let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
     let ids = (install.install_id, row.run_id);
-    let mut run = drive(retry_run(ids, &retried, 9).unwrap(), &fixture.ctx).await.unwrap();
+    let mut run = drive(retry_run(ids, &retried, 9).unwrap(), &fixture.ctx)
+        .await
+        .unwrap();
     assert_eq!(
         (run.state, run.attempts, run.due_ms),
         (RunState::Queued, 0, 9)
@@ -169,7 +176,9 @@ async fn drop_delivers_none() {
     let work_id = settled(&fixture, &install, RunState::Cancelled).await;
     let dropped = audit(&fixture, AdminAuditAction::PluginCompletionDropped);
     let ids = (install.install_id, work_id);
-    let row = drive(drop_completion(ids, &dropped).unwrap(), &fixture.ctx).await.unwrap();
+    let row = drive(drop_completion(ids, &dropped).unwrap(), &fixture.ctx)
+        .await
+        .unwrap();
     assert_eq!(waits_for(&row, Some(RunState::Cancelled)), None);
     let twice = drive(drop_completion(ids, &dropped).unwrap(), &fixture.ctx).await;
     assert_eq!(twice.map(drop), Err(RunError::NotHeld));
@@ -194,22 +203,35 @@ async fn retry_redoes_undone() {
     let mut run = scope(&fixture, &install).run;
     let (settled, undone) = (Intent::new(1, &[b"put"]), Intent::new(2, &[b"copy"]));
     let ctx = &fixture.ctx;
-    drive(begin(run.run_id, settled.clone()), ctx).await.unwrap();
+    drive(begin(run.run_id, settled.clone()), ctx)
+        .await
+        .unwrap();
     let settled = settled_row(run.run_id, &settled, "7".into()).unwrap();
     drive(write_rows(vec![settled]), ctx).await.unwrap();
     let unknown = unknown_row(run.run_id, &undone, "timed out").unwrap();
-        drive(write_rows(vec![unknown]), ctx).await.unwrap();
-    let intents = drive(scan_rows(intent_scan(run.run_id)), ctx).await.unwrap();
+    drive(write_rows(vec![unknown]), ctx).await.unwrap();
+    let intents = drive(scan_rows(intent_scan(run.run_id)), ctx)
+        .await
+        .unwrap();
     let resolved = resolved_rows(intents, false).unwrap();
     drive(write_rows(resolved), ctx).await.unwrap();
     run.finish(RunState::Failed, None, 1);
     drive(save_run(&run).unwrap(), ctx).await.unwrap();
     let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
-    drive(retry_run((install.install_id, run.run_id), &retried, 9).unwrap(), ctx).await
-        .unwrap();
-    assert_eq!(drive(begin(run.run_id, undone.clone()), ctx).await.unwrap(), Begun::Fresh);
+    drive(
+        retry_run((install.install_id, run.run_id), &retried, 9).unwrap(),
+        ctx,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        drive(begin(run.run_id, settled.clone()), ctx).await.unwrap(),
+        drive(begin(run.run_id, undone.clone()), ctx).await.unwrap(),
+        Begun::Fresh
+    );
+    assert_eq!(
+        drive(begin(run.run_id, settled.clone()), ctx)
+            .await
+            .unwrap(),
         Begun::Settled("7".into())
     );
 }

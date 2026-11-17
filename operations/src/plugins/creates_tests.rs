@@ -51,11 +51,15 @@ async fn rejection_allows_correction() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let first = pinned(&fixture, "a");
-    drive(claim_key((&install, "42"), first.clone()), ctx).await
+    drive(claim_key((&install, "42"), first.clone()), ctx)
+        .await
         .unwrap();
-    drive(settle_key((&install, "42"), true), ctx).await.unwrap();
+    drive(settle_key((&install, "42"), true), ctx)
+        .await
+        .unwrap();
     let edited = pinned(&fixture, "b");
-    let (corrected, claim) = drive(claim_key((&install, "42"), edited.clone()), ctx).await
+    let (corrected, claim) = drive(claim_key((&install, "42"), edited.clone()), ctx)
+        .await
         .unwrap();
     assert_eq!(claim, Claim::Fresh);
     assert_eq!(corrected.payload, edited.payload);
@@ -64,7 +68,9 @@ async fn rejection_allows_correction() {
         (corrected.document_id, corrected.target),
         (first.document_id, first.target)
     );
-    drive(settle_key((&install, "42"), false), ctx).await.unwrap();
+    drive(settle_key((&install, "42"), false), ctx)
+        .await
+        .unwrap();
     let later = drive(claim_key((&install, "42"), pinned(&fixture, "c")), ctx).await;
     assert_eq!(later, Ok((corrected, Claim::Earlier)));
 }
@@ -76,7 +82,8 @@ async fn unknown_keeps_arguments() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let first = pinned(&fixture, "a");
-    drive(claim_key((&install, "7"), first.clone()), ctx).await
+    drive(claim_key((&install, "7"), first.clone()), ctx)
+        .await
         .unwrap();
     let again = drive(claim_key((&install, "7"), pinned(&fixture, "b")), ctx).await;
     assert_eq!(again, Ok((first.clone(), Claim::Earlier)));
@@ -111,7 +118,8 @@ async fn removal_drops_keys() {
     let install = installed(&fixture).await;
     for key in ["1", "2"] {
         let minted = pinned(&fixture, key);
-        drive(claim_key((&install, key), minted), &fixture.ctx).await
+        drive(claim_key((&install, key), minted), &fixture.ctx)
+            .await
             .unwrap();
     }
     let mut config = config(&fixture).await;
@@ -133,7 +141,8 @@ async fn reinstall_starts_fresh() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let first = pinned(&fixture, "a");
-    drive(claim_key((&install, "9"), first.clone()), &fixture.ctx).await
+    drive(claim_key((&install, "9"), first.clone()), &fixture.ctx)
+        .await
         .unwrap();
     let reinstalled = PluginInstall {
         account: UserId::local(Ulid::generate(), fixture.actor.realm_id),

@@ -44,7 +44,10 @@ async fn expired_gaps() {
     txn.write(PLUGIN_GAPS_KEYSPACE, rows).await.unwrap();
     assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(0));
     let later = now + DEDUP_RETENTION_MS + 1;
-    assert_eq!(drive(sweep_events(&config, later), &fixture.ctx).await, Ok(2));
+    assert_eq!(
+        drive(sweep_events(&config, later), &fixture.ctx).await,
+        Ok(2)
+    );
     assert_eq!(count(&fixture, PLUGIN_GAPS_KEYSPACE).await, 0);
 }
 
@@ -68,7 +71,12 @@ async fn removed_install_rows() {
     assert!(count(&fixture, PLUGIN_REPLAYS_KEYSPACE).await > 0);
     let mut config = config(&fixture).await;
     config.installs[0].state = InstallState::Removing;
-    assert!(drive(sweep_events(&config, now), &fixture.ctx).await.unwrap() >= 2);
+    assert!(
+        drive(sweep_events(&config, now), &fixture.ctx)
+            .await
+            .unwrap()
+            >= 2
+    );
     for space in [
         PLUGIN_WAITING_KEYSPACE,
         PLUGIN_QUEUE_KEYSPACE,

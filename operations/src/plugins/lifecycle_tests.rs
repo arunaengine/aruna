@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use super::*;
+use crate::driver::drive;
 use crate::plugins::account::{ensure_role, guard_of};
 use crate::plugins::grants::role_paths;
 use crate::plugins::install::tests::Fixture;

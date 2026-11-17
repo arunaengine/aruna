@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use super::*;
+use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use crate::plugins::account::{read_row, read_user};

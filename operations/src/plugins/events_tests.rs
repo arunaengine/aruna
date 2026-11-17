@@ -14,11 +14,11 @@ use crate::plugins::decide::decide_batch;
 use crate::plugins::forward::{Backoff, Decisions, EventBatch, Outcome, send_outbox};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::{pause_install, set_grants};
-use crate::plugins::worker::match_journal;
 use crate::plugins::matcher::tests::{config, forwarded, journal};
 use crate::plugins::replay::plan_replays;
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
+use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
@@ -128,9 +128,14 @@ async fn narrowed_grant_stops() {
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "B/one", now - 1)).await;
-    match_journal(&fixture.ctx, &config(&fixture).await, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
+    match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (now, EVENTS_QUEUED),
+    )
+    .await
+    .unwrap();
     let base = created(&install, "").1;
     let narrowed = scoped(vec![format!("{base}/A/**")]);
     let (auth, id) = (fixture.auth(), install.install_id);
@@ -151,9 +156,14 @@ async fn pause_and_removal() {
     for (resource, at) in [("D1", now - 1), ("D2", now)] {
         journal(&fixture, &dataset(&install, resource, at)).await;
     }
-    match_journal(&fixture.ctx, &config(&fixture).await, local, (now, EVENTS_QUEUED))
-        .await
-        .unwrap();
+    match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (now, EVENTS_QUEUED),
+    )
+    .await
+    .unwrap();
     let (auth, id) = (fixture.auth(), install.install_id);
     pause_install(&fixture.ctx, &fixture.actor, &auth, id)
         .await

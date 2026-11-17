@@ -54,13 +54,29 @@ async fn sweep_awaits_work() {
     mark(&blob, ("in", "b.txt", orphan), unknown).await;
     // The orphan's work is gone and its version absent; the copy's work may still write.
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!drive(is_marked(("in", "b.txt", orphan)).unwrap(), &blob).await.unwrap());
-    assert!(drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob).await.unwrap());
+    assert!(
+        !drive(is_marked(("in", "b.txt", orphan)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+    assert!(
+        drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
     let settle = edit_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
     settle.await.unwrap();
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob).await.unwrap());
-    assert!(drive(is_marked(("in", "a.txt", present)).unwrap(), &blob).await.unwrap());
+    assert!(
+        !drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+    assert!(
+        drive(is_marked(("in", "a.txt", present)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
 
     // Removing the install deletes its work rows, never its marks; a written version keeps its
     // mark for any later install.
@@ -68,5 +84,9 @@ async fn sweep_awaits_work() {
     config.installs.clear();
     assert_eq!(retire_work(&blob, &config, 9).await.unwrap(), 1);
     assert_eq!(sweep_marks(&blob).await.unwrap(), 0);
-    assert!(drive(is_marked(("in", "a.txt", present)).unwrap(), &blob).await.unwrap());
+    assert!(
+        drive(is_marked(("in", "a.txt", present)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
 }

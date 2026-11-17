@@ -92,8 +92,12 @@ async fn reserved(
         ordinal: 0,
     };
     let marked = marked.then_some(("in", "reads.fq"));
-    let (row, _) = drive(reserve((install, &identity), row, marked).unwrap(), &fixture.ctx).await
-        .unwrap();
+    let (row, _) = drive(
+        reserve((install, &identity), row, marked).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let action = PluginWorkAction::Download {
         target,
         version_id: row.version_id.unwrap(),

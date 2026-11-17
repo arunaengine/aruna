@@ -12,9 +12,9 @@ use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::intents::unknown_row;
-use crate::plugins::rows::write_rows;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
+use crate::plugins::rows::write_rows;
 use crate::plugins::runs::admit;
 use crate::plugins::runs::tests::queued;
 use aruna_core::plugin_runs::{SourceEvent, SourceKind};
@@ -197,11 +197,14 @@ async fn finishes_runs() {
     let unsure = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
     let unknown = unknown_row(unsure.run_id, &intent, "timed out").unwrap();
-        drive(write_rows(vec![unknown]), &fixture.ctx).await.unwrap();
+    drive(write_rows(vec![unknown]), &fixture.ctx)
+        .await
+        .unwrap();
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 2);
     worker.settle().await;
-    let done = drive(read_run(install.install_id, ok.run_id), &fixture.ctx).await
+    let done = drive(read_run(install.install_id, ok.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     assert!(
@@ -210,7 +213,8 @@ async fn finishes_runs() {
             .starts_with(&format!("\"{}", ok.run_id))
     );
     assert_eq!(done.attempts, 1);
-    let open = drive(read_run(install.install_id, unsure.run_id), &fixture.ctx).await
+    let open = drive(read_run(install.install_id, unsure.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!(open.state, RunState::NeedsAttention);
     assert!(drive(unfinished(), &fixture.ctx).await.unwrap().is_empty());
@@ -268,7 +272,8 @@ async fn event_input() {
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let output = done.output.unwrap_or_default();
@@ -355,7 +360,8 @@ async fn event_rechecked() {
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!((done.state, done.attempts), (RunState::Cancelled, 2));
     let message = done.message.unwrap_or_default();
@@ -378,7 +384,8 @@ async fn bounded_and_restarted() {
     first.running().clear();
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 1);
     first.stop().await;
-    let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!((cut.state, cut.attempts), (RunState::Running, 1));
 
@@ -386,7 +393,8 @@ async fn bounded_and_restarted() {
     let second = worker(&fixture);
     assert_eq!(second.claim(unix_timestamp_millis()).await.unwrap(), 1);
     second.stop().await;
-    let again = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    let again = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!(again.attempts, 2);
 }
@@ -420,7 +428,9 @@ async fn revoked_runs() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let install = installed(&fixture).await;
     let state = async |run: &PluginRun| {
-        let run = drive(read_run(install.install_id, run.run_id), ctx).await.unwrap();
+        let run = drive(read_run(install.install_id, run.run_id), ctx)
+            .await
+            .unwrap();
         (run.state, run.message.unwrap_or_default())
     };
     let worker = worker(&fixture);
@@ -518,7 +528,7 @@ async fn removed_with_intents() {
     let clean = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
     let unknown = unknown_row(open.run_id, &intent, "timed out").unwrap();
-        drive(write_rows(vec![unknown]), ctx).await.unwrap();
+    drive(write_rows(vec![unknown]), ctx).await.unwrap();
     remove_install(ctx, actor, &auth, install.install_id)
         .await
         .unwrap();
@@ -527,7 +537,8 @@ async fn removed_with_intents() {
         .await
         .unwrap();
     let state = async |run: &PluginRun| {
-        drive(read_run(install.install_id, run.run_id), ctx).await
+        drive(read_run(install.install_id, run.run_id), ctx)
+            .await
             .unwrap()
             .state
     };

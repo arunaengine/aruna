@@ -109,8 +109,12 @@ async fn recorded(
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = drive(reserve((install, &identity), row, None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    let (row, _) = drive(
+        reserve((install, &identity), row, None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let spec = PluginWorkSpec {
         realm_id: fixture.actor.realm_id,
         install_id: install.install_id,

@@ -64,11 +64,15 @@ async fn bounded_queue() {
     drive(admit(queued(other, 600)), &ctx).await.unwrap();
 
     // A run that ended frees its place, and stays readable.
-    let mut done = drive(read_run(install, Ulid::from_parts(10, 1)), &ctx).await
+    let mut done = drive(read_run(install, Ulid::from_parts(10, 1)), &ctx)
+        .await
         .unwrap();
     done.finish(RunState::Succeeded, None, 700);
     drive(save_run(&done).unwrap(), &ctx).await.unwrap();
-    assert_eq!(drive(read_run(install, done.run_id), &ctx).await.unwrap(), done);
+    assert_eq!(
+        drive(read_run(install, done.run_id), &ctx).await.unwrap(),
+        done
+    );
     assert_eq!(drive(unfinished(), &ctx).await.unwrap().len(), RUNS_QUEUED);
     drive(admit(queued(install, 501)), &ctx).await.unwrap();
 }
@@ -80,7 +84,8 @@ async fn paged_runs() {
     for seq in [30, 10, 20] {
         drive(admit(queued(install, seq)), &ctx).await.unwrap();
     }
-    drive(admit(queued(Ulid::from_parts(1, 2), 15)), &ctx).await
+    drive(admit(queued(Ulid::from_parts(1, 2), 15)), &ctx)
+        .await
         .unwrap();
     let (first, next) = drive(list_runs(install, None, 2), &ctx).await.unwrap();
     let ids: Vec<_> = first.iter().map(|run| run.due_ms).collect();
@@ -110,7 +115,9 @@ async fn pruned_runs() {
         run.finish(state, None, finished);
         drive(save_run(&run).unwrap(), &ctx).await.unwrap();
         let intent = Intent::new(0, &[b"x"]);
-        drive(begin(run.run_id, intent.clone()), &ctx).await.unwrap();
+        drive(begin(run.run_id, intent.clone()), &ctx)
+            .await
+            .unwrap();
         let settled = settled_row(run.run_id, &intent, "r".into()).unwrap();
         drive(write_rows(vec![settled]), &ctx).await.unwrap();
         ended.push(run);
@@ -123,7 +130,10 @@ async fn pruned_runs() {
         drive(read_run(install, ended[0].run_id), &ctx).await,
         Err(RunError::NotFound)
     );
-    assert_eq!(drive(open_intent(ended[0].run_id), &ctx).await.unwrap(), None);
+    assert_eq!(
+        drive(open_intent(ended[0].run_id), &ctx).await.unwrap(),
+        None
+    );
     for kept in [&ended[1], &ended[2], &waiting] {
         assert!(drive(read_run(install, kept.run_id), &ctx).await.is_ok());
     }
@@ -140,7 +150,17 @@ async fn resolved_runs() {
     drive(admit(run.clone()), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    let early = drive(resolve_run((install, run.run_id), true, &audit, aruna_core::time::unix_timestamp_millis()).unwrap(), &ctx).await;
+    let early = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await;
     assert_eq!(early, Err(RunError::NotWaiting("queued")));
     run.finish(
         RunState::NeedsAttention,
@@ -148,11 +168,31 @@ async fn resolved_runs() {
         5,
     );
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
-    let resolved = drive(resolve_run((install, run.run_id), true, &audit, aruna_core::time::unix_timestamp_millis()).unwrap(), &ctx).await
-        .unwrap();
+    let resolved = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert_eq!(resolved.state, RunState::Succeeded);
     assert!(resolved.message.unwrap_or_default().ends_with("as done"));
-    let again = drive(resolve_run((install, run.run_id), false, &audit, aruna_core::time::unix_timestamp_millis()).unwrap(), &ctx).await;
+    let again = drive(
+        resolve_run(
+            (install, run.run_id),
+            false,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await;
     assert_eq!(again, Err(RunError::NotWaiting("succeeded")));
 }
 
@@ -169,8 +209,13 @@ async fn keeps_open_calls() {
     run.finish(RunState::Failed, None, 10);
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
     let unknown = unknown_row(run.run_id, &Intent::new(0, &[b"x"]), "lost").unwrap();
-        drive(write_rows(vec![unknown]), &ctx).await.unwrap();
-    assert_eq!(drive(prune_runs(10 + RUN_RETENTION_MS), &ctx).await.unwrap(), 0);
+    drive(write_rows(vec![unknown]), &ctx).await.unwrap();
+    assert_eq!(
+        drive(prune_runs(10 + RUN_RETENTION_MS), &ctx)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(drive(read_run(install, run.run_id), &ctx).await.is_ok());
 }
 
@@ -200,8 +245,18 @@ async fn unresolved_count() {
     assert!(!running.contains(&(install, waiting.run_id)));
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    drive(resolve_run((install, waiting.run_id), false, &audit, aruna_core::time::unix_timestamp_millis()).unwrap(), &ctx).await
-        .unwrap();
+    drive(
+        resolve_run(
+            (install, waiting.run_id),
+            false,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
     drive(admit(queued(install, 500)), &ctx).await.unwrap();
 }
 
@@ -221,7 +276,7 @@ async fn resolved_expire() {
     drive(admit(run.clone()), &ctx).await.unwrap();
     let intent = Intent::new(0, &[b"x"]);
     let unknown = unknown_row(run.run_id, &intent, "lost").unwrap();
-        drive(write_rows(vec![unknown]), &ctx).await.unwrap();
+    drive(write_rows(vec![unknown]), &ctx).await.unwrap();
     run.finish(
         RunState::NeedsAttention,
         Some("call 0 is unknown".into()),
@@ -230,8 +285,18 @@ async fn resolved_expire() {
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
     let admin = UserId::local(Ulid::from_parts(3, 3), RealmId::from_bytes([1u8; 32]));
     let audit = AdminAuditRecord::new(AdminAuditAction::PluginRunResolved, admin, admin);
-    let resolved = drive(resolve_run((install, run.run_id), true, &audit, aruna_core::time::unix_timestamp_millis()).unwrap(), &ctx).await
-        .unwrap();
+    let resolved = drive(
+        resolve_run(
+            (install, run.run_id),
+            true,
+            &audit,
+            aruna_core::time::unix_timestamp_millis(),
+        )
+        .unwrap(),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert_eq!(drive(open_intent(run.run_id), &ctx).await.unwrap(), None);
     let later = resolved.finished_ms.unwrap() + RUN_RETENTION_MS;
     assert_eq!(drive(prune_runs(later), &ctx).await.unwrap(), 1);
@@ -244,7 +309,9 @@ async fn resolved_expire() {
 
 /// A page answer of `count` queue rows.
 fn queue_page(count: usize) -> Answer {
-    let rows = (0..count).map(|seq| (vec![seq as u8], Vec::new())).collect();
+    let rows = (0..count)
+        .map(|seq| (vec![seq as u8], Vec::new()))
+        .collect();
     Answer::Page(rows, None)
 }
 
@@ -256,18 +323,36 @@ fn admission_bound() {
     let Ask::Page { space, prefix, .. } = admission.ask() else {
         panic!("an admission counts the install's queue");
     };
-    assert_eq!((space, prefix), (PLUGIN_QUEUE_KEYSPACE, install.to_bytes().to_vec()));
-    let rows = admission.take(queue_page(RUNS_QUEUED - 1)).unwrap().unwrap();
-    let keys: Vec<_> = rows.iter().map(|(space, key, _)| (space.clone(), key.to_vec())).collect();
+    assert_eq!(
+        (space, prefix),
+        (PLUGIN_QUEUE_KEYSPACE, install.to_bytes().to_vec())
+    );
+    let rows = admission
+        .take(queue_page(RUNS_QUEUED - 1))
+        .unwrap()
+        .unwrap();
+    let keys: Vec<_> = rows
+        .iter()
+        .map(|(space, key, _)| (space.clone(), key.to_vec()))
+        .collect();
     assert_eq!(
         keys,
         [
-            (PLUGIN_QUEUE_KEYSPACE.to_string(), queue_key(install, run.run_id)),
-            (PLUGIN_RUNS_KEYSPACE.to_string(), run_key(install, run.run_id)),
+            (
+                PLUGIN_QUEUE_KEYSPACE.to_string(),
+                queue_key(install, run.run_id)
+            ),
+            (
+                PLUGIN_RUNS_KEYSPACE.to_string(),
+                run_key(install, run.run_id)
+            ),
         ]
     );
     let mut full = Admission::new(run);
-    assert_eq!(full.take(queue_page(RUNS_QUEUED)), Err(RunError::Full(RUNS_QUEUED)));
+    assert_eq!(
+        full.take(queue_page(RUNS_QUEUED)),
+        Err(RunError::Full(RUNS_QUEUED))
+    );
     assert!(full.take(Answer::Done).is_err());
 }
 
@@ -298,18 +383,30 @@ fn resolve_decisions() {
     let running = Answer::Values(vec![Some(encode(&queued(install, 1)).unwrap())]);
     assert_eq!(plan.next(running), Err(RunError::NotWaiting("queued")));
     plan.phase = ResolvePhase::Reading;
-    assert_eq!(plan.next(Answer::Values(vec![None])), Err(RunError::NotFound));
+    assert_eq!(
+        plan.next(Answer::Values(vec![None])),
+        Err(RunError::NotFound)
+    );
     plan.phase = ResolvePhase::Reading;
     let stored = Answer::Values(vec![Some(encode(&waiting).unwrap())]);
-    assert!(matches!(plan.next(stored).unwrap(), Turn::Ask(Ask::Page { .. })));
+    assert!(matches!(
+        plan.next(stored).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
     let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
         panic!("the resolved run is written");
     };
     let saved: PluginRun = decode(&rows[0].2).unwrap();
-    assert_eq!((saved.state, saved.finished_ms), (RunState::Failed, Some(50)));
+    assert_eq!(
+        (saved.state, saved.finished_ms),
+        (RunState::Failed, Some(50))
+    );
     let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
         panic!("an ended run leaves the queue");
     };
-    assert_eq!(keys, [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]);
+    assert_eq!(
+        keys,
+        [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]
+    );
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(saved));
 }

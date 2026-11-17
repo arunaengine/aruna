@@ -129,7 +129,8 @@ async fn shared_bound() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     for seq in 0..RUNS_QUEUED as u64 - 2 {
-        drive(admit(queued(install.install_id, seq + 10)), &fixture.ctx).await
+        drive(admit(queued(install.install_id, seq + 10)), &fixture.ctx)
+            .await
             .unwrap();
     }
     let now = unix_timestamp_millis();
@@ -201,7 +202,10 @@ async fn dedup_retention() {
     run.finish(RunState::Succeeded, None, anchor + 7 * DAY);
     drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
     drive(prune_runs(u64::MAX / 2), &fixture.ctx).await.unwrap();
-    assert_eq!(drive(prune_seen(anchor + 10 * DAY), &fixture.ctx).await, Ok(0));
+    assert_eq!(
+        drive(prune_seen(anchor + 10 * DAY), &fixture.ctx).await,
+        Ok(0)
+    );
     let resent = decided_at(
         &fixture,
         std::slice::from_ref(&row),
@@ -263,7 +267,8 @@ async fn delivery_totals() {
     let mut waiting = event(&install, "D0", unix_timestamp_millis()).1;
     waiting.revision += 1;
     decided(&fixture, &[waiting]).await;
-    let delivery = drive(event_delivery(install.install_id), &fixture.ctx).await
+    let delivery = drive(event_delivery(install.install_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!((delivery.waiting, delivery.gaps.len()), (1, 1));
     assert_eq!((delivery.gaps[0].count, delivery.gaps[0].latest_ms), (5, 2));

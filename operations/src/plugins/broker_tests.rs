@@ -487,7 +487,8 @@ async fn expected_revision() {
         .await;
     assert_eq!(ahead.unwrap_err().kind, ErrorKind::Conflict);
     assert_eq!(
-        drive(open_intent(broker.scope.run.run_id), &broker.ctx).await
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx)
+            .await
             .unwrap(),
         None
     );
@@ -517,7 +518,8 @@ async fn invalid_patches() {
         assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
     }
     assert_eq!(
-        drive(open_intent(broker.scope.run.run_id), &broker.ctx).await
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx)
+            .await
             .unwrap(),
         None
     );

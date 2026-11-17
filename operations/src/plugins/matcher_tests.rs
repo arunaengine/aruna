@@ -79,7 +79,13 @@ async fn narrowed_grants() {
     journal(&fixture, &inside).await;
     journal(&fixture, &outside).await;
     let local = fixture.actor.node_id;
-    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
     assert_eq!(pending(&fixture).await, 0);
@@ -104,7 +110,13 @@ async fn narrowed_sync() {
         journal(&fixture, event).await;
     }
     let local = fixture.actor.node_id;
-    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
 }
@@ -120,8 +132,14 @@ async fn rows_commit_once() {
         .await
         .unwrap();
     journal(&fixture, &created(&install, "D2").0).await;
-    assert_eq!(match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await, Ok(1));
-    assert_eq!(match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await, Ok(0));
+    assert_eq!(
+        match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await,
+        Ok(1)
+    );
+    assert_eq!(
+        match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await,
+        Ok(0)
+    );
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2"]);
 }
 
@@ -156,7 +174,13 @@ async fn user_node_clears() {
         owner: fixture.actor.user_id,
     };
     journal(&fixture, &created(&install, "D1").0).await;
-    let read = match_journal(&fixture.ctx, &config, fixture.actor.node_id, (10, EVENTS_QUEUED)).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config,
+        fixture.actor.node_id,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 1);
     assert!(forwarded(&fixture, &install).await.is_empty());
     let txn = Txn::direct(&fixture.ctx);
@@ -211,7 +235,13 @@ async fn own_changes_skipped() {
     journal(&fixture, &own).await;
     journal(&fixture, &other).await;
     let local = fixture.actor.node_id;
-    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/other"]);
 }
@@ -235,11 +265,21 @@ fn plain_event(anchor_ms: u64) -> SourceEvent {
 fn outbox_counts_gaps() {
     let install = Ulid::from_parts(1, 1);
     let mut outbox = Outbox::new(9, BTreeMap::from([(install, 1)]));
-    outbox.offer((install, 1), b"j1", &plain_event(5), false, 2).unwrap();
+    outbox
+        .offer((install, 1), b"j1", &plain_event(5), false, 2)
+        .unwrap();
     // The bound is reached, then a stale row counts too.
-    outbox.offer((install, 1), b"j2", &plain_event(6), false, 2).unwrap();
-    outbox.offer((install, 1), b"j3", &plain_event(4), true, 2).unwrap();
-    outbox.lost_range(install, (SourceKind::DataUploaded, GapReason::Pruned), (1, 3));
+    outbox
+        .offer((install, 1), b"j2", &plain_event(6), false, 2)
+        .unwrap();
+    outbox
+        .offer((install, 1), b"j3", &plain_event(4), true, 2)
+        .unwrap();
+    outbox.lost_range(
+        install,
+        (SourceKind::DataUploaded, GapReason::Pruned),
+        (1, 3),
+    );
     let Ask::Read(reads) = outbox.gap_ask() else {
         panic!("gap rows are read once each");
     };
@@ -257,7 +297,10 @@ fn outbox_counts_gaps() {
         .find(|(_, key, _)| key.to_vec() == full)
         .map(|(_, _, value)| decode(value).unwrap())
         .unwrap();
-    assert_eq!((counted.count, counted.earliest_ms, counted.latest_ms), (2, 1, 6));
+    assert_eq!(
+        (counted.count, counted.earliest_ms, counted.latest_ms),
+        (2, 1, 6)
+    );
     let short = Outbox::new(9, BTreeMap::new());
     assert!(Outbox::new(9, BTreeMap::new()).rows(vec![None]).is_err());
     assert_eq!(short.rows(Vec::new()).unwrap(), Vec::new());
@@ -271,9 +314,14 @@ fn counting_pages() {
         panic!("each install's queue is counted");
     };
     assert_eq!((prefix, limit), (first.to_bytes().to_vec(), 5));
-    counting.take(Answer::Page(vec![(vec![1], Vec::new())], None)).unwrap();
+    counting
+        .take(Answer::Page(vec![(vec![1], Vec::new())], None))
+        .unwrap();
     counting.take(Answer::Page(Vec::new(), None)).unwrap();
     assert_eq!(counting.ask(), None);
     assert!(counting.take(Answer::Page(Vec::new(), None)).is_err());
-    assert_eq!(counting.counted(), BTreeMap::from([(first, 1), (second, 0)]));
+    assert_eq!(
+        counting.counted(),
+        BTreeMap::from([(first, 1), (second, 0)])
+    );
 }

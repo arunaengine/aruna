@@ -116,7 +116,10 @@ async fn prunes_old_hooks() {
     })
     .await;
     let removing = config(&fixture).await;
-    assert_eq!(drive(prune_hooks(&removing, NOW), &fixture.ctx).await, Ok(1));
+    assert_eq!(
+        drive(prune_hooks(&removing, NOW), &fixture.ctx).await,
+        Ok(1)
+    );
     assert!(
         txn.scan(PLUGIN_HOOKS_KEYSPACE, &[])
             .await

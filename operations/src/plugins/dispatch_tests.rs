@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use super::*;
+use crate::driver::drive;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::runs::{list_runs, read_run};
 use crate::plugins::worker::tests::installed;
@@ -32,7 +32,9 @@ async fn manual_runs() {
         );
     }
     let run = start("{}").await.unwrap();
-    let stored = drive(read_run(install.install_id, run.run_id), ctx).await.unwrap();
+    let stored = drive(read_run(install.install_id, run.run_id), ctx)
+        .await
+        .unwrap();
     assert_eq!(stored, run);
     assert_eq!(
         (run.handler.as_str(), run.revision),
@@ -80,7 +82,9 @@ async fn timer_occurrences() {
             .unwrap(),
         0
     );
-    let (runs, _) = drive(list_runs(install.install_id, None, 10), ctx).await.unwrap();
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), ctx)
+        .await
+        .unwrap();
     let occurrence_ms = active + 3 * HOUR;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].trigger, RunTrigger::Timer { occurrence_ms });
@@ -107,7 +111,10 @@ async fn timer_occurrences() {
             .unwrap(),
         0
     );
-    let row = drive(read_timer(install.install_id), ctx).await.unwrap().unwrap();
+    let row = drive(read_timer(install.install_id), ctx)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         row,
         TimerRow {

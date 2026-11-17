@@ -66,7 +66,8 @@ pub(crate) async fn probe(
     worker.use_outbound(outbound);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap()
 }
 
@@ -312,7 +313,8 @@ async fn probe_with(
     worker.use_outbound(outbound);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap()
 }
 
@@ -348,7 +350,8 @@ async fn narrowed_rules_refuse() {
     drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    run = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
+    run = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
+        .await
         .unwrap();
     assert_eq!(run.state, RunState::Failed);
     let message = run.message.unwrap_or_default();
