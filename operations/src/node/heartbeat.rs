@@ -6,15 +6,15 @@
 use std::time::Duration;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::heartbeat::{
     HeartbeatEffect, HeartbeatEvent, INFO_PUBLISH_INTERVAL, NodeHeartbeat,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::{Effects, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::{debug, warn};
 
@@ -26,18 +26,24 @@ const SEND_PASS_TIMEOUT: Duration = Duration::from_secs(INFO_PUBLISH_INTERVAL.as
 /// Why a heartbeat run stopped; a failed send or an invalid heartbeat is only logged.
 #[derive(Debug, Error, PartialEq)]
 pub enum HeartbeatError {
-    #[error("unexpected heartbeat event {0}")]
-    UnexpectedEvent(&'static str),
-    #[error("the heartbeat run has not finished")]
-    Unfinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
-#[derive(Debug, PartialEq)]
-enum SendPhase {
-    Idle,
-    Record,
-    Push,
-    Done(Result<(), HeartbeatError>),
+type Turn = Result<Next<()>, HeartbeatError>;
+
+fn heartbeat_call(effect: HeartbeatEffect) -> Turn {
+    let effect = Effect::Net(NetEffect::Heartbeat(Box::new(effect)));
+    Ok(Next::Call(IoCall::Effect(effect)))
+}
+
+fn unexpected(result: IoResult) -> HeartbeatError {
+    let got = match &result {
+        IoResult::Event(event) => event.label(),
+        _ => "another result",
+    };
+    let expected = "a heartbeat event";
+    IoError::Unexpected { expected, got }.into()
 }
 
 /// Keeps this node's own heartbeat and pushes it to every sync peer, at most
@@ -48,29 +54,22 @@ pub(crate) struct SendHeartbeatOperation {
     heartbeat: Option<NodeHeartbeat>,
     sequence: u64,
     frame: Value,
-    phase: SendPhase,
 }
 
 impl SendHeartbeatOperation {
     pub(crate) fn new(heartbeat: NodeHeartbeat) -> Self {
         Self {
+            sequence: heartbeat.sequence,
             heartbeat: Some(heartbeat),
-            sequence: 0,
             frame: Value::from(Vec::new()),
-            phase: SendPhase::Idle,
         }
-    }
-
-    fn finish(&mut self, result: Result<(), HeartbeatError>) -> Effects {
-        self.phase = SendPhase::Done(result);
-        smallvec![]
     }
 
     /// One push per peer; each pass starts at another peer, so peers that time out cannot
     /// starve the ones after them.
-    fn push(&mut self, mut peers: Vec<NodeId>) -> Effects {
+    fn push(&self, mut peers: Vec<NodeId>) -> Turn {
         if peers.is_empty() {
-            return self.finish(Ok(()));
+            return Ok(Next::Done(()));
         }
         let start = self.sequence % peers.len() as u64;
         peers.rotate_left(start as usize);
@@ -83,49 +82,44 @@ impl SendHeartbeatOperation {
                 })))
             })
             .collect();
-        self.phase = SendPhase::Push;
-        smallvec![Effect::Group(EffectGroup {
+        Ok(Next::Call(IoCall::Group(EffectGroup {
             members,
             limit: PARALLEL_SENDS,
             form: GroupForm::All {
                 deadline: Some(SEND_PASS_TIMEOUT),
             },
-        })]
+        })))
     }
 }
 
-impl EffectOperation for SendHeartbeatOperation {
+impl Operation for SendHeartbeatOperation {
     type Output = ();
     type Error = HeartbeatError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         let Some(heartbeat) = self.heartbeat.take() else {
-            return self.finish(Err(HeartbeatError::Unfinished));
+            return Ok(Next::Done(()));
         };
         let bytes = match heartbeat.to_bytes() {
             Ok(bytes) => bytes,
             Err(error) => {
                 warn!(%error, "Not sending an invalid heartbeat");
-                return self.finish(Ok(()));
+                return Ok(Next::Done(()));
             }
         };
-        self.sequence = heartbeat.sequence;
         let length = (bytes.len() as u32).to_be_bytes();
         self.frame = Value::from([length.as_slice(), &bytes].concat());
-        self.phase = SendPhase::Record;
-        smallvec![Effect::Net(NetEffect::Heartbeat(Box::new(
-            HeartbeatEffect::Record(heartbeat)
-        )))]
+        heartbeat_call(HeartbeatEffect::Record(heartbeat))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.phase, SendPhase::Idle), event) {
-            (SendPhase::Record, Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Peers(peers)))) => {
+    fn next(&mut self, result: IoResult) -> Turn {
+        match result {
+            IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Peers(peers)))) => {
                 self.push(peers)
             }
             // Without a net handle there is nobody to send to.
-            (SendPhase::Record, Event::Net(NetEvent::Error(_))) => self.finish(Ok(())),
-            (SendPhase::Push, Event::Group(GroupEvent::Finished { results })) => {
+            IoResult::Event(Event::Net(NetEvent::Error(_))) => Ok(Next::Done(())),
+            IoResult::Group(GroupEvent::Finished { results }) => {
                 for result in results {
                     match result {
                         GroupResult::Done(event) => match *event {
@@ -141,25 +135,10 @@ impl EffectOperation for SendHeartbeatOperation {
                         GroupResult::Refused => debug!("Heartbeat send was refused"),
                     }
                 }
-                self.finish(Ok(()))
+                Ok(Next::Done(()))
             }
-            (_, event) => self.finish(Err(HeartbeatError::UnexpectedEvent(event.label()))),
+            result => Err(unexpected(result)),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.phase, SendPhase::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.phase {
-            SendPhase::Done(result) => result,
-            _ => Err(HeartbeatError::Unfinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -169,8 +148,7 @@ impl EffectOperation for SendHeartbeatOperation {
 pub(crate) struct ReceiveHeartbeatOperation {
     peer: NodeId,
     realm_id: RealmId,
-    frame: Option<Vec<u8>>,
-    result: Option<Result<(), HeartbeatError>>,
+    frame: Vec<u8>,
 }
 
 impl ReceiveHeartbeatOperation {
@@ -178,67 +156,43 @@ impl ReceiveHeartbeatOperation {
         Self {
             peer,
             realm_id,
-            frame: Some(frame),
-            result: None,
+            frame,
         }
     }
 }
 
-impl EffectOperation for ReceiveHeartbeatOperation {
+impl Operation for ReceiveHeartbeatOperation {
     type Output = ();
     type Error = HeartbeatError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         let peer = self.peer;
-        let Some(frame) = self.frame.take() else {
-            self.result = Some(Err(HeartbeatError::Unfinished));
-            return smallvec![];
-        };
-        let heartbeat = match NodeHeartbeat::from_bytes(&frame) {
+        let heartbeat = match NodeHeartbeat::from_bytes(&self.frame) {
             Ok(heartbeat) => heartbeat,
             Err(error) => {
                 debug!(%peer, %error, "Dropping an invalid heartbeat");
-                self.result = Some(Ok(()));
-                return smallvec![];
+                return Ok(Next::Done(()));
             }
         };
         if heartbeat.realm_id != self.realm_id {
             debug!(%peer, "Dropping a heartbeat of another realm");
-            self.result = Some(Ok(()));
-            return smallvec![];
+            return Ok(Next::Done(()));
         }
-        smallvec![Effect::Net(NetEffect::Heartbeat(Box::new(
-            HeartbeatEffect::Store {
-                peer,
-                heartbeat: Box::new(heartbeat),
-            }
-        )))]
+        let heartbeat = Box::new(heartbeat);
+        heartbeat_call(HeartbeatEffect::Store { peer, heartbeat })
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Turn {
         let peer = self.peer;
-        self.result = Some(match (self.result.is_none(), event) {
-            (true, Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Stored(stored)))) => {
+        match result {
+            IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Stored(stored)))) => {
                 if !stored {
                     debug!(%peer, "Heartbeat not stored: not newer, too frequent or not a sync peer");
                 }
-                Ok(())
+                Ok(Next::Done(()))
             }
-            (_, event) => Err(HeartbeatError::UnexpectedEvent(event.label())),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(HeartbeatError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+            result => Err(unexpected(result)),
+        }
     }
 }
 
@@ -253,10 +207,6 @@ mod tests {
     use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::node_info::NodeInfoDocument;
     use aruna_core::structs::storage::node_info::{AdvertisementEpoch, NodeUrls, NodeUtilization};
-
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     use super::*;
 
@@ -380,12 +330,8 @@ mod tests {
         }
     }
 
-    fn heartbeat(effect: HeartbeatEffect) -> Effect {
-        Effect::Net(NetEffect::Heartbeat(Box::new(effect)))
-    }
-
-    fn answer(event: HeartbeatEvent) -> Event {
-        Event::Net(NetEvent::Heartbeat(event))
+    fn answer(event: HeartbeatEvent) -> IoResult {
+        IoResult::Event(Event::Net(NetEvent::Heartbeat(event)))
     }
 
     fn frame(heartbeat: &NodeHeartbeat) -> Value {
@@ -399,63 +345,58 @@ mod tests {
     fn sends_rotate_peers() {
         let sent = beat(4);
         let mut operation = SendHeartbeatOperation::new(sent.clone());
+        assert_eq!(
+            operation.first(),
+            heartbeat_call(HeartbeatEffect::Record(sent.clone()))
+        );
         let pushes = [node(3), node(1), node(2)]
             .into_iter()
             .map(|peer| {
-                heartbeat(HeartbeatEffect::Push {
+                let push = HeartbeatEffect::Push {
                     peer,
                     frame: frame(&sent),
-                })
+                };
+                Effect::Net(NetEffect::Heartbeat(Box::new(push)))
             })
             .collect();
-        let group = Effect::Group(EffectGroup {
+        let group = IoCall::Group(EffectGroup {
             members: pushes,
             limit: PARALLEL_SENDS,
             form: GroupForm::All {
                 deadline: Some(SEND_PASS_TIMEOUT),
             },
         });
-        let finished = Event::Group(GroupEvent::Finished {
+        let peers = answer(HeartbeatEvent::Peers(vec![node(1), node(2), node(3)]));
+        assert_eq!(operation.next(peers), Ok(Next::Call(group)));
+        let failed = HeartbeatEvent::PushFailed("refused".to_string());
+        let pushed = Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Pushed));
+        let finished = IoResult::Group(GroupEvent::Finished {
             results: vec![
-                GroupResult::Done(Box::new(answer(HeartbeatEvent::Pushed))),
-                GroupResult::Done(Box::new(answer(HeartbeatEvent::PushFailed(
-                    "refused".to_string(),
-                )))),
+                GroupResult::Done(Box::new(pushed)),
+                GroupResult::Done(Box::new(Event::Net(NetEvent::Heartbeat(failed)))),
                 GroupResult::Unfinished,
             ],
         });
-        check_trace(
-            &mut operation,
-            &[heartbeat(HeartbeatEffect::Record(sent.clone()))],
-            vec![
-                (
-                    answer(HeartbeatEvent::Peers(vec![node(1), node(2), node(3)])),
-                    vec![group],
-                ),
-                (finished, vec![]),
-            ],
-        );
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.next(finished), Ok(Next::Done(())));
     }
 
     #[test]
     fn nothing_to_send() {
         // No peers, or no net handle, end the run; failed sends never fail it.
-        for event in [
+        let closed = Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed));
+        for result in [
             answer(HeartbeatEvent::Peers(Vec::new())),
-            Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed)),
+            IoResult::Event(closed),
         ] {
             let mut operation = SendHeartbeatOperation::new(beat(1));
-            operation.start();
-            assert!(operation.step(event).is_empty());
-            assert_eq!(operation.finalize(), Ok(()));
+            operation.first().unwrap();
+            assert_eq!(operation.next(result), Ok(Next::Done(())));
         }
         // A heartbeat that breaks its own bounds is never sent.
         let mut invalid = beat(1);
         invalid.availability = vec![("x".repeat(10_000), availability(1))];
         let mut operation = SendHeartbeatOperation::new(invalid);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.first(), Ok(Next::Done(())));
     }
 
     #[test]
@@ -464,70 +405,37 @@ mod tests {
         let kept = beat(2);
         let mut operation =
             ReceiveHeartbeatOperation::new(node(5), realm, kept.to_bytes().unwrap());
-        let store = heartbeat(HeartbeatEffect::Store {
+        let store = heartbeat_call(HeartbeatEffect::Store {
             peer: node(5),
             heartbeat: Box::new(kept.clone()),
         });
-        check_trace(
-            &mut operation,
-            &[store],
-            vec![(answer(HeartbeatEvent::Stored(false)), vec![])],
-        );
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.first(), store);
+        let answer = operation.next(answer(HeartbeatEvent::Stored(false)));
+        assert_eq!(answer, Ok(Next::Done(())));
         // A foreign realm or an invalid frame is dropped without a store.
         let foreign =
             ReceiveHeartbeatOperation::new(node(5), RealmId([2; 32]), kept.to_bytes().unwrap());
         let garbled = ReceiveHeartbeatOperation::new(node(5), realm, vec![0xff; 3]);
         for mut dropped in [foreign, garbled] {
-            assert!(dropped.start().is_empty());
-            assert!(dropped.is_complete());
-            assert_eq!(dropped.finalize(), Ok(()));
+            assert_eq!(dropped.first(), Ok(Next::Done(())));
         }
     }
 
     #[test]
-    fn rejects_stray_events() {
-        let recording = || {
-            let mut operation = SendHeartbeatOperation::new(beat(1));
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Net(NetEvent::Heartbeat(_) | NetEvent::Error(_))
-            )
-        };
-        for (label, effects, error) in rejects_events(recording, sample_events, expected) {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(
-                matches!(error, HeartbeatError::UnexpectedEvent(_)),
-                "{label}"
-            );
-        }
-        let storing = || {
-            let realm = RealmId([1; 32]);
-            let mut operation =
-                ReceiveHeartbeatOperation::new(node(5), realm, beat(2).to_bytes().unwrap());
-            operation.start();
-            operation
-        };
-        let refused = rejects_events(storing, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
+    fn rejects_stray_results() {
         let mut sending = SendHeartbeatOperation::new(beat(1));
-        check_abort(&mut sending, &[]);
-        sending.start();
-        check_abort(&mut sending, &[]);
-        rejects_finalize(sending);
+        sending.first().unwrap();
+        let stored = sending.next(answer(HeartbeatEvent::Stored(true)));
+        assert!(matches!(stored, Err(HeartbeatError::Io(_))));
         let realm = RealmId([1; 32]);
         let mut receiving =
             ReceiveHeartbeatOperation::new(node(5), realm, beat(2).to_bytes().unwrap());
-        receiving.start();
-        check_abort(&mut receiving, &[]);
-        rejects_finalize(receiving);
+        receiving.first().unwrap();
+        let pushed = receiving.next(answer(HeartbeatEvent::Pushed));
+        assert!(matches!(pushed, Err(HeartbeatError::Io(_))));
+        assert!(matches!(
+            receiving.next(IoResult::Done),
+            Err(HeartbeatError::Io(_))
+        ));
     }
 }
