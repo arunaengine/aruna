@@ -462,3 +462,333 @@ impl Operation for PidTransitionOperation {
         txn_id.map(abort).into_iter().collect()
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::metadata::secondary_ids::tests::{mapping, read_event};
+    use crate::metadata::timestamp_sweep::state_machine_tests::record_bytes;
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::record::PlacementRef;
+
+    fn document() -> Ulid {
+        Ulid::from_bytes([3; 16])
+    }
+
+    fn txn() -> TxnId {
+        Ulid::from_bytes([9; 16])
+    }
+
+    fn user() -> UserId {
+        UserId::local(Ulid::from_bytes([2; 16]), RealmId([3; 32]))
+    }
+
+    fn mint() -> PidTransition {
+        PidTransition::Mint {
+            minted_by: user(),
+            minted_at_ms: 70,
+        }
+    }
+
+    fn failure() -> PidTransition {
+        PidTransition::Fail {
+            failure: PersistentIdFailure {
+                message: "provider refused".to_string(),
+                retryable: false,
+                recorded_at_ms: 80,
+            },
+        }
+    }
+
+    fn started(transition: PidTransition, route: Option<MappingRoute>) -> PidTransitionOperation {
+        let mut operation = PidTransitionOperation::new(route, document(), transition);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: txn(),
+        }));
+        operation
+    }
+
+    fn registry(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(Vec::new()),
+            value: value.map(ByteView::from),
+        })
+    }
+
+    fn written() -> Event {
+        Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() })
+    }
+
+    fn aborted() -> Event {
+        Event::Storage(StorageEvent::TransactionAborted { txn_id: txn() })
+    }
+
+    fn storage_error(error: StorageError) -> Event {
+        Event::Storage(StorageEvent::Error { error })
+    }
+
+    fn is_commit(effects: &Effects) -> bool {
+        effects.as_slice()
+            == [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: txn(),
+            })]
+    }
+
+    fn is_abort(effects: &Effects) -> bool {
+        effects.as_slice()
+            == [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: txn(),
+            })]
+    }
+
+    #[test]
+    fn mint_activates_mapping() {
+        let mut operation = PidTransitionOperation::new(None, document(), mint());
+        assert_eq!(
+            operation.start().as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: txn(),
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [read_mapping_effect(document(), Some(txn()))]
+        );
+        let effects = operation.step(read_event(Some(&mapping(document()))));
+        assert_eq!(
+            effects.as_slice(),
+            [read_document_registry(document(), Some(txn()))]
+        );
+        let effects = operation.step(registry(Some(vec![1])));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite {
+                txn_id: Some(_),
+                ..
+            })]
+        ));
+        assert!(is_commit(&operation.step(written())));
+        assert!(operation.step(committed()).is_empty());
+        let outcome = operation.finalize().unwrap();
+        assert!(outcome.mapping.is_active());
+        assert!(outcome.applied && outcome.committed);
+    }
+
+    #[test]
+    fn unprojected_mint_processing() {
+        // Without a registry row the mint commits Processing and reports no activation.
+        let mut operation = started(mint(), None);
+        operation.step(read_event(Some(&mapping(document()))));
+        operation.step(registry(None));
+        operation.step(written());
+        operation.step(committed());
+        let outcome = operation.finalize().unwrap();
+        assert!(!outcome.mapping.is_active());
+        assert!(!outcome.applied && outcome.committed);
+    }
+
+    #[test]
+    fn noop_reads_existing() {
+        // An active mapping is not minted again; the stored row answers outside the transaction.
+        let mut active = mapping(document());
+        active.activate(user(), active.revision);
+        let mut operation = started(mint(), None);
+        assert!(is_abort(&operation.step(read_event(Some(&active)))));
+        assert_eq!(
+            operation.step(aborted()).as_slice(),
+            [read_mapping_effect(document(), None)]
+        );
+        assert!(operation.step(read_event(Some(&active))).is_empty());
+        let outcome = operation.finalize().unwrap();
+        assert_eq!(outcome.mapping, active);
+        assert!(!outcome.applied && !outcome.committed);
+
+        let mut gone = started(mint(), None);
+        gone.step(read_event(Some(&active)));
+        gone.step(aborted());
+        gone.step(read_event(None));
+        assert_eq!(gone.finalize(), Err(PersistentIdError::DocumentMissing));
+    }
+
+    #[test]
+    fn withdraw_writes_audit() {
+        let transition = PidTransition::Withdraw {
+            withdrawn_by: user(),
+            reason: "court order".to_string(),
+            withdrawn_at_ms: 90,
+        };
+        let mut operation = started(transition.clone(), None);
+        let effects = operation.step(registry(Some(record_bytes(document(), 10).to_vec())));
+        assert_eq!(
+            effects.as_slice(),
+            [read_mapping_effect(document(), Some(txn()))]
+        );
+        let effects = operation.step(read_event(Some(&mapping(document()))));
+        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
+            panic!("expected one batch write, got {effects:?}");
+        };
+        assert!(
+            writes
+                .iter()
+                .any(|(key_space, _, _)| key_space == METADATA_AUDIT_KEYSPACE)
+        );
+        assert!(is_commit(&operation.step(written())));
+        operation.step(committed());
+        assert!(operation.finalize().unwrap().mapping.is_retired());
+
+        let mut missing = started(transition, None);
+        assert!(is_abort(&missing.step(registry(None))));
+        missing.step(aborted());
+        assert_eq!(missing.finalize(), Err(PersistentIdError::DocumentMissing));
+    }
+
+    #[test]
+    fn fence_rejects_failure() {
+        let route = MappingRoute {
+            realm_id: RealmId([5; 32]),
+            placement: PlacementRef {
+                strategy_id: Ulid::from_bytes([6; 16]),
+                shard: 1,
+            },
+            peers: Vec::new(),
+            actor: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            generation: 3,
+        };
+        let mut operation = started(failure(), Some(route));
+        let effects = operation.step(read_event(Some(&mapping(document()))));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read {
+                txn_id: Some(_),
+                ..
+            })]
+        ));
+        // A bucket closed at generation 5 no longer admits a transition resolved at 3.
+        let fence = registry(Some(5u64.to_be_bytes().to_vec()));
+        assert!(is_abort(&operation.step(fence)));
+        operation.step(aborted());
+        assert_eq!(
+            operation.finalize(),
+            Err(PersistentIdError::PlacementFenced)
+        );
+    }
+
+    #[test]
+    fn conflict_exhausts_retries() {
+        let mut operation = started(failure(), None);
+        for attempt in 1..=TRANSITION_ATTEMPTS {
+            if attempt > 1 {
+                operation.step(Event::Storage(StorageEvent::TransactionStarted {
+                    txn_id: txn(),
+                }));
+            }
+            operation.step(read_event(Some(&mapping(document()))));
+            operation.step(written());
+            let effects = operation.step(storage_error(StorageError::TransactionConflict));
+            let restarted = effects.as_slice()
+                == [Effect::Storage(StorageEffect::StartTransaction {
+                    read: false,
+                })];
+            assert_eq!(restarted, attempt < TRANSITION_ATTEMPTS);
+        }
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(PersistentIdError::Storage(
+                StorageError::TransactionConflict
+            ))
+        );
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        // Before a transaction nothing is aborted; inside one the abort runs first.
+        let mut unstarted = PidTransitionOperation::new(None, document(), failure());
+        unstarted.start();
+        assert!(
+            unstarted
+                .step(storage_error(StorageError::Timeout))
+                .is_empty()
+        );
+        assert_eq!(
+            unstarted.finalize(),
+            Err(PersistentIdError::Storage(StorageError::Timeout))
+        );
+
+        let mut reading = started(failure(), None);
+        assert!(is_abort(
+            &reading.step(storage_error(StorageError::Timeout))
+        ));
+        reading.step(aborted());
+        assert_eq!(
+            reading.finalize(),
+            Err(PersistentIdError::Storage(StorageError::Timeout))
+        );
+
+        let mut committing = started(failure(), None);
+        committing.step(read_event(Some(&mapping(document()))));
+        committing.step(written());
+        assert!(
+            committing
+                .step(storage_error(StorageError::Timeout))
+                .is_empty()
+        );
+        assert!(matches!(
+            committing.finalize(),
+            Err(PersistentIdError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let starting = || {
+            let mut operation = PidTransitionOperation::new(None, document(), failure());
+            operation.start();
+            operation
+        };
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(
+                    StorageEvent::TransactionStarted { .. } | StorageEvent::Error { .. }
+                )
+            )
+        };
+        for (_, effects, error) in rejects_events(starting, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, PersistentIdError::Unavailable(_)));
+        }
+    }
+
+    #[test]
+    fn abort_releases_transaction() {
+        let mut idle = PidTransitionOperation::new(None, document(), failure());
+        check_abort(&mut idle, &[]);
+        let mut open = started(failure(), None);
+        check_abort(
+            &mut open,
+            &[Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: txn(),
+            })],
+        );
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(PidTransitionOperation::new(None, document(), failure()));
+        rejects_finalize(started(failure(), None));
+    }
+}

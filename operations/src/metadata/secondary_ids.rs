@@ -271,7 +271,7 @@ pub(crate) fn merge_matches(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
     use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
@@ -280,7 +280,7 @@ mod tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::secondary_id::SecondaryIdKind;
 
-    fn mapping(document_id: Ulid) -> PersistentIdMapping {
+    pub(crate) fn mapping(document_id: Ulid) -> PersistentIdMapping {
         PersistentIdMapping::requested(
             document_id,
             false,
@@ -315,7 +315,7 @@ mod tests {
         })
     }
 
-    fn read_event(value: Option<&PersistentIdMapping>) -> Event {
+    pub(crate) fn read_event(value: Option<&PersistentIdMapping>) -> Event {
         Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(Vec::new()),
             value: value.map(|mapping| ByteView::from(mapping.to_bytes().unwrap())),
