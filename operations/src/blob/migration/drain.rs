@@ -97,7 +97,7 @@ pub(super) async fn rename_access(
 
 /// A denial ends the rename; policy state that cannot be read is an error to retry.
 pub(super) fn granted<T>(
-    loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
+    loaded: Result<T, crate::auth::error::AuthorizeError>,
 ) -> Result<Option<T>, String> {
     use crate::auth::error::AuthorizeError;
     use crate::auth::error::PolicyEnforcementError;

@@ -52,7 +52,7 @@ const AUDIT_FRAME_OVERHEAD: usize = 256;
 pub(crate) const INBOUND_FRAME_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const STANDARD_FRAME: u8 = 0;
 pub(crate) const AUDIT_FRAME: u8 = 1;
-const POSTCARD_VARIANT_BYTES: usize = 5;
+pub(crate) const POSTCARD_VARIANT_BYTES: usize = 5;
 const AUDIT_REQUEST_VARIANT: u32 = 31;
 const AUDIT_RESPONSE_VARIANT: u32 = 32;
 

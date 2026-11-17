@@ -49,8 +49,6 @@ pub struct NetEffectContext {
     pub presence: RealmPresenceCache,
     pub tasks: TaskTracker,
     pub shutdown: CancellationToken,
-    /// This node's key, for the sign effects only the key holder may carry out.
-    pub secret_key: iroh::SecretKey,
     #[cfg(test)]
     pub(crate) refresh_probe: Option<Arc<RefreshProbe>>,
 }

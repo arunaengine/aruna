@@ -99,13 +99,13 @@ impl Operation for AuditPageOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if self.output.is_some() {
-            self.output = Some(Err(AuditPageError::UnexpectedEvent(event.label())));
+            self.output = Some(Err(AuditPageError::UnexpectedEvent(event.label().to_string())));
             return smallvec![];
         }
         self.output = Some(match event {
             Event::Storage(StorageEvent::IterResult { values, .. }) => self.page(values),
             Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(AuditPageError::UnexpectedEvent(other.label())),
+            other => Err(AuditPageError::UnexpectedEvent(other.label().to_string())),
         });
         smallvec![]
     }

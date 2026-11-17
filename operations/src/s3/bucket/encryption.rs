@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::queue::encrypt_rows;
 use crate::s3::bucket::key::rows::{
     SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
     group_bucket_key, parse_authority, uploads_open,

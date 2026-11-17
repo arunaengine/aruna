@@ -514,7 +514,8 @@ async fn prepared(
         let fields = SecretFields::new(Default::default());
         return Ok((request, ResponseExposure::Full, fields));
     };
-    let place = (config, ctx.owner_node_id);
+    let keys = crate::plugins::release::node_keys(&ctx.driver);
+    let place = (config, ctx.owner_node_id, &keys);
     let released = release_into(
         &ctx.driver,
         place,

@@ -614,7 +614,7 @@ impl AppendVaultOperation {
             (state, event) => Err(AppendVaultError::UnexpectedEvent {
                 state: state.label().to_string(),
                 expected: "the event of the current step",
-                got: event.label().to_string(),
+                got: event.label(),
             }),
         }
     }

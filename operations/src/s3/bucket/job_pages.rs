@@ -110,7 +110,7 @@ pub(super) async fn job_access(
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
         Ok(_) | Err(AuthorizeError::PermissionDenied) => Ok(None),
         Err(AuthorizeError::Policy(
-            crate::auth::request_policy::PolicyEnforcementError::Denied { .. },
+            crate::auth::error::PolicyEnforcementError::Denied { .. },
         )) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
