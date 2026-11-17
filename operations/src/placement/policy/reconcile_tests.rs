@@ -95,10 +95,25 @@ fn draining_node_departs() {
         effects.into_vec(),
         scan_start(subject.clone(), SubjectScanMode::Depart)
     );
-    // Same subject as stored and nothing blocked: the scan ends without reading a copy.
+    // Departing blocks the unchanged record first, then records an empty inventory.
     let stored = NodeSubjectRecord::seed(subject).expect("subject is valid");
     let effects = operation.step(read(Some(stored.to_bytes().unwrap().into())));
-    assert!(effects.is_empty());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::Storage(StorageEffect::Write { key_space, .. })] if key_space == NODE_SUBJECT_KEYSPACE
+    ));
+    let written = Event::Storage(StorageEvent::WriteResult {
+        key: Key::from(NODE_SUBJECT_KEY.to_vec()),
+    });
+    assert!(
+        !operation.step(written).is_empty(),
+        "the inventory scan starts"
+    );
+    let empty = Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    });
+    assert!(operation.step(empty).is_empty());
     let (mode, result) = operation.finalize().unwrap().expect("a scan ran");
     assert_eq!(mode, SubjectScanMode::Depart);
     assert_eq!(result.generation, 1);

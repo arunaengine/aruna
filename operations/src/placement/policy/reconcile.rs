@@ -153,26 +153,22 @@ impl Operation for SubjectSyncOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match (&mut self.state, event) {
-            (SyncState::Config, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.config(value)
-            }
-            (SyncState::Local, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.local(value)
-            }
-            (SyncState::Scan { scan, .. }, event) => {
-                let effects = scan.step(event);
-                self.after_scan(effects)
-            }
-            (SyncState::Config, _) => {
-                self.finish(Err(SubjectScanError::InvalidEvent("ReadRealmConfig")))
-            }
-            (SyncState::Local, _) => {
-                self.finish(Err(SubjectScanError::InvalidEvent("ReadLocalSubject")))
-            }
-            (SyncState::Init | SyncState::Done, _) => {
-                self.finish(Err(SubjectScanError::InvalidEvent("SubjectSync")))
-            }
+        if let SyncState::Scan { scan, .. } = &mut self.state {
+            let effects = scan.step(event);
+            return self.after_scan(effects);
+        }
+        let read = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Some(value),
+            _ => None,
+        };
+        let config = matches!(self.state, SyncState::Config);
+        let local = matches!(self.state, SyncState::Local);
+        match read {
+            Some(value) if config => self.config(value),
+            Some(value) if local => self.local(value),
+            _ if config => self.finish(Err(SubjectScanError::InvalidEvent("ReadRealmConfig"))),
+            _ if local => self.finish(Err(SubjectScanError::InvalidEvent("ReadLocalSubject"))),
+            _ => self.finish(Err(SubjectScanError::InvalidEvent("SubjectSync"))),
         }
     }
 
