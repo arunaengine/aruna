@@ -659,6 +659,7 @@ pub async fn replace_source_connector(
         &state.get_ctx(),
     )
     .await
+    .and_then(|result| result.ok_or(ReplaceSourceError::ReferencesPending))
     .map_err(map_replace_error)?;
 
     Ok((
@@ -739,6 +740,7 @@ pub async fn delete_source_connector(
         &state.get_ctx(),
     )
     .await
+    .and_then(|result| result.ok_or(DeleteSourceError::ReferencesPending))
     .map_err(map_delete_error)?;
 
     Ok(StatusCode::NO_CONTENT)
