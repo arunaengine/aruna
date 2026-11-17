@@ -257,7 +257,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn skips_given_head() {
+    fn skips_head_read() {
         // A named version that is not stored resolves to its id without a record.
         let mut operation = ObjectVersionOperation::new(BUCKET, KEY, Some(version_id()));
         check_trace(
