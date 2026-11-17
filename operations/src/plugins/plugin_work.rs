@@ -11,22 +11,24 @@ use std::time::Duration;
 use aruna_core::errors::ConversionError;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::structs::execution::job::{
-    JobError, JobResultPayload, PluginWorkAction, PluginWorkSpec,
+    JobError, JobPayload, JobResultPayload, PluginWorkAction, PluginWorkSpec,
 };
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::VersionKey;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_plugins::broker::{ErrorKind, HostError};
+use futures_util::future::BoxFuture;
 
 use super::account::read_user;
 use super::broker::local_object;
 use super::broker::unmarked;
 use super::check::{check_identity, copy_grants};
 use super::install::read_config;
+use super::work::holds_job;
 use super::work::{WorkRow, read_work};
-use crate::driver::drive;
-use crate::jobs::executor::{JobContext, JobRunOutcome};
+use crate::driver::{DriverContext, drive};
+use crate::jobs::executor::{JobContext, JobRunOutcome, PayloadHandler};
 use crate::jobs::key_wake::version_wait;
 
 use super::transfers::{Download, Upload, download_work, upload_work};
@@ -40,6 +42,38 @@ use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);
 /// How long a paused install's work waits before its next attempt.
 const PAUSED_RETRY: Duration = Duration::from_secs(60);
+
+/// Runs plugin work jobs and keeps each job until its work row holds the summary.
+#[derive(Debug, Default)]
+pub struct PluginWorkHandler;
+
+impl PayloadHandler for PluginWorkHandler {
+    fn run<'a>(
+        &'a self,
+        ctx: &'a JobContext,
+        payload: &'a JobPayload,
+    ) -> Option<BoxFuture<'a, JobRunOutcome>> {
+        let JobPayload::PluginWork(spec) = payload else {
+            return None;
+        };
+        Some(Box::pin(run_plugin_work(ctx, spec)))
+    }
+
+    fn keeps_job<'a>(
+        &'a self,
+        context: &'a DriverContext,
+        payload: &'a JobPayload,
+    ) -> BoxFuture<'a, Result<bool, String>> {
+        Box::pin(async move {
+            let JobPayload::PluginWork(spec) = payload else {
+                return Ok(false);
+            };
+            drive(holds_job(spec), context)
+                .await
+                .map_err(|error| error.0)
+        })
+    }
+}
 
 /// Runs `spec` once. A refused check is final; state that cannot be read now is deferred.
 pub async fn run_plugin_work(ctx: &JobContext, spec: &PluginWorkSpec) -> JobRunOutcome {
