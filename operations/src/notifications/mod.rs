@@ -28,6 +28,7 @@ pub mod setting_rows;
 pub mod settings;
 #[cfg(test)]
 mod tests;
+pub mod user_call;
 pub mod watch;
 pub mod webhook;
 pub(crate) mod webhook_job;
