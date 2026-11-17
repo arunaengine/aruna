@@ -116,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_admin_after_group() {
+    fn realm_admin_fallback() {
         // A caller who is no group admin is asked about the realm groups path once.
         let mut operation = AdminCheckOperation::new(auth(3), Ulid::from_bytes([1u8; 16]));
         assert!(matches!(
