@@ -49,6 +49,7 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::drain_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use crate::node::info_write::{InfoChange, InfoWriteOperation, PUBLISH_OWED_KEY};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -99,19 +100,10 @@ pub async fn seed_info_document(
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
-    let txn_id = begin_write(&ctx.storage_handle).await?;
-    let written = match write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await {
-        Ok(()) => write_owed(ctx, epoch.publisher_generation, txn_id).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = written {
-        abort_txn(&ctx.storage_handle, txn_id).await;
-        return Err(error);
-    }
-    match commit_txn(&ctx.storage_handle, txn_id).await? {
-        true => Ok(()),
-        false => Err("node info seed conflicted with another revision".to_string()),
-    }
+    drive(InfoWriteOperation::seed(realm_id, document), ctx)
+        .await
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 /// Seeds this node's current info document and replicates it over the shared
@@ -461,14 +453,14 @@ pub(crate) async fn refresh_info_heartbeat(
             .map(|net| net.download_gauge().snapshot()),
         storage_capacity_bytes: storage_capacity(ctx),
     };
-    revise_node_info(ctx, node_id, realm_id, |document| {
-        document.executors = executors.clone();
-        document.labels = labels.clone();
-        document.reservation = reservation;
-        document.demand = demand.clone();
-        document.utilization = utilization;
-    })
-    .await?;
+    let change = InfoChange::Telemetry {
+        executors: executors.clone(),
+        labels,
+        reservation,
+        demand: demand.clone(),
+        utilization,
+    };
+    revise_node_info(ctx, node_id, realm_id, change).await?;
     if read_owed(ctx, None).await?.is_some() {
         replicate_node_info(ctx, node_id, realm_id).await?;
     }
@@ -508,95 +500,18 @@ pub(crate) async fn refresh_info_heartbeat(
     Ok(())
 }
 
-/// The advertisement without telemetry and publication stamps; only a change here publishes.
-fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
-    let mut view = document.clone();
-    for executor in &mut view.executors {
-        executor.availability = None;
-    }
-    view.utilization = NodeUtilization {
-        storage_bytes_used: 0,
-        documents_held: None,
-        load_permille: None,
-        heartbeat_at_ms: 0,
-        download_slots: None,
-        storage_capacity_bytes: None,
-    };
-    view.demand = ComputeDemandSnapshot::default();
-    view.reservation = ComputeReservationSnapshot::default();
-    view.updated_at_ms = 0;
-    view.epoch.publisher_generation = 0;
-    view.epoch.observed_at_ms = 0;
-    view
-}
-
-/// Node-info revisions one publisher retries after another committed first.
-const NODE_INFO_ATTEMPTS: usize = 3;
-
-/// Applies `revise` to the current node-info row inside one write transaction,
-/// also stamping the next epoch and re-reading published drain/departure state. All publishers
-/// use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row or no durable change.
+/// Applies `change` to the stored node-info row in one write transaction, which also stamps
+/// the next epoch and re-reads the drain. `Ok(false)` means no row or no durable change.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
-    mut revise: impl FnMut(&mut NodeInfoDocument),
+    change: InfoChange,
 ) -> Result<bool, String> {
-    let generation = membership_generation(ctx, realm_id).await?;
-    for attempt in 0..NODE_INFO_ATTEMPTS {
-        let txn_id = begin_write(&ctx.storage_handle).await?;
-        match write_revision(ctx, node_id, txn_id, generation, &mut revise).await {
-            Ok(false) => {
-                abort_txn(&ctx.storage_handle, txn_id).await;
-                return Ok(false);
-            }
-            Ok(true) => match commit_txn(&ctx.storage_handle, txn_id).await? {
-                true => return Ok(true),
-                false if attempt + 1 < NODE_INFO_ATTEMPTS => continue,
-                false => break,
-            },
-            Err(error) => {
-                abort_txn(&ctx.storage_handle, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err("node info revision exhausted conflict retries".to_string())
-}
-
-/// Reads, revises, and writes the node-info row inside `txn_id`.
-async fn write_revision(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    txn_id: TxnId,
-    generation: u64,
-    revise: &mut impl FnMut(&mut NodeInfoDocument),
-) -> Result<bool, String> {
-    let Some(mut document) = node_info_row(&ctx.storage_handle, node_id, Some(txn_id)).await?
-    else {
-        return Ok(false);
-    };
-    let stored = durable_view(&document);
-    revise(&mut document);
-    // The published drain is exactly the operator's durable flag or a departure,
-    // both read here, so no publisher carries a stale copy of them forward.
-    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
-    document.epoch.membership_generation = generation;
-    if durable_view(&document) == stored {
-        return Ok(false);
-    }
     let now = unix_timestamp_millis();
-    document.epoch = AdvertisementEpoch {
-        membership_generation: generation,
-        publisher_generation: document.epoch.publisher_generation.saturating_add(1),
-        observed_at_ms: now,
-    };
-    document.demand.epoch = document.epoch;
-    document.reservation.epoch = document.epoch;
-    document.updated_at_ms = now;
-    write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
-    write_owed(ctx, document.epoch.publisher_generation, txn_id).await?;
-    Ok(true)
+    drive(InfoWriteOperation::revise(realm_id, node_id, change, now), ctx)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn begin_write(storage: &StorageHandle) -> Result<TxnId, String> {
@@ -670,9 +585,6 @@ fn merge_view(
     (totals, truncated || missing)
 }
 
-/// The newest advertisement revision not yet handed to replication. It is written in the same
-/// transaction as that revision, so a failure after the commit only delays the publish.
-const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
@@ -699,12 +611,12 @@ pub(crate) async fn set_departure_state(
     if departing {
         write_departure_report(ctx, epoch.membership_generation, now).await?;
     }
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
-        document.leaving = departing;
-        document.reservation = reservation;
-        document.demand = demand.clone();
-    })
-    .await?;
+    let change = InfoChange::Leaving {
+        leaving: departing,
+        reservation,
+        demand,
+    };
+    let revised = revise_node_info(ctx, node_id, realm_id, change).await?;
     info!(
         leaving = departing,
         compute_draining = draining,
@@ -745,11 +657,11 @@ pub async fn set_operator_drain(
     let demand = demand_snapshot(ctx, epoch).await?;
     // The revision derives the published drain from the flag written above; a
     // departing node stays draining whatever that flag says.
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
-        document.reservation = reservation;
-        document.demand = demand.clone();
-    })
-    .await?;
+    let change = InfoChange::Snapshots {
+        reservation,
+        demand,
+    };
+    let revised = revise_node_info(ctx, node_id, realm_id, change).await?;
     info!(
         operator_draining = draining,
         leaving = document.leaving,
@@ -1039,23 +951,6 @@ async fn read_owed(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<Option<
         ),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("owed publish read failed: {other:?}")),
-    }
-}
-
-async fn write_owed(ctx: &DriverContext, generation: u64, txn_id: TxnId) -> Result<(), String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-            value: Value::from(generation.to_be_bytes().to_vec()),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("owed publish write failed: {other:?}")),
     }
 }
 
@@ -2403,11 +2298,15 @@ mod tests {
         assert_eq!(read_outbox(&ctx).await.len(), queued);
 
         // A publish that failed after its revision committed leaves the revision owed.
-        let txn_id = begin_write(&ctx.storage_handle).await.unwrap();
-        write_owed(&ctx, seeded.epoch.publisher_generation, txn_id)
-            .await
-            .unwrap();
-        assert!(commit_txn(&ctx.storage_handle, txn_id).await.unwrap());
+        let owed = seeded.epoch.publisher_generation.to_be_bytes().to_vec();
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+                value: Value::from(owed),
+                txn_id: None,
+            })
+            .await;
         refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
