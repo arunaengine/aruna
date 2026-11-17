@@ -18,6 +18,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{
@@ -44,7 +45,6 @@ use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
-use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,

@@ -28,8 +28,8 @@ use crate::jobs::records::{
 };
 use crate::jobs::service::kick_drain;
 use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
-use crate::metadata::AuthToken;
 use crate::realm::load_config::load_realm_config;
+use aruna_core::metadata::AuthToken;
 
 /// Cancels one external job through its family. `None` means the alias names no
 /// family here, so the caller keeps its ordinary local cancellation.

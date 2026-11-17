@@ -1084,7 +1084,7 @@ pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
 
 pub(crate) fn forwarded_job_auth(
     bearer: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+) -> ServerResult<Option<aruna_core::metadata::AuthToken>> {
     aruna_operations::metadata::api::fanout_types::forwarded_bearer(
         bearer.as_ref().map(ValidatedBearer::as_str),
     )

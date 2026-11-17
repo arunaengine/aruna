@@ -7,6 +7,7 @@ use crate::topology;
 use aruna_core::StructuredId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::storage_entries::registry_delete_entries;
@@ -30,7 +31,6 @@ use aruna_operations::jobs::service::{
 };
 use aruna_operations::jobs::store::find_dedup_job;
 use aruna_operations::jobs::submit::{SubmitJobError, mint_job_id};
-use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,

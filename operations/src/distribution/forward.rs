@@ -31,13 +31,14 @@ use crate::effect_adapters::routing::node_routing;
 use crate::forward::authorize::is_sync_eligible;
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::metadata::{DescriptionError, dataset_description};
+use aruna_core::metadata::AuthToken;
 
 /// A publish attempt retries a storage conflict this often before it gives up.
 const PUBLISH_ATTEMPTS: usize = 3;

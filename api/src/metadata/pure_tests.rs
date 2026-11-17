@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::auth::ValidatedBearer;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::distributed_types::{
     MetadataQueryForm as QueryForm, aggregate_query_results, query_select_limit,
 };

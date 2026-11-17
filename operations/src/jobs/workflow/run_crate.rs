@@ -45,7 +45,6 @@ use super::super::store::{
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -58,6 +57,7 @@ use crate::realm::mutate_placement::node_kind;
 use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use crate::replication::protocol::LocationSummaryRequest;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::metadata::AuthToken;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds

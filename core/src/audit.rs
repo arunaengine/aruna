@@ -8,10 +8,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::NodeId;
-use crate::metadata::AuthToken;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::metadata_registry::MetadataAuditRecord;
 use crate::types::GroupId;
+use aruna_core::metadata::AuthToken;
 
 pub const AUDIT_KEY_BYTES: usize = 48;
 pub const MAX_AUDIT_RECORDS: usize = 200;

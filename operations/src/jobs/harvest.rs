@@ -43,7 +43,6 @@ use crate::harvest::repository::{
 use crate::harvest::target_path::{HARVEST_PATH_BYTES, normalize_target_prefix};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::metadata_class::{MetadataFailure, classify_metadata};
-use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -53,6 +52,7 @@ use crate::metadata::forward::write::{
 };
 use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::UpdateDocumentMutation;
+use aruna_core::metadata::AuthToken;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.
 /// Operationally generous at a typical page size, and small enough that a

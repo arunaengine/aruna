@@ -9,7 +9,6 @@ use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
 use crate::UserId;
-use crate::metadata::AuthToken;
 use crate::structs::execution::job::{
     JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
     StagingJobCheckpoint, WorkspaceMode,
@@ -17,6 +16,7 @@ use crate::structs::execution::job::{
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
+use aruna_core::metadata::AuthToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {

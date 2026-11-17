@@ -298,7 +298,7 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
 /// so it re-runs the same permission checks under the same authority.
 pub(crate) fn forwarded_auth_token(
     bearer_token: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+) -> ServerResult<Option<aruna_core::metadata::AuthToken>> {
     forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(map_api_error)
 }
 

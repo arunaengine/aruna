@@ -52,13 +52,14 @@ use crate::jobs::source_read::{
     HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read, issue_grant, public_read,
 };
 use crate::jobs::submit::SubmitJobError;
+use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::{AuthToken, WritePeerError};
 use crate::realm::load_config::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::metadata::AuthToken;
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
@@ -1060,7 +1061,8 @@ async fn readable_metadata(
     };
     let described = match metadata.dataset {
         Some(dataset) => {
-            let token = bearer.and_then(|token| crate::metadata::AuthToken::bearer(token).ok());
+            let token =
+                bearer.and_then(|token| aruna_core::metadata::AuthToken::bearer(token).ok());
             let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
             admitted_description(read.await)?
         }

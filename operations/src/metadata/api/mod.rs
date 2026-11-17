@@ -70,7 +70,6 @@ use self::read::ensure_record_materialized;
 use self::read::{can_read_record, ensure_record_readable, filter_live_records, load_live_record};
 
 use self::read_types::metadata_read_request;
-use super::AuthToken;
 use super::forward::read::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::handle::{QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT};
 use super::protocol::{
@@ -110,6 +109,7 @@ use crate::s3::object::search::{
     ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput,
 };
 use crate::s3::object::search_scan::search_local_objects;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS};
 
 mod bucket_page;

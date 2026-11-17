@@ -5,7 +5,6 @@
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::PersistentIdOutcome;
@@ -18,6 +17,7 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::StructuredId;
 use aruna_core::UserId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::PersistentIdFailure;
 use aruna_core::structs::PersistentIdMapping;

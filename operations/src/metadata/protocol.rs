@@ -49,7 +49,7 @@ use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
-pub use aruna_core::metadata::{AuthToken, AuthTokenError};
+use aruna_core::metadata::AuthToken;
 
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;

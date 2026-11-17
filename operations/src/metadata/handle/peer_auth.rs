@@ -21,8 +21,9 @@ use crate::auth::bearer_token::{
 };
 use crate::driver::DriverContext;
 use crate::metadata::contact::PeerContacts;
-use crate::metadata::protocol::{AuthToken, MetadataReadError};
+use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
+use aruna_core::metadata::AuthToken;
 
 impl MetadataHandle {
     /// Validates a forwarded caller's bearer token and confirms the forwarding

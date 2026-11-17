@@ -68,7 +68,6 @@ use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
@@ -85,6 +84,7 @@ use crate::s3::object::delete::pinned::version_pins;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::metadata::AuthToken;
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 /// Longest wait for the source realm to confirm a grant.

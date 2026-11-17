@@ -11,7 +11,7 @@ use crate::compute::{ExecutionTargetId, SharedSecret};
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
-use crate::metadata::{AuthToken, MetadataEffect};
+use crate::metadata::MetadataEffect;
 use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
@@ -34,6 +34,7 @@ use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingSh
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
+use aruna_core::metadata::AuthToken;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;

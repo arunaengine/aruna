@@ -43,7 +43,7 @@ use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
 use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
 use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::protocol::{AuthToken, MetadataReadError};
+use crate::metadata::protocol::MetadataReadError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
@@ -53,6 +53,7 @@ use crate::s3::object::get::{
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use aruna_core::metadata::AuthToken;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
