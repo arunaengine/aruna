@@ -89,7 +89,7 @@ mod tests;
 /// Re-arms the replication and witness queues after a restart. Both queues are
 /// durable rows, so the timers only have to be brought back, never the work.
 pub async fn restore_lifecycle_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let pending = crate::jobs::store::iter_prefix_page(
+    let pending = crate::storage_read::iter_prefix_page(
         storage,
         aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
         None,

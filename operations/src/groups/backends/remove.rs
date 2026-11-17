@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 
 const SCAN_PAGE_SIZE: usize = 512;
 

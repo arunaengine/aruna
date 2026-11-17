@@ -13,8 +13,9 @@ use crate::blob::promote::{PromoteError, promote_unlocked};
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
-    AwaitOutcome, JobMutationError, iter_prefix_page, park_job, satisfy_key_wait, wake_key_waits,
+    AwaitOutcome, JobMutationError, park_job, satisfy_key_wait, wake_key_waits,
 };
+use crate::storage_read::iter_prefix_page;
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DELETE_TRAIL_KEYSPACE;

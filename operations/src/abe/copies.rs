@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use crate::node::usage_stats::{QuotaGate, RowChange, UsageCounterUpdate};
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};

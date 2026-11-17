@@ -25,8 +25,9 @@ use tracing::warn;
 use super::reconcile::ExternalReconciler;
 use super::store::{
     ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, read_job_record, requeue_job,
+    read_job_record, requeue_job,
 };
+use crate::storage_read::iter_prefix_page;
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class

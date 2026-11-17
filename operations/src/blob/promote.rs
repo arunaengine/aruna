@@ -866,7 +866,7 @@ pub async fn promote_unlocked(
     let mut start_after = None;
     let mut promoted = 0;
     loop {
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             PENDING_LOCATION_KEYSPACE,
             None,

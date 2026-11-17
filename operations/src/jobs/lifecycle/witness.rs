@@ -40,7 +40,8 @@ use crate::jobs::records::{
     Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
     load_kind_complete,
 };
-use crate::jobs::store::{batch_delete, iter_prefix_page};
+use crate::jobs::store::{batch_delete};
+use crate::storage_read::iter_prefix_page;
 use crate::metadata::api::load_realm_config;
 
 /// Domain of the stable witness order.

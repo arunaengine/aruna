@@ -157,7 +157,7 @@ async fn committed_restart_replays() {
         .await
         .is_none()
     );
-    let (outbox, _) = crate::jobs::store::iter_prefix_page(
+    let (outbox, _) = crate::storage_read::iter_prefix_page(
         &reopened.storage_handle,
         SYNC_OUTBOX_KEYSPACE,
         None,

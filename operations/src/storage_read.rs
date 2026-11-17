@@ -5,7 +5,7 @@
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_storage::StorageHandle;
 use futures_util::{Stream, stream};
 use thiserror::Error;
@@ -70,6 +70,26 @@ pub(crate) fn parse_storage_scan(event: Event) -> Result<StorageScan, StorageRea
     }
 }
 
+/// One page of `key_space` under `prefix` after `start_after`, and the key the next page
+/// starts after.
+pub async fn iter_prefix_page(
+    storage: &StorageHandle,
+    key_space: &str,
+    prefix: Option<Key>,
+    start_after: Option<Key>,
+    limit: usize,
+    txn_id: Option<TxnId>,
+) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
+    let iter = StorageEffect::Iter {
+        key_space: key_space.to_string(),
+        prefix,
+        start: start_after.map(IterStart::After),
+        limit,
+        txn_id,
+    };
+    parse_storage_scan(storage.send_storage_effect(iter).await).map_err(|error| error.to_string())
+}
+
 /// Reads a keyspace range page by page, so a caller handles each page before the next read.
 pub(crate) fn scan_pages<'a>(
     storage: &'a StorageHandle,
@@ -82,21 +102,9 @@ pub(crate) fn scan_pages<'a>(
             let Some(start) = start else {
                 return Ok(None);
             };
-            let iter = StorageEffect::Iter {
-                key_space: key_space.to_string(),
-                prefix,
-                start: start.map(IterStart::After),
-                limit: 1_000,
-                txn_id: None,
-            };
-            match storage.send_storage_effect(iter).await {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => Ok(Some((values, next_start_after.map(Some)))),
-                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-                other => Err(format!("unexpected iter event: {other:?}")),
-            }
+            let (values, next) =
+                iter_prefix_page(storage, key_space, prefix, start, 1_000, None).await?;
+            Ok(Some((values, next.map(Some))))
         }
     })
 }

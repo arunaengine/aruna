@@ -256,7 +256,7 @@ impl Operation for CheckVersionOperation {
 /// Advances the unfinished checks at the head of the queue by one page each. Returns when
 /// the task must run again.
 pub async fn process_checks(context: &DriverContext) -> Result<Option<Duration>, String> {
-    let (rows, more) = crate::jobs::store::iter_prefix_page(
+    let (rows, more) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         CHECK_QUEUE_KEYSPACE,
         None,
@@ -303,7 +303,7 @@ async fn check_page(
     mut record: StorageCheck,
 ) -> Result<bool, String> {
     let prefix = BlobHeadKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (heads, next) = crate::jobs::store::iter_prefix_page(
+    let (heads, next) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         BLOB_HEAD_KEYSPACE,
         Some(prefix.into()),
@@ -421,7 +421,7 @@ pub async fn list_broken(
     limit: usize,
 ) -> Result<(Vec<(VersionKey, BrokenVersion)>, Option<Key>), String> {
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (rows, next) = crate::jobs::store::iter_prefix_page(
+    let (rows, next) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         BROKEN_VERSION_KEYSPACE,
         Some(prefix.into()),

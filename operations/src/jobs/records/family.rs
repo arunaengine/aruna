@@ -17,7 +17,7 @@ use super::keys::{family_prefix, kind_prefix};
 use super::rows::from_bytes;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE};
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 
 /// Why one family could not be read completely. Every variant leaves the caller
 /// undecided; none of them means the family is empty.

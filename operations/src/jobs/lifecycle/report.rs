@@ -28,7 +28,7 @@ use crate::jobs::records::rows::from_bytes;
 use crate::jobs::records::{
     AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation, load_kind_complete,
 };
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;

@@ -7,7 +7,7 @@ use super::linked::JobStep;
 use super::rename::{JOB_CHANGED, RenameError, RenameInput, RenameKeysOperation, check_target};
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::NodeId;
 use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
 use aruna_core::structs::identity::auth::Permission;

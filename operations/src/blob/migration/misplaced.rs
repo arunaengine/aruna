@@ -69,7 +69,7 @@ pub async fn count_misplaced(
     let scan = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
     let (mut after, mut seen, mut scanned) = (None::<Key>, 0, 0);
     loop {
-        let (versions, next) = crate::jobs::store::iter_prefix_page(
+        let (versions, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BLOB_VERSIONS_KEYSPACE,
             Some(scan.clone().into()),
@@ -271,7 +271,7 @@ pub async fn rename_page(
     let prefix = object_prefix(rule.import_id);
     let mut start = None::<Key>;
     loop {
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             IMPORTED_OBJECT_KEYSPACE,
             Some(prefix.clone()),

@@ -1740,7 +1740,7 @@ pub async fn process_migrations(
     after: Option<Key>,
 ) -> Result<MigrationRun, String> {
     let resumed = after.is_some();
-    let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+    let (rows, cursor) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         COMPRESSION_QUEUE_KEYSPACE,
         None,
@@ -1903,7 +1903,7 @@ async fn migrate_page(
     let write = aruna_core::structs::identity::auth::Permission::WRITE;
     let mut denied = 0usize;
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::jobs::store::iter_prefix_page(
+    let (versions, next) = crate::storage_read::iter_prefix_page(
         &context.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
@@ -2229,7 +2229,7 @@ async fn hand_over_moves(
             store_handover(context, bucket, None).await?;
             return Ok(true);
         };
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             IMPORT_INTENT_KEYSPACE,
             Some(aruna_core::structs::storage::backend_import::object_prefix(
@@ -2467,7 +2467,7 @@ async fn stored_copy(
     };
     let mut after = None;
     loop {
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
             Some(hash.to_vec().into()),

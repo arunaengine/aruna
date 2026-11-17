@@ -7,7 +7,7 @@ use super::queue::{BlobJobRecord, BlobQueueError, REPLICATION_POLL_AFTER, schedu
 use super::version_replication::ReplicateScopeTarget;
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::iter_prefix_page;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

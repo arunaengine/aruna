@@ -180,35 +180,6 @@ pub async fn find_dedup_plan(
     }
 }
 
-// --- scan helpers --------------------------------------------------------------
-
-pub async fn iter_prefix_page(
-    storage: &StorageHandle,
-    key_space: &str,
-    prefix: Option<Key>,
-    start_after: Option<Key>,
-    limit: usize,
-    txn_id: Option<TxnId>,
-) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: start_after.map(IterStart::After),
-            limit,
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
-    }
-}
-
 /// Earliest `(timestamp, job_id)` under a schedule-index prefix.
 pub async fn first_schedule_entry(
     storage: &StorageHandle,
