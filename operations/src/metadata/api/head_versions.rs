@@ -64,7 +64,10 @@ impl HeadVersionsOperation {
             Next::Call(call) => return Ok(Next::Call(call)),
             Next::Wait => return Ok(Next::Wait),
             // The scan is a plain read, so it has no calls after a commit.
-            Next::Done(scanned) | Next::Then { output: scanned, .. } => scanned,
+            Next::Done(scanned)
+            | Next::Then {
+                output: scanned, ..
+            } => scanned,
         };
         self.scan = None;
         self.complete = !more;
