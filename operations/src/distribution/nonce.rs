@@ -11,7 +11,15 @@ use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 
-use super::delegate::DelegateError;
+use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum NonceError {
+    #[error("the nonce was already used")]
+    Replayed,
+    #[error("the nonce store is unavailable")]
+    Unavailable,
+}
 
 /// Expired nonce rows one spend deletes, so the keyspace never grows past live ones.
 const PRUNE_PAGE: usize = 64;
@@ -32,7 +40,7 @@ pub struct SpendNonceOperation {
     now: u64,
     state: SpendState,
     txn_id: Option<TxnId>,
-    output: Option<Result<(), DelegateError>>,
+    output: Option<Result<(), NonceError>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +74,7 @@ impl SpendNonceOperation {
     }
 
     /// Aborts the open transaction, if any, and ends with `error`.
-    fn fail(&mut self, error: DelegateError) -> Effects {
+    fn fail(&mut self, error: NonceError) -> Effects {
         self.output = Some(Err(error));
         match self.txn_id.take() {
             Some(txn_id) => self.storage(
@@ -87,16 +95,16 @@ impl SpendNonceOperation {
 }
 
 /// A storage failure while spending: a conflict means another acceptance spent the nonce.
-fn spend_error(error: StorageError) -> DelegateError {
+fn spend_error(error: StorageError) -> NonceError {
     match error {
-        StorageError::TransactionConflict => DelegateError::Replayed,
-        _ => DelegateError::Unavailable,
+        StorageError::TransactionConflict => NonceError::Replayed,
+        _ => NonceError::Unavailable,
     }
 }
 
 impl Operation for SpendNonceOperation {
     type Output = ();
-    type Error = DelegateError;
+    type Error = NonceError;
 
     fn start(&mut self) -> Effects {
         self.storage(
@@ -107,7 +115,7 @@ impl Operation for SpendNonceOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         let Event::Storage(event) = event else {
-            return self.fail(DelegateError::Unavailable);
+            return self.fail(NonceError::Unavailable);
         };
         match (self.state, event) {
             (SpendState::Start, StorageEvent::TransactionStarted { txn_id }) => {
@@ -120,7 +128,7 @@ impl Operation for SpendNonceOperation {
                 self.storage(SpendState::Read, read)
             }
             (SpendState::Read, StorageEvent::ReadResult { value: Some(_), .. }) => {
-                self.fail(DelegateError::Replayed)
+                self.fail(NonceError::Replayed)
             }
             (SpendState::Read, StorageEvent::ReadResult { value: None, .. }) => {
                 let write = StorageEffect::Write {
@@ -136,7 +144,7 @@ impl Operation for SpendNonceOperation {
                     SpendState::Commit,
                     StorageEffect::CommitTransaction { txn_id },
                 ),
-                None => self.fail(DelegateError::Unavailable),
+                None => self.fail(NonceError::Unavailable),
             },
             (SpendState::Commit, StorageEvent::TransactionCommitted { .. }) => {
                 self.output = Some(Ok(()));
@@ -180,7 +188,7 @@ impl Operation for SpendNonceOperation {
                 self.fail(spend_error(error))
             }
             (_, StorageEvent::Error { error }) => self.fail(spend_error(error)),
-            (_, _) => self.fail(DelegateError::Unavailable),
+            (_, _) => self.fail(NonceError::Unavailable),
         }
     }
 
@@ -191,9 +199,9 @@ impl Operation for SpendNonceOperation {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             SpendState::Finish | SpendState::Error => {
-                self.output.unwrap_or(Err(DelegateError::Unavailable))
+                self.output.unwrap_or(Err(NonceError::Unavailable))
             }
-            _ => Err(DelegateError::Unavailable),
+            _ => Err(NonceError::Unavailable),
         }
     }
 
@@ -217,7 +225,7 @@ mod tests {
         nonce: u8,
         expires: u64,
         now: u64,
-    ) -> Result<(), DelegateError> {
+    ) -> Result<(), NonceError> {
         drive(SpendNonceOperation::new([nonce; 16], expires, now), context).await
     }
 
@@ -226,10 +234,7 @@ mod tests {
         let (_dir, handle) = open();
         let context = context(&handle);
         assert_eq!(spend(&context, 1, 50, 0).await, Ok(()));
-        assert_eq!(
-            spend(&context, 1, 50, 0).await,
-            Err(DelegateError::Replayed)
-        );
+        assert_eq!(spend(&context, 1, 50, 0).await, Err(NonceError::Replayed));
         assert_eq!(spend(&context, 2, 50, 0).await, Ok(()));
     }
 
@@ -349,7 +354,7 @@ mod tests {
         assert_eq!(operation.step(stored(read)).as_slice(), [abort()]);
         assert!(!operation.is_complete());
         operation.step(stored(StorageEvent::TransactionAborted { txn_id: TXN }));
-        assert_eq!(operation.finalize(), Err(DelegateError::Replayed));
+        assert_eq!(operation.finalize(), Err(NonceError::Replayed));
 
         let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
         operation.start();
@@ -383,7 +388,7 @@ mod tests {
                 .step(stored(StorageEvent::Error { error }))
                 .is_empty()
         );
-        assert_eq!(operation.finalize(), Err(DelegateError::Replayed));
+        assert_eq!(operation.finalize(), Err(NonceError::Replayed));
 
         let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
         operation.start();
@@ -401,7 +406,7 @@ mod tests {
                 .step(stored(StorageEvent::Error { error }))
                 .is_empty()
         );
-        assert_eq!(operation.finalize(), Err(DelegateError::Unavailable));
+        assert_eq!(operation.finalize(), Err(NonceError::Unavailable));
     }
 
     // Events outside each phase are refused; abort ends an open transaction.

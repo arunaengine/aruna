@@ -23,12 +23,11 @@ use aruna_core::structs::storage::distribution::{
 use tokio::time::Instant;
 use ulid::Ulid;
 
+use crate::distribution::counts::MAX_SETS;
 use crate::distribution::version_key::{MemberAnswer, VersionKeyOperation};
 use crate::driver::{DriverContext, drive, drive_until};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
-/// At most this many distribution records are read to find a version's candidate sets.
-pub(crate) const MAX_SETS: usize = 4096;
 /// At most this many candidate sets are looked at for one id.
 const MAX_CANDIDATES: usize = 4;
 /// At most this many members are asked for one id, over all candidate sets.

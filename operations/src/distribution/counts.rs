@@ -17,8 +17,8 @@ use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::distribution::resolve::MAX_SETS;
-
+/// At most this many distribution records are read by one scan of this node's records.
+pub(crate) const MAX_SETS: usize = 4096;
 /// Distribution records one page reads.
 const PAGE: usize = 256;
 

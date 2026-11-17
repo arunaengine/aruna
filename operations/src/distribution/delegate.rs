@@ -18,7 +18,7 @@ use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::nonce::SpendNonceOperation;
+use super::nonce::{NonceError, SpendNonceOperation};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
@@ -36,6 +36,15 @@ pub enum DelegateError {
     Replayed,
     #[error("delegations need the realm transport and configuration")]
     Unavailable,
+}
+
+impl From<NonceError> for DelegateError {
+    fn from(error: NonceError) -> Self {
+        match error {
+            NonceError::Replayed => DelegateError::Replayed,
+            NonceError::Unavailable => DelegateError::Unavailable,
+        }
+    }
 }
 
 /// What the issuing node verified about one request before it forwards it.
