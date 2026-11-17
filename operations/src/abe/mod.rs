@@ -13,7 +13,7 @@ mod requests;
 mod snapshot;
 
 use crate::driver::{DriverContext, drive};
-use crate::tasks::queue_backoff::conflict_backoff;
+use aruna_core::backoff::conflict_backoff;
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
