@@ -5,12 +5,12 @@
 use crate::device::retry::RetryView;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::rows::done;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
 use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -269,12 +269,9 @@ pub fn scan_publish_queue(start_after: Option<Key>, txn_id: Option<TxnId>) -> Ef
     })
 }
 
-pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
-        key: publish_key(draft_id),
-        txn_id,
-    })
+/// The call that reads one queued draft.
+pub(super) fn read_entry(draft_id: Ulid) -> IoCall {
+    read_row(DEVICE_INTAKE_KEYSPACE, publish_key(draft_id))
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -321,11 +318,7 @@ impl Operation for ClaimStateOperation {
     type Error = ClaimError;
 
     fn first(&mut self) -> Result<Next<bool>, ClaimError> {
-        let row = (
-            DEVICE_INTAKE_KEYSPACE.to_string(),
-            publish_key(self.entry.draft_id),
-        );
-        Ok(Next::Call(IoCall::Read(vec![row])))
+        Ok(Next::Call(read_entry(self.entry.draft_id)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
@@ -333,7 +326,7 @@ impl Operation for ClaimStateOperation {
             done(result)?;
             return Ok(Next::Done(true));
         }
-        let stored = result.values()?.into_iter().next().flatten();
+        let [stored] = values::<1>(result)?;
         let current = stored.and_then(|bytes| PublishEntry::from_bytes(&bytes).ok());
         Ok(self.write(current))
     }
