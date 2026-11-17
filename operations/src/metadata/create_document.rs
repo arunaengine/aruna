@@ -49,11 +49,11 @@ use crate::metadata::profile::validation::{
 use crate::metadata::projector::schedule_projection_drain;
 use crate::metadata::repository::{create_projection_entries, read_document_registry};
 use crate::sync::shard_placement::sort_node_ids;
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
 };
-use aruna_core::backoff::conflict_backoff;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
