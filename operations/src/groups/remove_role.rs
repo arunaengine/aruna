@@ -273,34 +273,13 @@ impl RemoveGroupOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId, group: Group) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
+        let [auth_doc, reducer_state, realm_config] = match super::member_reads(event) {
+            Ok(values) => values,
+            Err((expected, got)) => {
+                return self.unexpected_event(self.state.clone(), expected, got);
+            }
         };
-        let [
-            (_, auth_doc_value),
-            (_, reducer_state_value),
-            (_, realm_config_value),
-        ] = values.as_slice()
-        else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc, admin state, and realm config values",
-                got,
-            );
-        };
-
-        match self.emit_document_write(
-            txn_id,
-            group,
-            auth_doc_value.clone(),
-            reducer_state_value.clone(),
-            realm_config_value.clone(),
-        ) {
+        match self.emit_document_write(txn_id, group, auth_doc, reducer_state, realm_config) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
