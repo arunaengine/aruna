@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
-use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -50,6 +49,7 @@ use crate::metadata::repository::{
     schedule_materialization,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
@@ -775,7 +775,9 @@ async fn journals(
         return Ok(false);
     };
     if let std::collections::btree_map::Entry::Vacant(slot) = realm_configs.entry(realm_id) {
-        slot.insert(read_realm_config(context, realm_id).await?);
+        slot.insert(optional_config(
+            drive(GetConfigOperation::new(realm_id), context).await,
+        )?);
     }
     let config = realm_configs.get(&realm_id).and_then(Option::as_ref);
     let kind = config.and_then(|config| node_kind(config, local));
@@ -1054,7 +1056,8 @@ async fn expand_cached_holders(
         match realm_configs.get(&realm_id) {
             Some(config) => config.clone(),
             None => {
-                let config = read_realm_config(context, realm_id).await?;
+                let config =
+                    optional_config(drive(GetConfigOperation::new(realm_id), context).await)?;
                 realm_configs.insert(realm_id, config.clone());
                 config
             }
@@ -1079,24 +1082,16 @@ fn expand_event_holders(
     Ok(event)
 }
 
-async fn read_realm_config(
-    context: &DriverContext,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
+/// A realm config read result where a missing config is `None`.
+fn optional_config(
+    result: Result<RealmConfigDocument, GetConfigError>,
 ) -> Result<Option<RealmConfigDocument>, MetadataProjectionError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    match context
-        .storage_handle
-        .send_effect(crate::document_repository::read_effect(&target, None))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| RealmConfigDocument::from_bytes(&value))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(
-            other.label().to_string(),
-        )),
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(GetConfigError::DocumentNotFound) => Ok(None),
+        Err(GetConfigError::StorageError(error)) => Err(error.into()),
+        Err(GetConfigError::ConversionError(error)) => Err(error.into()),
+        Err(other) => Err(MetadataProjectionError::UnexpectedEvent(other.to_string())),
     }
 }
 
@@ -1238,7 +1233,7 @@ async fn schedule_materialization_drain(
 mod tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::document::DocumentOutboxRecord;
+    use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
