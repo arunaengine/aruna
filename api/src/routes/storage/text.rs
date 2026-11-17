@@ -18,7 +18,7 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::{relay_json, rest_target};
+use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::mcp::data::{TextObjectRequest, WriteObjectInput, WriteObjectOutput, store_text};
 use crate::server::state::ServerState;
 

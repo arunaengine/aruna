@@ -41,9 +41,7 @@ use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::lookup::map_guard_error;
-use crate::lookup::{
-    self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
-};
+use crate::routes::storage::relay::{self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;

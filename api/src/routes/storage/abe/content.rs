@@ -5,7 +5,7 @@
 use super::*;
 use crate::auth::RealmAuth;
 use crate::download::{self, AdmissionError};
-use crate::lookup::relay_stream;
+use crate::routes::storage::relay::relay_stream;
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;

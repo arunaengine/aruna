@@ -21,7 +21,7 @@ use utoipa_axum::routes;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::lookup::{node_directed, node_read};
+use crate::routes::storage::relay::{node_directed, node_read};
 use crate::server::state::ServerState;
 
 /// How long a run read relayed to the node that ran it may take, body included.

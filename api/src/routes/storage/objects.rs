@@ -28,7 +28,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::lookup::map_guard_error;
 use crate::lookup::{ObjectOutput, object_output};
-use crate::lookup::{RestForward, relay_get, relayed_set};
+use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::server::state::ServerState;
 

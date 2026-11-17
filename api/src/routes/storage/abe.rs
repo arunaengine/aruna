@@ -7,7 +7,7 @@ mod records;
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::lookup::{copy_miss, read_holders, relay_read};
+use crate::routes::storage::relay::{copy_miss, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
@@ -120,7 +120,7 @@ fn version_path(route: &str, query: &VersionQuery) -> String {
         ("key", &query.key),
         ("version_id", &query.version_id),
     ];
-    crate::lookup::query_path(route, &pairs)
+    crate::routes::storage::relay::query_path(route, &pairs)
 }
 async fn read_envelope(
     state: &ServerState,
