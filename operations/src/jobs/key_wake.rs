@@ -15,7 +15,6 @@ use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{
     AwaitOutcome, JobMutationError, iter_prefix_page, park_job, satisfy_key_wait, wake_key_waits,
 };
-use crate::jobs::workflow::workspace::LOCKED_INPUT;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -247,8 +246,7 @@ pub(crate) async fn park_on_lock(
     node_id: NodeId,
     error: &JobError,
 ) -> bool {
-    error.message.starts_with(LOCKED_INPUT)
-        && Box::pin(park_locked(context, record, token, node_id)).await
+    error.locked && Box::pin(park_locked(context, record, token, node_id)).await
 }
 
 /// Parks a claimed job whose local inputs need locked keys. True when the job no longer runs
@@ -599,6 +597,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
+        use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::jobs::store::read_key_waits;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;
