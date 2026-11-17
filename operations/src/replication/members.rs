@@ -18,7 +18,6 @@ use aruna_core::structs::storage::distribution::{
     DistributionBinding, DistributionSnapshot, DistributionView, KeyRange, Publication,
 };
 use aruna_core::types::{Key, Value};
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};

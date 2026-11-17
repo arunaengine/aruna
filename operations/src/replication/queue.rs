@@ -21,7 +21,7 @@ use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::warn;
 use ulid::Ulid;
 
 use super::plaintext::{consent_delete, consent_write, job_consent};

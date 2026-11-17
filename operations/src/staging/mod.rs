@@ -116,6 +116,18 @@ pub(crate) fn describe_event(event: &Event) -> String {
             SubOperationEvent::VersionRekeyed { .. } => {
                 "Event::SubOperation(SubOperationEvent::VersionRekeyed)".to_string()
             }
+            SubOperationEvent::AuditStored { .. } => {
+                "Event::SubOperation(SubOperationEvent::AuditStored)".to_string()
+            }
+            SubOperationEvent::KeysLooked { .. } => {
+                "Event::SubOperation(SubOperationEvent::KeysLooked)".to_string()
+            }
+            SubOperationEvent::CopySealed { .. } => {
+                "Event::SubOperation(SubOperationEvent::CopySealed)".to_string()
+            }
+            SubOperationEvent::CopyWoken { .. } => {
+                "Event::SubOperation(SubOperationEvent::CopyWoken)".to_string()
+            }
         },
         Event::Task(_) => "Event::Task".to_string(),
         Event::Search() => "Event::Search".to_string(),

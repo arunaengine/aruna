@@ -800,7 +800,8 @@ async fn drop_indexes(
 /// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.
 async fn wait_paused(ctx: &JobContext) -> Result<(), PurgeRunError> {
     loop {
-        let paused = crate::blob::purge::is_paused(&ctx.driver, ctx.job_id.as_ulid()).await;
+        let paused = crate::blob::purge::PausedOperation::new(ctx.job_id.as_ulid());
+        let paused = drive(paused, &ctx.driver).await;
         match paused {
             Ok(false) => return Ok(()),
             Ok(true) => {}

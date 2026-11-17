@@ -9,21 +9,17 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    EVENT_JOURNAL_KEYSPACE, NODE_STATE_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE,
-    REPLICATION_JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
+    NODE_STATE_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
 };
-use aruna_core::plugin_runs::{SourceEvent, SourceKind, journal_entries};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
-use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::structs::storage::replication::ReplicationFailure;
 use aruna_core::structs::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, sync_relationship_key,
-    sync_relationship_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
@@ -33,16 +29,15 @@ use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{bound_record, member_publication};
-use super::obligations::{REPLICATION_PAGE_SIZE, live_obligations_exist, process_live_obligations};
+use super::obligations::{live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
-use super::parking::{PARKED_DUE, ParkJobOperation, REPLICATION_POLL_AFTER};
+use super::parking::{PARKED_DUE, ParkJobOperation};
 use super::plaintext::{HolderCheckOperation, job_consent};
 use super::queue::BlobQueueError;
 use super::retire::{BlobJobOutcome, RetireJobOperation};
@@ -76,7 +71,7 @@ pub struct BlobDrainResult {
     pub next_due_after: Option<Duration>,
 }
 
-struct BlobJobScan {
+pub(super) struct BlobJobScan {
     jobs: Vec<(Vec<u8>, BlobJobRecord)>,
     /// The generation the scan started in.
     generation: u64,

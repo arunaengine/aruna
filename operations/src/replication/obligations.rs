@@ -20,12 +20,11 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-use thiserror::Error;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::drain::abort_cursor;
 use super::members::{bound_record, member_jobs};
-use super::page::{PAGE_BYTES, PAGE_RECORDS};
+use super::page::PAGE_BYTES;
 use super::queue::BlobQueueError;
 use crate::driver::DriverContext;
 use aruna_core::structs::storage::replication_queue::SyncOrigin;
@@ -50,24 +49,24 @@ pub(super) const REPLICATION_RELATIONSHIP_LIMIT: usize = 1024;
 /// The obligation the next obligation pass continues after, so later ones get their turn.
 const OBLIGATION_CURSOR_KEY: &[u8] = b"live_obligation_cursor";
 
-struct RelationshipPage {
+pub(super) struct RelationshipPage {
     values: Vec<(Vec<u8>, SyncRelationship)>,
     next: Option<Vec<u8>>,
 }
 
-struct LiveRepairWrite {
+pub(super) struct LiveRepairWrite {
     queued: usize,
     continuation: Option<LiveReplicationContinuation>,
     progressed: bool,
 }
 
 #[derive(Default)]
-struct LiveRepairResult {
-    processed: usize,
-    queued: usize,
-    has_more: bool,
+pub(super) struct LiveRepairResult {
+    pub(super) processed: usize,
+    pub(super) queued: usize,
+    pub(super) has_more: bool,
     /// When the oldest obligation read was written.
-    oldest_ms: Option<u64>,
+    pub(super) oldest_ms: Option<u64>,
 }
 
 pub(super) async fn live_obligations_exist(

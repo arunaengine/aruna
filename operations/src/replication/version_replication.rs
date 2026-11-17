@@ -71,7 +71,7 @@ use aruna_core::structs::storage::routing::{NodeRouting, StorageRoutingRule, res
 use aruna_core::structs::{ReferenceHandling, SyncMode, SyncRelationship, sync_state_key};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use smallvec::smallvec;
 use std::collections::{BTreeSet, HashMap};
 use std::time::SystemTime;

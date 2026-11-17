@@ -21,7 +21,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_net::streams::BiStream;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 use super::{IncomingVersionOperation, IncomingVersionResult};
@@ -101,8 +101,10 @@ async fn bao_admission(
 /// Executes the manifest/reference-advance family for an admitted infra
 /// peer: routing, request policy, placement gate, and the watch emitted on
 /// success. Every refusal here closes the registered bao stream.
+#[allow(clippy::too_many_arguments)]
 async fn accept_version_replication(
     context: &DriverContext,
+    rocrate_limits: &RoCrateLimits,
     blob_handle: &BlobHandle,
     realm_id: RealmId,
     local_node: NodeId,

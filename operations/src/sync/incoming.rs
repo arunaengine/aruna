@@ -2,19 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use crate::auth::permission_rules::GroupPermissionRules;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
-use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::driver::{
-    DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
-};
+use crate::driver::DriverContext;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -23,49 +15,27 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::refresh_usage_targets;
-use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::realm::get_config::GetConfigOperation;
-use crate::realm::mutate_placement::node_kind;
-use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::bootstrap::wake_bootstrap;
-use crate::replication::incoming::{IncomingVersionOperation, IncomingVersionResult};
-use crate::replication::locations::LocationSummaryOperation;
-use crate::replication::protocol::{
-    BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
-};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
-use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
-};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
-    HashIndex, bucket_permission_path, object_permission_path,
-};
-use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
-use ulid::Ulid;
 
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAINTENANCE_JITTER_SECS: u64 = 15;

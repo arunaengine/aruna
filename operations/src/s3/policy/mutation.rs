@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::Operation;
