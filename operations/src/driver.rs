@@ -9,6 +9,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
+use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -73,6 +74,47 @@ impl DriverContext {
         context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
         context
     }
+
+    /// One status snapshot of the net, blob and storage backends this context holds.
+    pub async fn status(&self) -> NodeSnapshot {
+        let network = match &self.net_handle {
+            Some(net) => Some(net.get_status().await),
+            None => None,
+        };
+        let blob = match &self.blob_handle {
+            Some(blob) => Some(blob.get_status().await),
+            None => None,
+        };
+        let metrics = self.storage_handle.snapshot_metrics();
+        NodeSnapshot {
+            network,
+            blob,
+            database: StorageSnapshot {
+                status: if metrics.channel_closed {
+                    Status::Unavailable
+                } else {
+                    Status::Available
+                },
+                requests: RequestSummaryState {
+                    total: metrics.requests_total,
+                    failures: metrics.failed_total,
+                    last_error: metrics.last_error,
+                },
+            },
+        }
+    }
+}
+
+/// The backend status of one node, from [`DriverContext::status`].
+pub struct NodeSnapshot {
+    pub network: Option<NetState>,
+    pub blob: Option<BlobState>,
+    pub database: StorageSnapshot,
+}
+
+pub struct StorageSnapshot {
+    pub status: Status,
+    pub requests: RequestSummaryState,
 }
 
 impl std::fmt::Debug for DriverContext {

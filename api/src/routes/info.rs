@@ -31,7 +31,6 @@ use aruna_operations::federation::totals::data_totals;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
-use aruna_operations::node::status::load_status;
 use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
@@ -2696,7 +2695,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
     }
 
     let ctx = state.get_ctx();
-    let snapshot = load_status(ctx.as_ref()).await;
+    let snapshot = ctx.status().await;
 
     let (network, warnings) = match snapshot.network {
         Some(info) => {
