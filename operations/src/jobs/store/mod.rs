@@ -46,12 +46,15 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 
 pub mod attempt;
 pub mod key_wait;
+pub mod mutation;
 pub mod query;
 pub mod remote_wait;
 pub mod state;
 
+use crate::driver::drive;
 use attempt::*;
 use key_wait::*;
+use mutation::{MutateJobOperation, NoGuard, settle_attempt};
 use query::*;
 use state::*;
 
@@ -122,34 +125,21 @@ pub async fn mutate_job<F>(
     mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
 {
     let mut mutate = mutate;
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        match Box::pin(mutate_in_txn(context, txn_id, job_id, &mut mutate, None)).await {
-            Ok(record) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "job mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(record),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+    let mut attempt = 0;
+    loop {
+        let result = drive(
+            MutateJobOperation::new(job_id, &mut mutate, None::<NoGuard>),
+            context,
+        )
+        .await;
+        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "job mutation exhausted conflict retries".to_string(),
-    ))
 }
 
 /// What deleting a run from this node's lists found.
@@ -292,12 +282,6 @@ async fn hide_settled(
     Ok(RunDelete::Deleted)
 }
 
-/// Re-checks a mutated record against the attempt control read in the same
-/// transaction. Only supplied when an invariant needs it, so ordinary mutations
-/// pay no extra read.
-type JobGuard<'a> =
-    &'a mut (dyn FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send);
-
 /// Same transaction as [`mutate_job`], with `guard` re-checking the mutated
 /// record against the attempt control read in that transaction; a rejection
 /// aborts before any write, so the invariant is atomic with the state change.
@@ -308,42 +292,21 @@ pub async fn mutate_job_guarded<F, G>(
     mut guard: G,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
     G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
 {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        match Box::pin(mutate_in_txn(
+    let mut attempt = 0;
+    loop {
+        let result = drive(
+            MutateJobOperation::new(job_id, &mut mutate, Some(&mut guard)),
             context,
-            txn_id,
-            job_id,
-            &mut mutate,
-            Some(&mut guard),
-        ))
-        .await
-        {
-            Ok(record) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "job mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(record),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+        )
+        .await;
+        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "job mutation exhausted conflict retries".to_string(),
-    ))
 }
 
 /// Read and postcard-decode a state row, keeping a missing row distinct from a malformed one.
@@ -554,293 +517,9 @@ pub async fn put_job_entry<T: Serialize>(
     ))
 }
 
-async fn mutate_in_txn<F>(
-    context: &DriverContext,
-    txn_id: TxnId,
-    job_id: JobId,
-    mutate: &mut F,
-    guard: Option<JobGuard<'_>>,
-) -> Result<JobRecord, JobMutationError>
-where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
-{
-    let Some(mut record) = read_job_record(context, job_id, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?
-    else {
-        return Err(JobMutationError::NotFound);
-    };
-    let old = record.clone();
-    match mutate(&mut record)? {
-        JobMutation::Skip => Ok(old),
-        JobMutation::Persist => {
-            if let Some(guard) = guard {
-                let control = match record.attempt_intent.as_ref() {
-                    Some(intent) => {
-                        read_attempt_control(context, job_id, intent.attempt_epoch, Some(txn_id))
-                            .await?
-                    }
-                    None => None,
-                };
-                guard(&record, control.as_ref())?;
-            }
-            if old.state != record.state {
-                validate_transition(old.execution_class, old.state, record.state)?;
-            }
-            // A source's pause belongs to a running attempt; every other state stores none.
-            if record.state != JobState::Running {
-                record.progress.paused_until = None;
-            }
-            if !old.is_settled()
-                && record.is_settled()
-                && (record.payload.is_rocrate()
-                    || matches!(&record.payload, JobPayload::Execution(spec) if session_of(spec).is_some()))
-            {
-                let digest = report_digest(context, txn_id, record.job_id).await?;
-                record.report_digest = Some(digest);
-                match record.result.as_mut() {
-                    Some(JobResultPayload::ImportRoCrate(result)) => {
-                        result.report_digest = digest;
-                    }
-                    Some(JobResultPayload::ExportRoCrate(result)) => {
-                        result.report_digest = digest;
-                        if let Some(artifact) = result.artifact.as_mut() {
-                            artifact.expires_at_ms = record
-                                .finished_at_ms
-                                .unwrap_or(record.updated_at_ms)
-                                .saturating_add(record.retention_ms);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let settled = !old.is_settled() && record.is_settled();
-            let mut terminal_deletes = Vec::new();
-            if settled && let Some(spec) = record.payload.purge_spec() {
-                let bucket = crate::s3::purge_fence::fence_key(spec.scope.bucket());
-                let fence = read_raw(context, PURGE_FENCE_KEYSPACE, bucket, Some(txn_id))
-                    .await
-                    .map_err(JobMutationError::Storage)?;
-                let owned = crate::s3::fence_store::owned_fence_delete(
-                    fence.as_deref(),
-                    record.job_id,
-                    &spec.scope,
-                );
-                if let Some(delete) =
-                    owned.map_err(|error| JobMutationError::Storage(error.to_string()))?
-                {
-                    terminal_deletes.push(delete);
-                }
-                terminal_deletes.push((
-                    PURGE_CHECKPOINT_KEYSPACE.to_string(),
-                    ByteView::from(record.job_id.to_bytes().to_vec()),
-                ));
-            }
-            let (writes, mut deletes) = index_deltas(&old, &record)
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-            deletes.extend(terminal_deletes);
-            batch_write(context, writes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            batch_delete(context, deletes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            if settled {
-                insert_crate_obligation(context, txn_id, &record).await?;
-                insert_cleanup_obligation(context, txn_id, &record).await?;
-                mark_crate_failed(context, txn_id, &record).await?;
-            }
-            cleanup_dedup_entry(context, txn_id, &old, &record).await?;
-            Ok(record)
-        }
-    }
-}
-
-async fn report_digest(
-    context: &DriverContext,
-    txn_id: TxnId,
-    job_id: JobId,
-) -> Result<[u8; 32], JobMutationError> {
-    let prefix = job_entry_prefix(job_id);
-    let mut start_after = None;
-    let mut hasher = blake3::Hasher::new();
-    loop {
-        let (values, next) = iter_prefix_page(
-            &context.storage_handle,
-            JOB_ENTRY_KEYSPACE,
-            Some(prefix.clone()),
-            start_after,
-            512,
-            Some(txn_id),
-        )
-        .await
-        .map_err(JobMutationError::Storage)?;
-        for (_, value) in values {
-            hash_report_value(&mut hasher, value.as_ref());
-        }
-        let Some(next) = next else {
-            return Ok(*hasher.finalize().as_bytes());
-        };
-        start_after = Some(next);
-    }
-}
-
 fn hash_report_value(hasher: &mut blake3::Hasher, value: &[u8]) {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
-}
-
-async fn insert_cleanup_obligation(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: &JobRecord,
-) -> Result<(), JobMutationError> {
-    if !matches!(&record.payload, JobPayload::Execution(_)) {
-        return Ok(());
-    }
-    let access_key = UserAccess::build_access_key(&workspace_credential_id(record.job_id))
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-    let mut child = JobRecord::new(
-        cleanup_job_id(record.job_id),
-        JobPayload::TerminalCleanup {
-            for_job: record.job_id,
-            attempt: record.attempt_intent.clone(),
-            access_key,
-        },
-        record.created_by,
-        record.owner_node_id,
-        now_ms,
-        now_ms,
-        Some(cleanup_dedup_key(record.job_id)),
-    );
-    child.retention_ms = record.retention_ms;
-    let writes =
-        job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    batch_write(context, writes, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)
-}
-
-async fn insert_crate_obligation(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: &JobRecord,
-) -> Result<(), JobMutationError> {
-    let JobPayload::Execution(spec) = &record.payload else {
-        return Ok(());
-    };
-    // A stopped notebook session keeps its report; it is no run to describe.
-    if session_of(spec).is_some() {
-        return Ok(());
-    }
-    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
-    let mut child = JobRecord::new(
-        crate_job_id(record.job_id),
-        JobPayload::WriteRunCrate {
-            for_job: record.job_id,
-        },
-        record.created_by,
-        record.owner_node_id,
-        now_ms,
-        now_ms,
-        Some(crate_dedup_key(record.job_id)),
-    );
-    child.retention_ms = record.retention_ms;
-    let mut writes =
-        job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    writes.push((
-        RUN_CRATE_KEYSPACE.to_string(),
-        run_crate_key(record.job_id),
-        ByteView::from(
-            RunCrateStatus::Pending
-                .to_bytes()
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-        ),
-    ));
-    batch_write(context, writes, Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)
-}
-
-async fn mark_crate_failed(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: &JobRecord,
-) -> Result<(), JobMutationError> {
-    let JobPayload::WriteRunCrate { for_job } = &record.payload else {
-        return Ok(());
-    };
-    if !matches!(record.state, JobState::Failed | JobState::Cancelled) {
-        return Ok(());
-    }
-    let key = run_crate_key(*for_job);
-    if let Some(value) = read_raw(context, RUN_CRATE_KEYSPACE, key.clone(), Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?
-        && !matches!(
-            RunCrateStatus::from_bytes(value.as_ref())
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-            RunCrateStatus::Pending | RunCrateStatus::Minted { .. }
-        )
-    {
-        return Ok(());
-    }
-    let status = RunCrateStatus::Failed {
-        message: record
-            .last_error
-            .as_ref()
-            .map(|error| error.message.clone())
-            .unwrap_or_else(|| match record.state {
-                JobState::Cancelled => "run-crate obligation cancelled".to_string(),
-                _ => "run-crate retries exhausted".to_string(),
-            }),
-    };
-    batch_write(
-        context,
-        vec![(
-            RUN_CRATE_KEYSPACE.to_string(),
-            key,
-            ByteView::from(
-                status
-                    .to_bytes()
-                    .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-            ),
-        )],
-        Some(txn_id),
-    )
-    .await
-    .map_err(JobMutationError::Storage)
-}
-
-/// Remove a non-RO-Crate dedup row only when it still references THIS job.
-/// RO-Crate dedup rows persist until their jobs are pruned.
-async fn cleanup_dedup_entry(
-    context: &DriverContext,
-    txn_id: TxnId,
-    old: &JobRecord,
-    new: &JobRecord,
-) -> Result<(), JobMutationError> {
-    let Some(dedup_key) = &old.dedup_key else {
-        return Ok(());
-    };
-    if old.payload.dedup_until_prune() || old.is_settled() || !new.is_settled() {
-        return Ok(());
-    }
-    let key = dedup_index_key(old.created_by, dedup_key);
-    let current = read_raw(context, DEDUP_INDEX_KEYSPACE, key.clone(), Some(txn_id))
-        .await
-        .map_err(JobMutationError::Storage)?;
-    let still_ours = current
-        .as_deref()
-        .and_then(|bytes| parse_dedup_value(bytes).ok())
-        .is_some_and(|(job_id, _)| job_id == old.job_id);
-    if still_ours {
-        delete_raw(context, DEDUP_INDEX_KEYSPACE, key, Some(txn_id))
-            .await
-            .map_err(JobMutationError::Storage)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
