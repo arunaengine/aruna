@@ -17,9 +17,8 @@ use aruna_core::structs::storage::usage::{
 };
 use aruna_core::NodeId;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::realm_usage::RealmUsageOperation;
+use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::node::usage_publish::publish_usage_snapshots;
-use aruna_operations::s3::usage::{RealmUsage, RealmUsageScope};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,

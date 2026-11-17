@@ -7,45 +7,27 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
-};
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BucketInfo};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
-    BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
-    SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
-    USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, dirty_share_id, dirty_share_key, global_group_key,
-    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
-    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
-    usage_node_id, usage_snapshot_key, usage_summary_key,
+    BucketDelta, DIRTY_GLOBAL_KEY, NodeUsageSnapshot, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY,
+    USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta, dirty_group_key,
+    dirty_share_key, global_group_key, global_shard_key, global_shard_keys, shard_for_archive,
+    shard_for_hash, usage_backend_key, usage_bucket_key, usage_group_key, usage_group_prefix,
+    usage_node_id,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
 use byteview::ByteView;
-use futures_util::TryStreamExt;
 use smallvec::smallvec;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::pin::pin;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
-use crate::distribution::usage::replica_shares;
-use crate::driver::{DriverContext, drive};
-use crate::storage_read::scan_pages;
-use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
-
-pub use crate::node::usage_rebuild::{
-    RebuildStatsError, RebuildStatsOperation, RebuildStatsState,
-};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
@@ -874,70 +856,6 @@ pub fn schedule_snapshot_publish() -> Effect {
     })
 }
 
-/// Groups/global scope touched by a publish run, so callers can refresh exactly
-/// the affected realm summary cache entries.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PublishedUsage {
-    pub global: bool,
-    pub groups: Vec<GroupId>,
-}
-
-impl PublishedUsage {
-    pub fn is_empty(&self) -> bool {
-        !self.global && self.groups.is_empty()
-    }
-
-    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentTarget> {
-        let mut targets = Vec::with_capacity(self.groups.len() + usize::from(self.global));
-        if self.global {
-            targets.push(DocumentTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: None,
-            });
-        }
-        for group_id in &self.groups {
-            targets.push(DocumentTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: Some(*group_id),
-            });
-        }
-        targets
-    }
-}
-
-/// Which realm-wide counter a caller wants to read from the summed cache.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RealmUsageScope {
-    Global,
-    Group(GroupId),
-}
-
-/// A realm-wide usage total.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RealmUsage {
-    /// Objects and data counted once, a distributed range at its coordinator; `stored_*` and
-    /// `buckets` over every node.
-    pub counters: UsageCounters,
-    /// The copies of distributed ranges left out of `counters`.
-    pub replicas: UsageCounters,
-}
-
-impl RealmUsage {
-    pub(crate) fn of(
-        local: UsageCounters,
-        (remote, replicas): (UsageCounters, UsageCounters),
-    ) -> Result<Self, String> {
-        let mut total = local;
-        total.add(&remote).map_err(|e| e.to_string())?;
-        Ok(Self {
-            counters: total.without_replicas(&replicas),
-            replicas,
-        })
-    }
-}
-
 /// Rows marking `groups` and the global for the next publish, for a caller's transaction.
 pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(String, Key, Value)> {
     let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
@@ -960,7 +878,10 @@ pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(Stri
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use crate::node::realm_usage::{RealmUsageError, RealmUsageOperation};
+    use crate::node::realm_usage::{
+        RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
+    };
+    use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::node::usage_publish::{
         clear_consumed_markers, publish_refresh_snapshots, publish_usage_snapshots,
         refresh_usage_targets,
@@ -985,7 +906,10 @@ mod tests {
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
-    use aruna_core::structs::storage::usage::global_shard_keys;
+    use aruna_core::structs::storage::usage::{
+        SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
+        usage_summary_key,
+    };
     use aruna_core::structs::storage::usage::usage_hash_key;
     use aruna_core::structs::storage::usage::{BucketCounters, global_shard_index};
     use std::time::SystemTime;

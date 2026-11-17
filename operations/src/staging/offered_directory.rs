@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
 
         crate::driver::drive(
-            crate::s3::usage::RebuildStatsOperation::new(),
+            crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
 
         crate::driver::drive(
-            crate::s3::usage::RebuildStatsOperation::new(),
+            crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await

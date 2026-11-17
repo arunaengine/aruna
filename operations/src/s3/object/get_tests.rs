@@ -2222,7 +2222,7 @@ async fn offered_drift_replaces() {
     let counters = usage().await;
     assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
     drive(
-        crate::s3::usage::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await

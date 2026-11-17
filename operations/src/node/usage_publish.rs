@@ -30,9 +30,42 @@ use tracing::warn;
 use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::node::realm_usage::RealmUsageOperation;
-use crate::s3::usage::{PublishedUsage, dirty_rows, schedule_snapshot_publish};
+use crate::s3::usage::{dirty_rows, schedule_snapshot_publish};
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+
+/// Groups/global scope touched by a publish run, so callers can refresh exactly
+/// the affected realm summary cache entries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PublishedUsage {
+    pub global: bool,
+    pub groups: Vec<GroupId>,
+}
+
+impl PublishedUsage {
+    pub fn is_empty(&self) -> bool {
+        !self.global && self.groups.is_empty()
+    }
+
+    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentTarget> {
+        let mut targets = Vec::with_capacity(self.groups.len() + usize::from(self.global));
+        if self.global {
+            targets.push(DocumentTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: None,
+            });
+        }
+        for group_id in &self.groups {
+            targets.push(DocumentTarget::NodeUsage {
+                realm_id,
+                node_id,
+                group_id: Some(*group_id),
+            });
+        }
+        targets
+    }
+}
 
 pub(crate) async fn read_local_global(
     storage: &StorageHandle,

@@ -32,8 +32,8 @@ use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::read_info::ReadInfoOperation;
-use aruna_operations::node::realm_usage::RealmUsageOperation;
-use aruna_operations::s3::usage::{LoadCountersOperation, RealmUsage, RealmUsageScope};
+use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
+use aruna_operations::s3::usage::LoadCountersOperation;
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };

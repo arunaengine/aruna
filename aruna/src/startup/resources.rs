@@ -19,7 +19,7 @@ use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::startup::RecoveryStatus;
 use aruna_operations::node::usage_publish::publish_refresh_snapshots;
-use aruna_operations::s3::usage::RebuildStatsOperation;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
@@ -821,7 +821,7 @@ mod tests {
 
     async fn rebuild(driver_ctx: &DriverContext) {
         use aruna_operations::driver::drive;
-        use aruna_operations::s3::usage::RebuildStatsOperation;
+        use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
             .expect("usage rebuild finishes");

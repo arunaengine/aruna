@@ -21,10 +21,39 @@ use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::s3::usage::{RealmUsage, RealmUsageScope};
-
 /// Snapshot rows one page reads.
 const PAGE_LIMIT: usize = 1_000;
+
+/// Which realm-wide counter a caller wants to read from the summed cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RealmUsageScope {
+    Global,
+    Group(GroupId),
+}
+
+/// A realm-wide usage total.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RealmUsage {
+    /// Objects and data counted once, a distributed range at its coordinator; `stored_*` and
+    /// `buckets` over every node.
+    pub counters: UsageCounters,
+    /// The copies of distributed ranges left out of `counters`.
+    pub replicas: UsageCounters,
+}
+
+impl RealmUsage {
+    pub(crate) fn of(
+        local: UsageCounters,
+        (remote, replicas): (UsageCounters, UsageCounters),
+    ) -> Result<Self, UsageCounterError> {
+        let mut total = local;
+        total.add(&remote)?;
+        Ok(Self {
+            counters: total.without_replicas(&replicas),
+            replicas,
+        })
+    }
+}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RealmUsageError {
@@ -430,8 +459,9 @@ mod state_machine_tests {
     use aruna_core::types::{GroupId, Key, Value};
     use ulid::Ulid;
 
-    use super::{RealmUsageError, RealmUsageOperation, UsageCompleteOperation};
-    use crate::s3::usage::{RealmUsage, RealmUsageScope};
+    use super::{
+        RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope, UsageCompleteOperation,
+    };
 
     const REALM: RealmId = RealmId([7; 32]);
     const GROUP: GroupId = Ulid::from_parts(4, 4);

@@ -705,7 +705,7 @@ mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::drive;
-    use crate::s3::usage::RebuildStatsOperation;
+    use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};

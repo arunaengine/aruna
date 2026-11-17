@@ -1598,7 +1598,7 @@ async fn delete_then_recount(
         .unwrap();
     let counters = read_counters(context, usage_group_key(offer.group_id)).await;
     drive(
-        crate::s3::usage::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -1715,7 +1715,7 @@ fn marker_needs_head() {
 /// exact and the group row their sum, and a rebuild finds the same rows.
 #[tokio::test]
 async fn bucket_rows_sum() {
-    use crate::s3::usage::RebuildStatsOperation;
+    use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;

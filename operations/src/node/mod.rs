@@ -12,4 +12,4 @@ pub mod realm_usage;
 mod rebuild_counts;
 pub mod startup;
 pub mod usage_publish;
-mod usage_rebuild;
+pub mod usage_rebuild;
