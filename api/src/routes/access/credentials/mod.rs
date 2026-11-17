@@ -925,7 +925,7 @@ pub(crate) async fn authorize_credential_issuance(
         // A member whose roles reach only part of the group data may still take
         // a credential: authorization uses the derived roots, while probing the
         // bare directory would ask a `/**` grant to match the directory itself.
-        let roots = aruna_operations::auth::permission_rules::reachable_roots(
+        let roots = aruna_operations::auth::request_authorization::reachable_roots(
             &state.get_ctx(),
             &effective_auth,
             &group_root,
