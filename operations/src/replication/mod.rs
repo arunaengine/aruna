@@ -19,4 +19,5 @@ pub mod plaintext;
 pub mod protocol;
 pub mod queue;
 mod retire;
+mod source_rules;
 pub(crate) mod version_replication;

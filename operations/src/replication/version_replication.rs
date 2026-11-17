@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::permission_rules::{
-    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
-};
+use crate::auth::permission_rules::PermissionRules;
 use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
 use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
@@ -12,7 +10,6 @@ use crate::blob::managed_copy::{
 use crate::blob::records::blob_location_read;
 use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::groups::storage_routing::load_group_inputs;
 use crate::placement::policy::{
@@ -27,7 +24,7 @@ use crate::staging::root_record::{hydrated, named_root, parse_root, read_root};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
-use aruna_core::errors::{AuthorizationError, BlobError, ConversionError, StorageError};
+use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
@@ -91,11 +88,11 @@ pub(crate) enum SourceAuthorizationError {
 }
 
 pub(crate) struct SourceAuthorization {
-    group_id: GroupId,
-    source_node_id: NodeId,
-    auth_context: AuthContext,
-    permissions: PermissionRules,
-    policies: PolicyEvaluator,
+    pub(super) group_id: GroupId,
+    pub(super) source_node_id: NodeId,
+    pub(super) auth_context: AuthContext,
+    pub(super) permissions: PermissionRules,
+    pub(super) policies: PolicyEvaluator,
 }
 
 // Compiled rules and evaluators are derived state; identity fields decide equality.
@@ -119,33 +116,6 @@ impl std::fmt::Debug for SourceAuthorization {
 }
 
 impl SourceAuthorization {
-    pub(crate) async fn load(
-        context: &DriverContext,
-        auth_context: AuthContext,
-        group_id: GroupId,
-        source_node_id: NodeId,
-    ) -> Result<Self, SourceAuthorizationError> {
-        let permissions = drive(
-            PermissionRulesOperation::new(PermissionRulesConfig {
-                auth_context: auth_context.clone(),
-                path: format!("/{}/g/{group_id}", auth_context.realm_id),
-            }),
-            context,
-        )
-        .await
-        .map_err(permission_error)?;
-        let policies = PolicyEvaluator::load(context, auth_context.realm_id, Some(group_id))
-            .await
-            .map_err(|error| SourceAuthorizationError::Unavailable(error.to_string()))?;
-        Ok(Self {
-            group_id,
-            source_node_id,
-            auth_context,
-            permissions,
-            policies,
-        })
-    }
-
     pub(crate) fn group_id(&self) -> GroupId {
         self.group_id
     }
@@ -170,16 +140,6 @@ impl SourceAuthorization {
         self.policies
             .evaluate(&request)
             .map_err(|_| SourceAuthorizationError::Denied)
-    }
-}
-
-fn permission_error(error: AuthorizationError) -> SourceAuthorizationError {
-    match error {
-        AuthorizationError::DocNotFound
-        | AuthorizationError::GroupNotFound
-        | AuthorizationError::InvalidGroupId
-        | AuthorizationError::InvalidRealmId => SourceAuthorizationError::Denied,
-        other => SourceAuthorizationError::Unavailable(other.to_string()),
     }
 }
 
