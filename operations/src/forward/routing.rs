@@ -48,10 +48,8 @@ pub fn write_route(
     MetadataWriteRoute::Forward(resolve_shard_holders(config, placement))
 }
 
-/// Whether the local node is a device. Devices cache the realm's documents, so
-/// their local checks are real, but they hold no metadata bucket: an effectful
-/// write goes to an ingress, which stays the authority for what it applies.
-/// `None` when the config does not list the local node.
+/// Whether the local node is a device; `None` when the config does not list it. Devices hold no
+/// metadata bucket, so an effectful write goes to an ingress, which stays its authority.
 pub fn is_user_origin(config: &RealmConfigDocument, local_node_id: NodeId) -> Option<bool> {
     let local = local_node_id.to_string();
     let node = config.nodes.iter().find(|node| node.node_id == local)?;

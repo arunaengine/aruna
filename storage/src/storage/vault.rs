@@ -268,7 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_open_needs_keys() {
+    async fn realm_needs_keys() {
         // A handle that was never given the realm keys answers NoKey and opens nothing.
         use aruna_core::realm_vault::{
             RealmSealed, RealmVaultEntry, RealmVaultError, RealmVaultPurpose, RealmVaultRecord,

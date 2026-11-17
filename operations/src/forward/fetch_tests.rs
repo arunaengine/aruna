@@ -58,7 +58,7 @@ fn reply(peer: NodeId, seconds: u64, result: Result<Vec<u8>, PeerRequestError>) 
 }
 
 #[test]
-fn asks_holders_in_order() {
+fn asks_in_order() {
     // A miss and a useless answer move on with the time left; the first record wins.
     let mut operation = fetch(Budget::Shared);
     check_trace(
@@ -86,7 +86,7 @@ fn asks_holders_in_order() {
 }
 
 #[test]
-fn misses_are_not_found() {
+fn misses_not_found() {
     // Only a fetch where nobody answered is unavailable; answered misses are a miss.
     let mut operation = fetch(Budget::Shared);
     operation.start();

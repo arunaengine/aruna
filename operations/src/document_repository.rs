@@ -1,6 +1,7 @@
 //! Maps a document target to its storage key, builds the read, write and delete effects, and
 //! reads the realm config and group documents that authorization and every domain build on.
 // Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
