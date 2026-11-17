@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::lookup::RELAY_SET_HEADER;
+use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate,
@@ -256,7 +256,7 @@ async fn reference_import_counted() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    aruna_operations::jobs::store::insert_job(&ctx.storage_handle, &record)
+    aruna_operations::jobs::store::query::insert_job(&ctx.storage_handle, &record)
         .await
         .unwrap();
     let checkpoint = StagingJobCheckpoint {

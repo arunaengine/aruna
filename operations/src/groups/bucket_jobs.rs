@@ -6,7 +6,7 @@ use crate::blob::purge::is_paused;
 use crate::driver::DriverContext;
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::last_run;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -354,7 +354,7 @@ mod tests {
         // A job row that cannot be read, such as one of an older layout, hides only that job.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let write = StorageEffect::Write {
             key_space: COMPRESSION_MIGRATION_KEYSPACE.to_string(),
             key: b"b".to_vec().into(),

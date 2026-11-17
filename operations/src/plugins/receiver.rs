@@ -17,7 +17,7 @@ use crate::placement::{
 use crate::realm::mutate_placement::node_kind;
 
 /// The first eligible holder of the group's root metadata bucket, in holder order.
-pub fn pick_receiver(
+pub(crate) fn pick_receiver(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     group_id: GroupId,

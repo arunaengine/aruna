@@ -2223,7 +2223,8 @@ mod test {
 
     /// A user node with a fresh store; the routes below refuse before they read it.
     async fn extractor_state() -> (tempfile::TempDir, std::sync::Arc<ServerState>) {
-        use crate::tests::routes::{test_context, test_state, test_storage};
+        use crate::tests::routes::{test_state, test_storage};
+        use aruna_operations::testing::test_context;
         let (dir, storage) = test_storage();
         let realm_key = ed25519_dalek::SigningKey::from_bytes(&[5; 32]);
         let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());

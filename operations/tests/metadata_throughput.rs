@@ -15,9 +15,9 @@ use ulid::Ulid;
 
 use crate::convergence::{wait_empty_queues, wait_for_visibility, wait_storage_released};
 use crate::topology::{
-    BoxError, build_realm_nodes, init_logging, install_default_config, make_runtime, mesh,
-    mixed_payload, node_targets, respawn_with_retry, run_writer, run_writers, shutdown_nodes,
-    spawn_load_node, spawn_node_with, wait_node_convergence,
+    BoxError, WriterSettings, build_realm_nodes, init_logging, install_default_config,
+    make_runtime, mesh, mixed_payload, node_targets, respawn_with_retry, run_writer, run_writers,
+    shutdown_nodes, spawn_load_node, spawn_node_with, wait_node_convergence,
 };
 
 const TOTAL_CREATES: usize = 2000;
@@ -37,14 +37,16 @@ fn writer_levels_complete() -> Result<(), BoxError> {
             let group_id = Ulid::generate();
             let label = format!("tp{writers}");
             let created = run_writers(
-                realm_id,
-                group_id,
-                &label,
+                &WriterSettings {
+                    realm_id,
+                    group_id,
+                    label: label.to_string(),
+                    period: None,
+                    payload: mixed_payload,
+                },
                 writers,
                 per_writer,
                 &targets,
-                None,
-                mixed_payload,
             )
             .await;
             shutdown_nodes(nodes).await;
@@ -72,14 +74,16 @@ fn convergence_gate() -> Result<(), BoxError> {
         let group_id = Ulid::generate();
 
         let mut created = run_writers(
-            realm_id,
-            group_id,
-            "conv",
+            &WriterSettings {
+                realm_id,
+                group_id,
+                label: "conv".to_string(),
+                period: None,
+                payload: mixed_payload,
+            },
             64,
             16,
             &targets,
-            None,
-            mixed_payload,
         )
         .await?;
         println!(
@@ -117,14 +121,16 @@ fn production_convergence_gate() -> Result<(), BoxError> {
         let group_id = Ulid::generate();
 
         let created = run_writers(
-            realm_id,
-            group_id,
-            "prod",
+            &WriterSettings {
+                realm_id,
+                group_id,
+                label: "prod".to_string(),
+                period: None,
+                payload: mixed_payload,
+            },
             32,
             128,
             &targets,
-            None,
-            mixed_payload,
         )
         .await?;
         println!(
@@ -203,14 +209,16 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     let group_id = Ulid::generate();
     let targets0 = vec![(nodes[0].net.node_id(), nodes[0].context.clone())];
     let initial = run_writer(
-        realm_id,
-        group_id,
-        "seed",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "seed".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         0,
         1,
         targets0.clone(),
-        None,
-        mixed_payload,
     )
     .await?;
     let initial_pair = vec![(initial[0].0, initial[0].1)];
@@ -237,14 +245,16 @@ async fn churn_convergence_body() -> Result<(), BoxError> {
     println!("node 2 shut down");
 
     let created = run_writer(
-        realm_id,
-        group_id,
-        "churn",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "churn".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         0,
         200,
         targets0,
-        None,
-        mixed_payload,
     )
     .await?;
     let pairs: Vec<(GroupId, Ulid)> = created.iter().map(|(g, d, _)| (*g, *d)).collect();

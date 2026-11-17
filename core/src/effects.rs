@@ -54,6 +54,7 @@ pub enum Effect {
     Stream(),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
+    Session(Box<crate::compute::session::SessionEffect>),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -752,6 +753,8 @@ pub enum NetEffect {
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.
+    ArtifactStore(Box<crate::plugins::ArtifactStore>),
     /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
     Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
 }

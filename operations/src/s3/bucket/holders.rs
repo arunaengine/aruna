@@ -98,7 +98,8 @@ async fn read_document(context: &DriverContext, key: Vec<u8>) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
     use aruna_core::structs::identity::auth::Actor;
 
     #[tokio::test]

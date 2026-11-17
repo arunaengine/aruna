@@ -320,7 +320,7 @@ async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<
         aruna_operations::placement::policy::SubjectScanMode::Revalidate(
             aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
         ),
-        aruna_operations::driver::now_ms(),
+        aruna_core::time::unix_timestamp_millis(),
     )
     .await
     .map(|_| ())

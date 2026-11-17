@@ -1740,7 +1740,7 @@ pub async fn process_migrations(
     after: Option<Key>,
 ) -> Result<MigrationRun, String> {
     let resumed = after.is_some();
-    let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+    let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         COMPRESSION_QUEUE_KEYSPACE,
         None,
@@ -1903,7 +1903,7 @@ async fn migrate_page(
     let write = aruna_core::structs::identity::auth::Permission::WRITE;
     let mut denied = 0usize;
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::jobs::store::iter_prefix_page(
+    let (versions, next) = crate::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
@@ -2229,7 +2229,7 @@ async fn hand_over_moves(
             store_handover(context, bucket, None).await?;
             return Ok(true);
         };
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::jobs::store::query::iter_prefix_page(
             &context.storage_handle,
             IMPORT_INTENT_KEYSPACE,
             Some(aruna_core::structs::storage::backend_import::object_prefix(
@@ -2467,7 +2467,7 @@ async fn stored_copy(
     };
     let mut after = None;
     loop {
-        let (rows, next) = crate::jobs::store::iter_prefix_page(
+        let (rows, next) = crate::jobs::store::query::iter_prefix_page(
             &context.storage_handle,
             BLOB_LOCATIONS_KEYSPACE,
             Some(hash.to_vec().into()),
@@ -3105,7 +3105,7 @@ mod tests {
         use aruna_core::structs::storage::blob::object_permission_path;
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let (realm, group) = (RealmId::from_bytes([1; 32]), Ulid::from_parts(1, 1));
         let node = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let secret = object_permission_path(realm, group, node, "b", "secret/**");
@@ -3158,7 +3158,7 @@ mod tests {
         // rows left go on at once while a failure pass waits for its retry.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let record = CompressionMigration::new(ZSTD, 1);
         let put = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
             key_space: key_space.to_string(),
@@ -3212,7 +3212,7 @@ mod tests {
         // the next run goes on at once after it.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let record = CompressionMigration::new(ZSTD, 1);
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
@@ -3248,7 +3248,7 @@ mod tests {
         // passes over them, and a row of another pass or cursor is not trusted.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
         let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
@@ -3292,7 +3292,7 @@ mod tests {
         // they were, so the run that repeats it counts each row once.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |index: u64| VersionKey::new("b", format!("k{index}"), Ulid::from_parts(1, 1));
         let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
@@ -3345,7 +3345,7 @@ mod tests {
         // key it finished after it now open the next run and still count once.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let deleted = BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default());
         let row = |at: u64| VersionKey::new("b", "k1", Ulid::from_parts(at, 1));
         let write = |key_space: &str, key: Vec<u8>, value: Vec<u8>| StorageEffect::Write {
@@ -3388,7 +3388,7 @@ mod tests {
         // An aborted rename ends its move with its counts and keeps the request as the abort.
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let mut record = CompressionMigration::new(Compression::Off, 7);
         (record.moving, record.migrated) = (true, 3);
         let info = BucketInfo {
@@ -3484,7 +3484,7 @@ mod tests {
         use aruna_core::structs::storage::backend_import::{BackendImport, DEFAULT_PATTERN};
         let temp = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
-        let context = crate::tests::s3::test_context(storage.clone());
+        let context = crate::testing::test_context(storage.clone());
         let group = Ulid::from_parts(1, 1);
         let rule = BackendImport {
             import_id: Ulid::from_parts(2, 2),

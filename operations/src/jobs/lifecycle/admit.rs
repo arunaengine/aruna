@@ -18,17 +18,21 @@ use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
-use super::LifecycleError;
 use super::ids::workspace_of;
-use crate::jobs::records::keys::{alias_key, family_prefix, record_key, submission_prefix};
-use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
+use super::{LifecycleError, stored_view};
 use crate::jobs::records::verify::{Evidence, FamilyView};
 use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, family_prefix, record_key, submission_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// The alias this node would mint, with the records it already signed for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,15 +136,6 @@ impl AdmitSubmissionOperation {
             key: config.storage_key(),
             txn_id: None,
         })]
-    }
-
-    fn keep_view(&mut self, value: Option<Value>) -> Result<(), LifecycleError> {
-        let Some(value) = value else {
-            return Err(LifecycleError::RealmConfigMissing);
-        };
-        let config = RealmConfigDocument::from_bytes(&value)?;
-        self.view = FamilyView::resolve(&config, self.config.realm_id, self.family());
-        Ok(())
     }
 
     /// Claims of every request family under this submission, so a replay and an
@@ -351,13 +346,8 @@ impl AdmitSubmissionOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(LifecycleError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(LifecycleError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -389,8 +379,9 @@ impl Operation for AdmitSubmissionOperation {
         match self.state {
             AdmitState::ReadConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Err(error) = self.keep_view(value) {
-                        return self.fail(error);
+                    match stored_view(value, self.config.realm_id, self.family()) {
+                        Ok(view) => self.view = view,
+                        Err(error) => return self.fail(error),
                     }
                     if self.view.is_none() {
                         return self.fail(LifecycleError::NotHolder);
@@ -401,12 +392,12 @@ impl Operation for AdmitSubmissionOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", format!("{other:?}")),
+                other => self.unexpected("realm config read", other.label()),
             },
             AdmitState::Begin => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.scan(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
+                other => self.unexpected("transaction start", other.label()),
             },
             AdmitState::Scan { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -426,7 +417,7 @@ impl Operation for AdmitSubmissionOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("submission scan", format!("{other:?}")),
+                other => self.unexpected("submission scan", other.label()),
             },
             AdmitState::ReadQuota { txn_id } => {
                 match crate::groups::fence::parse_group_record(event) {
@@ -445,7 +436,7 @@ impl Operation for AdmitSubmissionOperation {
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", format!("{other:?}")),
+                other => self.unexpected("projection cache read", other.label()),
             },
             AdmitState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -453,20 +444,20 @@ impl Operation for AdmitSubmissionOperation {
                     self.commit(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("admission write", format!("{other:?}")),
+                other => self.unexpected("admission write", other.label()),
             },
             AdmitState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
+                other => self.unexpected("transaction commit", other.label()),
             },
             AdmitState::Cancel { .. } => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", format!("{other:?}")),
+                other => self.unexpected("transaction abort", other.label()),
             },
             AdmitState::Init | AdmitState::Finish | AdmitState::Error => {
-                self.unexpected("no event", format!("{event:?}"))
+                self.unexpected("no event", event.label())
             }
         }
     }

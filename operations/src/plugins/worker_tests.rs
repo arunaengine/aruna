@@ -7,19 +7,23 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::driver::drive;
+use crate::plugins::broker::call_intent;
 use crate::plugins::copies::store_local;
 use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::intents::mark_unknown;
+use crate::plugins::intents::unknown_row;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
-use crate::plugins::runs::admit;
+use crate::plugins::rows::write_rows;
 use crate::plugins::runs::tests::queued;
+use crate::plugins::runs::{admit, ended};
 use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;
+use aruna_plugins::InvokeError;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
+use std::time::Duration;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 
@@ -164,7 +168,7 @@ async fn admitted(
         run.handler = "dataset_created".into();
     }
     run.due_ms = 0;
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     run
 }
 
@@ -195,13 +199,14 @@ async fn finishes_runs() {
     let ok = admitted(&fixture, &install, 1, "echo").await;
     let unsure = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    mark_unknown(&fixture.ctx, unsure.run_id, &intent, "timed out")
+    let unknown = unknown_row(unsure.run_id, &call_intent(&intent), "timed out").unwrap();
+    drive(write_rows(vec![unknown]), &fixture.ctx)
         .await
         .unwrap();
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 2);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, ok.run_id)
+    let done = drive(read_run(install.install_id, ok.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
@@ -211,11 +216,11 @@ async fn finishes_runs() {
             .starts_with(&format!("\"{}", ok.run_id))
     );
     assert_eq!(done.attempts, 1);
-    let open = read_run(&fixture.ctx, install.install_id, unsure.run_id)
+    let open = drive(read_run(install.install_id, unsure.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!(open.state, RunState::NeedsAttention);
-    assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+    assert!(drive(unfinished(), &fixture.ctx).await.unwrap().is_empty());
 }
 
 /// Grant choices that scope both `read` and `write` to `patterns`.
@@ -266,11 +271,11 @@ async fn event_input() {
     let fields = [given.kind, given.path, given.resource, given.revision];
     assert_eq!(fields, ["dataset_created", event.path.as_str(), "D1", "r1"]);
 
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
@@ -340,9 +345,9 @@ async fn event_rechecked() {
     let (event, base) = created(&install, "D1");
     // An earlier attempt passed the check and was cut short; its grant is removed since.
     let mut run = event_run(&config, &install, &event, 0).unwrap();
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     (run.state, run.attempts) = (RunState::Running, 1);
-    save_run(&fixture.ctx, &run).await.unwrap();
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
     let narrowed = scoped(vec![format!("{base}/D2/**")]);
     let auth = fixture.auth();
     set_grants(
@@ -358,7 +363,7 @@ async fn event_rechecked() {
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!((done.state, done.attempts), (RunState::Cancelled, 2));
@@ -382,7 +387,7 @@ async fn bounded_and_restarted() {
     first.running().clear();
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 1);
     first.stop().await;
-    let cut = read_run(&fixture.ctx, install.install_id, run.run_id)
+    let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!((cut.state, cut.attempts), (RunState::Running, 1));
@@ -391,7 +396,7 @@ async fn bounded_and_restarted() {
     let second = worker(&fixture);
     assert_eq!(second.claim(unix_timestamp_millis()).await.unwrap(), 1);
     second.stop().await;
-    let again = read_run(&fixture.ctx, install.install_id, run.run_id)
+    let again = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!(again.attempts, 2);
@@ -426,7 +431,9 @@ async fn revoked_runs() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let install = installed(&fixture).await;
     let state = async |run: &PluginRun| {
-        let run = read_run(ctx, install.install_id, run.run_id).await.unwrap();
+        let run = drive(read_run(install.install_id, run.run_id), ctx)
+            .await
+            .unwrap();
         (run.state, run.message.unwrap_or_default())
     };
     let worker = worker(&fixture);
@@ -467,7 +474,7 @@ async fn revoked_runs() {
         .unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
     assert_eq!(state(&queued).await.0, RunState::Cancelled);
-    assert!(unfinished(ctx).await.unwrap().is_empty());
+    assert!(drive(unfinished(), ctx).await.unwrap().is_empty());
 }
 
 #[test]
@@ -523,9 +530,8 @@ async fn removed_with_intents() {
     let open = admitted(&fixture, &install, 1, "echo").await;
     let clean = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    mark_unknown(ctx, open.run_id, &intent, "timed out")
-        .await
-        .unwrap();
+    let unknown = unknown_row(open.run_id, &call_intent(&intent), "timed out").unwrap();
+    drive(write_rows(vec![unknown]), ctx).await.unwrap();
     remove_install(ctx, actor, &auth, install.install_id)
         .await
         .unwrap();
@@ -534,7 +540,7 @@ async fn removed_with_intents() {
         .await
         .unwrap();
     let state = async |run: &PluginRun| {
-        read_run(ctx, install.install_id, run.run_id)
+        drive(read_run(install.install_id, run.run_id), ctx)
             .await
             .unwrap()
             .state
@@ -570,7 +576,7 @@ async fn retries_hide_values() {
     const VALUE: &str = "canary-value-7b1e";
     let fixture = Fixture::new().await;
     let mut run = queued(Ulid::from_parts(3, 3), 1);
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     let scope = RunScope {
         realm_id: fixture.actor.realm_id,
         local: fixture.actor.node_id,
@@ -583,8 +589,8 @@ async fn retries_hide_values() {
     // A retryable error that names a value handed to the code keeps the run without it.
     let ended = scrub_ended(&broker, Ended::Retry(format!("upstream said {VALUE}")));
     conclude(&mut run, ended, false, Ok(None), 5);
-    save_run(&fixture.ctx, &run).await.unwrap();
-    let stored = read_run(&fixture.ctx, run.install_id, run.run_id).await;
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
+    let stored = drive(read_run(run.install_id, run.run_id), &fixture.ctx).await;
     let stored = stored.unwrap();
     assert_eq!(stored.state, RunState::Queued);
     assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));

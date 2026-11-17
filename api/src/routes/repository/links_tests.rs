@@ -591,7 +591,7 @@ async fn unmet_link_findings() {
     let link = create(&linked, Some(linked.test.auth.clone()))
         .await
         .unwrap();
-    let mut stored = aruna_operations::jobs::repository::links::read_link(
+    let mut stored = aruna_operations::jobs::repository::link_store::read_link(
         &linked.test.state.get_ctx().storage_handle,
         parse_document_id(&linked.document_id).unwrap(),
         Ulid::from_string(&link.link_id).unwrap(),
@@ -634,7 +634,7 @@ async fn admin_rights_limited() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     let link_id = Ulid::from_string(&link.link_id).unwrap();
     let context = linked.test.state.get_ctx();
-    let mut stored = aruna_operations::jobs::repository::links::read_link(
+    let mut stored = aruna_operations::jobs::repository::link_store::read_link(
         &context.storage_handle,
         document_id,
         link_id,

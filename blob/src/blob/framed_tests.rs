@@ -5,8 +5,8 @@
 use super::{cold_backend, read_back, s3_env, setup_s3_mixed, stream_from_bytes, test_user_id};
 use crate::blob::BlobHandler;
 use crate::codec::PART_MIN;
-use crate::hash::Hasher;
 use aruna_core::events::BlobEvent;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};

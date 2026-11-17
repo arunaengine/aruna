@@ -8,24 +8,20 @@ use std::sync::Arc;
 
 use aruna_core::UserId;
 use aruna_core::errors::StorageError;
-use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
+use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
-use aruna_operations::plugins::bound::vault_kind;
-use aruna_operations::plugins::check::covers;
-use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants, writes};
+use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
-    InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
-    read_manifest,
+    InstallError, InstallRequest, Summary, install_plugin, installed_summary, pick_version,
+    prepare_install, prepared_summary, read_config, read_manifest,
 };
 use aruna_operations::plugins::lifecycle::remove_install;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
 use aruna_operations::users::service_account::group_admin_path;
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Grant;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -133,6 +129,46 @@ pub struct SecretLine {
     pub secret: String,
     /// The code may read the secret's value: the manifest lists it under `[secrets]`.
     pub value: bool,
+}
+
+impl From<Summary> for InstallSummary {
+    fn from(summary: Summary) -> Self {
+        Self {
+            id: summary.id,
+            plugin: summary.plugin,
+            title: summary.title,
+            version: summary.version,
+            digest: summary.digest,
+            group: summary.group,
+            permissions: (summary.permissions.into_iter())
+                .map(|line| PermissionLine {
+                    permission: line.permission,
+                    required: line.required,
+                    granted: line.granted,
+                })
+                .collect(),
+            connections: (summary.connections.into_iter())
+                .map(|line| ConnectionLine {
+                    name: line.name,
+                    url: line.url,
+                    methods: line.methods,
+                    required: line.required,
+                    granted: line.granted,
+                    stored: line.stored,
+                })
+                .collect(),
+            triggers: summary.triggers,
+            secrets: (summary.secrets.into_iter())
+                .map(|line| SecretLine {
+                    slot: line.slot,
+                    kind: line.kind,
+                    secret: line.secret,
+                    value: line.value,
+                })
+                .collect(),
+            warnings: summary.warnings,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -265,14 +301,7 @@ pub async fn install(
         let prepared = prepare_install(&ctx, &auth, state.get_realm_id(), &request)
             .await
             .map_err(map_error)?;
-        let grants = aruna_operations::plugins::grants::stored_grants(&prepared.grants);
-        let granted = (&grants, &prepared.secrets);
-        let summary = summary(
-            &prepared.manifest,
-            &prepared.plugin.digest,
-            &prepared.scope,
-            granted,
-        );
+        let summary = InstallSummary::from(prepared_summary(&prepared));
         return Ok(Json(summary).into_response());
     }
     let installed = install_plugin(&ctx, &actor(&state, &auth), &auth, &request)
@@ -478,21 +507,7 @@ pub(crate) async fn view(state: &ServerState, install: PluginInstall) -> ServerR
 }
 
 fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView {
-    let manifest = pick_version(config, &install.plugin, Some(&install.digest))
-        .ok()
-        .and_then(|plugin| read_manifest(&plugin).ok());
-    let scope = InstallScope {
-        realm_id: config.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    };
-    let summary = match manifest {
-        Some(manifest) => {
-            let granted = (&install.grants, &install.secrets);
-            summary(&manifest, &install.digest, &scope, granted)
-        }
-        None => bare_summary(&install),
-    };
+    let summary = InstallSummary::from(installed_summary(config, &install));
     // A lost receiver blocks the install here; its stored state stays as it is.
     let lost = lost_reason(config, install.receiver);
     let webhook = (summary.triggers.iter().any(|kind| kind == "webhook"))
@@ -518,107 +533,6 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
         failed: install.failed,
         webhook,
         summary,
-    }
-}
-
-/// The summary of `grants` against the manifest's requests.
-fn summary(
-    manifest: &Manifest,
-    digest: &str,
-    scope: &InstallScope,
-    (grants, bound): (
-        &BTreeMap<String, Vec<String>>,
-        &BTreeMap<String, SecretBinding>,
-    ),
-) -> InstallSummary {
-    let granted = parse_grants(grants);
-    let requested = [Grant::Read]
-        .into_iter()
-        .chain(writes(manifest).then_some(Grant::Write));
-    let permissions = requested
-        .map(|grant| PermissionLine {
-            permission: grant.to_string(),
-            required: true,
-            granted: (granted.get(&grant).into_iter().flatten())
-                .cloned()
-                .collect(),
-        })
-        .collect();
-    let sends = granted.get(&Grant::Services);
-    let values = granted.get(&Grant::Secrets);
-    let readable = |slot: &str| {
-        let path = scope.secret(slot);
-        values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
-    };
-    let downloads =
-        (manifest.requested()).contains(&aruna_plugins::permission::Permission::TransfersDownload);
-    let connections = (manifest.connections.iter())
-        .map(|(name, connection)| ConnectionLine {
-            name: name.clone(),
-            url: connection.url.clone(),
-            methods: (connection.methods.iter())
-                .map(|method| method.as_str().to_string())
-                .collect(),
-            required: !connection.optional,
-            granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
-            stored: downloads && connection.auth.is_some(),
-        })
-        .collect();
-    InstallSummary {
-        id: scope.install_id.to_string(),
-        plugin: manifest.name.clone(),
-        title: manifest.title.clone(),
-        version: manifest.version.clone(),
-        digest: digest.to_string(),
-        group: scope.group_id.to_string(),
-        permissions,
-        connections,
-        triggers: manifest
-            .triggers
-            .keys()
-            .map(|kind| kind.as_str().to_string())
-            .collect(),
-        secrets: (bound.iter())
-            .map(|(slot, binding)| SecretLine {
-                slot: slot.clone(),
-                kind: (manifest.secrets.get(slot))
-                    .and_then(|declared| vault_kind(declared.kind))
-                    .map_or_else(String::new, |kind| kind.as_str().to_string()),
-                secret: binding.to_string(),
-                value: readable(slot),
-            })
-            .collect(),
-        warnings: (bound.iter())
-            .filter_map(|(slot, binding)| {
-                let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
-                shared
-                    .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
-            })
-            .collect(),
-    }
-}
-
-/// A summary from the record alone, when the pinned version's manifest is not here yet.
-fn bare_summary(install: &PluginInstall) -> InstallSummary {
-    let permissions = (install.grants.iter())
-        .map(|(permission, granted)| PermissionLine {
-            permission: permission.clone(),
-            required: false,
-            granted: granted.clone(),
-        })
-        .collect();
-    InstallSummary {
-        id: install.install_id.to_string(),
-        plugin: install.plugin.clone(),
-        title: None,
-        version: install.version.clone(),
-        digest: install.digest.clone(),
-        group: install.group_id.to_string(),
-        permissions,
-        connections: Vec::new(),
-        triggers: Vec::new(),
-        secrets: Vec::new(),
-        warnings: Vec::new(),
     }
 }
 
@@ -681,7 +595,7 @@ mod tests {
     use super::*;
     use crate::routes::install_changes::{GrantsBody, put_grants};
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+        seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
@@ -689,6 +603,7 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_operations::testing::test_context;
 
     #[tokio::test]
     async fn secret_changes_unrestricted() {
@@ -791,70 +706,5 @@ mod tests {
                 .await
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn summary_warnings() {
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let warned = |triggers: Value, binding: Option<&str>| {
-            let manifest =
-                serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
-            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            let bound = (binding.into_iter())
-                .map(|text| ("key".to_string(), SecretBinding::parse(text).unwrap()))
-                .collect();
-            summary(&manifest, "sha256:ab", &scope, (&BTreeMap::new(), &bound)).warnings
-        };
-        // Sync triggers are delivered now and warn about nothing; a shared secret still warns.
-        let sync = serde_json::json!({"sync_completed": {}, "sync_failed": {}});
-        assert!(warned(sync.clone(), None).is_empty());
-        assert!(warned(sync.clone(), Some("group:key")).is_empty());
-        assert_eq!(
-            warned(sync, Some("realm:key")),
-            vec!["a realm admin adds the use rule of `realm:key` for `key`".to_string()]
-        );
-    }
-
-    #[test]
-    fn summary_lists_methods() {
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "connections": {
-            "catalog": {"url": "https://c.example.org/", "methods": ["GET", "POST"]}}});
-        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-        let none = (&BTreeMap::new(), &BTreeMap::new());
-        let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
-        assert_eq!(lines[0].methods, ["GET", "POST"]);
-    }
-
-    #[test]
-    fn summary_stored_answers() {
-        // Only a download through a connection with a secret stores answers the rule screens.
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let stored = |required: Value| {
-            let manifest = serde_json::json!({"name": "p", "version": "0.1.0",
-                "permissions": {"required": required},
-                "connections": {
-                    "files": {"url": "https://f.example.org/", "auth": "token"},
-                    "public": {"url": "https://p.example.org/"}}});
-            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            let none = (&BTreeMap::new(), &BTreeMap::new());
-            let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
-            lines.iter().map(|line| line.stored).collect::<Vec<_>>()
-        };
-        let download = serde_json::json!(["transfers.download"]);
-        assert_eq!(stored(download), [true, false]);
-        assert_eq!(stored(serde_json::json!([])), [false, false]);
     }
 }

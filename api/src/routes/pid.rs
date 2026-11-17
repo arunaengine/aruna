@@ -173,7 +173,7 @@ async fn document_landing(
 /// already carry the `/api/v1` nest.
 fn rocrate_url(api: &str, document_id: Ulid) -> String {
     let path = format!("/metadata/{document_id}/rocrate?here=true");
-    crate::lookup::relay_url(api, &path)
+    crate::routes::storage::relay::relay_url(api, &path)
 }
 
 #[utoipa::path(
@@ -637,7 +637,7 @@ pub(crate) async fn list_persistent_ids(
     let ctx = state.get_ctx();
     let record = load_document_record(&ctx, document_id)
         .await
-        .map_err(|error| ServerError::InternalError(format!("{error:?}").into()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let routed = read_pid_routed(&ctx, state.get_realm_id(), document_id).await;
     match routed {
         Ok(Some(mapping)) => {
@@ -1013,8 +1013,8 @@ mod tests {
         Actor,
     ) {
         use crate::tests::routes::{
-            seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state,
-            test_storage, write_doc,
+            seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
+            write_doc,
         };
         use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, ID_MAPPING_KEYSPACE};
         use aruna_core::storage_entries::metadata_document_key;
@@ -1022,6 +1022,7 @@ mod tests {
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::persistent_id_key;
         use aruna_core::structs::placement::record::PlacementRef;
+        use aruna_operations::testing::test_context;
 
         let (dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes(

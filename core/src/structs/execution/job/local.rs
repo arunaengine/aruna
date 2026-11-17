@@ -523,6 +523,9 @@ impl JobErrorKind {
 pub struct JobError {
     pub message: String,
     pub kind: JobErrorKind,
+    /// An input key was locked, so the job parks on it instead of failing. Never stored.
+    #[serde(skip)]
+    pub locked: bool,
 }
 
 impl JobError {
@@ -530,6 +533,7 @@ impl JobError {
         Self {
             message: message.into(),
             kind: JobErrorKind::Retryable,
+            locked: false,
         }
     }
 
@@ -537,6 +541,15 @@ impl JobError {
         Self {
             message: message.into(),
             kind: JobErrorKind::Permanent,
+            locked: false,
+        }
+    }
+
+    /// A retryable error raised because an input key is locked.
+    pub fn locked(message: impl Into<String>) -> Self {
+        Self {
+            locked: true,
+            ..Self::retryable(message)
         }
     }
 }

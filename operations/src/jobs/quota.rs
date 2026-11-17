@@ -4,7 +4,6 @@
 
 use crate::driver::DriverContext;
 use crate::jobs::demand::group_demand;
-use crate::jobs::records::rows::from_bytes;
 use aruna_core::NodeId;
 use aruna_core::compute::quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
@@ -13,6 +12,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::structs::execution::job::EffectiveResources;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::types::{GroupId, Key};
 use tracing::{info, warn};
@@ -99,7 +99,7 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
             .transpose()
             .map(Option::unwrap_or_default),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("quota revision read failed: {other:?}")),
+        other => Err(format!("quota revision read failed: {}", other.label())),
     }
 }
 

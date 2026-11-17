@@ -5,8 +5,7 @@
 
 use std::future::Future;
 
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use aruna_core::cursor;
 use futures_util::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,22 +30,20 @@ const SEALED_OVERHEAD: usize = 1 + 24 + 16;
 /// node makes it invalid.
 pub fn seal_cursor(value: &impl Serialize) -> Option<String> {
     let sealed = seal_position(&postcard::to_allocvec(value).ok()?).ok()?;
-    Some(format!("{SEALED_MARK}{}", URL_SAFE_NO_PAD.encode(sealed)))
+    Some(format!("{SEALED_MARK}{}", cursor::encode(sealed)))
 }
 
 /// Whether `text` has the shape of a sealed cursor: the mark, then base64 of a sealed position.
 /// One that does not open, as after a restart of the node, is refused, never read as a key.
 pub fn is_sealed(text: &str) -> bool {
     (text.strip_prefix(SEALED_MARK))
-        .and_then(|rest| URL_SAFE_NO_PAD.decode(rest).ok())
+        .and_then(|rest| cursor::decode(rest).ok())
         .is_some_and(|sealed| sealed_position(&sealed) && sealed.len() > SEALED_OVERHEAD)
 }
 
 /// The position a sealed cursor of this node holds; `None` for any other text.
 pub fn open_cursor<T: DeserializeOwned>(text: &str) -> Option<T> {
-    let sealed = URL_SAFE_NO_PAD
-        .decode(text.strip_prefix(SEALED_MARK)?)
-        .ok()?;
+    let sealed = cursor::decode(text.strip_prefix(SEALED_MARK)?).ok()?;
     if !sealed_position(&sealed) {
         return None;
     }
@@ -376,7 +373,7 @@ mod tests {
         let cursor = seal_cursor(&HiddenCursor::default()).unwrap();
         assert!(is_sealed(&cursor));
         assert_eq!(open_cursor(&cursor), Some(HiddenCursor::default()));
-        let foreign = format!("~{}", URL_SAFE_NO_PAD.encode([0xFF; 64]));
+        let foreign = format!("~{}", cursor::encode([0xFF; 64]));
         assert!(is_sealed(&foreign));
         assert_eq!(open_cursor::<HiddenCursor>(&foreign), None);
         assert!(!is_sealed("~notes.txt"));

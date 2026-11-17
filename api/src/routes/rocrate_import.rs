@@ -18,9 +18,10 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::federation::import::read_import;
-use aruna_operations::jobs::import::{
-    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
+use aruna_operations::jobs::import::upload::{
+    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
 };
+use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -854,7 +855,8 @@ fn validate_source_path(path: &str) -> ServerResult<()> {
     Ok(())
 }
 
-fn map_head_error(error: HeadObjectError) -> ServerError {
+/// A missing object reads as 404 like a missing bucket; anything else is the node's own failure.
+pub(crate) fn map_head_error(error: HeadObjectError) -> ServerError {
     match error {
         HeadObjectError::NoSuchKey
         | HeadObjectError::NoSuchVersion

@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 pub mod backend_import;
+pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
 pub mod demand;
@@ -32,14 +33,13 @@ mod route;
 pub mod runs;
 pub mod runtime;
 pub mod service;
+pub mod session;
 pub mod source_read;
 pub mod staging;
 pub mod store;
 pub mod submit;
 mod transfers;
 pub mod workflow;
-
-pub use route::JobRouteError;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;

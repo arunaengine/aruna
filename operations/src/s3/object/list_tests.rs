@@ -4,7 +4,8 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::tests::s3::{test_context, test_storage};
+use crate::testing::test_context;
+use crate::tests::s3::test_storage;
 use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

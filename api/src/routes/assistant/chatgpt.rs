@@ -3,12 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ProviderModel, ensure_enabled, load_provider, save_provider, validate_base_url};
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus,
@@ -16,9 +15,9 @@ use aruna_core::structs::{
 use aruna_core::time::unix_timestamp_secs;
 use aruna_operations::assistant::provider::CreateProviderOperation;
 use aruna_operations::driver::drive;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -229,11 +228,10 @@ refused. The provider is registered for the calling user alone.
 )]
 pub async fn start_login(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     body: Option<Json<StartLoginRequest>>,
 ) -> ServerResult<(StatusCode, Json<ChatgptLoginResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let label = body
         .and_then(|Json(request)| request.label)
         .map(|label| label.trim().to_string())
@@ -344,11 +342,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn poll_login(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<LoginPollResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     let expected = provider.clone();
     if provider.kind != AssistantProviderKind::Chatgpt {

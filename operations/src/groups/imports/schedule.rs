@@ -7,7 +7,7 @@ use super::remove::RemoveImportOperation;
 use super::{ImportRuleError, all_imports};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_import_job;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
 use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::effects::Effect;

@@ -8,8 +8,8 @@ use super::{
     server_error, tool_extras,
 };
 use crate::lookup::ObjectOutput;
-use crate::lookup::{relay_json, rest_target};
 use crate::routes::storage::objects::object_page;
+use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -17,7 +17,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
-use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::{bucket_snapshot, drive, gate_context};
 use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
@@ -1112,9 +1113,13 @@ pub(crate) async fn store_stream(
     let routing = bucket_snapshot(&state.get_ctx(), bucket_info)
         .await
         .map_err(|error| internal(&error))?;
-    let gate = gate_context(&state.get_ctx(), state.get_realm_id(), now_ms())
-        .await
-        .map_err(|error| internal(&error))?;
+    let gate = gate_context(
+        &state.get_ctx(),
+        state.get_realm_id(),
+        unix_timestamp_millis(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket_info.group_id,

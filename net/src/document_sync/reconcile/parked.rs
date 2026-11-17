@@ -58,15 +58,8 @@ pub(in crate::document_sync) async fn park_snapshot(
                 body.into(),
             ),
         ];
-        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
-            Ok(()) => return Ok(Handled::Done),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = abort_txn(storage, txn_id).await;
-            }
-            Err(error) => {
-                let _ = abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, Vec::new(), writes).await? {
+            return Ok(Handled::Done);
         }
     }
     Err(NetError::Dht(

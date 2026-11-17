@@ -9,9 +9,9 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
+use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::source_read::READ_OPERATION;
-use aruna_operations::jobs::store::read_job_record;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::link::{
     LinkCaller, LinkError, LinkSource, authorize_target, create_link, head_target, read_target,

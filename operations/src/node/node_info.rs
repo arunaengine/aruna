@@ -683,8 +683,6 @@ pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &T
 mod tests {
     use super::*;
     use crate::jobs::demand::{group_demand, merge_view};
-    use crate::jobs::records::keys::kind_prefix;
-    use crate::jobs::records::rows::{ProjectionCache, from_bytes};
     use crate::node::info_write::PUBLISH_OWED_KEY;
     use aruna_core::compute::quota::{
         DemandFamily, DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES,
@@ -697,6 +695,8 @@ mod tests {
     };
     use aruna_core::node_state::DrainStateOperation;
     use aruna_core::storage_entries::metadata_registry_key;
+    use aruna_core::structs::execution::job::record_keys::kind_prefix;
+    use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
     use aruna_core::structs::execution::job::{
         JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState,
         SubmissionId,
@@ -1295,7 +1295,7 @@ mod tests {
         state: LogicalJobState,
     ) {
         let cache = ProjectionCache {
-            version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
+            version: aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
             projection: Some(aruna_core::structs::execution::job::JobProjection {

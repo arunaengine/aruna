@@ -194,8 +194,8 @@ async fn call(fixture: &Fixture, auth: &AuthContext, request: Request) -> Server
 #[tokio::test]
 async fn visitor_is_refused() {
     let fixture = fixture().await;
-    let refused = get_central(State(fixture.state.clone()), Extension(None)).await;
-    assert!(matches!(refused, Err(ServerError::Unauthorized)));
+    let refused = crate::auth::extract::<UnrestrictedAuth>(&fixture.state, None).await;
+    assert!(matches!(refused, Err(StatusCode::UNAUTHORIZED)));
     let refused = proxy_post(
         State(fixture.state.clone()),
         Extension(None),
@@ -241,7 +241,7 @@ async fn key_never_returned() {
     assert!(view.admin.is_some());
     let (_, Json(member)) = get_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await
     .unwrap();
@@ -322,7 +322,7 @@ async fn bad_session_refused() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (_, Json(view)) = get_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await
     .unwrap();
@@ -394,7 +394,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 /// A device that is not the holder and knows the holder's address from its installation.
 async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router, String) {
     let (dir, storage) = test_storage();
-    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let context = Arc::new(aruna_operations::testing::test_context(storage));
     let node_id = iroh::SecretKey::generate().public();
     let owner = UserId::local(Ulid::generate(), realm_id);
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();

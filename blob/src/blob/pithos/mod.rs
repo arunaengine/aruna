@@ -119,10 +119,10 @@ fn budget_units(bytes: u64) -> u32 {
 }
 
 /// One stored archive. Stored objects never change, so reads need no pinned revision.
-struct StoredArchive {
-    operator: Operator,
-    path: String,
-    idle: Duration,
+pub(super) struct StoredArchive {
+    pub(super) operator: Operator,
+    pub(super) path: String,
+    pub(super) idle: Duration,
 }
 
 impl AsyncArchiveSource for StoredArchive {

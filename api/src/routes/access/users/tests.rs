@@ -2,14 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
+use super::enrollment_status;
 use crate::auth::{OidcValidator, handle_token};
 use crate::auth::{RealmAuth, TokenAuth};
 use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
 use crate::server::Server;
 use crate::server::ServerConfig;
-use crate::server::state::{ADMIN_CLAIMED_KEY, ServerState, load_persisted_state};
+use crate::server::state::ServerState;
 use aruna_core::UserId;
+use aruna_core::auth::ADMIN_CLAIMED_KEY;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -27,6 +28,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::realm::announce_presence::{
@@ -40,6 +42,7 @@ use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;
@@ -288,7 +291,7 @@ async fn spawn_node(
         compute_handle: None,
     });
     initialize_incoming_fixture(driver_ctx.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         driver_ctx.clone(),
         task_handle,
@@ -1178,7 +1181,12 @@ async fn burned_secret_recovers() {
         StatusCode::UNAUTHORIZED
     );
     assert_eq!(
-        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        drive(
+            LoadStateOperation::<bool>::new(ADMIN_CLAIMED_KEY),
+            node.context.as_ref()
+        )
+        .await
+        .unwrap(),
         Some(true)
     );
 
@@ -1197,7 +1205,12 @@ async fn restart_keeps_administrator() {
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_node(provider, true, true, true).await;
     assert_eq!(
-        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        drive(
+            LoadStateOperation::<bool>::new(ADMIN_CLAIMED_KEY),
+            node.context.as_ref()
+        )
+        .await
+        .unwrap(),
         None
     );
 
@@ -1220,7 +1233,12 @@ async fn restart_keeps_administrator() {
     let admin_token = sign_aruna_token(&node, node.realm_admin_id, None);
     assert_eq!(secrets_status(&node, &admin_token).await, StatusCode::OK);
     assert_eq!(
-        load_persisted_state::<bool>(node.context.as_ref(), ADMIN_CLAIMED_KEY).await,
+        drive(
+            LoadStateOperation::<bool>::new(ADMIN_CLAIMED_KEY),
+            node.context.as_ref()
+        )
+        .await
+        .unwrap(),
         Some(true)
     );
 
@@ -2022,7 +2040,7 @@ async fn federated_profile_synthesized() {
     use axum::Extension;
     use axum::response::IntoResponse;
     let (_dir, storage) = crate::tests::routes::test_storage();
-    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let context = Arc::new(aruna_operations::testing::test_context(storage));
     let signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
     let node_id = iroh::SecretKey::generate().public();

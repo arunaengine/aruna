@@ -42,12 +42,18 @@ use crate::user::validation::{
 };
 
 mod apply;
+mod overlay;
 mod paths;
 mod placement;
 mod revocation;
 mod snapshot;
 mod targets;
 
+pub use overlay::{
+    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
+    materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_state,
+    overlay_realm_config, reduced_admin_target,
+};
 pub use paths::*;
 use paths::{event_observes_dot, operation_paths, role_definition_value};
 pub use placement::*;

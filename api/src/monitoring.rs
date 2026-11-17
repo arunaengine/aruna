@@ -113,35 +113,34 @@ pub struct MonitoringState {
 
 impl MonitoringState {
     /// Builds the monitoring state and registers the built-in scrape-time sources.
-    pub async fn new(
+    pub fn new(
         ctx: Arc<DriverContext>,
         metrics: Arc<NodeMetrics>,
         readiness: Readiness,
     ) -> Arc<Self> {
-        Self::with_recovery(ctx, metrics, readiness, RecoveryStatus::new()).await
+        Self::with_recovery(ctx, metrics, readiness, RecoveryStatus::new())
     }
 
     /// Same, but reporting the recovery status the caller also hands to the
     /// recovery driver.
-    pub async fn with_recovery(
+    pub fn with_recovery(
         ctx: Arc<DriverContext>,
         metrics: Arc<NodeMetrics>,
         readiness: Readiness,
         recovery: RecoveryStatus,
     ) -> Arc<Self> {
-        register_storage_source(&metrics, ctx.clone()).await;
-        let queue_metrics = register_queue_metrics(&metrics).await;
+        metrics.register_collector(StorageCollector { ctx: ctx.clone() });
+        let queue_metrics = register_queue_metrics(&metrics);
         let queue_refresher = spawn_queue_refresher(
             Arc::downgrade(&ctx),
             queue_metrics,
             tokio_util::sync::CancellationToken::new(),
         );
-        register_recovery_metrics(&metrics, recovery.clone()).await;
+        metrics.register_collector(RecoveryCollector {
+            recovery: recovery.clone(),
+        });
         if let Some(net_handle) = &ctx.net_handle {
-            net_handle
-                .notification_watch_metrics()
-                .register(&metrics)
-                .await;
+            net_handle.notification_watch_metrics().register(&metrics);
         }
         Arc::new(Self {
             ctx,
@@ -250,7 +249,7 @@ async fn readyz(State(state): State<Arc<MonitoringState>>) -> Response {
 
 async fn metrics_handler(State(state): State<Arc<MonitoringState>>) -> Response {
     state.metrics.set_node_started(state.readiness.is_started());
-    let body = state.metrics.render().await;
+    let body = state.metrics.render();
     (
         [(
             header::CONTENT_TYPE,
@@ -434,10 +433,6 @@ impl Collector for StorageCollector {
     }
 }
 
-async fn register_storage_source(metrics: &NodeMetrics, ctx: Arc<DriverContext>) {
-    metrics.register_collector(StorageCollector { ctx }).await;
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct QueueLabels {
     queue: &'static str,
@@ -517,12 +512,6 @@ impl Collector for RecoveryCollector {
 
         Ok(())
     }
-}
-
-async fn register_recovery_metrics(metrics: &NodeMetrics, recovery: RecoveryStatus) {
-    metrics
-        .register_collector(RecoveryCollector { recovery })
-        .await;
 }
 
 /// Background-updated depth and oldest-record age gauges for durable work
@@ -636,44 +625,34 @@ fn spawn_queue_refresher(
     }
 }
 
-async fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
+fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
     let depth = Family::<QueueLabels, Gauge>::default();
-    metrics
-        .register("queue_depth", "Durable work queue depth", depth.clone())
-        .await;
+    metrics.register("queue_depth", "Durable work queue depth", depth.clone());
     let oldest_age_seconds = Family::<QueueLabels, Gauge<f64, AtomicU64>>::default();
-    metrics
-        .register_with_unit(
-            "queue_oldest_age",
-            "Age of the oldest record in a durable work queue",
-            Unit::Seconds,
-            oldest_age_seconds.clone(),
-        )
-        .await;
+    metrics.register_with_unit(
+        "queue_oldest_age",
+        "Age of the oldest record in a durable work queue",
+        Unit::Seconds,
+        oldest_age_seconds.clone(),
+    );
     let depth_capped = Family::<QueueLabels, Gauge>::default();
-    metrics
-        .register(
-            "queue_depth_capped",
-            "1 when a queue depth probe stopped at its page cap",
-            depth_capped.clone(),
-        )
-        .await;
+    metrics.register(
+        "queue_depth_capped",
+        "1 when a queue depth probe stopped at its page cap",
+        depth_capped.clone(),
+    );
     let probe_up = Family::<QueueLabels, Gauge>::default();
-    metrics
-        .register(
-            "queue_probe_up",
-            "1 when the latest durable queue probe succeeded",
-            probe_up.clone(),
-        )
-        .await;
+    metrics.register(
+        "queue_probe_up",
+        "1 when the latest durable queue probe succeeded",
+        probe_up.clone(),
+    );
     let last_success_seconds = Family::<QueueLabels, Gauge>::default();
-    metrics
-        .register(
-            "queue_probe_last_success_timestamp_seconds",
-            "Unix timestamp of the latest successful durable queue probe",
-            last_success_seconds.clone(),
-        )
-        .await;
+    metrics.register(
+        "queue_probe_last_success_timestamp_seconds",
+        "Unix timestamp of the latest successful durable queue probe",
+        last_success_seconds.clone(),
+    );
 
     let queue_metrics = Arc::new(QueueMetrics {
         depth,
@@ -766,7 +745,7 @@ mod tests {
     #[tokio::test]
     async fn healthz_ok_live() {
         let (_temp, ctx) = fjall_ctx();
-        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new()).await;
+        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new());
         let (status, body) = request(&router(ops), "/healthz").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "ok");
@@ -790,8 +769,7 @@ mod tests {
             ctx_with_storage(storage),
             Arc::new(NodeMetrics::new()),
             Readiness::new(),
-        )
-        .await;
+        );
         let (status, _body) = request(&router(ops), "/healthz").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -800,7 +778,7 @@ mod tests {
     async fn readyz_gates_startup() {
         let (_temp, ctx) = fjall_ctx();
         let readiness = Readiness::new();
-        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone()).await;
+        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone());
         let router = router(ops);
 
         let (status, body) = request(&router, "/readyz").await;
@@ -834,8 +812,7 @@ mod tests {
             ctx_with_storage(storage),
             Arc::new(NodeMetrics::new()),
             readiness,
-        )
-        .await;
+        );
         let (status, body) = request(&router(ops), "/readyz").await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(body.contains("\"storage\":\"failed"), "{body}");
@@ -853,8 +830,7 @@ mod tests {
             Arc::new(NodeMetrics::new()),
             readiness,
             recovery.clone(),
-        )
-        .await;
+        );
         let router = router(ops);
 
         let (_status, body) = request(&router, "/readyz").await;
@@ -889,8 +865,7 @@ mod tests {
             Arc::new(NodeMetrics::new()),
             Readiness::new(),
             recovery,
-        )
-        .await;
+        );
         let (status, body) = request(&router(ops), "/metrics").await;
         assert_eq!(status, StatusCode::OK);
 
@@ -932,8 +907,7 @@ mod tests {
             Some(RecoveryError::PeerUnavailable),
         );
         let ops =
-            MonitoringState::with_recovery(ctx, Arc::new(NodeMetrics::new()), readiness, recovery)
-                .await;
+            MonitoringState::with_recovery(ctx, Arc::new(NodeMetrics::new()), readiness, recovery);
         let router = router(ops);
 
         let (status, body) = request(&router, "/healthz").await;
@@ -962,7 +936,7 @@ mod tests {
         let (_temp, ctx) = fjall_ctx();
         let readiness = Readiness::new();
         readiness.set_ready();
-        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone()).await;
+        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone());
         let router = router(ops);
         readiness.begin_drain();
         let (status, body) = request(&router, "/readyz").await;
@@ -1026,7 +1000,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refresher_stop_completes() {
         let metrics = NodeMetrics::new();
-        let queue_metrics = register_queue_metrics(&metrics).await;
+        let queue_metrics = register_queue_metrics(&metrics);
         let mut refresher = spawn_queue_refresher(
             Weak::new(),
             queue_metrics,
@@ -1046,8 +1020,7 @@ mod tests {
             ctx_with_storage(storage),
             Arc::new(NodeMetrics::new()),
             Readiness::new(),
-        )
-        .await;
+        );
         // The first interval tick dispatches its probe; nobody answers it.
         tokio::task::yield_now().await;
 
@@ -1135,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_expose_storage() {
         let (_temp, ctx) = fjall_ctx();
-        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new()).await;
+        let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new());
         let response = router(ops)
             .oneshot(
                 Request::builder()

@@ -53,6 +53,7 @@ pub enum Event {
     Search(),
     Stream(),
     Group(GroupEvent),
+    Session(Box<crate::compute::session::SessionAnswer>),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -467,6 +468,8 @@ pub enum NetEvent {
     StatementSign(StatementSignEvent),
     Release(crate::structs::storage::release::ReleaseEvent),
     Error(NetError),
+    /// Whether the node holds the complete artifact after the chunk, or why it was not stored.
+    ArtifactStored(Result<bool, String>),
     Heartbeat(crate::heartbeat::HeartbeatEvent),
 }
 
@@ -866,6 +869,7 @@ impl Event {
                     StatementSign,
                     Release,
                     Error,
+                    ArtifactStored,
                     Heartbeat,
                 }
             ),
@@ -945,6 +949,7 @@ impl Event {
             ),
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
+            Event::Session(_) => "Event::Session",
         }
     }
 }

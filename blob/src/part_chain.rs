@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::hash::Hasher;
+use aruna_core::structs::checksum::Hasher;
 use ulid::Ulid;
 
 /// One upload attempt of a part. A repeated upload of the same number is a new attempt.

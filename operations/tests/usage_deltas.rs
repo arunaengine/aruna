@@ -278,7 +278,7 @@ async fn complete_upload(
             object_size: Some(object_size),
             created_by: h.created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &h.driver,
     )
@@ -641,7 +641,7 @@ async fn abort_preserves_counters() {
             bucket: "bucket".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &h.driver,
     )
@@ -681,7 +681,7 @@ async fn uploads_count_records() {
             bucket: "bucket".to_string(),
             key: "dropped.bin".to_string(),
             upload_id: dropped,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         })
     };
     drive(abort(), &h.driver).await.unwrap();
@@ -694,7 +694,7 @@ async fn uploads_count_records() {
     // The stale sweep ends an old upload through the same abort.
     create_upload(&h, "bucket", "stale.bin", group_id).await;
     assert_eq!(uploads().await, 1);
-    let later = aruna_operations::driver::now_ms() + 365 * 24 * 3_600_000;
+    let later = aruna_core::time::unix_timestamp_millis() + 365 * 24 * 3_600_000;
     aruna_operations::blob::cleanup::sweep_stale_uploads(&h.driver, later)
         .await
         .unwrap();
@@ -974,7 +974,7 @@ async fn try_complete_multipart(
             object_size: Some(data.len() as u64),
             created_by: h.created_by,
             quota_ceiling,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &h.driver,
     )

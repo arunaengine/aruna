@@ -4,7 +4,6 @@
 
 use std::collections::HashSet;
 
-use aruna_blob::hash::Hasher;
 use aruna_blob::invenio::InvenioClient;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
@@ -14,6 +13,7 @@ use aruna_core::repository::invenio::{
 };
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryPull};
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::job::{ArtifactRef, ImportRoCrateSpec, RoCrateLimits};
 use aruna_core::structs::identity::auth::Permission;

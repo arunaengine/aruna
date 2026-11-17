@@ -11,9 +11,9 @@ use aruna_core::structs::execution::job::{
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM};
 
 use crate::tests::records::context as fixture;
@@ -144,7 +144,7 @@ async fn keeps_attempt_state() {
     let mut physical = logical.clone();
     physical.job_id = physical_id;
     physical.state = JobState::Running;
-    crate::jobs::store::insert_job(&context.storage_handle, &physical)
+    crate::jobs::store::query::insert_job(&context.storage_handle, &physical)
         .await
         .expect("physical row inserted");
 
@@ -156,15 +156,17 @@ async fn keeps_attempt_state() {
         LogicalJobState::Succeeded
     );
 
-    let stored = crate::jobs::store::read_job_record(&context.storage_handle, family.job_id, None)
-        .await
-        .expect("job row read")
-        .expect("job row exists");
+    let stored =
+        crate::jobs::store::state::read_job_record(&context.storage_handle, family.job_id, None)
+            .await
+            .expect("job row read")
+            .expect("job row exists");
     assert_eq!(stored.state, JobState::Succeeded);
-    let physical = crate::jobs::store::read_job_record(&context.storage_handle, physical_id, None)
-        .await
-        .expect("physical row read")
-        .expect("physical row exists");
+    let physical =
+        crate::jobs::store::state::read_job_record(&context.storage_handle, physical_id, None)
+            .await
+            .expect("physical row read")
+            .expect("physical row exists");
     assert_eq!(physical.state, JobState::Running);
 }
 

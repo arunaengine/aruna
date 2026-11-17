@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::NodeId;
+
 #[cfg(test)]
 use crate::admin_documents::AdminDocumentTarget;
 use crate::document::{DocumentEvent, DocumentTarget};
@@ -15,6 +16,47 @@ use irokle::{ActorId, TopicId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
+
+/// A permanently rejected sync operation awaiting durable evidence. Evidence is
+/// materialized only as the cursor advances past it, so both land in one
+/// transaction; the identity is transport-derived, so undecodable payloads stay keyed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyncRejection {
+    pub identity: SyncQuarantineIdentity,
+    pub evidence: SyncQuarantineEvidence,
+    pub reason: String,
+}
+
+impl SyncRejection {
+    pub fn new(
+        identity: SyncQuarantineIdentity,
+        event: DocumentEvent,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            identity,
+            evidence: SyncQuarantineEvidence::from_event(&event),
+            reason: reason.into(),
+        }
+    }
+
+    /// Evidence for a payload that could not be decoded into an event at all.
+    pub fn raw(
+        identity: SyncQuarantineIdentity,
+        bytes: Vec<u8>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            identity,
+            evidence: SyncQuarantineEvidence::raw(bytes),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn topic_id(&self) -> TopicId {
+        self.identity.topic
+    }
+}
 
 /// Single row of the usage keyspace; the quarantine keyspace itself stays a pure
 /// `topic || actor || actor_seq` prefix scan.

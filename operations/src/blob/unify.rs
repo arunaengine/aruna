@@ -7,7 +7,7 @@ use crate::auth::request_authorization::BucketAccess;
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::migration::move_routing;
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::s3::bucket::linked::JobStep;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};

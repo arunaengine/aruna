@@ -32,22 +32,6 @@ pub struct JoinRegistry<K, V, I = ()> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JoinConflict;
 
-impl<K, V> JoinRegistry<K, V>
-where
-    K: Eq + Hash,
-    V: Clone + Send + Sync + 'static,
-{
-    /// Joins the work already running for `key`, or spawns `work` for it.
-    pub fn join<F>(&self, key: K, work: F) -> JoinWatch<V>
-    where
-        F: Future<Output = V> + Send + 'static,
-    {
-        match self.join_as(key, (), work) {
-            Ok(watch) | Err((_, watch)) => watch,
-        }
-    }
-}
-
 impl<K, V, I> JoinRegistry<K, V, I>
 where
     K: Eq + Hash,
@@ -135,6 +119,21 @@ mod tests {
 
     const RETENTION: Duration = Duration::from_secs(600);
 
+    /// Joins the work already running for `key`, or spawns `work` for it.
+    fn join<V, F>(
+        registry: &JoinRegistry<&'static str, V>,
+        key: &'static str,
+        work: F,
+    ) -> JoinWatch<V>
+    where
+        V: Clone + Send + Sync + 'static,
+        F: Future<Output = V> + Send + 'static,
+    {
+        match registry.join_as(key, (), work) {
+            Ok(watch) | Err((_, watch)) => watch,
+        }
+    }
+
     // Two callers for one key must run the work once and share the value.
     #[tokio::test(start_paused = true)]
     async fn joins_running_work() {
@@ -142,7 +141,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let (gate, blocked) = tokio::sync::oneshot::channel();
 
-        let first = registry.join("key", {
+        let first = join(&registry, "key", {
             let runs = runs.clone();
             async move {
                 let _ = blocked.await;
@@ -150,7 +149,7 @@ mod tests {
                 "first"
             }
         });
-        let second = registry.join("key", {
+        let second = join(&registry, "key", {
             let runs = runs.clone();
             async move {
                 runs.fetch_add(1, Ordering::SeqCst);
@@ -195,19 +194,19 @@ mod tests {
         let registry = JoinRegistry::new(RETENTION);
 
         assert_eq!(
-            await_joined(registry.join("key", async { "first" })).await,
+            await_joined(join(&registry, "key", async { "first" })).await,
             Some("first")
         );
 
         tokio::time::advance(RETENTION / 2).await;
         assert_eq!(
-            await_joined(registry.join("key", async { "second" })).await,
+            await_joined(join(&registry, "key", async { "second" })).await,
             Some("first")
         );
 
         tokio::time::advance(RETENTION).await;
         assert_eq!(
-            await_joined(registry.join("key", async { "second" })).await,
+            await_joined(join(&registry, "key", async { "second" })).await,
             Some("second")
         );
     }
@@ -219,10 +218,10 @@ mod tests {
         let registry: JoinRegistry<&str, Result<&str, &str>> =
             JoinRegistry::new(RETENTION).retain_if(|value| value.is_ok());
 
-        let failed = registry.join("key", async { Err("failed") });
+        let failed = join(&registry, "key", async { Err("failed") });
         assert_eq!(await_joined(failed).await, Some(Err("failed")));
 
-        let retried = registry.join("key", async { Ok("retried") });
+        let retried = join(&registry, "key", async { Ok("retried") });
         assert_eq!(await_joined(retried).await, Some(Ok("retried")));
     }
 
@@ -231,10 +230,10 @@ mod tests {
     async fn retries_panicked_work() {
         let registry: JoinRegistry<&str, &str> = JoinRegistry::new(RETENTION);
 
-        let failed = registry.join("key", async { panic!("producer failed") });
+        let failed = join(&registry, "key", async { panic!("producer failed") });
         assert_eq!(await_joined(failed).await, None);
 
-        let retried = registry.join("key", async { "retried" });
+        let retried = join(&registry, "key", async { "retried" });
         assert_eq!(await_joined(retried).await, Some("retried"));
     }
 
@@ -243,11 +242,11 @@ mod tests {
     async fn shares_retried_work() {
         let registry: JoinRegistry<&str, usize> = JoinRegistry::new(RETENTION);
         let runs = Arc::new(AtomicUsize::new(0));
-        let failed = registry.join("key", async { panic!("producer failed") });
+        let failed = join(&registry, "key", async { panic!("producer failed") });
         assert_eq!(await_joined(failed).await, None);
 
         let (gate, blocked) = tokio::sync::oneshot::channel();
-        let first = registry.join("key", {
+        let first = join(&registry, "key", {
             let runs = runs.clone();
             async move {
                 let _ = blocked.await;
@@ -258,7 +257,7 @@ mod tests {
         let later: Vec<_> = (2..5)
             .map(|value| {
                 let runs = runs.clone();
-                registry.join("key", async move {
+                join(&registry, "key", async move {
                     runs.fetch_add(1, Ordering::SeqCst);
                     value
                 })
@@ -278,20 +277,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn keeps_replacement_entry() {
         let registry: JoinRegistry<&str, usize> = JoinRegistry::new(RETENTION);
-        let failed = registry.join("key", async { panic!("producer failed") });
+        let failed = join(&registry, "key", async { panic!("producer failed") });
         assert_eq!(await_joined(failed).await, None);
 
         let (gate, blocked) = tokio::sync::oneshot::channel();
-        let replacement = registry.join("key", async move {
+        let replacement = join(&registry, "key", async move {
             let _ = blocked.await;
             1
         });
-        let other = registry.join("other", async { 2 });
+        let other = join(&registry, "other", async { 2 });
         assert_eq!(await_joined(other).await, Some(2));
 
         let _ = gate.send(());
         assert_eq!(await_joined(replacement).await, Some(1));
-        let later = registry.join("key", async { 3 });
+        let later = join(&registry, "key", async { 3 });
         assert_eq!(await_joined(later).await, Some(1));
     }
 }

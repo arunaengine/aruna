@@ -14,7 +14,6 @@ use crate::s3::object::get::{
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::hash::Hasher;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
@@ -27,6 +26,7 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
 use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata, SourceStats,

@@ -644,6 +644,20 @@ pub struct RoCrateUploadRecord {
     pub claimed_by: Option<JobId>,
 }
 
+/// The storage key of one upload record.
+pub fn upload_key(upload_id: Ulid) -> ByteView {
+    ByteView::from(upload_id.to_bytes().to_vec())
+}
+
+/// Whether a bound upload can no longer start an import under an upload claim: it is unclaimed
+/// and expired, or it is gone and no import job holds its import key.
+pub fn upload_stale(record: Option<&RoCrateUploadRecord>, job_held: bool, now_ms: u64) -> bool {
+    match record {
+        Some(record) => record.claimed_by.is_none() && record.expires_at_ms <= now_ms,
+        None => !job_held,
+    }
+}
+
 /// Durable compensation for a hidden upload whose record cleanup was ambiguous.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoCrateUploadCleanup {

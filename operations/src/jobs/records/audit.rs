@@ -12,9 +12,11 @@ use aruna_core::structs::execution::job::{
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 
-use super::keys::{cursor_key, cursor_of, family_prefix, record_key, submission_prefix};
-use super::rows::{ConflictRecord, from_bytes};
 use super::{MAX_CONFLICT_ROWS, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    cursor_key, cursor_of, family_prefix, record_key, submission_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{ConflictRecord, from_bytes};
 
 /// Records of which scope one audit pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,13 +114,8 @@ impl FamilyAuditOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordStoreError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -160,7 +157,7 @@ impl Operation for FamilyAuditOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record page", format!("{other:?}")),
+                other => self.unexpected("record page", other.label()),
             },
             AuditState::Conflicts => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -173,10 +170,10 @@ impl Operation for FamilyAuditOperation {
                 // Conflict evidence is diagnostic: a failed read must not deny
                 // the audit page itself.
                 Event::Storage(StorageEvent::Error { .. }) => self.settle(Vec::new()),
-                other => self.unexpected("conflict page", format!("{other:?}")),
+                other => self.unexpected("conflict page", other.label()),
             },
             AuditState::Init | AuditState::Finish | AuditState::Error => {
-                self.unexpected("no event in a terminal state", format!("{event:?}"))
+                self.unexpected("no event in a terminal state", event.label())
             }
         }
     }

@@ -95,3 +95,21 @@ fn drops_credentials() {
     assert_eq!(request.url.as_str(), "https://public.example.org/v1/");
     assert_eq!(slot, None);
 }
+
+#[test]
+fn stored_answer_reads() {
+    let reply = Response {
+        status: 201,
+        headers: vec![Field {
+            name: "x-run".into(),
+            value: "7".into(),
+        }],
+        body: b"done".to_vec(),
+    };
+    let read = stored_whole(&whole_text(&reply)).unwrap();
+    assert_eq!((read.status, read.body), (201, b"done".to_vec()));
+    assert_eq!(read.headers[0].value, "7");
+    let large = stored_whole(&too_large(413)).unwrap_err();
+    assert_eq!(large.kind, ErrorKind::Limit);
+    assert!(stored_whole("{}").is_err());
+}

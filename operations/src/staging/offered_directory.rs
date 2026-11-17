@@ -5,7 +5,6 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
-use crate::plugins::journal::journaled;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::UserId;
@@ -17,6 +16,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
 use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
 };

@@ -1,11 +1,11 @@
-//! Sends net effects through the net handle and runs the job control frame round trip.
+//! Sends net effects through the net handle and answers them when this node has none.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
-use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
@@ -15,21 +15,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
 use crate::driver::DriverContext;
-
-/// Executes a job-control request by opening the frame stream and reading the
-/// owner's reply; an unreachable owner is reported so the routing operation can
-/// map it to `Unavailable` (503). The artifact body path stays out of band.
-pub(super) async fn dispatch_job_control(
-    effect: JobControlEffect,
-    context: &DriverContext,
-) -> Event {
-    let JobControlEffect { owner, request } = effect;
-    let event = match crate::jobs::protocol::send_job_request(context, owner, request).await {
-        Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
-        Err(error) => JobControlEvent::Unavailable(error.to_string()),
-    };
-    Event::Net(NetEvent::JobControl(event))
-}
 
 /// Records, sends or keeps one heartbeat with the net handle; a send is cut off after
 /// [`HEARTBEAT_IO_TIMEOUT`].
@@ -86,6 +71,11 @@ async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Resul
 }
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
+    if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
+        return Event::Net(NetEvent::DocumentSync(
+            reconcile_topics(context, topics).await,
+        ));
+    }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
     } else {
@@ -97,8 +87,38 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
+            NetEffect::JobControl(_) => {
+                Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(
+                    "job owner unavailable: network handle unavailable".to_string(),
+                )))
+            }
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
+    }
+}
+
+/// Reconciles through the handle, which also reloads realm peers after a realm config change.
+async fn reconcile_topics(
+    context: &DriverContext,
+    topics: Vec<irokle::TopicId>,
+) -> DocumentNetEvent {
+    let Some(net_handle) = &context.net_handle else {
+        return DocumentNetEvent::Error {
+            target: None,
+            error: "net handle unavailable".to_string(),
+        };
+    };
+    match Box::pin(net_handle.reconcile_sync_topics(topics)).await {
+        Ok(result) => DocumentNetEvent::DocumentsReconciled {
+            applied: result.applied(),
+            targets: result.targets,
+            metadata_create_events: result.metadata_create_events,
+            metadata_graph_tombstones: result.metadata_graph_tombstones,
+        },
+        Err(error) => DocumentNetEvent::Error {
+            target: None,
+            error: error.to_string(),
+        },
     }
 }
 

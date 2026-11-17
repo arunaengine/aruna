@@ -16,6 +16,8 @@ use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::keyspaces::{
     FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
 };
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState, SubmissionId,
 };
@@ -25,9 +27,7 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::kind_prefix;
-use crate::jobs::records::rows::{ProjectionCache, from_bytes};
-use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
+use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::realm::get_config::GetConfigOperation;
 
 /// Rows one snapshot scan reads per page.

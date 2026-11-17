@@ -3,17 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use aruna_core::plugin_runs::{
-    DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent,
-    journal_entries, journal_key,
+    DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent, journal_key,
 };
 use ulid::Ulid;
 
-use super::store::{StoreError, Txn};
-use crate::driver::DriverContext;
+use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, StoreError, Turn, done, unexpected};
 
 /// Rows a journal page holds at most.
 pub const JOURNAL_PAGE: usize = 500;
@@ -23,82 +19,154 @@ pub type JournalRow = (Vec<u8>, SourceEvent);
 
 /// At most `limit` rows of `kind` after the key `after`, oldest first, and the key to continue
 /// after when more may follow. A row that does not decode is skipped.
-pub async fn journal_page(
-    txn: &Txn<'_>,
-    kind: u8,
-    after: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<JournalRow>, Option<Vec<u8>>), StoreError> {
-    let (rows, next) = txn
-        .page(EVENT_JOURNAL_KEYSPACE, &[kind], after, limit)
-        .await?;
-    let rows = (rows.into_iter())
-        .filter_map(|(key, value)| Some((key, SourceEvent::from_bytes(&value).ok()?)))
-        .collect();
-    Ok((rows, next))
+pub fn journal_page(kind: u8, after: Option<Vec<u8>>, limit: usize) -> RowsOperation<JournalPage> {
+    RowsOperation::direct(JournalPage(Some(Ask::Page {
+        space: EVENT_JOURNAL_KEYSPACE,
+        prefix: vec![kind],
+        after,
+        limit,
+    })))
 }
 
-/// The version write `effect` with the event's journal rows in the same batch. A single write
-/// becomes a batch, so its caller must accept `BatchWriteResult`.
-pub fn journaled(effect: Effect, event: &SourceEvent) -> Result<Effect, ConversionError> {
-    let rows = journal_entries(event)?;
-    match effect {
-        Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id,
-        }) => Ok(Effect::Storage(StorageEffect::BatchWrite {
-            writes: [vec![(key_space, key, value)], rows].concat(),
-            txn_id,
-        })),
-        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }) => {
-            Ok(Effect::Storage(StorageEffect::BatchWrite {
-                writes: [writes, rows].concat(),
-                txn_id,
-            }))
-        }
-        other => Ok(other),
+#[derive(Debug, PartialEq)]
+pub struct JournalPage(Option<Ask>);
+
+impl Plan for JournalPage {
+    type Output = (Vec<JournalRow>, Option<Vec<u8>>);
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        let page = self
+            .0
+            .take()
+            .ok_or_else(|| StoreError("paged twice".into()))?;
+        Ok(Turn::Ask(page))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        let Answer::Page(rows, next) = answer else {
+            return Err(unexpected(answer));
+        };
+        let rows = (rows.into_iter())
+            .filter_map(|(key, value)| Some((key, SourceEvent::from_bytes(&value).ok()?)))
+            .collect();
+        Ok(Turn::Finish((rows, next)))
     }
 }
 
 /// Deletes kept rows journaled longer than the retention ago, and source-id rows past the
 /// dedup horizon, after which a source is not journaled again; returns how many rows.
-pub async fn prune_journal(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
-    let txn = Txn::direct(ctx);
+pub(crate) fn prune_journal(now_ms: u64) -> RowsOperation<PruneJournal> {
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
-    let cutoff = journal_key(JOURNAL_ROW, kept_from, Ulid::nil());
-    let mut pruned = 0;
-    loop {
-        let (rows, _) = txn
-            .page(EVENT_JOURNAL_KEYSPACE, &[JOURNAL_ROW], None, JOURNAL_PAGE)
-            .await?;
-        let old: Vec<Vec<u8>> = (rows.into_iter())
-            .map(|(key, _)| key)
-            .take_while(|key| *key < cutoff)
-            .collect();
-        if old.is_empty() {
-            break;
+    RowsOperation::direct(PruneJournal {
+        now_ms,
+        cutoff: journal_key(JOURNAL_ROW, kept_from, Ulid::nil()),
+        phase: JournalPhase::Kept,
+        pruned: 0,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PruneJournal {
+    now_ms: u64,
+    cutoff: Vec<u8>,
+    phase: JournalPhase,
+    pruned: usize,
+}
+
+#[derive(Debug, PartialEq)]
+enum JournalPhase {
+    /// Reads the oldest kept rows, deleted a page at a time.
+    Kept,
+    DeletingKept,
+    Sources(Scan),
+    DeletingSources,
+}
+
+impl PruneJournal {
+    fn kept_page() -> Ask {
+        Ask::Page {
+            space: EVENT_JOURNAL_KEYSPACE,
+            prefix: vec![JOURNAL_ROW],
+            after: None,
+            limit: JOURNAL_PAGE,
         }
-        pruned += old.len();
-        txn.delete(EVENT_JOURNAL_KEYSPACE, old).await?;
     }
-    let sources = txn.scan(EVENT_JOURNAL_KEYSPACE, &[SOURCE_ROW]).await?;
-    let old: Vec<Vec<u8>> = (sources.into_iter())
-        .filter(|(_, value)| {
-            let anchor = value.as_slice().try_into().map(u64::from_be_bytes);
-            anchor.is_ok_and(|anchor| now_ms > anchor.saturating_add(DEDUP_RETENTION_MS))
-        })
-        .map(|(key, _)| key)
-        .collect();
-    pruned += old.len();
-    txn.delete(EVENT_JOURNAL_KEYSPACE, old).await?;
-    Ok(pruned)
+}
+
+impl Plan for PruneJournal {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
+        Ok(Turn::Ask(Self::kept_page()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+        match std::mem::replace(&mut self.phase, JournalPhase::DeletingSources) {
+            JournalPhase::Kept => {
+                let Answer::Page(rows, _) = answer else {
+                    return Err(unexpected(answer));
+                };
+                let old: Vec<_> = (rows.into_iter())
+                    .map(|(key, _)| key)
+                    .take_while(|key| *key < self.cutoff)
+                    .map(|key| (EVENT_JOURNAL_KEYSPACE, key))
+                    .collect();
+                if old.is_empty() {
+                    let scan = Scan::new(EVENT_JOURNAL_KEYSPACE, vec![SOURCE_ROW]);
+                    let ask = scan.ask();
+                    self.phase = JournalPhase::Sources(scan);
+                    return Ok(Turn::Ask(ask));
+                }
+                self.pruned += old.len();
+                self.phase = JournalPhase::DeletingKept;
+                Ok(Turn::Ask(Ask::Delete(old)))
+            }
+            JournalPhase::DeletingKept => {
+                done(answer)?;
+                self.phase = JournalPhase::Kept;
+                Ok(Turn::Ask(Self::kept_page()))
+            }
+            JournalPhase::Sources(mut scan) => {
+                let Some(sources) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = JournalPhase::Sources(scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let old: Vec<_> = (sources.into_iter())
+                    .filter(|(_, value)| {
+                        let anchor = value.as_slice().try_into().map(u64::from_be_bytes);
+                        anchor.is_ok_and(|anchor| {
+                            self.now_ms > anchor.saturating_add(DEDUP_RETENTION_MS)
+                        })
+                    })
+                    .map(|(key, _)| (EVENT_JOURNAL_KEYSPACE, key))
+                    .collect();
+                self.pruned += old.len();
+                Ok(Turn::Ask(Ask::Delete(old)))
+            }
+            JournalPhase::DeletingSources => {
+                done(answer)?;
+                Ok(Turn::Finish(self.pruned))
+            }
+        }
+    }
+}
+
+/// The journal rows this node has not matched yet, at most a hundred.
+#[cfg(test)]
+pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<SourceEvent> {
+    let page = journal_page(aruna_core::plugin_runs::PENDING_ROW, None, 100);
+    let (rows, _) = crate::driver::drive(page, ctx).await.unwrap();
+    rows.into_iter().map(|(_, event)| event).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
+    use crate::plugins::rows::{scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
     use aruna_core::plugin_runs::{SourceKind, journal_entries};
 
@@ -119,30 +187,28 @@ mod tests {
     #[tokio::test]
     async fn retention_pruning() {
         let (_dir, ctx) = opened();
-        let txn = Txn::direct(&ctx);
         for at in [10, 20, 10 + JOURNAL_RETENTION_MS] {
-            let rows = (journal_entries(&event(at)).unwrap().into_iter())
-                .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-                .collect();
-            txn.write(EVENT_JOURNAL_KEYSPACE, rows).await.unwrap();
+            let rows = journal_entries(&event(at)).unwrap();
+            drive(write_rows(rows), &ctx).await.unwrap();
         }
         let now = 15 + JOURNAL_RETENTION_MS;
-        assert_eq!(prune_journal(&ctx, now).await.unwrap(), 1);
-        let (kept, _) = journal_page(&txn, JOURNAL_ROW, None, 10).await.unwrap();
+        assert_eq!(drive(prune_journal(now), &ctx).await.unwrap(), 1);
+        let (kept, _) = drive(journal_page(JOURNAL_ROW, None, 10), &ctx)
+            .await
+            .unwrap();
         let times: Vec<u64> = kept.iter().map(|(_, row)| row.journaled_ms).collect();
         assert_eq!(times, [20, 10 + JOURNAL_RETENTION_MS]);
         // Pending rows are the matcher's; retention pruning leaves them.
-        let (pending, _) = journal_page(&txn, b'u', None, 10).await.unwrap();
+        let (pending, _) = drive(journal_page(b'u', None, 10), &ctx).await.unwrap();
         assert_eq!(pending.len(), 3);
         // Source-id rows stay until the dedup horizon, so a late copy is not journaled again.
         let sources = async || {
-            txn.scan(EVENT_JOURNAL_KEYSPACE, &[SOURCE_ROW])
-                .await
-                .unwrap()
+            let scan = Scan::new(EVENT_JOURNAL_KEYSPACE, vec![SOURCE_ROW]);
+            drive(scan_rows(scan), &ctx).await.unwrap()
         };
         assert_eq!(sources().await.len(), 3);
         let horizon = 25 + DEDUP_RETENTION_MS;
-        assert_eq!(prune_journal(&ctx, horizon).await.unwrap(), 3);
+        assert_eq!(drive(prune_journal(horizon), &ctx).await.unwrap(), 3);
         assert_eq!(sources().await.len(), 1);
     }
 
@@ -186,9 +252,61 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let txn = Txn::direct(&ctx);
-        let (kept, _) = journal_page(&txn, JOURNAL_ROW, None, 10).await.unwrap();
+        let page = journal_page(JOURNAL_ROW, None, 10);
+        let (kept, _) = drive(page, &ctx).await.unwrap();
         let resources: Vec<String> = kept.into_iter().map(|(_, row)| row.resource).collect();
         assert_eq!(resources, [created.record.document_id.to_string()]);
+    }
+
+    #[test]
+    fn prune_stops_young() {
+        let mut plan = PruneJournal {
+            now_ms: 100,
+            cutoff: journal_key(JOURNAL_ROW, 50, Ulid::nil()),
+            phase: JournalPhase::Kept,
+            pruned: 0,
+        };
+        let old = journal_key(JOURNAL_ROW, 10, Ulid::from_parts(1, 1));
+        let young = journal_key(JOURNAL_ROW, 60, Ulid::from_parts(1, 2));
+        let page = vec![(old.clone(), Vec::new()), (young.clone(), Vec::new())];
+        let deleted = Ask::Delete(vec![(EVENT_JOURNAL_KEYSPACE, old)]);
+        assert_eq!(
+            plan.next(Answer::Page(page, None)).unwrap(),
+            Turn::Ask(deleted)
+        );
+        assert!(matches!(
+            plan.next(Answer::Done).unwrap(),
+            Turn::Ask(Ask::Page { .. })
+        ));
+        let page = vec![(young, Vec::new())];
+        assert!(matches!(
+            plan.next(Answer::Page(page, None)).unwrap(),
+            Turn::Ask(Ask::Page { .. })
+        ));
+        // A source row past the dedup horizon goes; a recent one stays.
+        let anchor = |at: u64| at.to_be_bytes().to_vec();
+        let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
+        let next = plan.next(Answer::Page(sources, None)).unwrap();
+        let expected = if 100 > 1 + DEDUP_RETENTION_MS { 1 } else { 0 };
+        let Turn::Ask(Ask::Delete(keys)) = next else {
+            panic!("old source rows are deleted");
+        };
+        assert_eq!(keys.len(), expected);
+        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1 + expected));
+    }
+
+    #[test]
+    fn page_skips_unreadable() {
+        let mut plan = JournalPage(None);
+        assert!(plan.first().is_err());
+        let rows = vec![(b"j1".to_vec(), Vec::new())];
+        let next = Some(b"j1".to_vec());
+        let Turn::Finish((events, after)) = plan.next(Answer::Page(rows, next.clone())).unwrap()
+        else {
+            panic!("a page answers its readable rows");
+        };
+        assert!(events.is_empty());
+        assert_eq!(after, next);
+        assert!(plan.next(Answer::Done).is_err());
     }
 }

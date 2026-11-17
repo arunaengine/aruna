@@ -351,7 +351,7 @@ mod tests {
         let realm = RealmId([1u8; 32]);
         let (_dir, ctx, net) = ctx_with_net(realm, [84u8; 32]).await;
         let metrics = NodeMetrics::new();
-        net.notification_watch_metrics().register(&metrics).await;
+        net.notification_watch_metrics().register(&metrics);
         let owner = UserId::new(Ulid::generate(), realm);
         let group_id = Ulid::from_bytes([3u8; 16]);
         let prefix = watch_resource_path(group_id, net.node_id(), "bucket", "");
@@ -387,7 +387,7 @@ mod tests {
         install_authorization(&ctx, realm, group_id, UserId::new(Ulid::generate(), realm)).await;
         emit_watch_event(&ctx, upload_event(realm, actor, &event_path)).await;
         assert_eq!(read_inbox_rows(&ctx).await.len(), 1);
-        assert!(metrics.render().await.contains(
+        assert!(metrics.render().contains(
             "aruna_notification_watch_delivery_suppressions_total{reason=\"permission_denied\"} 1"
         ));
     }
