@@ -24,11 +24,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::distribution::index_feed::{IndexProgress, range_progress};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::read_cursor;
-use crate::replication::members::{CopyLag, copy_lag};
+use crate::replication::members::{CopyLag, CopyLagOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -393,7 +393,8 @@ pub async fn add_progress(context: &Arc<DriverContext>, status: &mut Distributio
     let Some(member) = (snapshot.config.members.iter()).find(|m| Some(m.node_id) == local) else {
         return;
     };
-    let Ok((lag, counted)) = copy_lag(context, snapshot, member.member_id).await else {
+    let lag = CopyLagOperation::new(snapshot.clone(), member.member_id);
+    let Ok((lag, counted)) = drive(lag, context).await else {
         return;
     };
     status.copies_counted = counted;

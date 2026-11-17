@@ -46,7 +46,7 @@ use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{dirty_rows, wake_publish};
-use crate::replication::members::owes_fanout;
+use crate::replication::members::OwesFanoutOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// Sets one pass looks at, and purge pages it spends at most.
@@ -510,7 +510,11 @@ impl SetWork {
             return Ok(Left::Waiting);
         }
         // The new coordinator learns nothing of what this node still owes other members.
-        if owes_fanout(context, &snapshot.config.bucket, self.set_id, range).await? {
+        let owes = OwesFanoutOperation::new(&snapshot.config.bucket, self.set_id, range.clone());
+        if drive(owes, context)
+            .await
+            .map_err(|error| error.to_string())?
+        {
             return Ok(Left::Waiting);
         }
         let Some(counters) = range_counters(context, self.set_id, range.range_id).await? else {

@@ -28,8 +28,8 @@ use super::{
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
 use crate::distribution::key_index::{KeyPage, KeyQuery, MetaTerms, RangeIndexes};
-use crate::driver::DriverContext;
-use crate::replication::members::read_record;
+use crate::driver::{DriverContext, drive};
+use crate::replication::members::ReadRecordOperation;
 
 /// Index candidates one node page examines at most, visible or not.
 pub(super) const EXAMINE_BUDGET: usize = 1_000;
@@ -51,8 +51,9 @@ pub(super) async fn search_ranges(
     search: RangeSearch,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
-    let record = read_record(context, set_id).await;
-    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
+    let record = drive(ReadRecordOperation::new(set_id), context).await;
+    let record = record.map_err(|error| SearchObjectsError::Storage(error.to_string()));
+    let Some(view) = record? else {
         // Without the record the ranges are unknown, so nothing is covered.
         return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
     };

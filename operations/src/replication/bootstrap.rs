@@ -38,7 +38,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::members::read_record;
+use super::members::ReadRecordOperation;
 use super::queue::schedule_blob_drain;
 use crate::distribution::create::submit;
 use crate::distribution::lifecycle::settle_marker;
@@ -568,7 +568,8 @@ struct SetWalk {
 
 impl SetWalk {
     async fn run(&self, context: &DriverContext, budget: &mut usize) -> Result<Outcome, String> {
-        let Some(view) = read_record(context, self.set_id).await? else {
+        let read = drive(ReadRecordOperation::new(self.set_id), context).await;
+        let Some(view) = read.map_err(|error| error.to_string())? else {
             return Ok(Outcome::Settled);
         };
         let snapshot = view.head.snapshot;

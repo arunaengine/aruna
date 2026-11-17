@@ -36,8 +36,8 @@ use super::feed_store::{
 };
 use super::key_index::{IndexedKey, KeyChange, KeyIndexError, MetaTerms, RangeIndexes};
 use super::usage::{held_ranges, sum_held};
-use crate::driver::DriverContext;
-use crate::replication::members::read_record;
+use crate::driver::{DriverContext, drive};
+use crate::replication::members::ReadRecordOperation;
 
 /// The key changes of one range and the feed rows they settle.
 type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
@@ -467,9 +467,9 @@ async fn search_on(
     if let Some(search) = searched.get(&set_id) {
         return Ok(*search);
     }
-    let view = read_record(context, set_id)
+    let view = drive(ReadRecordOperation::new(set_id), context)
         .await
-        .map_err(FeedError::Storage)?;
+        .map_err(|error| FeedError::Storage(error.to_string()))?;
     let search = view.is_some_and(|view| view.snapshot().config.settings.search_index);
     searched.insert(set_id, search);
     Ok(search)
@@ -558,9 +558,9 @@ async fn describe(
     if wanted.is_empty() {
         return Ok(());
     }
-    let Some(view) = read_record(context, set_id)
+    let Some(view) = drive(ReadRecordOperation::new(set_id), context)
         .await
-        .map_err(FeedError::Storage)?
+        .map_err(|error| FeedError::Storage(error.to_string()))?
     else {
         return Ok(());
     };

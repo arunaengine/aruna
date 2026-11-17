@@ -23,10 +23,10 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::drain::abort_cursor;
-use super::members::{bound_record, member_jobs};
+use super::members::{BoundRecordOperation, member_jobs};
 use super::page::PAGE_BYTES;
 use super::queue::BlobQueueError;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use aruna_core::structs::storage::replication_queue::SyncOrigin;
 use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, LiveObligationRecord, LiveReplicationContinuation, RelationshipJobTarget,
@@ -129,8 +129,9 @@ pub(super) async fn process_live_obligations(
     let mut records = HashMap::<String, Option<(DistributionBinding, DistributionSnapshot)>>::new();
     for (_, obligation) in &obligations {
         if !records.contains_key(&obligation.bucket) {
-            let record = bound_record(context, &obligation.bucket)
+            let record = drive(BoundRecordOperation::new(&obligation.bucket), context)
                 .await
+                .map_err(|error| error.to_string())
                 .map_err(BlobQueueError::UnexpectedEvent)?;
             records.insert(obligation.bucket.clone(), record);
         }

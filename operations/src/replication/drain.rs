@@ -33,7 +33,7 @@ use tracing::{error, info, warn};
 use ulid::Ulid;
 
 use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
-use super::members::{bound_record, member_publication};
+use super::members::{BoundRecordOperation, member_publication};
 use super::obligations::{live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
@@ -602,8 +602,9 @@ async fn publish_member(
     let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return Err("source node identity unavailable".to_string());
     };
-    let publication = bound_record(context, &job.input.bucket)
-        .await?
+    let publication = drive(BoundRecordOperation::new(&job.input.bucket), context)
+        .await
+        .map_err(|error| error.to_string())?
         .and_then(|(binding, snapshot)| member_publication(&binding, &snapshot, key, target))
         .filter(|(_, node_id)| *node_id == job.input.target_node_id);
     let Some((publication, _)) = publication else {

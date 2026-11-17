@@ -23,9 +23,9 @@ use aruna_core::types::{GroupId, Key, TxnId, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::usage_complete;
-use crate::replication::members::bound_record;
+use crate::replication::members::BoundRecordOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageError {
@@ -120,8 +120,9 @@ pub async fn held_ranges(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Option<(DistributionBinding, DistributionSnapshot, Vec<HeldRange>)>, UsageError> {
-    let Some((binding, snapshot)) = bound_record(context, bucket)
+    let Some((binding, snapshot)) = drive(BoundRecordOperation::new(bucket), context)
         .await
+        .map_err(|error| error.to_string())
         .map_err(UsageError::Record)?
     else {
         return Ok(None);
@@ -231,8 +232,9 @@ pub async fn replica_share(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
-    let Some((binding, _)) = bound_record(context, bucket)
+    let Some((binding, _)) = drive(BoundRecordOperation::new(bucket), context)
         .await
+        .map_err(|error| error.to_string())
         .map_err(UsageError::Record)?
     else {
         return Ok((RangeCounters::default(), None));

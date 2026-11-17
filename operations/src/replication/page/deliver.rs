@@ -20,7 +20,7 @@ use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildInput, Built, PageBuildOperation};
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
 use crate::driver::{DriverContext, drive};
-use crate::replication::members::{bound_record, member_publication};
+use crate::replication::members::{BoundRecordOperation, member_publication};
 use crate::replication::queue::BlobQueueError;
 use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
@@ -101,7 +101,9 @@ pub(crate) async fn deliver_pages(
     let mut retire = Vec::new();
     for (key, job) in jobs {
         if !records.contains_key(&job.input.bucket) {
-            let record = bound_record(context, &job.input.bucket).await;
+            let record = drive(BoundRecordOperation::new(&job.input.bucket), context)
+                .await
+                .map_err(|error| error.to_string());
             let record = record.map_err(BlobQueueError::UnexpectedEvent)?;
             records.insert(job.input.bucket.clone(), record);
         }
