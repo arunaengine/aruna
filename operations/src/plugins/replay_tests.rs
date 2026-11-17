@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::plugins::lifecycle::set_grants;
-use crate::plugins::matcher::match_pending;
+use crate::plugins::worker::match_journal;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::store::decode;
 use crate::plugins::worker::tests::{
@@ -34,7 +34,7 @@ async fn unmatched(fixture: &crate::plugins::install::tests::Fixture, now: u64) 
     let mut bare = config(fixture).await;
     bare.installs.clear();
     let local = fixture.actor.node_id;
-    match_pending(&fixture.ctx, &bare, local, now)
+    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
 }
@@ -52,12 +52,12 @@ async fn late_install() {
         plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
         Ok(1)
     );
-    assert_eq!(run_replays(&fixture.ctx, now).await, Ok(1));
+    assert_eq!(run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await, Ok(1));
     assert_eq!(
         plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
         Ok(0)
     );
-    assert_eq!(run_replays(&fixture.ctx, now).await, Ok(0));
+    assert_eq!(run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await, Ok(0));
     assert_eq!(forwarded(&fixture, &install).await, ["D1"]);
 }
 
@@ -84,10 +84,10 @@ async fn widened_grant() {
     plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
         .await
         .unwrap();
-    run_replays(&fixture.ctx, now).await.unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await.unwrap();
     journal(&fixture, &inside).await;
     journal(&fixture, &outside).await;
-    match_pending(&fixture.ctx, &narrowed, local, now)
+    match_journal(&fixture.ctx, &narrowed, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
@@ -101,7 +101,7 @@ async fn widened_grant() {
         Ok(1)
     );
     // Only the newly covered event is read into a forward row.
-    run_replays(&fixture.ctx, now).await.unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await.unwrap();
     assert_eq!(forwarded(&fixture, &install).await, ["A/one", "B/two"]);
     assert_eq!(
         plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
@@ -129,13 +129,13 @@ async fn widened_sync() {
     plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
         .await
         .unwrap();
-    run_replays(&fixture.ctx, now).await.unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await.unwrap();
     for (prefix, relationship, at) in [("raw/", inside, now - 1), ("other/", outside, now)] {
         let mut event = synced(&install, prefix, relationship);
         (event.journaled_ms, event.anchor_ms) = (at, at);
         journal(&fixture, &event).await;
     }
-    match_pending(&fixture.ctx, &narrowed, local, now)
+    match_journal(&fixture.ctx, &narrowed, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
@@ -146,7 +146,7 @@ async fn widened_sync() {
     let config = config(&fixture).await;
     let planned = plan_replays(&fixture.ctx, &config, local, now, no_clock).await;
     assert_eq!(planned, Ok(1));
-    run_replays(&fixture.ctx, now).await.unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await.unwrap();
     let both = [inside.to_string(), outside.to_string()];
     assert_eq!(forwarded(&fixture, &install).await, both);
 }
@@ -204,9 +204,9 @@ async fn cut_replay_continues() {
     plan_replays(&fixture.ctx, &config, local, now, no_clock)
         .await
         .unwrap();
-    assert_eq!(replay_pages(&fixture.ctx, now, 1, 1).await, Ok(1));
+    assert_eq!(run_replays(&fixture.ctx, now, (1, 1)).await, Ok(1));
     // After a restart the replay reads on from its last row.
-    assert_eq!(run_replays(&fixture.ctx, now).await, Ok(2));
+    assert_eq!(run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await, Ok(2));
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2", "D3"]);
 }
 
@@ -231,7 +231,7 @@ async fn unreadable_clock() {
     plan_replays(&fixture.ctx, &config, local, now, slow)
         .await
         .unwrap();
-    run_replays(&fixture.ctx, now).await.unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await.unwrap();
     assert_eq!(forwarded(&fixture, &install).await, ["D0"]);
     let key = row_key(COVERAGE_ROW, install.install_id);
     let row: CoverageRow = stored(&Txn::direct(&fixture.ctx), &key)

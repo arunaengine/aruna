@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::structs::execution::job::PluginWorkSpec;
 
 use super::*;
@@ -30,10 +31,8 @@ async fn mark(ctx: &DriverContext, version: Version<'_>, (install_id, work_id): 
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let write = transact(ctx, async |txn: &Txn<'_>| {
-        mark_in(txn, version, &mark).await
-    });
-    write.await.unwrap();
+    let marked = mark_row(version, &mark).unwrap();
+    drive(write_rows(vec![marked]), ctx).await.unwrap();
 }
 
 fn work_of(spec: &PluginWorkSpec) -> (Ulid, Ulid) {
@@ -52,13 +51,13 @@ async fn sweep_awaits_work() {
     mark(&blob, ("in", "b.txt", orphan), unknown).await;
     // The orphan's work is gone and its version absent; the copy's work may still write.
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!is_marked(&blob, ("in", "b.txt", orphan)).await.unwrap());
-    assert!(is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
-    let settle = update_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
+    assert!(!drive(is_marked(("in", "b.txt", orphan)).unwrap(), &blob).await.unwrap());
+    assert!(drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob).await.unwrap());
+    let settle = edit_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
     settle.await.unwrap();
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
-    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+    assert!(!drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob).await.unwrap());
+    assert!(drive(is_marked(("in", "a.txt", present)).unwrap(), &blob).await.unwrap());
 
     // Removing the install deletes its work rows, never its marks; a written version keeps its
     // mark for any later install.
@@ -66,5 +65,5 @@ async fn sweep_awaits_work() {
     config.installs.clear();
     assert_eq!(retire_work(&blob, &config, 9).await.unwrap(), 1);
     assert_eq!(sweep_marks(&blob).await.unwrap(), 0);
-    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+    assert!(drive(is_marked(("in", "a.txt", present)).unwrap(), &blob).await.unwrap());
 }

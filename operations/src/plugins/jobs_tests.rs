@@ -46,7 +46,7 @@ async fn status_from_row() {
 
     // Once settled, the kept summary answers, with the outputs on this node.
     let remote = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-    let settle = update_work(&fixture.ctx, (install.install_id, id), |row| {
+    let settle = edit_work(&fixture.ctx, (install.install_id, id), |row| {
         let mut summary = summary_of(None).unwrap();
         summary.state = FinalState::Succeeded;
         (summary.message, summary.bytes) = (None, Some(5));

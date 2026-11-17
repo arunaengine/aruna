@@ -164,7 +164,7 @@ async fn admitted(
         run.handler = "dataset_created".into();
     }
     run.due_ms = 0;
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     run
 }
 
@@ -201,8 +201,7 @@ async fn finishes_runs() {
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 2);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, ok.run_id)
-        .await
+    let done = drive(read_run(install.install_id, ok.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     assert!(
@@ -211,11 +210,10 @@ async fn finishes_runs() {
             .starts_with(&format!("\"{}", ok.run_id))
     );
     assert_eq!(done.attempts, 1);
-    let open = read_run(&fixture.ctx, install.install_id, unsure.run_id)
-        .await
+    let open = drive(read_run(install.install_id, unsure.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!(open.state, RunState::NeedsAttention);
-    assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+    assert!(drive(unfinished(), &fixture.ctx).await.unwrap().is_empty());
 }
 
 /// Grant choices that scope both `read` and `write` to `patterns`.
@@ -266,12 +264,11 @@ async fn event_input() {
     let fields = [given.kind, given.path, given.resource, given.revision];
     assert_eq!(fields, ["dataset_created", event.path.as_str(), "D1", "r1"]);
 
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
-        .await
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let output = done.output.unwrap_or_default();
@@ -340,9 +337,9 @@ async fn event_rechecked() {
     let (event, base) = created(&install, "D1");
     // An earlier attempt passed the check and was cut short; its grant is removed since.
     let mut run = event_run(&config, &install, &event, 0).unwrap();
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     (run.state, run.attempts) = (RunState::Running, 1);
-    save_run(&fixture.ctx, &run).await.unwrap();
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
     let narrowed = scoped(vec![format!("{base}/D2/**")]);
     let auth = fixture.auth();
     set_grants(
@@ -358,8 +355,7 @@ async fn event_rechecked() {
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 1);
     worker.settle().await;
-    let done = read_run(&fixture.ctx, install.install_id, run.run_id)
-        .await
+    let done = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!((done.state, done.attempts), (RunState::Cancelled, 2));
     let message = done.message.unwrap_or_default();
@@ -382,8 +378,7 @@ async fn bounded_and_restarted() {
     first.running().clear();
     assert_eq!(first.claim(unix_timestamp_millis()).await.unwrap(), 1);
     first.stop().await;
-    let cut = read_run(&fixture.ctx, install.install_id, run.run_id)
-        .await
+    let cut = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!((cut.state, cut.attempts), (RunState::Running, 1));
 
@@ -391,8 +386,7 @@ async fn bounded_and_restarted() {
     let second = worker(&fixture);
     assert_eq!(second.claim(unix_timestamp_millis()).await.unwrap(), 1);
     second.stop().await;
-    let again = read_run(&fixture.ctx, install.install_id, run.run_id)
-        .await
+    let again = drive(read_run(install.install_id, run.run_id), &fixture.ctx).await
         .unwrap();
     assert_eq!(again.attempts, 2);
 }
@@ -426,7 +420,7 @@ async fn revoked_runs() {
     let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
     let install = installed(&fixture).await;
     let state = async |run: &PluginRun| {
-        let run = read_run(ctx, install.install_id, run.run_id).await.unwrap();
+        let run = drive(read_run(install.install_id, run.run_id), ctx).await.unwrap();
         (run.state, run.message.unwrap_or_default())
     };
     let worker = worker(&fixture);
@@ -467,7 +461,7 @@ async fn revoked_runs() {
         .unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
     assert_eq!(state(&queued).await.0, RunState::Cancelled);
-    assert!(unfinished(ctx).await.unwrap().is_empty());
+    assert!(drive(unfinished(), ctx).await.unwrap().is_empty());
 }
 
 #[test]
@@ -534,8 +528,7 @@ async fn removed_with_intents() {
         .await
         .unwrap();
     let state = async |run: &PluginRun| {
-        read_run(ctx, install.install_id, run.run_id)
-            .await
+        drive(read_run(install.install_id, run.run_id), ctx).await
             .unwrap()
             .state
     };
@@ -570,7 +563,7 @@ async fn retries_hide_values() {
     const VALUE: &str = "canary-value-7b1e";
     let fixture = Fixture::new().await;
     let mut run = queued(Ulid::from_parts(3, 3), 1);
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     let scope = RunScope {
         realm_id: fixture.actor.realm_id,
         local: fixture.actor.node_id,
@@ -583,8 +576,8 @@ async fn retries_hide_values() {
     // A retryable error that names a value handed to the code keeps the run without it.
     let ended = scrub_ended(&broker, Ended::Retry(format!("upstream said {VALUE}")));
     conclude(&mut run, ended, false, Ok(None), 5);
-    save_run(&fixture.ctx, &run).await.unwrap();
-    let stored = read_run(&fixture.ctx, run.install_id, run.run_id).await;
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
+    let stored = drive(read_run(run.install_id, run.run_id), &fixture.ctx).await;
     let stored = stored.unwrap();
     assert_eq!(stored.state, RunState::Queued);
     assert_eq!(stored.message.as_deref(), Some("upstream said [redacted]"));

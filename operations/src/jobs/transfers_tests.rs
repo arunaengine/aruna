@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::atomic::AtomicUsize;
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -91,8 +92,7 @@ async fn reserved(
         ordinal: 0,
     };
     let marked = marked.then_some(("in", "reads.fq"));
-    let (row, _) = reserve_marked(&fixture.ctx, (install, &identity), row, marked)
-        .await
+    let (row, _) = drive(reserve((install, &identity), row, marked).unwrap(), &fixture.ctx).await
         .unwrap();
     let action = PluginWorkAction::Download {
         target,
@@ -340,6 +340,6 @@ async fn sweep_during_download() {
     };
     assert_eq!(version_id, row.version_id);
     assert_eq!(sweep_marks(&blob).await, Ok(0), "the version exists");
-    assert!(is_marked(&blob, version).await.unwrap());
+    assert!(drive(is_marked(version).unwrap(), &blob).await.unwrap());
     assert_eq!(stored(&blob, &fixture, &install).await, BODY);
 }

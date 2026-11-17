@@ -79,7 +79,7 @@ async fn narrowed_grants() {
     journal(&fixture, &inside).await;
     journal(&fixture, &outside).await;
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
     assert_eq!(pending(&fixture).await, 0);
@@ -104,7 +104,7 @@ async fn narrowed_sync() {
         journal(&fixture, event).await;
     }
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
 }
@@ -116,12 +116,12 @@ async fn rows_commit_once() {
     let install = installed(&fixture).await;
     let (local, config) = (fixture.actor.node_id, config(&fixture).await);
     journal(&fixture, &created(&install, "D1").0).await;
-    match_pending(&fixture.ctx, &config, local, 10)
+    match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED))
         .await
         .unwrap();
     journal(&fixture, &created(&install, "D2").0).await;
-    assert_eq!(match_pending(&fixture.ctx, &config, local, 10).await, Ok(1));
-    assert_eq!(match_pending(&fixture.ctx, &config, local, 10).await, Ok(0));
+    assert_eq!(match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await, Ok(1));
+    assert_eq!(match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await, Ok(0));
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2"]);
 }
 
@@ -136,7 +136,7 @@ async fn bound_and_stale() {
         (event.journaled_ms, event.anchor_ms) = (journaled_ms, journaled_ms);
         journal(&fixture, &event).await;
     }
-    let read = match_bounded(&fixture.ctx, &config, local, now, 2).await;
+    let read = match_journal(&fixture.ctx, &config, local, (now, 2)).await;
     assert_eq!(read.unwrap(), 4);
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2"]);
     let full = gap(&fixture, &install, GapReason::Full).await.unwrap();
@@ -156,7 +156,7 @@ async fn user_node_clears() {
         owner: fixture.actor.user_id,
     };
     journal(&fixture, &created(&install, "D1").0).await;
-    let read = match_pending(&fixture.ctx, &config, fixture.actor.node_id, 10).await;
+    let read = match_journal(&fixture.ctx, &config, fixture.actor.node_id, (10, EVENTS_QUEUED)).await;
     assert_eq!(read.unwrap(), 1);
     assert!(forwarded(&fixture, &install).await.is_empty());
     let txn = Txn::direct(&fixture.ctx);
@@ -211,7 +211,7 @@ async fn own_changes_skipped() {
     journal(&fixture, &own).await;
     journal(&fixture, &other).await;
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(&fixture.ctx, &config(&fixture).await, local, (10, EVENTS_QUEUED)).await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/other"]);
 }

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{RECEIVER_GAP, RunState, RunTrigger, SourceEvent};
 use aruna_core::storage_entries::reducer_state_key;
@@ -54,7 +55,7 @@ async fn decided_at(
 }
 
 async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
-    let listed = list_runs(&fixture.ctx, install.install_id, None, 1_000).await;
+    let listed = drive(list_runs(install.install_id, None, 1_000), &fixture.ctx).await;
     listed.unwrap().0
 }
 
@@ -100,7 +101,7 @@ async fn waits_for_record() {
     let prefix = install.install_id.to_bytes();
     let slots = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await.unwrap();
     assert_eq!(slots.len(), 2);
-    assert!(unfinished(&fixture.ctx).await.unwrap().is_empty());
+    assert!(drive(unfinished(), &fixture.ctx).await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -128,8 +129,7 @@ async fn shared_bound() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     for seq in 0..RUNS_QUEUED as u64 - 2 {
-        admit(&fixture.ctx, &queued(install.install_id, seq + 10))
-            .await
+        drive(admit(queued(install.install_id, seq + 10)), &fixture.ctx).await
             .unwrap();
     }
     let now = unix_timestamp_millis();
@@ -199,9 +199,9 @@ async fn dedup_retention() {
     assert_eq!(first.await, [Outcome::Queued]);
     let mut run = runs(&fixture, &install).await.remove(0);
     run.finish(RunState::Succeeded, None, anchor + 7 * DAY);
-    save_run(&fixture.ctx, &run).await.unwrap();
-    prune_runs(&fixture.ctx, u64::MAX / 2).await.unwrap();
-    assert_eq!(prune_seen(&fixture.ctx, anchor + 10 * DAY).await, Ok(0));
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
+    drive(prune_runs(u64::MAX / 2), &fixture.ctx).await.unwrap();
+    assert_eq!(drive(prune_seen(anchor + 10 * DAY), &fixture.ctx).await, Ok(0));
     let resent = decided_at(
         &fixture,
         std::slice::from_ref(&row),
@@ -211,7 +211,7 @@ async fn dedup_retention() {
     assert_eq!(resent.await, [Outcome::Queued]);
     assert!(runs(&fixture, &install).await.is_empty());
     let expired = anchor + DEDUP_RETENTION_MS + 1;
-    assert_eq!(prune_seen(&fixture.ctx, expired).await, Ok(1));
+    assert_eq!(drive(prune_seen(expired), &fixture.ctx).await, Ok(1));
 }
 
 #[tokio::test]
@@ -263,8 +263,7 @@ async fn delivery_totals() {
     let mut waiting = event(&install, "D0", unix_timestamp_millis()).1;
     waiting.revision += 1;
     decided(&fixture, &[waiting]).await;
-    let delivery = event_delivery(&fixture.ctx, install.install_id)
-        .await
+    let delivery = drive(event_delivery(install.install_id), &fixture.ctx).await
         .unwrap();
     assert_eq!((delivery.waiting, delivery.gaps.len()), (1, 1));
     assert_eq!((delivery.gaps[0].count, delivery.gaps[0].latest_ms), (5, 2));

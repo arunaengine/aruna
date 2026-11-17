@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
@@ -108,8 +109,7 @@ async fn recorded(
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = reserve(&fixture.ctx, (install, &identity), row)
-        .await
+    let (row, _) = drive(reserve((install, &identity), row, None).unwrap(), &fixture.ctx).await
         .unwrap();
     let spec = PluginWorkSpec {
         realm_id: fixture.actor.realm_id,
@@ -136,7 +136,7 @@ fn name(outcome: &JobRunOutcome) -> (&'static str, Option<JobErrorKind>) {
 }
 
 async fn boundary(fixture: &Fixture, (install_id, work_id): (Ulid, Ulid)) -> Option<SendBoundary> {
-    let found = read_work(&fixture.ctx, install_id, work_id).await;
+    let found = drive(read_work(install_id, work_id), &fixture.ctx).await;
     found.unwrap().unwrap().boundary
 }
 
@@ -178,7 +178,7 @@ async fn open_post_undecided() {
     let (base, seen) = server(201).await;
     let (row, spec) = recorded(&fixture, &install, (&base, "POST")).await;
     let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    update_work(&fixture.ctx, (install.install_id, row.work_id), begun)
+    edit_work(&fixture.ctx, (install.install_id, row.work_id), begun)
         .await
         .unwrap();
     let ctx = job_context(&blob, &fixture);
@@ -229,8 +229,8 @@ async fn marked_source_kept() {
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     let outcome = run_plugin_work(&ctx, &spec).await;
     assert_eq!(name(&outcome), ("failed", Some(JobErrorKind::Permanent)));
@@ -364,7 +364,7 @@ async fn recovers_without_source() {
     }
     let ids = (install.install_id, row.work_id);
     let begun = |row: &mut WorkRow| row.boundary = Some(SendBoundary::Sending { attempt: 1 });
-    update_work(&fixture.ctx, ids, begun).await.unwrap();
+    edit_work(&fixture.ctx, ids, begun).await.unwrap();
     let ctx = job_context(&blob, &fixture);
     assert_eq!(name(&run_plugin_work(&ctx, &spec).await).0, "undecided");
     let answered = |row: &mut WorkRow| {
@@ -375,7 +375,7 @@ async fn recovers_without_source() {
             version: Ulid::from_parts(5, 2),
         })
     };
-    update_work(&fixture.ctx, ids, answered).await.unwrap();
+    edit_work(&fixture.ctx, ids, answered).await.unwrap();
     let outcome = run_plugin_work(&ctx, &spec).await;
     let JobRunOutcome::Succeeded(JobResultPayload::PluginWork { bytes, version_id }) = outcome
     else {

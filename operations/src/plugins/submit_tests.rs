@@ -61,7 +61,7 @@ async fn repeat_finds_work() {
         .await
         .unwrap();
     assert_eq!(first, again);
-    let row = read_work(&fixture.ctx, install.install_id, first).await;
+    let row = drive(read_work(install.install_id, first), &fixture.ctx).await;
     let row = row.unwrap().unwrap();
     assert_eq!(row.state, WorkState::Dispatched);
     assert!(row.job.is_some() && row.version_id.is_some());
@@ -157,7 +157,7 @@ async fn broker_starts_copies() {
     };
     let id = broker.jobs_copy(&cx, copy(None)).await.unwrap();
     assert_eq!(broker.jobs_copy(&cx, copy(None)).await.unwrap(), id);
-    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = drive(read_work(install.install_id, id.parse().unwrap()), &fixture.ctx).await;
     let row = row.unwrap().unwrap();
     assert_eq!(row.source, Some(path(&fixture, &install, "in/a.txt")));
     let bad = broker.jobs_copy(&cx, copy(Some("v1"))).await;
@@ -201,8 +201,7 @@ async fn shifted_copy_refused() {
         Err(ErrorKind::Conflict)
     );
     assert!(broker.changed());
-    let (rows, _) = list_work(&fixture.ctx, install.install_id, None, 10)
-        .await
+    let (rows, _) = drive(list_work(install.install_id, None, 10), &fixture.ctx).await
         .unwrap();
     assert!(rows.is_empty());
 }
@@ -269,12 +268,11 @@ async fn download_marked() {
     let work_id = start_download(&fixture.ctx, &scope, request.clone())
         .await
         .unwrap();
-    let row = read_work(&fixture.ctx, install.install_id, work_id)
-        .await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
         .unwrap()
         .unwrap();
     let version = ("in", "reads.fq", row.version_id.unwrap());
-    assert!(is_marked(&fixture.ctx, version).await.unwrap());
+    assert!(drive(is_marked(version).unwrap(), &fixture.ctx).await.unwrap());
     let again = start_download(&fixture.ctx, &scope, request.clone()).await;
     assert_eq!(again, Ok(work_id));
     assert_eq!(marks(&fixture).await, 1);
@@ -349,8 +347,7 @@ async fn retired_unmarked() {
     let mut row = WorkRow::reserved(&install, WorkKind::Download, Ulid::from_parts(9, 9), 1);
     row.version_id = Some(Ulid::generate());
     let marked = Some(("in", "reads.fq"));
-    reserve_marked(&fixture.ctx, (&install, &identity), row, marked)
-        .await
+    drive(reserve((&install, &identity), row, marked).unwrap(), &fixture.ctx).await
         .unwrap();
     assert_eq!(
         sweep_marks(&fixture.ctx).await,
@@ -409,7 +406,7 @@ async fn broker_starts_downloads() {
         .unwrap();
     let again = broker.jobs_download(&cx, download(vec![md5(digest)])).await;
     assert_eq!(again, Ok(id.clone()));
-    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = drive(read_work(install.install_id, id.parse().unwrap()), &fixture.ctx).await;
     let row = row.unwrap().unwrap();
     assert_eq!(row.target, Some(path(&fixture, &install, "in/reads.fq")));
     let context = row.context.unwrap();
@@ -468,8 +465,7 @@ async fn narrowed_download_refused() {
         refused.message,
         "this connection does not expose its whole answer"
     );
-    let (works, _) = list_work(&fixture.ctx, install.install_id, None, 10)
-        .await
+    let (works, _) = drive(list_work(install.install_id, None, 10), &fixture.ctx).await
         .unwrap();
     assert!(works.is_empty());
 }
@@ -542,8 +538,8 @@ async fn upload_started() {
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let marked = async |txn: &Txn<'_>| mark_in(txn, ("in", "a.txt", version), &mark).await;
-    transact(&blob, marked).await.unwrap();
+    let marked = mark_row(("in", "a.txt", version), &mark).unwrap();
+    drive(write_rows(vec![marked]), &blob).await.unwrap();
     let mut later = send(&fixture, &install, None);
     later.ordinal = 2;
     assert_eq!(
@@ -588,15 +584,18 @@ async fn reply_rechecked() {
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = reserve(&fixture.ctx, (&install, &identity), row)
-        .await
+    let (row, _) = drive(reserve((&install, &identity), row, None).unwrap(), &fixture.ctx).await
         .unwrap();
     let reply = r#"{"status":201,"headers":[["etag","e1"]],"body":"eyJpZCI6N30="}"#;
     let ids = (install.install_id, row.work_id);
     let answer = (201, Some(reply.into()));
-    record_sent(&fixture.ctx, ids, answer, (8, Ulid::nil()))
-        .await
-        .unwrap();
+    let sent = WorkChange::Sent {
+        status: answer.0,
+        reply: answer.1,
+        bytes: 8,
+        version: Ulid::nil(),
+    };
+    drive(update_work(ids, sent), &fixture.ctx).await.unwrap();
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
     let broker = broker.with_keys(keys());
     let cx = CallContext {
@@ -684,7 +683,7 @@ async fn broker_starts_uploads() {
         .unwrap_err();
     assert_eq!(refused.kind, ErrorKind::Invalid);
     let id = broker.jobs_upload(&cx, upload(Method::Post)).await.unwrap();
-    let row = read_work(&fixture.ctx, install.install_id, id.parse().unwrap()).await;
+    let row = drive(read_work(install.install_id, id.parse().unwrap()), &fixture.ctx).await;
     let row = row.unwrap().unwrap();
     assert_eq!(row.source, Some(path(&fixture, &install, "in/a.txt")));
     assert_eq!(row.context.unwrap().method, "POST");

@@ -11,7 +11,7 @@ use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::match_pending;
+use crate::plugins::worker::match_journal;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
 use crate::plugins::worker::tests::{created, installed};
 
@@ -60,7 +60,7 @@ async fn queued(fixture: &Fixture, install: &PluginInstall, names: &[&str], at_m
     }
     let local = fixture.actor.node_id;
     let config = config(fixture).await;
-    match_pending(&fixture.ctx, &config, local, at_ms)
+    match_journal(&fixture.ctx, &config, local, (at_ms, EVENTS_QUEUED))
         .await
         .unwrap();
 }
@@ -147,7 +147,7 @@ async fn creation(fixture: &Fixture, install: &PluginInstall, now: u64) -> (Ulid
     };
     journal(fixture, &event).await;
     let (local, config) = (fixture.actor.node_id, config(fixture).await);
-    match_pending(&fixture.ctx, &config, local, now)
+    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     (document, event_id)

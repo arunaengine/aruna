@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_runs::{GapReason, SourceKind, gap_key, reported_key};
 use aruna_core::storage_entries::reducer_state_key;
@@ -41,9 +42,9 @@ async fn expired_gaps() {
     ];
     let txn = Txn::direct(&fixture.ctx);
     txn.write(PLUGIN_GAPS_KEYSPACE, rows).await.unwrap();
-    assert_eq!(sweep_events(&fixture.ctx, &config, now).await, Ok(0));
+    assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(0));
     let later = now + DEDUP_RETENTION_MS + 1;
-    assert_eq!(sweep_events(&fixture.ctx, &config, later).await, Ok(2));
+    assert_eq!(drive(sweep_events(&config, later), &fixture.ctx).await, Ok(2));
     assert_eq!(count(&fixture, PLUGIN_GAPS_KEYSPACE).await, 0);
 }
 
@@ -67,7 +68,7 @@ async fn removed_install_rows() {
     assert!(count(&fixture, PLUGIN_REPLAYS_KEYSPACE).await > 0);
     let mut config = config(&fixture).await;
     config.installs[0].state = InstallState::Removing;
-    assert!(sweep_events(&fixture.ctx, &config, now).await.unwrap() >= 2);
+    assert!(drive(sweep_events(&config, now), &fixture.ctx).await.unwrap() >= 2);
     for space in [
         PLUGIN_WAITING_KEYSPACE,
         PLUGIN_QUEUE_KEYSPACE,

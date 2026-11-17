@@ -56,8 +56,7 @@ pub(crate) async fn recorded(
         run_id: row.run_id,
         ordinal: 0,
     };
-    let (row, _) = reserve(&fixture.ctx, (install, &identity), row)
-        .await
+    let (row, _) = drive(reserve((install, &identity), row, None).unwrap(), &fixture.ctx).await
         .unwrap();
     let data = format!("/{}/g/{}/data", fixture.actor.realm_id, install.group_id);
     let node = fixture.actor.node_id;

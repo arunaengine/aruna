@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::UserId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::time::unix_timestamp_millis;
@@ -32,13 +33,13 @@ async fn later_call_adopts() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let first = pinned(&fixture, "a");
-    let claimed = claim_key(&fixture.ctx, (&install, "42"), first.clone()).await;
+    let claimed = drive(claim_key((&install, "42"), first.clone()), &fixture.ctx).await;
     assert_eq!(claimed, Ok((first.clone(), Claim::Fresh)));
     // An edited source sends other arguments; the stored ones stay.
     let edited = pinned(&fixture, "b");
-    let again = claim_key(&fixture.ctx, (&install, "42"), edited.clone()).await;
+    let again = drive(claim_key((&install, "42"), edited.clone()), &fixture.ctx).await;
     assert_eq!(again, Ok((first, Claim::Earlier)));
-    let other = claim_key(&fixture.ctx, (&install, "43"), edited.clone()).await;
+    let other = drive(claim_key((&install, "43"), edited.clone()), &fixture.ctx).await;
     assert_eq!(other, Ok((edited, Claim::Fresh)));
 }
 
@@ -50,13 +51,11 @@ async fn rejection_allows_correction() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let first = pinned(&fixture, "a");
-    claim_key(ctx, (&install, "42"), first.clone())
-        .await
+    drive(claim_key((&install, "42"), first.clone()), ctx).await
         .unwrap();
-    settle_key(ctx, (&install, "42"), true).await.unwrap();
+    drive(settle_key((&install, "42"), true), ctx).await.unwrap();
     let edited = pinned(&fixture, "b");
-    let (corrected, claim) = claim_key(ctx, (&install, "42"), edited.clone())
-        .await
+    let (corrected, claim) = drive(claim_key((&install, "42"), edited.clone()), ctx).await
         .unwrap();
     assert_eq!(claim, Claim::Fresh);
     assert_eq!(corrected.payload, edited.payload);
@@ -65,8 +64,8 @@ async fn rejection_allows_correction() {
         (corrected.document_id, corrected.target),
         (first.document_id, first.target)
     );
-    settle_key(ctx, (&install, "42"), false).await.unwrap();
-    let later = claim_key(ctx, (&install, "42"), pinned(&fixture, "c")).await;
+    drive(settle_key((&install, "42"), false), ctx).await.unwrap();
+    let later = drive(claim_key((&install, "42"), pinned(&fixture, "c")), ctx).await;
     assert_eq!(later, Ok((corrected, Claim::Earlier)));
 }
 
@@ -77,13 +76,12 @@ async fn unknown_keeps_arguments() {
     let install = installed(&fixture).await;
     let ctx = &fixture.ctx;
     let first = pinned(&fixture, "a");
-    claim_key(ctx, (&install, "7"), first.clone())
-        .await
+    drive(claim_key((&install, "7"), first.clone()), ctx).await
         .unwrap();
-    let again = claim_key(ctx, (&install, "7"), pinned(&fixture, "b")).await;
+    let again = drive(claim_key((&install, "7"), pinned(&fixture, "b")), ctx).await;
     assert_eq!(again, Ok((first.clone(), Claim::Earlier)));
-    settle_key(ctx, (&install, "7"), true).await.unwrap();
-    let later = claim_key(ctx, (&install, "7"), pinned(&fixture, "c")).await;
+    drive(settle_key((&install, "7"), true), ctx).await.unwrap();
+    let later = drive(claim_key((&install, "7"), pinned(&fixture, "c")), ctx).await;
     assert_eq!(later, Ok((first, Claim::Earlier)));
 }
 
@@ -113,15 +111,14 @@ async fn removal_drops_keys() {
     let install = installed(&fixture).await;
     for key in ["1", "2"] {
         let minted = pinned(&fixture, key);
-        claim_key(&fixture.ctx, (&install, key), minted)
-            .await
+        drive(claim_key((&install, key), minted), &fixture.ctx).await
             .unwrap();
     }
     let mut config = config(&fixture).await;
     let now = unix_timestamp_millis();
-    assert_eq!(sweep_events(&fixture.ctx, &config, now).await, Ok(0));
+    assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(0));
     config.installs[0].state = InstallState::Removing;
-    assert_eq!(sweep_events(&fixture.ctx, &config, now).await, Ok(2));
+    assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(2));
     let left = Txn::direct(&fixture.ctx)
         .scan(PLUGIN_CREATES_KEYSPACE, &[])
         .await
@@ -136,21 +133,20 @@ async fn reinstall_starts_fresh() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let first = pinned(&fixture, "a");
-    claim_key(&fixture.ctx, (&install, "9"), first.clone())
-        .await
+    drive(claim_key((&install, "9"), first.clone()), &fixture.ctx).await
         .unwrap();
     let reinstalled = PluginInstall {
         account: UserId::local(Ulid::generate(), fixture.actor.realm_id),
         ..install.clone()
     };
     let fresh = pinned(&fixture, "b");
-    let claimed = claim_key(&fixture.ctx, (&reinstalled, "9"), fresh.clone()).await;
+    let claimed = drive(claim_key((&reinstalled, "9"), fresh.clone()), &fixture.ctx).await;
     assert_eq!(claimed, Ok((fresh, Claim::Fresh)));
 
     let mut config = config(&fixture).await;
     config.installs.clear();
     let now = unix_timestamp_millis();
-    assert_eq!(sweep_events(&fixture.ctx, &config, now).await, Ok(1));
-    let again = claim_key(&fixture.ctx, (&reinstalled, "9"), first.clone()).await;
+    assert_eq!(drive(sweep_events(&config, now), &fixture.ctx).await, Ok(1));
+    let again = drive(claim_key((&reinstalled, "9"), first.clone()), &fixture.ctx).await;
     assert_eq!(again, Ok((first, Claim::Fresh)));
 }

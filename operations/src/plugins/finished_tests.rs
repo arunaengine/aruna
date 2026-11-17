@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, RunTrigger};
 use aruna_core::structs::identity::admin_audit::AdminAuditAction;
 use serde_json::json;
@@ -48,8 +49,8 @@ async fn settled(fixture: &Fixture, install: &PluginInstall, ended: RunState) ->
     let work_id = start_copy(&fixture.ctx, &scope, copy).await.unwrap();
     let mut run = scope.run.clone();
     run.finish(ended, None, 1);
-    save_run(&fixture.ctx, &run).await.unwrap();
-    let settle = update_work(&fixture.ctx, (install.install_id, work_id), |row| {
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
+    let settle = edit_work(&fixture.ctx, (install.install_id, work_id), |row| {
         let mut summary = summary_of(None).unwrap();
         (summary.state, summary.message) = (FinalState::Succeeded, None);
         (row.state, row.summary, row.settled_ms) = (WorkState::Settled, Some(summary), Some(1));
@@ -69,8 +70,7 @@ async fn notify(fixture: &Fixture) -> usize {
 
 /// The `job_finished` runs of `install`, as the job id and how it ended.
 async fn finish_runs(fixture: &Fixture, install: &PluginInstall) -> Vec<(String, String)> {
-    let (runs, _) = list_runs(&fixture.ctx, install.install_id, None, 10)
-        .await
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await
         .unwrap();
     (runs.into_iter())
         .filter_map(|run| match run.trigger {
@@ -90,8 +90,7 @@ async fn delivers_after_success() {
     assert_eq!(notify(&fixture).await, 1);
     let expected = vec![(work_id.to_string(), "succeeded".to_string())];
     assert_eq!(finish_runs(&fixture, &install).await, expected);
-    let (runs, _) = list_runs(&fixture.ctx, install.install_id, None, 10)
-        .await
+    let (runs, _) = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await
         .unwrap();
     let RunTrigger::Event(event) = &runs.last().unwrap().trigger else {
         panic!("a job_finished run gets an event");
@@ -112,10 +111,9 @@ async fn holds_failed_runs() {
     assert_eq!(notify(&fixture).await, 0);
     assert!(finish_runs(&fixture, &install).await.is_empty());
     let late = RUN_RETENTION_MS * 3;
-    assert_eq!(prune_runs(&fixture.ctx, late).await.unwrap(), 0);
-    assert_eq!(prune_work(&fixture.ctx, late).await.unwrap(), 0);
-    let row = read_work(&fixture.ctx, install.install_id, work_id)
-        .await
+    assert_eq!(drive(prune_runs(late), &fixture.ctx).await.unwrap(), 0);
+    assert_eq!(drive(prune_work(late), &fixture.ctx).await.unwrap(), 0);
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
         .unwrap();
     assert!(row.is_some_and(|row| !row.notified));
 }
@@ -127,8 +125,7 @@ async fn notifies_without_trigger() {
     let work_id = settled(&fixture, &install, RunState::Succeeded).await;
     assert_eq!(notify(&fixture).await, 1);
     assert!(finish_runs(&fixture, &install).await.is_empty());
-    let row = read_work(&fixture.ctx, install.install_id, work_id)
-        .await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
         .unwrap();
     assert!(row.is_some_and(|row| row.notified));
 }
@@ -145,23 +142,22 @@ async fn retry_releases_held() {
     let fixture = Fixture::new().await;
     let install = finisher(&fixture).await;
     let work_id = settled(&fixture, &install, RunState::Failed).await;
-    let row = read_work(&fixture.ctx, install.install_id, work_id)
-        .await
+    let row = drive(read_work(install.install_id, work_id), &fixture.ctx).await
         .unwrap()
         .unwrap();
     assert_eq!(waits_for(&row, Some(RunState::Failed)), Some(row.run_id));
     let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
     let ids = (install.install_id, row.run_id);
-    let mut run = retry_run(&fixture.ctx, ids, &retried, 9).await.unwrap();
+    let mut run = drive(retry_run(ids, &retried, 9).unwrap(), &fixture.ctx).await.unwrap();
     assert_eq!(
         (run.state, run.attempts, run.due_ms),
         (RunState::Queued, 0, 9)
     );
-    let again = retry_run(&fixture.ctx, ids, &retried, 9).await;
+    let again = drive(retry_run(ids, &retried, 9).unwrap(), &fixture.ctx).await;
     assert_eq!(again.map(drop), Err(RunError::NotRetried("queued")));
     assert_eq!(notify(&fixture).await, 0);
     run.finish(RunState::Succeeded, None, 10);
-    save_run(&fixture.ctx, &run).await.unwrap();
+    drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
     assert_eq!(notify(&fixture).await, 1);
     assert_eq!(finish_runs(&fixture, &install).await.len(), 1);
 }
@@ -173,9 +169,9 @@ async fn drop_delivers_none() {
     let work_id = settled(&fixture, &install, RunState::Cancelled).await;
     let dropped = audit(&fixture, AdminAuditAction::PluginCompletionDropped);
     let ids = (install.install_id, work_id);
-    let row = drop_completion(&fixture.ctx, ids, &dropped).await.unwrap();
+    let row = drive(drop_completion(ids, &dropped).unwrap(), &fixture.ctx).await.unwrap();
     assert_eq!(waits_for(&row, Some(RunState::Cancelled)), None);
-    let twice = drop_completion(&fixture.ctx, ids, &dropped).await;
+    let twice = drive(drop_completion(ids, &dropped).unwrap(), &fixture.ctx).await;
     assert_eq!(twice.map(drop), Err(RunError::NotHeld));
     assert_eq!(notify(&fixture).await, 0);
     assert!(finish_runs(&fixture, &install).await.is_empty());
@@ -189,29 +185,31 @@ async fn retry_redoes_undone() {
     // reply again.
     use aruna_plugins::broker::Intent;
 
-    use crate::plugins::intents::{Begun, begin, mark_unknown, resolve_intents, settle_in};
+    use crate::plugins::intents::{
+        Begun, begin, intent_scan, resolved_rows, settled_row, unknown_row,
+    };
+    use crate::plugins::rows::{scan_rows, write_rows};
     let fixture = Fixture::new().await;
     let install = finisher(&fixture).await;
     let mut run = scope(&fixture, &install).run;
     let (settled, undone) = (Intent::new(1, &[b"put"]), Intent::new(2, &[b"copy"]));
     let ctx = &fixture.ctx;
-    begin(ctx, run.run_id, &settled).await.unwrap();
-    let settle = async |txn: &Txn<'_>| settle_in(txn, run.run_id, &settled, "7".into()).await;
-    transact(ctx, settle).await.unwrap();
-    mark_unknown(ctx, run.run_id, &undone, "timed out")
-        .await
-        .unwrap();
-    let resolve = async |txn: &Txn<'_>| resolve_intents(txn, run.run_id, false).await;
-    transact(ctx, resolve).await.unwrap();
+    drive(begin(run.run_id, settled.clone()), ctx).await.unwrap();
+    let settled = settled_row(run.run_id, &settled, "7".into()).unwrap();
+    drive(write_rows(vec![settled]), ctx).await.unwrap();
+    let unknown = unknown_row(run.run_id, &undone, "timed out").unwrap();
+        drive(write_rows(vec![unknown]), ctx).await.unwrap();
+    let intents = drive(scan_rows(intent_scan(run.run_id)), ctx).await.unwrap();
+    let resolved = resolved_rows(intents, false).unwrap();
+    drive(write_rows(resolved), ctx).await.unwrap();
     run.finish(RunState::Failed, None, 1);
-    save_run(ctx, &run).await.unwrap();
+    drive(save_run(&run).unwrap(), ctx).await.unwrap();
     let retried = audit(&fixture, AdminAuditAction::PluginRunRetried);
-    retry_run(ctx, (install.install_id, run.run_id), &retried, 9)
-        .await
+    drive(retry_run((install.install_id, run.run_id), &retried, 9).unwrap(), ctx).await
         .unwrap();
-    assert_eq!(begin(ctx, run.run_id, &undone).await.unwrap(), Begun::Fresh);
+    assert_eq!(drive(begin(run.run_id, undone.clone()), ctx).await.unwrap(), Begun::Fresh);
     assert_eq!(
-        begin(ctx, run.run_id, &settled).await.unwrap(),
+        drive(begin(run.run_id, settled.clone()), ctx).await.unwrap(),
         Begun::Settled("7".into())
     );
 }

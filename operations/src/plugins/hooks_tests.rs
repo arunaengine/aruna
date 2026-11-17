@@ -60,7 +60,7 @@ fn request(signature: &str, delivery: Option<&str>) -> HookRequest {
 }
 
 async fn runs(fixture: &Fixture, install: &PluginInstall) -> Vec<PluginRun> {
-    let listed = list_runs(&fixture.ctx, install.install_id, None, 100).await;
+    let listed = drive(list_runs(install.install_id, None, 100), &fixture.ctx).await;
     listed.unwrap().0
 }
 

@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::collections::BTreeMap;
 
 use super::*;
@@ -486,8 +487,7 @@ async fn expected_revision() {
         .await;
     assert_eq!(ahead.unwrap_err().kind, ErrorKind::Conflict);
     assert_eq!(
-        open_intent(&broker.ctx, broker.scope.run.run_id)
-            .await
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx).await
             .unwrap(),
         None
     );
@@ -517,8 +517,7 @@ async fn invalid_patches() {
         assert_eq!(refused.kind, ErrorKind::Invalid, "{bad}");
     }
     assert_eq!(
-        open_intent(&broker.ctx, broker.scope.run.run_id)
-            .await
+        drive(open_intent(broker.scope.run.run_id), &broker.ctx).await
             .unwrap(),
         None
     );
@@ -629,9 +628,8 @@ async fn keyed_creates() {
     );
     // A lost reply leaves the call unknown in its run; the next run recovers by the key.
     let lost = "the reply was lost";
-    mark_unknown(&broker.ctx, scope.run.run_id, &first.intent, lost)
-        .await
-        .unwrap();
+    let unknown = unknown_row(scope.run.run_id, &first.intent, lost).unwrap();
+    drive(write_rows(vec![unknown]), &broker.ctx).await.unwrap();
     let unknown = creator.metadata_create(&cx(), first).await.unwrap_err();
     assert_eq!(unknown.kind, ErrorKind::UnknownOutcome);
 

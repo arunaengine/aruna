@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger};
@@ -93,7 +94,7 @@ async fn queues_when_ready() {
     assert_eq!(slots(&fixture, &install).await, 1);
     assert_eq!(seen(&fixture, &row).await, Outcome::Queued);
     assert_eq!(decide(&fixture, &row, now).await, Outcome::Queued);
-    let runs = list_runs(&fixture.ctx, install.install_id, None, 10).await;
+    let runs = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await;
     let runs = runs.unwrap().0;
     assert_eq!(runs.len(), 1);
     assert!(matches!(runs[0].trigger, RunTrigger::Event(_)));

@@ -856,4 +856,4 @@ fn identity_at(key: &[u8]) -> Option<Identity> {
 
 #[cfg(test)]
 #[path = "work_tests.rs"]
-mod tests;
+pub(crate) mod tests;
