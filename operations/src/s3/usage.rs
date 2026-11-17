@@ -691,6 +691,55 @@ fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
     })
 }
 
+/// Reads whether the local usage counters are complete: false while a usage rebuild runs,
+/// when they must not count as free capacity and do not yet back quota decisions.
+#[derive(Debug, Default, PartialEq)]
+pub struct UsageCompleteOperation {
+    started: bool,
+    result: Option<Result<bool, StorageError>>,
+}
+
+impl UsageCompleteOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for UsageCompleteOperation {
+    type Output = bool;
+    type Error = StorageError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        smallvec![rebuild_marker_read(None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.result = Some(match (self.started && self.result.is_none(), event) {
+            (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_none()),
+            (true, Event::Storage(StorageEvent::Error { error })) => Err(error),
+            _ => Err(StorageError::ReadError(
+                "unexpected event for the usage rebuild marker".to_string(),
+            )),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.result.unwrap_or(Err(StorageError::ReadError(
+            "the usage rebuild marker was not read".to_string(),
+        )))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LoadCountersState {
     Init,
@@ -2794,5 +2843,48 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod state_machine_tests {
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    use super::*;
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+            value,
+        })
+    }
+
+    #[test]
+    fn marker_marks_incomplete() {
+        let marker_read = Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+            txn_id: None,
+        });
+        for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
+            let mut operation = UsageCompleteOperation::new();
+            check_trace(&mut operation, &[marker_read.clone()], vec![(read(value), vec![])]);
+            assert_eq!(operation.finalize(), Ok(complete));
+        }
+        let mut failed = UsageCompleteOperation::new();
+        failed.start();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(failed.finalize(), Err(StorageError::Timeout));
+        let refusals = rejects_events(UsageCompleteOperation::new, sample_events, |_| false);
+        assert_eq!(refusals.len(), sample_events().len());
+        let mut started = UsageCompleteOperation::new();
+        check_abort(&mut started, &[]);
+        started.start();
+        check_abort(&mut started, &[]);
+        rejects_finalize(started);
     }
 }

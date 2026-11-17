@@ -24,7 +24,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::node::realm_usage::UsageCompleteOperation;
+use crate::s3::usage::UsageCompleteOperation;
 use crate::replication::members::bound_record;
 
 #[derive(Debug, Error, PartialEq)]

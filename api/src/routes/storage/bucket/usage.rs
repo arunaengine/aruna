@@ -14,7 +14,7 @@ use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
 use aruna_operations::distribution::status::read_view;
 use aruna_operations::distribution::usage::{HeldRange, RangeUsage, held_ranges, sum_held};
 use aruna_operations::driver::drive;
-use aruna_operations::node::realm_usage::UsageCompleteOperation;
+use aruna_operations::s3::usage::UsageCompleteOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
