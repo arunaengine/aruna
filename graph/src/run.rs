@@ -827,30 +827,30 @@ fn handle_effect(inner: Arc<GraphInner>, effect: MetadataEffect) -> MetadataEven
 
     let result = effect_span.in_scope(|| match effect {
         effect @ (MetadataEffect::ValidateCreateCrate { .. }
-        | MetadataEffect::ValidateRoCrate { .. }) => validate_effect(&node, &auth, effect),
+        | MetadataEffect::ValidateRoCrate { .. }) => validate_effect(node, &auth, effect),
         effect @ (MetadataEffect::CreateCrate { .. } | MetadataEffect::ApplyRoCrate { .. }) => {
-            crate_effect(&node, &auth, effect)
+            crate_effect(node, &auth, effect)
         }
         effect @ (MetadataEffect::UpsertDataEntity { .. }
-        | MetadataEffect::UpsertContextualEntity { .. }) => entity_effect(&node, &auth, effect),
+        | MetadataEffect::UpsertContextualEntity { .. }) => entity_effect(node, &auth, effect),
         effect @ (MetadataEffect::SetGraphPolicy { .. }
         | MetadataEffect::AddGraphPeer { .. }
-        | MetadataEffect::GetGraphPolicy { .. }) => policy_effect(&node, &auth, effect),
+        | MetadataEffect::GetGraphPolicy { .. }) => policy_effect(node, &auth, effect),
         effect @ (MetadataEffect::ExportRoCrate { .. }
         | MetadataEffect::ExportRoCrateSummary { .. }
         | MetadataEffect::ExportRoCratePage { .. }
-        | MetadataEffect::ExportVersioned { .. }) => export_effect(&node, &auth, effect),
+        | MetadataEffect::ExportVersioned { .. }) => export_effect(node, &auth, effect),
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncBestEffort { .. } => unreachable!("handled asynchronously"),
         effect @ (MetadataEffect::DeleteGraph { .. }
         | MetadataEffect::ListGraphs
         | MetadataEffect::ContainsGraph { .. }
-        | MetadataEffect::ContainsDot { .. }) => graph_effect(&node, &auth, effect),
+        | MetadataEffect::ContainsDot { .. }) => graph_effect(node, &auth, effect),
         effect @ (MetadataEffect::GraphSnapshot { .. }
         | MetadataEffect::InstallSnapshot { .. }
         | MetadataEffect::PlanBatch { .. }
-        | MetadataEffect::MergeBatch { .. }) => sync_effect(&node, &auth, effect),
+        | MetadataEffect::MergeBatch { .. }) => sync_effect(node, &auth, effect),
     });
 
     let persist_error = if persist_sync_success && result.is_ok() {
