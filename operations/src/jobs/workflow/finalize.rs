@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use aruna_compute::ExecutorBackend;
-use aruna_compute::session::{EndReason, Session};
+use aruna_compute::session::Session;
+use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{
     AttemptPhase, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits, LogTails,
 };

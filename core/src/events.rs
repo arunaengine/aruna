@@ -53,6 +53,7 @@ pub enum Event {
     Search(),
     Stream(),
     Group(GroupEvent),
+    Session(Box<crate::compute::session::SessionAnswer>),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -943,6 +944,7 @@ impl Event {
             ),
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
+            Event::Session(_) => "Event::Session",
         }
     }
 }

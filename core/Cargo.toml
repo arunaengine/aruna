@@ -25,6 +25,9 @@ byteview = { workspace = true }
 async-trait = { workspace = true }
 aes-gcm = { workspace = true }
 blake3 = { workspace = true }
+crc-fast = { workspace = true }
+md5 = { workspace = true }
+sha1 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }

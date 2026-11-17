@@ -54,6 +54,7 @@ pub enum Effect {
     Stream(),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
+    Session(Box<crate::compute::session::SessionEffect>),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at

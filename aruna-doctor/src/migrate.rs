@@ -5,7 +5,6 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
@@ -46,6 +45,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -1356,10 +1356,10 @@ mod tests {
     }
 
     pub(super) fn node_state(path: &Path) {
-        use aruna::identity::{
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+        use aruna_core::structs::identity::node_state::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,

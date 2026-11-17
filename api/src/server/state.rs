@@ -8,13 +8,9 @@ use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::auth::REALMS_LIST_KEY;
+use aruna_core::auth::{ADMIN_CLAIMED_KEY, REALMS_LIST_KEY};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -28,6 +24,7 @@ use aruna_operations::auth::bearer_token::{
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation, StateError};
 use aruna_operations::onboarding::issue_ticket::{
     IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS,
 };
@@ -35,14 +32,15 @@ use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
 use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_wire::address::client_host_url;
+use aruna_wire::info::PortalStatus;
 use async_trait::async_trait;
-use byteview::ByteView;
 use ed25519_dalek::Signer;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,11 +50,8 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
-pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 
 /// Identity, realm trust roots, and the shared issuer-key cache. The `Arc`
@@ -94,7 +89,7 @@ impl IdentityState {
 
     async fn persist_trusted_realms(&self, driver_ctx: &DriverContext) {
         let trusted_realms = self.trusted_realms_list.read().await.clone();
-        persist_state(driver_ctx, REALMS_LIST_KEY, &trusted_realms).await;
+        save_state(driver_ctx, REALMS_LIST_KEY, &trusted_realms).await;
     }
 
     async fn claim_initial_admin(
@@ -153,7 +148,7 @@ impl IdentityState {
             return;
         };
         let claimed = initial_admin_claim.load(Ordering::Acquire);
-        persist_state(driver_ctx, ADMIN_CLAIMED_KEY, &claimed).await;
+        save_state(driver_ctx, ADMIN_CLAIMED_KEY, &claimed).await;
     }
 }
 
@@ -208,7 +203,6 @@ struct AssistantConnections {
 /// (driver context, semaphores, locks, caches) rather than duplicating them.
 #[derive(Clone, Debug)]
 pub struct ServerState {
-    git: Option<Arc<aruna_blob::git::GitStore>>,
     // Contains necessary drivers for request handling.
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -222,33 +216,6 @@ pub struct ServerState {
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PortalStatus {
-    pub installed: bool,
-    pub mode: String,
-    pub version: Option<String>,
-    pub source: Option<String>,
-    pub url: Option<String>,
-    pub checksum: Option<String>,
-    pub fetched_at: Option<String>,
-    pub last_error: Option<String>,
-}
-
-impl Default for PortalStatus {
-    fn default() -> Self {
-        Self {
-            installed: false,
-            mode: "disabled".to_string(),
-            version: None,
-            source: None,
-            url: None,
-            checksum: None,
-            fetched_at: None,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,17 +262,20 @@ impl ServerState {
         oidc_validator: Option<Arc<OidcValidator>>,
         jobs_runtime: Arc<JobsRuntime>,
     ) -> Self {
-        let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
-            driver_ctx.as_ref(),
-            REALMS_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
+        let realms =
+            LoadStateOperation::<HashSet<RealmId, ahash::RandomState>>::new(REALMS_LIST_KEY);
+        let mut trusted_realms =
+            loaded(drive(realms, driver_ctx.as_ref()).await).unwrap_or_default();
         let initial_admin_claim = if claim_initial_admin {
             Some(Arc::new(AtomicBool::new(
-                load_persisted_state::<bool>(driver_ctx.as_ref(), ADMIN_CLAIMED_KEY)
-                    .await
-                    .unwrap_or(false),
+                loaded(
+                    drive(
+                        LoadStateOperation::new(ADMIN_CLAIMED_KEY),
+                        driver_ctx.as_ref(),
+                    )
+                    .await,
+                )
+                .unwrap_or(false),
             )))
         } else {
             None
@@ -323,7 +293,6 @@ impl ServerState {
             .as_ref()
             .map_or_else(Default::default, |net| net.download_gauge().clone());
         let state = Self {
-            git: None,
             driver_ctx,
             jobs_runtime,
             metrics: Arc::new(NodeMetrics::new()),
@@ -391,19 +360,6 @@ impl ServerState {
 
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
-    }
-
-    pub fn with_git(mut self, root: PathBuf, helper: PathBuf) -> Self {
-        let store = Arc::new(aruna_blob::git::GitStore::new(root, helper));
-        self.git = Some(match &self.driver_ctx.metadata_handle {
-            Some(handle) => handle.install_git(store),
-            None => store,
-        });
-        self
-    }
-
-    pub fn git(&self) -> Option<&aruna_blob::git::GitStore> {
-        self.git.as_deref()
     }
 
     pub fn metrics(&self) -> Arc<NodeMetrics> {
@@ -787,55 +743,21 @@ impl ArunaValidationState for ServerState {
     }
 }
 
-pub async fn load_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8]) -> Option<T>
-where
-    T: DeserializeOwned,
-{
-    match driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => match postcard::from_bytes(&bytes) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warn!(error = %error, "Failed to decode persisted API state");
-                None
-            }
-        },
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to load persisted API state");
-            None
-        }
-        _ => None,
-    }
+/// A loaded API state row; a failed load counts as absent.
+fn loaded<T>(result: Result<Option<T>, StateError>) -> Option<T> {
+    result.unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to load persisted API state");
+        None
+    })
 }
 
-pub async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
-where
-    T: Serialize,
-{
-    let Ok(bytes) = postcard::to_allocvec(value) else {
-        warn!("Failed to serialize API state for persistence");
-        return;
+/// Saves one API state row; a failure only warns, as the state is rebuilt on change.
+async fn save_state<T: Serialize>(driver_ctx: &DriverContext, key: &[u8], value: &T) {
+    let saved = match SaveStateOperation::new(key, value) {
+        Ok(operation) => drive(operation, driver_ctx).await,
+        Err(error) => Err(error),
     };
-
-    if let Event::Storage(StorageEvent::Error { error }) = driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(bytes),
-            txn_id: None,
-        }))
-        .await
-    {
+    if let Err(error) = saved {
         warn!(error = %error, "Failed to persist API state");
     }
 }
@@ -856,50 +778,6 @@ impl RestInterfaceRuntime {
             swagger_ui_url: format!("{base_url}/swagger-ui"),
             base_url,
         }
-    }
-}
-
-pub fn client_bind_url(bind_address: SocketAddr) -> String {
-    format!(
-        "http://{}:{}",
-        host_for_ip(bind_address.ip()),
-        bind_address.port()
-    )
-}
-
-pub fn client_host_url(advertised_host: &str, bind_address: SocketAddr) -> String {
-    let host = match advertised_host.trim() {
-        "" => return client_bind_url(bind_address),
-        host => {
-            if host.contains("://") {
-                return host.trim_end_matches('/').to_string();
-            }
-
-            if let Ok(addr) = host.parse::<SocketAddr>() {
-                return format!("http://{}:{}", host_for_ip(addr.ip()), addr.port());
-            }
-
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                return format!("http://{}:{}", host_for_ip(ip), bind_address.port());
-            }
-
-            host
-        }
-    };
-
-    format!("http://{host}")
-}
-
-fn host_for_ip(ip: std::net::IpAddr) -> String {
-    match ip {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-            std::net::Ipv4Addr::LOCALHOST.to_string()
-        }
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-            format!("[{}]", std::net::Ipv6Addr::LOCALHOST)
-        }
-        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-        std::net::IpAddr::V4(ip) => ip.to_string(),
     }
 }
 

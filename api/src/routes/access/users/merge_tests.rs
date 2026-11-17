@@ -6,8 +6,9 @@ use super::{
     RegisterUserRequest, RegisterUserResponse, TestNode, TestOidcClaims, register_via_oidc,
     sign_claims, spawn_oidc_provider, spawn_test_node,
 };
-use crate::routes::access::users::{GetTokenResponse, GetUserResponse};
+use crate::routes::access::users::GetUserResponse;
 use aruna_core::keys::generate_signing_key;
+use aruna_wire::users::GetTokenResponse;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};

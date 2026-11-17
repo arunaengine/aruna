@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna_api::routes::info::InfoResponse;
-use aruna_api::server::state::client_bind_url;
 use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_wire::address::client_bind_url;
+use aruna_wire::info::InfoResponse;
 use reqwest::Client;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -568,14 +568,11 @@ mod tests {
 
         let info = fetch_info(node.http_addr, None).await.unwrap();
 
-        assert_eq!(
-            info.node.status,
-            aruna_api::routes::info::ServiceStatus::Available
-        );
+        assert_eq!(info.node.status, aruna_wire::info::ServiceStatus::Available);
         assert!(!info.api_version.is_empty());
         assert_eq!(
             info.services.interfaces.rest.status,
-            aruna_api::routes::info::ServiceStatus::Available
+            aruna_wire::info::ServiceStatus::Available
         );
         let api_url = format!("http://{}/api/v1", node.http_addr);
         assert_eq!(

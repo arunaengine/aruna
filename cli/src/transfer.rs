@@ -4,11 +4,13 @@
 
 use crate::client::Api;
 use crate::error::{CliError, s3_error};
+use aruna_wire::info::InfoResponse;
+use aruna_wire::session::{CLIENT_REFRESH_WINDOW, SessionTokenResponse};
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::{ByteStream, Length};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::io::Read;
 use std::path::Path;
 use tokio::io::AsyncWriteExt;
@@ -19,48 +21,15 @@ pub const S3_REGION: &str = "us-east-1";
 const MAX_PARTS: u64 = 10_000;
 const PART_UPLOADS: usize = 4;
 const PARTIAL_SUFFIX: &str = ".aruna-part";
-/// The node refreshes a session from five minutes before its expiry; one minute is kept for skew.
-const REFRESH_BEFORE: chrono::TimeDelta = chrono::TimeDelta::minutes(4);
+const REFRESH_BEFORE: chrono::TimeDelta =
+    chrono::TimeDelta::seconds(CLIENT_REFRESH_WINDOW.as_secs() as i64);
 
-/// A short-lived S3 session of one group on one node.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A short-lived S3 session of one group on one node, and the endpoint it is used at.
+/// Restrictions are set only for a path-restricted token, which can neither refresh nor revoke.
+#[derive(Clone, Debug)]
 pub struct S3Session {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: String,
-    pub expires_at: String,
-    pub issuer_node: Issuer,
-    /// Set only for a path-restricted token, which can neither refresh nor revoke the session.
-    #[serde(default)]
-    pub restrictions: Vec<serde_json::Value>,
-    #[serde(default)]
+    pub token: SessionTokenResponse,
     pub endpoint: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Issuer {
-    pub node_id: String,
-    pub s3_endpoint: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct NodeInfo {
-    services: Services,
-}
-
-#[derive(Deserialize)]
-struct Services {
-    interfaces: Interfaces,
-}
-
-#[derive(Deserialize)]
-struct Interfaces {
-    s3: Interface,
-}
-
-#[derive(Deserialize)]
-struct Interface {
-    url: Option<String>,
 }
 
 /// Asks `api`'s node for an S3 session of `group_id`; it is valid on that node only.
@@ -89,10 +58,15 @@ async fn request_session(
     fallback: Option<&str>,
 ) -> Result<S3Session, CliError> {
     let body = serde_json::json!({ "group_id": group_id });
-    let mut session: S3Session = api.send(Method::POST, "access/s3/sessions", &body).await?;
-    session.endpoint = match session.issuer_node.s3_endpoint.clone() {
+    let token: SessionTokenResponse = api.send(Method::POST, "access/s3/sessions", &body).await?;
+    let mut session = S3Session {
+        token,
+        endpoint: String::new(),
+    };
+    let issuer = &session.token.issuer_node;
+    session.endpoint = match issuer.s3_endpoint.clone() {
         Some(endpoint) => endpoint,
-        None => match node_endpoint(api, fallback, &session.issuer_node.node_id).await {
+        None => match node_endpoint(api, fallback, &issuer.node_id).await {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 revoke_session(api, &session).await;
@@ -109,7 +83,7 @@ pub(crate) async fn node_endpoint(
     fallback: Option<&str>,
     node_id: &str,
 ) -> Result<String, CliError> {
-    let info: NodeInfo = api.get("system/info", &[]).await?;
+    let info: InfoResponse = api.get("system/info", &[]).await?;
     info.services
         .interfaces
         .s3
@@ -125,14 +99,15 @@ pub(crate) async fn node_endpoint(
 /// Revokes a session; a failure only warns, as the session ends at its expiry anyway.
 /// A path-restricted token may not revoke, so its session is left to expire.
 pub async fn revoke_session(api: &Api, session: &S3Session) {
-    if !session.restrictions.is_empty() {
+    let token = &session.token;
+    if !token.restrictions.is_empty() {
         return;
     }
-    let path = format!("access/s3/sessions/{}", session.access_key_id);
+    let path = format!("access/s3/sessions/{}", token.access_key_id);
     if let Err(error) = api.delete(&path).await {
         eprintln!(
             "warning: the S3 session {} was not revoked: {error}",
-            session.access_key_id
+            token.access_key_id
         );
     }
 }
@@ -146,10 +121,11 @@ fn client_config(endpoint: &str) -> aws_sdk_s3::config::Builder {
 }
 
 pub fn s3_client(session: &S3Session) -> aws_sdk_s3::Client {
+    let token = &session.token;
     let credentials = Credentials::new(
-        &session.access_key_id,
-        &session.secret_access_key,
-        Some(session.session_token.clone()),
+        &token.access_key_id,
+        &token.secret_access_key,
+        Some(token.session_token.clone()),
         None,
         "aruna-cli",
     );
@@ -201,25 +177,25 @@ impl S3Access {
             return Ok(self.client.clone());
         };
         let now = chrono::Utc::now();
-        if !expires_within(&session.expires_at, now, REFRESH_BEFORE) {
+        if !expires_within(&session.token.expires_at, now, REFRESH_BEFORE) {
             return Ok(self.client.clone());
         }
-        if !session.restrictions.is_empty() {
-            return Err(cannot_refresh(&session.expires_at));
+        if !session.token.restrictions.is_empty() {
+            return Err(cannot_refresh(&session.token.expires_at));
         }
-        let path = format!("access/s3/sessions/{}/refresh", session.access_key_id);
+        let path = format!("access/s3/sessions/{}/refresh", session.token.access_key_id);
         match self
             .api
-            .send::<S3Session>(Method::POST, &path, &serde_json::json!({}))
+            .send::<SessionTokenResponse>(Method::POST, &path, &serde_json::json!({}))
             .await
         {
             Ok(fresh) => {
-                let endpoint = std::mem::take(&mut session.endpoint);
-                *session = S3Session { endpoint, ..fresh };
+                session.token = fresh;
                 self.client = s3_client(session);
             }
             // The node may see the refresh window later; the old pair works until expiry.
-            Err(_) if !expires_within(&session.expires_at, now, chrono::TimeDelta::zero()) => {}
+            Err(_)
+                if !expires_within(&session.token.expires_at, now, chrono::TimeDelta::zero()) => {}
             Err(error) => return Err(error),
         }
         Ok(self.client.clone())
@@ -630,6 +606,9 @@ pub async fn download(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_wire::session::{
+        SessionGroupResponse, SessionIssuerResponse, SessionRestrictionResponse,
+    };
 
     #[test]
     fn splits_into_parts() {
@@ -704,16 +683,23 @@ mod tests {
     #[tokio::test]
     async fn refuses_restricted_refresh() {
         let soon = chrono::Utc::now() + chrono::TimeDelta::minutes(1);
-        let session = S3Session {
+        let token = SessionTokenResponse {
             access_key_id: "key".into(),
             secret_access_key: "secret".into(),
             session_token: "token".into(),
             expires_at: soon.to_rfc3339(),
-            issuer_node: Issuer {
+            group: SessionGroupResponse { id: "g".into() },
+            restrictions: vec![SessionRestrictionResponse {
+                pattern: "/r/g/*".into(),
+                permission: "READ".into(),
+            }],
+            issuer_node: SessionIssuerResponse {
                 node_id: "node".into(),
                 s3_endpoint: None,
             },
-            restrictions: vec![serde_json::json!({ "pattern": "/r/g/*", "permission": "READ" })],
+        };
+        let session = S3Session {
+            token,
             endpoint: "http://127.0.0.1:1".into(),
         };
         // The refusal comes before any request, so the unreachable API is never called.

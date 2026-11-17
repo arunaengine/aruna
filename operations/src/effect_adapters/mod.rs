@@ -7,6 +7,7 @@ mod blob;
 mod metadata;
 mod net;
 pub mod routing;
+mod session;
 mod storage;
 mod task;
 
@@ -136,6 +137,9 @@ pub(crate) async fn dispatch_effect_until(
             let results = group.members.iter().map(|_| GroupResult::Refused).collect();
             Event::Group(GroupEvent::Finished { results })
         }
+        Effect::Session(effect) => {
+            Event::Session(Box::new(session::dispatch_session(*effect, context).await))
+        }
     };
 
     trace!(
@@ -169,5 +173,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Search() => "search",
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_compute::ExecutorBackend;
-use aruna_compute::session::EndReason;
+use aruna_core::compute::session::EndReason;
 use aruna_core::compute::{AttemptStatus, BackendError, FenceContext};
 use aruna_core::structs::execution::job::{ExecutionSpec, JobId};
 use aruna_core::time::unix_timestamp_millis;

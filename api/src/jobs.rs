@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
-use std::sync::Arc;
 
-use aruna_compute::session::Session;
 use aruna_core::compute::normalize_container_path;
 use aruna_core::compute::runtimes::MOUNT_PREFIX_TAG;
+use aruna_core::compute::session::{SessionAnswer, SessionError, SessionRequest};
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
     CollisionPolicy, CompositionError, ComputeResources, ExecutionSpec, InputMode, InputSelection,
@@ -29,6 +28,7 @@ use aruna_operations::jobs::command::{
 use aruna_operations::jobs::lifecycle::routing::session_job;
 use aruna_operations::jobs::lifecycle::submit_external_job;
 use aruna_operations::jobs::service::read_owned_job;
+use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::jobs::submit::SubmitJobError;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use ulid::Ulid;
@@ -385,24 +385,36 @@ pub(crate) async fn owned_session_job(
         .map_err(JobRequestError::from_route)
 }
 
-/// The caller's live session on this node, for callers that have no coded
+/// The answer of the caller's live session on this node, for callers that have no coded
 /// answer of their own. Absence reads as 404 like every other session route.
 pub(crate) async fn caller_session(
     state: &ServerState,
     auth: &AuthContext,
     raw_job_id: &str,
-) -> Result<Arc<Session>, JobRequestError> {
+    request: SessionRequest,
+) -> Result<SessionAnswer, JobRequestError> {
     let (record, physical_job_id) = owned_session_job(state, auth, raw_job_id).await?;
     if record.owner_node_id != state.get_node_id() {
         return Err(JobRequestError::NotFound);
     }
     let job_id = physical_job_id.ok_or(JobRequestError::NotFound)?;
-    state
-        .get_ctx()
-        .compute_handle
-        .as_ref()
-        .and_then(|registry| registry.sessions().get(&job_id.to_string()))
-        .ok_or(JobRequestError::NotFound)
+    match session_call(state, job_id, request).await {
+        SessionAnswer::Missing => Err(JobRequestError::NotFound),
+        answer => Ok(answer),
+    }
+}
+
+/// Asks the live session of `job_id` on this node one request.
+pub(crate) async fn session_call(
+    state: &ServerState,
+    job_id: JobId,
+    request: SessionRequest,
+) -> SessionAnswer {
+    let operation = SessionOperation::new(job_id.to_string(), request);
+    match drive(operation, &state.get_ctx()).await {
+        Ok(answer) => answer,
+        Err(_) => SessionAnswer::Refused(SessionError::NoReply),
+    }
 }
 
 /// A blank label carries no more than an absent one, so it is stored as absent.

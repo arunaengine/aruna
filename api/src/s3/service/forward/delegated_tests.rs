@@ -371,7 +371,7 @@ async fn framed_send(
 
 fn crc32(body: &[u8]) -> String {
     use base64::Engine;
-    let mut sums = aruna_blob::hash::Hasher::new();
+    let mut sums = aruna_core::structs::checksum::Hasher::new();
     sums.update(body);
     let crc = sums.to_map()[aruna_core::structs::checksum::HASH_CRC32].clone();
     base64::engine::general_purpose::STANDARD.encode(crc)

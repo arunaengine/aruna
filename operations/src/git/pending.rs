@@ -174,11 +174,7 @@ pub fn spawn_drain(context: Arc<DriverContext>, shutdown: &Shutdown) {
 }
 
 async fn drain(context: &DriverContext) {
-    let Some(store) = context
-        .metadata_handle
-        .as_ref()
-        .and_then(|handle| handle.git())
-    else {
+    let Ok(store) = super::store(context) else {
         return;
     };
     let rows = match records::prefixed::<PendingMerge>(context, PENDING, Vec::new()).await {

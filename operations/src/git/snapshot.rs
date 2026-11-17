@@ -733,11 +733,7 @@ fn background(context: &DriverContext, document: &MetadataRegistryRecord) {
     let context = context.clone();
     let document = document.clone();
     tokio::spawn(async move {
-        if let Some(store) = context
-            .metadata_handle
-            .as_ref()
-            .and_then(|handle| handle.git())
-        {
+        if let Ok(store) = super::store(&context) {
             let refreshing = timed(id, async {
                 let _guard = lock(id).await;
                 refresh(&context, store, &document).await
@@ -838,11 +834,7 @@ pub async fn capture(
     record: &MetadataRegistryRecord,
     revision: Option<&MetadataRawRevision>,
 ) -> Result<(), GitError> {
-    let Some(store) = context
-        .metadata_handle
-        .as_ref()
-        .and_then(|handle| handle.git())
-    else {
+    let Ok(store) = super::store(context) else {
         return Ok(());
     };
     timed(record.document_id, async {
@@ -873,7 +865,6 @@ async fn timed<T>(document_id: Ulid, work: impl std::future::Future<Output = T>)
 /// whether a newer snapshot is still being made.
 pub async fn status(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<
@@ -886,6 +877,7 @@ pub async fn status(
     ),
     GitError,
 > {
+    let store = super::store(context)?;
     let (document, _) = super::repository(context, auth, id, Permission::READ).await?;
     // Status never waits for a first snapshot either; it reports an empty pending state.
     let (projection, pending) = match super::project::try_lock(id) {
@@ -926,11 +918,11 @@ pub async fn status(
 
 pub async fn export(
     context: &DriverContext,
-    store: &GitStore,
     auth: &AuthContext,
     id: Ulid,
     revision: String,
 ) -> Result<Bytes, GitError> {
+    let store = super::store(context)?;
     let document = document(context, auth, id, Permission::READ).await?;
     read_view(context, store, &document).await?;
     let known = GitEffect::Resolve {

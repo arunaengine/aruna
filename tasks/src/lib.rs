@@ -6,7 +6,6 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub mod join_registry;
 pub mod shutdown;
 
 use aruna_core::effects::Effect;

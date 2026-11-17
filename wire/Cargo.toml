@@ -1,0 +1,16 @@
+# Manifest of aruna-wire, the request and response types the api and its clients share.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-core = { workspace = true }
+serde = { workspace = true }
+utoipa = { workspace = true }

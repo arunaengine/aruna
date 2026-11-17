@@ -330,6 +330,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-wire",
  "aws-sdk-s3",
  "aws-smithy-http-client",
  "aws-smithy-runtime-api",
@@ -385,9 +386,9 @@ dependencies = [
  "aruna-core",
  "aruna-net",
  "aruna-operations",
- "aruna-plugins",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-wire",
  "astral_async_zip",
  "async-trait",
  "axum",
@@ -467,7 +468,6 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "chrono",
- "crc-fast",
  "futures",
  "getrandom 0.4.3",
  "hex",
@@ -485,7 +485,6 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "sha1 0.11.0",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
@@ -504,6 +503,7 @@ version = "3.0.0-alpha.207"
 dependencies = [
  "apple-native-keyring-store",
  "aruna-plugins",
+ "aruna-wire",
  "aws-sdk-s3",
  "base64 0.23.1",
  "blake3",
@@ -583,6 +583,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "craqle",
+ "crc-fast",
  "csv",
  "ed25519-dalek 3.0.0",
  "flate2",
@@ -595,6 +596,7 @@ dependencies = [
  "ipnet",
  "iroh",
  "irokle",
+ "md5",
  "nix",
  "opentelemetry",
  "oxrdf",
@@ -607,6 +609,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "sha1 0.11.0",
  "sha2 0.11.0",
  "smallvec",
  "subtle",
@@ -634,6 +637,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aruna-wire",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -895,6 +899,15 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "aruna-wire"
+version = "3.0.0-alpha.207"
+dependencies = [
+ "aruna-core",
+ "serde",
+ "utoipa",
 ]
 
 [[package]]
