@@ -85,7 +85,7 @@ pub enum ReconcileError {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ReconcileState {
     Init,
     ReadBases,
@@ -564,7 +564,7 @@ impl Operation for ReconcileFolderOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             ReconcileState::ReadBases => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {

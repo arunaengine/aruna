@@ -31,7 +31,7 @@ pub struct EnqueueDraftOperation {
     output: Option<Result<PublishEntry, EnqueueDraftError>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum EnqueueDraftState {
     Init,
     StartTransaction,
@@ -137,7 +137,7 @@ impl Operation for EnqueueDraftOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             EnqueueDraftState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {

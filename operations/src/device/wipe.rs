@@ -40,7 +40,7 @@ pub struct WipeDeviceOperation {
     output: Option<Result<NodeId, WipeDeviceError>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum WipeDeviceState {
     Init,
     SyncStorage,
@@ -96,7 +96,7 @@ impl Operation for WipeDeviceOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             WipeDeviceState::SyncStorage => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::SyncAllFinished) = event else {

@@ -19,7 +19,7 @@ pub struct InspectDraftOperation {
     output: Option<Result<PublishEntry, InspectDraftError>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum InspectDraftState {
     Init,
     ReadEntry,
@@ -72,7 +72,7 @@ impl Operation for InspectDraftOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             InspectDraftState::ReadEntry => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {

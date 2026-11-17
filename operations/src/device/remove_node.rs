@@ -68,20 +68,30 @@ enum RemoveNodeState {
         reducer_state_value: Option<Value>,
     },
     WriteDocumentState {
-        document: RealmConfigDocument,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
+    DeleteAdminConflicts,
+    CommitTransaction,
+    ScheduleSyncDrain,
     Finish,
     Error,
+}
+
+impl RemoveNodeState {
+    fn name(&self) -> &'static str {
+        match self {
+            RemoveNodeState::Init => "init",
+            RemoveNodeState::StartTransaction => "start transaction",
+            RemoveNodeState::ReadCurrent => "read current",
+            RemoveNodeState::ReadCutoffs { .. } => "read cutoffs",
+            RemoveNodeState::WriteDocumentState { .. } => "write document state",
+            RemoveNodeState::DeleteAdminConflicts => "delete admin conflicts",
+            RemoveNodeState::CommitTransaction => "commit transaction",
+            RemoveNodeState::ScheduleSyncDrain => "schedule sync drain",
+            RemoveNodeState::Finish => "finish",
+            RemoveNodeState::Error => "error",
+        }
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -250,9 +260,8 @@ impl RemoveNodeOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
+        self.output = Some(Ok(document));
         self.state = RemoveNodeState::WriteDocumentState {
-            document,
             stale_conflict_deletes,
         };
 
@@ -262,11 +271,11 @@ impl RemoveNodeOperation {
         })])
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
+    fn emit_commit_transaction(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.fail(RemoveNodeError::MissingTransaction);
         };
-        self.state = RemoveNodeState::CommitTransaction { document };
+        self.state = RemoveNodeState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -277,10 +286,9 @@ impl RemoveNodeOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
+    fn unexpected_event(&mut self, state: &str, expected: &'static str, got: String) -> Effects {
         self.fail(RemoveNodeError::UnexpectedEvent {
-            state,
+            state: state.to_string(),
             expected,
             got,
         })
@@ -299,13 +307,16 @@ impl Operation for RemoveNodeOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
+        let name = self.state.name();
+        match std::mem::replace(&mut self.state, RemoveNodeState::Error) {
             RemoveNodeState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event(name, "transaction start result", format!("{other:?}"))
+                }
             },
             RemoveNodeState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -316,6 +327,7 @@ impl Operation for RemoveNodeOperation {
                     ] = values.as_slice()
                     else {
                         return self.unexpected_event(
+                            name,
                             "storage batch read result with realm config and reducer state",
                             format!("{values:?}"),
                         );
@@ -340,7 +352,9 @@ impl Operation for RemoveNodeOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event(name, "storage batch read result", format!("{other:?}"))
+                }
             },
             RemoveNodeState::ReadCutoffs {
                 document_value,
@@ -357,10 +371,9 @@ impl Operation for RemoveNodeOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("publisher index rows", format!("{other:?}")),
+                other => self.unexpected_event(name, "publisher index rows", format!("{other:?}")),
             },
             RemoveNodeState::WriteDocumentState {
-                document,
                 stale_conflict_deletes,
             } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -368,37 +381,43 @@ impl Operation for RemoveNodeOperation {
                         return self.fail(RemoveNodeError::MissingTransaction);
                     };
                     if !stale_conflict_deletes.is_empty() {
-                        self.state = RemoveNodeState::DeleteAdminConflicts { document };
+                        self.state = RemoveNodeState::DeleteAdminConflicts;
                         return smallvec![Effect::Storage(StorageEffect::BatchDelete {
                             deletes: stale_conflict_deletes,
                             txn_id: Some(txn_id),
                         })];
                     }
-                    self.emit_commit_transaction(document)
+                    self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event(name, "storage batch write result", format!("{other:?}"))
+                }
             },
-            RemoveNodeState::DeleteAdminConflicts { document } => match event {
+            RemoveNodeState::DeleteAdminConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+                    self.emit_commit_transaction()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event(name, "storage batch delete result", format!("{other:?}"))
+                }
             },
-            RemoveNodeState::CommitTransaction { document } => match event {
+            RemoveNodeState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = RemoveNodeState::ScheduleSyncDrain { document };
+                    self.state = RemoveNodeState::ScheduleSyncDrain;
                     smallvec![schedule_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event(name, "transaction commit result", format!("{other:?}"))
+                }
             },
-            RemoveNodeState::ScheduleSyncDrain { .. } => match event {
+            RemoveNodeState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = RemoveNodeState::Finish;
                     smallvec![]
@@ -409,11 +428,13 @@ impl Operation for RemoveNodeOperation {
                     smallvec![]
                 }
                 other => self.unexpected_event(
+                    name,
                     "document sync outbox drain timer schedule",
                     format!("{other:?}"),
                 ),
             },
-            RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init => {
+            state @ (RemoveNodeState::Finish | RemoveNodeState::Error | RemoveNodeState::Init) => {
+                self.state = state;
                 smallvec![]
             }
         }

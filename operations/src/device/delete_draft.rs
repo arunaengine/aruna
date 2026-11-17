@@ -18,23 +18,18 @@ use super::publish_queue::{PublishEntry, PublishState, publish_key, read_publish
 pub struct DeleteDraftOperation {
     draft_id: Ulid,
     state: DeleteDraftState,
+    /// The deleted entry, held until the delete commits.
+    entry: Option<Box<PublishEntry>>,
     output: Option<Result<PublishEntry, DeleteDraftError>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum DeleteDraftState {
     Init,
     StartTransaction,
-    ReadEntry {
-        txn_id: TxnId,
-    },
-    DeleteEntry {
-        txn_id: TxnId,
-        entry: Box<PublishEntry>,
-    },
-    CommitTransaction {
-        entry: Box<PublishEntry>,
-    },
+    ReadEntry { txn_id: TxnId },
+    DeleteEntry { txn_id: TxnId },
+    CommitTransaction,
     Finish,
     Error,
 }
@@ -64,6 +59,7 @@ impl DeleteDraftOperation {
         Self {
             draft_id,
             state: DeleteDraftState::Init,
+            entry: None,
             output: None,
         }
     }
@@ -88,7 +84,7 @@ impl Operation for DeleteDraftOperation {
             other => other,
         };
 
-        match self.state.clone() {
+        match self.state {
             DeleteDraftState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -128,10 +124,8 @@ impl Operation for DeleteDraftOperation {
                 if matches!(entry.state, PublishState::Publishing { .. }) {
                     return fail(self, DeleteDraftError::PublishInFlight);
                 }
-                self.state = DeleteDraftState::DeleteEntry {
-                    txn_id,
-                    entry: Box::new(entry),
-                };
+                self.entry = Some(Box::new(entry));
+                self.state = DeleteDraftState::DeleteEntry { txn_id };
                 smallvec![Effect::Storage(StorageEffect::BatchDelete {
                     deletes: vec![
                         (
@@ -146,7 +140,7 @@ impl Operation for DeleteDraftOperation {
                     txn_id: Some(txn_id),
                 })]
             }
-            DeleteDraftState::DeleteEntry { txn_id, entry } => {
+            DeleteDraftState::DeleteEntry { txn_id } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return fail(
@@ -158,10 +152,10 @@ impl Operation for DeleteDraftOperation {
                         },
                     );
                 };
-                self.state = DeleteDraftState::CommitTransaction { entry };
+                self.state = DeleteDraftState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            DeleteDraftState::CommitTransaction { entry } => {
+            DeleteDraftState::CommitTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
@@ -172,6 +166,9 @@ impl Operation for DeleteDraftOperation {
                             got,
                         },
                     );
+                };
+                let Some(entry) = self.entry.take() else {
+                    return fail(self, DeleteDraftError::NotFinished);
                 };
                 self.state = DeleteDraftState::Finish;
                 self.output = Some(Ok(*entry));
@@ -196,8 +193,7 @@ impl Operation for DeleteDraftOperation {
 
     fn abort(&mut self) -> Effects {
         match &self.state {
-            DeleteDraftState::ReadEntry { txn_id }
-            | DeleteDraftState::DeleteEntry { txn_id, .. } => {
+            DeleteDraftState::ReadEntry { txn_id } | DeleteDraftState::DeleteEntry { txn_id } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction {
                     txn_id: *txn_id
                 })]
