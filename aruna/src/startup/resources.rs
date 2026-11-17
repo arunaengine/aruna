@@ -695,7 +695,6 @@ mod tests {
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
     use aruna_operations::node::counter_check::CounterCheckError;
     use aruna_storage::StorageHandle;
-    use std::thread;
     use tempfile::tempdir;
 
     fn test_driver_ctx(storage_handle: StorageHandle) -> DriverContext {
