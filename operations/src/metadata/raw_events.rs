@@ -6,10 +6,13 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::EVENT_LOG_KEYSPACE;
-use aruna_core::metadata::{EVENT_LIMIT, MetadataError, MetadataEventRecord, RAW_BYTES_LIMIT};
+use aruna_core::metadata::{
+    EVENT_LIMIT, MetadataError, MetadataEventRecord, MetadataRawRevision, RAW_BYTES_LIMIT,
+};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{event_log_key, event_log_prefix, pending_projection_target};
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -98,6 +101,24 @@ pub(crate) fn validate_raw_entry(
         )));
     }
     Ok(())
+}
+
+/// The base event a raw revision was folded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct RawBaseIdentity {
+    pub(crate) updated_at_ms: u64,
+    pub(crate) event_id: Ulid,
+}
+
+/// The folded raw state stored per document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RawRevisionState {
+    pub(crate) base: Option<RawBaseIdentity>,
+    pub(crate) last_event_id: Ulid,
+    pub(crate) revision: Option<MetadataRawRevision>,
+    /// Set once a batch has merged into the graph. From then on the rendered
+    /// graph owns this document's revision and no text event rebuilds it.
+    pub(crate) merged: bool,
 }
 
 #[derive(Debug, PartialEq)]

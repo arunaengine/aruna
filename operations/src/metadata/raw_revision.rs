@@ -5,20 +5,13 @@
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    RAW_REVISION_KEYSPACE,
-};
+use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
-    MetadataEventRecord, MetadataLifecycleRecord, MetadataMergedRevision, MetadataRawRevision,
-    apply_raw_event, raw_context_digest, resolve_raw_revision,
+    MaterializationState, MetadataError, MetadataEventPayload, MetadataEventRecord,
+    MetadataMergedRevision, MetadataRawRevision, apply_raw_event, raw_context_digest,
+    resolve_raw_revision,
 };
-use aruna_core::storage_entries::{
-    document_lifecycle_key, event_log_key, graph_lifecycle_key, raw_revision_key,
-};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::storage_entries::{event_log_key, raw_revision_key};
 use aruna_core::types::TxnId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -26,29 +19,13 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::raw_events::{
-    RAW_ENCODED_LIMIT, RawEventsOperation, RawLoadBudget, RawReadError, budget_error,
-    validate_raw_entry,
+    RAW_ENCODED_LIMIT, RawBaseIdentity, RawEventsOperation, RawLoadBudget, RawReadError,
+    RawRevisionState, budget_error, validate_raw_entry,
 };
-use crate::metadata::repository::{parse_status_read, read_status_effect};
+use crate::metadata::revision_read::RawViewOperation;
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct RawBaseIdentity {
-    updated_at_ms: u64,
-    event_id: Ulid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RawRevisionState {
-    base: Option<RawBaseIdentity>,
-    last_event_id: Ulid,
-    revision: Option<MetadataRawRevision>,
-    /// Set once a batch has merged into the graph. From then on the rendered
-    /// graph owns this document's revision and no text event rebuilds it.
-    merged: bool,
 }
 
 #[derive(Debug, Default)]
@@ -83,21 +60,8 @@ pub(crate) async fn load_raw_view(
     document_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawView>, RawReadError> {
-    let status = parse_status_read(
-        context
-            .storage_handle
-            .send_effect(read_status_effect(document_id, txn_id))
-            .await,
-    )
-    .map_err(|error| match error {
-        crate::metadata::repository::StorageReadError::Storage(error) => {
-            RawReadError::Storage(error)
-        }
-        crate::metadata::repository::StorageReadError::Conversion(error) => {
-            RawReadError::Conversion(error)
-        }
-    })?;
-    let revision = load_raw_revision(context, document_id, txn_id).await?;
+    let (status, revision) =
+        drive(RawViewOperation::new(document_id, txn_id, true), context).await?;
     let Some(revision) = revision else {
         return Ok(None);
     };
@@ -125,22 +89,8 @@ pub async fn load_raw_revision(
     document_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Option<MetadataRawRevision>, RawReadError> {
-    if raw_deleted(context, document_id, txn_id).await? {
-        return Ok(None);
-    }
-    // Once a batch has merged, the rendered graph is the document's revision;
-    // the authored-text replay only serves a document until then.
-    if let Some(state) = read_raw_state(context, document_id, txn_id).await?
-        && state.merged
-    {
-        return Ok(state.revision);
-    }
-    let events = drive(
-        RawEventsOperation::new(document_id, None, None, txn_id, RawLoadBudget::default()),
-        context,
-    )
-    .await?;
-    resolve_raw_revision(&events).map_err(Into::into)
+    let operation = RawViewOperation::new(document_id, txn_id, false);
+    Ok(drive(operation, context).await?.1)
 }
 
 /// Digest of the displayed revision, read without replaying the event log.
@@ -152,57 +102,6 @@ pub(crate) async fn load_raw_digest(
         .await?
         .and_then(|state| state.revision)
         .and_then(|revision| revision.dataset_digest))
-}
-
-async fn raw_deleted(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<bool, RawReadError> {
-    let document = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: document_lifecycle_key(document_id),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| {
-                postcard::from_bytes::<MetadataLifecycleRecord>(&value)
-                    .map(|record| matches!(record, MetadataLifecycleRecord::Delete { .. }))
-                    .map_err(ConversionError::from)
-            })
-            .transpose()?
-            .unwrap_or(false),
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(RawReadError::UnexpectedEvent(other.label().to_string())),
-    };
-    if document {
-        return Ok(true);
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| {
-                postcard::from_bytes::<GraphLifecycleRecord>(&value)
-                    .map(|record| record.is_deleted())
-                    .map_err(ConversionError::from)
-            })
-            .transpose()
-            .map(|deleted| deleted.unwrap_or(false))
-            .map_err(RawReadError::from),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
-    }
 }
 
 pub(crate) async fn prepare_raw_event(
