@@ -48,23 +48,20 @@ fn storage_error(event: Event) -> ShareStoreError {
     }
 }
 
-/// The batch that writes one link record and its owner index row.
-pub fn save_effect(link: &ShareLink) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes: vec![
-            (
-                SHARE_LINK_KEYSPACE.to_string(),
-                link.id.to_bytes().to_vec().into(),
-                link.to_bytes()?.into(),
-            ),
-            (
-                SHARE_OWNER_KEYSPACE.to_string(),
-                owner_key(&link.created_by, link.id).into(),
-                Vec::new().into(),
-            ),
-        ],
-        txn_id: None,
-    }))
+/// The rows of one link record and its owner index row.
+pub fn save_rows(link: &ShareLink) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    Ok(vec![
+        (
+            SHARE_LINK_KEYSPACE.to_string(),
+            link.id.to_bytes().to_vec().into(),
+            link.to_bytes()?.into(),
+        ),
+        (
+            SHARE_OWNER_KEYSPACE.to_string(),
+            owner_key(&link.created_by, link.id).into(),
+            Vec::new().into(),
+        ),
+    ])
 }
 
 /// Reads one link record; `None` when the id is unknown.
