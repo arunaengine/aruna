@@ -21,7 +21,7 @@ use ulid::Ulid;
 
 use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
@@ -30,9 +30,6 @@ use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
 use aruna_core::placement::{holds_placement, target_placement_ref};
-
-/// Saves one holder attempt makes when its transaction loses to a concurrent save.
-const CONFLICT_ATTEMPTS: usize = 3;
 
 /// Why a holder refused a forwarded vault change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,17 +82,9 @@ async fn append_local(
     context: &Arc<DriverContext>,
     config: AppendVaultConfig,
 ) -> Result<VaultAppended, AppendVaultError> {
-    let mut attempt = 1;
-    loop {
-        match drive(AppendVaultOperation::new(config.clone()), context.as_ref()).await {
-            Err(AppendVaultError::Storage(
-                aruna_core::errors::StorageError::TransactionConflict,
-            )) if attempt < CONFLICT_ATTEMPTS => {
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
+    let seed = config.record_id.to_bytes();
+    let build = || AppendVaultOperation::new(config.clone());
+    drive_retry(build, context.as_ref(), &seed).await
 }
 
 /// Runs one forwarded vault change for the user the forwarded token names.

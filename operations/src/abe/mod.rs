@@ -10,10 +10,9 @@ mod reissue;
 mod requests;
 mod snapshot;
 
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive_retry};
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
-use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -425,7 +424,6 @@ impl KeyOperation {
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
-const CONFLICT_RETRIES: usize = 3;
 /// Runs a key action, rerunning it from the start after a transaction conflict.
 pub async fn drive_key(
     bucket: String,
@@ -435,18 +433,11 @@ pub async fn drive_key(
     context: &DriverContext,
 ) -> Result<KeyResult, KeyError> {
     let seed = Ulid::generate().to_bytes();
-    let mut attempt = 0;
-    loop {
+    let build = || {
         let now = aruna_core::time::unix_timestamp_millis();
-        let operation = KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now);
-        match drive(operation, context).await {
-            Err(KeyError::Conflict) if attempt < CONFLICT_RETRIES => {
-                tokio::time::sleep(conflict_backoff(attempt, &seed)).await;
-                attempt += 1;
-            }
-            result => return result,
-        }
-    }
+        KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
+    };
+    drive_retry(build, context, &seed).await
 }
 impl Operation for KeyOperation {
     type Output = KeyResult;
@@ -591,6 +582,9 @@ impl Operation for KeyOperation {
         self.txn.take().map_or_else(Effects::new, |txn_id| {
             smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         })
+    }
+    fn is_conflict(error: &KeyError) -> bool {
+        matches!(error, KeyError::Conflict)
     }
 }
 

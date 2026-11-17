@@ -671,6 +671,13 @@ impl Operation for AppendVaultOperation {
                 | AppendVaultError::TooManyKeys
         )
     }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            AppendVaultError::Storage(StorageError::TransactionConflict)
+        )
+    }
 }
 
 #[cfg(test)]
