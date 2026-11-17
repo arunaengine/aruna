@@ -120,7 +120,7 @@ pub enum EnsureConfigError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -496,7 +496,7 @@ impl EnsureConfigOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(EnsureConfigError::UnexpectedEvent {
             state,
@@ -524,7 +524,7 @@ impl Operation for EnsureConfigOperation {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             EnsureConfigState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -552,7 +552,7 @@ impl Operation for EnsureConfigOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             EnsureConfigState::WriteDocumentState {
                 document,
@@ -575,9 +575,7 @@ impl Operation for EnsureConfigOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             EnsureConfigState::DeleteAdminConflicts { document } => {
@@ -587,9 +585,7 @@ impl Operation for EnsureConfigOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             EnsureConfigState::CommitNoop { .. } => match event {
@@ -602,7 +598,7 @@ impl Operation for EnsureConfigOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             EnsureConfigState::CommitTransaction { document } => {
                 let document = document.clone();
@@ -616,9 +612,7 @@ impl Operation for EnsureConfigOperation {
                         self.txn_id = None;
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             EnsureConfigState::ScheduleSyncDrain { .. } => match event {
@@ -631,10 +625,8 @@ impl Operation for EnsureConfigOperation {
                     self.state = EnsureConfigState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             EnsureConfigState::Finish | EnsureConfigState::Error | EnsureConfigState::Init => {
                 smallvec![]

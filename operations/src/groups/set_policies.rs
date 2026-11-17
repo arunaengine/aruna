@@ -111,7 +111,7 @@ pub enum SetGroupError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -309,7 +309,7 @@ impl SetGroupOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetGroupError::UnexpectedEvent {
             state,
@@ -366,14 +366,14 @@ impl Operation for SetGroupOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetGroupState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetGroupState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -398,7 +398,7 @@ impl Operation for SetGroupOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetGroupState::WriteDocumentState {
                 document,
@@ -421,9 +421,7 @@ impl Operation for SetGroupOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             SetGroupState::DeleteAdminConflicts { document } => {
@@ -433,9 +431,7 @@ impl Operation for SetGroupOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             SetGroupState::ReadBucketFence { document } => {
@@ -449,9 +445,7 @@ impl Operation for SetGroupOperation {
                         }
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("bucket fence read result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("bucket fence read result", other.label()),
                 }
             }
             SetGroupState::CommitTransaction { document } => {
@@ -471,9 +465,7 @@ impl Operation for SetGroupOperation {
                         }
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             SetGroupState::ScheduleSyncDrain { .. } => match event {
@@ -486,10 +478,8 @@ impl Operation for SetGroupOperation {
                     self.state = SetGroupState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetGroupState::Finish | SetGroupState::Error | SetGroupState::Init => {
                 smallvec![]

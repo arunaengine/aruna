@@ -92,7 +92,7 @@ pub enum CreateSessionError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -160,7 +160,7 @@ impl CreateSessionOperation {
         self.emit_error(CreateSessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

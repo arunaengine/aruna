@@ -56,7 +56,7 @@ pub enum RevokeSessionError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -103,7 +103,7 @@ impl RevokeSessionOperation {
         self.emit_error(RevokeSessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

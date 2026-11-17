@@ -101,7 +101,7 @@ pub enum SetQuotaError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -260,7 +260,7 @@ impl SetQuotaOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetQuotaError::UnexpectedEvent {
             state,
@@ -307,14 +307,14 @@ impl Operation for SetQuotaOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetQuotaState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetQuotaState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -332,7 +332,7 @@ impl Operation for SetQuotaOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetQuotaState::WriteDocumentState {
                 document,
@@ -355,9 +355,7 @@ impl Operation for SetQuotaOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             SetQuotaState::DeleteAdminConflicts { document } => {
@@ -367,9 +365,7 @@ impl Operation for SetQuotaOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             SetQuotaState::CommitTransaction { document } => {
@@ -390,9 +386,7 @@ impl Operation for SetQuotaOperation {
                         self.txn_id = None;
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             SetQuotaState::ScheduleSyncDrain { .. } => match event {
@@ -405,10 +399,8 @@ impl Operation for SetQuotaOperation {
                     self.state = SetQuotaState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetQuotaState::Finish | SetQuotaState::Error | SetQuotaState::Init => {
                 smallvec![]

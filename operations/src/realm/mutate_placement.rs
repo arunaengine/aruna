@@ -805,7 +805,7 @@ pub enum MutatePlacementError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -1082,7 +1082,7 @@ impl MutatePlacementOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(MutatePlacementError::UnexpectedEvent {
             state,
@@ -1155,14 +1155,14 @@ impl Operation for MutatePlacementOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             MutatePlacementState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             MutatePlacementState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -1180,7 +1180,7 @@ impl Operation for MutatePlacementOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             MutatePlacementState::ReadRegistryReferences { check } => {
                 let check = check.clone();
@@ -1209,9 +1209,7 @@ impl Operation for MutatePlacementOperation {
                         }
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("metadata registry scan result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("metadata registry scan result", other.label()),
                 }
             }
             MutatePlacementState::ReadPendingReferences { check } => {
@@ -1245,8 +1243,7 @@ impl Operation for MutatePlacementOperation {
                         })]
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self
-                        .unexpected_event("pending projection scan result", format!("{other:?}")),
+                    other => self.unexpected_event("pending projection scan result", other.label()),
                 }
             }
             MutatePlacementState::ReadPendingEvents {
@@ -1291,9 +1288,7 @@ impl Operation for MutatePlacementOperation {
                         }
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("pending create event reads", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("pending create event reads", other.label()),
                 }
             }
             MutatePlacementState::WriteDocumentState {
@@ -1317,9 +1312,7 @@ impl Operation for MutatePlacementOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             MutatePlacementState::DeleteAdminConflicts { document } => {
@@ -1329,9 +1322,7 @@ impl Operation for MutatePlacementOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             MutatePlacementState::CommitTransaction { .. } => match event {
@@ -1344,7 +1335,7 @@ impl Operation for MutatePlacementOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             MutatePlacementState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -1362,10 +1353,8 @@ impl Operation for MutatePlacementOperation {
                         self.actor.node_id,
                     )]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             MutatePlacementState::SchedulePlacementRevalidation => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -1377,10 +1366,9 @@ impl Operation for MutatePlacementOperation {
                     self.state = MutatePlacementState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "placement revalidation timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => {
+                    self.unexpected_event("placement revalidation timer schedule", other.label())
+                }
             },
             MutatePlacementState::Finish
             | MutatePlacementState::Error

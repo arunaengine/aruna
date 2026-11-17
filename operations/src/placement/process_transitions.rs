@@ -756,7 +756,12 @@ pub async fn close(
         {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence transaction result: {other:?}")),
+            other => {
+                return Err(format!(
+                    "unexpected fence transaction result: {}",
+                    other.label()
+                ));
+            }
         };
         let current = match storage
             .send_storage_effect(StorageEffect::Read {
@@ -779,7 +784,7 @@ pub async fn close(
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(format!("unexpected fence read result: {other:?}"));
+                return Err(format!("unexpected fence read result: {}", other.label()));
             }
         };
         if current.is_some_and(|current| current >= generation) {
@@ -813,7 +818,7 @@ pub async fn close(
                 let _ = storage
                     .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                     .await;
-                return Err(format!("unexpected fence write result: {other:?}"));
+                return Err(format!("unexpected fence write result: {}", other.label()));
             }
         }
         match storage
@@ -829,7 +834,7 @@ pub async fn close(
                 error: StorageError::TransactionConflict,
             }) => continue,
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected fence commit result: {other:?}")),
+            other => return Err(format!("unexpected fence commit result: {}", other.label())),
         }
     }
     Err(StorageError::TransactionConflict.to_string())

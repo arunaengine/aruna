@@ -55,7 +55,7 @@ pub enum AnnouncePresenceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -102,7 +102,7 @@ impl AnnouncePresenceOperation {
         smallvec![]
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(AnnouncePresenceError::UnexpectedEvent {
             state,
@@ -144,14 +144,14 @@ impl Operation for AnnouncePresenceOperation {
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
                     self.fail(AnnouncePresenceError::PutFailed(error))
                 }
-                other => self.unexpected_event("dht put result", format!("{other:?}")),
+                other => self.unexpected_event("dht put result", other.label()),
             },
             AnnouncePresenceState::ScheduleRefresh => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => self.finish_success(),
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     self.fail(AnnouncePresenceError::ScheduleFailed(message))
                 }
-                other => self.unexpected_event("task scheduling result", format!("{other:?}")),
+                other => self.unexpected_event("task scheduling result", other.label()),
             },
             AnnouncePresenceState::Finish
             | AnnouncePresenceState::Error

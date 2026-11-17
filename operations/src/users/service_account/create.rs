@@ -70,7 +70,7 @@ pub enum CreateServiceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -125,7 +125,7 @@ impl CreateServiceOperation {
         self.fail(CreateServiceError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

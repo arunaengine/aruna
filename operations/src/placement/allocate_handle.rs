@@ -109,9 +109,9 @@ impl AllocateHandleOperation {
     }
 
     fn unexpected(&mut self, event: Event) -> Effects {
-        self.fail(HandleAllocationError::UnexpectedStorageEvent(format!(
-            "{event:?}"
-        )))
+        self.fail(HandleAllocationError::UnexpectedStorageEvent(
+            event.label().to_string(),
+        ))
     }
 }
 

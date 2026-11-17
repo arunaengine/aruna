@@ -164,7 +164,7 @@ pub enum RevokeTokenError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -612,7 +612,7 @@ impl RevokeTokenOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(RevokeTokenError::UnexpectedEvent {
             state,
@@ -649,7 +649,7 @@ impl Operation for RevokeTokenOperation {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             RevokeTokenState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -666,7 +666,7 @@ impl Operation for RevokeTokenOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             RevokeTokenState::ReadOutboxCapacity {
                 document,
@@ -729,8 +729,9 @@ impl Operation for RevokeTokenOperation {
                         })]
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self
-                        .unexpected_event("outbox capacity iteration result", format!("{other:?}")),
+                    other => {
+                        self.unexpected_event("outbox capacity iteration result", other.label())
+                    }
                 }
             }
             RevokeTokenState::ReadOutboxRecords {
@@ -799,8 +800,9 @@ impl Operation for RevokeTokenOperation {
                         }
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self
-                        .unexpected_event("outbox record batch read result", format!("{other:?}")),
+                    other => {
+                        self.unexpected_event("outbox record batch read result", other.label())
+                    }
                 }
             }
             RevokeTokenState::DeletePendingOutbox {
@@ -828,9 +830,7 @@ impl Operation for RevokeTokenOperation {
                         Err(error) => self.fail(error),
                     },
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("pending outbox cleanup result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("pending outbox cleanup result", other.label()),
                 }
             }
             RevokeTokenState::WriteDocumentState {
@@ -859,9 +859,7 @@ impl Operation for RevokeTokenOperation {
                         self.emit_commit(document, schedule_drain)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             RevokeTokenState::DeleteAdminConflicts {
@@ -875,9 +873,7 @@ impl Operation for RevokeTokenOperation {
                         self.emit_commit(document, schedule_drain)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             RevokeTokenState::CommitNoop { .. } => match event {
@@ -890,7 +886,7 @@ impl Operation for RevokeTokenOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             RevokeTokenState::CommitTransaction { document } => {
                 let document = document.clone();
@@ -904,9 +900,7 @@ impl Operation for RevokeTokenOperation {
                         self.txn_id = None;
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             RevokeTokenState::ScheduleSyncDrain { .. } => match event {
@@ -919,10 +913,8 @@ impl Operation for RevokeTokenOperation {
                     self.state = RevokeTokenState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             RevokeTokenState::Finish | RevokeTokenState::Error | RevokeTokenState::Init => {
                 smallvec![]

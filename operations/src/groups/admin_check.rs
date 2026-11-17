@@ -81,7 +81,7 @@ impl Operation for AdminCheckOperation {
             let error = AuthorizationError::UnexpectedEvent {
                 state: format!("{:?}", self.state),
                 expected: "authorization result",
-                got: format!("{event:?}"),
+                got: event.label(),
             };
             return self.finish(Err(error));
         };

@@ -46,7 +46,7 @@ pub enum SubjectCheckError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("canonical user token subject check did not finish")]
     NotFinished,

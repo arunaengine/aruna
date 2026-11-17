@@ -67,7 +67,7 @@ pub enum IssueSyncError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -189,7 +189,7 @@ impl Operation for IssueSyncOperation {
                 other => self.fail(IssueSyncError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "storage iter result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             IssueSyncState::ListDeletions => match event {
@@ -223,7 +223,7 @@ impl Operation for IssueSyncOperation {
                 other => self.fail(IssueSyncError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "deletion records",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             IssueSyncState::Persist => match event {
@@ -232,7 +232,7 @@ impl Operation for IssueSyncOperation {
                 other => self.fail(IssueSyncError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "durable deletion records",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             IssueSyncState::Init | IssueSyncState::Finish | IssueSyncState::Error => smallvec![],

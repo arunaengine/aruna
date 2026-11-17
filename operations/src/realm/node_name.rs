@@ -141,7 +141,7 @@ pub enum NodeNameError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -310,7 +310,7 @@ impl NodeNameOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(NodeNameError::UnexpectedEvent {
             state,
@@ -365,14 +365,14 @@ impl Operation for NodeNameOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             NodeNameState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             NodeNameState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -389,7 +389,7 @@ impl Operation for NodeNameOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             NodeNameState::WriteState {
                 stale_conflict_deletes,
@@ -410,15 +410,13 @@ impl Operation for NodeNameOperation {
                         })]
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             NodeNameState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch delete result", other.label()),
             },
             NodeNameState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -436,7 +434,7 @@ impl Operation for NodeNameOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             NodeNameState::ScheduleSyncDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -448,10 +446,8 @@ impl Operation for NodeNameOperation {
                     self.state = NodeNameState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             NodeNameState::Finish | NodeNameState::Error | NodeNameState::Init => {
                 smallvec![]
@@ -557,7 +553,7 @@ impl Operation for ReadNamesOperation {
             other => self.finish(Err(NodeNameError::UnexpectedEvent {
                 state: "ReadState".to_string(),
                 expected: "storage read result",
-                got: format!("{other:?}"),
+                got: other.label(),
             })),
         }
     }

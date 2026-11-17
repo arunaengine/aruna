@@ -211,7 +211,8 @@ pub async fn check_bucket(
         Event::Blob(BlobEvent::BucketExists { exists, writable }) => Ok((exists, writable)),
         Event::Blob(BlobEvent::Error(error)) => Err(error),
         other => Err(BlobError::UnknownBackend(format!(
-            "unexpected bucket check answer: {other:?}"
+            "unexpected bucket check answer: {}",
+            other.label()
         ))),
     }
 }

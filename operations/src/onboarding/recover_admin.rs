@@ -64,7 +64,7 @@ pub enum RecoverInitialError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -109,7 +109,7 @@ impl RecoverInitialOperation {
         self.fail(RecoverInitialError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

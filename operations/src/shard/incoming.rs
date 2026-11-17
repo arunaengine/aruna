@@ -207,7 +207,7 @@ async fn read_realm_config(
             .map_err(|error| error.to_string()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 

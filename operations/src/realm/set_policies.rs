@@ -104,7 +104,7 @@ pub enum SetPoliciesError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -264,7 +264,7 @@ impl SetPoliciesOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(SetPoliciesError::UnexpectedEvent {
             state,
@@ -317,14 +317,14 @@ impl Operation for SetPoliciesOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             SetPoliciesState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_current(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             SetPoliciesState::ReadCurrent => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -341,7 +341,7 @@ impl Operation for SetPoliciesOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             SetPoliciesState::WriteDocumentState {
                 document,
@@ -364,9 +364,7 @@ impl Operation for SetPoliciesOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch write result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch write result", other.label()),
                 }
             }
             SetPoliciesState::DeleteAdminConflicts { document } => {
@@ -376,9 +374,7 @@ impl Operation for SetPoliciesOperation {
                         self.emit_commit_transaction(document)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => {
-                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("storage batch delete result", other.label()),
                 }
             }
             SetPoliciesState::CommitTransaction { document } => {
@@ -399,9 +395,7 @@ impl Operation for SetPoliciesOperation {
                         self.txn_id = None;
                         self.fail(error.into())
                     }
-                    other => {
-                        self.unexpected_event("transaction commit result", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("transaction commit result", other.label()),
                 }
             }
             SetPoliciesState::ScheduleSyncDrain { .. } => match event {
@@ -414,10 +408,8 @@ impl Operation for SetPoliciesOperation {
                     self.state = SetPoliciesState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("document sync outbox drain timer schedule", other.label()),
             },
             SetPoliciesState::Finish | SetPoliciesState::Error | SetPoliciesState::Init => {
                 smallvec![]

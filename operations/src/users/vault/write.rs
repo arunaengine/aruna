@@ -113,7 +113,7 @@ pub enum AppendVaultError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 

@@ -46,7 +46,7 @@ pub enum ServiceCheckError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -98,7 +98,7 @@ impl ServiceCheckOperation {
         self.fail(ServiceCheckError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

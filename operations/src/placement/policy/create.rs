@@ -116,7 +116,7 @@ pub enum CreatePolicyError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -309,7 +309,7 @@ impl CreatePolicyOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(CreatePolicyError::UnexpectedEvent {
             state,
@@ -362,14 +362,14 @@ impl Operation for CreatePolicyOperation {
                         }
                     }
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
+                other => self.unexpected_event("authorization result", other.label()),
             },
             CreatePolicyState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.emit_read_config(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => self.unexpected_event("transaction start result", other.label()),
             },
             CreatePolicyState::ReadConfig => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -402,7 +402,7 @@ impl Operation for CreatePolicyOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             CreatePolicyState::ReadFence { pending } => {
                 let pending = pending.clone();
@@ -414,7 +414,7 @@ impl Operation for CreatePolicyOperation {
                         self.emit_sign(pending)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                    other => self.unexpected_event("placement fence read", format!("{other:?}")),
+                    other => self.unexpected_event("placement fence read", other.label()),
                 }
             }
             CreatePolicyState::Sign { pending } => {
@@ -429,15 +429,13 @@ impl Operation for CreatePolicyOperation {
                     Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
                         self.fail(CreatePolicyError::PublicationUnavailable(reason))
                     }
-                    other => {
-                        self.unexpected_event("policy publication signature", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("policy publication signature", other.label()),
                 }
             }
             CreatePolicyState::Write => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch write result", other.label()),
             },
             CreatePolicyState::Commit => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -449,7 +447,7 @@ impl Operation for CreatePolicyOperation {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self.unexpected_event("transaction commit result", other.label()),
             },
             CreatePolicyState::ScheduleDrain => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -461,7 +459,7 @@ impl Operation for CreatePolicyOperation {
                     self.state = CreatePolicyState::Finish;
                     smallvec![]
                 }
-                other => self.unexpected_event("outbox drain schedule", format!("{other:?}")),
+                other => self.unexpected_event("outbox drain schedule", other.label()),
             },
             CreatePolicyState::Init | CreatePolicyState::Finish | CreatePolicyState::Error => {
                 smallvec![]

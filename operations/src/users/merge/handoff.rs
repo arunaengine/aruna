@@ -221,7 +221,7 @@ impl HandoffOperation {
             (state, event) => Err(MergeError::UnexpectedEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current handoff step",
-                got: format!("{event:?}"),
+                got: event.label(),
             }),
         }
     }

@@ -140,7 +140,7 @@ pub enum ReadPolicyError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -353,7 +353,7 @@ impl ReadPolicyOperation {
         smallvec![]
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.finish(Err(ReadPolicyError::UnexpectedEvent {
             state,
@@ -412,7 +412,7 @@ impl Operation for ReadPolicyOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-                other => self.unexpected_event("local policy read", format!("{other:?}")),
+                other => self.unexpected_event("local policy read", other.label()),
             },
             ReadPolicyState::Fetch { asked } => {
                 let asked = asked.clone();
@@ -429,7 +429,7 @@ impl Operation for ReadPolicyOperation {
                             self.finish(Err(ReadPolicyError::Unavailable(reason)))
                         }
                     },
-                    other => self.unexpected_event("policy fetch result", format!("{other:?}")),
+                    other => self.unexpected_event("policy fetch result", other.label()),
                 }
             }
             ReadPolicyState::ReadGroupAuth { pending } => {
@@ -439,9 +439,7 @@ impl Operation for ReadPolicyOperation {
                         self.handle_group_auth(*pending, value)
                     }
                     Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-                    other => {
-                        self.unexpected_event("group authorization read", format!("{other:?}"))
-                    }
+                    other => self.unexpected_event("group authorization read", other.label()),
                 }
             }
             ReadPolicyState::Init | ReadPolicyState::Finish | ReadPolicyState::Error => {

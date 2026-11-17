@@ -40,7 +40,7 @@ pub enum ListSessionError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -77,7 +77,7 @@ impl ListSessionOperation {
         self.emit_error(ListSessionError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

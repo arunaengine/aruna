@@ -131,7 +131,8 @@ pub(crate) async fn accepted_create(
             Err(format!("metadata create acceptance read failed: {error}"))
         }
         other => Err(format!(
-            "unexpected metadata create acceptance read result: {other:?}"
+            "unexpected metadata create acceptance read result: {}",
+            other.label()
         )),
     }
 }

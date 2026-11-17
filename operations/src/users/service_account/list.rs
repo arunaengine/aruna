@@ -34,7 +34,7 @@ pub enum ListServiceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -78,7 +78,7 @@ impl ListServiceOperation {
         self.fail(ListServiceError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 

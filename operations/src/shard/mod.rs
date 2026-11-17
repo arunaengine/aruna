@@ -106,7 +106,10 @@ async fn scan_manifest_entries(
                 return Err(format!("failed to scan shard manifest: {error}"));
             }
             other => {
-                return Err(format!("unexpected shard manifest iter result: {other:?}"));
+                return Err(format!(
+                    "unexpected shard manifest iter result: {}",
+                    other.label()
+                ));
             }
         };
         for (_, value) in &batch {

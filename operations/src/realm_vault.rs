@@ -94,7 +94,7 @@ where
     let write = write_secret(entry, SecretBytes::new(value.concat()), None);
     match ctx.storage_handle.send_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(secret),
-        other => Err(RealmSecretError::Cache(format!("{other:?}"))),
+        other => Err(RealmSecretError::Cache(other.label())),
     }
 }
 
@@ -294,7 +294,7 @@ pub async fn prune_secret_cache(
                 values,
                 next_start_after,
             }) => (values.into_iter().map(|(key, _)| key), next_start_after),
-            other => return Err(format!("node vault page: {other:?}")),
+            other => return Err(format!("node vault page: {}", other.label())),
         };
         for key in keys {
             let Some(id) = key.get(1..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
@@ -316,7 +316,7 @@ pub async fn prune_secret_cache(
                 .await
             {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => pruned += 1,
-                other => return Err(format!("node vault delete: {other:?}")),
+                other => return Err(format!("node vault delete: {}", other.label())),
             }
         }
         match next {

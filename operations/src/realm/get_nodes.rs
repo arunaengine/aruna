@@ -84,7 +84,7 @@ pub enum GetNodesError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -103,7 +103,7 @@ impl GetNodesOperation {
         smallvec![]
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(GetNodesError::UnexpectedEvent {
             state,
@@ -140,7 +140,7 @@ impl Operation for GetNodesOperation {
                     smallvec![]
                 }
                 Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
-                other => self.unexpected_event("dht get result", format!("{other:?}")),
+                other => self.unexpected_event("dht get result", other.label()),
             },
             GetNodesState::Finish | GetNodesState::Error | GetNodesState::Init => {
                 smallvec![]

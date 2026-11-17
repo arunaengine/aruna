@@ -130,8 +130,7 @@ impl ResolvePolicyOperation {
             [config, auth] => ([config, auth], None),
             [config, auth, (_, group)] => ([config, auth], Some(group)),
             other => {
-                return self
-                    .unexpected_event("realm config and authorization", format!("{other:?}"));
+                return self.unexpected_event("realm config and authorization", other.label());
             }
         };
         let Some(config_value) = config_value else {
@@ -249,7 +248,7 @@ impl ResolvePolicyOperation {
         self.finish()
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(ReadPolicyError::UnexpectedEvent {
             state,
@@ -306,18 +305,18 @@ impl Operation for ResolvePolicyOperation {
                     self.stats.misses = 1;
                     self.start_read()
                 }
-                other => self.unexpected_event("policy cache read", format!("{other:?}")),
+                other => self.unexpected_event("policy cache read", other.label()),
             },
             ResolveState::Revalidate => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
                     self.accept_cached(values)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm authority read", format!("{other:?}")),
+                other => self.unexpected_event("realm authority read", other.label()),
             },
             ResolveState::Resolve => {
                 let Some(reader) = self.reader.as_mut() else {
-                    return self.unexpected_event("active policy read", format!("{event:?}"));
+                    return self.unexpected_event("active policy read", event.label());
                 };
                 let effects = reader.step(event);
                 if !reader.is_complete() {
@@ -356,7 +355,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache scan failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache scan", format!("{other:?}")),
+                other => self.unexpected_event("policy cache scan", other.label()),
             },
             ResolveState::Evict => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_store(),
@@ -364,7 +363,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache eviction failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache eviction", format!("{other:?}")),
+                other => self.unexpected_event("policy cache eviction", other.label()),
             },
             ResolveState::Store => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => self.finish(),
@@ -372,7 +371,7 @@ impl Operation for ResolvePolicyOperation {
                     warn!(error = %error, "Policy cache write failed");
                     self.finish()
                 }
-                other => self.unexpected_event("policy cache write", format!("{other:?}")),
+                other => self.unexpected_event("policy cache write", other.label()),
             },
             ResolveState::Init | ResolveState::Finish | ResolveState::Error => smallvec![],
         }
