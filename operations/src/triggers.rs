@@ -59,7 +59,7 @@ pub trait TimerRun: Operation + Sized {
 
 /// The operation of one timer run. Its output is when the timer runs again; the shell persists
 /// and arms that timer.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TimerOperation {
     DrainNotificationOutbox(DrainOutboxOperation),
     PruneNotifications(PruneNotificationsOperation),
@@ -213,7 +213,7 @@ impl From<IoError> for PeerFailure {
 }
 
 /// The operation that answers one peer request frame.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PeerOperation {
     /// A notification batch delivered to the inbox this node holds.
     DeliverNotifications(DeliverBatchOperation),

@@ -44,7 +44,7 @@ pub(crate) fn reject(reason: String) -> AnswerTurn {
     Ok(Next::Done(NotificationTransportMessage::Reject(reason)))
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum DeliverState {
     #[default]
     Config,
@@ -60,7 +60,7 @@ enum DeliverState {
 /// Stores a sync-eligible peer's valid batch held here and queues its deliveries on every
 /// attempt, so a delivery a failed queue left behind is queued on the next one. A bucket notice
 /// must come from the bucket's node. The output is the answer frame.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DeliverBatchOperation {
     input: DeliverInput,
     records: Vec<NotificationRecord>,

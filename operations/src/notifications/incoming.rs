@@ -22,7 +22,7 @@ use byteview::ByteView;
 use tokio::time::{Instant, timeout_at};
 use tracing::{debug, warn};
 
-use crate::driver::{DriverContext, drive, drive_until};
+use crate::driver::{DriverContext, drive, drive_retry_until};
 use crate::notifications::checks::{message_realm, validate_watch_events, verify_recipient_holder};
 use crate::notifications::dispatch::{list_on_holder, mark_on_holder, unread_on_holder};
 use crate::notifications::mark_read::MARK_MAX_IDS;
@@ -82,10 +82,14 @@ pub(crate) async fn handle_notification_stream(
     };
     let written = match peer_operation(input) {
         // The same bound the config read had before, so a slow store cannot hold the stream.
-        Some(operation) => match drive_until(operation, context, deliver_deadline()).await {
-            Ok(answer) => write_frame(&mut stream, &answer).await,
-            Err(error) => Err(error.to_string()),
-        },
+        Some(operation) => {
+            let build = || operation.clone();
+            let deadline = deliver_deadline();
+            match drive_retry_until(build, context, peer.as_bytes(), deadline).await {
+                Ok(answer) => write_frame(&mut stream, &answer).await,
+                Err(error) => Err(error.to_string()),
+            }
+        }
         None => match postcard::from_bytes::<NotificationTransportMessage>(&frame) {
             Ok(message) => {
                 debug!(peer = %peer, message = message.label(), "Received notification message");

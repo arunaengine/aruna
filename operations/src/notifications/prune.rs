@@ -27,7 +27,7 @@ pub(crate) const PRUNE_PAGE_SIZE: usize = 512;
 pub(crate) const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
 pub(crate) const NOTIFICATION_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NotificationPruneOutcome {
     pub expired: usize,
     pub capped: usize,
@@ -66,7 +66,7 @@ impl From<IoError> for PruneError {
 }
 
 /// One due row of the prune index and the two inbox rows it may name; only one class matches.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct Candidate {
     index: Key,
     direct: Key,
@@ -74,13 +74,13 @@ struct Candidate {
 }
 
 /// Where a phase continues after its current page.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Scan {
     next: Option<Key>,
     stopped: bool,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum PruneState {
     #[default]
     IndexPage,
@@ -104,7 +104,7 @@ type Turn = Result<Next<NotificationPruneOutcome>, PruneError>;
 
 /// One prune run: the due rows of the prune index (at most four pages of them), then a sweep of
 /// the inbox for expired and over-cap transient rows, then a sweep of outlived deletion times.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PruneNotificationsOperation {
     now_ms: u64,
     page_size: usize,

@@ -33,7 +33,7 @@ pub(crate) const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 
 /// One page of outbox rows on its way to the holders.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Page {
     has_more: bool,
     records: Vec<(Key, NotificationOutboxRecord)>,
@@ -41,7 +41,7 @@ struct Page {
     remote: VecDeque<(NodeId, Vec<NotificationRecord>, Vec<Key>)>,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum DrainState {
     #[default]
     Page,
@@ -68,7 +68,7 @@ type Turn = Result<Next<Option<Duration>>, IoError>;
 /// One drain run, page by page after a cursor, so a dead holder hides no healthy record. Local
 /// records go to the inbox, others to their holder once per run; rows stay until delivered,
 /// expired ones are dropped. The output is when the drain runs again.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     local: Option<NodeId>,
     now_ms: u64,

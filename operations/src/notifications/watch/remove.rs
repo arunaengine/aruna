@@ -17,7 +17,7 @@ use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::records::{WatchSubscriptionError, watch_delete_replication};
 use crate::notifications::watch::store::StoreWatchOperation;
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum RemoveState {
     #[default]
     Config,
@@ -28,7 +28,7 @@ enum RemoveState {
 /// Deletes the watch for a sync-eligible peer when this node holds the owner's inbox, writes
 /// its replication rows and requests the interest publish. A missing watch is still deleted.
 /// The output is the answer frame.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RemoveWatchOperation {
     input: DeliverInput,
     owner: UserId,
