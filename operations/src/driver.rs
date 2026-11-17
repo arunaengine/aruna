@@ -4,12 +4,15 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
+use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
+use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{EffectOperation, HoldScope, Runnable, SubOperation};
+use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
 use aruna_net::NetHandle;
@@ -23,6 +26,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
@@ -82,6 +86,87 @@ impl DriverContext {
         context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
         context
     }
+
+    /// The dashboard epoch and a receiver of its change counter; `None` without a net transport.
+    pub fn subscribe_dashboard_changes(&self) -> Option<(String, watch::Receiver<u64>)> {
+        self.net_handle.as_ref().map(|net_handle| {
+            (
+                net_handle.dashboard_epoch().to_string(),
+                net_handle.subscribe_dashboard_changes(),
+            )
+        })
+    }
+
+    /// Heartbeats held for each node, fresh or stale; none without a net transport.
+    pub fn held_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let held = self.net_handle.as_ref().map(NetHandle::held_heartbeats);
+        (held.unwrap_or_default().into_iter())
+            .map(|held| (held.node_id, held))
+            .collect()
+    }
+
+    /// Fresh heartbeats held for each node; none without a net transport.
+    pub fn fresh_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
+        let mut held = self.held_heartbeats();
+        held.retain(|_, held| held.age_ms <= max_age_ms);
+        held
+    }
+
+    /// Skips holder `node_id` in holder choices for a while after it failed or refused a slot.
+    pub fn avoid_holder(&self, node_id: NodeId, now_ms: u64) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.avoided_holders().avoid(node_id, now_ms);
+        }
+    }
+
+    /// Tells dashboard subscribers that something they show changed.
+    pub fn notify_dashboard_change(&self) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.notify_dashboard_change();
+        }
+    }
+
+    /// One status snapshot of the net, blob and storage backends this context holds.
+    pub async fn status(&self) -> NodeSnapshot {
+        let network = match &self.net_handle {
+            Some(net) => Some(net.get_status().await),
+            None => None,
+        };
+        let blob = match &self.blob_handle {
+            Some(blob) => Some(blob.get_status().await),
+            None => None,
+        };
+        let metrics = self.storage_handle.snapshot_metrics();
+        NodeSnapshot {
+            network,
+            blob,
+            database: StorageSnapshot {
+                status: if metrics.channel_closed {
+                    Status::Unavailable
+                } else {
+                    Status::Available
+                },
+                requests: RequestSummaryState {
+                    total: metrics.requests_total,
+                    failures: metrics.failed_total,
+                    last_error: metrics.last_error,
+                },
+            },
+        }
+    }
+}
+
+/// The backend status of one node, from [`DriverContext::status`].
+pub struct NodeSnapshot {
+    pub network: Option<NetState>,
+    pub blob: Option<BlobState>,
+    pub database: StorageSnapshot,
+}
+
+pub struct StorageSnapshot {
+    pub status: Status,
+    pub requests: RequestSummaryState,
 }
 
 impl std::fmt::Debug for DriverContext {

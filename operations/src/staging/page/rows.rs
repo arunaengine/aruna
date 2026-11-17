@@ -9,9 +9,11 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
+use crate::s3::usage::UsageUpdateError;
+use crate::staging::descriptor::build_source_binding;
+use crate::staging::root_record::{compact_version, root_write};
 use crate::storage_read::StorageReadError;
 use aruna_core::UserId;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};

@@ -261,6 +261,7 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             "notification requests must be dispatched by the operations runner".to_string(),
         )),
         NetEffect::WakeInbox(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
+        NetEffect::Heartbeat(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
     }
 }
 
@@ -575,6 +576,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::Notification(_) => "notification",
         NetEffect::WakeInbox(_) => "wake_inbox",
+        NetEffect::Heartbeat(_) => "heartbeat",
     }
 }
 

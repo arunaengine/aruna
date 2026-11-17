@@ -46,9 +46,9 @@ use super::purge::{
 use super::roots::{RootsCheckOperation, RootsOutcome, Sweep};
 use super::status::read_view;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::node::usage_stats::{dirty_rows, wake_publish};
 use crate::replication::members::owes_fanout;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
 
 /// Sets one pass looks at, and purge pages it spends at most.
 const SET_BATCH: usize = 16;
@@ -853,7 +853,7 @@ async fn unbind(
     storage.send_storage_effect(write).await;
     // The released bucket is ordinary now: its group's published replica share must go.
     let markers = StorageEffect::BatchWrite {
-        writes: dirty_rows([info.group_id]),
+        writes: dirty_rows([info.group_id], Ulid::generate()),
         txn_id: Some(txn_id),
     };
     storage.send_storage_effect(markers).await;
@@ -870,7 +870,8 @@ async fn unbind(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            wake_publish(context).await;
+            // Scheduling the publish is best effort; the committed markers wait for it.
+            let _ = drive(MarkDirtyOperation::wake(), context).await;
             Ok(())
         }
         other => Err(format!("the bucket was not released: {}", other.label())),

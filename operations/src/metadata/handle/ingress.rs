@@ -46,6 +46,7 @@ use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
     StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::node_state::ReadInfoOperation;
 
 impl MetadataHandle {
     #[allow(clippy::too_many_arguments)]
@@ -411,14 +412,13 @@ impl MetadataHandle {
                     let result = match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth) => match context.net_handle.as_ref() {
                             Some(net) => {
-                                let endpoint = crate::node::node_info::read_info_document(
-                                    &context.storage_handle,
-                                    net.node_id(),
-                                )
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|document| document.urls.s3);
+                                let local = net.node_id();
+                                let read = ReadInfoOperation::new(vec![local]);
+                                let endpoint = drive(read, context.as_ref())
+                                    .await
+                                    .ok()
+                                    .and_then(|mut documents| documents.remove(&local))
+                                    .and_then(|document| document.urls.s3);
                                 super::super::api::references_preflight_local(
                                     context.as_ref(),
                                     *net.realm_id(),

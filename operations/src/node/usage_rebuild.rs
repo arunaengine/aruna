@@ -9,10 +9,7 @@
 // so a restarted rebuild reads them unchanged and resumes there, rereading only the buckets.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::Arc;
-use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -36,57 +33,15 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
 use crate::node::rebuild_counts::{Joined, RebuildCounts, is_pithos, named_size, usable};
-use crate::node::usage_stats::publish_refresh_snapshots;
 
 /// Rows read per walk page; every page commits before the next one is read.
 const PAGE_LIMIT: usize = 256;
 /// Copies of one hash read per page when a version's own location row is unusable.
 const COPY_LIMIT: usize = 16;
-/// Pause before a failed background rebuild starts again from a new snapshot.
-const RETRY_PAUSE: Duration = Duration::from_secs(30);
-
-/// Rebuilds the usage counters in the background until one rebuild finishes, then publishes
-/// full usage snapshots. Startup does not wait; until then quota-limited writes are refused.
-pub fn spawn_usage_rebuild(
-    context: Arc<DriverContext>,
-    realm_id: RealmId,
-    node_id: NodeId,
-    shutdown: &Shutdown,
-) {
-    let token = shutdown.token();
-    shutdown.spawn(async move {
-        // Range counters of distributed buckets are confirmed again by their own rebuilds.
-        match crate::distribution::sharding::begin_range_rebuilds(&context).await {
-            Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
-            Ok(_) => {}
-            Err(error) => warn!(%error, "Range counter rebuilds could not begin"),
-        }
-        loop {
-            let rebuild = drive(RebuildStatsOperation::new().with_realm(realm_id), &context);
-            let result = tokio::select! {
-                _ = token.cancelled() => return,
-                result = rebuild => result,
-            };
-            match result {
-                Ok(_) => break,
-                Err(error) => warn!(error = %error, "Usage counter rebuild failed; retrying"),
-            }
-            tokio::select! {
-                _ = token.cancelled() => return,
-                _ = tokio::time::sleep(RETRY_PAUSE) => {}
-            }
-        }
-        info!("Usage counters rebuilt");
-        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
-            warn!(error = %error, "Usage snapshots were not published after the rebuild");
-        }
-    });
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RebuildStatsState {
@@ -116,11 +71,11 @@ pub enum RebuildStatsError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     CounterError(#[from] UsageCounterError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received}]")]
     InvalidStateEvent {
         state: RebuildStatsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("RebuildUsageStats failed")]
     RebuildFailed,
@@ -286,7 +241,7 @@ impl RebuildStatsOperation {
         self.fail(RebuildStatsError::InvalidStateEvent {
             state: self.state.clone(),
             expected,
-            received,
+            received: received.label(),
         })
     }
 

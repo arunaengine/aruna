@@ -9,6 +9,8 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, client_ip, external_base_url};
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
+use aruna_core::holder_choice::{HolderChoiceOperation, pick};
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, object_permission_path};
@@ -25,8 +27,6 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
-use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
@@ -971,8 +971,9 @@ async fn chosen_holder(
         .copied()
         .filter(|node_id| *node_id != local || resolved.location.is_some())
         .collect();
-    choose_holder(&state.get_ctx(), &candidates, unix_timestamp_millis())
-        .await
+    let choice = HolderChoiceOperation::new(&candidates, unix_timestamp_millis());
+    let candidates = drive(choice, state.get_ctx().as_ref()).await;
+    pick(candidates.unwrap_or_default(), Ulid::generate().random())
         .map(|chosen| chosen.node_id)
         .filter(|node_id| *node_id != local)
 }
@@ -1306,7 +1307,9 @@ async fn resolve_global(
         if Instant::now() >= deadline {
             break;
         }
-        let Some(holder) = choose_holder(&context, &remote, unix_timestamp_millis()).await else {
+        let choice = HolderChoiceOperation::new(&remote, unix_timestamp_millis());
+        let candidates = drive(choice, context.as_ref()).await.unwrap_or_default();
+        let Some(holder) = pick(candidates, Ulid::generate().random()) else {
             break;
         };
         remote.retain(|node_id| *node_id != holder.node_id);
@@ -1317,7 +1320,7 @@ async fn resolve_global(
             ResolveOutcome::Denied => outcome = ResolveOutcome::Denied,
             // A holder that could not answer is skipped by the next choices for a while.
             ResolveOutcome::Unavailable => {
-                avoid_holder(&context, holder.node_id, unix_timestamp_millis())
+                context.avoid_holder(holder.node_id, unix_timestamp_millis())
             }
             ResolveOutcome::NotFound => {}
         }
@@ -1423,9 +1426,12 @@ async fn owner_origin(
     state: &ServerState,
     node_id: aruna_core::NodeId,
 ) -> Result<Option<String>, DrsError> {
-    let documents = read_info_documents(&state.get_ctx(), &[node_id])
-        .await
-        .map_err(DrsError::internal)?;
+    let documents = drive(
+        ReadInfoOperation::new(vec![node_id]),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| DrsError::internal(error.to_string()))?;
     let Some(published) = documents.get(&node_id).and_then(|doc| doc.urls.api.clone()) else {
         return Ok(None);
     };

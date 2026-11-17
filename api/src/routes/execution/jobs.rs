@@ -9,12 +9,14 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::jobs::JobKind;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
+use aruna_operations::driver::drive;
 use aruna_operations::federation::export::admit_grant;
 use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
@@ -29,7 +31,6 @@ use aruna_operations::jobs::service::{
     resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
@@ -1084,9 +1085,12 @@ async fn node_url(state: &ServerState, node_id: NodeId, job_id: JobId) -> Option
             .ok()
             .map(|urls| urls.owner_node_url);
     }
-    let documents = read_info_documents(&state.get_ctx(), &[node_id])
-        .await
-        .ok()?;
+    let documents = drive(
+        ReadInfoOperation::new(vec![node_id]),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .ok()?;
     let published = documents.get(&node_id)?.urls.api.clone()?;
     // The owner derives its url from this published one, which is absolute, so no address is used.
     let unused = SocketAddr::from(([0, 0, 0, 0], 0));

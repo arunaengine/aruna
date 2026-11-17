@@ -13,8 +13,8 @@ use ulid::Ulid;
 use super::charged_ranges::{ChargedRangesOperation, UsageError, charged_rows};
 use super::replica_shares::{GroupShare, ReplicaSharesOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::usage_complete;
 use crate::replication::members::bound_record;
+use crate::s3::usage::UsageCompleteOperation;
 
 /// The counted part of a distributed bucket on this member.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -62,7 +62,7 @@ pub async fn held_ranges(
     let (accounts, values) = drive(charged, context).await?;
     let set_id = binding.set_id;
     // A node-wide usage rebuild also leaves range counters unconfirmed.
-    let confirmed = usage_complete(context).await?;
+    let confirmed = drive(UsageCompleteOperation::new(), context).await?;
     let ranges = (accounts.iter())
         .map(|(range_id, account)| HeldRange {
             range_id: *range_id,

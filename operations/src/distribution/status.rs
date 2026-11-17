@@ -26,10 +26,10 @@ use ulid::Ulid;
 use crate::distribution::feed_walks::IndexProgress;
 use crate::distribution::index_feed::range_progress;
 use crate::driver::DriverContext;
-use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::read_cursor;
 use crate::replication::members::{CopyLag, copy_lag};
+use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum StatusError {
@@ -313,7 +313,8 @@ impl Reach {
 /// Whether this node hears from `node_id` now, from its heartbeats.
 pub fn node_reach(context: &DriverContext, node_id: NodeId) -> Reach {
     let net = context.net_handle.as_ref();
-    let heard = held_heartbeats(net)
+    let heard = context
+        .held_heartbeats()
         .into_iter()
         .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
         .collect();
@@ -349,7 +350,8 @@ pub async fn read_status(
         return Ok(None);
     };
     let net = context.net_handle.as_ref();
-    let heard = held_heartbeats(net)
+    let heard = context
+        .held_heartbeats()
         .into_iter()
         .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
         .collect();

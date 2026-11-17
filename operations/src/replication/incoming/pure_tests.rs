@@ -3608,7 +3608,7 @@ fn materialized_trace() {
 /// version and marker counts follow when the incoming row replaces it.
 #[test]
 fn replaced_row_kind() {
-    use crate::node::usage_stats::RowChange;
+    use crate::s3::usage::RowChange;
 
     let group_id = test_group_id();
     type Row = fn(&VersionReplicationManifest) -> BlobVersion;

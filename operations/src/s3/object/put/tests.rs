@@ -10,7 +10,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 
-use crate::node::usage_stats::{QuotaGate, UsageCounterUpdate};
+use crate::s3::usage::{QuotaGate, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::{BackendRegistry, NodeBackend};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

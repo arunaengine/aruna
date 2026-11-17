@@ -36,7 +36,7 @@ use super::refill::{RefillConfig, RefillOperation};
 use super::refresh::{RefreshCursor, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::mark_dirty;
+use crate::s3::usage::MarkDirtyOperation;
 
 /// How long a pass that found nothing to do waits before it looks again.
 const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
@@ -274,7 +274,8 @@ impl Tending<'_> {
     /// A finished accounting transition moves the charged rows a replica share reads.
     async fn republish(&self, context: &DriverContext) {
         let group = self.snapshot.config.owner_group;
-        if let Err(error) = mark_dirty(context, [group]).await {
+        let mark = MarkDirtyOperation::new([group], Ulid::generate());
+        if let Err(error) = drive(mark, context).await {
             warn!(set_id = %self.set_id(), %error, "The replica share was not marked for a publish");
         }
     }

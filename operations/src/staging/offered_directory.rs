@@ -5,10 +5,10 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::staging::bucket_guard::BucketGuardError;
 use crate::staging::list_offers::{ListOffersError, ListOffersOperation};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
 
         crate::driver::drive(
-            crate::node::usage_stats::RebuildStatsOperation::new(),
+            crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await
@@ -1033,7 +1033,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
 
         crate::driver::drive(
-            crate::node::usage_stats::RebuildStatsOperation::new(),
+            crate::node::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await

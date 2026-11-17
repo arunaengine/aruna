@@ -489,6 +489,7 @@ pub enum NetEvent {
         Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
     ),
     InboxWoken,
+    Heartbeat(crate::heartbeat::HeartbeatEvent),
 }
 
 /// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
@@ -890,6 +891,7 @@ impl Event {
                     ArtifactStored,
                     Notification,
                     InboxWoken,
+                    Heartbeat,
                 }
             ),
             Event::Metadata(event) => variant_label!(

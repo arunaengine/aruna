@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
-use crate::node::usage_stats::count_upload;
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
+use crate::s3::usage::count_upload;
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

@@ -16,14 +16,17 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
+use crate::driver::{DriverContext, drive};
 use crate::replication::queue::build_live_obligation;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
+use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
+use crate::tasks::task_persistence::persist_task_effect;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -842,7 +845,7 @@ mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::driver::{DriverContext, drive};
-    use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::replication::queue::{LiveObligationRecord, live_obligation_key};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};

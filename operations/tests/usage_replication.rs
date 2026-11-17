@@ -4,6 +4,7 @@
 
 use aruna_core::structs::storage::format::Compression;
 
+use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -15,10 +16,9 @@ use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key, usage_global_key,
     usage_group_key,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::node::usage_stats::{
-    RealmUsageScope, load_realm_usage, publish_usage_snapshots,
-};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
+use aruna_operations::node::usage_publish::publish_usage_snapshots;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
@@ -76,7 +76,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
             let received = read_node_stats(node_b, a_snapshot_key.clone())
                 .await
                 .is_some();
-            let global = load_realm_usage(
+            let global = realm_usage(
                 node_b.context.as_ref(),
                 node_b.net.node_id(),
                 RealmUsageScope::Global,
@@ -84,7 +84,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map(|usage| usage.counters)
             .unwrap_or_default();
-            let group = load_realm_usage(
+            let group = realm_usage(
                 node_b.context.as_ref(),
                 node_b.net.node_id(),
                 RealmUsageScope::Group(group_id),
@@ -100,7 +100,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Realm aggregate on B includes A's bucket even though B created nothing.
-    let realm_global = load_realm_usage(
+    let realm_global = realm_usage(
         node_b.context.as_ref(),
         node_b.net.node_id(),
         RealmUsageScope::Global,
@@ -108,7 +108,7 @@ async fn snapshot_reaches_peer() -> Result<(), Box<dyn std::error::Error>> {
     .await?
     .counters;
     assert_eq!(realm_global.buckets, 1, "realm global should include A");
-    let realm_group = load_realm_usage(
+    let realm_group = realm_usage(
         node_b.context.as_ref(),
         node_b.net.node_id(),
         RealmUsageScope::Group(group_id),
@@ -167,7 +167,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
             let received = read_node_stats(node_b, a_snapshot_key.clone())
                 .await
                 .is_some();
-            let global = load_realm_usage(
+            let global = realm_usage(
                 node_b.context.as_ref(),
                 node_b.net.node_id(),
                 RealmUsageScope::Global,
@@ -175,7 +175,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
             .await
             .map(|usage| usage.counters)
             .unwrap_or_default();
-            let group = load_realm_usage(
+            let group = realm_usage(
                 node_b.context.as_ref(),
                 node_b.net.node_id(),
                 RealmUsageScope::Group(group_id),
@@ -191,7 +191,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Every field of A's snapshot surfaces in B's realm aggregate.
-    let realm_global = load_realm_usage(
+    let realm_global = realm_usage(
         node_b.context.as_ref(),
         node_b.net.node_id(),
         RealmUsageScope::Global,
@@ -202,7 +202,7 @@ async fn snapshot_ingest_neutral() -> Result<(), Box<dyn std::error::Error>> {
         realm_global, rich,
         "realm global aggregate must equal A's snapshot"
     );
-    let realm_group = load_realm_usage(
+    let realm_group = realm_usage(
         node_b.context.as_ref(),
         node_b.net.node_id(),
         RealmUsageScope::Group(group_id),
@@ -423,4 +423,14 @@ async fn shutdown_nodes(nodes: Vec<TestNode>) {
     for node in nodes {
         node.net.shutdown().await;
     }
+}
+
+async fn realm_usage(
+    context: &DriverContext,
+    node_id: NodeId,
+    scope: RealmUsageScope,
+) -> Result<RealmUsage, Box<dyn std::error::Error>> {
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let mut totals = drive(RealmUsageOperation::new(node_id, realm_id, scope), context).await?;
+    Ok(totals.pop().expect("one scope gives one total"))
 }

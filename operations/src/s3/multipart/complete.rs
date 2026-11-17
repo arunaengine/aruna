@@ -13,10 +13,6 @@ use crate::distribution::inventory::{
     AddedVersion, InventoryChange, InventoryUpdate, stamp_head, stamp_version, version_written,
 };
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
-use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    count_upload, schedule_snapshot_publish,
-};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
@@ -27,6 +23,10 @@ use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_uplo
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
+};
+use crate::s3::usage::{
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    count_upload, schedule_snapshot_publish,
 };
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup, delete_records_effect};
 use aruna_core::UserId;

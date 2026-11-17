@@ -6,16 +6,16 @@
 use std::sync::Arc;
 
 use aruna_core::compute::quota::{ComputeQuota, ResourceTotals};
+use aruna_core::node_state::DrainStateOperation;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
-use aruna_operations::node::heartbeat::held_heartbeats;
-use aruna_operations::node::node_info::{
-    departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
-};
+use aruna_operations::jobs::demand::group_demand;
+use aruna_operations::node::node_info::set_operator_drain;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
@@ -601,11 +601,11 @@ pub async fn get_compute_snapshots(
     let members = config
         .node_ids()
         .map_err(|error| ServerError::InternalError(error.into()))?;
-    let documents = read_info_documents(&context, &members)
+    let documents = drive(ReadInfoOperation::new(members), context.as_ref())
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
 
-    let heartbeats = held_heartbeats(context.net_handle.as_ref());
+    let heartbeats = context.held_heartbeats();
     let nodes = documents
         .values()
         .map(|document| {
@@ -658,23 +658,21 @@ pub async fn get_compute_snapshots(
         }
         None => None,
     };
-    let departure = departure_report(&context)
+    let drain = drive(DrainStateOperation::new(), context.as_ref())
         .await
-        .map_err(|error| ServerError::InternalError(error.into()))?
-        .map(|report| DepartureBody {
-            departed_at_ms: report.departed_at_ms,
-            membership_generation: report.membership_generation,
-            unresolved: report
-                .unresolved
-                .iter()
-                .map(ulid::Ulid::to_string)
-                .collect(),
-            truncated: report.truncated,
-        });
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    let departure = drain.departure.map(|report| DepartureBody {
+        departed_at_ms: report.departed_at_ms,
+        membership_generation: report.membership_generation,
+        unresolved: report
+            .unresolved
+            .iter()
+            .map(ulid::Ulid::to_string)
+            .collect(),
+        truncated: report.truncated,
+    });
     Ok(Json(ComputeSnapshotsResponse {
-        operator_draining: read_operator_drain(&context)
-            .await
-            .map_err(|error| ServerError::InternalError(error.into()))?,
+        operator_draining: drain.operator_draining,
         nodes,
         group,
         departure,

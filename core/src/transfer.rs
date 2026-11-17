@@ -231,6 +231,50 @@ pub fn check_issued(
     check_lifetime(grant.payload.issued_at, grant.payload.expires_at, now)
 }
 
+/// The node-local record beside a finished export job that its grant is checked against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantRecord {
+    pub grant: Signed<ExportGrant>,
+    pub principal: UserId,
+    pub document_path: String,
+    pub with_files: bool,
+    pub sources: Vec<PinnedSource>,
+    pub revoked: bool,
+}
+
+/// A selected file version read on this node, rechecked on every artifact read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedSource {
+    pub bucket: String,
+    pub key: String,
+    pub path: String,
+    pub version_id: Ulid,
+    pub blake3: [u8; 32],
+    pub size: u64,
+    /// The bucket key generation of an encrypted version.
+    pub key_ref: Option<crate::structs::storage::encryption::BucketKeyRef>,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum GrantError {
+    #[error("the export is not finished or left out a selected file")]
+    Unfinished,
+    #[error("no grant was issued for this export")]
+    Missing,
+    #[error("the grant was revoked")]
+    Revoked,
+    #[error("the export is no longer allowed")]
+    Denied,
+    #[error("only a current key holder of the encrypted bucket `{0}` may export its files")]
+    NotHolder(String),
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
+    #[error(transparent)]
+    Sign(#[from] FederationError),
+    #[error("grant storage failed: {0}")]
+    Storage(String),
+}
+
 #[cfg(test)]
 #[path = "transfer_tests.rs"]
 mod tests;

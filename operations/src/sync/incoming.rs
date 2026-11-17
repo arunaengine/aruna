@@ -16,9 +16,9 @@ use crate::driver::{
     DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
 };
 use crate::jobs::runtime::JobsRuntime;
-use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::document_sync::{apply_metadata, run_maintenance};
-use crate::node::usage_stats::refresh_usage_targets;
+use crate::node::heartbeat::ReceiveHeartbeatOperation;
+use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
@@ -41,6 +41,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
@@ -963,7 +964,10 @@ async fn reconcile_inbound_topics(
     if applied == 0 {
         return true;
     }
-    let dashboard_changed = targets_change_dashboard(&targets.targets);
+    let dashboard_changed = targets
+        .targets
+        .iter()
+        .any(DocumentTarget::changes_dashboard);
     let realm_config_changed = targets
         .targets
         .iter()
@@ -973,9 +977,16 @@ async fn reconcile_inbound_topics(
         // application; the reconcile arms the SyncPlacements timer instead.
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
         let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
-        crate::federation::publish::publish_soon(context, realm_id, node_id).await;
+        let soon = crate::federation::publish::PublishSoonOperation::new(realm_id, node_id);
+        if let Err(error) = drive(soon, context).await {
+            warn!(%error, "Registry publication was not moved up");
+        }
     }
-    refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
+    let refresh = RefreshUsageOperation::new(node_id, realm_id, &targets.targets, Ulid::generate());
+    if let Err(error) = drive(refresh, context).await {
+        warn!(%error, "Realm usage refresh stopped after a document sync");
+    }
     crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
@@ -992,7 +1003,7 @@ async fn reconcile_inbound_topics(
         "Inbound document sync reconcile summary"
     );
     if dashboard_changed {
-        notify_dashboard_change(context);
+        context.notify_dashboard_change();
     }
     true
 }
@@ -1147,12 +1158,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::Heartbeat => {
-                    Box::pin(crate::node::heartbeat::handle_heartbeat_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
+                    Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::JobControl => {
                     Box::pin(async {
@@ -1257,6 +1263,57 @@ fn schedule_sync_maintenance(
             run_maintenance(&context, "periodic", cycle).await;
         }
     });
+}
+
+/// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
+/// the heartbeat operation; every refusal is only logged.
+async fn receive_heartbeat(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return;
+    };
+    let Some(_slot) = net_handle.heartbeat_slot(peer) else {
+        debug!(%peer, "Dropping a heartbeat stream past the stream limits");
+        return;
+    };
+    let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(&mut stream)).await;
+    let _ = stream.0.finish();
+    let frame = match read {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            debug!(%peer, %error, "Dropping an invalid heartbeat");
+            return;
+        }
+        Err(_) => {
+            debug!(%peer, "Heartbeat read timed out");
+            return;
+        }
+    };
+    let receive = ReceiveHeartbeatOperation::new(peer, *net_handle.realm_id(), frame);
+    if let Err(error) = drive(receive, context).await {
+        debug!(%peer, %error, "Heartbeat not kept");
+    }
+}
+
+/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
+async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    stream
+        .1
+        .read_exact(&mut length)
+        .await
+        .map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_HEARTBEAT_BYTES {
+        return Err("heartbeat frame exceeds the size limit".to_string());
+    }
+    let mut bytes = vec![0u8; length];
+    stream
+        .1
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
 }
 
 #[cfg(test)]

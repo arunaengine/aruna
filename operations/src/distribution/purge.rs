@@ -37,11 +37,11 @@ use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::node::usage_stats::{dirty_rows, mark_dirty, wake_publish};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
 
 /// Inventory rows one page purges at most.
 const PAGE_ROWS: usize = 64;
@@ -96,7 +96,10 @@ pub async fn purge_range(
                 (None, true) => {
                     clear_range_rows(context, set_id, target.range_id).await?;
                     // The range leaves this node's replica share with its counter rows.
-                    mark_dirty(context, [target.group_id]).await?;
+                    let mark = MarkDirtyOperation::new([target.group_id], Ulid::generate());
+                    drive(mark, context)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     cursor.done = true;
                 }
                 (Some(last), false) => {
@@ -428,7 +431,8 @@ async fn debit_rows(
         other => return Err(format!("a purge page did not commit: {}", other.label())),
     }
     if debited {
-        wake_publish(context).await;
+        // Scheduling the publish is best effort; the committed markers wait for it.
+        let _ = drive(MarkDirtyOperation::wake(), context).await;
     }
     Ok(())
 }
@@ -499,7 +503,7 @@ async fn stage_debit(
         });
         // The share moves without the group counters, so the group is published again.
         effects.push(StorageEffect::BatchWrite {
-            writes: dirty_rows([target.group_id]),
+            writes: dirty_rows([target.group_id], Ulid::generate()),
             txn_id: Some(txn_id),
         });
     }

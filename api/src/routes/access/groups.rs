@@ -1324,7 +1324,7 @@ pub(crate) async fn run_group_usage(
     let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
         state,
-        aruna_operations::node::usage_stats::RealmUsageScope::Group(group_id),
+        aruna_operations::node::realm_usage::RealmUsageScope::Group(group_id),
     )
     .await?;
 

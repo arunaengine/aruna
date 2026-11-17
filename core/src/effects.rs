@@ -764,6 +764,8 @@ pub enum NetEffect {
     Notification(Box<crate::structs::execution::notification::NotificationRequest>),
     /// Wakes the live inbox streams of these local recipients.
     WakeInbox(Vec<crate::UserId>),
+    /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
+    Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its

@@ -7,14 +7,19 @@ use std::time::Duration;
 
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
+use aruna_core::NodeId;
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::distribution::sharding::begin_range_rebuilds;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
 use aruna_operations::node::counter_check::CounterCheckOperation;
-use aruna_operations::node::startup::RecoveryStatus;
+use aruna_operations::node::recovery::RecoveryStatus;
+use aruna_operations::node::usage_publish::publish_refresh_snapshots;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
@@ -33,6 +38,8 @@ const RECORD_LIMITS: aruna_operations::recorder::RecordLimits =
         total_bytes: 64 << 20,
         entry_bytes: 16 << 10,
     };
+/// Pause before a failed background usage rebuild starts again from a new snapshot.
+const REBUILD_RETRY_PAUSE: Duration = Duration::from_secs(30);
 
 /// The node resources a running process owns. This is not the Tokio runtime.
 pub struct NodeResources {
@@ -505,7 +512,7 @@ async fn fill(
     acquired.usage_counters_rebuilt =
         drive(CounterCheckOperation::new(), driver_ctx.as_ref()).await?;
     if acquired.usage_counters_rebuilt {
-        aruna_operations::node::usage_stats::spawn_usage_rebuild(
+        spawn_usage_rebuild(
             driver_ctx.clone(),
             config.realm_id,
             config.node_id,
@@ -628,6 +635,44 @@ async fn record_restart_locks(
     Ok(())
 }
 
+/// Rebuilds the usage counters in the background until one rebuild finishes, then publishes
+/// full usage snapshots. Startup does not wait; until then quota-limited writes are refused.
+fn spawn_usage_rebuild(
+    context: Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+    shutdown: &Shutdown,
+) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        // Range counters of distributed buckets are confirmed again by their own rebuilds.
+        match begin_range_rebuilds(&context).await {
+            Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Range counter rebuilds could not begin"),
+        }
+        loop {
+            let rebuild = drive(RebuildStatsOperation::new().with_realm(realm_id), &context);
+            let result = tokio::select! {
+                _ = token.cancelled() => return,
+                result = rebuild => result,
+            };
+            match result {
+                Ok(_) => break,
+                Err(error) => warn!(error = %error, "Usage counter rebuild failed; retrying"),
+            }
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(REBUILD_RETRY_PAUSE) => {}
+            }
+        }
+        info!("Usage counters rebuilt");
+        if let Err(error) = publish_refresh_snapshots(&context, node_id, realm_id, true).await {
+            warn!(error = %error, "Usage snapshots were not published after the rebuild");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -678,7 +723,7 @@ mod tests {
     }
 
     async fn rebuild(driver_ctx: &DriverContext) {
-        use aruna_operations::node::usage_stats::RebuildStatsOperation;
+        use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
             .expect("usage rebuild finishes");

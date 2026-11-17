@@ -38,10 +38,10 @@ use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectError, GetObjectResult, HolderFailures};
+use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
@@ -233,7 +233,9 @@ async fn member_of(
         .collect();
     // Replicas share the load by free download slots; the coordinator stays the fallback.
     if replicas > 1 {
-        let chosen = choose_holder(context, &holders[..replicas], now_ms()).await;
+        let choice = HolderChoiceOperation::new(&holders[..replicas], now_ms());
+        let candidates = drive(choice, context).await.unwrap_or_default();
+        let chosen = pick(candidates, Ulid::generate().random());
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),
@@ -244,7 +246,8 @@ async fn member_of(
         }
     }
     // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
-    let fresh: Vec<NodeId> = (candidates(context, &holders, now_ms()).await.into_iter())
+    let choice = HolderChoiceOperation::new(&holders, now_ms());
+    let fresh: Vec<NodeId> = (drive(choice, context).await.unwrap_or_default().into_iter())
         .map(|candidate| candidate.node_id)
         .collect();
     if !fresh.is_empty() {
@@ -299,7 +302,7 @@ async fn from_holders(
             result,
             Err(BaoReadError::Blob(_) | BaoReadError::Refused(BaoReadRefusal::BackendFailure))
         ) {
-            avoid_holder(context, *holder, now_ms());
+            context.avoid_holder(*holder, now_ms());
         }
         if let Some(BaoReadOutput::Stream { blob, .. }) = failures.consider(result) {
             return Ok(blob);

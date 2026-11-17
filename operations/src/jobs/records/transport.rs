@@ -30,7 +30,6 @@ use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
-use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
 use aruna_core::structs::execution::job::record_rows::PendingNeed;
 
@@ -389,7 +388,7 @@ async fn accept_record(
         ServeError::Unavailable
     })?;
     if matches!(outcome.admission, Admission::Authentic) {
-        notify_dashboard_change(context.as_ref());
+        context.notify_dashboard_change();
         if rearms {
             crate::jobs::lifecycle::witness::arm_family(context.as_ref(), family, now_ms).await;
         }

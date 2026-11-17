@@ -35,9 +35,8 @@ use aruna_core::structs::storage::usage::{
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::usage_stats::{
-    RealmUsageScope, RebuildStatsOperation, load_realm_usage, recompute_usage_summary,
-};
+use aruna_operations::node::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
@@ -1280,11 +1279,15 @@ async fn multipart_releases_observation() {
 }
 
 async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
-    load_realm_usage(&h.driver, h.node_id, RealmUsageScope::Group(group_id))
-        .await
-        .unwrap()
-        .counters
-        .logical_bytes
+    let realm_id = h.driver.node_and_realm().map(|(_, realm_id)| realm_id);
+    let scope = RealmUsageScope::Group(group_id);
+    let totals = drive(
+        RealmUsageOperation::new(h.node_id, realm_id, scope),
+        &h.driver,
+    )
+    .await
+    .unwrap();
+    totals[0].counters.logical_bytes
 }
 
 /// The usage the quota gate counts for the group, read from a refused one-byte write.
@@ -1307,9 +1310,9 @@ async fn report_matches_admission() {
     assert_eq!(admitted_bytes(&h, group_id).await, 90);
     assert_eq!(reported_bytes(&h, group_id).await, 90);
 
-    recompute_usage_summary(&h.driver, h.node_id, false, vec![group_id])
-        .await
-        .unwrap();
+    let realm_id = h.driver.node_and_realm().map(|(_, realm_id)| realm_id);
+    let summary = RealmUsageOperation::summary(h.node_id, realm_id, false, vec![group_id]);
+    drive(summary, &h.driver).await.unwrap();
     put_object(&h, "bucket", "b.bin", group_id, &[2u8; 5]).await;
     let version = put_object(&h, "bucket", "c.bin", group_id, &[3u8; 7]).await;
     delete_object(&h, "bucket", "c.bin", group_id, Some(version.version_id)).await;

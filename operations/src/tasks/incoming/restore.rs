@@ -291,7 +291,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::federation::publish::restore_publish_timer(&context.storage_handle, &task_handle)
+        crate::federation::registry::restore_publish_timer(&context.storage_handle, &task_handle)
             .await;
         if stopped() {
             return;
@@ -377,7 +377,7 @@ impl OperationsTaskHandler {
         };
         let node_id = net_handle.node_id();
         let realm_id = *net_handle.realm_id();
-        match crate::node::usage_stats::publish_refresh_snapshots(
+        match crate::node::usage_publish::publish_refresh_snapshots(
             &self.context,
             node_id,
             realm_id,
@@ -390,7 +390,7 @@ impl OperationsTaskHandler {
                 warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
-                    crate::node::usage_stats::SNAPSHOT_PUBLISH_DEBOUNCE,
+                    crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }
@@ -423,7 +423,7 @@ impl OperationsTaskHandler {
         // outcome so a transient failure never stops the heartbeat.
         self.reschedule_timer(
             TaskKey::PublishNodeInfo,
-            crate::node::node_info::INFO_PUBLISH_INTERVAL,
+            aruna_core::heartbeat::INFO_PUBLISH_INTERVAL,
         )
         .await;
     }
@@ -432,7 +432,7 @@ impl OperationsTaskHandler {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
             (Some(net_handle), Some(capabilities)) => {
-                if let Err(error) = crate::federation::publish::publish_registration(
+                if let Err(error) = crate::federation::registry::publish_registration(
                     &self.context,
                     *net_handle.realm_id(),
                     net_handle.node_id(),

@@ -1834,7 +1834,7 @@ async fn probe_sources_checked(
         }
         // No copy opened and one of them needs a bucket key the caller lacks.
         if let Some(bucket) = unheld {
-            let refused = crate::federation::export::GrantError::NotHolder(bucket);
+            let refused = aruna_core::transfer::GrantError::NotHolder(bucket);
             return Err(ExportFailure::Permanent(refused.to_string()));
         }
 

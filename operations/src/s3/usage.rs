@@ -7,50 +7,32 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
-};
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, BucketInfo};
+use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
 use aruna_core::structs::storage::usage::{
-    BucketDelta, DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, SUMMARY_GLOBAL_KEY,
-    SUMMARY_GROUP_PREFIX, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY, USAGE_GLOBAL_PREFIX,
-    USAGE_GROUP_PREFIX, USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta,
-    dirty_group_id, dirty_group_key, dirty_share_id, dirty_share_key, global_group_key,
-    global_shard_key, global_shard_keys, shard_for_archive, shard_for_hash, usage_backend_key,
-    usage_bucket_key, usage_global_key, usage_group_id, usage_group_key, usage_group_prefix,
-    usage_node_id, usage_snapshot_key, usage_summary_key,
+    BucketDelta, DIRTY_GLOBAL_KEY, NodeUsageSnapshot, USAGE_COMPLETE_KEY, USAGE_GLOBAL_KEY,
+    USAGE_REBUILD_KEY, UsageCounterError, UsageCounters, UsageDelta, dirty_group_key,
+    dirty_share_key, global_group_key, global_shard_key, global_shard_keys, shard_for_archive,
+    shard_for_hash, usage_backend_key, usage_bucket_key, usage_group_key, usage_group_prefix,
+    usage_node_id,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
 use byteview::ByteView;
-use futures_util::TryStreamExt;
 use smallvec::smallvec;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::pin::pin;
+use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 use thiserror::Error;
-use tracing::warn;
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
-use crate::distribution::usage::replica_shares;
-use crate::driver::{DriverContext, drive};
-use crate::storage_read::scan_pages;
-use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
-
-pub use crate::node::usage_rebuild::{
-    RebuildStatsError, RebuildStatsOperation, RebuildStatsState, spawn_usage_rebuild,
-};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
-    #[error("usage counter update received unexpected event: {0:?}")]
-    UnexpectedEvent(Event),
+    #[error("usage counter update received unexpected event: {0}")]
+    UnexpectedEvent(&'static str),
     #[error(transparent)]
     Inventory(#[from] InventoryError),
 }
@@ -384,7 +366,7 @@ impl UsageCounterUpdate {
             }
             (UsageUpdatePhase::Inventory, event) => {
                 let Some(inventory) = self.inventory.as_mut() else {
-                    return Err(UsageUpdateError::UnexpectedEvent(event));
+                    return Err(UsageUpdateError::UnexpectedEvent(event.label()));
                 };
                 match inventory.step(event, txn_id)? {
                     Some(effects) => Ok(Some(effects)),
@@ -394,7 +376,7 @@ impl UsageCounterUpdate {
                     }
                 }
             }
-            (_, received) => Err(UsageUpdateError::UnexpectedEvent(received)),
+            (_, received) => Err(UsageUpdateError::UnexpectedEvent(received.label())),
         }
     }
 
@@ -432,8 +414,8 @@ enum QuotaGatePhase {
 pub enum QuotaGateError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("quota gate received unexpected event: {0:?}")]
-    UnexpectedEvent(Event),
+    #[error("quota gate received unexpected event: {0}")]
+    UnexpectedEvent(&'static str),
 }
 
 /// Read side of the per-group quota gate: sums realm-wide `logical_bytes` in the caller's write
@@ -648,7 +630,7 @@ impl QuotaGate {
                 self.phase = QuotaGatePhase::Done;
                 Ok(None)
             }
-            (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
+            (_, received) => Err(QuotaGateError::UnexpectedEvent(received.label())),
         }
     }
 
@@ -701,7 +683,7 @@ impl QuotaGate {
 }
 
 /// Reads the usage rebuild marker; a present row means the local counters are incomplete.
-pub fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
+fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: USAGE_STATS_KEYSPACE.to_string(),
         key: Key::from(USAGE_REBUILD_KEY.to_vec()),
@@ -709,18 +691,52 @@ pub fn rebuild_marker_read(txn_id: Option<TxnId>) -> Effect {
     })
 }
 
-/// False while a usage rebuild runs: local usage counters must not count as free capacity
-/// and do not yet back quota decisions.
-pub async fn usage_complete(context: &DriverContext) -> Result<bool, StorageError> {
-    let Effect::Storage(read) = rebuild_marker_read(None) else {
-        return Err(StorageError::InvalidEffect);
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error),
-        other => Err(StorageError::ReadError(format!(
-            "unexpected answer {other:?}"
-        ))),
+/// Reads whether the local usage counters are complete: false while a usage rebuild runs,
+/// when they must not count as free capacity and do not yet back quota decisions.
+#[derive(Debug, Default, PartialEq)]
+pub struct UsageCompleteOperation {
+    started: bool,
+    result: Option<Result<bool, StorageError>>,
+}
+
+impl UsageCompleteOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for UsageCompleteOperation {
+    type Output = bool;
+    type Error = StorageError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        smallvec![rebuild_marker_read(None)]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.result = Some(match (self.started && self.result.is_none(), event) {
+            (true, Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_none()),
+            (true, Event::Storage(StorageEvent::Error { error })) => Err(error),
+            _ => Err(StorageError::ReadError(
+                "unexpected event for the usage rebuild marker".to_string(),
+            )),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.result.unwrap_or(Err(StorageError::ReadError(
+            "the usage rebuild marker was not read".to_string(),
+        )))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -742,12 +758,12 @@ pub enum LoadCountersError {
     #[error(transparent)]
     CounterError(#[from] UsageCounterError),
     #[error(
-        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received:?}"
+        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received}"
     )]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("usage counter read did not finish")]
     NotFinished,
@@ -783,7 +799,7 @@ impl LoadCountersOperation {
         self.finish(Err(LoadCountersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            received,
+            received: received.label(),
         }))
     }
 
@@ -803,7 +819,7 @@ impl LoadCountersOperation {
     fn handle_global_read(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                self.finish(sum_global_usage(values))
+                self.finish(global_sum(values))
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
             other => self.unexpected_event("storage batch read result", other),
@@ -818,14 +834,7 @@ impl Operation for LoadCountersOperation {
     fn start(&mut self) -> Effects {
         if self.key.as_slice() == USAGE_GLOBAL_KEY {
             self.state = LoadCountersState::ReadGlobal;
-            let reads = global_shard_keys()
-                .into_iter()
-                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.into()))
-                .collect::<Vec<_>>();
-            smallvec![Effect::Storage(StorageEffect::BatchRead {
-                reads,
-                txn_id: None,
-            })]
+            smallvec![Effect::Storage(global_shard_read(None))]
         } else {
             self.state = LoadCountersState::ReadCounter;
             smallvec![Effect::Storage(StorageEffect::Read {
@@ -862,17 +871,32 @@ impl Operation for LoadCountersOperation {
     }
 }
 
-fn sum_global_usage(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, LoadCountersError> {
-    let mut total = UsageCounters::default();
-
-    for (_, value) in values {
-        let Some(bytes) = value else {
-            continue;
-        };
-        let counters = UsageCounters::from_bytes(bytes.as_ref())?;
-        total.add(&counters)?;
+/// Whether a snapshot of `node_id` counts: with a realm config, only its sync-eligible nodes do.
+pub(crate) fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option<NodeId>) -> bool {
+    match (active_node_ids, node_id) {
+        (Some(active_node_ids), Some(node_id)) => active_node_ids.contains(&node_id),
+        _ => true,
     }
+}
 
+/// One batch read of every global counter shard, inside `txn_id` when given.
+pub(crate) fn global_shard_read(txn_id: Option<TxnId>) -> StorageEffect {
+    let reads = global_shard_keys()
+        .into_iter()
+        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+        .collect();
+    StorageEffect::BatchRead { reads, txn_id }
+}
+
+/// The node-wide counters: the sum of the shard rows [`global_shard_read`] returned.
+pub(crate) fn global_sum<E>(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, E>
+where
+    E: From<ConversionError> + From<UsageCounterError>,
+{
+    let mut total = UsageCounters::default();
+    for bytes in values.into_iter().filter_map(|(_, value)| value) {
+        total.add(&UsageCounters::from_bytes(bytes.as_ref())?)?;
+    }
     Ok(total)
 }
 
@@ -889,724 +913,13 @@ pub fn schedule_snapshot_publish() -> Effect {
     })
 }
 
-/// Groups/global scope touched by a publish run, so callers can refresh exactly
-/// the affected realm summary cache entries.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct PublishedUsage {
-    pub global: bool,
-    pub groups: Vec<GroupId>,
-}
-
-impl PublishedUsage {
-    pub fn is_empty(&self) -> bool {
-        !self.global && self.groups.is_empty()
-    }
-
-    fn targets(&self, realm_id: RealmId, node_id: NodeId) -> Vec<DocumentTarget> {
-        let mut targets = Vec::with_capacity(self.groups.len() + usize::from(self.global));
-        if self.global {
-            targets.push(DocumentTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: None,
-            });
-        }
-        for group_id in &self.groups {
-            targets.push(DocumentTarget::NodeUsage {
-                realm_id,
-                node_id,
-                group_id: Some(*group_id),
-            });
-        }
-        targets
-    }
-}
-
-/// Which realm-wide counter a caller wants to read from the summed cache.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RealmUsageScope {
-    Global,
-    Group(GroupId),
-}
-
-pub(crate) async fn read_local_global(
-    storage: &StorageHandle,
-    txn_id: Option<TxnId>,
-) -> Result<UsageCounters, String> {
-    let reads = global_shard_keys()
-        .into_iter()
-        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
-        .collect();
-    match storage
-        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            let mut total = UsageCounters::default();
-            for (_, value) in values {
-                if let Some(bytes) = value {
-                    let counters =
-                        UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string())?;
-                    total.add(&counters).map_err(|e| e.to_string())?;
-                }
-            }
-            Ok(total)
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected global read event: {other:?}")),
-    }
-}
-
-async fn read_local_group(
-    storage: &StorageHandle,
-    group_id: GroupId,
-    txn_id: Option<TxnId>,
-) -> Result<UsageCounters, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: Key::from(usage_group_key(group_id)),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => UsageCounters::from_bytes(bytes.as_ref()).map_err(|e| e.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Ok(UsageCounters::default())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected group read event: {other:?}")),
-    }
-}
-
-/// Whether a snapshot of `node_id` counts: with a realm config, only its sync-eligible nodes do.
-fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option<NodeId>) -> bool {
-    match (active_node_ids, node_id) {
-        (Some(active_node_ids), Some(node_id)) => active_node_ids.contains(&node_id),
-        _ => true,
-    }
-}
-
-/// Sums remote nodes' snapshots under `prefix`, and every node's replica share, the local one
-/// included. The local counters are skipped so they are never double-counted against the live
-/// local counters.
-async fn sum_snapshots(
-    storage: &StorageHandle,
-    prefix: Vec<u8>,
-    local_node_id: NodeId,
-    active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<(UsageCounters, UsageCounters), String> {
-    let mut pages = pin!(scan_pages(
-        storage,
-        NODE_STATS_KEYSPACE,
-        Some(Key::from(prefix))
-    ));
-    let (mut total, mut replicas) = (UsageCounters::default(), UsageCounters::default());
-    while let Some(page) = pages.try_next().await? {
-        for (key, value) in page {
-            let key_node_id = usage_node_id(key.as_ref());
-            let local = key_node_id == Some(local_node_id);
-            if !local && !counted(active_node_ids, key_node_id) {
-                continue;
-            }
-            let snapshot =
-                NodeUsageSnapshot::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-            // Reject snapshots whose embedded node differs from the storage key.
-            if key_node_id != Some(snapshot.node_id) {
-                continue;
-            }
-            replicas
-                .add(&snapshot.replicas)
-                .map_err(|e| e.to_string())?;
-            if !local {
-                total.add(&snapshot.counters).map_err(|e| e.to_string())?;
-            }
-        }
-    }
-    Ok((total, replicas))
-}
-
-/// Rebuilds this node's snapshot documents from live counters and distributes them
-/// over the sync layer: dirty mode refreshes marked groups, full mode all groups plus
-/// the global. Markers clear only after durable replication, never if re-dirtied.
-pub async fn publish_usage_snapshots(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<PublishedUsage, String> {
-    let (published, observed_markers) =
-        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
-    clear_consumed_markers(&ctx.storage_handle, observed_markers).await?;
-    Ok(published)
-}
-
-async fn publish_retaining_markers(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<(PublishedUsage, Vec<(Key, Value)>), String> {
-    let storage = &ctx.storage_handle;
-
-    let dirty_prefix = Some(Key::from(DIRTY_PREFIX.to_vec()));
-    let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, dirty_prefix));
-    let mut observed_markers = Vec::new();
-    while let Some(page) = pages.try_next().await? {
-        observed_markers.extend(page);
-    }
-
-    let mut groups: BTreeSet<GroupId> = BTreeSet::new();
-    let mut global = false;
-    for (key, _) in &observed_markers {
-        if key.as_ref() == DIRTY_GLOBAL_KEY {
-            global = true;
-        } else if let Some(group_id) = dirty_group_id(key.as_ref()) {
-            groups.insert(group_id);
-        } else if let Some(group_id) = dirty_share_id(key.as_ref()) {
-            // A share marker the scan saw without its group's marker still needs a publish.
-            groups.insert(group_id);
-        }
-    }
-
-    if full {
-        global = true;
-        let group_prefix = Some(Key::from(b"group/".to_vec()));
-        let mut pages = pin!(scan_pages(storage, USAGE_STATS_KEYSPACE, group_prefix));
-        while let Some(page) = pages.try_next().await? {
-            for (key, _) in page {
-                if let Some(rest) = key.as_ref().strip_prefix(b"group/")
-                    && let Ok(bytes) = <[u8; 16]>::try_from(rest)
-                {
-                    groups.insert(GroupId::from_bytes(bytes));
-                }
-            }
-        }
-        // Republish snapshots missing a live counter as zero so peers stop summing stale data.
-        let usage_prefix = Some(Key::from(USAGE_GROUP_PREFIX.to_vec()));
-        let mut pages = pin!(scan_pages(storage, NODE_STATS_KEYSPACE, usage_prefix));
-        while let Some(page) = pages.try_next().await? {
-            for (key, _) in page {
-                if usage_node_id(key.as_ref()) == Some(node_id)
-                    && let Some(group_id) = usage_group_id(key.as_ref())
-                {
-                    groups.insert(group_id);
-                }
-            }
-        }
-    }
-
-    if !global && groups.is_empty() {
-        return Ok((PublishedUsage::default(), Vec::new()));
-    }
-
-    // Counters and replica shares come from one snapshot, as a purge debits both together.
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction answer {other:?}")),
-    };
-    let group_list: Vec<GroupId> = groups.into_iter().collect();
-    let read = async {
-        let shares = replica_shares(ctx, txn_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        let counters = if global {
-            read_local_global(storage, Some(txn_id)).await?
-        } else {
-            UsageCounters::default()
-        };
-        let mut group_counters = Vec::with_capacity(group_list.len());
-        for group_id in &group_list {
-            group_counters.push(read_local_group(storage, *group_id, Some(txn_id)).await?);
-        }
-        Ok::<_, String>((shares, counters, group_counters))
-    }
-    .await;
-    storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-    let (shares, counters, group_counters) = read?;
-    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(group_list.len() + 1);
-    if global {
-        let (mut replicas, mut revisions) = (UsageCounters::default(), BTreeMap::new());
-        for share in shares.values() {
-            replicas.add(&share.replicas).map_err(|e| e.to_string())?;
-            revisions.extend(&share.revisions);
-        }
-        let snapshot = NodeUsageSnapshot {
-            node_id,
-            counters,
-            replicas,
-            revisions,
-        };
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_global_key(node_id)),
-            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
-        ));
-    }
-    for (group_id, counters) in group_list.iter().zip(group_counters) {
-        let share = shares.get(group_id).cloned().unwrap_or_default();
-        let snapshot = NodeUsageSnapshot {
-            node_id,
-            counters,
-            replicas: share.replicas,
-            revisions: share.revisions,
-        };
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_snapshot_key(*group_id, node_id)),
-            Value::from(snapshot.to_bytes().map_err(|e| e.to_string())?),
-        ));
-    }
-
-    // Persist the refreshed snapshots but keep the dirty markers until the
-    // documents have been durably handed to replication.
-    write_snapshot_documents(storage, writes).await?;
-
-    let published = PublishedUsage {
-        global,
-        groups: group_list,
-    };
-    let targets = published.targets(realm_id, node_id);
-    if let Err(error) = drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id,
-            local_node_id: node_id,
-            excluded_peers: Vec::new(),
-            documents: targets,
-            // Steady-state publishers must not mint the shared node-usage
-            // genesis; bootstrap/placement-origin paths do that authoritatively.
-            allow_genesis: false,
-        }),
-        ctx,
-    )
-    .await
-    .map_err(|error| format!("node usage snapshot replication failed: {error}"))
-    {
-        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
-            return Err(format!(
-                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
-            ));
-        }
-        return Err(error);
-    }
-
-    Ok((published, observed_markers))
-}
-
-pub async fn publish_refresh_snapshots(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    realm_id: RealmId,
-    full: bool,
-) -> Result<PublishedUsage, String> {
-    let (published, observed_markers) =
-        publish_retaining_markers(ctx, node_id, realm_id, full).await?;
-    if !published.is_empty()
-        && let Err(error) =
-            recompute_usage_summary(ctx, node_id, published.global, published.groups.clone()).await
-    {
-        if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
-            return Err(format!(
-                "{error}; additionally failed to mark usage snapshot retry: {retry_error}"
-            ));
-        }
-        return Err(error);
-    }
-    // Replication and summary refresh both succeeded; only now consume the
-    // markers, and only those a concurrent write did not re-dirty meanwhile.
-    clear_consumed_markers(&ctx.storage_handle, observed_markers).await?;
-    Ok(published)
-}
-
-async fn signal_snapshot_retry(
-    ctx: &DriverContext,
-    published: &PublishedUsage,
-    observed_markers: &[(Key, Value)],
-) -> Result<(), String> {
-    write_retry_markers(&ctx.storage_handle, published, observed_markers).await?;
-
-    let Some(task_handle) = ctx.task_handle.as_ref() else {
-        return Ok(());
-    };
-    match task_handle.send_effect(schedule_snapshot_publish()).await {
-        Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
-        Event::Task(TaskEvent::Error { message, .. }) => {
-            warn!(message = %message, "Failed to schedule usage snapshot retry");
-            Ok(())
-        }
-        other => {
-            warn!(event = ?other, "Unexpected usage snapshot retry schedule result");
-            Ok(())
-        }
-    }
-}
-
-async fn write_retry_markers(
-    storage: &StorageHandle,
-    published: &PublishedUsage,
-    observed_markers: &[(Key, Value)],
-) -> Result<(), String> {
-    if published.is_empty() {
-        return Ok(());
-    }
-
-    let observed_keys: HashSet<Vec<u8>> = observed_markers
-        .iter()
-        .map(|(key, _)| key.as_ref().to_vec())
-        .collect();
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
-    let mut writes: Vec<(String, Key, Value)> =
-        Vec::with_capacity(published.groups.len() + usize::from(published.global));
-    if published.global && !observed_keys.contains(DIRTY_GLOBAL_KEY) {
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
-            generation.clone(),
-        ));
-    }
-    for group_id in &published.groups {
-        let marker_key = dirty_group_key(*group_id);
-        if observed_keys.contains(&marker_key) {
-            continue;
-        }
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(marker_key),
-            generation.clone(),
-        ));
-    }
-    if writes.is_empty() {
-        return Ok(());
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("retry marker write failed: {other:?}")),
-    }
-}
-
-/// Persists the refreshed snapshot documents. Each snapshot key has a single
-/// writer (this node), so a plain batch write is enough.
-async fn write_snapshot_documents(
-    storage: &StorageHandle,
-    writes: Vec<(String, Key, Value)>,
-) -> Result<(), String> {
-    if writes.is_empty() {
-        return Ok(());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("snapshot write failed: {other:?}")),
-    }
-}
-
-/// Deletes each observed dirty marker only if its stored generation still matches
-/// the one seen at publish start. Re-reading inside the transaction makes a racing
-/// counter update abort the commit, so its retry signal is never lost.
-async fn clear_consumed_markers(
-    storage: &StorageHandle,
-    observed: Vec<(Key, Value)>,
-) -> Result<(), String> {
-    if observed.is_empty() {
-        return Ok(());
-    }
-
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    else {
-        return Err("failed to start marker cleanup transaction".to_string());
-    };
-
-    let reads = observed
-        .iter()
-        .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key.clone()))
-        .collect();
-    let current = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("marker re-read failed: {other:?}"));
-        }
-    };
-
-    let mut deletes: Vec<(String, Key)> = Vec::with_capacity(observed.len());
-    for ((key, observed_generation), (_, current_value)) in observed.iter().zip(current) {
-        if current_value.as_ref() == Some(observed_generation) {
-            deletes.push((NODE_STATS_KEYSPACE.to_string(), key.clone()));
-        }
-    }
-
-    if deletes.is_empty() {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Ok(());
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("marker delete failed: {other:?}"));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        // A concurrent counter update re-dirtied one of the observed markers; the
-        // conflicting commit aborts and every marker survives for the next run.
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(()),
-        other => Err(format!("marker cleanup commit failed: {other:?}")),
-    }
-}
-
-async fn active_usage_nodes(ctx: &DriverContext) -> Result<Option<HashSet<NodeId>>, String> {
-    let Some(net_handle) = ctx.net_handle.as_ref() else {
-        return Ok(None);
-    };
-    let realm_id = *net_handle.realm_id();
-    let key = DocumentTarget::RealmConfig { realm_id }.storage_key();
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => {
-            let document = RealmConfigDocument::from_bytes(bytes.as_ref())
-                .map_err(|error| error.to_string())?;
-            Ok(Some(
-                document
-                    .sync_eligible_nodes()
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .collect(),
-            ))
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected realm config read event: {other:?}")),
-    }
-}
-
-async fn clear_usage_cache(ctx: &DriverContext) -> Result<(), String> {
-    let mut deletes = vec![(
-        NODE_STATS_KEYSPACE.to_string(),
-        Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-    )];
-    let summary_prefix = Some(Key::from(SUMMARY_GROUP_PREFIX.to_vec()));
-    let mut pages = pin!(scan_pages(
-        &ctx.storage_handle,
-        NODE_STATS_KEYSPACE,
-        summary_prefix
-    ));
-    while let Some(page) = pages.try_next().await? {
-        deletes.extend(
-            page.into_iter()
-                .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key)),
-        );
-    }
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected summary cache delete event: {other:?}")),
-    }
-}
-
-/// Recomputes the persisted realm-wide summed cache for the requested scopes:
-/// realm total = live local counters + every remote node's snapshot.
-pub async fn recompute_usage_summary(
-    ctx: &DriverContext,
-    local_node_id: NodeId,
-    include_global: bool,
-    groups: Vec<GroupId>,
-) -> Result<(), String> {
-    let storage = &ctx.storage_handle;
-    let active_node_ids = active_usage_nodes(ctx).await?;
-    let mut writes: Vec<(String, Key, Value)> = Vec::with_capacity(groups.len() + 1);
-
-    if include_global {
-        let total = realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await?;
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
-        ));
-    }
-    for group_id in groups {
-        let total =
-            realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await?;
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(usage_summary_key(group_id)),
-            Value::from(total.counters.to_bytes().map_err(|e| e.to_string())?),
-        ));
-    }
-
-    if writes.is_empty() {
-        return Ok(());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected summary write event: {other:?}")),
-    }
-}
-
-/// Refreshes the persisted realm usage sum cache for exactly the `NodeUsage` scopes
-/// touched by a document-sync reconcile. Shared by all reconcile handlers so remote
-/// snapshots update the realm aggregate on every path.
-pub async fn refresh_usage_targets(
-    ctx: &DriverContext,
-    local_node_id: NodeId,
-    targets: &[DocumentTarget],
-) {
-    let mut include_global = false;
-    let mut groups = BTreeSet::new();
-    let mut realm_config_changed = false;
-    for target in targets {
-        match target {
-            DocumentTarget::NodeUsage { group_id, .. } => match group_id {
-                Some(group_id) => {
-                    groups.insert(*group_id);
-                }
-                None => include_global = true,
-            },
-            DocumentTarget::RealmConfig { .. } => {
-                realm_config_changed = true;
-            }
-            _ => {}
-        }
-    }
-    if realm_config_changed && let Err(error) = clear_usage_cache(ctx).await {
-        warn!(error = %error, "Failed to clear realm usage summary after realm config change");
-    }
-    // Distribution records arrive as realm config targets; a new coordinator moves replica shares.
-    if realm_config_changed && let Err(error) = dirty_bound_groups(ctx).await {
-        warn!(error = %error, "Failed to mark distributed bucket groups for a usage publish");
-    }
-    if !include_global && groups.is_empty() {
-        return;
-    }
-    if let Err(error) = recompute_usage_summary(
-        ctx,
-        local_node_id,
-        include_global,
-        groups.into_iter().collect(),
-    )
-    .await
-    {
-        warn!(error = %error, "Failed to refresh realm usage summary after document sync reconciliation");
-    }
-}
-
-/// A realm-wide usage total.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RealmUsage {
-    /// Objects and data counted once, a distributed range at its coordinator; `stored_*` and
-    /// `buckets` over every node.
-    pub counters: UsageCounters,
-    /// The copies of distributed ranges left out of `counters`.
-    pub replicas: UsageCounters,
-}
-
-impl RealmUsage {
-    fn of(
-        local: UsageCounters,
-        (remote, replicas): (UsageCounters, UsageCounters),
-    ) -> Result<Self, String> {
-        let mut total = local;
-        total.add(&remote).map_err(|e| e.to_string())?;
-        Ok(Self {
-            counters: total.without_replicas(&replicas),
-            replicas,
-        })
-    }
-}
-
-/// Marks the groups of local distributed buckets and the global for the next publish, which
-/// recomputes their replica shares, and schedules it.
-async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
-    let mut groups = BTreeSet::new();
-    let mut pages = pin!(scan_pages(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None));
-    while let Some(page) = pages.try_next().await? {
-        for (_, value) in page {
-            let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-            if info.distribution.is_some() {
-                groups.insert(info.group_id);
-            }
-        }
-    }
-    if groups.is_empty() {
-        return Ok(());
-    }
-    mark_dirty(ctx, groups).await
-}
-
-/// Rows marking `groups` and the global for the next publish, for a caller's transaction.
-pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(String, Key, Value)> {
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+/// Rows marking `groups` and the global for the next publish under `generation`, for a
+/// caller's transaction. A publish clears a marker only while it keeps that generation.
+pub(crate) fn dirty_rows(
+    groups: impl IntoIterator<Item = GroupId>,
+    generation: ulid::Ulid,
+) -> Vec<(String, Key, Value)> {
+    let generation = Value::from(generation.to_bytes().to_vec());
     let marker = |key: Vec<u8>| {
         (
             NODE_STATS_KEYSPACE.to_string(),
@@ -1622,100 +935,93 @@ pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(Stri
     rows
 }
 
-/// Schedules the publish that consumes committed dirty markers.
-pub(crate) async fn wake_publish(ctx: &DriverContext) {
-    if let Some(task_handle) = ctx.task_handle.as_ref() {
-        task_handle.send_effect(schedule_snapshot_publish()).await;
-    }
+#[derive(Debug, Error, PartialEq)]
+pub enum MarkDirtyError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error("unexpected event while marking usage for a publish: {0}")]
+    UnexpectedEvent(&'static str),
+    #[error("the usage marking has not finished")]
+    Unfinished,
 }
 
-/// Marks `groups` and the global for the next publish and schedules it.
-pub(crate) async fn mark_dirty(
-    ctx: &DriverContext,
-    groups: impl IntoIterator<Item = GroupId>,
-) -> Result<(), String> {
-    let write = StorageEffect::BatchWrite {
-        writes: dirty_rows(groups),
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("dirty marker write failed: {other:?}")),
-    }
-    wake_publish(ctx).await;
-    Ok(())
+/// Marks groups and the global for the next usage publish, then schedules that publish; the
+/// wake form only schedules the publish that consumes markers a caller already committed.
+/// Scheduling is best effort: a refused timer still ends the run.
+#[derive(Debug, PartialEq)]
+pub struct MarkDirtyOperation {
+    writes: Option<Vec<(String, Key, Value)>>,
+    marking: bool,
+    result: Option<Result<(), MarkDirtyError>>,
 }
 
-async fn realm_global_usage(
-    storage: &StorageHandle,
-    local_node_id: NodeId,
-    active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<RealmUsage, String> {
-    let local = read_local_global(storage, None).await?;
-    let prefix = USAGE_GLOBAL_PREFIX.to_vec();
-    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
-    RealmUsage::of(local, remote)
-}
-
-async fn realm_group_usage(
-    storage: &StorageHandle,
-    local_node_id: NodeId,
-    group_id: GroupId,
-    active_node_ids: Option<&HashSet<NodeId>>,
-) -> Result<RealmUsage, String> {
-    let local = read_local_group(storage, group_id, None).await?;
-    let prefix = usage_group_prefix(group_id);
-    let remote = sum_snapshots(storage, prefix, local_node_id, active_node_ids).await?;
-    RealmUsage::of(local, remote)
-}
-
-/// Sums the realm-wide total from the live local counters and the remote snapshots, the
-/// same rows quota admission counts. The stored sum can be older than a local write.
-pub async fn load_realm_usage(
-    ctx: &DriverContext,
-    local_node_id: NodeId,
-    scope: RealmUsageScope,
-) -> Result<RealmUsage, String> {
-    let storage = &ctx.storage_handle;
-    let active_node_ids = active_usage_nodes(ctx).await?;
-    match scope {
-        RealmUsageScope::Global => {
-            realm_global_usage(storage, local_node_id, active_node_ids.as_ref()).await
+impl MarkDirtyOperation {
+    pub fn new(groups: impl IntoIterator<Item = GroupId>, generation: ulid::Ulid) -> Self {
+        Self {
+            writes: Some(dirty_rows(groups, generation)),
+            marking: false,
+            result: None,
         }
-        RealmUsageScope::Group(group_id) => {
-            realm_group_usage(storage, local_node_id, group_id, active_node_ids.as_ref()).await
+    }
+
+    pub fn wake() -> Self {
+        Self {
+            writes: None,
+            marking: false,
+            result: None,
         }
     }
 }
 
-/// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let has_markers = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(Key::from(DIRTY_PREFIX.to_vec())),
-            start: None,
-            limit: 1,
+impl Operation for MarkDirtyOperation {
+    type Output = ();
+    type Error = MarkDirtyError;
+
+    fn start(&mut self) -> Effects {
+        let Some(writes) = self.writes.take() else {
+            return smallvec![schedule_snapshot_publish()];
+        };
+        self.marking = true;
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
             txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan node usage dirty markers");
-            return;
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if self.result.is_some() {
+            self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
+            return smallvec![];
         }
-        other => {
-            warn!(event = ?other, "Unexpected event while scanning node usage dirty markers");
-            return;
+        match (std::mem::replace(&mut self.marking, false), event) {
+            (true, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                smallvec![schedule_snapshot_publish()]
+            }
+            (true, Event::Storage(StorageEvent::Error { error })) => {
+                self.result = Some(Err(error.into()));
+                smallvec![]
+            }
+            (false, Event::Task(_)) => {
+                self.result = Some(Ok(()));
+                smallvec![]
+            }
+            (_, event) => {
+                self.result = Some(Err(MarkDirtyError::UnexpectedEvent(event.label())));
+                smallvec![]
+            }
         }
-    };
-    if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_snapshot_publish()).await
-    {
-        warn!(message = %message, "Failed to restore node usage publish timer");
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.result.unwrap_or(Err(MarkDirtyError::Unfinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -1723,6 +1029,14 @@ pub async fn restore_usage_timer(storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::node::realm_usage::{
+        RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
+    };
+    use crate::node::summary_refresh::RefreshUsageOperation;
+    use crate::node::usage_publish::{
+        clear_consumed_markers, publish_refresh_snapshots, publish_usage_snapshots,
+    };
+    use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -1743,9 +1057,12 @@ mod tests {
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
-    use aruna_core::structs::storage::usage::global_shard_keys;
     use aruna_core::structs::storage::usage::usage_hash_key;
     use aruna_core::structs::storage::usage::{BucketCounters, global_shard_index};
+    use aruna_core::structs::storage::usage::{
+        SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
+        usage_summary_key,
+    };
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -1781,6 +1098,16 @@ mod tests {
             Some([Effect::Storage(StorageEffect::Read { key, .. })]) if key.as_ref() != USAGE_COMPLETE_KEY
         ));
         assert!(!complete.is_rebuilding());
+    }
+
+    async fn realm_usage(
+        ctx: &DriverContext,
+        local: NodeId,
+        scope: RealmUsageScope,
+    ) -> Result<RealmUsage, RealmUsageError> {
+        let realm_id = ctx.node_and_realm().map(|(_, realm_id)| realm_id);
+        let mut totals = drive(RealmUsageOperation::new(local, realm_id, scope), ctx).await?;
+        Ok(totals.pop().expect("one scope gives one total"))
     }
 
     fn test_ctx(root: &str) -> DriverContext {
@@ -2823,12 +2150,12 @@ mod tests {
             write_node_stat(&ctx, key, value).await;
         }
 
-        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+        let global = realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
             .unwrap();
         assert_eq!(global.counters, counters(2, 20, 5, 75));
         assert_eq!(global.replicas, counters(3, 30, 10, 0));
-        let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
+        let group = realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
             .await
             .unwrap();
         assert_eq!(group.counters, counters(2, 20, 5, 0));
@@ -2882,7 +2209,8 @@ mod tests {
         let target = DocumentTarget::RealmConfig {
             realm_id: RealmId([4; 32]),
         };
-        refresh_usage_targets(&ctx, node(1), &[target]).await;
+        let refresh = RefreshUsageOperation::new(node(1), None, &[target], Ulid::from_parts(1, 1));
+        drive(refresh, &ctx).await.unwrap();
 
         assert!(read_node_stat(&ctx, dirty_group_key(bound)).await.is_some());
         assert!(read_node_stat(&ctx, dirty_group_key(plain)).await.is_none());
@@ -3089,17 +2417,16 @@ mod tests {
         )
         .await;
 
-        recompute_usage_summary(&ctx, local, true, vec![group_id])
-            .await
-            .unwrap();
+        let summary = RealmUsageOperation::summary(local, None, true, vec![group_id]);
+        drive(summary, &ctx).await.unwrap();
 
-        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+        let global = realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
             .unwrap()
             .counters;
         assert_eq!(global.logical_bytes, 15);
         assert_eq!(global.objects, 2);
-        let group = load_realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
+        let group = realm_usage(&ctx, local, RealmUsageScope::Group(group_id))
             .await
             .unwrap()
             .counters;
@@ -3141,7 +2468,7 @@ mod tests {
         .await;
 
         // No summary/global cache entry exists, so the read recomputes on the fly.
-        let global = load_realm_usage(&ctx, local, RealmUsageScope::Global)
+        let global = realm_usage(&ctx, local, RealmUsageScope::Global)
             .await
             .unwrap()
             .counters;
@@ -3552,23 +2879,20 @@ mod tests {
         )
         .await;
 
-        refresh_usage_targets(
-            &ctx,
-            local,
-            &[
-                DocumentTarget::NodeUsage {
-                    realm_id: RealmId::from_bytes([9u8; 32]),
-                    node_id: remote,
-                    group_id: None,
-                },
-                DocumentTarget::NodeUsage {
-                    realm_id: RealmId::from_bytes([9u8; 32]),
-                    node_id: remote,
-                    group_id: Some(group_id),
-                },
-            ],
-        )
-        .await;
+        let targets = [
+            DocumentTarget::NodeUsage {
+                realm_id: RealmId::from_bytes([9u8; 32]),
+                node_id: remote,
+                group_id: None,
+            },
+            DocumentTarget::NodeUsage {
+                realm_id: RealmId::from_bytes([9u8; 32]),
+                node_id: remote,
+                group_id: Some(group_id),
+            },
+        ];
+        let refresh = RefreshUsageOperation::new(local, None, &targets, Ulid::from_parts(1, 1));
+        drive(refresh, &ctx).await.unwrap();
 
         // The summed cache was materialized for both touched scopes.
         assert_eq!(
@@ -3618,5 +2942,139 @@ mod tests {
                 "{error:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod state_machine_tests {
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::task::TaskEvent;
+
+    use super::*;
+
+    fn read(value: Option<Value>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+            value,
+        })
+    }
+
+    #[test]
+    fn marker_marks_incomplete() {
+        let marker_read = Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: Key::from(USAGE_REBUILD_KEY.to_vec()),
+            txn_id: None,
+        });
+        for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
+            let mut operation = UsageCompleteOperation::new();
+            check_trace(
+                &mut operation,
+                &[marker_read.clone()],
+                vec![(read(value), vec![])],
+            );
+            assert_eq!(operation.finalize(), Ok(complete));
+        }
+        let mut failed = UsageCompleteOperation::new();
+        failed.start();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(failed.finalize(), Err(StorageError::Timeout));
+        let refusals = rejects_events(UsageCompleteOperation::new, sample_events, |_| false);
+        assert_eq!(refusals.len(), sample_events().len());
+        let mut started = UsageCompleteOperation::new();
+        check_abort(&mut started, &[]);
+        started.start();
+        check_abort(&mut started, &[]);
+        rejects_finalize(started);
+    }
+
+    #[test]
+    fn marks_then_wakes() {
+        let group = ulid::Ulid::from_parts(6, 6);
+        let generation = ulid::Ulid::from_parts(1, 1);
+        let mut mark = MarkDirtyOperation::new([group], generation);
+        let write = Effect::Storage(StorageEffect::BatchWrite {
+            writes: dirty_rows([group], generation),
+            txn_id: None,
+        });
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishUsageSnapshots,
+            after: SNAPSHOT_PUBLISH_DEBOUNCE,
+        });
+        let written = Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        });
+        check_trace(
+            &mut mark,
+            &[write],
+            vec![
+                (written, vec![schedule_snapshot_publish()]),
+                (scheduled, vec![]),
+            ],
+        );
+        assert_eq!(mark.finalize(), Ok(()));
+        // A refused timer still ends the wake; the markers wait for the next publish.
+        let mut wake = MarkDirtyOperation::wake();
+        let refused = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "no task handle".to_string(),
+        });
+        check_trace(
+            &mut wake,
+            &[schedule_snapshot_publish()],
+            vec![(refused, vec![])],
+        );
+        assert_eq!(wake.finalize(), Ok(()));
+        let mut failed = MarkDirtyOperation::new([group], generation);
+        failed.start();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(
+            failed.finalize(),
+            Err(MarkDirtyError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn marking_rejects_stray() {
+        let marking = || {
+            let mut operation =
+                MarkDirtyOperation::new([ulid::Ulid::from_parts(6, 6)], ulid::Ulid::nil());
+            operation.start();
+            operation
+        };
+        let write = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::BatchWriteResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(marking, sample_events, write) {
+            assert!(effects.is_empty(), "{label}");
+            assert!(
+                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
+                "{label}"
+            );
+        }
+        let waking = || {
+            let mut operation = MarkDirtyOperation::wake();
+            operation.start();
+            operation
+        };
+        let task = |event: &Event| matches!(event, Event::Task(_));
+        for (label, _, error) in rejects_events(waking, sample_events, task) {
+            assert!(
+                matches!(error, MarkDirtyError::UnexpectedEvent(_)),
+                "{label}"
+            );
+        }
+        let mut open = marking();
+        check_abort(&mut open, &[]);
+        rejects_finalize(open);
     }
 }
