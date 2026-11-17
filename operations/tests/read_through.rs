@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::StructuredId;
 use aruna_operations::device::drain::drain_publish_queue;
 use aruna_operations::device::realm_documents::fetch_realm_documents;
-use aruna_operations::device::replica::read_replica;
+use aruna_operations::device::replica_store::read_replica;
 use aruna_operations::device::selection::select_document;
 use aruna_operations::metadata::api::{
     ExportMetadataRequest, GetVisibleRequest, RoCrateExportView,

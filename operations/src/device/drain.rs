@@ -37,7 +37,7 @@ use super::publish_queue::{
     MAX_PUBLISH_ATTEMPTS, PublishEntry, PublishKind, PublishState, entry_with_state, publish_entry,
     publish_key, read_publish_entry, scan_publish_queue,
 };
-use super::replica::{read_replica, store_replica};
+use super::replica_store::{read_replica, store_replica};
 use super::retry::{exhausted, retry_due_ms};
 use super::selection::track_created;
 

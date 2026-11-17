@@ -13,10 +13,8 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 
 use super::refresh::{RefreshOutcome, refresh_replica, refusal_reason};
-use super::replica::{
-    ReplicaOrigin, ReplicaRecord, ReplicaState, cache_budget, cache_usage, delete_replica,
-    read_replica, store_replica,
-};
+use super::replica::{ReplicaOrigin, ReplicaRecord, ReplicaState, cache_budget};
+use super::replica_store::{cache_usage, delete_replica, read_replica, store_replica};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
 #[derive(Debug, Error, PartialEq)]

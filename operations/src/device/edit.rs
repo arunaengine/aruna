@@ -25,7 +25,8 @@ use ulid::Ulid;
 
 use crate::device::enqueue_draft::{EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation};
 use crate::device::publish_queue::{PublishEntry, PublishKind, PublishState};
-use crate::device::replica::{ReplicaRecord, mark_edited, store_replica};
+use crate::device::replica::{ReplicaRecord, mark_edited};
+use crate::device::replica_store::store_replica;
 use crate::device::sync_status::read_publish_entries;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::update_document::UpdateDocumentMutation;
@@ -513,7 +514,7 @@ mod tests {
         let mut read = replica(&record);
         read.selected = false;
         read.displayed_jsonld = r#"{"@graph":[]}"#.to_string();
-        assert!(crate::device::replica::store_replica(&context, &read).await);
+        assert!(crate::device::replica_store::store_replica(&context, &read).await);
         let update = |public: Option<bool>| {
             route_metadata_update(
                 &context,

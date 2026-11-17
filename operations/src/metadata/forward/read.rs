@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::replica::ReplicaRecord;
-use crate::device::replica::read_replica;
+use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
 use crate::driver::DriverContext;
 use crate::metadata::api::ExportMetadataRequest;

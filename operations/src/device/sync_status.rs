@@ -22,7 +22,8 @@ use crate::driver::DriverContext;
 
 use super::drain::claim_state;
 use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
-use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
+use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state};
+use super::replica_store::list_replicas;
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::outbox::requeue_uploads;
 use super::sync::repository::scan_folder;

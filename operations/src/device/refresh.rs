@@ -27,9 +27,8 @@ use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 
-use super::replica::{
-    ReplicaRecord, ReplicaState, list_replicas, read_replica, record_graph, store_replica,
-};
+use super::replica::{ReplicaRecord, ReplicaState};
+use super::replica_store::{list_replicas, read_replica, record_graph, store_replica};
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.

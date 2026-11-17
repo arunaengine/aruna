@@ -18,6 +18,7 @@ pub mod realm_documents;
 pub mod refresh;
 pub mod remove_node;
 pub mod replica;
+pub mod replica_store;
 pub mod retry;
 pub mod selection;
 pub mod sync;
