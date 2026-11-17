@@ -6,16 +6,15 @@ use crate::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation, owner_cutoff,
 };
 use aruna_core::UserId;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::USER_SESSION_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::session::UserSession;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -26,19 +25,16 @@ pub(crate) fn cutoff_revocation(actor: Actor, issued_at: u64, now: u64) -> Revok
     owner_cutoff(actor, owner, issued_at, now)
 }
 
+/// Where a session revocation stands before its write transaction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RevokeSessionState {
-    Init,
     ReadSession,
     RevokeToken,
     RaiseCutoff,
-    StartTransaction,
-    RereadSession,
-    WriteSession,
-    CommitTransaction,
-    Finish,
-    Error,
+    Write,
 }
+
+type RevokeTurn = Result<Next<Option<UserSession>>, RevokeSessionError>;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RevokeSessionError {
@@ -60,6 +56,23 @@ pub enum RevokeSessionError {
     },
 }
 
+impl From<IoError> for RevokeSessionError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RevokeSession".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+/// Revokes the session's token outside any transaction, then marks the session revoked in a
+/// write transaction that reads it again.
 #[derive(Debug, PartialEq)]
 pub struct RevokeSessionOperation {
     actor: Actor,
@@ -67,9 +80,7 @@ pub struct RevokeSessionOperation {
     session_id: String,
     now: u64,
     session: Option<UserSession>,
-    txn_id: Option<TxnId>,
     state: RevokeSessionState,
-    output: Option<Result<Option<UserSession>, RevokeSessionError>>,
 }
 
 impl RevokeSessionOperation {
@@ -86,78 +97,25 @@ impl RevokeSessionOperation {
             session_id,
             now,
             session: None,
-            txn_id: None,
-            state: RevokeSessionState::Init,
-            output: None,
+            state: RevokeSessionState::ReadSession,
         }
     }
 
-    fn emit_error(&mut self, error: RevokeSessionError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RevokeSessionState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.emit_error(RevokeSessionError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn read_session(&self, txn_id: Option<TxnId>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SESSION_KEYSPACE.to_string(),
-            key: self.session_id.as_bytes().into(),
-            txn_id,
-        })]
-    }
-
-    fn decode_session(&self, key: &[u8], value: &[u8]) -> Result<UserSession, RevokeSessionError> {
-        let session = UserSession::from_bytes(value)?;
-        if session.sid.as_bytes() != key
-            || session.sid != self.session_id
-            || session.user_id != self.owner
-        {
-            return Err(RevokeSessionError::NotFound);
-        }
-        Ok(session)
-    }
-
-    fn begin_write(&mut self) -> Effects {
-        self.state = RevokeSessionState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn handle_session(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
-            return self.unexpected("session read", event);
-        };
+    fn handle_session(&mut self, value: Option<Value>) -> RevokeTurn {
         let Some(value) = value else {
-            self.state = RevokeSessionState::Finish;
-            self.output = Some(Ok(None));
-            return smallvec![];
+            return Ok(Next::Done(None));
         };
-        let session = match self.decode_session(key.as_ref(), value.as_ref()) {
-            Ok(session) => session,
-            Err(error) => return self.emit_error(error),
-        };
+        let session = decode_session(&self.session_id, self.owner, value.as_ref())?;
         if session.revoked {
-            self.state = RevokeSessionState::Finish;
-            self.output = Some(Ok(Some(session)));
-            return smallvec![];
+            return Ok(Next::Done(Some(session)));
         }
         self.session = Some(session.clone());
         if session.expires_at <= self.now {
-            return self.begin_write();
+            return Ok(self.write());
         }
         self.state = RevokeSessionState::RevokeToken;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            RevokeTokenOperation::new(RevokeTokenConfig {
+        Ok(Next::Call(IoCall::child(RevokeTokenOperation::new(
+            RevokeTokenConfig {
                 actor: self.actor.clone(),
                 token_hash: session.token_hash,
                 expires_at: session.expires_at,
@@ -167,155 +125,131 @@ impl RevokeSessionOperation {
                     false => RevokeTokenAdmission::Privileged,
                 },
                 now: self.now,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
-                result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
+            },
+        ))))
     }
 
-    fn handle_revoked(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::TokenRevoked { result }) = event else {
-            return self.unexpected("token revocation result", event);
-        };
-        let full = RevokeTokenError::CapacityReached.to_string();
-        match result {
-            Ok(()) => self.begin_write(),
+    fn handle_revoked(&mut self, result: IoResult) -> RevokeTurn {
+        let revoked = result.child::<RealmConfigDocument, RevokeTokenError>()?;
+        match revoked {
+            Ok(_) => Ok(self.write()),
             // A full revocation set never keeps a session alive: the user's cutoff moves past
             // it, which also signs out the user's older sessions.
-            Err(error) if error == full && self.state == RevokeSessionState::RevokeToken => {
-                let Some(session) = self.session.as_ref() else {
-                    return self.emit_error(RevokeSessionError::NotFinished);
-                };
+            Err(RevokeTokenError::CapacityReached)
+                if self.state == RevokeSessionState::RevokeToken =>
+            {
+                let session = self
+                    .session
+                    .as_ref()
+                    .ok_or(RevokeSessionError::NotFinished)?;
                 let config =
                     owner_cutoff(self.actor.clone(), self.owner, session.created_at, self.now);
                 self.state = RevokeSessionState::RaiseCutoff;
-                smallvec![Effect::SubOperation(boxed_suboperation(
-                    RevokeTokenOperation::new(config),
-                    |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
-                        result: result.map(|_| ()).map_err(|error| error.to_string()),
-                    }),
-                ))]
+                Ok(Next::Call(IoCall::child(RevokeTokenOperation::new(config))))
             }
-            Err(error) => self.emit_error(RevokeSessionError::TokenRevoke(error)),
+            Err(error) => Err(RevokeSessionError::TokenRevoke(error.to_string())),
         }
     }
 
-    fn handle_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected("transaction started", event);
-        };
-        self.txn_id = Some(txn_id);
-        self.state = RevokeSessionState::RereadSession;
-        self.read_session(Some(txn_id))
-    }
-
-    fn handle_reread(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
-            return self.unexpected("session reread", event);
-        };
-        let Some(value) = value else {
-            return self.emit_error(RevokeSessionError::NotFound);
-        };
-        let mut session = match self.decode_session(key.as_ref(), value.as_ref()) {
-            Ok(session) => session,
-            Err(error) => return self.emit_error(error),
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
-        if session.revoked {
-            self.output = Some(Ok(Some(session)));
-            self.state = RevokeSessionState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        session.revoked = true;
-        let bytes = match session.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        self.session = Some(session);
-        self.state = RevokeSessionState::WriteSession;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USER_SESSION_KEYSPACE.to_string(),
-            key: self.session_id.as_bytes().into(),
-            value: bytes.into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected("session write", event);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
-        let Some(session) = self.session.clone() else {
-            return self.emit_error(RevokeSessionError::NotFinished);
-        };
-        self.output = Some(Ok(Some(session)));
-        self.state = RevokeSessionState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected("transaction committed", event);
-        };
-        self.txn_id = None;
-        self.state = RevokeSessionState::Finish;
-        smallvec![]
+    fn write(&mut self) -> Next<Option<UserSession>> {
+        self.state = RevokeSessionState::Write;
+        Next::Call(IoCall::child(SessionWrite {
+            session_id: self.session_id.clone(),
+            owner: self.owner,
+            session: None,
+        }))
     }
 }
 
-impl EffectOperation for RevokeSessionOperation {
+fn session_row(session_id: &str) -> (KeySpace, Key) {
+    (
+        USER_SESSION_KEYSPACE.to_string(),
+        session_id.as_bytes().into(),
+    )
+}
+
+/// The stored session of `owner` under `session_id`; another one is not found.
+fn decode_session(
+    session_id: &str,
+    owner: UserId,
+    value: &[u8],
+) -> Result<UserSession, RevokeSessionError> {
+    let session = UserSession::from_bytes(value)?;
+    if session.sid != session_id || session.user_id != owner {
+        return Err(RevokeSessionError::NotFound);
+    }
+    Ok(session)
+}
+
+impl Operation for RevokeSessionOperation {
     type Output = Option<UserSession>;
     type Error = RevokeSessionError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = Ulid::from_string(&self.session_id) {
-            return self.emit_error(ConversionError::from(error).into());
-        }
-        self.state = RevokeSessionState::ReadSession;
-        self.read_session(None)
+    fn first(&mut self) -> RevokeTurn {
+        Ulid::from_string(&self.session_id).map_err(ConversionError::from)?;
+        Ok(Next::Call(IoCall::Read(vec![session_row(
+            &self.session_id,
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(error.into());
-        }
+    fn next(&mut self, result: IoResult) -> RevokeTurn {
         match self.state {
-            RevokeSessionState::Init => self.start(),
-            RevokeSessionState::ReadSession => self.handle_session(event),
-            RevokeSessionState::RevokeToken | RevokeSessionState::RaiseCutoff => {
-                self.handle_revoked(event)
+            RevokeSessionState::ReadSession => {
+                let [value] = values::<1>(result)?;
+                self.handle_session(value)
             }
-            RevokeSessionState::StartTransaction => self.handle_started(event),
-            RevokeSessionState::RereadSession => self.handle_reread(event),
-            RevokeSessionState::WriteSession => self.handle_written(event),
-            RevokeSessionState::CommitTransaction => self.handle_committed(event),
-            RevokeSessionState::Finish | RevokeSessionState::Error => smallvec![],
+            RevokeSessionState::RevokeToken | RevokeSessionState::RaiseCutoff => {
+                self.handle_revoked(result)
+            }
+            RevokeSessionState::Write => result
+                .child::<Option<UserSession>, RevokeSessionError>()?
+                .map(Next::Done),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RevokeSessionState::Finish | RevokeSessionState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(RevokeSessionError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         matches!(error, RevokeSessionError::NotFound)
+    }
+}
+
+/// Reads the session again and marks it revoked in one write transaction.
+#[derive(Debug, PartialEq)]
+struct SessionWrite {
+    session_id: String,
+    owner: UserId,
+    session: Option<UserSession>,
+}
+
+impl Operation for SessionWrite {
+    type Output = Option<UserSession>;
+    type Error = RevokeSessionError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> RevokeTurn {
+        Ok(Next::Call(IoCall::Read(vec![session_row(
+            &self.session_id,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> RevokeTurn {
+        if let Some(session) = self.session.take() {
+            done(result)?;
+            return Ok(Next::Done(Some(session)));
+        }
+        let [value] = values::<1>(result)?;
+        let value = value.ok_or(RevokeSessionError::NotFound)?;
+        let mut session = decode_session(&self.session_id, self.owner, value.as_ref())?;
+        if session.revoked {
+            return Ok(Next::Done(Some(session)));
+        }
+        session.revoked = true;
+        let bytes = session.to_bytes()?;
+        self.session = Some(session);
+        let (space, key) = session_row(&self.session_id);
+        Ok(Next::Call(IoCall::Write(vec![(space, key, bytes.into())])))
     }
 }
 
@@ -324,6 +258,7 @@ mod pure_tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{user_cutoff_expiry, user_cutoff_hash};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::SessionKind;
     use aruna_core::structs::identity::realm::RealmId;
 
@@ -352,13 +287,12 @@ mod pure_tests {
             session_id.clone(),
             15,
         );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: session_id.as_bytes().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-
-        assert!(operation.finalize().unwrap().unwrap().revoked);
+        operation.first().unwrap();
+        let stored = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        let Ok(Next::Done(Some(session))) = operation.next(stored) else {
+            panic!("expected the revoked session");
+        };
+        assert!(session.revoked);
     }
 
     #[test]
@@ -387,12 +321,12 @@ mod pure_tests {
             session_id.clone(),
             15,
         );
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: session_id.as_bytes().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        operation.first().unwrap();
+        let stored = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        assert!(matches!(
+            operation.next(stored),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
     }
 
     // A full revocation set never keeps a session alive: the user's cutoff moves past it.
@@ -417,56 +351,72 @@ mod pure_tests {
             user_id,
             realm_id,
         };
+        let stored = || IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        let full = || {
+            let full = Err::<RealmConfigDocument, _>(RevokeTokenError::CapacityReached);
+            IoResult::Child(ChildOutcome::new(full))
+        };
         let mut operation = RevokeSessionOperation::new(actor.clone(), session_id.clone(), 15);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: session_id.as_bytes().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-        let full = Err(RevokeTokenError::CapacityReached.to_string());
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: full.clone(),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        operation.first().unwrap();
+        operation.next(stored()).unwrap();
+        let raised = operation.next(full());
+        assert!(matches!(raised, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(operation.state, RevokeSessionState::RaiseCutoff);
-        let cutoff = cutoff_revocation(actor, record.created_at, 15);
+        let cutoff = cutoff_revocation(actor.clone(), record.created_at, 15);
         assert_eq!(cutoff.token_hash, user_cutoff_hash(&user_id));
         assert_eq!(cutoff.admission, RevokeTokenAdmission::Privileged);
         // Tokens issued in the session's second or before are cut off.
         assert_eq!(cutoff.expires_at, user_cutoff_expiry(11));
 
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
+        let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        let raised = IoResult::Child(ChildOutcome::new(Ok::<_, RevokeTokenError>(config)));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            operation.next(raised),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
+        assert_eq!(operation.state, RevokeSessionState::Write);
 
         // A failed cutoff is reported, never retried as another cutoff.
-        let mut operation = RevokeSessionOperation::new(
-            Actor {
-                node_id: iroh::SecretKey::from_bytes(&[65; 32]).public(),
-                user_id,
-                realm_id,
-            },
-            session_id.clone(),
-            15,
-        );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: session_id.as_bytes().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: full.clone(),
-        }));
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: full,
-        }));
+        let mut operation = RevokeSessionOperation::new(actor, session_id.clone(), 15);
+        operation.first().unwrap();
+        operation.next(stored()).unwrap();
+        operation.next(full()).unwrap();
         assert!(matches!(
-            operation.finalize(),
+            operation.next(full()),
             Err(RevokeSessionError::TokenRevoke(_))
         ));
+    }
+
+    #[test]
+    fn write_marks_revoked() {
+        // The write transaction reads the session again and stores it revoked.
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([4; 16]), realm_id);
+        let session_id = Ulid::from_bytes([5; 16]).to_string();
+        let record = UserSession {
+            sid: session_id.clone(),
+            user_id,
+            kind: SessionKind::Portal,
+            label: None,
+            created_at: 10,
+            expires_at: 20,
+            token_hash: "a".repeat(64),
+            revoked: false,
+            via: None,
+        };
+        let mut write = SessionWrite {
+            session_id,
+            owner: user_id,
+            session: None,
+        };
+        assert_eq!(write.transaction(), TransactionMode::Write);
+        write.first().unwrap();
+        let stored = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        let Ok(Next::Call(IoCall::Write(rows))) = write.next(stored) else {
+            panic!("expected the session write");
+        };
+        let written = UserSession::from_bytes(rows[0].2.as_ref()).unwrap();
+        assert!(written.revoked);
+        assert_eq!(write.next(IoResult::Done), Ok(Next::Done(Some(written))));
     }
 }

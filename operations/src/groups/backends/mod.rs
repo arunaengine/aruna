@@ -98,6 +98,15 @@ pub enum RecordReadError {
     Unexpected,
 }
 
+impl From<aruna_core::calls::IoError> for RecordReadError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Storage(error) => Self::Storage(error),
+            _ => Self::Unexpected,
+        }
+    }
+}
+
 pub fn parse_read<T>(
     event: Event,
     decode: impl Fn(&[u8]) -> Result<T, ConversionError>,

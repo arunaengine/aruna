@@ -8,7 +8,7 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use smallvec::smallvec;
 
 use crate::auth::permission_rules::{read_rules, rule_reads};
@@ -26,8 +26,13 @@ pub struct CheckPermissionsConfig {
 }
 
 impl CheckPermissionsConfig {
-    /// Whether the rules read in `values`, in the order of `rule_reads`, allow the path.
-    fn allowed(
+    /// The rows the check reads, for a parent that folds the check into its own transaction.
+    pub(crate) fn reads(&self) -> Result<Vec<(KeySpace, Key)>, AuthorizationError> {
+        rule_reads(&self.path)
+    }
+
+    /// Whether the rows [`Self::reads`] named, answered in that order, allow the path.
+    pub(crate) fn allowed(
         &self,
         values: Vec<Option<aruna_core::types::Value>>,
     ) -> Result<bool, AuthorizationError> {
@@ -64,7 +69,7 @@ impl Operation for CheckPermissionsOperation {
     type Error = AuthorizationError;
 
     fn first(&mut self) -> Result<Next<bool>, AuthorizationError> {
-        Ok(Next::Call(IoCall::Read(rule_reads(&self.config.path)?)))
+        Ok(Next::Call(IoCall::Read(self.config.reads()?)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, AuthorizationError> {
@@ -92,7 +97,7 @@ impl EffectOperation for TransactionCheck {
     type Error = AuthorizationError;
 
     fn start(&mut self) -> Effects {
-        match rule_reads(&self.config.path) {
+        match self.config.reads() {
             Ok(reads) => smallvec![Effect::Storage(StorageEffect::BatchRead {
                 reads,
                 txn_id: Some(self.txn_id),
