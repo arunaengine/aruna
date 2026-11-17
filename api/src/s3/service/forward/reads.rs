@@ -17,7 +17,8 @@ use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
-use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
+use aruna_operations::driver::drive;
+use aruna_operations::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method};
 use s3s::dto::{
@@ -253,9 +254,9 @@ impl ArunaS3Service {
                 Err(error) => return Err(guard_error(&error)),
             };
         let holders = key_holders(self.state.as_ref(), binding.set_id, key).await;
-        let node_id = choose_holder(self.state.as_ref(), &holders, unix_timestamp_millis())
-            .await
-            .map_or(coordinator, |chosen| chosen.node_id);
+        let choice = HolderChoiceOperation::new(&holders, unix_timestamp_millis());
+        let candidates = drive(choice, self.state.as_ref()).await.unwrap_or_default();
+        let node_id = pick(candidates).map_or(coordinator, |chosen| chosen.node_id);
         let holder = Forward {
             set_id: binding.set_id,
             range_id,

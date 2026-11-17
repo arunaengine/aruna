@@ -46,7 +46,7 @@ use super::keep::{
 };
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
+use crate::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
@@ -368,7 +368,8 @@ async fn member_of(
         .collect();
     // Replicas share the load by free download slots; the coordinator stays the fallback.
     if replicas > 1 {
-        let chosen = choose_holder(context, &holders[..replicas], now_ms()).await;
+        let choice = HolderChoiceOperation::new(&holders[..replicas], now_ms());
+        let chosen = pick(drive(choice, context).await.unwrap_or_default());
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),
@@ -379,7 +380,8 @@ async fn member_of(
         }
     }
     // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
-    let fresh: Vec<NodeId> = (candidates(context, &holders, now_ms()).await.into_iter())
+    let choice = HolderChoiceOperation::new(&holders, now_ms());
+    let fresh: Vec<NodeId> = (drive(choice, context).await.unwrap_or_default().into_iter())
         .map(|candidate| candidate.node_id)
         .collect();
     if !fresh.is_empty() {

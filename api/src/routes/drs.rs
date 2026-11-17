@@ -25,7 +25,7 @@ use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
 use aruna_operations::driver::{drive, drive_until};
-use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
+use aruna_operations::node::holder_choice::{HolderChoiceOperation, avoid_holder, pick};
 use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
@@ -971,8 +971,9 @@ async fn chosen_holder(
         .copied()
         .filter(|node_id| *node_id != local || resolved.location.is_some())
         .collect();
-    choose_holder(&state.get_ctx(), &candidates, unix_timestamp_millis())
-        .await
+    let choice = HolderChoiceOperation::new(&candidates, unix_timestamp_millis());
+    let candidates = drive(choice, state.get_ctx().as_ref()).await;
+    pick(candidates.unwrap_or_default())
         .map(|chosen| chosen.node_id)
         .filter(|node_id| *node_id != local)
 }
@@ -1306,7 +1307,9 @@ async fn resolve_global(
         if Instant::now() >= deadline {
             break;
         }
-        let Some(holder) = choose_holder(&context, &remote, unix_timestamp_millis()).await else {
+        let choice = HolderChoiceOperation::new(&remote, unix_timestamp_millis());
+        let candidates = drive(choice, context.as_ref()).await.unwrap_or_default();
+        let Some(holder) = pick(candidates) else {
             break;
         };
         remote.retain(|node_id| *node_id != holder.node_id);
