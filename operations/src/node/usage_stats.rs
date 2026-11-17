@@ -44,7 +44,7 @@ use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
 pub use crate::node::usage_rebuild::{
-    RebuildStatsError, RebuildStatsOperation, RebuildStatsState, spawn_usage_rebuild,
+    RebuildStatsError, RebuildStatsOperation, RebuildStatsState,
 };
 
 #[derive(Debug, Error, PartialEq)]
