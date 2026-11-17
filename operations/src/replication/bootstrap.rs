@@ -98,7 +98,10 @@ pub enum BootstrapError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,7 +168,7 @@ impl BootstrapPage {
             PageState::Abort => "Abort",
             PageState::Init | PageState::Finish | PageState::Error => "Idle",
         };
-        let got = format!("{event:?}");
+        let got = event.label();
         self.fail(BootstrapError::UnexpectedEvent { state, got })
     }
 

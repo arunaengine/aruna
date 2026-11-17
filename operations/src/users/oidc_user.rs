@@ -111,7 +111,7 @@ pub enum ResolveOidcError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("the user's bucket cut over to a new holder set; retry the registration")]
     PlacementFenced,
@@ -153,7 +153,7 @@ impl ResolveOidcOperation {
         cleanup
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ResolveOidcError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -162,7 +162,7 @@ impl ResolveOidcOperation {
     }
 
     fn handle_start_txn(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
@@ -192,7 +192,7 @@ impl ResolveOidcOperation {
     }
 
     fn accept_subject(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::BatchReadResult { values })",
@@ -241,7 +241,7 @@ impl ResolveOidcOperation {
     }
 
     fn accept_users(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -342,7 +342,7 @@ impl ResolveOidcOperation {
     }
 
     fn handle_write_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self
                 .unexpected_event("Event::Storage(StorageEvent::BatchWriteResult { .. })", got);
@@ -380,7 +380,7 @@ impl ResolveOidcOperation {
     }
 
     fn accept_subject_write(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         match event {
             Event::Storage(StorageEvent::WriteResult { .. })
             | Event::Storage(StorageEvent::BatchWriteResult { .. })
@@ -397,7 +397,7 @@ impl ResolveOidcOperation {
     }
 
     fn accept_existing(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::ReadResult { value, .. })",
@@ -448,7 +448,7 @@ impl ResolveOidcOperation {
         user: User,
         announce: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
@@ -464,7 +464,7 @@ impl ResolveOidcOperation {
     }
 
     fn handle_commit_txn(&mut self, event: Event, user: User, announce: bool) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::TransactionCommitted { .. })",
@@ -484,10 +484,9 @@ impl ResolveOidcOperation {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => self.emit_finish(user),
-            other => self.unexpected_event(
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
+            other => {
+                self.unexpected_event("admin document outbox drain timer schedule", other.label())
+            }
         }
     }
 

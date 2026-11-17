@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
-use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
@@ -52,7 +51,7 @@ pub enum ListStagingError {
     UnexpectedEvent {
         state: ListStagingState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("List staging source failed")]
     ListFailed,
@@ -141,13 +140,13 @@ impl Operation for ListStagingOperation {
                 self.emit_error(ListStagingError::UnexpectedEvent {
                     state: self.state.clone(),
                     expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                    got: describe_event(&event),
+                    got: event.label(),
                 })
             }
             (_, event) => self.emit_error(ListStagingError::UnexpectedEvent {
                 state: self.state.clone(),
                 expected: "Event::StagingSource(StagingSourceEvent::ListResult)",
-                got: describe_event(&event),
+                got: event.label(),
             }),
         }
     }

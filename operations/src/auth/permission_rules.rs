@@ -464,7 +464,7 @@ impl PermissionRulesOperation {
     }
 
     fn handle_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         if let (
             PermissionRulesState::StartTransaction,
             Event::Storage(StorageEvent::TransactionStarted { txn_id }),
@@ -485,7 +485,7 @@ impl PermissionRulesOperation {
     }
 
     fn handle_realm_auth(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         if let (
             PermissionRulesState::GetRealmDoc,
             Event::Storage(StorageEvent::ReadResult { value, .. }),
@@ -501,7 +501,7 @@ impl PermissionRulesOperation {
     }
 
     fn handle_group_auth(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         if let (
             PermissionRulesState::GetGroupDoc,
             Event::Storage(StorageEvent::ReadResult { value, .. }),
@@ -517,7 +517,7 @@ impl PermissionRulesOperation {
     }
 
     fn handle_commit(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         if let (
             PermissionRulesState::CollectRules,
             Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
@@ -685,14 +685,14 @@ impl PermissionRulesOperation {
         &mut self,
         state: PermissionRulesState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
             AuthorizationError::UnexpectedEvent {
                 state: state.to_string(),
                 expected,
-                got,
+                got: got.to_string(),
             },
             cleanup_effects,
         )
@@ -751,7 +751,7 @@ impl Operation for PermissionRulesOperation {
             PermissionRulesState::Finish
             | PermissionRulesState::Init
             | PermissionRulesState::Error => {
-                self.unexpected_event(self.state, "no event", format!("{event:?}"))
+                self.unexpected_event(self.state, "no event", event.label())
             }
         }
     }

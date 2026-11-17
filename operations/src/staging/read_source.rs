@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
-use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
@@ -54,7 +53,7 @@ pub enum ReadSourceError {
     UnexpectedEvent {
         state: ReadSourceState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("Read staging source failed")]
     ReadSourceFailed,
@@ -88,7 +87,7 @@ impl ReadSourceOperation {
         self.emit_error(ReadSourceError::UnexpectedEvent {
             state: self.state.clone(),
             expected,
-            got: describe_event(event),
+            got: event.label(),
         })
     }
 
@@ -344,7 +343,7 @@ mod tests {
             Err(ReadSourceError::UnexpectedEvent {
                 state: ReadSourceState::ResolveConnector,
                 expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                got: "Event::Task".to_string(),
+                got: "TaskEvent::Error",
             })
         );
     }

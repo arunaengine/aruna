@@ -1,4 +1,4 @@
-//! Computes retry delays and jittered conflict backoff for queued task work.
+//! Computes retry delays for queued task work.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -23,30 +23,9 @@ pub(crate) fn due_after(now_ms: u64, due_at_ms: u64) -> Duration {
     Duration::from_millis(due_at_ms.saturating_sub(now_ms))
 }
 
-// Deterministic jitter from the caller's own id decorrelates the retries of
-// drivers that conflict on one record, and the wait lets the winner commit.
-pub(crate) fn conflict_backoff(attempt: usize, seed: &[u8]) -> Duration {
-    let mut head = [0u8; 8];
-    head.copy_from_slice(&seed[..8]);
-    let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
-    let (base, cap) = (Duration::from_millis(25), Duration::from_millis(250));
-    capped_backoff(base, cap, attempt, u64::from_le_bytes(head))
-}
-
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-
-    #[test]
-    fn backoff_jitters() {
-        // Backoff is deterministic per seed and stays within [base, 2*base).
-        let seed = [7u8; 16];
-        let base = 25;
-        let first = conflict_backoff(0, &seed);
-        assert_eq!(first, conflict_backoff(0, &seed));
-        let ms = first.as_millis() as u64;
-        assert!(ms >= base && ms < base.saturating_mul(2));
-    }
 
     #[test]
     fn retry_backoff_values() {

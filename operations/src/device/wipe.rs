@@ -46,7 +46,7 @@ pub enum WipeDeviceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -84,7 +84,7 @@ impl Operation for WipeDeviceOperation {
 
         match self.state {
             WipeDeviceState::SyncStorage => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::SyncAllFinished) = event else {
                     return fail(
                         self,

@@ -38,7 +38,7 @@ pub enum ListDraftsError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -77,7 +77,7 @@ impl Operation for ListDraftsOperation {
 
         match self.state {
             ListDraftsState::Scan => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,

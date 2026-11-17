@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
-use crate::staging::describe_event;
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
@@ -48,7 +47,7 @@ pub enum HeadSourceError {
     UnexpectedEvent {
         state: HeadSourceState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("Head staging source failed")]
     HeadSourceFailed,
@@ -84,7 +83,7 @@ impl HeadSourceOperation {
         self.emit_error(HeadSourceError::UnexpectedEvent {
             state: self.state.clone(),
             expected,
-            got: describe_event(event),
+            got: event.label(),
         })
     }
 
@@ -315,7 +314,7 @@ mod tests {
             Err(HeadSourceError::UnexpectedEvent {
                 state: HeadSourceState::ResolveConnector,
                 expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                got: "Event::Search".to_string(),
+                got: "Event::Search",
             })
         );
     }

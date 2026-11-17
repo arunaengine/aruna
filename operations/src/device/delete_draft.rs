@@ -50,7 +50,7 @@ pub enum DeleteDraftError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -86,7 +86,7 @@ impl Operation for DeleteDraftOperation {
 
         match self.state {
             DeleteDraftState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -101,7 +101,7 @@ impl Operation for DeleteDraftOperation {
                 smallvec![read_publish_entry(self.draft_id, Some(txn_id))]
             }
             DeleteDraftState::ReadEntry { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,
@@ -141,7 +141,7 @@ impl Operation for DeleteDraftOperation {
                 })]
             }
             DeleteDraftState::DeleteEntry { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
                     return fail(
                         self,
@@ -156,7 +156,7 @@ impl Operation for DeleteDraftOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             DeleteDraftState::CommitTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,
