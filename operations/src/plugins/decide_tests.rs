@@ -17,6 +17,7 @@ use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::prune_runs;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
+use aruna_core::operation::Operation;
 
 /// A created dataset journaled now, and its forward row for `install`.
 fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
@@ -278,4 +279,114 @@ async fn delivery_totals() {
     assert_eq!((delivery.waiting, delivery.gaps.len()), (1, 1));
     assert_eq!((delivery.gaps[0].count, delivery.gaps[0].latest_ms), (5, 2));
     assert!(delivery.oldest_ms.is_some());
+}
+
+/// A forward row of a fixed install, with no install record behind it.
+fn plain_row(source: &str) -> ForwardRow {
+    ForwardRow {
+        install_id: Ulid::from_parts(1, 1),
+        revision: 1,
+        event: SourceEvent {
+            kind: SourceKind::DatasetCreated,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: source.into(),
+            actor: None,
+            anchor_ms: 5,
+            journaled_ms: 5,
+        },
+        queued_ms: 5,
+    }
+}
+
+#[test]
+fn verdict_decisions() {
+    let row = plain_row("s1");
+    // An unavailable check is busy and needs no storage.
+    let mut busy = decide_event(Verdict::Unavailable, &row, 9).unwrap();
+    assert!(busy.start().is_empty());
+    assert_eq!(busy.finalize(), Ok(Outcome::Busy));
+    // A denial records its outcome at once.
+    let mut plan = DecideEvent {
+        row: Box::new(row.clone()),
+        now_ms: 9,
+        phase: DecidePhase::Denying("no".into()),
+    };
+    let Turn::Ask(Ask::Write(rows)) = plan.first().unwrap() else {
+        panic!("a denial writes its dedup record");
+    };
+    assert_eq!(
+        rows,
+        [seen_row(&row, &Outcome::Denied("no".into()), 9).unwrap()]
+    );
+    let denied = Outcome::Denied("no".into());
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(denied));
+    // An unready event holds a queue slot unless the queue is full.
+    let mut hold = DecideEvent {
+        row: Box::new(row.clone()),
+        now_ms: 9,
+        phase: DecidePhase::Holding(Hold::new(&row, 9).unwrap()),
+    };
+    hold.first().unwrap();
+    let full = (0..RUNS_QUEUED)
+        .map(|seq| (vec![seq as u8], Vec::new()))
+        .collect();
+    assert_eq!(
+        hold.next(Answer::Page(full, None)).unwrap(),
+        Turn::Finish(Outcome::Busy)
+    );
+    let mut slot = DecideEvent {
+        row: Box::new(row.clone()),
+        now_ms: 9,
+        phase: DecidePhase::Holding(Hold::new(&row, 9).unwrap()),
+    };
+    slot.first().unwrap();
+    let Turn::Ask(Ask::Write(rows)) = slot.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("a free slot is taken");
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        slot.next(Answer::Done).unwrap(),
+        Turn::Finish(Outcome::Waiting)
+    );
+    assert!(slot.next(Answer::Done).is_err());
+}
+
+#[test]
+fn reports_keep_newest() {
+    let sender = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let install = Ulid::from_parts(1, 1);
+    let report = |sequence| {
+        let mut row = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+        row.sequence = sequence;
+        (install, row)
+    };
+    let mut plan = KeepReports {
+        sender,
+        reports: vec![report(3)],
+        acked: None,
+    };
+    let Turn::Ask(Ask::Read(reads)) = plan.first().unwrap() else {
+        panic!("the kept reports are read first");
+    };
+    assert_eq!(reads.len(), 1);
+    // A newer kept report wins and nothing is written.
+    let kept = Answer::Values(vec![Some(encode(&report(5).1).unwrap())]);
+    assert_eq!(plan.next(kept).unwrap(), Turn::Ask(Ask::Write(Vec::new())));
+    let acked = vec![(install, SourceKind::DatasetCreated, GapReason::Full, 5)];
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(acked));
+}
+
+#[test]
+fn gap_counts_once() {
+    let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let mut gap = GapCount::new(local, &plain_row("s1"), GapReason::Late);
+    let Some(counted) = gap.take(Answer::Values(vec![None])).unwrap() else {
+        panic!("the first answer counts the gap");
+    };
+    let row: GapRow = decode(&counted.2).unwrap();
+    assert_eq!((row.count, row.earliest_ms), (1, 5));
+    assert_eq!(gap.take(Answer::Done).unwrap(), None);
 }

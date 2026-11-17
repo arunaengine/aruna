@@ -407,3 +407,32 @@ fn resolve_decisions() {
     );
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(saved));
 }
+
+#[test]
+fn drop_deletes_intents() {
+    let install = Ulid::from_parts(1, 1);
+    let run = queued(install, 1);
+    let mut plan = DropRun {
+        key: run_key(install, run.run_id),
+        intents: intent_scan(run.run_id),
+        phase: DropPhase::Run,
+    };
+    let first = plan.first().unwrap();
+    assert_eq!(
+        first,
+        Turn::Ask(Ask::Delete(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            run_key(install, run.run_id)
+        )]))
+    );
+    assert!(matches!(
+        plan.next(Answer::Done).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let intents = vec![(b"i1".to_vec(), Vec::new())];
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(intents, None)).unwrap() else {
+        panic!("the run's intents are deleted");
+    };
+    assert_eq!(keys.len(), 1);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+}
