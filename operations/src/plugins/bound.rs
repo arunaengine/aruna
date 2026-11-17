@@ -217,7 +217,7 @@ pub async fn open(
                     secret: Some(secret),
                     ..
                 }) => Ok(secret),
-                other => Err(failed(format!("the node vault answered {other:?}"))),
+                other => Err(failed(format!("the node vault answered {}", other.label()))),
             }
         }
     }

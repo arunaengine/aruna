@@ -140,5 +140,8 @@ impl<'a> Txn<'a> {
 }
 
 fn failed(event: Event) -> StoreError {
-    StoreError(format!("{event:?}"))
+    match event {
+        Event::Storage(StorageEvent::Error { error }) => StoreError(error.to_string()),
+        other => StoreError(format!("unexpected {}", other.label())),
+    }
 }

@@ -234,7 +234,7 @@ impl<P: Plan> Operation for RowsOperation<P> {
     fn step(&mut self, event: Event) -> Effects {
         let event = match event {
             Event::Storage(event) => event,
-            other => return self.fail(StoreError(format!("{other:?}"))),
+            other => return self.fail(unexpected_event(&other)),
         };
         match (std::mem::replace(&mut self.state, State::Created), event) {
             (State::Starting(ask), StorageEvent::TransactionStarted { txn_id }) => {
@@ -257,7 +257,7 @@ impl<P: Plan> Operation for RowsOperation<P> {
             }
             (state, event) => {
                 self.state = state;
-                self.fail(StoreError(format!("{event:?}")))
+                self.fail(storage_failed(event))
             }
         }
     }
@@ -519,6 +519,18 @@ pub fn unexpected(answer: Answer) -> StoreError {
     StoreError(format!("unexpected answer {answer:?}"))
 }
 
+/// A storage event the plan did not wait for, or the storage error it reports.
+fn storage_failed(event: StorageEvent) -> StoreError {
+    match event {
+        StorageEvent::Error { error } => StoreError(error.to_string()),
+        other => unexpected_event(&Event::Storage(other)),
+    }
+}
+
+fn unexpected_event(event: &Event) -> StoreError {
+    StoreError(format!("unexpected {}", event.label()))
+}
+
 /// The answer to an empty read, write or delete, which needs no storage.
 fn empty_answer(ask: &Ask) -> Option<Answer> {
     match ask {
@@ -555,7 +567,7 @@ fn answer(wait: Wait, event: StorageEvent) -> Result<Answer, StoreError> {
         (Wait::Written, StorageEvent::BatchWriteResult { .. }) => Ok(Answer::Done),
         (Wait::Deleted, StorageEvent::BatchDeleteResult { .. }) => Ok(Answer::Done),
         (Wait::Synced, StorageEvent::SyncAllFinished) => Ok(Answer::Done),
-        (_, event) => Err(StoreError(format!("{event:?}"))),
+        (_, event) => Err(storage_failed(event)),
     }
 }
 
