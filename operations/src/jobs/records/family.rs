@@ -40,7 +40,7 @@ pub enum FamilyReadError {
 /// Pages one family prefix to its end. A page error, an undecodable row, or a
 /// continuation past the bound fails the whole read instead of returning the
 /// part that happened to load.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct LoadFamilyOperation {
     prefix: Key,
     limit: usize,

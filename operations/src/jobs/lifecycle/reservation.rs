@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, LaunchIntent, RecordVerdict,
     RunLink, run_crate_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 
 use smallvec::smallvec;

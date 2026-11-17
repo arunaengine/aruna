@@ -7,7 +7,7 @@ use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
 use aruna_core::structs::execution::job::{
-    ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProgress,
+    ExecutionRole, JobError, JobFamilyRecord, JobId, JobPayload, JobProgress,
     JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
     PhysicalExecutionState, ResultMessage, WorkspaceMode,
 };
@@ -346,7 +346,7 @@ fn local_state(state: LogicalJobState) -> JobState {
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::structs::execution::job::SubmissionId;
+    use aruna_core::structs::execution::job::{JobFamilyId, SubmissionId};
 
     use super::*;
 

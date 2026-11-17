@@ -21,6 +21,7 @@ pub const JOB_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// The owner's answer and, for a ranged artifact that is ready, the stream carrying its bytes.
+#[derive(Debug)]
 pub struct JobReply {
     pub response: JobResponse,
     pub body: Option<BiStream>,

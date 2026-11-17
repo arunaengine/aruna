@@ -26,7 +26,7 @@ const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
 /// One drain pass. Every local failure ends the pass with "entries remain", so
 /// the timer retries later; only an event that fits no phase is an error.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     realm_id: RealmId,
     local: NodeId,
@@ -37,7 +37,7 @@ pub struct DrainOutboxOperation {
     outcome: Option<Result<bool, LifecycleError>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Phase {
     Init,
     Config(GetConfigOperation),

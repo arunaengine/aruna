@@ -8,7 +8,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
-    ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordKind,
+    ExecutionReceipt, JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
+    JobRecordKind,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -36,7 +37,7 @@ pub struct ExecutionChain {
 
 /// Reads one execution chain. Every read failure ends with no chain and a
 /// warning, as a purely local job does; only an event that fits no phase fails.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ExecutionChainOperation {
     /// The local physical job, when the chain starts from its reservation.
     physical: Option<JobId>,
@@ -48,7 +49,7 @@ pub struct ExecutionChainOperation {
     outcome: Option<Result<Option<ExecutionChain>, LifecycleError>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Phase {
     Init,
     Reservation(HeldReservations),

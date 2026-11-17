@@ -15,7 +15,7 @@ use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_family, alias_prefix}
 
 /// The family of one alias, ordered by key, so two families claiming one alias
 /// resolve identically on every replica. `None` names no family here.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct AliasFamilyOperation {
     job_id: JobId,
     started: bool,

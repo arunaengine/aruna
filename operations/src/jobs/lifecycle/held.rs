@@ -16,7 +16,7 @@ use aruna_core::compute::quota::JobReservationRecord;
 use crate::jobs::records::rows::from_bytes;
 
 /// Reads every held reservation, or only the one of `job_id`, oldest key first.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct HeldReservations {
     job_id: Option<JobId>,
     held: Vec<JobReservationRecord>,

@@ -18,7 +18,7 @@ use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, LogicalJobSpec,
     RecordVerdict, SubmissionClaim, SubmissionId, WorkspaceMode, job_record_key, owner_index_key,
 };
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::{debug, warn};
