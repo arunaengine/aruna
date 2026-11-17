@@ -205,6 +205,13 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
             }
+            aruna_core::DocumentEffect::ReconcileTopics { .. } => {
+                NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
+                    target: None,
+                    error: "topic reconcile must be dispatched by the operations runner"
+                        .to_string(),
+                })
+            }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
         // Job-control and audit effects are executed by the operations runner,
