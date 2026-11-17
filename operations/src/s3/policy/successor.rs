@@ -916,13 +916,12 @@ mod pure_tests {
     use crate::blob::records::HeadAliasContext;
     use crate::s3::purge_fence::PurgeFenceError;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::checksum::HASH_BLAKE3;
     use aruna_core::structs::execution::job::JobId;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
@@ -945,7 +944,7 @@ mod pure_tests {
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
-    use aruna_core::types::{Key, TxnId, Value};
+    use aruna_core::types::{Key, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::time::{SystemTime, UNIX_EPOCH};
     use ulid::Ulid;
@@ -1063,11 +1062,7 @@ mod pure_tests {
     #[test]
     fn successor_obeys_fence() {
         let mut operation = MintSuccessorOperation::new(plan(Vec::new(), PolicyRefMode::Replace));
-        let transaction = Ulid::from_bytes([11; 16]);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: transaction,
-        }));
+        operation.first().unwrap();
         let fence = StoragePurgeFence {
             job_id: JobId::from_bytes([12; 16]),
             scope: StoragePurgeScope::File {
@@ -1076,20 +1071,32 @@ mod pure_tests {
             },
         };
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: BUCKET.as_bytes().to_vec().into(),
-            value: Some(fence.to_bytes().unwrap().into()),
-        }));
+        let turn = operation.next(read(Some(fence.to_bytes().unwrap())));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-                if *txn_id == transaction
-        ));
         assert_eq!(
-            operation.finalize(),
-            Err(SuccessorError::Purge(PurgeFenceError::Suspended))
+            turn.err(),
+            Some(SuccessorError::Purge(PurgeFenceError::Suspended))
         );
+    }
+
+    #[test]
+    fn operation_commits_outcome() {
+        // A replayed mutation ends the run; the runner commits its read transaction.
+        let mut operation = MintSuccessorOperation::new(plan(Vec::new(), PolicyRefMode::Replace));
+        operation.first().unwrap();
+        operation.next(read(None)).unwrap();
+        let record = PolicyMutationRecord {
+            mutation_id: Ulid::from_bytes([8u8; 16]),
+            params: plan(Vec::new(), PolicyRefMode::Replace).params(),
+            successor_version_id: Ulid::from_bytes([4u8; 16]),
+            effective_refs: Vec::new(),
+            materialized: true,
+        };
+        let turn = operation.next(read(Some(record.to_bytes().unwrap())));
+        assert!(matches!(
+            turn,
+            Ok(Next::Done(SuccessorOutcome::Replayed { .. }))
+        ));
     }
 
     fn location() -> BackendLocation {
@@ -1140,66 +1147,49 @@ mod pure_tests {
         )
     }
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
+    fn read(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
     }
 
     /// The bucket and the live subject the exposing transaction re-reads.
-    fn drift(bucket: Option<Vec<u8>>, record: NodeSubjectRecord) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::<u8>::new()), bucket.map(Into::into)),
-                (
-                    Key::from(Vec::<u8>::new()),
-                    Some(Value::from(record.to_bytes().expect("record encodes"))),
-                ),
-            ],
-        })
+    fn drift(bucket: Option<Vec<u8>>, record: NodeSubjectRecord) -> IoResult {
+        IoResult::Values(vec![
+            bucket.map(Into::into),
+            Some(Value::from(record.to_bytes().expect("record encodes"))),
+        ])
     }
 
     fn advertised() -> NodeSubjectRecord {
         NodeSubjectRecord::seed(subject()).expect("subject is valid")
     }
 
-    fn copies(rows: Vec<(Key, Value)>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: None,
-        })
+    fn copies(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
     }
 
     /// Drives the mint through mutation, head, bucket, version and the free
     /// successor id, up to the copy scan.
-    fn drive_to_copy(mint: &mut SuccessorMint, version: &BlobVersion) -> Option<Effect> {
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
+    fn drive_to_copy(mint: &mut SuccessorMint, version: &BlobVersion) -> Option<IoCall> {
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
         if mint.plan.intent.is_some() {
-            mint.step(read(None), None).expect("intent absent");
+            mint.step_calls(read(None)).expect("intent absent");
         }
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
-        mint.step(
-            drift(Some(bucket().to_bytes().unwrap()), advertised()),
-            None,
-        )
-        .expect("bucket matches");
+        mint.step_calls(drift(Some(bucket().to_bytes().unwrap()), advertised()))
+            .expect("bucket matches");
         let effects = mint
-            .step(read(Some(version.to_bytes().unwrap())), None)
+            .step_calls(read(Some(version.to_bytes().unwrap())))
             .expect("version decodes");
         match effects {
-            Some(_) => mint
-                .step(read(None), None)
-                .expect("successor id is free")
-                .and_then(|effects| effects.into_iter().next()),
+            Some(_) => mint.step_calls(read(None)).expect("successor id is free"),
             None => None,
         }
     }
 
-    fn batch_writes(effect: Effect) -> Vec<(String, Vec<u8>, Vec<u8>)> {
-        let Effect::Storage(StorageEffect::BatchWrite { writes, .. }) = effect else {
+    fn batch_writes(call: IoCall) -> Vec<(String, Vec<u8>, Vec<u8>)> {
+        let IoCall::Write(writes) = call else {
             panic!("expected a batch write");
         };
         writes
@@ -1210,25 +1200,17 @@ mod pure_tests {
 
     /// Runs the embedded counter update from the record batch to its deltas
     /// and returns the counters the owning group would commit from zero.
-    fn group_counters(mint: &mut SuccessorMint, txn_id: TxnId) -> UsageCounters {
+    fn group_counters(mint: &mut SuccessorMint) -> UsageCounters {
         let mut effect = first_effect(
-            mint.step(
-                Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }),
-                Some(txn_id),
-            )
-            .expect("the usage update starts"),
+            mint.step_calls(IoResult::Done)
+                .expect("the usage update starts"),
         );
         // A materialized mint reads the realm config first; without one the
         // group is unlimited and the counter update starts right after.
         if mint.state == MintState::ReadQuota {
-            effect = first_effect(
-                mint.step(read(None), Some(txn_id))
-                    .expect("no ceiling applies"),
-            );
+            effect = first_effect(mint.step_calls(read(None)).expect("no ceiling applies"));
         }
-        let Effect::Storage(StorageEffect::AddUsage { deltas, .. }) = effect else {
+        let IoCall::AddUsage { deltas, .. } = effect else {
             panic!("expected the counter deltas");
         };
         let group_key = usage_group_key(bucket().group_id);
@@ -1241,12 +1223,8 @@ mod pure_tests {
         counters
     }
 
-    fn first_effect(effects: Option<aruna_core::types::Effects>) -> Effect {
-        effects
-            .expect("effects follow")
-            .into_iter()
-            .next()
-            .expect("one effect")
+    fn first_effect(call: Option<IoCall>) -> IoCall {
+        call.expect("a call follows")
     }
 
     #[test]
@@ -1260,10 +1238,10 @@ mod pure_tests {
             effective_refs: Vec::new(),
             materialized: true,
         };
-        mint.start(None).expect("start builds");
+        mint.start_calls().expect("start builds");
 
         assert_eq!(
-            mint.step(read(Some(record.to_bytes().unwrap())), None)
+            mint.step_calls(read(Some(record.to_bytes().unwrap())))
                 .expect("replay decides"),
             None
         );
@@ -1275,7 +1253,6 @@ mod pure_tests {
                 materialized: true,
             })
         );
-        assert!(!mint.wrote(), "a replay commits nothing");
     }
 
     #[test]
@@ -1289,10 +1266,10 @@ mod pure_tests {
             effective_refs: Vec::new(),
             materialized: true,
         };
-        mint.start(None).expect("start builds");
+        mint.start_calls().expect("start builds");
 
         assert_eq!(
-            mint.step(read(Some(record.to_bytes().unwrap())), None),
+            mint.step_calls(read(Some(record.to_bytes().unwrap()))),
             Err(SuccessorError::MutationConflict(Ulid::from_bytes(
                 [8u8; 16]
             )))
@@ -1304,12 +1281,12 @@ mod pure_tests {
         // A concurrent write advanced the head, so the successor must not roll it
         // back to the version this mutation was planned against.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
         let moved = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 5);
 
         assert_eq!(
-            mint.step(read(Some(moved.to_bytes().unwrap())), None),
+            mint.step_calls(read(Some(moved.to_bytes().unwrap()))),
             Err(SuccessorError::HeadConflict {
                 current: Some(moved)
             })
@@ -1319,18 +1296,15 @@ mod pure_tests {
     #[test]
     fn rejects_changed_bucket() {
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
         let mut recreated = bucket();
         recreated.created_at = UNIX_EPOCH + std::time::Duration::from_secs(9);
 
         assert_eq!(
-            mint.step(
-                drift(Some(recreated.to_bytes().unwrap()), advertised()),
-                None
-            ),
+            mint.step_calls(drift(Some(recreated.to_bytes().unwrap()), advertised())),
             Err(SuccessorError::BucketChanged)
         );
     }
@@ -1339,9 +1313,9 @@ mod pure_tests {
     fn needs_set_hint() {
         // A successor id planned without the set hint is refused in a distributed bucket.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Replace));
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
         let mut bound = bucket();
         bound.distribution = Some(super::DistributionBinding {
@@ -1351,7 +1325,7 @@ mod pure_tests {
             revision: Default::default(),
         });
         assert_eq!(
-            mint.step(drift(Some(bound.to_bytes().unwrap()), advertised()), None),
+            mint.step_calls(drift(Some(bound.to_bytes().unwrap()), advertised())),
             Err(SuccessorError::BucketChanged)
         );
     }
@@ -1387,29 +1361,29 @@ mod pure_tests {
         // The plan was evaluated against the subject this node advertised then;
         // a drift before the commit must not expose bytes nothing evaluated.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
         let mut moved = advertised();
         moved.subject.generation = 9;
 
         assert_eq!(
-            mint.step(drift(Some(bucket().to_bytes().unwrap()), moved), None),
+            mint.step_calls(drift(Some(bucket().to_bytes().unwrap()), moved)),
             Err(SuccessorError::SubjectDrift)
         );
 
         // A node that stopped serving is refused under the same generation.
         let mut mint = SuccessorMint::new(plan(Vec::new(), PolicyRefMode::Union));
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
         let mut blocked = advertised();
         blocked.serving_blocked = true;
 
         assert_eq!(
-            mint.step(drift(Some(bucket().to_bytes().unwrap()), blocked), None),
+            mint.step_calls(drift(Some(bucket().to_bytes().unwrap()), blocked)),
             Err(SuccessorError::SubjectDrift)
         );
     }
@@ -1423,16 +1397,13 @@ mod pure_tests {
             generation: 2,
             refs: Vec::new(),
         });
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
 
         assert_eq!(
-            mint.step(
-                drift(Some(bucket().to_bytes().unwrap()), advertised()),
-                None
-            ),
+            mint.step_calls(drift(Some(bucket().to_bytes().unwrap()), advertised())),
             Err(SuccessorError::DefaultChanged { current: 3 })
         );
     }
@@ -1444,26 +1415,17 @@ mod pure_tests {
         let policy = verified(1, Some(node_id()));
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
-        mint.step(read(Some(head().to_bytes().unwrap())), None)
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
+        mint.step_calls(read(Some(head().to_bytes().unwrap())))
             .expect("head matches");
-        mint.step(
-            drift(Some(bucket().to_bytes().unwrap()), advertised()),
-            None,
-        )
-        .expect("bucket matches");
-        mint.step(
-            read(Some(materialized(Vec::new()).to_bytes().unwrap())),
-            None,
-        )
-        .expect("version decodes");
+        mint.step_calls(drift(Some(bucket().to_bytes().unwrap()), advertised()))
+            .expect("bucket matches");
+        mint.step_calls(read(Some(materialized(Vec::new()).to_bytes().unwrap())))
+            .expect("version decodes");
 
         assert_eq!(
-            mint.step(
-                read(Some(materialized(Vec::new()).to_bytes().unwrap())),
-                None
-            ),
+            mint.step_calls(read(Some(materialized(Vec::new()).to_bytes().unwrap()))),
             Err(SuccessorError::VersionCollision(Ulid::from_bytes(
                 [9u8; 16]
             )))
@@ -1477,11 +1439,11 @@ mod pure_tests {
         mint.plan.intent = Some(intent());
         let mut stored = intent();
         stored.successor_version_id = Ulid::from_bytes([4u8; 16]);
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
 
         assert_eq!(
-            mint.step(read(Some(stored.to_bytes().unwrap())), None),
+            mint.step_calls(read(Some(stored.to_bytes().unwrap()))),
             Err(SuccessorError::IntentConflict)
         );
     }
@@ -1496,11 +1458,11 @@ mod pure_tests {
             version_id: Ulid::from_bytes([9u8; 16]),
             materialized: true,
         };
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
 
         assert_eq!(
-            mint.step(read(Some(stored.to_bytes().unwrap())), None),
+            mint.step_calls(read(Some(stored.to_bytes().unwrap()))),
             Err(SuccessorError::IntentConflict)
         );
     }
@@ -1515,11 +1477,11 @@ mod pure_tests {
         stored.observed_head =
             CurrentVersionPointer::new_with_generation(Ulid::from_bytes([1u8; 16]), 2);
         stored.successor_version_id = Ulid::from_bytes([4u8; 16]);
-        mint.start(None).expect("start builds");
-        mint.step(read(None), None).expect("mutation absent");
+        mint.start_calls().expect("start builds");
+        mint.step_calls(read(None)).expect("mutation absent");
 
         assert!(
-            mint.step(read(Some(stored.to_bytes().unwrap())), None)
+            mint.step_calls(read(Some(stored.to_bytes().unwrap())))
                 .expect("stale intent is replanned")
                 .is_some()
         );
@@ -1536,10 +1498,10 @@ mod pure_tests {
         let effect = drive_to_copy(&mut mint, &materialized(vec![existing.policy_ref()]))
             .expect("copy scan follows");
 
-        let Effect::Storage(StorageEffect::Iter { key_space, .. }) = effect else {
+        let IoCall::Page { space, .. } = effect else {
             panic!("expected the managed-copy scan");
         };
-        assert_eq!(key_space, MANAGED_COPY_KEYSPACE);
+        assert_eq!(space, MANAGED_COPY_KEYSPACE);
         assert!(mint.effective_refs.contains(&existing.policy_ref()));
         assert!(mint.effective_refs.contains(&added.policy_ref()));
     }
@@ -1593,8 +1555,9 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
 
+        // A blocked mutation without a run writes nothing.
         assert_eq!(
-            mint.step(copies(Vec::new()), None).expect("scan decides"),
+            mint.step_calls(copies(Vec::new())).expect("scan decides"),
             None
         );
         assert_eq!(
@@ -1602,10 +1565,6 @@ mod pure_tests {
             Some(&SuccessorOutcome::Blocked(
                 PolicyBlockedReason::SourceUnavailable
             ))
-        );
-        assert!(
-            !mint.wrote(),
-            "a blocked mutation without a run writes nothing"
         );
     }
 
@@ -1618,7 +1577,7 @@ mod pure_tests {
         let row = copy_row(Vec::new(), ManagedCopyState::UnresolvedDeparted);
 
         assert_eq!(
-            mint.step(copies(vec![row]), None).expect("scan decides"),
+            mint.step_calls(copies(vec![row])).expect("scan decides"),
             None
         );
         assert_eq!(
@@ -1642,7 +1601,7 @@ mod pure_tests {
         let row = copy_row(vec![policy.policy_ref()], ManagedCopyState::Registered);
 
         assert_eq!(
-            mint.step(copies(vec![row]), None).expect("scan decides"),
+            mint.step_calls(copies(vec![row])).expect("scan decides"),
             None
         );
         assert_eq!(
@@ -1661,7 +1620,7 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         mint.plan.intent = Some(intent());
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let effect = first_effect(mint.step(copies(Vec::new()), None).expect("scan decides"));
+        let effect = first_effect(mint.step_calls(copies(Vec::new())).expect("scan decides"));
         let writes = batch_writes(effect);
 
         assert_eq!(writes.len(), 1);
@@ -1671,7 +1630,6 @@ mod pure_tests {
             stored.outcome,
             PolicyIntentOutcome::Blocked(PolicyBlockedReason::SourceUnavailable)
         );
-        assert!(mint.wrote(), "the blocked reason has to commit");
     }
 
     #[test]
@@ -1682,7 +1640,7 @@ mod pure_tests {
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
         let row = copy_row(Vec::new(), ManagedCopyState::Registered);
 
-        let effect = first_effect(mint.step(copies(vec![row]), None).expect("scan decides"));
+        let effect = first_effect(mint.step_calls(copies(vec![row])).expect("scan decides"));
         let writes = batch_writes(effect);
 
         let spaces: Vec<&str> = writes.iter().map(|(space, ..)| space.as_str()).collect();
@@ -1713,12 +1671,10 @@ mod pure_tests {
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::from_parts(1, 1);
         let row = copy_row(Vec::new(), ManagedCopyState::Registered);
-        mint.step(copies(vec![row]), Some(txn_id))
-            .expect("scan decides");
+        mint.step_calls(copies(vec![row])).expect("scan decides");
 
-        let counters = group_counters(&mut mint, txn_id);
+        let counters = group_counters(&mut mint);
         assert_eq!(counters.logical_bytes, location().blob_size);
         assert_eq!(counters.objects, 0);
         assert_eq!(counters.stored_bytes, 0);
@@ -1732,17 +1688,10 @@ mod pure_tests {
         let mut mint = SuccessorMint::new(plan(vec![policy.policy_ref()], PolicyRefMode::Replace));
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::from_parts(2, 2);
         let row = copy_row(Vec::new(), ManagedCopyState::Registered);
-        mint.step(copies(vec![row]), Some(txn_id))
-            .expect("scan decides");
-        mint.step(
-            Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }),
-            Some(txn_id),
-        )
-        .expect("the quota read follows");
+        mint.step_calls(copies(vec![row])).expect("scan decides");
+        mint.step_calls(IoResult::Done)
+            .expect("the quota read follows");
 
         let mut config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
         config.quota.default_quota_bytes = Some(1);
@@ -1752,20 +1701,16 @@ mod pure_tests {
             user_id: user_id(),
             realm_id: realm_id(),
         };
-        mint.step(
-            read(Some(config.to_bytes(&actor).expect("config encodes"))),
-            Some(txn_id),
-        )
-        .expect("the gate starts");
-        mint.step(read(None), Some(txn_id))
-            .expect("no usage rebuild runs");
-        mint.step(read(None), Some(txn_id))
+        mint.step_calls(read(Some(config.to_bytes(&actor).expect("config encodes"))))
+            .expect("the gate starts");
+        mint.step_calls(read(None)).expect("no usage rebuild runs");
+        mint.step_calls(read(None))
             .expect("the gate reads its own realm config");
-        mint.step(read(None), Some(txn_id))
+        mint.step_calls(read(None))
             .expect("the group holds no counters yet");
 
         let error = mint
-            .step(copies(Vec::new()), Some(txn_id))
+            .step_calls(copies(Vec::new()))
             .expect_err("the mint is refused");
 
         assert_eq!(
@@ -1785,18 +1730,9 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         mint.plan.intent = Some(intent());
         drive_to_copy(&mut mint, &materialized(Vec::new())).expect("copy scan follows");
-        let txn_id = Ulid::from_parts(3, 3);
-        mint.step(copies(Vec::new()), Some(txn_id))
-            .expect("scan decides");
+        mint.step_calls(copies(Vec::new())).expect("scan decides");
 
-        let effects = mint
-            .step(
-                Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }),
-                Some(txn_id),
-            )
-            .expect("the mint settles");
+        let effects = mint.step_calls(IoResult::Done).expect("the mint settles");
         assert_eq!(effects, None);
         assert_eq!(mint.state, MintState::Done);
     }
@@ -1844,7 +1780,7 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &reference()).expect("writes follow");
 
-        let counters = group_counters(&mut mint, Ulid::from_parts(4, 4));
+        let counters = group_counters(&mut mint);
         assert_eq!(counters.referenced_bytes, REFERENCE_BYTES);
         assert_eq!(counters.logical_bytes, 0);
         assert_eq!(counters.objects, 0);
@@ -1872,21 +1808,12 @@ mod pure_tests {
         mint.plan.resolved = resolution(&policy);
         drive_to_copy(&mut mint, &observation).expect("writes follow");
 
-        let written = || {
-            Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            })
-        };
-        let txn_id = Some(Ulid::from_parts(4, 4));
-        let effects = mint.step(written(), txn_id).expect("the write settles");
+        let written = || IoResult::Done;
+        let effects = mint.step_calls(written()).expect("the write settles");
         // No group counter moves; only the bucket counts the successor's row.
-        let Some(
-            [
-                Effect::Storage(StorageEffect::AddUsage {
-                    deltas, buckets, ..
-                }),
-            ],
-        ) = effects.as_deref()
+        let Some(IoCall::AddUsage {
+            deltas, buckets, ..
+        }) = &effects
         else {
             panic!("expected the bucket row update, got {effects:?}");
         };
@@ -1894,8 +1821,8 @@ mod pure_tests {
         let versions: Vec<_> = buckets.iter().map(|(_, delta)| delta.versions).collect();
         assert_eq!(versions, [1]);
         // The counter rows, then the dirty markers, are written.
-        mint.step(written(), txn_id).expect("the counters settle");
-        let done = mint.step(written(), txn_id).expect("the markers settle");
+        mint.step_calls(written()).expect("the counters settle");
+        let done = mint.step_calls(written()).expect("the markers settle");
         assert!(done.is_none());
         assert_eq!(mint.state, MintState::Done);
     }
