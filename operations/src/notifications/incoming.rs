@@ -29,10 +29,11 @@ use crate::notifications::mark_read::MARK_MAX_IDS;
 use crate::triggers::{PeerInput, peer_operation};
 
 use crate::notifications::watch::authorization::{
-    WatchAuthorization, authorize_forwarded_watch, list_authorized_subscriptions,
+    authorize_forwarded_watch, list_authorized_subscriptions,
 };
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
+use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::subscriptions::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, create_holder_watch,
     delete_holder_watch,

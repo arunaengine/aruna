@@ -28,9 +28,8 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
-use aruna_operations::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_creation, watch_permission_path,
-};
+use aruna_operations::notifications::watch::authorization::evaluate_watch_creation;
+use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

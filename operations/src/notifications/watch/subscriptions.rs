@@ -28,8 +28,9 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
-use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
+use crate::notifications::watch::authorization::evaluate_watch_creation;
 use crate::notifications::watch::interest::dirty_marker_write;
+use crate::notifications::watch::paths::WatchAuthorization;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };

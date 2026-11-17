@@ -26,12 +26,11 @@ use crate::notifications::protocol::{
     RETRY_BATCH_CAP, RETRY_BYTES_CAP,
 };
 use crate::notifications::routing::route_watch_event;
-use crate::notifications::watch::authorization::{
-    WatchAuthorization, authorize_watch_event, evaluate_watch_delivery,
-};
+use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
 use crate::notifications::watch::interest::{
     dirty_marker_write, mark_interest_dirty, schedule_interest_publish,
 };
+use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::subscriptions::list_watch_page;
 
 /// Expands one bounded subscription page into idempotent inbox records.
