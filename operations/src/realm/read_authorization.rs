@@ -2,30 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::document_repository::read_effect;
+use crate::document_repository::read_row;
 
 #[derive(Debug, PartialEq)]
 pub struct ReadAuthorizationOperation {
     realm_id: RealmId,
-    state: ReadAuthorizationState,
-    output: Option<Result<Option<RealmAuthorizationDocument>, ReadAuthorizationError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ReadAuthorizationState {
-    Init,
-    ReadAuthorization,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -44,76 +32,96 @@ pub enum ReadAuthorizationError {
     NotFinished,
 }
 
-impl ReadAuthorizationOperation {
-    pub fn new(realm_id: RealmId) -> Self {
-        Self {
-            realm_id,
-            state: ReadAuthorizationState::Init,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: ReadAuthorizationError) -> Effects {
-        self.state = ReadAuthorizationState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_authorization_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let result = value
-                    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes).map_err(Into::into))
-                    .transpose();
-                self.state = ReadAuthorizationState::Finish;
-                self.output = Some(result);
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(ReadAuthorizationError::UnexpectedEvent {
-                state: format!("{:?}", self.state),
-                expected: "storage read result",
-                got: other.label(),
-            }),
+impl From<IoError> for ReadAuthorizationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ReadAuthorization".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
         }
     }
 }
 
-impl EffectOperation for ReadAuthorizationOperation {
+impl ReadAuthorizationOperation {
+    pub fn new(realm_id: RealmId) -> Self {
+        Self { realm_id }
+    }
+}
+
+impl Operation for ReadAuthorizationOperation {
     type Output = Option<RealmAuthorizationDocument>;
     type Error = ReadAuthorizationError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReadAuthorizationState::ReadAuthorization;
-        smallvec![read_effect(
-            &DocumentTarget::RealmAuthorization {
-                realm_id: self.realm_id,
-            },
-            None,
-        )]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let target = DocumentTarget::RealmAuthorization {
+            realm_id: self.realm_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![read_row(&target)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ReadAuthorizationState::ReadAuthorization => self.handle_authorization_read(event),
-            ReadAuthorizationState::Init
-            | ReadAuthorizationState::Finish
-            | ReadAuthorizationState::Error => smallvec![],
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Values(values) = result else {
+            let got = "another result";
+            return Err(IoError::Unexpected {
+                expected: "storage read result",
+                got,
+            }
+            .into());
+        };
+        let document = (values.into_iter().next().flatten())
+            .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
+            .transpose()?;
+        Ok(Next::Done(document))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn realm_id() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReadAuthorizationState::Finish | ReadAuthorizationState::Error
-        )
+    #[test]
+    fn reads_the_document() {
+        // One read of the realm authorization row; a missing row is none.
+        let mut operation = ReadAuthorizationOperation::new(realm_id());
+        let target = DocumentTarget::RealmAuthorization {
+            realm_id: realm_id(),
+        };
+        let read = Next::Call(IoCall::Read(vec![read_row(&target)]));
+        assert_eq!(operation.first(), Ok(read));
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ReadAuthorizationError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn read_failures_end() {
+        // An undecodable row, a wrong answer or a runner failure ends the read.
+        let mut operation = ReadAuthorizationOperation::new(realm_id());
+        operation.first().unwrap();
+        let broken = IoResult::Values(vec![Some(vec![0xff; 3].into())]);
+        assert!(matches!(
+            operation.next(broken),
+            Err(ReadAuthorizationError::ConversionError(_))
+        ));
+        let mut operation = ReadAuthorizationOperation::new(realm_id());
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(ReadAuthorizationError::UnexpectedEvent { .. })
+        ));
+        let conflict = ReadAuthorizationError::from(IoError::Conflict);
+        assert!(ReadAuthorizationOperation::is_conflict(&conflict));
+        let timeout = ReadAuthorizationError::from(IoError::Storage(StorageError::Timeout));
+        assert!(!ReadAuthorizationOperation::is_conflict(&timeout));
     }
 }
