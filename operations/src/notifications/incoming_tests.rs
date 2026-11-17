@@ -1184,7 +1184,7 @@ async fn oversized_message_refused() {
         })
         .expect("encodes")
         .len();
-    let count = crate::notifications::protocol::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
+    let count = aruna_core::structs::execution::notification_transport::MAX_NOTIFICATION_SIZE / per_record.max(1) + 1_000;
     let records = vec![sample; count];
 
     let error = deliver_remote(&a.net, b.net.node_id(), records)

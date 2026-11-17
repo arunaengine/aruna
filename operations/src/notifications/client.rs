@@ -1,61 +1,16 @@
-//! Sends notification requests to a remote holder node over a notification stream.
+//! Sends notification requests to a remote holder node and maps their answers.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::alpn::Alpn;
 use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification_transport::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
 };
 use aruna_net::NetHandle;
-use aruna_net::streams::BiStream;
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::time::timeout;
 use ulid::Ulid;
-
-use crate::notifications::protocol::{
-    NotificationTransportMessage, read_notification_message, write_notification_message,
-};
-
-pub const NOTIFICATION_IO_TIMEOUT: Duration = Duration::from_secs(10);
-
-pub async fn send_notification_request(
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    message: NotificationTransportMessage,
-) -> Result<NotificationTransportMessage, String> {
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Notification)
-        .await
-        .map_err(|error| error.to_string())?;
-    write_message(&mut stream, &message).await?;
-    stream.0.finish().map_err(|error| error.to_string())?;
-    let response = read_message(&mut stream).await?;
-    close_stream(&mut stream).await;
-    Ok(response)
-}
-
-pub async fn deliver_remote(
-    net_handle: &NetHandle,
-    holder: NodeId,
-    records: Vec<NotificationRecord>,
-) -> Result<u32, String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::DeliverBatch { records },
-    )
-    .await?
-    {
-        NotificationTransportMessage::DeliverAck { written } => Ok(written),
-        NotificationTransportMessage::Reject(reason) => Err(reason),
-        _ => Err("unexpected notification response".to_string()),
-    }
-}
 
 pub async fn list_remote(
     net_handle: &NetHandle,
@@ -64,16 +19,16 @@ pub async fn list_remote(
     cursor: Option<Vec<u8>>,
     limit: u32,
 ) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::List {
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::List {
             recipient,
             cursor,
             limit,
         },
-    )
-    .await?
+        )
+        .await?
     {
         NotificationTransportMessage::ListResult {
             records,
@@ -89,12 +44,12 @@ pub async fn unread_count_remote(
     holder: NodeId,
     recipient: UserId,
 ) -> Result<(u32, bool), String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::UnreadCount { recipient },
-    )
-    .await?
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::UnreadCount { recipient },
+        )
+        .await?
     {
         NotificationTransportMessage::UnreadCountResult { count, capped } => Ok((count, capped)),
         NotificationTransportMessage::Reject(reason) => Err(reason),
@@ -109,16 +64,16 @@ pub async fn mark_read_remote(
     ids: Vec<Ulid>,
     up_to_ms: Option<u64>,
 ) -> Result<u32, String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::MarkRead {
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::MarkRead {
             recipient,
             ids,
             up_to_ms,
         },
-    )
-    .await?
+        )
+        .await?
     {
         NotificationTransportMessage::MarkReadResult { marked } => Ok(marked),
         NotificationTransportMessage::Reject(reason) => Err(reason),
@@ -134,17 +89,17 @@ pub async fn create_watch_remote(
     event_mask: WatchEventMask,
     authorization: WatchAuthorizationBinding,
 ) -> Result<WatchSubscription, String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::CreateWatch {
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::CreateWatch {
             owner,
             path_prefix,
             event_mask,
             authorization,
         },
-    )
-    .await?
+        )
+        .await?
     {
         NotificationTransportMessage::WatchCreated { subscription } => Ok(subscription),
         NotificationTransportMessage::Reject(reason) => Err(reason),
@@ -158,12 +113,12 @@ pub async fn delete_watch_remote(
     owner: UserId,
     watch_id: Ulid,
 ) -> Result<(), String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::DeleteWatch { owner, watch_id },
-    )
-    .await?
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::DeleteWatch { owner, watch_id },
+        )
+        .await?
     {
         NotificationTransportMessage::WatchDeleted => Ok(()),
         NotificationTransportMessage::Reject(reason) => Err(reason),
@@ -176,12 +131,12 @@ pub async fn deliver_events_remote(
     holder: NodeId,
     events: Vec<WatchEvent>,
 ) -> Result<u32, String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::DeliverWatchEvents { events },
-    )
-    .await?
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::DeliverWatchEvents { events },
+        )
+        .await?
     {
         NotificationTransportMessage::WatchEventsAck { written } => Ok(written),
         NotificationTransportMessage::Reject(reason) => Err(reason),
@@ -194,96 +149,15 @@ pub async fn list_watches_remote(
     holder: NodeId,
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, String> {
-    match send_notification_request(
-        net_handle,
-        holder,
-        NotificationTransportMessage::ListWatches { owner },
-    )
-    .await?
+    match net_handle
+        .notification_request(
+            holder,
+            &NotificationTransportMessage::ListWatches { owner },
+        )
+        .await?
     {
         NotificationTransportMessage::WatchList { subscriptions } => Ok(subscriptions),
         NotificationTransportMessage::Reject(reason) => Err(reason),
         _ => Err("unexpected notification response".to_string()),
-    }
-}
-
-pub(crate) async fn write_message(
-    stream: &mut BiStream,
-    message: &NotificationTransportMessage,
-) -> Result<(), String> {
-    timeout(
-        NOTIFICATION_IO_TIMEOUT,
-        write_notification_message(stream, message),
-    )
-    .await
-    .map_err(|_| "timed out writing notification message".to_string())?
-}
-
-pub(crate) async fn read_message(
-    stream: &mut BiStream,
-) -> Result<NotificationTransportMessage, String> {
-    timeout(NOTIFICATION_IO_TIMEOUT, read_notification_message(stream))
-        .await
-        .map_err(|_| "timed out waiting for notification message".to_string())?
-}
-
-pub(crate) async fn drain_request_stream(stream: &mut BiStream) -> Result<(), String> {
-    drain_reader(&mut stream.1).await
-}
-
-async fn drain_reader<R>(reader: &mut R) -> Result<(), String>
-where
-    R: AsyncRead + Unpin + ?Sized,
-{
-    let mut trailing = [0u8; 1];
-    match timeout(NOTIFICATION_IO_TIMEOUT, reader.read(&mut trailing)).await {
-        Ok(Ok(0)) => Ok(()),
-        Ok(Ok(_)) => Err("notification request stream has trailing bytes".to_string()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("timed out draining notification request stream".to_string()),
-    }
-}
-
-pub(crate) async fn close_stream(stream: &mut BiStream) {
-    let _ = stream.0.finish();
-    let _ = stream.1.stop(0u32.into());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::drain_reader;
-    use tokio::io::{AsyncWriteExt, duplex};
-
-    #[tokio::test]
-    async fn drain_rejects_trailing() {
-        let (mut writer, mut reader) = duplex(1);
-        writer.write_all(&[1]).await.expect("write trailing byte");
-
-        let error = drain_reader(&mut reader)
-            .await
-            .expect_err("trailing byte must be rejected");
-        assert!(error.contains("trailing bytes"));
-    }
-
-    #[tokio::test]
-    async fn drain_accepts_eof() {
-        let (writer, mut reader) = duplex(1);
-        drop(writer);
-
-        drain_reader(&mut reader).await.expect("eof is clean");
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn drain_times_out() {
-        let (_writer, mut reader) = duplex(1);
-        let task = tokio::spawn(async move { drain_reader(&mut reader).await });
-        tokio::task::yield_now().await;
-        tokio::time::advance(super::NOTIFICATION_IO_TIMEOUT).await;
-
-        let error = task
-            .await
-            .expect("drain task completes")
-            .expect_err("pending drain must time out");
-        assert!(error.contains("timed out"));
     }
 }

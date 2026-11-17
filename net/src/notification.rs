@@ -34,18 +34,23 @@ impl NetHandle {
     }
 }
 
-/// Writes one length-prefixed frame within the I/O timeout.
+/// Encodes and writes one frame.
 pub async fn write_message(
     stream: &mut BiStream,
     message: &NotificationTransportMessage,
 ) -> Result<(), String> {
     let bytes = postcard::to_allocvec(message).map_err(|error| error.to_string())?;
+    write_frame(stream, &bytes).await
+}
+
+/// Writes one length-prefixed frame body within the I/O timeout.
+pub async fn write_frame(stream: &mut BiStream, bytes: &[u8]) -> Result<(), String> {
     if bytes.len() > MAX_NOTIFICATION_SIZE {
         return Err("notification message exceeds maximum size".to_string());
     }
     let write = async {
         stream.0.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
-        stream.0.write_all(&bytes).await?;
+        stream.0.write_all(bytes).await?;
         stream.0.flush().await
     };
     timeout(NOTIFICATION_IO_TIMEOUT, write)
