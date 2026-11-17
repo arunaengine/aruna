@@ -5,7 +5,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};
-use aruna_core::document::{DocumentEvent, DocumentReconcileResult, DocumentTarget};
+use aruna_core::document::{
+    DocumentEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+};
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::storage_entries::{
@@ -37,19 +39,6 @@ use super::registry::{
     validate_metadata_event,
 };
 use super::{dependency_available, register_deferred_topic, remove_deferred_topic};
-
-/// One bounded causal batch with the topic identity and cursor it was read
-/// under. The cursor is already advanced past the batch.
-struct ReconcileBatch {
-    genesis: ::irokle::OpId,
-    /// The cursor the batch starts from, where an overflow replay resumes.
-    start: ::irokle::ActorClock,
-    cursor_key: ByteView,
-    /// The stored form of the advanced cursor, written once the batch applied.
-    cursor_value: Value,
-    rejections: Vec<SyncRejection>,
-    events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
-}
 
 /// Topics still to reconcile plus the persisted dependency registry that gates
 /// them. Already-satisfied dependencies are resolved once per pass, so a

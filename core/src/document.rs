@@ -315,6 +315,21 @@ pub enum DocumentSyncPublish {
     },
 }
 
+/// One bounded causal batch of a document sync topic, read under its stored cursor. The new
+/// cursor is written, as `cursor_value` under `cursor_key`, only once the batch applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileBatch {
+    pub genesis: irokle::OpId,
+    /// The cursor the batch starts from, where an overflow replay resumes.
+    pub start: irokle::ActorClock,
+    pub cursor_key: ByteView,
+    pub cursor_value: ByteView,
+    /// Ops whose payload never decoded into an event.
+    pub rejections: Vec<crate::structs::SyncRejection>,
+    /// Each event with its publishing actor and that actor's sequence.
+    pub events: Vec<(DocumentEvent, irokle::ActorId, u64)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DocumentReconcileResult {
     pub targets: Vec<DocumentTarget>,
