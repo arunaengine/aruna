@@ -3,18 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::PLACEMENT_POLICY_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, group_admin_path, policy_admin_path,
 };
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use tracing::warn;
 
@@ -58,63 +57,55 @@ pub enum ListPoliciesError {
     InvalidEvent,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ListState {
-    Init,
-    Authorize,
-    Scan,
-    Finish,
-    Error,
+impl From<IoError> for ListPoliciesError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::InvalidEvent,
+        }
+    }
 }
 
+/// Checks the caller's permission, then reads one page of policy rows.
 #[derive(Debug, PartialEq)]
 pub struct ListPoliciesOperation {
     input: ListPoliciesInput,
-    state: ListState,
-    output: Option<Result<PolicyListPage, ListPoliciesError>>,
 }
 
 impl ListPoliciesOperation {
     pub fn new(input: ListPoliciesInput) -> Self {
-        Self {
-            input,
-            state: ListState::Init,
-            output: None,
+        Self { input }
+    }
+
+    fn authorized(&self, event: Event) -> Result<Next<PolicyListPage>, ListPoliciesError> {
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return Err(ListPoliciesError::InvalidEvent);
+        };
+        match allowed {
+            Ok(true) => Ok(Next::Call(IoCall::Page {
+                space: PLACEMENT_POLICY_KEYSPACE.to_string(),
+                prefix: Key::from(Vec::new()),
+                after: self.input.start_after.clone(),
+                limit: self.input.limit.clamp(1, POLICY_LIST_LIMIT),
+            })),
+            Ok(false) => Err(ListPoliciesError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Policy listing authorization check failed");
+                Err(ListPoliciesError::Unauthorized)
+            }
         }
     }
 
-    fn fail(&mut self, error: ListPoliciesError) -> Effects {
-        self.state = ListState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn scan(&mut self) -> Effects {
-        self.state = ListState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PLACEMENT_POLICY_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.input.start_after.clone().map(IterStart::After),
-            limit: self.input.limit.clamp(1, POLICY_LIST_LIMIT),
-            txn_id: None,
-        })]
-    }
-
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.fail(ListPoliciesError::InvalidEvent);
-        };
+    fn collect(
+        &self,
+        rows: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Result<PolicyListPage, ListPoliciesError> {
         let realm_id: RealmId = self.input.auth_context.realm_id;
-        let mut policies = Vec::with_capacity(values.len());
-        for (_, value) in values {
-            let document = match PlacementPolicyDocument::from_bytes(value.as_ref()) {
-                Ok(document) => document,
-                Err(error) => return self.fail(error.into()),
-            };
+        let mut policies = Vec::with_capacity(rows.len());
+        for (_, value) in rows {
+            let document = PlacementPolicyDocument::from_bytes(value.as_ref())?;
             // A row stored for another realm, or owned by a group the caller
             // did not ask about, is not part of this page.
             let visible = document.realm_id == realm_id
@@ -127,22 +118,19 @@ impl ListPoliciesOperation {
                 policies.push(document);
             }
         }
-        self.output = Some(Ok(PolicyListPage {
+        Ok(PolicyListPage {
             policies,
-            complete: next_start_after.is_none(),
-            cursor: next_start_after,
-        }));
-        self.state = ListState::Finish;
-        smallvec![]
+            complete: next.is_none(),
+            cursor: next,
+        })
     }
 }
 
-impl EffectOperation for ListPoliciesOperation {
+impl Operation for ListPoliciesOperation {
     type Output = PolicyListPage;
     type Error = ListPoliciesError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ListState::Authorize;
+    fn first(&mut self) -> Result<Next<PolicyListPage>, ListPoliciesError> {
         let realm_id = self.input.auth_context.realm_id;
         let auth_config = CheckPermissionsConfig {
             auth_context: self.input.auth_context.clone(),
@@ -152,49 +140,18 @@ impl EffectOperation for ListPoliciesOperation {
             },
             required_permission: Permission::READ,
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+        let child = boxed_suboperation(CheckPermissionsOperation::new(auth_config), |result| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<PolicyListPage>, ListPoliciesError> {
+        match result {
+            IoResult::Event(event) => self.authorized(*event),
+            IoResult::Page { rows, next } => self.collect(rows, next).map(Next::Done),
+            _ => Err(ListPoliciesError::InvalidEvent),
         }
-        match self.state {
-            ListState::Init => self.start(),
-            ListState::Authorize => {
-                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
-                else {
-                    return self.fail(ListPoliciesError::InvalidEvent);
-                };
-                match allowed {
-                    Ok(true) => self.scan(),
-                    Ok(false) => self.fail(ListPoliciesError::Unauthorized),
-                    Err(error) => {
-                        warn!(error = %error, "Policy listing authorization check failed");
-                        self.fail(ListPoliciesError::Unauthorized)
-                    }
-                }
-            }
-            ListState::Scan => self.handle_page(event),
-            ListState::Finish | ListState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListState::Finish | ListState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ListPoliciesError::InvalidEvent))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -206,9 +163,10 @@ impl EffectOperation for ListPoliciesOperation {
 mod pure_tests {
     use super::{ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, PolicyListPage};
     use aruna_core::UserId;
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::document::placement_policy_key;
@@ -257,10 +215,25 @@ mod pure_tests {
         })
     }
 
-    fn authorized(allowed: bool) -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult {
+    fn authorized(allowed: bool) -> IoResult {
+        let event = SubOperationEvent::AuthorizationResult {
             allowed: Ok(allowed),
-        })
+        };
+        IoResult::Event(Box::new(Event::SubOperation(event)))
+    }
+
+    /// Runs `operation` through an allowed check and one page of `rows`.
+    fn listed(
+        mut operation: ListPoliciesOperation,
+        rows: Vec<(Key, Key)>,
+        next: Option<Key>,
+    ) -> PolicyListPage {
+        operation.first().unwrap();
+        operation.next(authorized(true)).unwrap();
+        match operation.next(IoResult::Page { rows, next }) {
+            Ok(Next::Done(page)) => page,
+            other => panic!("expected a page, got {other:?}"),
+        }
     }
 
     fn page(seeds: &[u8], truncated: bool) -> PolicyListPage {
@@ -275,14 +248,7 @@ mod pure_tests {
             })
             .collect();
         let next = truncated.then(|| rows.last().expect("a truncated page has rows").0.clone());
-        let mut operation = operation();
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: next,
-        }));
-        operation.finalize().expect("page returned")
+        listed(operation(), rows, next)
     }
 
     #[test]
@@ -366,7 +332,7 @@ mod pure_tests {
                 ),
             ),
         ];
-        let mut operation = ListPoliciesOperation::new(ListPoliciesInput {
+        let operation = ListPoliciesOperation::new(ListPoliciesInput {
             auth_context: AuthContext {
                 user_id: UserId::nil(realm_id()),
                 realm_id: realm_id(),
@@ -377,16 +343,7 @@ mod pure_tests {
             start_after: None,
             limit: 16,
         });
-        operation.start();
-        operation.step(authorized(true));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: None,
-        }));
-
-        let ids: Vec<_> = operation
-            .finalize()
-            .expect("page returned")
+        let ids: Vec<_> = listed(operation, rows, None)
             .policies
             .iter()
             .map(|document| document.policy.policy_id)
@@ -408,11 +365,12 @@ mod pure_tests {
 
     #[test]
     fn denies_non_admin() {
+        // Nothing is read for a denied caller.
         let mut operation = operation();
-        operation.start();
-        let effects = operation.step(authorized(false));
-
-        assert!(effects.is_empty(), "nothing is read for a denied caller");
-        assert_eq!(operation.finalize(), Err(ListPoliciesError::Unauthorized));
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(authorized(false)),
+            Err(ListPoliciesError::Unauthorized)
+        );
     }
 }
