@@ -44,9 +44,8 @@ use aruna_operations::metadata::forward::write::{
     PinnedCreate, create_with_id, route_metadata_create, route_metadata_delete,
     route_metadata_update,
 };
-use aruna_operations::metadata::get_document::{
-    GetDocumentError, GetDocumentOperation, load_document_record,
-};
+use aruna_operations::metadata::get_document::{GetDocumentError, GetDocumentOperation};
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;

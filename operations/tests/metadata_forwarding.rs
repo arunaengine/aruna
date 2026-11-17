@@ -51,7 +51,7 @@ use aruna_operations::metadata::create_document::{
     mint_local_document,
 };
 use aruna_operations::metadata::forward::write::{route_metadata_create, route_metadata_update};
-use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::realm::get_config::GetConfigOperation;

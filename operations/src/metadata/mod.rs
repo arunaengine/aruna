@@ -30,6 +30,7 @@ pub mod public_preview;
 mod query_cache;
 mod queue_storage;
 pub mod raw_revision;
+pub mod record_reads;
 pub mod repository;
 mod search_cursor;
 pub mod secondary_ids;

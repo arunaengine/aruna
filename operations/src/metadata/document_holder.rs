@@ -9,7 +9,7 @@ use aruna_core::NodeId;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::node::holder_choice::{HolderCandidate, choose_holder as choose};
 
 /// The holder that should serve `document_id`, or `None` to serve it here: this node holds

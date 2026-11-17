@@ -32,7 +32,7 @@ use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDoc
 use aruna_operations::metadata::forward::write::{
     CreateAuthorizedError, create_metadata_authorized,
 };
-use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::record_reads::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use chrono::{TimeZone, Utc};

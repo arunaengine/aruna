@@ -92,7 +92,7 @@ use crate::auth::permission_rules::GroupPermissionRules;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::get_document::{load_document_record, record_materialized_read};
+use crate::metadata::record_reads::{load_document_record, record_materialized_read};
 use crate::metadata::repository::{
     LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
     parse_registry_read, read_document_registry,

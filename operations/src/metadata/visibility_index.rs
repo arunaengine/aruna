@@ -409,7 +409,7 @@ pub async fn visible_page(
             if effective_ms >= from_ms
                 && effective_ms <= until_ms
                 && let Some(record) =
-                    crate::metadata::get_document::load_document_record(context, document_id)
+                    crate::metadata::record_reads::load_document_record(context, document_id)
                         .await?
                 && record.updated_at_ms == updated_at_ms
             {

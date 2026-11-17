@@ -25,7 +25,7 @@ use crate::jobs::executor::JobContext;
 use crate::jobs::service::submit_rocrate_import;
 use crate::jobs::store::read_job_record;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 
 /// How often a check waits for a running pull before it looks again.
 const ACTIVE_RETRY_MS: u64 = 60_000;

@@ -1027,8 +1027,8 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::get_document::load_document_record;
     use crate::metadata::projector::project_create_event;
+    use crate::metadata::record_reads::load_document_record;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
         MetadataBatchSource, MetadataEffect, MetadataEvent, MetadataEventPayload,
@@ -1407,7 +1407,7 @@ async fn removal_keeps_rest() {
     // descriptor and other entities are refused, and the other files stay.
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let remove = |id: &str, revision| {
         let mutation = UpdateDocumentMutation::RemoveDataEntity { id: id.to_string() };
@@ -1510,7 +1510,7 @@ async fn pending_graph_refused() {
         .metadata_remove_file(&cx(), removal(document, "./a.txt", &pending, 1))
         .await;
     assert_eq!(refused.unwrap_err().kind, ErrorKind::Unavailable);
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let remove = || {
         let mutation = UpdateDocumentMutation::RemoveDataEntity {
@@ -1554,7 +1554,7 @@ async fn unprojected_event_refused() {
     use aruna_core::storage_entries::{event_log_key, pending_projection_key};
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;
-    let record = crate::metadata::get_document::load_document_record(&broker.ctx, document).await;
+    let record = crate::metadata::record_reads::load_document_record(&broker.ctx, document).await;
     let record = record.unwrap().unwrap();
     let source = MetadataBatchSource::UpsertDataEntity {
         jsonld: r#"{"@id":"./a.txt","@type":"File","name":"older"}"#.to_string(),

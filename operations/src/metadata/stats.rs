@@ -17,7 +17,7 @@ use serde_json::Value;
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::DriverContext;
-use crate::metadata::get_document::record_materialized_read;
+use crate::metadata::record_reads::record_materialized_read;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const COUNT_PAGE_SIZE: usize = 1_000;

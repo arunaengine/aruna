@@ -51,7 +51,7 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::write::{
     route_metadata_create, route_metadata_delete, route_metadata_update,
 };
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::UpdateDocumentMutation;
 
 /// Bound on resumption-token paging so a broken provider cannot loop forever.

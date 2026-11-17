@@ -6,7 +6,7 @@ use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
 use crate::jobs::metadata_class::metadata_error_transient;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
     update_metadata_document,

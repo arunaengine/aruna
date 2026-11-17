@@ -54,7 +54,7 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
 use crate::realm::load_config::load_realm_config;
 
@@ -1290,7 +1290,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::metadata::get_document::load_document_record(context, spec.document_id)
+        crate::metadata::record_reads::load_document_record(context, spec.document_id)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),

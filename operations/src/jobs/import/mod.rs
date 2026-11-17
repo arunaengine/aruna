@@ -1211,7 +1211,7 @@ async fn update_document(
             realm_id: spec.auth_context.realm_id,
         };
         let record =
-            crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
+            crate::metadata::record_reads::load_document_record(&ctx.driver, spec.document_id)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.

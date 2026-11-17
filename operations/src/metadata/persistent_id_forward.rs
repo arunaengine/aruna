@@ -5,13 +5,13 @@
 use crate::driver::DriverContext;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::get_document::load_document_record;
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::PersistentIdOutcome;
 use crate::metadata::protocol::PersistentIdRequest;
 use crate::metadata::protocol::PersistentIdResolution;
+use crate::metadata::record_reads::load_document_record;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::resolve_shard_holders;
 use aruna_core::MetaResourceId;

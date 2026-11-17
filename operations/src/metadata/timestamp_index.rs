@@ -17,7 +17,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
 use crate::storage_read::parse_storage_scan;
 
