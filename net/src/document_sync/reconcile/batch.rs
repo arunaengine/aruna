@@ -20,7 +20,6 @@ use crate::error::{NetError, Result};
 use super::admin::{apply_admin_operation, coalescible_config_op, flush_config_run};
 use super::distribution::apply_distribution_operation;
 use super::links::apply_link_event;
-use super::materialize::reduced_admin_target;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};
 use super::parked::Handled;
 use super::satisfied_dependencies;

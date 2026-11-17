@@ -74,7 +74,7 @@ pub fn materialized_group(group_id: Ulid, reducer_state: &AdminDocumentState) ->
     })
 }
 
-pub fn overlay_group_role(
+fn overlay_group_role(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentState,
     role_id: RoleId,
@@ -87,7 +87,7 @@ pub fn overlay_group_role(
     );
 }
 
-pub fn overlay_realm_role(
+fn overlay_realm_role(
     auth_doc: &mut RealmAuthorizationDocument,
     reducer_state: &AdminDocumentState,
     role_id: RoleId,

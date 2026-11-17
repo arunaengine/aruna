@@ -47,11 +47,10 @@ use aruna_core::metadata::{
 };
 use aruna_core::reducer::{
     AdminApplyStatus, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-    config_node_path, decode_reducer_state, group_user_path, materialize_group_authorization,
+    config_node_path, decode_reducer_state, materialize_group_authorization,
     materialize_realm_authorization, materialize_user_operation, materialized_group,
-    materialized_realm_config, needs_revocation_index, overlay_group_role, overlay_group_state,
-    overlay_placement, overlay_realm_config, overlay_realm_role, realm_user_path,
-    reduced_admin_target,
+    materialized_realm_config, needs_revocation_index, overlay_group_state, overlay_placement,
+    overlay_realm_config, reduced_admin_target,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, create_acceptance_entry, create_acceptance_key,
@@ -92,7 +91,7 @@ use aruna_core::structs::{
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::types::{GroupId, RoleId, TxnId, Value};
+use aruna_core::types::{GroupId, TxnId, Value};
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
