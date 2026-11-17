@@ -1,49 +1,60 @@
-//! Drives a realm config setter through a lost commit and a successful retry in unit tests.
+//! Drives realm config setters through their write transaction, or a lost commit and a retry.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation, TransactionMode};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, KeySpace, Value};
 use std::time::Duration;
 use ulid::Ulid;
 
-use crate::realm::mutate_placement::node_kind;
+use super::COMMIT_ATTEMPTS;
 use crate::sync::outbox_record::schedule_drain_effect;
 
-/// What another writer commits between the two attempts.
-const ELSEWHERE: &str = "changed elsewhere";
+/// Checks that a setter's write transaction reruns from its read after a lost commit.
+pub(super) fn retries_conflicts<O: Operation>() {
+    assert!(O::is_conflict(&O::Error::from(IoError::Conflict)));
+    assert_eq!(O::conflict_retries(), COMMIT_ATTEMPTS as u32 - 1);
+}
 
-/// Lets `operation` read `first` and lose its commit, then read a newer document that another
-/// writer changed; returns the document the retry wrote, which keeps that writer's change.
-pub(super) fn conflict_then_commit<O: EffectOperation>(
-    operation: &mut O,
+/// Runs a setter's write transaction once on `config` with no admin state yet, and returns the
+/// config it writes and its output, which comes only with the drain wake after the commit.
+pub(super) fn write_once<O: Operation>(
+    write: &mut O,
     actor: &Actor,
-    first: &RealmConfigDocument,
-) -> RealmConfigDocument {
-    let other = iroh::SecretKey::from_bytes(&[0xEE; 32]).public();
-    let mut newer = first.clone();
-    newer.description = ELSEWHERE.to_string();
-    newer.ensure_node(other, RealmNodeKind::Server);
-    let writes = conflict_then_write(
-        operation,
-        vec![Some(first.to_bytes(actor).unwrap()), None],
-        vec![Some(newer.to_bytes(actor).unwrap()), None],
-    );
-    let (_, _, value) = writes
-        .iter()
-        .find(|(space, _, _)| space == REALM_CONFIG_KEYSPACE)
-        .expect("the retry rewrites the realm config");
-    let written = RealmConfigDocument::from_bytes(value).unwrap();
-    assert_eq!(written.description, ELSEWHERE);
-    assert_eq!(node_kind(&written, other), Some(RealmNodeKind::Server));
-    written
+    config: &RealmConfigDocument,
+) -> (RealmConfigDocument, O::Output) {
+    assert_eq!(write.transaction(), TransactionMode::Write);
+    assert!(matches!(write.first(), Ok(Next::Call(IoCall::Read(rows))) if rows.len() == 2));
+    let read = IoResult::Values(vec![Some(config.to_bytes(actor).unwrap().into()), None]);
+    let mut turn = write.next(read);
+    let mut written = None;
+    loop {
+        turn = match turn {
+            Ok(Next::Call(IoCall::Write(rows))) => {
+                let (_, _, value) = rows
+                    .iter()
+                    .find(|(space, _, _)| space == REALM_CONFIG_KEYSPACE)
+                    .expect("the write stores the realm config");
+                written = Some(RealmConfigDocument::from_bytes(value).unwrap());
+                write.next(IoResult::Done)
+            }
+            Ok(Next::Call(IoCall::Delete(_))) => write.next(IoResult::Done),
+            Ok(Next::Then { output, calls }) => {
+                assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
+                return (written.expect("the config is written"), output);
+            }
+            Ok(_) => panic!("the write asked for another call before its commit"),
+            Err(error) => panic!("the write failed: {error:?}"),
+        };
+    }
 }
 
 /// Lets `operation` read `first` and lose its commit, then read `newer` in a fresh transaction
