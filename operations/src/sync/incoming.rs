@@ -976,7 +976,10 @@ async fn reconcile_inbound_topics(
         // application; the reconcile arms the SyncPlacements timer instead.
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
         let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
-        crate::federation::publish::publish_soon(context, realm_id, node_id).await;
+        let soon = crate::federation::publish::PublishSoonOperation::new(realm_id, node_id);
+        if let Err(error) = drive(soon, context).await {
+            warn!(%error, "Registry publication was not moved up");
+        }
     }
     refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
     crate::notifications::email::config_applied(context, &targets.targets).await;

@@ -237,7 +237,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::federation::publish::restore_publish_timer(&context.storage_handle, &task_handle)
+        crate::federation::registry::restore_publish_timer(&context.storage_handle, &task_handle)
             .await;
         if stopped() {
             return;
@@ -379,7 +379,7 @@ impl OperationsTaskHandler {
         let key = TaskKey::PublishRegistration;
         match (self.context.net_handle.as_ref(), &self.node_capabilities) {
             (Some(net_handle), Some(capabilities)) => {
-                if let Err(error) = crate::federation::publish::publish_registration(
+                if let Err(error) = crate::federation::registry::publish_registration(
                     &self.context,
                     *net_handle.realm_id(),
                     net_handle.node_id(),

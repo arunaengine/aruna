@@ -306,6 +306,134 @@ fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
         && is_reporting(config, node_id)
 }
 
+#[derive(Debug, PartialEq)]
+enum SoonState {
+    Idle,
+    ReadConfig,
+    ArmTimer,
+    Done(Result<bool, PublishError>),
+}
+
+/// Moves the registry publication up on the reporting node after replicated realm settings
+/// materialize here, also when another management node served the change. True when armed.
+#[derive(Debug, PartialEq)]
+pub struct PublishSoonOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    state: SoonState,
+}
+
+impl PublishSoonOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            state: SoonState::Idle,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.state {
+            SoonState::Idle => "idle",
+            SoonState::ReadConfig => "reading the realm config",
+            SoonState::ArmTimer => "arming the publication timer",
+            SoonState::Done(_) => "done",
+        }
+    }
+
+    fn decide(&mut self, event: Event) -> Result<Effects, PublishError> {
+        let (state, got) = (self.label(), event_kind(&event));
+        let expected = match self.state {
+            SoonState::ReadConfig => "storage read result",
+            _ => "task timer result",
+        };
+        let unexpected = move || PublishError::UnexpectedEvent {
+            state: state.to_string(),
+            expected,
+            got: got.to_string(),
+        };
+        match self.state {
+            SoonState::ReadConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let bytes = value.ok_or(PublishError::ConfigMissing)?;
+                    let config = RealmConfigDocument::from_bytes(&bytes)?;
+                    if !publishes_soon(&config, self.node_id) {
+                        self.state = SoonState::Done(Ok(false));
+                        return Ok(smallvec![]);
+                    }
+                    self.state = SoonState::ArmTimer;
+                    Ok(smallvec![Effect::Task(TaskEffect::ShortenTimer {
+                        key: TaskKey::PublishRegistration,
+                        after: PUBLISH_SOON,
+                    })])
+                }
+                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+                _ => Err(unexpected()),
+            },
+            SoonState::ArmTimer => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.state = SoonState::Done(Ok(true));
+                    Ok(smallvec![])
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => Err(PublishError::Timer(message)),
+                _ => Err(unexpected()),
+            },
+            SoonState::Idle | SoonState::Done(_) => Err(unexpected()),
+        }
+    }
+}
+
+/// The kind of an event, for an error message without formatting its payload.
+fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Storage(_) => "storage event",
+        Event::Task(_) => "task event",
+        _ => "other event",
+    }
+}
+
+impl Operation for PublishSoonOperation {
+    type Output = bool;
+    type Error = PublishError;
+
+    fn start(&mut self) -> Effects {
+        self.state = SoonState::ReadConfig;
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: config.storage_keyspace().to_string(),
+            key: config.storage_key(),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match self.decide(event) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.state = SoonState::Done(Err(error));
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, SoonState::Done(_))
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            SoonState::Done(result) => result,
+            _ => Err(PublishError::NotFinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,5 +716,131 @@ mod tests {
             }
         }
         assert_eq!(sent, MAX_WITHDRAWALS);
+    }
+
+    fn soon_read(realm_id: RealmId) -> Effect {
+        let target = DocumentTarget::RealmConfig { realm_id };
+        Effect::Storage(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+    }
+
+    fn soon_config(config: &RealmConfigDocument) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: Some(postcard::to_allocvec(config).unwrap().into()),
+        })
+    }
+
+    fn soon_timer() -> Effect {
+        Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        })
+    }
+
+    #[test]
+    fn soon_arms_reporter() {
+        let config = config(RegistrationMode::Enabled, true);
+        let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        });
+        check_trace(
+            &mut operation,
+            &[soon_read(config.realm_id)],
+            vec![(soon_config(&config), vec![soon_timer()]), (scheduled, vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(true));
+
+        // Another node, or settings without a registry, arm nothing.
+        let other = lower(node(1), node(2)).1;
+        for (config, node_id) in [
+            (config.clone(), other),
+            (self::config(RegistrationMode::Enabled, false), reporter()),
+        ] {
+            let mut operation = PublishSoonOperation::new(config.realm_id, node_id);
+            check_trace(
+                &mut operation,
+                &[soon_read(config.realm_id)],
+                vec![(soon_config(&config), vec![])],
+            );
+            assert_eq!(operation.finalize(), Ok(false));
+        }
+    }
+
+    #[test]
+    fn soon_failures_end() {
+        let config = config(RegistrationMode::Enabled, true);
+        let started = || {
+            let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+            operation.start();
+            operation
+        };
+        let mut missing = started();
+        missing.step(Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+        assert_eq!(missing.finalize(), Err(PublishError::ConfigMissing));
+        let mut failed = started();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(failed.finalize(), Err(StorageError::Timeout.into()));
+        let mut refused = started();
+        refused.step(soon_config(&config));
+        refused.step(Event::Task(TaskEvent::Error {
+            key: Some(TaskKey::PublishRegistration),
+            message: "full".to_string(),
+        }));
+        assert_eq!(refused.finalize(), Err(PublishError::Timer("full".to_string())));
+    }
+
+    #[test]
+    fn soon_rejects_stray() {
+        let config = config(RegistrationMode::Enabled, true);
+        let started = || {
+            let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+            operation.start();
+            operation
+        };
+        let expected = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(started, sample_events, expected) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, PublishError::UnexpectedEvent { .. }), "{label}");
+        }
+        let arming = || {
+            let mut operation = started();
+            operation.step(soon_config(&config));
+            operation
+        };
+        let expected = |event: &Event| matches!(event, Event::Task(TaskEvent::Error { .. }));
+        for (label, effects, error) in rejects_events(arming, sample_events, expected) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, PublishError::UnexpectedEvent { .. }), "{label}");
+        }
+        let fresh = || PublishSoonOperation::new(config.realm_id, reporter());
+        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+    }
+
+    #[test]
+    fn soon_abort_finalize() {
+        let config = config(RegistrationMode::Enabled, true);
+        let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        operation.step(soon_config(&config));
+        check_abort(&mut operation, &[]);
+        rejects_finalize(operation);
     }
 }
