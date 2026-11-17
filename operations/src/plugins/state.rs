@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::intents::settled_row;
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, row, unexpected, values, StoreError, decode, encode};
+use super::rows::{
+    Answer, Ask, Plan, Row, RowsOperation, StoreError, Turn, decode, encode, row, unexpected,
+    values,
+};
 
 /// Bytes of one key, of one value, and of all keys and values of one install.
 pub const MAX_STATE_KEY: usize = 256;
@@ -130,7 +133,10 @@ impl Plan for PutState {
             return Err(PutError::Refused(message, ErrorKind::Limit));
         }
         Ok(Turn::Ask(Ask::Read(vec![
-            (PLUGIN_STATE_KEYSPACE, value_key(self.install_id, &self.put.key)),
+            (
+                PLUGIN_STATE_KEYSPACE,
+                value_key(self.install_id, &self.put.key),
+            ),
             (PLUGIN_STATE_KEYSPACE, bytes_key(self.install_id)),
             (PLUGIN_STATE_KEYSPACE, version_key(self.install_id)),
         ])))
@@ -144,7 +150,9 @@ impl Plan for PutState {
             };
         }
         let [current, total, last] = values::<3>(answer)?;
-        let current = current.map(|bytes| decode::<StateRow>(&bytes)).transpose()?;
+        let current = current
+            .map(|bytes| decode::<StateRow>(&bytes))
+            .transpose()?;
         let version = current.as_ref().map(|row| row.version);
         if version != self.put.expected {
             let message = format!("the value is at version {version:?}");
@@ -166,9 +174,21 @@ impl Plan for PutState {
         };
         let install_id = self.install_id;
         let rows = vec![
-            row(PLUGIN_STATE_KEYSPACE, value_key(install_id, &self.put.key), encode(&state)?),
-            row(PLUGIN_STATE_KEYSPACE, bytes_key(install_id), encode(&total)?),
-            row(PLUGIN_STATE_KEYSPACE, version_key(install_id), encode(&next)?),
+            row(
+                PLUGIN_STATE_KEYSPACE,
+                value_key(install_id, &self.put.key),
+                encode(&state)?,
+            ),
+            row(
+                PLUGIN_STATE_KEYSPACE,
+                bytes_key(install_id),
+                encode(&total)?,
+            ),
+            row(
+                PLUGIN_STATE_KEYSPACE,
+                version_key(install_id),
+                encode(&next)?,
+            ),
             settled_row(self.run_id, &self.put.intent, next.to_string())?,
         ];
         self.written = Some(next);
@@ -213,16 +233,24 @@ impl Plan for RemoveState {
 
     fn first(&mut self) -> Result<Turn<()>, PutError> {
         Ok(Turn::Ask(Ask::Read(vec![
-            (PLUGIN_STATE_KEYSPACE, value_key(self.install_id, &self.remove.key)),
+            (
+                PLUGIN_STATE_KEYSPACE,
+                value_key(self.install_id, &self.remove.key),
+            ),
             (PLUGIN_STATE_KEYSPACE, bytes_key(self.install_id)),
         ])))
     }
 
     fn next(&mut self, answer: Answer) -> Result<Turn<()>, PutError> {
-        match (std::mem::replace(&mut self.phase, RemovePhase::Writing), answer) {
+        match (
+            std::mem::replace(&mut self.phase, RemovePhase::Writing),
+            answer,
+        ) {
             (RemovePhase::Reading, answer) => {
                 let [current, total] = values::<2>(answer)?;
-                let current = current.map(|bytes| decode::<StateRow>(&bytes)).transpose()?;
+                let current = current
+                    .map(|bytes| decode::<StateRow>(&bytes))
+                    .transpose()?;
                 let Some(stored) = current.filter(|row| row.version == self.remove.expected) else {
                     let message = format!("the value is not at version {}", self.remove.expected);
                     return Err(PutError::Refused(message, ErrorKind::Conflict));
@@ -271,7 +299,12 @@ mod tests {
             Ulid::from_parts(1, 2),
         );
         let first = put("cursor", b"a", None, 0);
-        assert_eq!(drive(put_state(run, install, first.clone()), &ctx).await.unwrap(), 1);
+        assert_eq!(
+            drive(put_state(run, install, first.clone()), &ctx)
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(
             drive(begin(run, first.intent.clone()), &ctx).await.unwrap(),
             Begun::Settled("1".into())
@@ -282,26 +315,41 @@ mod tests {
             Err(PutError::Refused(_, ErrorKind::Conflict))
         ));
         assert_eq!(
-            drive(put_state(run, install, put("cursor", b"b", Some(1), 2)), &ctx).await
-                .unwrap(),
+            drive(
+                put_state(run, install, put("cursor", b"b", Some(1), 2)),
+                &ctx
+            )
+            .await
+            .unwrap(),
             2
         );
-        let entry = drive(read_state(install, "cursor"), &ctx).await.unwrap().unwrap();
+        let entry = drive(read_state(install, "cursor"), &ctx)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!((entry.version, entry.value), (2, b"b".to_vec()));
-        assert_eq!(drive(read_state(other, "cursor"), &ctx).await.unwrap(), None);
+        assert_eq!(
+            drive(read_state(other, "cursor"), &ctx).await.unwrap(),
+            None
+        );
 
         // The bytes of all keys of one install are bounded.
         let big = vec![0u8; MAX_STATE_VALUE];
         let count = MAX_STATE_BYTES as usize / MAX_STATE_VALUE;
         for n in 1..count {
             let key = format!("k{n}");
-            drive(put_state(run, install, put(&key, &big, None, 10 + n as u32)), &ctx).await
-                .unwrap();
+            drive(
+                put_state(run, install, put(&key, &big, None, 10 + n as u32)),
+                &ctx,
+            )
+            .await
+            .unwrap();
         }
         let full = drive(put_state(run, install, put("last", &big, None, 900)), &ctx).await;
         assert!(matches!(full, Err(PutError::Refused(_, ErrorKind::Limit))));
         assert!(
-            drive(put_state(run, other, put("last", &big, None, 901)), &ctx).await
+            drive(put_state(run, other, put("last", &big, None, 901)), &ctx)
+                .await
                 .is_ok()
         );
         assert!(check_key("").is_err() && check_key(&"k".repeat(257)).is_err());
@@ -312,19 +360,27 @@ mod tests {
         // A key removed and written again gets a new version, so the old one cannot change it.
         let (_dir, ctx) = opened();
         let (run, install) = (Ulid::from_parts(9, 1), Ulid::from_parts(1, 1));
-        let first = drive(put_state(run, install, put("k", b"a", None, 1)), &ctx).await
+        let first = drive(put_state(run, install, put("k", b"a", None, 1)), &ctx)
+            .await
             .unwrap();
         let remove = StateRemove {
             key: "k".into(),
             expected: first,
             intent: Intent::new(2, &[b"k"]),
         };
-        drive(remove_state(run, install, remove.clone()), &ctx).await.unwrap();
+        drive(remove_state(run, install, remove.clone()), &ctx)
+            .await
+            .unwrap();
         assert_eq!(drive(read_state(install, "k"), &ctx).await.unwrap(), None);
-        let again = drive(put_state(run, install, put("k", b"b", None, 3)), &ctx).await
+        let again = drive(put_state(run, install, put("k", b"b", None, 3)), &ctx)
+            .await
             .unwrap();
         assert!(again > first, "{again} after {first}");
-        let stale = drive(put_state(run, install, put("k", b"c", Some(first), 4)), &ctx).await;
+        let stale = drive(
+            put_state(run, install, put("k", b"c", Some(first), 4)),
+            &ctx,
+        )
+        .await;
         assert!(matches!(
             stale,
             Err(PutError::Refused(_, ErrorKind::Conflict))
@@ -349,8 +405,12 @@ mod tests {
         let count = MAX_STATE_BYTES as usize / MAX_STATE_VALUE;
         for n in 1..count {
             let key = format!("k{n}");
-            drive(put_state(run, install, put(&key, &big, None, n as u32)), &ctx).await
-                .unwrap();
+            drive(
+                put_state(run, install, put(&key, &big, None, n as u32)),
+                &ctx,
+            )
+            .await
+            .unwrap();
         }
         let full = drive(put_state(run, install, put("last", &big, None, 900)), &ctx).await;
         assert!(matches!(full, Err(PutError::Refused(_, ErrorKind::Limit))));
@@ -364,11 +424,14 @@ mod tests {
             stale,
             Err(PutError::Refused(_, ErrorKind::Conflict))
         ));
-        drive(remove_state(run, install, remove(1, 902)), &ctx).await
+        drive(remove_state(run, install, remove(1, 902)), &ctx)
+            .await
             .unwrap();
         assert_eq!(drive(read_state(install, "k1"), &ctx).await.unwrap(), None);
         assert_eq!(
-            drive(begin(run, remove(1, 902).intent), &ctx).await.unwrap(),
+            drive(begin(run, remove(1, 902).intent), &ctx)
+                .await
+                .unwrap(),
             Begun::Settled(String::new())
         );
         let again = drive(remove_state(run, install, remove(1, 903)), &ctx).await;
@@ -377,7 +440,8 @@ mod tests {
             Err(PutError::Refused(_, ErrorKind::Conflict))
         ));
         assert!(
-            drive(put_state(run, install, put("last", &big, None, 904)), &ctx).await
+            drive(put_state(run, install, put("last", &big, None, 904)), &ctx)
+                .await
                 .is_ok()
         );
     }
@@ -395,13 +459,28 @@ mod tests {
             panic!("a put reads first");
         };
         assert_eq!(reads.len(), 3);
-        let stored = |version| Some(encode(&StateRow { version, value: b"old".to_vec() }).unwrap());
+        let stored = |version| {
+            Some(
+                encode(&StateRow {
+                    version,
+                    value: b"old".to_vec(),
+                })
+                .unwrap(),
+            )
+        };
         let answer = |version, total: u64, last: u64| {
-            Answer::Values(vec![stored(version), Some(encode(&total).unwrap()), Some(encode(&last).unwrap())])
+            Answer::Values(vec![
+                stored(version),
+                Some(encode(&total).unwrap()),
+                Some(encode(&last).unwrap()),
+            ])
         };
         // Another version is a conflict and writes nothing.
         let conflict = plan.next(answer(2, 4, 2));
-        assert!(matches!(conflict, Err(PutError::Refused(_, ErrorKind::Conflict))));
+        assert!(matches!(
+            conflict,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
         // The stored version writes the value, the bytes, the version and the settled intent.
         let Turn::Ask(Ask::Write(rows)) = plan.next(answer(3, 4, 7)).unwrap() else {
             panic!("a matching put writes");
@@ -416,8 +495,14 @@ mod tests {
             put: put("k", &vec![0; MAX_STATE_VALUE + 1], None, 1),
             written: None,
         };
-        assert!(matches!(big.first(), Err(PutError::Refused(_, ErrorKind::Limit))));
-        assert!(matches!(plan.next(Answer::Page(Vec::new(), None)), Err(PutError::Store(_))));
+        assert!(matches!(
+            big.first(),
+            Err(PutError::Refused(_, ErrorKind::Limit))
+        ));
+        assert!(matches!(
+            plan.next(Answer::Page(Vec::new(), None)),
+            Err(PutError::Store(_))
+        ));
     }
 
     #[test]
@@ -435,7 +520,11 @@ mod tests {
             phase: RemovePhase::Reading,
         };
         assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
-        let row = encode(&StateRow { version: 3, value: b"abc".to_vec() }).unwrap();
+        let row = encode(&StateRow {
+            version: 3,
+            value: b"abc".to_vec(),
+        })
+        .unwrap();
         let read = Answer::Values(vec![Some(row), Some(encode(&10u64).unwrap())]);
         let Turn::Ask(Ask::Delete(keys)) = plan.next(read).unwrap() else {
             panic!("a matching removal deletes the value");
@@ -451,6 +540,9 @@ mod tests {
             ..plan
         };
         let missing = absent.next(Answer::Values(vec![None, None]));
-        assert!(matches!(missing, Err(PutError::Refused(_, ErrorKind::Conflict))));
+        assert!(matches!(
+            missing,
+            Err(PutError::Refused(_, ErrorKind::Conflict))
+        ));
     }
 }

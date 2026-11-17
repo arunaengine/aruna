@@ -10,8 +10,8 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 use super::*;
 use crate::driver::{DriverContext, drive};
-use crate::plugins::jobs::{retire_work, settle_work};
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::jobs::{retire_work, settle_work};
 use crate::plugins::rows::{read_rows, write_rows};
 use crate::plugins::worker::tests::installed;
 
@@ -68,18 +68,38 @@ async fn repeated_call_adopts() {
     let install = installed(&fixture).await;
     let identity = call(1);
     let first = proposed(&install, 1);
-    let reserved = drive(reserve((&install, &identity), first.clone(), None).unwrap(), &fixture.ctx).await;
+    let reserved = drive(
+        reserve((&install, &identity), first.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(reserved, Ok((first.clone(), Reserve::Fresh)));
     // A rerun of the call mints new ids, but the stored ones answer.
-    let again = drive(reserve((&install, &identity), proposed(&install, 1), None).unwrap(), &fixture.ctx).await;
+    let again = drive(
+        reserve((&install, &identity), proposed(&install, 1), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(again, Ok((first.clone(), Reserve::Earlier)));
-    let other = drive(reserve((&install, &identity), proposed(&install, 2), None).unwrap(), &fixture.ctx).await;
+    let other = drive(
+        reserve((&install, &identity), proposed(&install, 2), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(other, Err(WorkError::Conflict));
-    let next = drive(reserve((&install, &call(3)), proposed(&install, 2), None).unwrap(), &fixture.ctx).await;
+    let next = drive(
+        reserve((&install, &call(3)), proposed(&install, 2), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(next.map(|(_, reserve)| reserve), Ok(Reserve::Fresh));
     let found = drive(read_work(install.install_id, first.work_id), &fixture.ctx).await;
     assert_eq!(found, Ok(Some(first)));
-    let missing = drive(read_work(install.install_id, Ulid::generate()), &fixture.ctx).await;
+    let missing = drive(
+        read_work(install.install_id, Ulid::generate()),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(missing, Ok(None));
 }
 
@@ -89,16 +109,28 @@ async fn reinstall_adopts_nothing() {
     let install = installed(&fixture).await;
     let identity = call(1);
     let first = proposed(&install, 1);
-    drive(reserve((&install, &identity), first.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &identity), first.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let mut reinstalled = install.clone();
     reinstalled.account = UserId::local(Ulid::generate(), install.account.realm_id);
     let other = proposed(&install, 2);
     let second = call(2);
-    drive(reserve((&install, &second), other.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &second), other.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let fresh = proposed(&reinstalled, 1);
-    let reserved = drive(reserve((&reinstalled, &identity), fresh.clone(), None).unwrap(), &fixture.ctx).await;
+    let reserved = drive(
+        reserve((&reinstalled, &identity), fresh.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(reserved, Ok((fresh.clone(), Reserve::Fresh)));
     let former = index_key(install.install_id, first.work_id);
     let txn = Txn::direct(&fixture.ctx);
@@ -127,21 +159,40 @@ async fn dispatch_records_once() {
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
     let identity = call(1);
-    drive(reserve((&install, &identity), row.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &identity), row.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let ids = (install.install_id, row.work_id);
-    let first = drive(update_work(ids, WorkChange::Dispatched(job(1))), &fixture.ctx).await
-        .unwrap()
-        .unwrap();
+    let first = drive(
+        update_work(ids, WorkChange::Dispatched(job(1))),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(
         (first.state, first.job),
         (WorkState::Dispatched, Some(job(1)))
     );
-    let later = drive(update_work(ids, WorkChange::Dispatched(job(2))), &fixture.ctx).await
-        .unwrap()
-        .unwrap();
+    let later = drive(
+        update_work(ids, WorkChange::Dispatched(job(2))),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(later.job, Some(job(1)));
-    let gone = drive(update_work((install.install_id, Ulid::generate()), WorkChange::Dispatched(job(3))), &fixture.ctx).await;
+    let gone = drive(
+        update_work(
+            (install.install_id, Ulid::generate()),
+            WorkChange::Dispatched(job(3)),
+        ),
+        &fixture.ctx,
+    )
+    .await;
     assert_eq!(gone, Ok(None));
 }
 
@@ -205,10 +256,19 @@ async fn settles_before_pruning() {
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
     let identity = call(1);
-    drive(reserve((&install, &identity), row.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &identity), row.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let ids = (install.install_id, row.work_id);
-    drive(update_work(ids, WorkChange::Dispatched(job(1))), &fixture.ctx).await.unwrap();
+    drive(
+        update_work(ids, WorkChange::Dispatched(job(1))),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let spec = spec_of(&install, &row);
     let mut job_record = record(spec.clone(), job(1), JobState::Running);
     insert_job(&fixture.ctx.storage_handle, &job_record)
@@ -225,7 +285,8 @@ async fn settles_before_pruning() {
     let pruned = prune_job_batch(&fixture.ctx).await.unwrap();
     assert_eq!(pruned.pruned, 0);
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
-    let settled = drive(read_work(ids.0, ids.1), &fixture.ctx).await
+    let settled = drive(read_work(ids.0, ids.1), &fixture.ctx)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(settled.state, WorkState::Settled);
@@ -238,7 +299,8 @@ async fn settles_before_pruning() {
     assert_eq!(settle_work(&fixture.ctx, 6).await, Ok(0));
     assert_eq!(prune_job_batch(&fixture.ctx).await.unwrap().pruned, 1);
     // The job record is gone; the row still answers the paths, also from its summary.
-    let read = drive(read_work(ids.0, ids.1), &fixture.ctx).await
+    let read = drive(read_work(ids.0, ids.1), &fixture.ctx)
+        .await
         .unwrap()
         .unwrap();
     let summary = read.summary.unwrap();
@@ -265,16 +327,29 @@ async fn prunes_settled_rows() {
     let mut rows = Vec::new();
     for seq in [1, 2] {
         let run = crate::plugins::runs::tests::queued(install.install_id, seq);
-        drive(crate::plugins::runs::admit(run.clone()), ctx).await.unwrap();
+        drive(crate::plugins::runs::admit(run.clone()), ctx)
+            .await
+            .unwrap();
         let identity = Identity::Call {
             run_id: run.run_id,
             ordinal: 0,
         };
         let row = proposed(&install, 1);
-        drive(reserve((&install, &identity), row.clone(), None).unwrap(), ctx).await
-            .unwrap();
-        drive(update_work((install.install_id, row.work_id), WorkChange::Dispatched(job(seq))), ctx).await
-            .unwrap();
+        drive(
+            reserve((&install, &identity), row.clone(), None).unwrap(),
+            ctx,
+        )
+        .await
+        .unwrap();
+        drive(
+            update_work(
+                (install.install_id, row.work_id),
+                WorkChange::Dispatched(job(seq)),
+            ),
+            ctx,
+        )
+        .await
+        .unwrap();
         let mut job_record = record(spec_of(&install, &row), job(seq), JobState::Succeeded);
         job_record.finished_at_ms = Some(1);
         insert_job(&ctx.storage_handle, &job_record).await.unwrap();
@@ -324,12 +399,21 @@ async fn removal_cancels_first() {
     // Calls 0, 1 and 2: running, settled and reserved work.
     for ordinal in 0..3 {
         let row = proposed(&install, 1);
-        drive(reserve((&install, &call(ordinal)), row.clone(), None).unwrap(), ctx).await
-            .unwrap();
+        drive(
+            reserve((&install, &call(ordinal)), row.clone(), None).unwrap(),
+            ctx,
+        )
+        .await
+        .unwrap();
         rows.push(row);
     }
     let ids = |row: &WorkRow| (install.install_id, row.work_id);
-    drive(update_work(ids(&rows[0]), WorkChange::Dispatched(job(1))), ctx).await.unwrap();
+    drive(
+        update_work(ids(&rows[0]), WorkChange::Dispatched(job(1))),
+        ctx,
+    )
+    .await
+    .unwrap();
     let job_record = record(spec_of(&install, &rows[0]), job(1), JobState::Queued);
     insert_job(&ctx.storage_handle, &job_record).await.unwrap();
     let settle = |row: &mut WorkRow| row.state = WorkState::Settled;
@@ -371,8 +455,12 @@ async fn reserved_work_settles() {
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
     let identity = call(1);
-    drive(reserve((&install, &identity), row.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &identity), row.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let job_record = finished(&install, &row, job(1));
     insert_job(&fixture.ctx.storage_handle, &job_record)
         .await
@@ -401,8 +489,12 @@ async fn removal_keeps_finished() {
     let ctx = &fixture.ctx;
     let row = proposed(&install, 1);
     let identity = call(1);
-    drive(reserve((&install, &identity), row.clone(), None).unwrap(), ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &identity), row.clone(), None).unwrap(),
+        ctx,
+    )
+    .await
+    .unwrap();
     insert_job(&ctx.storage_handle, &finished(&install, &row, job(1)))
         .await
         .unwrap();
@@ -431,8 +523,12 @@ async fn boundary_sends_once() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
-    drive(reserve((&install, &call(1)), row.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &call(1)), row.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let ids = (install.install_id, row.work_id);
     assert_eq!(
         drive(begin_send(ids, false), &fixture.ctx).await,
@@ -446,20 +542,19 @@ async fn boundary_sends_once() {
         drive(begin_send(ids, true), &fixture.ctx).await,
         Ok(Some(Send::Now))
     );
-    let stored = drive(read_work(ids.0, ids.1), &fixture.ctx).await
+    let stored = drive(read_work(ids.0, ids.1), &fixture.ctx)
+        .await
         .unwrap()
         .unwrap();
     assert_eq!(stored.boundary, Some(SendBoundary::Sending { attempt: 2 }));
     let reply = Some(r#"{"status":201}"#.to_string());
     let sent = WorkChange::Sent {
-            status: 201,
-            reply: reply.clone(),
-            bytes: 8,
-            version: Ulid::nil(),
-        };
-        drive(update_work(ids, sent), &fixture.ctx)
-        .await
-        .unwrap();
+        status: 201,
+        reply: reply.clone(),
+        bytes: 8,
+        version: Ulid::nil(),
+    };
+    drive(update_work(ids, sent), &fixture.ctx).await.unwrap();
     let answered = Send::Answered {
         status: 201,
         reply: reply.clone(),
@@ -481,27 +576,35 @@ async fn settles_answer() {
     let fixture = Fixture::new().await;
     let install = installed(&fixture).await;
     let row = proposed(&install, 1);
-    drive(reserve((&install, &call(1)), row.clone(), None).unwrap(), &fixture.ctx).await
-        .unwrap();
+    drive(
+        reserve((&install, &call(1)), row.clone(), None).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let ids = (install.install_id, row.work_id);
-    drive(update_work(ids, WorkChange::Dispatched(job(1))), &fixture.ctx).await.unwrap();
+    drive(
+        update_work(ids, WorkChange::Dispatched(job(1))),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let reply = Some(r#"{"status":201}"#.to_string());
     let sent = WorkChange::Sent {
-            status: 201,
-            reply: reply.clone(),
-            bytes: 8,
-            version: Ulid::nil(),
-        };
-        drive(update_work(ids, sent), &fixture.ctx)
-        .await
-        .unwrap();
+        status: 201,
+        reply: reply.clone(),
+        bytes: 8,
+        version: Ulid::nil(),
+    };
+    drive(update_work(ids, sent), &fixture.ctx).await.unwrap();
     let mut job_record = record(spec_of(&install, &row), job(1), JobState::Succeeded);
     job_record.finished_at_ms = Some(1);
     insert_job(&fixture.ctx.storage_handle, &job_record)
         .await
         .unwrap();
     assert_eq!(settle_work(&fixture.ctx, 5).await, Ok(1));
-    let settled = drive(read_work(ids.0, ids.1), &fixture.ctx).await
+    let settled = drive(read_work(ids.0, ids.1), &fixture.ctx)
+        .await
         .unwrap()
         .unwrap();
     let summary = settled.summary.unwrap();
@@ -526,11 +629,20 @@ fn lookup_follows_index() {
     assert_eq!(lookup.ask(), Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, index)]));
     let [by_index, by_key] = found(b"key", &row);
     let next = lookup.take(by_index).unwrap();
-    assert_eq!(next, Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, b"key".to_vec())])));
-    assert_eq!(lookup.take(by_key).unwrap(), Found::Row(Some((b"key".to_vec(), row.clone()))));
+    assert_eq!(
+        next,
+        Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, b"key".to_vec())]))
+    );
+    assert_eq!(
+        lookup.take(by_key).unwrap(),
+        Found::Row(Some((b"key".to_vec(), row.clone())))
+    );
     // A missing index, and a row of another work under the key, find nothing.
     let mut gone = WorkLookup::new(install_id, row.work_id);
-    assert_eq!(gone.take(Answer::Values(vec![None])).unwrap(), Found::Row(None));
+    assert_eq!(
+        gone.take(Answer::Values(vec![None])).unwrap(),
+        Found::Row(None)
+    );
     let mut other = WorkLookup::new(install_id, Ulid::from_parts(3, 3));
     let [by_index, by_key] = found(b"key", &row);
     other.take(by_index).unwrap();
@@ -541,7 +653,12 @@ fn lookup_follows_index() {
 #[test]
 fn send_boundary_decides() {
     let install_id = Ulid::from_parts(1, 1);
-    let mut row = WorkRow::reserved(&sample_install(install_id), WorkKind::Upload, Ulid::nil(), 1);
+    let mut row = WorkRow::reserved(
+        &sample_install(install_id),
+        WorkKind::Upload,
+        Ulid::nil(),
+        1,
+    );
     row.boundary = Some(SendBoundary::Sending { attempt: 1 });
     let ids = (install_id, row.work_id);
     // A begun send is undecided for a request that may not go twice.
@@ -553,7 +670,10 @@ fn send_boundary_decides() {
     let [by_index, by_key] = found(b"key", &row);
     once.first().unwrap();
     once.next(by_index).unwrap();
-    assert_eq!(once.next(by_key).unwrap(), Turn::Finish(Some(Send::Undecided)));
+    assert_eq!(
+        once.next(by_key).unwrap(),
+        Turn::Finish(Some(Send::Undecided))
+    );
     // One that may go twice moves the boundary to the next attempt first.
     let mut again = BeginSend {
         lookup: WorkLookup::new(ids.0, ids.1),
@@ -567,7 +687,10 @@ fn send_boundary_decides() {
     };
     let written: WorkRow = decode(&rows[0].2).unwrap();
     assert_eq!(written.boundary, Some(SendBoundary::Sending { attempt: 2 }));
-    assert_eq!(again.next(Answer::Done).unwrap(), Turn::Finish(Some(Send::Now)));
+    assert_eq!(
+        again.next(Answer::Done).unwrap(),
+        Turn::Finish(Some(Send::Now))
+    );
 }
 
 #[test]
@@ -588,7 +711,10 @@ fn reserve_adopts_or_conflicts() {
         phase: ReservePhase::Reading,
     };
     let stored = Answer::Values(vec![Some(encode(&row).unwrap())]);
-    assert_eq!(plan.next(stored).unwrap(), Turn::Finish((row.clone(), Reserve::Earlier)));
+    assert_eq!(
+        plan.next(stored).unwrap(),
+        Turn::Finish((row.clone(), Reserve::Earlier))
+    );
     let mut conflict = ReserveWork {
         proposed: Some(Box::new(proposed(&install, 2))),
         phase: ReservePhase::Reading,
@@ -606,7 +732,10 @@ fn reserve_adopts_or_conflicts() {
         panic!("a new row is written");
     };
     assert_eq!(rows.len(), 2);
-    assert_eq!(fresh.next(Answer::Done).unwrap(), Turn::Finish((row, Reserve::Fresh)));
+    assert_eq!(
+        fresh.next(Answer::Done).unwrap(),
+        Turn::Finish((row, Reserve::Fresh))
+    );
 }
 
 fn sample_install(install_id: Ulid) -> PluginInstall {
