@@ -3,10 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::Effect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::attachment::PolicyRefMode;
 use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
@@ -22,7 +21,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::auth::check_permissions::permission_check;
 use crate::blob::records::HeadAliasContext;
 use crate::placement::policy::foreign_owner;
 use crate::placement::policy::read::ReadPolicyError;
@@ -115,17 +114,11 @@ impl PolicyMutationOperation {
     }
 
     fn authorize(&self, path: String) -> Effects {
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
+        smallvec![permission_check(
+            self.config.auth_context.clone(),
             path,
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+            Permission::WRITE,
+        )]
     }
 
     fn fail(&mut self, error: PolicyMutationError) -> Effects {

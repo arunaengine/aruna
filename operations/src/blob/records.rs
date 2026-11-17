@@ -135,17 +135,6 @@ pub fn write_location_effect(
     }))
 }
 
-pub fn read_head_effect(
-    context: &HeadAliasContext,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Read {
-        key_space: BLOB_HEAD_KEYSPACE.to_string(),
-        key: context.head_key().to_bytes()?.into(),
-        txn_id,
-    }))
-}
-
 pub fn write_head_effect(
     context: &HeadAliasContext,
     pointer: CurrentVersionPointer,
@@ -159,7 +148,7 @@ pub fn write_head_effect(
     }))
 }
 
-pub fn delete_head_effect(
+fn delete_head_effect(
     context: &HeadAliasContext,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {

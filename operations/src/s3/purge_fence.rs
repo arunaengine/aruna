@@ -46,7 +46,7 @@ pub fn check_write_fence(event: Event, bucket: &str, key: &str) -> Result<(), Pu
     let value = match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        event => return Err(PurgeFenceError::Unexpected(format!("{event:?}"))),
+        event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
     };
     let fence = value
         .map(|value| {
@@ -85,7 +85,7 @@ pub fn check_publication(
     let values = match event {
         Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 3 => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        event => return Err(PurgeFenceError::Unexpected(format!("{event:?}"))),
+        event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
     };
     let mut values = values.into_iter().map(|(_, value)| value);
     let (purge, record, fence) = (values.next(), values.next(), values.next());

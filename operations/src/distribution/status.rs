@@ -25,10 +25,10 @@ use ulid::Ulid;
 
 use crate::distribution::feed_walks::IndexProgress;
 use crate::distribution::index_feed::range_progress;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::placement::process_placements::load_realm_config;
-use crate::replication::bootstrap::read_cursor;
-use crate::replication::members::{CopyLag, copy_lag};
+use crate::replication::bootstrap::ReadCursorOperation;
+use crate::replication::members::{CopyLag, CopyLagOperation};
 use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
 
 #[derive(Debug, Error, PartialEq)]
@@ -396,7 +396,8 @@ pub async fn add_progress(context: &Arc<DriverContext>, status: &mut Distributio
     let Some(member) = (snapshot.config.members.iter()).find(|m| Some(m.node_id) == local) else {
         return;
     };
-    let Ok((lag, counted)) = copy_lag(context, snapshot, member.member_id).await else {
+    let lag = CopyLagOperation::new(snapshot.clone(), member.member_id);
+    let Ok((lag, counted)) = drive(lag, context).await else {
         return;
     };
     status.copies_counted = counted;
@@ -435,7 +436,8 @@ async fn add_fills(context: &DriverContext, set_id: Ulid, range: &mut RangeStatu
             admitted: true,
         }
         .intent();
-        let cursor = read_cursor(context, key).await.ok().flatten();
+        let cursor = drive(ReadCursorOperation::new(key), context).await;
+        let cursor = cursor.ok().flatten();
         fill.progress = Some(match cursor.filter(|cursor| cursor.intent == intent) {
             Some(cursor) => FillProgress {
                 versions: cursor.versions,

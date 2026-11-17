@@ -88,11 +88,11 @@ pub enum CreateMultipartError {
     Distribution(#[from] GuardError),
     #[error("Transaction id missing")]
     TransactionMissing,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: CreateMultipartState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
@@ -368,7 +368,7 @@ impl CreateMultipartOperation {
             event => self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::PlainStat)",
-                received: event,
+                received: (event).label(),
             }),
         }
     }
@@ -399,7 +399,7 @@ impl CreateMultipartOperation {
             event => self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::UploadOpened)",
-                received: event,
+                received: (event).label(),
             }),
         }
     }
@@ -448,7 +448,7 @@ impl CreateMultipartOperation {
             event => self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Blob(BlobEvent::Abe)",
-                received: event,
+                received: (event).label(),
             }),
         }
     }
@@ -612,7 +612,7 @@ impl CreateMultipartOperation {
             return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -760,7 +760,7 @@ impl CreateMultipartOperation {
             return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -780,7 +780,7 @@ impl CreateMultipartOperation {
             return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: (event).label(),
             });
         };
         let Some(txn_id) = self.txn_id else {
@@ -830,7 +830,7 @@ impl CreateMultipartOperation {
             return self.emit_error(CreateMultipartError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: (event).label(),
             });
         };
 

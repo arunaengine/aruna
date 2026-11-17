@@ -329,7 +329,7 @@ impl ArunaS3Service {
     async fn read_copy(
         &self,
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::s3::object::read::TokenRead>,
     ) -> S3Result<GetObjectResult> {
         let input = GetObjectInput {
             bucket: source.name,
@@ -355,7 +355,7 @@ impl ArunaS3Service {
         (bucket, key): (String, String),
         source: CopySource<'_>,
         metadata: Option<HashMap<String, String>>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::s3::object::read::TokenRead>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let (name, key_of) = (source.name.clone(), source.key.clone());
         let distributed = source.bucket.distribution.is_some();
@@ -421,7 +421,7 @@ impl ArunaS3Service {
         forward: &Forward,
         (bucket, key, query): (String, String, String),
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::s3::object::read::TokenRead>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let read = self.read_copy(source, token).await?;
         let version = read.resolved_version_id.or(read.version_id);

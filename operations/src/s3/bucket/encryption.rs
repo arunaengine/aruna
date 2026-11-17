@@ -3,11 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::queue::encrypt_rows;
 use crate::groups::imports::LinkScan;
 use crate::s3::bucket::key::rows::{
-    SettingsError, audit_row, authority_read, copy_targets, generation_rows, group_bucket_key,
-    parse_authority, uploads_open,
+    SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
+    group_bucket_key, parse_authority, uploads_open,
 };
 use aruna_blob::blob::pithos::MAX_SIZE;
 use aruna_core::compute::SharedSecret;
@@ -95,11 +94,11 @@ pub enum EnableError {
     RecoveryUnmet,
     #[error("{}", crate::groups::imports::MAPPED_REASON)]
     Mapped,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("enabling encryption did not finish")]
     NotFinished,
@@ -225,20 +224,10 @@ impl EnableEncryptionOperation {
             Ok(None) if links.linked => self.fail(EnableError::Mapped),
             Ok(None) => {
                 self.state = EnableState::CheckUploads;
-                self.scan(UPLOAD_KEYSPACE, None)
+                smallvec![full_scan(UPLOAD_KEYSPACE, None, self.txn_id)]
             }
             Err(error) => self.fail(error),
         }
-    }
-
-    fn scan(&self, key_space: &str, prefix: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: None,
-            limit: u64::MAX as usize,
-            txn_id: self.txn_id,
-        })]
     }
 
     fn check_uploads(&mut self, uploads: &[(Key, Value)]) -> Effects {
@@ -332,10 +321,11 @@ impl EnableEncryptionOperation {
             return self.generate();
         };
         self.state = EnableState::ReadGrants;
-        self.scan(
+        smallvec![full_scan(
             BUCKET_HOLDER_KEYSPACE,
             Some(bucket_id.to_bytes().to_vec().into()),
-        )
+            self.txn_id
+        )]
     }
 
     fn generate(&mut self) -> Effects {
@@ -635,7 +625,7 @@ impl Operation for EnableEncryptionOperation {
             (state, received) => self.fail(EnableError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -661,6 +651,36 @@ impl Operation for EnableEncryptionOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
     }
+}
+
+/// The rows that start converting a bucket's plain copies after encryption is enabled. The
+/// enabling transaction writes them with its settings, then wakes `TaskKey::MigrateCompression`.
+fn encrypt_rows(
+    bucket: &str,
+    settings: &BucketEncryption,
+    record: &BucketKeyRecord,
+    compression: Compression,
+    now_ms: u64,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    let plan = aruna_core::structs::storage::encryption::SealPlan::capture(settings, record)
+        .map_err(ConversionError::from)?;
+    let target = aruna_core::structs::storage::transition::TransitionTarget { compression, plan };
+    let generation = settings.storage_generation;
+    let kind = aruna_core::structs::storage::transition::TransitionKind::Encrypt;
+    let transition = EncryptionTransition::new(kind, None, target, generation, now_ms);
+    let key: Key = bucket.as_bytes().to_vec().into();
+    Ok(vec![
+        (
+            aruna_core::keyspaces::TRANSITION_KEYSPACE.to_string(),
+            key.clone(),
+            transition.to_bytes()?.into(),
+        ),
+        (
+            aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE.to_string(),
+            key,
+            Vec::new().into(),
+        ),
+    ])
 }
 
 #[cfg(test)]

@@ -22,16 +22,15 @@ use aruna_operations::driver::{bucket_snapshot, drive, gate_context};
 use aruna_operations::metadata::api::fanout::search_buckets_distributed;
 use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::replication::queue::complete_put;
+use aruna_operations::replication::live_queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
-};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::s3::object::read::get_object_routed;
 use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use bytes::Bytes;
@@ -1240,7 +1239,7 @@ pub(crate) fn map_bucket_error(error: GetBucketError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received}"
         )),
         GetBucketError::Incomplete => internal_error("bucket lookup failed"),
     }
@@ -1280,7 +1279,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object read event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object read event in {state:?}: expected {expected}, got {received}"
         )),
         GetObjectError::NoTransactionFound => internal_error("object read transaction is missing"),
         GetObjectError::UsageError(error) => internal_error(error),
@@ -1325,7 +1324,7 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object head event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object head event in {state:?}: expected {expected}, got {received}"
         )),
         HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),

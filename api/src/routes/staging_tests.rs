@@ -28,8 +28,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::testing::test_context;
 use std::collections::HashMap;
 use std::sync::Arc;

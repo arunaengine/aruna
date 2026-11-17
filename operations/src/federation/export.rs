@@ -31,7 +31,7 @@ use crate::federation::grant::{IssueGrantConfig, IssueGrantOperation, record_key
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::{crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
-use crate::replication::plaintext::is_holder;
+use crate::replication::plaintext::HolderCheckOperation;
 
 const EXPORT_OPERATION: &str = "federation.export";
 
@@ -164,9 +164,10 @@ async fn recheck(
             None => active_key(context, &source.bucket).await?,
         };
         if let Some(key) = key {
-            let holder = is_holder(context, auth.realm_id, &source.bucket, auth.user_id)
+            let holder = HolderCheckOperation::new(auth.realm_id, &source.bucket, auth.user_id);
+            let holder = drive(holder, context)
                 .await
-                .map_err(GrantError::Storage)?;
+                .map_err(|error| GrantError::Storage(error.to_string()))?;
             if !holder || !unlocked(context, key).await? {
                 return Err(GrantError::Denied);
             }

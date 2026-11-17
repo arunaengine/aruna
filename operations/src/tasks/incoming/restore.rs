@@ -33,7 +33,8 @@ async fn durable_rearm_loop(
         };
         ticks = ticks.saturating_add(1);
         restore_blob_timer(&context.storage_handle, &task_handle).await;
-        crate::s3::object::metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::object::metadata_drain::restore_timer(&context.storage_handle, &task_handle)
+            .await;
         let restore = crate::connectors::reference_prune::RestorePruneOperation::new();
         if let Err(error) = drive(restore, &context).await {
             warn!(%error, "Failed to restore connector reference pruning");
@@ -325,7 +326,8 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::s3::object::metadata::restore_timer(&context.storage_handle, &task_handle).await;
+        crate::s3::object::metadata_drain::restore_timer(&context.storage_handle, &task_handle)
+            .await;
         if stopped() {
             return;
         }
@@ -630,7 +632,7 @@ impl OperationsTaskHandler {
     }
 
     pub(super) async fn drain_refresh_queue(&self) {
-        match crate::s3::object::metadata::process_batch(&self.context).await {
+        match crate::s3::object::metadata_drain::process_batch(&self.context).await {
             Ok(result) if result.has_more_due => {
                 self.reschedule_timer(TaskKey::DrainRefreshQueue, Duration::ZERO)
                     .await;

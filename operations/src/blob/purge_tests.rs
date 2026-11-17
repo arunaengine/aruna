@@ -192,7 +192,7 @@ async fn plans_until_ended() {
     plan_files(&context, job, &found).await.unwrap();
     plan_files(&context, job, &found).await.unwrap();
     let works = || async {
-        let page = crate::jobs::store::query::iter_prefix_page(
+        let page = crate::storage_read::iter_prefix_page(
             &context.storage_handle,
             BLOB_CLEANUP_KEYSPACE,
             None,
@@ -271,11 +271,18 @@ async fn plans_until_ended() {
 async fn pauses_purges() {
     let (_directory, context) = setup().await;
     let job = Ulid::from_parts(50, 1);
-    assert!(!is_paused(&context, job).await.unwrap());
-    set_paused(&context, job, true).await.unwrap();
-    assert!(is_paused(&context, job).await.unwrap());
-    set_paused(&context, job, false).await.unwrap();
-    assert!(!is_paused(&context, job).await.unwrap());
+    use crate::blob::pause::{PausePurgeOperation, PausedOperation};
+    use crate::driver::drive;
+    let paused = || drive(PausedOperation::new(job), &context);
+    assert!(!paused().await.unwrap());
+    drive(PausePurgeOperation::new(job, true), &context)
+        .await
+        .unwrap();
+    assert!(paused().await.unwrap());
+    drive(PausePurgeOperation::new(job, false), &context)
+        .await
+        .unwrap();
+    assert!(!paused().await.unwrap());
 }
 
 #[tokio::test]

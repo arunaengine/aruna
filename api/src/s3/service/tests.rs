@@ -40,16 +40,15 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::store::StoreWatchOperation;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
 use aruna_operations::s3::object::get::ObjectInfo;
 use aruna_operations::s3::object::list::ListContinuationToken;
-use aruna_operations::s3::object::metadata::{
-    QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
-};
+use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_operations::s3::object::metadata_drain::refresh_reference_metadata;
 use aruna_operations::s3::object::put::PutObjectResult;
 use aruna_operations::testing::read_value;
 use aruna_storage::storage;

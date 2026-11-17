@@ -10,15 +10,14 @@ use crate::driver::{
     routing_snapshot,
 };
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::fence_store::ensure_write_allowed;
+use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::{TokenRead, read_source};
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
@@ -289,9 +288,12 @@ async fn copy_inner(
     {
         return Ok(committed);
     }
-    ensure_write_allowed(&context.storage_handle, &input.dest_bucket, &input.dest_key)
-        .await
-        .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
+    drive(
+        FenceCheckOperation::new(&input.dest_bucket, &input.dest_key),
+        context,
+    )
+    .await
+    .map_err(|error| CopyObjectError::Put(PutObjectError::PurgeFence(error)))?;
     // The description touches no source, so a reference can be kept without
     // contacting its connector.
     let head = drive(

@@ -187,8 +187,9 @@ async fn decrypting_source(state: &ServerState, user: UserId) {
 #[tokio::test]
 async fn decrypting_copy_consent() {
     use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
-    use aruna_operations::jobs::store::query::iter_prefix_page;
-    use aruna_operations::replication::plaintext::{job_consent, read_consent};
+    use aruna_operations::driver::drive;
+    use aruna_operations::replication::plaintext::{ConsentReadOperation, job_consent};
+    use aruna_operations::storage_read::iter_prefix_page;
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;
     let (status, _) = replicate_blob(
@@ -217,16 +218,20 @@ async fn decrypting_copy_consent() {
     .unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(
-        read_consent(&state.get_ctx(), job_consent(&jobs[0].0))
-            .await
-            .unwrap(),
+        drive(
+            ConsentReadOperation::new(job_consent(&jobs[0].0)),
+            &state.get_ctx()
+        )
+        .await
+        .unwrap(),
         Some(auth.user_id)
     );
 }
 
 #[tokio::test]
 async fn decrypting_sync_consent() {
-    use aruna_operations::replication::plaintext::read_consent;
+    use aruna_operations::driver::drive;
+    use aruna_operations::replication::plaintext::ConsentReadOperation;
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;
     let mut request = create_request(state.get_node_id());
@@ -243,9 +248,12 @@ async fn decrypting_sync_consent() {
     assert!(response.plaintext);
     let id = Ulid::from_string(&response.id).unwrap();
     assert_eq!(
-        read_consent(&state.get_ctx(), relationship_consent(id))
-            .await
-            .unwrap(),
+        drive(
+            ConsentReadOperation::new(relationship_consent(id)),
+            &state.get_ctx()
+        )
+        .await
+        .unwrap(),
         Some(auth.user_id)
     );
 }

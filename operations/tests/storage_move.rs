@@ -164,7 +164,7 @@ async fn settles_gone_versions() {
     use aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::blob::VersionKey;
-    use aruna_operations::blob::migration::settle_move;
+    use aruna_operations::blob::migration::drain::settle_move;
     let context = setup_context().await;
     let id = Ulid::generate();
     let intent = WriteIntent {
@@ -203,7 +203,7 @@ async fn settles_missing_copies() {
     use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
-    use aruna_operations::blob::migration::settle_move;
+    use aruna_operations::blob::migration::drain::settle_move;
     let context = setup_context().await;
     let id = put(&context, "data/a.txt", b"lost research data").await;
     let stored = version(&context, "data/a.txt", id).await;

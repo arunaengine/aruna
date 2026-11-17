@@ -24,9 +24,10 @@ use tracing::warn;
 
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
-use super::store::query::{batch_delete, first_schedule_entry, iter_prefix_page};
+use super::store::query::{batch_delete, first_schedule_entry};
 use super::store::state::{ClaimOutcome, RequeueOutcome, claim_job, read_job_record, requeue_job};
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
+use crate::storage_read::iter_prefix_page;
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.

@@ -124,7 +124,7 @@ impl Operation for RelationshipNodesOperation {
                 else {
                     return self.fail(LocationSummaryError::Unexpected {
                         state: "relationship_scan",
-                        event: format!("{event:?}"),
+                        event: event.label().to_string(),
                     });
                 };
                 for (_, value) in values {

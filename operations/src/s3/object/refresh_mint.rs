@@ -28,14 +28,16 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::replication::protocol::ReferenceAdvance;
-use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
+};
 
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
@@ -312,7 +314,7 @@ impl MintSuccessorOperation {
             (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
             (state, event) => Err(MintError::UnexpectedEvent {
                 state,
-                received: format!("{event:?}"),
+                received: event.label().to_string(),
             }),
         }
     }

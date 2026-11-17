@@ -19,8 +19,8 @@ use super::walk::{PageFailure, directory_list_path, first_key, target_of, walk_p
 use super::{checkpoint_key, persist_rows};
 use crate::driver::DriverContext;
 use crate::jobs::executor::JobContext;
-use crate::jobs::store::query::iter_prefix_page;
 use crate::staging::page::rows::MAX_ERROR_SAMPLE;
+use crate::storage_read::iter_prefix_page;
 
 /// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
 /// job holds a bounded number of pages whatever the source holds.

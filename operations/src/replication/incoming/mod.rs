@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::abe::copies::copy_row;
+use crate::blob::holders::dht_registration_effect;
 use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
@@ -16,14 +17,9 @@ use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
 };
-use crate::replication::dht_registration::dht_registration_effect;
 use crate::replication::error::ReplicationError;
-use crate::replication::protocol::{
-    ReferenceAdvance, VersionReplicationManifest, VersionReplicationMessage,
-};
-use crate::replication::queue::{
-    LiveObligationRecord, live_obligation_effect, schedule_blob_drain,
-};
+use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
+use crate::replication::queue::schedule_blob_drain;
 use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
@@ -75,6 +71,10 @@ use aruna_core::structs::storage::origin::{OriginVersion, SyncHop};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::replication::{
     ReplicationItemKind, ReplicationNegotiationResult,
+};
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_effect,
 };
 use aruna_core::structs::storage::routing::{
     GroupRoutingInputs, NodeRouting, RoutingError, StorageRoutingRule, resolve_backend,
@@ -239,11 +239,11 @@ pub enum IncomingVersionError {
     MultipartMetadataOverflow,
     #[error("operation did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: &'static str,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the destination bucket encrypts its objects, so it accepts no references")]
     EncryptedDestination,
@@ -536,6 +536,7 @@ impl IncomingVersionOperation {
     /// Replaces the clock the enqueue phase samples. Production keeps the
     /// default; tests fix it so a long apply can prove the candidate carries
     /// the enqueue time rather than the construction time.
+    #[cfg(test)]
     pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
         self.clock = EnqueueClock(clock);
         self
@@ -1292,7 +1293,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let Some(plan) = self.seal_plan else {
@@ -1328,7 +1329,7 @@ impl IncomingVersionOperation {
                     return self.fail(IncomingVersionError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "AbeEvent::Envelope",
-                        received: Event::Blob(BlobEvent::Abe(Box::new(event))),
+                        received: (Event::Blob(BlobEvent::Abe(Box::new(event)))).label(),
                     });
                 }
             },
@@ -1337,7 +1338,7 @@ impl IncomingVersionOperation {
                 return self.fail(IncomingVersionError::InvalidStateEvent {
                     state: self.state_name(),
                     expected: "Event::Blob(BlobEvent::Abe)",
-                    received: event,
+                    received: event.label(),
                 });
             }
         };
@@ -1413,7 +1414,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "an active placement gate",
-                received: event,
+                received: event.label(),
             });
         };
         let effects = gate.step(event);
@@ -1894,7 +1895,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let head = value.as_deref().map(CurrentVersionPointer::from_bytes);
@@ -2556,14 +2557,14 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ReservationReleased)",
-                received: event,
+                received: event.label(),
             });
         };
         if self.release_id != Some(id) {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "matching reservation id",
-                received: Event::Blob(BlobEvent::ReservationReleased { id }),
+                received: (Event::Blob(BlobEvent::ReservationReleased { id })).label(),
             });
         }
         self.release_id = None;
@@ -2582,7 +2583,7 @@ impl IncomingVersionOperation {
             other => self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::{WriteResult|Error})",
-                received: other,
+                received: other.label(),
             }),
         }
     }
@@ -2713,7 +2714,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let [(_, value), (_, settings)] = match <[_; 2]>::try_from(values) {
@@ -2794,7 +2795,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let Some(settings) = self.destination_settings.take() else {
@@ -2819,7 +2820,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::SubOperation(SubOperationEvent::BucketCreated)",
-                received: event,
+                received: event.label(),
             });
         };
         if let Err(reason) = result {
@@ -2838,7 +2839,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::SubOperation(SubOperationEvent::GroupRoutingLoaded)",
-                received: event,
+                received: event.label(),
             });
         };
         match result {
@@ -2855,7 +2856,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -2970,7 +2971,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let claimed = self.manifest.blob.as_ref().map(|blob| blob.hash.to_vec());
@@ -2985,7 +2986,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         self.replaced_logical_bytes = match value
@@ -3009,7 +3010,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let Some(group_id) = self.destination_group_id else {
@@ -3048,7 +3049,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: event.label(),
             });
         };
         self.txn_id = Some(txn_id);
@@ -3084,7 +3085,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: event,
+                received: event.label(),
             });
         };
         self.txn_id = None;
@@ -3103,7 +3104,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -3159,7 +3160,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -3215,7 +3216,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "VersionApplyApproved",
-                received: event,
+                received: event.label(),
             });
         };
         match VersionReplicationMessage::from_bytes(&payload) {
@@ -3223,10 +3224,11 @@ impl IncomingVersionOperation {
             Ok(_) => self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "VersionApplyApproved",
-                received: Event::Blob(BlobEvent::MessageReceived {
+                received: (Event::Blob(BlobEvent::MessageReceived {
                     stream_id: self.stream_id,
                     payload,
-                }),
+                }))
+                .label(),
             }),
             Err(error) => self.fail(error.into()),
         }
@@ -3245,7 +3247,7 @@ impl IncomingVersionOperation {
                 return self.fail(IncomingVersionError::InvalidStateEvent {
                     state: self.state_name(),
                     expected: "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
-                    received: other,
+                    received: other.label(),
                 });
             }
         };
@@ -3271,7 +3273,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: event.label(),
             });
         };
         self.txn_id = Some(txn_id);
@@ -3298,7 +3300,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         if let (Some(plan), Some(envelope)) = (self.seal_plan, &self.envelope) {
@@ -3378,7 +3380,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let current = match value
@@ -3425,7 +3427,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let [(key, id), (_, settings)] = values.as_slice() else {
@@ -3470,7 +3472,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let charge = match values.as_slice() {
@@ -3506,7 +3508,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: event.label(),
             });
         };
         if next_start_after.is_some() {
@@ -3520,7 +3522,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received: event,
+                received: event.label(),
             });
         };
         match self.replaced_reclaim_key() {
@@ -3537,7 +3539,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event,
+                received: event.label(),
             });
         };
         self.replaced_version = None;
@@ -3556,7 +3558,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let stored = match value
@@ -3580,7 +3582,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::{WriteResult|BatchWriteResult})",
-                received: event,
+                received: event.label(),
             });
         };
         self.write_object_lookup()
@@ -3591,7 +3593,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let existing_pointer = value
@@ -3622,7 +3624,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
         let Some(value) = value else {
@@ -3661,7 +3663,7 @@ impl IncomingVersionOperation {
             _ => self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::{WriteResult|DeleteResult})",
-                received: event,
+                received: event.label(),
             }),
         }
     }
@@ -3673,7 +3675,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event,
+                received: event.label(),
             });
         };
         if let Some(effect) = self.pending_version_effects.pop_front() {
@@ -3687,7 +3689,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
+                received: event.label(),
             });
         };
         debug!(
@@ -3706,7 +3708,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: event,
+                received: event.label(),
             });
         };
         self.start_commit_quota()
@@ -3782,7 +3784,7 @@ impl IncomingVersionOperation {
             other => self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::{TransactionCommitted|Error})",
-                received: other,
+                received: other.label(),
             }),
         }
     }
@@ -3821,7 +3823,7 @@ impl IncomingVersionOperation {
             _ => self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Net(NetEvent::Dht(DhtEvent::*))",
-                received: event,
+                received: event.label(),
             }),
         }
     }
@@ -3831,7 +3833,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event,
+                received: event.label(),
             });
         };
         debug!(
@@ -3853,7 +3855,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::MessageSent)",
-                received: event,
+                received: event.label(),
             });
         };
         self.abort_or_close()
@@ -3864,7 +3866,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: event,
+                received: event.label(),
             });
         };
         self.cleanup_or_close()
@@ -3888,7 +3890,7 @@ impl IncomingVersionOperation {
             return self.fail(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Blob(BlobEvent::ConnectionClosed)",
-                received: event,
+                received: event.label(),
             });
         };
         if self.output.as_ref().is_some_and(Result::is_err) {
@@ -3939,6 +3941,7 @@ pub(crate) fn same_reference(existing: &BlobVersion, incoming: &BlobVersion) -> 
 }
 
 mod admission;
+pub(crate) mod stream;
 
 #[cfg(test)]
 mod pure_tests;

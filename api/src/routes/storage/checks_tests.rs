@@ -15,7 +15,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::blob::migration::check::clean_broken;
+use aruna_operations::blob::migration::broken::clean_broken;
 use axum::extract::{Path, Query, State};
 use std::time::SystemTime;
 use ulid::Ulid;

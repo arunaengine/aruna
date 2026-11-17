@@ -5,12 +5,13 @@
 use crate::connectors::repository::source_connector_key;
 use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::BaoReadError;
-use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
-use crate::replication::queue::LiveObligationRecord;
+use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
-    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, promote_leased, routed_info, slice_blob,
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
+    MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+};
+use crate::s3::object::read::{
+    HolderFailures, RoutedRead, get_object_routed, promote_leased, routed_info, slice_blob,
 };
 use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
@@ -45,6 +46,8 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
@@ -2552,7 +2555,7 @@ mod sealed {
     fn remote_lock_typed() {
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;
-        use crate::s3::object::get::HolderFailures;
+        use crate::s3::object::read::HolderFailures;
 
         let mut failures = HolderFailures::default();
         failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));

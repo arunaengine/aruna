@@ -5,10 +5,10 @@
 
 use crate::auth::request_authorization::BucketAccess;
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::migration::move_routing;
+use crate::blob::migration::drain::move_routing;
 use crate::driver::DriverContext;
-use crate::jobs::store::query::iter_prefix_page;
-use crate::s3::bucket::linked::JobStep;
+use crate::s3::bucket::job_progress::JobStep;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -549,7 +549,7 @@ pub async fn unify(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("could not start a transaction: {other:?}")),
+        other => return Err(format!("could not start a transaction: {}", other.label())),
     };
     let staged = Stage {
         context,
@@ -610,7 +610,7 @@ impl Stage<'_> {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
                 Ok(values.into_iter().map(|(_, value)| value).collect())
             }
-            other => Err(format!("could not read the copies: {other:?}")),
+            other => Err(format!("could not read the copies: {}", other.label())),
         }
     }
 
@@ -793,7 +793,7 @@ impl Stage<'_> {
                 .await
             {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-                other => return Err(format!("could not drop the copy index: {other:?}")),
+                other => return Err(format!("could not drop the copy index: {}", other.label())),
             }
         }
         let write = StorageEffect::BatchWrite {
@@ -802,7 +802,10 @@ impl Stage<'_> {
         };
         match self.context.storage_handle.send_storage_effect(write).await {
             Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(Unified::Done),
-            other => Err(format!("could not write the unification: {other:?}")),
+            other => Err(format!(
+                "could not write the unification: {}",
+                other.label()
+            )),
         }
     }
 
@@ -872,7 +875,7 @@ impl Stage<'_> {
                         && object.etag.as_deref().map(unquoted) == Some(unquoted(&recorded))
                 }))
             }
-            other => Err(format!("could not list the kept file: {other:?}")),
+            other => Err(format!("could not list the kept file: {}", other.label())),
         }
     }
 
@@ -1025,7 +1028,7 @@ async fn read(context: &DriverContext, space: &str, key: Key) -> Result<Option<V
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("could not read {space}: {other:?}")),
+        other => Err(format!("could not read {space}: {}", other.label())),
     }
 }
 

@@ -24,9 +24,8 @@ use crate::plugins::worker::send_outbox;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
-use crate::replication::protocol::ReplicationMode;
-use crate::replication::queue::{QueueBlobOperation, process_blob_batch};
-use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+use crate::replication::drain::process_blob_batch;
+use crate::replication::queue::QueueBlobOperation;
 use crate::sync::sync_relationship::StoreRelationshipOperation;
 use crate::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
@@ -35,6 +34,8 @@ use aruna_core::plugin_runs::{Decisions, EventBatch, Outcome};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
 use std::time::SystemTime;
 use ulid::Ulid;

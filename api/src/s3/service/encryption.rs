@@ -15,9 +15,10 @@ use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
 use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
+use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::encryption::EnableError;
 use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::key_status::{KeyStatusOperation, bucket_settings};
+use aruna_operations::s3::key_status::KeyStatusOperation;
 use s3s::dto::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
     ServerSideEncryptionRule,
@@ -26,9 +27,8 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 impl ArunaS3Service {
     pub(super) async fn bucket_encrypted(&self, bucket: &str) -> S3Result<bool> {
-        bucket_settings(&self.state, bucket)
+        drive(EncryptionCheckOperation::new(bucket, false), &self.state)
             .await
-            .map(|settings| settings.is_encrypted())
             .map_err(|error| s3_error!(InternalError, "{}", error))
     }
 

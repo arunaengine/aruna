@@ -30,11 +30,10 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
-use aruna_operations::s3::bucket::holders::lookup_keys;
-use aruna_operations::s3::bucket::key_install::{
-    InstallInput, InstallKeyOperation, install_and_wake,
-};
-use aruna_operations::s3::bucket::key_rows::SettingsError;
+use aruna_operations::s3::bucket::holders::LookupKeysOperation;
+use aruna_operations::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
+use aruna_operations::s3::bucket::key::rows::SettingsError;
+use aruna_operations::s3::bucket::key::wake::activate_and_wake;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
@@ -453,13 +452,13 @@ pub(crate) async fn holder_report(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let copies: Vec<_> = snapshot
         .copies
         .iter()
@@ -903,7 +902,13 @@ pub(crate) async fn change_bucket(
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
     let context = state.get_ctx();
-    let lookups = lookup_keys(&context, state.get_realm_id(), state.get_node_id(), users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
+        &context,
+    )
+    .await
+    .unwrap_or_default();
     let input = ChangeInput {
         bucket: bucket.to_string(),
         group_id,
@@ -936,7 +941,7 @@ pub(crate) async fn change_bucket(
         );
         let origin = (state.get_realm_id(), node_id);
         if let Err(error) =
-            install_and_wake(&context, install, origin, state.rocrate_limits()).await
+            activate_and_wake(&context, install, origin, state.rocrate_limits()).await
         {
             tracing::warn!(%bucket, ?error, "new bucket key stays locked");
         }
@@ -987,7 +992,10 @@ pub(crate) async fn enable_bucket(
         .into_iter()
         .chain(snapshot.admins.iter().copied())
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(context, realm_id, node_id, users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(LookupKeysOperation::new(realm_id, node_id, users), context)
+        .await
+        .unwrap_or_default();
     let input = EnableInput {
         bucket: bucket.to_string(),
         group_id,
@@ -1013,7 +1021,7 @@ pub(crate) async fn enable_bucket(
     // The bucket is encrypted either way; a failed install only leaves it locked.
     let install =
         InstallKeyOperation::new(install).audited(node_id, Some(caller), unix_timestamp_millis());
-    if let Err(error) = install_and_wake(context, install, (realm_id, node_id), limits).await {
+    if let Err(error) = activate_and_wake(context, install, (realm_id, node_id), limits).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }
     Ok(())

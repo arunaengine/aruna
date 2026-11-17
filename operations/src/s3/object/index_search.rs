@@ -28,8 +28,8 @@ use super::{
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::distribution::feed_walks::state_key;
 use crate::distribution::index_feed::range_progress;
-use crate::driver::DriverContext;
-use crate::replication::members::read_record;
+use crate::driver::{DriverContext, drive};
+use crate::replication::members::ReadRecordOperation;
 use aruna_core::key_index::{KeyPage, KeyQuery, MetaTerms};
 use aruna_storage::key_index::RangeIndexes;
 
@@ -53,8 +53,9 @@ pub(super) async fn search_ranges(
     search: RangeSearch,
 ) -> Result<SearchNodePage, SearchObjectsError> {
     let (indexes, set_id) = (search.indexes.clone(), search.binding.set_id);
-    let record = read_record(context, set_id).await;
-    let Some(view) = record.map_err(SearchObjectsError::Storage)? else {
+    let record = drive(ReadRecordOperation::new(set_id), context).await;
+    let record = record.map_err(|error| SearchObjectsError::Storage(error.to_string()));
+    let Some(view) = record? else {
         // Without the record the ranges are unknown, so nothing is covered.
         return Ok(page(Vec::new(), Vec::new(), true, None, 1, 0));
     };

@@ -9,7 +9,6 @@ mod list;
 mod purge;
 mod refresh;
 mod revoke;
-pub mod sweep;
 mod touch;
 
 pub use create::{CreateS3Config, CreateS3Operation};
@@ -84,11 +83,11 @@ pub enum S3SessionError {
     NotFinished,
     #[error("session operation failed")]
     Failed,
-    #[error("state {state} expected {expected}, received {received:?}")]
+    #[error("state {state} expected {expected}, received {received}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
 }
 

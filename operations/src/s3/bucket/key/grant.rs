@@ -50,11 +50,11 @@ pub enum GrantError {
     /// The granting user lost the group admin role before the grant committed.
     #[error("the caller is no group admin")]
     NotAdmin,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the grant did not finish")]
     NotFinished,
@@ -304,7 +304,7 @@ impl Operation for GrantHolderOperation {
             (state, received) => self.fail(GrantError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

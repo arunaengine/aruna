@@ -22,11 +22,12 @@ use tracing::warn;
 
 use super::JOB_PRUNE_PAGE;
 use super::store::query::{
-    batch_delete, first_schedule_entry, iter_prefix_page, job_entry_deletes, staging_row_deletes,
+    batch_delete, first_schedule_entry, job_entry_deletes, staging_row_deletes,
 };
 use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
 use crate::driver::{DriverContext, drive};
 use crate::plugins::work::holds_job;
+use crate::storage_read::iter_prefix_page;
 use aruna_core::structs::execution::job::prune_delete_entries;
 
 #[derive(Debug, Default, PartialEq, Eq)]

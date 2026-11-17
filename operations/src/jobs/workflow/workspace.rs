@@ -46,14 +46,12 @@ use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::jobs::store::attempt::reserve_output_commits;
 use crate::realm::get_config::GetConfigOperation;
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
-use crate::replication::protocol::{
-    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReplicationMode,
-};
-use crate::replication::queue::complete_put;
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
+use crate::replication::live_queue::complete_put;
+use crate::replication::managed_read::{local_is_user, managed_read};
+use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget, SourceAuthorization,
-    SourceAuthorizationError,
+    ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
 };
 use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
 use crate::s3::access::get::{GetAccessError, GetAccessOperation};
@@ -73,6 +71,8 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
 use aruna_core::structs::storage::read_grant::READ_OPERATION;
+use aruna_core::structs::storage::replication_queue::ReplicationMode;
+use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
 use tracing::warn;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.

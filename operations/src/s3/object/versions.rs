@@ -73,11 +73,11 @@ pub enum ListVersionsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: ListVersionsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -271,7 +271,7 @@ impl ListVersionsOperation {
             return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -364,7 +364,7 @@ impl ListVersionsOperation {
             return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -469,7 +469,7 @@ impl ListVersionsOperation {
             return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -622,7 +622,7 @@ impl ListVersionsOperation {
             return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         };
 
@@ -768,7 +768,7 @@ impl ListVersionsOperation {
             return self.emit_error(ListVersionsError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
+                received: event.label(),
             });
         };
 

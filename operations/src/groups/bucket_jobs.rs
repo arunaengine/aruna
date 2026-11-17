@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::purge::is_paused;
-use crate::driver::DriverContext;
+use crate::blob::pause::PausedOperation;
+use crate::driver::{DriverContext, drive};
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::last_run;
 use crate::jobs::store::state::read_job_record;
@@ -221,7 +221,9 @@ async fn purge_job(context: &DriverContext, job_id: JobId) -> Result<Option<Acti
     let Some(record) = record.filter(|record| is_running(record.state)) else {
         return Ok(None);
     };
-    let paused = is_paused(context, job_id.as_ulid()).await?;
+    let paused = drive(PausedOperation::new(job_id.as_ulid()), context)
+        .await
+        .map_err(|error| error.to_string())?;
     Ok(Some(ActiveJob {
         paused,
         ..ActiveJob::running(JobKind::Purge, record.progress.current, 0)

@@ -23,7 +23,7 @@ use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
-use aruna_operations::s3::bucket::metadata::dataset_description;
+use aruna_operations::s3::bucket::dataset::dataset_description;
 use aruna_operations::s3::object::search::ObjectKeyMatch;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};

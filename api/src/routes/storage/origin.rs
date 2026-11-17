@@ -24,7 +24,8 @@ use aruna_operations::distribution::resolve::{
 };
 use aruna_operations::distribution::routing::route_read;
 use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
-use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
+use aruna_operations::driver::drive;
+use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
 use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
@@ -52,9 +53,9 @@ use crate::routes::storage::relay::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
-use aruna_operations::s3::bucket::release::{
-    BucketScope, MembershipCaller, MembershipQuery, release_members,
-};
+use aruna_core::structs::storage::release::MembershipQuery;
+use aruna_operations::s3::bucket::release::read::release_members;
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
@@ -859,7 +860,8 @@ pub async fn get_sources(
         &bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let (sources, complete) = bucket_sources(state.get_ctx().as_ref(), info.group_id, &bucket)
+    let listing = BucketSourcesOperation::new(info.group_id, &bucket);
+    let (sources, complete) = drive(listing, state.get_ctx().as_ref())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(FileSourcesResponse {

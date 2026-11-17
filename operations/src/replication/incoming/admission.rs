@@ -43,7 +43,7 @@ impl IncomingVersionOperation {
             return Err(IncomingVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
+                received: event.label(),
             });
         }
         let (value, fence) =

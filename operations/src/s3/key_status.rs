@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::abe::rekey::RekeyProgress;
-use crate::driver::DriverContext;
 use crate::s3::bucket::key::restart::Replay;
 use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
 use aruna_core::UserId;
@@ -13,8 +12,7 @@ use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BUCKET_AUDIT_KEYSPACE,
-    BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
-    TRANSITION_KEYSPACE,
+    BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
@@ -42,11 +40,11 @@ pub enum KeyStatusError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Blob(#[from] BlobError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the status read did not finish")]
     NotFinished,
@@ -284,7 +282,7 @@ impl Operation for KeyStatusOperation {
             (state, received) => self.fail(KeyStatusError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }
@@ -326,25 +324,6 @@ fn parse_abe(
             .map(|value| postcard::from_bytes(&value))
             .transpose()?,
     }))
-}
-
-/// The encryption settings of `bucket`; a bucket without a settings row is plain.
-pub async fn bucket_settings(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<BucketEncryption, KeyStatusError> {
-    let read = StorageEffect::Read {
-        key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        key: bucket.as_bytes().to_vec().into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(BucketEncryption::from_row(value.as_deref())?)
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError("unexpected settings read".to_string()).into()),
-    }
 }
 
 /// One page of a bucket's key audit in time order, after the event `cursor`.
@@ -415,7 +394,7 @@ impl Operation for AuditPageOperation {
             received => Err(KeyStatusError::InvalidStateEvent {
                 state: "ReadAudit".to_string(),
                 expected: "IterResult",
-                received,
+                received: received.label(),
             }),
         });
         smallvec![]

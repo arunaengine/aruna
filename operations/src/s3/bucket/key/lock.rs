@@ -25,7 +25,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 /// The record of a lock of `ticket`, timed when there is no actor.
-pub fn lock_record(
+fn lock_record(
     ticket: KeyTicket,
     actor: Option<UserId>,
     node_id: NodeId,
@@ -79,11 +79,11 @@ pub enum LockError {
     NotEncrypted,
     #[error("the caller is neither a key holder nor a group admin")]
     NotHolder,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the lock did not finish")]
     NotFinished,
@@ -394,7 +394,7 @@ impl Operation for LockBucketOperation {
             (state, received) => self.fail(LockError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

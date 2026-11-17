@@ -34,8 +34,8 @@ use crate::connectors::repository::source_connector_key;
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive};
 use crate::effect_adapters::dispatch_effect;
+use crate::s3::bucket::dataset::bucket_metadata;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::bucket_metadata;
 
 #[derive(Debug, Error)]
 pub enum OriginError {
@@ -300,9 +300,9 @@ fn view(version_id: Ulid, global: Option<GlobalId>, version: BlobVersion) -> Ori
 
 /// Reads `version_id`, or the current version, of a local bucket's key, with its source root.
 /// Current files one runs lookup reads at most; a larger scope answers incomplete.
-pub const RUN_SCAN_LIMIT: usize = 5000;
+const RUN_SCAN_LIMIT: usize = 5000;
 /// Runs one lookup names at most.
-pub const RUN_LIMIT: usize = 50;
+const RUN_LIMIT: usize = 50;
 
 /// The runs whose results are current files of a bucket under a prefix, newest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -338,7 +338,7 @@ pub async fn bucket_runs(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(OriginError::Storage(format!("{other:?}"))),
+            other => return Err(OriginError::Storage(other.label().to_string())),
         };
         scanned += heads.len();
         for (head, pointer) in heads {
@@ -463,12 +463,12 @@ async fn read(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(OriginError::Storage(error.to_string()))
         }
-        other => Err(OriginError::Storage(format!("{other:?}"))),
+        other => Err(OriginError::Storage(other.label().to_string())),
     }
 }
 
 /// Puts the root's settings back into a version read with a compact binding.
-pub async fn hydrate_version(
+async fn hydrate_version(
     context: &DriverContext,
     version: BlobVersion,
 ) -> Result<BlobVersion, String> {

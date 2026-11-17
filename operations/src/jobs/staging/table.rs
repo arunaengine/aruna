@@ -41,11 +41,10 @@ use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::get_object_routed;
 use crate::s3::purge_fence::PurgeFenceError;
 use crate::s3::usage::QuotaGateError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};

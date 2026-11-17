@@ -20,13 +20,15 @@ use super::apply::{ApplyInput, PageApplyOperation, page_answer};
 use super::build::{BuildInput, Built, PageBuildOperation};
 use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
 use crate::driver::{DriverContext, drive};
-use crate::replication::members::{MemberTarget, bound_record, member_publication};
-use crate::replication::queue::{BlobJobRecord, BlobQueueError};
-use crate::replication::version_replication::ReplicateScopeTarget;
+use crate::replication::members::{BoundRecordOperation, member_publication};
+use crate::replication::queue::BlobQueueError;
 use crate::tasks::queue_backoff::{min_due_at, retry_delay_ms};
+use aruna_core::structs::storage::replication_queue::BlobJobRecord;
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 
 /// The error a job carries while single delivery owes it instead of a page.
-pub(crate) const PAGE_SINGLE: &str = "left to single delivery by a reference page";
+const PAGE_SINGLE: &str = "left to single delivery by a reference page";
 /// Failed attempts that each halve the pages a job travels in.
 const PAGE_SHRINKS: u32 = 4;
 
@@ -99,7 +101,9 @@ pub(crate) async fn deliver_pages(
     let mut retire = Vec::new();
     for (key, job) in jobs {
         if !records.contains_key(&job.input.bucket) {
-            let record = bound_record(context, &job.input.bucket).await;
+            let record = drive(BoundRecordOperation::new(&job.input.bucket), context)
+                .await
+                .map_err(|error| error.to_string());
             let record = record.map_err(BlobQueueError::UnexpectedEvent)?;
             records.insert(job.input.bucket.clone(), record);
         }
@@ -258,7 +262,7 @@ async fn delete_jobs(context: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), 
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -301,7 +305,7 @@ async fn reschedule(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(due),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
     }
 }
 

@@ -13,10 +13,12 @@ use crate::distribution::resolve::version_holders;
 use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::metadata::materialization_queue::capture_pending;
-use crate::replication::bao_read::{BaoReadOutput, managed_read};
+use crate::replication::bao_read::BaoReadOutput;
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{GetObjectInput, get_object_info};
+use crate::s3::object::get::GetObjectInput;
+use crate::s3::object::read::get_object_info;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{
     CHECKPOINT_AFTER, GitChange, GitCheckpoint, GitEffect, GitEvent, GitSnapshot, GitStatus,

@@ -4,7 +4,7 @@
 
 use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
@@ -40,6 +40,7 @@ use ulid::Ulid;
 
 use super::lifecycle::ids::session_of;
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
+use crate::storage_read::iter_prefix_page;
 use crate::tasks::queue_backoff::retry_delay_ms;
 
 pub mod attempt;
@@ -606,14 +607,17 @@ where
             let settled = !old.is_settled() && record.is_settled();
             let mut terminal_deletes = Vec::new();
             if settled && let Some(spec) = record.payload.purge_spec() {
-                if let Some(delete) = crate::s3::fence_store::delete_owned_terminal(
-                    storage,
-                    txn_id,
+                let bucket = crate::s3::purge_fence::fence_key(spec.scope.bucket());
+                let fence = read_raw(storage, PURGE_FENCE_KEYSPACE, bucket, Some(txn_id))
+                    .await
+                    .map_err(JobMutationError::Storage)?;
+                let owned = crate::s3::fence_store::owned_fence_delete(
+                    fence.as_deref(),
                     record.job_id,
                     &spec.scope,
-                )
-                .await
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?
+                );
+                if let Some(delete) =
+                    owned.map_err(|error| JobMutationError::Storage(error.to_string()))?
                 {
                     terminal_deletes.push(delete);
                 }

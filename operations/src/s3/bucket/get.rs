@@ -28,11 +28,11 @@ pub enum GetBucketError {
     ConversionError(#[from] ConversionError),
     #[error("Bucket not found")]
     NotFound,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: GetBucketState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("GetBucketInfo has no result yet")]
     Incomplete,
@@ -74,7 +74,7 @@ impl GetBucketOperation {
             return self.emit_error(GetBucketError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
+                received: (event).label(),
             });
         };
 
@@ -96,14 +96,16 @@ impl Operation for GetBucketOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
-        match self.state {
-            GetBucketState::Init => self.handle_init(),
-            GetBucketState::ReadBucket => self.handle_bucket_read(event),
-            GetBucketState::Finish => smallvec![],
-            GetBucketState::Error => self.abort(),
+        match (&self.state, event) {
+            (GetBucketState::ReadBucket, Event::Storage(StorageEvent::Error { error })) => {
+                self.emit_error(error.into())
+            }
+            (GetBucketState::ReadBucket, event) => self.handle_bucket_read(event),
+            (_, event) => self.emit_error(GetBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "no event",
+                received: (event).label(),
+            }),
         }
     }
 
@@ -242,6 +244,27 @@ mod state_machine_tests {
         );
         let error = operation.finalize().expect_err("invalid event must fail");
         assert!(matches!(error, GetBucketError::InvalidStateEvent { .. }));
+    }
+
+    #[test]
+    fn rejects_late_events() {
+        // An event after the answer, or before start, is refused instead of ignored.
+        let info = fixed_bucket_info();
+        let mut finished = GetBucketOperation::new("bucket".to_owned());
+        finished.start();
+        finished.step(read_result("bucket", Some(info.to_bytes().unwrap())));
+        finished.step(read_result("bucket", None));
+        assert!(matches!(
+            finished.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
+        let mut fresh = GetBucketOperation::new("bucket".to_owned());
+        assert!(fresh.step(read_result("bucket", None)).is_empty());
+        assert!(fresh.is_complete());
+        assert!(matches!(
+            fresh.finalize(),
+            Err(GetBucketError::InvalidStateEvent { .. })
+        ));
     }
 
     #[test]

@@ -51,11 +51,11 @@ pub enum RestartScanError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Settings(#[from] SettingsError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
+    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
     InvalidStateEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("the restart scan did not finish")]
     NotFinished,
@@ -511,7 +511,7 @@ impl Operation for RestartScanOperation {
             (state, received) => self.fail(RestartScanError::InvalidStateEvent {
                 state: format!("{state:?}"),
                 expected: "the event of the current step",
-                received,
+                received: received.label(),
             }),
         }
     }

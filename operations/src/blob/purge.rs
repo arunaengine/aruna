@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PURGE_FILES_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, names_version, object_key, version_key,
@@ -77,7 +77,7 @@ async fn batch(
         Event::Storage(StorageEvent::BatchReadResult { values }) => {
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
-        other => Err(format!("could not read purged versions: {other:?}")),
+        other => Err(format!("could not read purged versions: {}", other.label())),
     }
 }
 
@@ -135,7 +135,7 @@ pub async fn storage_files(
         });
     }
     // A second copy an import registered for a purged version goes with that version.
-    let routing = crate::blob::migration::move_routing(context, bucket).await?;
+    let routing = crate::blob::migration::drain::move_routing(context, bucket).await?;
     let mut keys: std::collections::BTreeMap<&str, Vec<Ulid>> = Default::default();
     for (key, id) in versions {
         keys.entry(key.as_str()).or_default().push(*id);
@@ -244,7 +244,7 @@ async fn read_elsewhere(
                 values,
                 next_start_after,
             }) => (values, next_start_after),
-            other => return Err(format!("could not read hash aliases: {other:?}")),
+            other => return Err(format!("could not read hash aliases: {}", other.label())),
         };
         for (key, _) in aliases {
             *budget = budget.saturating_sub(1);
@@ -301,7 +301,7 @@ pub async fn scope_totals(
     let (mut key_marker, mut version_marker) = (None, None);
     let mut last_key = None::<String>;
     let mut scanned = 0u64;
-    let routing = crate::blob::migration::move_routing(context, scope.bucket()).await?;
+    let routing = crate::blob::migration::drain::move_routing(context, scope.bucket()).await?;
     let routing = routing.as_ref();
     // The versions of the key passed over last, whose second copies count once it ends.
     let mut ids = Vec::new();
@@ -423,10 +423,6 @@ fn plan_key(job_id: Ulid, location: Ulid) -> Key {
         .into()
 }
 
-fn pause_key(job_id: Ulid) -> Key {
-    [&job_id.to_bytes()[..], b"p"].concat().into()
-}
-
 /// Plans the release of `files` in the cleanup queue before their versions go; the queue
 /// releases them once the purge has ended, whichever way. A file without a backend version
 /// is not planned.
@@ -453,38 +449,11 @@ pub async fn plan_files(
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(format!("could not plan the file releases: {other:?}")),
+        other => Err(format!(
+            "could not plan the file releases: {}",
+            other.label()
+        )),
     }
-}
-
-/// Pauses or resumes the purge `job_id` between its batches.
-pub async fn set_paused(context: &DriverContext, job_id: Ulid, paused: bool) -> Result<(), String> {
-    let key = pause_key(job_id);
-    let effect = match paused {
-        true => StorageEffect::Write {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key,
-            value: Vec::new().into(),
-            txn_id: None,
-        },
-        false => StorageEffect::Delete {
-            key_space: PURGE_FILES_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }) => {
-            Ok(())
-        }
-        other => Err(format!("could not change the purge pause: {other:?}")),
-    }
-}
-
-/// Whether the purge `job_id` is paused.
-pub async fn is_paused(context: &DriverContext, job_id: Ulid) -> Result<bool, String> {
-    let read = vec![(PURGE_FILES_KEYSPACE.to_string(), pause_key(job_id))];
-    Ok(batch(context, read).await?.pop().flatten().is_some())
 }
 
 #[cfg(test)]

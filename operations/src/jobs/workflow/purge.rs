@@ -27,11 +27,11 @@ use super::super::store::state::flush_progress;
 use super::super::store::{put_purge_checkpoint, read_purge_checkpoint};
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::driver::drive;
+use crate::driver::{drive, drive_retry};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::{BucketScope, MembershipQuery};
-use crate::s3::fence_store::acquire_purge_fence;
+use crate::s3::bucket::release::BucketScope;
+use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
@@ -39,6 +39,7 @@ use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_o
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::structs::storage::release::MembershipQuery;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.
@@ -50,16 +51,16 @@ pub async fn run_storage_purge(
     spec: &StoragePurgeSpec,
     files: bool,
 ) -> JobRunOutcome {
-    if let Err(error) =
-        acquire_purge_fence(&ctx.driver.storage_handle, ctx.job_id, &spec.scope).await
-    {
+    let acquire = || AcquireFenceOperation::new(ctx.job_id, spec.scope.clone());
+    let seed = ctx.job_id.to_bytes();
+    if let Err(error) = drive_retry(acquire, &ctx.driver, &seed).await {
         return JobRunOutcome::Failed(fence_error(error));
     }
     // The planned files wait in the cleanup queue until the job has ended.
     let outcome = run_fenced_purge(ctx, spec, files).await;
     if !matches!(outcome, Err(PurgeRunError::Interrupted)) {
-        let unpaused = crate::blob::purge::set_paused(&ctx.driver, ctx.job_id.as_ulid(), false);
-        if let Err(error) = unpaused.await {
+        let resume = crate::blob::pause::PausePurgeOperation::new(ctx.job_id.as_ulid(), false);
+        if let Err(error) = drive(resume, &ctx.driver).await {
             tracing::warn!(%error, "A purge's pause mark could not be removed");
         }
     }
@@ -803,7 +804,8 @@ async fn drop_indexes(
 /// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.
 async fn wait_paused(ctx: &JobContext) -> Result<(), PurgeRunError> {
     loop {
-        let paused = crate::blob::purge::is_paused(&ctx.driver, ctx.job_id.as_ulid()).await;
+        let paused = crate::blob::pause::PausedOperation::new(ctx.job_id.as_ulid());
+        let paused = drive(paused, &ctx.driver).await;
         match paused {
             Ok(false) => return Ok(()),
             Ok(true) => {}

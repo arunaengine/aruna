@@ -38,9 +38,11 @@ use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
 use crate::driver::{DriverContext, drive, now_ms};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
+use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
+use crate::replication::managed_read::managed_read;
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::{GetObjectError, GetObjectResult, HolderFailures};
+use crate::s3::object::get::{GetObjectError, GetObjectResult};
+use crate::s3::object::read::HolderFailures;
 use aruna_core::holder_choice::{HolderChoiceOperation, pick};
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
