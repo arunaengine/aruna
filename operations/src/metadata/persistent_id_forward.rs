@@ -748,8 +748,8 @@ pub(crate) async fn apply_forwarded_pid(
             result: Ok(outcome),
         },
         Err(
-            crate::metadata::persistent_id::PersistentIdError::DocumentMissing
-            | crate::metadata::persistent_id::PersistentIdError::IntentMissing,
+            crate::metadata::id_mapping::PersistentIdError::DocumentMissing
+            | crate::metadata::id_mapping::PersistentIdError::IntentMissing,
         ) => MetadataTransportMessage::WriteNotFound,
         Err(error) => {
             warn!(%document_id, ?error, "Forwarded persistent id transition failed");
@@ -758,12 +758,10 @@ pub(crate) async fn apply_forwarded_pid(
     }
 }
 
-pub(super) fn pid_error(
-    error: crate::metadata::persistent_id::PersistentIdError,
-) -> MetadataApiError {
+pub(super) fn pid_error(error: crate::metadata::id_mapping::PersistentIdError) -> MetadataApiError {
     match error {
-        crate::metadata::persistent_id::PersistentIdError::DocumentMissing
-        | crate::metadata::persistent_id::PersistentIdError::IntentMissing => {
+        crate::metadata::id_mapping::PersistentIdError::DocumentMissing
+        | crate::metadata::id_mapping::PersistentIdError::IntentMissing => {
             MetadataApiError::NotFound
         }
         error => MetadataApiError::Internal(error.to_string()),

@@ -39,7 +39,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
+use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
 use crate::metadata::profile::validation::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
 };

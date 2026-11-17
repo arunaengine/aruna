@@ -24,10 +24,11 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::api::{MetadataApiError, can_read_record};
-use crate::metadata::persistent_id::{
-    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping,
-    read_mapping_effect, transition_entries,
+use crate::metadata::id_mapping::{
+    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping_effect,
+    transition_entries,
 };
+use crate::metadata::persistent_id::read_mapping;
 use crate::metadata::record_reads::load_document_record;
 use crate::storage_read::scan_pages;
 

@@ -30,7 +30,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::metadata::persistent_id::{
+use crate::metadata::id_mapping::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
 use crate::metadata::repository::{
