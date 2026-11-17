@@ -28,6 +28,7 @@ pub(crate) mod live_records;
 pub mod materialization_queue;
 pub(crate) mod object_version;
 pub mod persistent_id;
+pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projector;
 pub(crate) mod protocol;

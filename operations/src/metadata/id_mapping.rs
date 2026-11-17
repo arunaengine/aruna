@@ -110,7 +110,7 @@ pub(crate) fn mapping_placement(
 
 /// A context without a net handle replicates nothing, so its transitions record a
 /// fixed placeholder actor rather than inventing an identity.
-fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::NodeId {
+pub(crate) fn transition_actor(route: &Option<MappingRoute>) -> aruna_core::NodeId {
     route
         .as_ref()
         .map(|route| route.actor)
