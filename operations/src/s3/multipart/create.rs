@@ -750,15 +750,19 @@ impl Operation for CreateMultipartOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{CreateMultipartError, CreateMultipartInput, CreateMultipartOperation};
+    use super::{
+        CreateMultipartError, CreateMultipartInput, CreateMultipartOperation, CreateMultipartState,
+        Turn,
+    };
     use crate::groups::backends::BackendFenceError;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::BlobError;
-    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::events::{BlobEvent, Event};
     use aruna_core::keyspaces::{
-        ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE,
+        ABE_PENDING_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, PURGE_FENCE_KEYSPACE,
     };
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::{Operation, SubOperation};
     use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_core::structs::storage::abe::ObjectEnvelope;
     use aruna_core::structs::storage::backend_import::{PlainPath, tagged_path};
@@ -775,7 +779,6 @@ mod pure_tests {
         StorageRoutingRule,
     };
     use aruna_core::types::Effects;
-    use aruna_core::types::TxnId;
     use std::collections::BTreeSet;
     use ulid::Ulid;
 
@@ -790,27 +793,79 @@ mod pure_tests {
         }
     }
 
+    fn values(values: Vec<Option<Vec<u8>>>) -> IoResult {
+        IoResult::Values(
+            values
+                .into_iter()
+                .map(|value| value.map(Into::into))
+                .collect(),
+        )
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
     /// A bucket with no default refs, so the gate is skipped entirely.
-    fn ungoverned_bucket() -> Event {
+    fn ungoverned_bucket() -> IoResult {
         bucket_read(None, None)
     }
 
     /// Answers the bucket and settings read.
-    fn bucket_read(bucket: Option<Vec<u8>>, settings: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (b"bucket".to_vec().into(), bucket.map(Into::into)),
-                (b"bucket".to_vec().into(), settings.map(Into::into)),
-            ],
-        })
+    fn bucket_read(bucket: Option<Vec<u8>>, settings: Option<Vec<u8>>) -> IoResult {
+        values(vec![bucket, settings])
     }
 
     /// Answers the purge fence read with no fence held.
-    fn fence_clear() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: crate::s3::purge_fence::fence_key("bucket"),
-            value: None,
-        })
+    fn fence_clear() -> IoResult {
+        values(vec![None])
+    }
+
+    /// The settings reread inside the record transaction, for a bucket without encryption.
+    fn plain_settings() -> IoResult {
+        values(vec![None])
+    }
+
+    fn opened(backend_upload: Option<BackendUpload>) -> IoResult {
+        event(Event::Blob(BlobEvent::UploadOpened { backend_upload }))
+    }
+
+    fn call(turn: Turn) -> IoCall {
+        match turn {
+            Ok(Next::Call(call)) => call,
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    /// The effect a step asks the adapter for.
+    fn asked(turn: &Turn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => &**effect,
+            other => panic!("expected an effect, got {other:?}"),
+        }
+    }
+
+    /// The key space of the first row a step reads in the transaction.
+    fn space(turn: &Turn) -> &str {
+        match turn {
+            Ok(Next::Call(IoCall::Read(rows))) => &rows[0].0,
+            other => panic!("expected a read, got {other:?}"),
+        }
+    }
+
+    /// The reads of a step that reads outside the transaction, as a child run.
+    fn outside(turn: &mut Turn) -> Effects {
+        match turn {
+            Ok(Next::Call(IoCall::Child(child))) => child.start(),
+            other => panic!("expected a read outside the transaction, got {other:?}"),
+        }
+    }
+
+    fn written(turn: Turn) -> Vec<(String, aruna_core::types::Key, aruna_core::types::Value)> {
+        match call(turn) {
+            IoCall::Write(rows) => rows,
+            other => panic!("expected a write, got {other:?}"),
+        }
     }
 
     fn snapshot() -> RoutingSnapshot {
@@ -830,26 +885,25 @@ mod pure_tests {
         }
     }
 
+    /// Runs an ungoverned upload on a node backend up to its record write.
+    fn record_write(snapshot: RoutingSnapshot) -> MultipartUpload {
+        let mut operation = CreateMultipartOperation::new(input(snapshot));
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation.next(opened(None)).unwrap();
+        let turn = operation.next(fence_clear());
+        assert_eq!(space(&turn), BUCKET_ENCRYPTION_KEYSPACE);
+        let rows = written(operation.next(plain_settings()));
+        let [(_, _, value)] = rows.as_slice() else {
+            panic!("expected one record write, got {rows:?}")
+        };
+        MultipartUpload::from_bytes(value.as_ref()).unwrap()
+    }
+
     #[test]
     fn pins_record_backend() {
-        let snapshot = snapshot().with_bucket_rules(vec![rule("archive")]);
-        let mut operation = CreateMultipartOperation::new(input(snapshot));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        operation.step(fence_clear());
-        operation.step(opened(None));
-
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-
-        operation.step(fence_clear());
-        let effects = operation.step(plain_settings());
-
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one record write, got {effects:?}")
-        };
-        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        let record = record_write(snapshot().with_bucket_rules(vec![rule("archive")]));
         assert_eq!(record.backend, BackendRef::Node("tape".to_string()));
         assert_eq!(record.storage_class.as_deref(), Some("archive"));
     }
@@ -886,26 +940,22 @@ mod pure_tests {
             let mut input = input(snapshot);
             input.key = key.to_string();
             let mut operation = CreateMultipartOperation::new(input);
-            operation.start();
-            operation.step(ungoverned_bucket());
-            let effects = operation.step(fence_clear());
-            (operation, effects)
+            operation.first().unwrap();
+            operation.next(ungoverned_bucket()).unwrap();
+            let turn = operation.next(fence_clear());
+            (operation, turn)
         };
         // A plain key checks its exact key before the provider upload opens there.
         let (mut operation, _) = created("data/a.csv");
-        let effects = owner_answer(&mut operation, None);
+        let turn = owner_answer(&mut operation, None);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "team-a-bucket/data/a.csv"
+            asked(&turn),
+            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "team-a-bucket/data/a.csv"
         ));
         // A folder key or a key without a plain path never opens an upload.
         for key in ["reports/", "reports//a.csv"] {
-            let (operation, effects) = created(key);
-            assert!(effects.is_empty(), "{key}: {effects:?}");
-            assert!(matches!(
-                operation.finalize(),
-                Err(CreateMultipartError::Unmapped)
-            ));
+            let (_, turn) = created(key);
+            assert_eq!(turn.err(), Some(CreateMultipartError::Unmapped), "{key}");
         }
     }
 
@@ -914,7 +964,7 @@ mod pure_tests {
         // The blob side opens no provider upload for a compressed bucket, so the parts are
         // composed into frames.
         let mut operation = CreateMultipartOperation::new(input(snapshot()));
-        operation.start();
+        operation.first().unwrap();
         let bucket = aruna_core::structs::storage::blob::BucketInfo {
             group_id: Ulid::from_parts(1, 1),
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -926,36 +976,34 @@ mod pure_tests {
             compression: Compression::Zstd { level: 3 },
             distribution: None,
         };
-        operation.step(bucket_read(Some(bucket.to_bytes().unwrap()), None));
+        operation
+            .next(bucket_read(Some(bucket.to_bytes().unwrap()), None))
+            .unwrap();
 
-        let effects = operation.step(fence_clear());
+        let turn = operation.next(fence_clear());
 
-        let [Effect::Blob(BlobEffect::OpenUpload { resolved, .. })] = effects.as_slice() else {
-            panic!("expected the upload to open, got {effects:?}")
+        let Effect::Blob(BlobEffect::OpenUpload { resolved, .. }) = asked(&turn) else {
+            panic!("expected the upload to open, got {turn:?}")
         };
         assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
     }
 
     /// Opens an upload of a distributed bucket up to its transactional authority read.
     fn distributed_until_check(bucket: &[u8], record: &[u8]) -> CreateMultipartOperation {
-        use crate::distribution::test_record::authority_rows;
         let mut operation = CreateMultipartOperation::new(input(snapshot()));
-        operation.start();
-        operation.step(bucket_read(Some(bucket.to_vec()), None));
-        operation.step(authority_rows(Some(record.to_vec()), None));
-        operation.step(fence_clear());
-        operation.step(opened(None));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-        let effects = operation.step(fence_clear());
+        operation.first().unwrap();
+        operation
+            .next(bucket_read(Some(bucket.to_vec()), None))
+            .unwrap();
+        operation
+            .next(values(vec![Some(record.to_vec()), None]))
+            .unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation.next(opened(None)).unwrap();
+        let turn = operation.next(fence_clear());
         assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: Some(_) })]
-                    if reads.len() == 3
-            ),
-            "the transaction rereads bucket, record and fence: {effects:?}"
+            matches!(&turn, Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 3),
+            "the transaction rereads bucket, record and fence: {turn:?}"
         );
         operation
     }
@@ -977,18 +1025,11 @@ mod pure_tests {
             distribution: Some(binding),
         };
         let bucket = bucket.to_bytes().unwrap();
-        let rows = |fence: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (b"bucket".to_vec().into(), Some(bucket.clone().into())),
-                    (b"record".to_vec().into(), Some(bytes.clone().into())),
-                    (b"fence".to_vec().into(), fence.map(Into::into)),
-                ],
-            })
-        };
+        let rows =
+            |fence: Option<Vec<u8>>| values(vec![Some(bucket.clone()), Some(bytes.clone()), fence]);
         let mut open = distributed_until_check(&bucket, &bytes);
-        let effects = open.step(rows(None));
-        assert!(open.output.is_none(), "{effects:?}");
+        let turn = open.next(rows(None));
+        assert!(turn.is_ok(), "{turn:?}");
         // A transfer fence set after the first check refuses the upload in its transaction.
         let fence = LocalFence {
             ranges: vec![RangeFence {
@@ -1001,14 +1042,14 @@ mod pure_tests {
             ..LocalFence::default()
         };
         let mut fenced = distributed_until_check(&bucket, &bytes);
-        fenced.step(rows(Some(fence.to_bytes().unwrap())));
+        let turn = fenced.next(rows(Some(fence.to_bytes().unwrap())));
         assert!(matches!(
-            fenced.output,
-            Some(Err(CreateMultipartError::Distribution(
+            turn,
+            Err(CreateMultipartError::Distribution(
                 crate::distribution::guard::GuardError::Route(
                     aruna_core::structs::storage::distribution::RouteError::Moving(_)
                 )
-            )))
+            ))
         ));
     }
 
@@ -1027,33 +1068,31 @@ mod pure_tests {
         )
     }
 
-    /// Runs a sealed upload up to its record write and returns the effects of that step.
-    fn sealed_create(hint: Option<MultipartChecksumHint>) -> (CreateMultipartOperation, Effects) {
+    /// Runs a sealed upload up to its key record and returns the step after it.
+    fn sealed_create(hint: Option<MultipartChecksumHint>) -> (CreateMultipartOperation, Turn) {
         let (settings, record) = sealed_settings();
         let mut input = input(snapshot());
         input.checksum_hint = hint;
         let mut operation = CreateMultipartOperation::new(input);
-        operation.start();
-        let effects = operation.step(bucket_read(None, Some(settings.to_bytes().unwrap())));
-        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
-        else {
+        operation.first().unwrap();
+        let mut turn = operation.next(bucket_read(None, Some(settings.to_bytes().unwrap())));
+        let effects = outside(&mut turn);
+        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
             panic!("expected the key record read, got {effects:?}")
         };
-        assert_eq!(key_space, BUCKET_KEY_KEYSPACE);
-        assert_eq!(key.as_ref(), settings.active_key().unwrap().key());
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: key.clone(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
-        (operation, effects)
+        assert_eq!(reads[0].0, BUCKET_KEY_KEYSPACE);
+        assert_eq!(reads[0].1.as_ref(), settings.active_key().unwrap().key());
+        let turn = operation.next(values(vec![Some(record.to_bytes().unwrap())]));
+        (operation, turn)
     }
 
     /// Clears the open fence of a sealed upload and answers its ABE read and envelope effect.
-    fn open_sealed(operation: &mut CreateMultipartOperation) -> Effects {
+    fn open_sealed(operation: &mut CreateMultipartOperation) -> Turn {
         use aruna_core::structs::storage::abe::{
             AbeEffect, AbeEvent, create_envelope, create_parameters,
         };
-        let effects = operation.step(fence_clear());
+        let mut turn = operation.next(fence_clear());
+        let effects = outside(&mut turn);
         let [
             Effect::Storage(StorageEffect::BatchRead {
                 reads,
@@ -1063,30 +1102,27 @@ mod pure_tests {
         else {
             panic!("expected the ABE read, got {effects:?}")
         };
+        assert_eq!(reads.len(), 2);
         let key = sealed_settings().0.active_key().unwrap();
         let secret = aruna_core::compute::SecretBytes::new(vec![9; 32]);
         let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([3; 32]);
         let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let parameters = create_parameters(&secret, realm, node, key).unwrap();
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    reads[0].1.clone(),
-                    Some(parameters.to_bytes().unwrap().into()),
-                ),
-                (reads[1].1.clone(), Some(1u64.to_be_bytes().to_vec().into())),
-            ],
-        }));
-        let [Effect::Blob(BlobEffect::Abe(effect))] = effects.as_slice() else {
-            panic!("expected the envelope effect, got {effects:?}")
+        let answer = values(vec![
+            Some(parameters.to_bytes().unwrap()),
+            Some(1u64.to_be_bytes().to_vec()),
+        ]);
+        let turn = operation.next(answer);
+        let Effect::Blob(BlobEffect::Abe(effect)) = asked(&turn) else {
+            panic!("expected the envelope effect, got {turn:?}")
         };
         let AbeEffect::Envelope(plan) = effect.as_ref() else {
             panic!("expected an envelope plan, got {effect:?}")
         };
         assert_eq!(plan.bucket_public, [5; 32]);
         let (envelope, _) = create_envelope(plan.clone()).unwrap();
-        let event = AbeEvent::Envelope(envelope);
-        operation.step(Event::Blob(BlobEvent::Abe(Box::new(event))))
+        let created = AbeEvent::Envelope(envelope);
+        operation.next(event(Event::Blob(BlobEvent::Abe(Box::new(created)))))
     }
 
     #[test]
@@ -1095,32 +1131,13 @@ mod pure_tests {
         // Its pending envelope commits beside the record.
         let (settings, record) = sealed_settings();
         let (mut operation, _) = sealed_create(None);
-        let effects = open_sealed(&mut operation);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
-        let txn_id = TxnId::from_bytes([3u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(fence_clear());
-        let [
-            Effect::Storage(StorageEffect::Read {
-                key_space,
-                txn_id: read_txn,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the settings reread, got {effects:?}")
-        };
-        assert_eq!(key_space, BUCKET_ENCRYPTION_KEYSPACE);
-        assert_eq!(*read_txn, Some(txn_id));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(settings.to_bytes().unwrap().into()),
-        }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected the upload record, got {effects:?}")
+        let turn = open_sealed(&mut operation);
+        assert_eq!(space(&turn), PURGE_FENCE_KEYSPACE);
+        let turn = operation.next(fence_clear());
+        assert_eq!(space(&turn), BUCKET_ENCRYPTION_KEYSPACE);
+        let rows = written(operation.next(values(vec![Some(settings.to_bytes().unwrap())])));
+        let [(_, _, value)] = rows.as_slice() else {
+            panic!("expected the upload record, got {rows:?}")
         };
         let upload = MultipartUpload::from_bytes(value.as_ref()).unwrap();
         let plan = SealPlan::capture(&settings, &record).unwrap().unwrap();
@@ -1129,34 +1146,17 @@ mod pure_tests {
             Some(plan)
         );
         assert_eq!(upload.backend_upload, None);
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"upload".to_vec().into(),
-        }));
-        let effects = counted(&mut operation);
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: write_txn,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected the pending envelope, got {effects:?}")
+        operation.next(IoResult::Done).unwrap();
+        let rows = written(counted(&mut operation));
+        let [(key_space, key, value)] = rows.as_slice() else {
+            panic!("expected the pending envelope, got {rows:?}")
         };
         assert_eq!(key_space, ABE_PENDING_KEYSPACE);
         assert_eq!(key.as_ref(), upload.upload_id.to_bytes());
-        assert_eq!(*write_txn, Some(txn_id));
         let envelope = ObjectEnvelope::from_bytes(value.as_ref()).unwrap();
         assert_eq!(envelope.context.object_key, upload.key);
         assert_eq!(envelope.context.epoch, 1);
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: key.clone(),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        );
+        assert!(matches!(operation.next(IoResult::Done), Ok(Next::Done(_))));
     }
 
     #[test]
@@ -1164,48 +1164,31 @@ mod pure_tests {
         // A generation without admitted parameters commits its record without an envelope.
         let (settings, _) = sealed_settings();
         let (mut operation, _) = sealed_create(None);
-        let effects = operation.step(fence_clear());
-        let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
-            panic!("expected the ABE read, got {effects:?}")
-        };
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: reads.iter().map(|(_, key)| (key.clone(), None)).collect(),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
-        let txn_id = TxnId::from_bytes([3u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(fence_clear());
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(settings.to_bytes().unwrap().into()),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: b"upload".to_vec().into(),
-        }));
-        assert_eq!(operation.state, super::CreateMultipartState::CountUpload);
-        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
-            panic!("expected the upload count, got {effects:?}")
+        let mut turn = operation.next(fence_clear());
+        assert_eq!(outside(&mut turn).len(), 1);
+        let turn = operation.next(values(vec![None, None]));
+        assert_eq!(space(&turn), PURGE_FENCE_KEYSPACE);
+        operation.next(fence_clear()).unwrap();
+        operation
+            .next(values(vec![Some(settings.to_bytes().unwrap())]))
+            .unwrap();
+        let turn = operation.next(IoResult::Done);
+        assert_eq!(operation.state, CreateMultipartState::CountUpload);
+        let Ok(Next::Call(IoCall::AddUsage { buckets, .. })) = turn else {
+            panic!("expected the upload count, got {turn:?}")
         };
         let uploads: Vec<_> = buckets
             .iter()
             .map(|(_, delta)| delta.open_uploads)
             .collect();
         assert_eq!(uploads, [1]);
-        assert_eq!(
-            counted(&mut operation).as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        );
+        assert!(matches!(counted(&mut operation), Ok(Next::Done(_))));
     }
 
     /// Settles the open upload count the record write books.
-    fn counted(operation: &mut CreateMultipartOperation) -> aruna_core::types::Effects {
-        assert_eq!(operation.state, super::CreateMultipartState::CountUpload);
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }))
+    fn counted(operation: &mut CreateMultipartOperation) -> Turn {
+        assert_eq!(operation.state, CreateMultipartState::CountUpload);
+        operation.next(IoResult::Done)
     }
 
     #[test]
@@ -1213,23 +1196,11 @@ mod pure_tests {
         // A key generation that moved before the record commits fails the upload.
         let (mut settings, _) = sealed_settings();
         let (mut operation, _) = sealed_create(None);
-        open_sealed(&mut operation);
-        let txn_id = TxnId::from_bytes([3u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(fence_clear());
+        open_sealed(&mut operation).unwrap();
+        operation.next(fence_clear()).unwrap();
         settings.key_generation = 3;
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(settings.to_bytes().unwrap().into()),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        );
-        assert!(matches!(
-            operation.finalize(),
-            Err(CreateMultipartError::BucketKey(_))
-        ));
+        let turn = operation.next(values(vec![Some(settings.to_bytes().unwrap())]));
+        assert!(matches!(turn, Err(CreateMultipartError::BucketKey(_))));
     }
 
     #[test]
@@ -1239,89 +1210,92 @@ mod pure_tests {
             algorithm: Some(algorithm),
             checksum_type: MultipartChecksumType::FullObject,
         };
-        let (operation, _) = sealed_create(Some(hint(ChecksumAlgorithm::Sha256)));
+        let (_, turn) = sealed_create(Some(hint(ChecksumAlgorithm::Sha256)));
         assert_eq!(
-            operation.finalize(),
-            Err(CreateMultipartError::UnsupportedChecksum("SHA256"))
+            turn.err(),
+            Some(CreateMultipartError::UnsupportedChecksum("SHA256"))
         );
         let (mut operation, _) = sealed_create(Some(hint(ChecksumAlgorithm::Crc64Nvme)));
-        let effects = open_sealed(&mut operation);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
-        ));
+        let turn = open_sealed(&mut operation);
+        assert_eq!(space(&turn), PURGE_FENCE_KEYSPACE);
     }
 
     #[test]
     fn missing_class_pins() {
         // The pin records where the parts actually land, not what was asked.
-        let snapshot = snapshot().with_bucket_rules(vec![rule("glacier")]);
-        let mut operation = CreateMultipartOperation::new(input(snapshot));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        operation.step(fence_clear());
-        operation.step(opened(None));
-
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
-
-        operation.step(fence_clear());
-        let effects = operation.step(plain_settings());
-
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected one record write, got {effects:?}")
-        };
-        let record = MultipartUpload::from_bytes(value.as_ref()).unwrap();
+        let record = record_write(snapshot().with_bucket_rules(vec![rule("glacier")]));
         assert_eq!(record.backend, BackendRef::Node("default".to_string()));
         assert_eq!(record.storage_class, None);
     }
 
-    #[test]
-    fn refuses_disabled_backend() {
-        // The pinned backend must not outlive the tenant disabling it.
-        let backend_id = Ulid::from_bytes([5u8; 16]);
+    /// Runs an upload on the group backend `backend_id` up to its backend fence.
+    fn group_create(backend_id: Ulid, upload: Option<BackendUpload>) -> CreateMultipartOperation {
         let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
             default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
             backend_ids: BTreeSet::from([backend_id]),
             ..Default::default()
         });
         let mut operation = CreateMultipartOperation::new(input(snapshot));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        operation.step(fence_clear());
-        operation.step(opened(None));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(3),
-        }));
-        operation.step(fence_clear());
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
-        }));
-
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-            ),
-            "expected an abort, got {effects:?}"
-        );
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        let turn = operation.next(fence_clear());
         assert!(matches!(
-            operation.finalize(),
-            Err(CreateMultipartError::BackendFenceError(
-                BackendFenceError::Unavailable
-            ))
+            asked(&turn),
+            Effect::Blob(BlobEffect::OpenUpload { .. })
         ));
+        operation.next(opened(upload)).unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation
     }
 
-    /// The settings reread inside the record transaction, for a bucket without encryption.
-    fn plain_settings() -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: None,
-        })
+    #[test]
+    fn refuses_disabled_backend() {
+        // The pinned backend must not outlive the tenant disabling it.
+        let backend_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation = group_create(backend_id, None);
+
+        let turn = operation.next(values(vec![Some(disabled(backend_id).to_bytes().unwrap())]));
+
+        assert_eq!(
+            turn.err(),
+            Some(CreateMultipartError::BackendFenceError(
+                BackendFenceError::Unavailable
+            ))
+        );
+        assert!(operation.abort().is_empty());
+    }
+
+    fn provider_upload(backend: BackendRef, storage_bucket: &str) -> BackendUpload {
+        BackendUpload {
+            location: aruna_core::structs::storage::blob::BackendLocation {
+                backend,
+                storage_class: None,
+                root: "/".to_string(),
+                storage_bucket: storage_bucket.to_string(),
+                backend_path: "bucket/key".to_string(),
+                ulid: Ulid::from_bytes([6u8; 16]),
+                format: aruna_core::structs::storage::format::StoredFormat::default(),
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 0,
+                hashes: std::collections::HashMap::new(),
+            },
+            upload_id: "provider".to_string(),
+            record_id: Ulid::from_bytes([9u8; 16]),
+        }
+    }
+
+    /// The provider upload `calls` abort.
+    fn aborted(calls: &[IoCall]) -> Option<&BackendUpload> {
+        match calls {
+            [IoCall::Effect(effect)] => match &**effect {
+                Effect::Blob(BlobEffect::AbortUpload { backend_upload }) => Some(&**backend_upload),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     #[test]
@@ -1329,134 +1303,59 @@ mod pure_tests {
         // Encryption enabled while the provider upload opened, before any upload row existed:
         // the plain upload never records and its provider upload is aborted.
         let mut operation = CreateMultipartOperation::new(input(snapshot()));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        operation.step(fence_clear());
-        let upload = BackendUpload {
-            location: aruna_core::structs::storage::blob::BackendLocation {
-                backend: BackendRef::node_default(),
-                storage_class: None,
-                root: "/".to_string(),
-                storage_bucket: "bucket".to_string(),
-                backend_path: "bucket/key".to_string(),
-                ulid: Ulid::from_bytes([6u8; 16]),
-                format: aruna_core::structs::storage::format::StoredFormat::default(),
-                created_by: aruna_core::UserId::default(),
-                created_at: std::time::SystemTime::UNIX_EPOCH,
-                staging: false,
-                partial: false,
-                blob_size: 0,
-                hashes: std::collections::HashMap::new(),
-            },
-            upload_id: "provider".to_string(),
-            record_id: Ulid::from_bytes([9u8; 16]),
-        };
-        operation.step(opened(Some(upload.clone())));
-        let txn_id = TxnId::from_bytes([3u8; 16]);
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(fence_clear());
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        operation.next(fence_clear()).unwrap();
+        let upload = provider_upload(BackendRef::node_default(), "bucket");
+        operation.next(opened(Some(upload.clone()))).unwrap();
+        operation.next(fence_clear()).unwrap();
         let (settings, _) = sealed_settings();
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(settings.to_bytes().unwrap().into()),
-        }));
+        let turn = operation.next(values(vec![Some(settings.to_bytes().unwrap())]));
 
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [
-                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
-                    Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
-                ] if **backend_upload == upload
-            ),
-            "expected the record and provider upload to be dropped, got {effects:?}"
-        );
-        assert!(matches!(
-            operation.pending_error,
-            Some(CreateMultipartError::BucketKey(_))
-        ));
-    }
-
-    fn opened(backend_upload: Option<BackendUpload>) -> Event {
-        Event::Blob(BlobEvent::UploadOpened { backend_upload })
+        assert!(matches!(turn, Err(CreateMultipartError::BucketKey(_))));
+        assert_eq!(aborted(&operation.abort()), Some(&upload));
     }
 
     #[test]
     fn refusal_aborts_provider() {
         // A record that never commits must not strand the provider upload it opened.
         let backend_id = Ulid::from_bytes([5u8; 16]);
-        let snapshot = snapshot().with_group_inputs(GroupRoutingInputs {
-            default_target: Some(RoutingTarget::Backend(BackendRef::Group(backend_id))),
-            backend_ids: BTreeSet::from([backend_id]),
-            ..Default::default()
-        });
-        let mut operation = CreateMultipartOperation::new(input(snapshot));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        let effects = operation.step(fence_clear());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::OpenUpload { .. })]
-        ));
-        let upload = BackendUpload {
-            location: aruna_core::structs::storage::blob::BackendLocation {
-                backend: BackendRef::Group(backend_id),
-                storage_class: None,
-                root: "/".to_string(),
-                storage_bucket: "tenant".to_string(),
-                backend_path: "bucket/key".to_string(),
-                ulid: Ulid::from_bytes([6u8; 16]),
-                format: aruna_core::structs::storage::format::StoredFormat::default(),
-                created_by: aruna_core::UserId::default(),
-                created_at: std::time::SystemTime::UNIX_EPOCH,
-                staging: false,
-                partial: false,
-                blob_size: 0,
-                hashes: std::collections::HashMap::new(),
-            },
-            upload_id: "provider".to_string(),
-            record_id: Ulid::from_bytes([9u8; 16]),
-        };
-        operation.step(opened(Some(upload.clone())));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from(3),
-        }));
-        operation.step(fence_clear());
+        let upload = provider_upload(BackendRef::Group(backend_id), "tenant");
+        let mut operation = group_create(backend_id, Some(upload.clone()));
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(disabled(backend_id).to_bytes().unwrap().into()),
-        }));
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [
-                    Effect::Storage(StorageEffect::AbortTransaction { .. }),
-                    Effect::Blob(BlobEffect::AbortUpload { backend_upload }),
-                ] if **backend_upload == upload
-            ),
-            "expected both aborts, got {effects:?}"
-        );
-        assert!(!operation.is_complete());
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TxnId::from(3),
-        }));
-        operation.step(Event::Blob(BlobEvent::UploadAborted));
+        let turn = operation.next(values(vec![Some(disabled(backend_id).to_bytes().unwrap())]));
 
-        assert!(matches!(
-            operation.finalize(),
-            Err(CreateMultipartError::BackendFenceError(
+        assert_eq!(
+            turn.err(),
+            Some(CreateMultipartError::BackendFenceError(
                 BackendFenceError::Unavailable
             ))
-        ));
+        );
+        assert_eq!(aborted(&operation.abort()), Some(&upload));
+    }
+
+    #[test]
+    fn commit_keeps_provider() {
+        // A commit that was sent may have recorded the upload, which then owns its provider upload.
+        let mut operation = CreateMultipartOperation::new(input(snapshot()));
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        operation.next(fence_clear()).unwrap();
+        let upload = provider_upload(BackendRef::node_default(), "bucket");
+        operation.next(opened(Some(upload))).unwrap();
+        operation.next(fence_clear()).unwrap();
+        operation.next(plain_settings()).unwrap();
+        operation.next(IoResult::Done).unwrap();
+        assert!(matches!(operation.next(IoResult::Done), Ok(Next::Done(_))));
+        assert!(operation.abort().is_empty());
     }
 
     /// An import rule writing `archive/` keys of `bucket` to `raw/` with `pattern`.
-    fn plain_create(pattern: &str) -> (CreateMultipartOperation, Effects) {
+    fn plain_create(pattern: &str) -> (CreateMultipartOperation, Turn) {
         plain_create_at(pattern, None)
     }
 
-    fn plain_create_at(pattern: &str, folder: Option<&str>) -> (CreateMultipartOperation, Effects) {
+    fn plain_create_at(pattern: &str, folder: Option<&str>) -> (CreateMultipartOperation, Turn) {
         let backend_id = Ulid::from_bytes([5u8; 16]);
         let rule = aruna_core::structs::storage::backend_import::BackendImport {
             import_id: Ulid::from_bytes([4u8; 16]),
@@ -1482,14 +1381,14 @@ mod pure_tests {
             ..Default::default()
         });
         let mut operation = CreateMultipartOperation::new(input(snapshot));
-        operation.start();
-        operation.step(ungoverned_bucket());
-        let effects = operation.step(fence_clear());
-        (operation, effects)
+        operation.first().unwrap();
+        operation.next(ungoverned_bucket()).unwrap();
+        let turn = operation.next(fence_clear());
+        (operation, turn)
     }
 
     /// Answers the read of the rule's record at the plain path with a row for `key`.
-    fn owner_answer(operation: &mut CreateMultipartOperation, key: Option<&str>) -> Effects {
+    fn owner_answer(operation: &mut CreateMultipartOperation, key: Option<&str>) -> Turn {
         let row = key.map(|key| {
             let id = Ulid::from_parts(8, 8);
             let row = aruna_core::structs::storage::backend_import::ImportedObject::written(
@@ -1498,22 +1397,17 @@ mod pure_tests {
                 1,
                 None,
             );
-            row.to_bytes().unwrap().into()
+            row.to_bytes().unwrap()
         });
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: row,
-        }))
+        operation.next(values(vec![row]))
     }
 
-    fn opened_plain(effects: &Effects) -> PlainPath {
-        match effects.as_slice() {
-            [
-                Effect::Blob(BlobEffect::OpenUpload {
-                    plain: Some(plain), ..
-                }),
-            ] => plain.clone(),
-            _ => panic!("expected a plain provider upload, got {effects:?}"),
+    fn opened_plain(turn: &Turn) -> PlainPath {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::OpenUpload {
+                plain: Some(plain), ..
+            }) => plain.clone(),
+            other => panic!("expected a plain provider upload, got {other:?}"),
         }
     }
 
@@ -1530,24 +1424,18 @@ mod pure_tests {
             (None, true, Some("v1".to_string()), true, true),
         ];
         for (owner, exists, version, tagged, if_not_exists) in cases {
-            let (mut operation, effects) = plain_create("{dir}{name}");
+            let (mut operation, mut turn) = plain_create("{dir}{name}");
+            assert_eq!(outside(&mut turn).len(), 1, "expected the owner read");
+            let turn = owner_answer(&mut operation, owner);
             assert!(
                 matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::Read { .. })]
+                    asked(&turn),
+                    Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/one"
                 ),
-                "expected the owner read, got {effects:?}"
+                "expected the path stat, got {turn:?}"
             );
-            let effects = owner_answer(&mut operation, owner);
-            assert!(
-                matches!(
-                    effects.as_slice(),
-                    [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "raw/one"
-                ),
-                "expected the path stat, got {effects:?}"
-            );
-            let effects = operation.step(Event::Blob(BlobEvent::PlainStat { exists, version }));
-            let plain = opened_plain(&effects);
+            let stat = BlobEvent::PlainStat { exists, version };
+            let plain = opened_plain(&operation.next(event(Event::Blob(stat))));
             let expected = match tagged {
                 true => tagged_path("raw/one", plain.ulid),
                 false => "raw/one".to_string(),
@@ -1560,40 +1448,41 @@ mod pure_tests {
     #[test]
     fn tags_unrecorded_path() {
         // A separate write folder has no record to prove the file there the upload's own.
-        let (mut operation, effects) = plain_create_at("{dir}{name}", Some("out/"));
+        let (mut operation, turn) = plain_create_at("{dir}{name}", Some("out/"));
         assert!(
             matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::StatPlain { path, .. })] if path == "out/one"
+                asked(&turn),
+                Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "out/one"
             ),
-            "expected the path stat, got {effects:?}"
+            "expected the path stat, got {turn:?}"
         );
-        let effects = operation.step(Event::Blob(BlobEvent::PlainStat {
+        let stat = BlobEvent::PlainStat {
             exists: true,
             version: Some("v1".to_string()),
-        }));
-        let plain = opened_plain(&effects);
+        };
+        let plain = opened_plain(&operation.next(event(Event::Blob(stat))));
         assert_eq!(plain.path, tagged_path("out/one", plain.ulid));
     }
 
     #[test]
     fn opens_versioned_path() {
         // An `{id}` pattern names a path of its own, fixed by the version id picked now.
-        let (_, effects) = plain_create("{id}_{name}");
-        let plain = opened_plain(&effects);
+        let (_, turn) = plain_create("{id}_{name}");
+        let plain = opened_plain(&turn);
         assert_eq!(plain.path, format!("raw/{}_one", plain.ulid));
     }
 
     #[test]
     fn plain_stat_fails() {
         let (mut operation, _) = plain_create("{dir}{name}");
-        owner_answer(&mut operation, None);
-        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::KeyTooLong)));
-        assert!(effects.is_empty(), "nothing was opened yet: {effects:?}");
-        assert!(matches!(
-            operation.finalize(),
-            Err(CreateMultipartError::BlobError(BlobError::KeyTooLong))
-        ));
+        owner_answer(&mut operation, None).unwrap();
+        let failed = BlobEvent::Error(BlobError::KeyTooLong);
+        let turn = operation.next(event(Event::Blob(failed)));
+        assert_eq!(
+            turn.err(),
+            Some(CreateMultipartError::BlobError(BlobError::KeyTooLong))
+        );
+        assert!(operation.abort().is_empty(), "nothing was opened yet");
     }
 
     fn disabled(backend_id: Ulid) -> GroupStorage {
@@ -1621,12 +1510,10 @@ mod pure_tests {
         }]);
         let mut operation = CreateMultipartOperation::new(input(snapshot));
 
-        let effects = operation.start();
+        let turn = operation.first();
 
-        assert!(effects.is_empty(), "expected no effects, got {effects:?}");
-        assert!(operation.is_complete());
         assert!(matches!(
-            operation.finalize(),
+            turn,
             Err(CreateMultipartError::RoutingFailed(
                 RoutingError::UnknownBackend(_)
             ))
