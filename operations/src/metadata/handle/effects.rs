@@ -13,27 +13,42 @@ use tracing::{Instrument, Span, debug_span, field};
 
 use super::lifecycle::{effect_rejects_deleted, metadata_graph_deleted};
 use super::search::list_visible_graphs;
-use super::{handles, metadata_graph_fence};
+use super::{MetadataHandle, metadata_graph_fence};
 use crate::driver::DriverContext;
 use crate::metadata::protocol::MetadataReadError;
 
 /// Runs one metadata effect on this node's graph store and answers with its event.
 pub async fn send_metadata_effect(context: &DriverContext, effect: MetadataEffect) -> Event {
-    let started = Instant::now();
-    let event = run_effect(context, effect).await;
-    aruna_core::telemetry::record_stage("craqle", started.elapsed());
-    Event::Metadata(event)
+    match &context.metadata_handle {
+        Some(metadata) => metadata.run_effect(context, effect).await,
+        None => Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        }),
+    }
 }
 
-async fn run_effect(context: &DriverContext, effect: MetadataEffect) -> MetadataEvent {
-    let (metadata, graph) = match handles(context) {
-        Ok(handles) => handles,
-        Err(error) => {
-            return MetadataEvent::Error {
-                graph_iri: None,
-                error,
-            };
-        }
+impl MetadataHandle {
+    /// Runs one metadata effect on the graph store of `context`, after the graph fence
+    /// and the deleted-graph check.
+    pub(crate) async fn run_effect(&self, context: &DriverContext, effect: MetadataEffect) -> Event {
+        let started = Instant::now();
+        let event = run_effect(self, context, effect).await;
+        aruna_core::telemetry::record_stage("craqle", started.elapsed());
+        Event::Metadata(event)
+    }
+}
+
+async fn run_effect(
+    metadata: &MetadataHandle,
+    context: &DriverContext,
+    effect: MetadataEffect,
+) -> MetadataEvent {
+    let Some(graph) = context.graph_handle.as_ref() else {
+        return MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        };
     };
     let graph_iri = effect.graph_iri();
     let _graph_fence = match graph_iri.as_deref() {

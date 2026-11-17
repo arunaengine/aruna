@@ -360,7 +360,7 @@ pub(super) async fn read_graph_state(
         .await
         .map_err(sync_refusal)?;
     let graph_iri = record.graph_iri.clone();
-    let snapshot = match crate::metadata::send_metadata_effect(context, MetadataEffect::GraphSnapshot { graph_iri })
+    let snapshot = match metadata.run_effect(context, MetadataEffect::GraphSnapshot { graph_iri })
         .await
     {
         Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
@@ -403,7 +403,7 @@ async fn scaffold_display(
     record: &MetadataRegistryRecord,
     snapshot: &GraphReplicaSnapshot,
 ) -> Result<String, SyncRefusal> {
-    context
+    let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
@@ -415,7 +415,7 @@ async fn scaffold_display(
     }
     let Event::Metadata(MetadataEvent::VersionedExport {
         jsonld, version, ..
-    }) = crate::metadata::send_metadata_effect(context, MetadataEffect::ExportVersioned {
+    }) = metadata.run_effect(context, MetadataEffect::ExportVersioned {
             graph_iri: record.graph_iri.clone(),
         })
         .await
@@ -516,12 +516,12 @@ pub(super) async fn run_device_batch(
         })?;
     // An edit whose dependencies never reached this holder would wait in its log forever;
     // the device retries it instead, or learns the dependency was refused.
-    context
+    let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     for (actor, counter) in &batch.base_clock.0 {
-        let known = crate::metadata::send_metadata_effect(context, MetadataEffect::ContainsDot {
+        let known = metadata.run_effect(context, MetadataEffect::ContainsDot {
                 graph_iri: record.graph_iri.clone(),
                 actor: actor.0,
                 counter: *counter,

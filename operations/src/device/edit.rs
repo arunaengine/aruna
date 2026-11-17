@@ -197,11 +197,11 @@ async fn plan_local(
     dot: ([u8; 32], u64),
 ) -> Result<MetadataBatch, DeviceEditError> {
     let (actor, counter) = dot;
-    context
+    let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match crate::metadata::send_metadata_effect(context, MetadataEffect::PlanBatch {
+    match metadata.run_effect(context, MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor,
             counter,
@@ -230,11 +230,11 @@ async fn merge_local(
     context: &Arc<DriverContext>,
     batch: &MetadataBatch,
 ) -> Result<(), DeviceEditError> {
-    context
+    let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match crate::metadata::send_metadata_effect(context, MetadataEffect::MergeBatch {
+    match metadata.run_effect(context, MetadataEffect::MergeBatch {
             graph_iri: batch.graph_iri.clone(),
             batch: batch.clone(),
         })
@@ -250,16 +250,20 @@ async fn merge_local(
 
 /// The render of the merged graph this device displays from now on.
 async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String, DeviceEditError> {
-    context
+    let metadata = context
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    crate::metadata::export_rocrate_jsonld(context, graph_iri.to_string())
-        .await
-        .map_err(|error| {
-            warn!(error = %error, "Could not render an edited replica");
-            DeviceEditError::Unavailable
-        })
+    let export = MetadataEffect::ExportRoCrate {
+        graph_iri: graph_iri.to_string(),
+    };
+    match metadata.run_effect(context, export).await {
+        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => Ok(jsonld),
+        other => {
+            warn!(event = ?other, "Could not render an edited replica");
+            Err(DeviceEditError::Unavailable)
+        }
+    }
 }
 
 /// Wakes the publish drain so a reachable realm sees the edit at once.
@@ -301,9 +305,9 @@ pub fn replays_edit(entry: &PublishEntry) -> bool {
 ///
 /// A crash between the WAL write and persist can leave the graph behind; merging is idempotent by dot.
 pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
-    if context.metadata_handle.is_none() {
+    let Some(metadata) = context.metadata_handle.as_ref() else {
         return 0;
-    }
+    };
     let mut replayed = 0usize;
     for entry in read_publish_entries(context).await {
         let PublishKind::Edit { batch, .. } = &entry.kind else {
@@ -312,7 +316,7 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         if !replays_edit(&entry) {
             continue;
         }
-        match crate::metadata::send_metadata_effect(context, MetadataEffect::MergeBatch {
+        match metadata.run_effect(context, MetadataEffect::MergeBatch {
                 graph_iri: batch.graph_iri.clone(),
                 batch: (**batch).clone(),
             })
@@ -440,7 +444,7 @@ let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(),
                 .metadata_handle
                 .as_ref()
                 .unwrap()
-                .send_metadata_effect(MetadataEffect::CreateCrate {
+                .run_effect(&context, MetadataEffect::CreateCrate {
                     request: MetadataCrateRequest {
                         graph_iri: record.graph_iri.clone(),
                         name: "Notes".to_string(),
@@ -635,9 +639,7 @@ let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(),
             ReplicaOrigin::Realm,
         );
         replica.record = Some(Box::new(record.clone()));
-        let before = crate::metadata::export_rocrate_jsonld(&context, record.graph_iri.clone())
-            .await
-            .unwrap();
+        let before = super::render(&context, &record.graph_iri).await.unwrap();
 
         assert_eq!(
             apply_local_edit(
@@ -658,9 +660,7 @@ let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(),
         // The refused edit must not consume a dot either.
         assert_eq!(read_actor(&context, record.document_id).await, Ok(None));
         assert_eq!(
-            crate::metadata::export_rocrate_jsonld(&context, record.graph_iri.clone())
-                .await
-                .unwrap(),
+            super::render(&context, &record.graph_iri).await.unwrap(),
             before
         );
     }
