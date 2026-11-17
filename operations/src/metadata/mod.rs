@@ -97,7 +97,7 @@ pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
 pub use handle::{
     MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, export_rocrate_page,
     export_summary_jsonld, list_cached_group, list_cached_records, list_group_records,
-    prune_deleted_graphs, prune_if_deleted, query_authorized_local, reconcile_document_sync,
+    prune_if_deleted, query_authorized_local,
     search_authorized_local, search_local_filtered, send_metadata_effect, warm_caches,
 };
 pub(crate) use handle::{WritePeerError, transport_message_kind};

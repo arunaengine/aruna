@@ -24,7 +24,7 @@ use tracing::{Span, field, warn};
 use ulid::Ulid;
 
 use super::{
-    GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, LifecycleDeletedEntry, MetadataInner,
+    GRAPH_SYNC_AFTER, GRAPH_SYNC_ATTEMPTS, LifecycleDeletedEntry, MetadataHandle, MetadataInner,
     MetadataVisibilityCache, REGISTRY_CANDIDATE_LIMIT, RegistryCacheEntry, VISIBILITY_CACHE_TTL,
     VisibilityFillResult, handles, metadata_graph_fence,
 };
@@ -414,19 +414,6 @@ impl MetadataVisibilityCache {
     }
 }
 
-/// Applies document sync updates from peers; returns how many graphs changed.
-pub async fn reconcile_document_sync(context: &DriverContext) -> Result<usize, MetadataError> {
-    let (metadata, graph) = handles(context)?;
-    let applied = graph.reconcile().await?;
-    // Peer sync invalidates summaries because their cursor may precede newly applied content.
-    if !applied.is_empty() {
-        metadata.inner.query_cache.bump_apply();
-        for graph in &applied {
-            summary_cache().remove(graph);
-        }
-    }
-    Ok(applied.len())
-}
 
 /// Removes the local copy of `graph_iri` when its lifecycle record says it is deleted.
 pub async fn prune_if_deleted(
@@ -455,16 +442,41 @@ pub async fn prune_if_deleted(
     Ok(true)
 }
 
-/// Removes the local copy of every deleted graph; returns how many were removed.
-pub async fn prune_deleted_graphs(context: &DriverContext) -> Result<usize, MetadataError> {
-    let (_, graph) = handles(context)?;
-    let mut pruned = 0usize;
-    for graph_iri in graph.graphs().await? {
-        if prune_if_deleted(context, graph_iri).await? {
-            pruned += 1;
+impl MetadataHandle {
+    /// Applies document sync updates from peers; returns how many graphs changed.
+    pub async fn reconcile_document_sync(
+        &self,
+        context: &DriverContext,
+    ) -> Result<usize, MetadataError> {
+        let graph = context
+            .graph_handle
+            .as_ref()
+            .ok_or(MetadataError::HandleMissing)?;
+        let applied = graph.reconcile().await?;
+        // Peer sync invalidates summaries because their cursor may precede newly applied content.
+        if !applied.is_empty() {
+            self.inner.query_cache.bump_apply();
+            for graph in &applied {
+                summary_cache().remove(graph);
+            }
         }
+        Ok(applied.len())
     }
-    Ok(pruned)
+
+    /// Removes the local copy of every deleted graph; returns how many were removed.
+    pub async fn prune_deleted_graphs(&self, context: &DriverContext) -> Result<usize, MetadataError> {
+        let graph = context
+            .graph_handle
+            .as_ref()
+            .ok_or(MetadataError::HandleMissing)?;
+        let mut pruned = 0usize;
+        for graph_iri in graph.graphs().await? {
+            if prune_if_deleted(context, graph_iri).await? {
+                pruned += 1;
+            }
+        }
+        Ok(pruned)
+    }
 }
 
 pub(super) fn sync_best_effort(

@@ -48,12 +48,10 @@ pub use self::effects::{
     export_rocrate_jsonld, export_rocrate_page, export_summary_jsonld, send_metadata_effect,
 };
 pub use self::lifecycle::{
-    list_cached_group, list_cached_records, list_group_records, prune_deleted_graphs,
-    prune_if_deleted, reconcile_document_sync, warm_caches,
+    list_cached_group, list_cached_records, list_group_records, prune_if_deleted, warm_caches,
 };
 pub use self::query::query_authorized_local;
 pub use self::search::{search_authorized_local, search_local_filtered};
-pub(crate) use self::ingress::write_answer;
 pub(crate) use self::transport::transport_message_kind;
 mod ingress;
 mod lifecycle;

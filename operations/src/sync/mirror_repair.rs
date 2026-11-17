@@ -33,7 +33,7 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::metadata::AuthToken;
+use aruna_core::metadata::AuthToken;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, StoreRelationshipOperation, SyncRelationshipDirection,

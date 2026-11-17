@@ -4,7 +4,7 @@
 
 use super::peer_auth::authorize_peer;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::metadata::MetadataError;
@@ -25,7 +25,7 @@ use super::query::query_local_graphs;
 use super::search::{clamp_remote_limit, search_local_graphs};
 use super::transport::{
     close_stream, close_stream_at, drain_request_stream, drain_stream_at, metadata_body_limit,
-    read_budget, write_body_at, write_message_at, write_stream_body,
+    read_budget, transport_message_kind, write_body_at, write_message_at, write_stream_body,
     write_transport_message,
 };
 use super::{
@@ -1039,12 +1039,20 @@ impl MetadataHandle {
         }
     }
 
-    /// Reads one request frame from an inbound metadata stream under the shared frame budget.
-    pub(crate) async fn read_request(
-        &self,
-        stream: &mut BiStream,
-    ) -> Result<(MetadataTransportMessage, tokio::sync::OwnedSemaphorePermit), MetadataError> {
-        read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await
+    /// Reads one request frame from an inbound metadata stream under the shared frame budget
+    /// and names it on the current span. Returns the deadline an audit request keeps.
+    pub(crate) async fn read_request(&self, stream: &mut BiStream) -> Result<InboundRequest, MetadataError> {
+        let audit_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(super::super::audit::AUDIT_DEADLINE_SECS);
+        let (message, budget) = read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await?;
+        Span::current().record("request", transport_message_kind(&message));
+        let audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
+        Ok(InboundRequest {
+            message,
+            budget,
+            audit_deadline,
+            audit,
+        })
     }
 
     /// Answers one metadata request from `peer`; requests of other domains are rejected.
@@ -1158,6 +1166,47 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::SetPreviewResults { result }, None)
             }
+            MetadataTransportMessage::StagingSpec {
+                transfer_id,
+                job_id,
+            } => {
+                let job = (transfer_id, job_id);
+                let spec = crate::distribution::imports::staging_spec(context, peer, job);
+                let result = spec.await.map(Box::new);
+                (MetadataTransportMessage::StagingSpecResult { result }, None)
+            }
+            MetadataTransportMessage::ReferencePage { page } => {
+                let answer = Box::pin(crate::replication::page::deliver::serve_page(
+                    context, peer, *page,
+                ));
+                let answer = answer.await;
+                (MetadataTransportMessage::ReferencePageAnswer { answer }, None)
+            }
+            MetadataTransportMessage::HandRealmKey { key } => {
+                let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);
+                let result = Box::pin(stored).await;
+                (MetadataTransportMessage::RealmKeyStored { result }, None)
+            }
+            MetadataTransportMessage::RealmSecret { entry, revision } => {
+                let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
+                let key = self.realm_vault_key();
+                let served =
+                    crate::realm_vault::serve_realm_secret(context, key.as_deref(), peer, request);
+                let result = Box::pin(served).await;
+                (MetadataTransportMessage::RealmSecretResult { result }, None)
+            }
+            MetadataTransportMessage::OpenSetting { target, bytes } => {
+                let key = self.realm_seal_key();
+                let served =
+                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
+                let result = Box::pin(served).await;
+                (MetadataTransportMessage::OpenSettingResult { result }, None)
+            }
+            MetadataTransportMessage::PromotionCheck => {
+                let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
+                let result = Box::pin(ready).await;
+                (MetadataTransportMessage::PromotionReady { result }, None)
+            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
@@ -1215,45 +1264,57 @@ impl MetadataHandle {
     }
 }
 
-/// Drains the request, writes the answer and closes the stream. An audit answer keeps
-/// the audit deadline for every step.
-pub(crate) async fn write_answer(
-    mut stream: BiStream,
-    audit_deadline: Option<tokio::time::Instant>,
-    response: &MetadataTransportMessage,
-    response_body: Option<Vec<u8>>,
-) -> Result<(), MetadataError> {
-    let span = Span::current();
-    let drain_started = Instant::now();
-    let drain_result = match audit_deadline {
-        Some(deadline) => drain_stream_at(&mut stream.1, deadline).await,
-        None => drain_request_stream(&mut stream).await,
-    };
-    if let Err(error) = drain_result {
-        if let Some(deadline) = audit_deadline {
-            close_stream_at(&mut stream, deadline);
-        }
-        return Err(error);
-    }
-    record_elapsed_ms(&span, "drain_ms", drain_started);
+/// One request read from an inbound metadata stream.
+pub(crate) struct InboundRequest {
+    pub(crate) message: MetadataTransportMessage,
+    /// Held until the answer is written, so frames in flight stay within the budget.
+    pub(crate) budget: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) audit_deadline: tokio::time::Instant,
+    pub(crate) audit: bool,
+}
 
-    let write_started = Instant::now();
-    let response_written = match audit_deadline {
-        Some(deadline) => write_message_at(&mut stream, response, deadline)
-            .await
-            .is_ok(),
-        None => write_transport_message(&mut stream, response).await.is_ok(),
-    };
-    if response_written && let Some(body) = response_body {
-        let _ = match audit_deadline {
-            Some(deadline) => write_body_at(&mut stream, &body, deadline).await,
-            None => write_stream_body(&mut stream, &body).await,
+impl MetadataHandle {
+    /// Drains the request, writes the answer and closes the stream. An audit request keeps
+    /// the audit deadline for every step.
+    pub(crate) async fn write_answer(
+        mut stream: BiStream,
+        audit_deadline: Option<tokio::time::Instant>,
+        response: &MetadataTransportMessage,
+        response_body: Option<Vec<u8>>,
+    ) -> Result<(), MetadataError> {
+        let span = Span::current();
+        span.record("response", transport_message_kind(response));
+        let drain_started = Instant::now();
+        let drain_result = match audit_deadline {
+            Some(deadline) => drain_stream_at(&mut stream.1, deadline).await,
+            None => drain_request_stream(&mut stream).await,
         };
+        if let Err(error) = drain_result {
+            if let Some(deadline) = audit_deadline {
+                close_stream_at(&mut stream, deadline);
+            }
+            return Err(error);
+        }
+        record_elapsed_ms(&span, "drain_ms", drain_started);
+
+        let write_started = Instant::now();
+        let response_written = match audit_deadline {
+            Some(deadline) => write_message_at(&mut stream, response, deadline)
+                .await
+                .is_ok(),
+            None => write_transport_message(&mut stream, response).await.is_ok(),
+        };
+        if response_written && let Some(body) = response_body {
+            let _ = match audit_deadline {
+                Some(deadline) => write_body_at(&mut stream, &body, deadline).await,
+                None => write_stream_body(&mut stream, &body).await,
+            };
+        }
+        record_elapsed_ms(&span, "write_ms", write_started);
+        match audit_deadline {
+            Some(deadline) => close_stream_at(&mut stream, deadline),
+            None => close_stream(&mut stream).await,
+        }
+        Ok(())
     }
-    record_elapsed_ms(&span, "write_ms", write_started);
-    match audit_deadline {
-        Some(deadline) => close_stream_at(&mut stream, deadline),
-        None => close_stream(&mut stream).await,
-    }
-    Ok(())
 }
