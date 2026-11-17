@@ -192,6 +192,10 @@ pub enum SubOperationEvent {
     DeliveryQueued {
         result: Result<(), String>,
     },
+    /// What a notification inbox upsert stored, or its failure as text.
+    InboxUpserted {
+        result: Result<crate::structs::execution::notification::InboxWriteOutcome, String>,
+    },
 }
 
 /// How the re-key of one version ended.
@@ -1013,6 +1017,7 @@ impl Event {
                     NotificationsFailed,
                     WatchStored,
                     DeliveryQueued,
+                    InboxUpserted,
                 }
             ),
             Event::Task(event) => variant_label!(
