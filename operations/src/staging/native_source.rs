@@ -47,7 +47,7 @@ use crate::s3::object::get::{
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
@@ -890,8 +890,8 @@ async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelat
         .counters
         .consecutive_failures
         .saturating_add(1);
-    match store_sync_status(context, &relationship).await {
-        Ok(true) => kick_mirror_repair(context).await,
+    match drive(StoreStatusOperation::new(relationship.clone()), context).await {
+        Ok(true) => _ = drive(KickRepairOperation::new(), context).await,
         Ok(false) => {}
         Err(error) => warn!(%error, "Failed to persist native reference denial"),
     }
