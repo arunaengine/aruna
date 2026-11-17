@@ -20,12 +20,13 @@ use aruna_plugins::trigger::TriggerKind;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use super::entry::ReadEntry;
 use super::install::{pick_version, read_manifest};
 use super::rows::read_rows;
 use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::{EntryReader, open_value};
+use crate::secrets::owner::open_value;
 
 /// The step of the use check that refused a release.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,22 +171,8 @@ pub(crate) async fn read_entry(
     owner: &SecretOwner,
     name: &SecretName,
 ) -> Result<Option<SecretEntry>, ReleaseError> {
-    let unavailable = |error: String| ReleaseError::Unavailable(error);
-    let mut reader = EntryReader::new(realm_id, owner, name);
-    let mut effect = reader.start(None);
-    loop {
-        let aruna_core::effects::Effect::Storage(storage) = effect else {
-            return Err(unavailable(
-                "the reader asked for a non-storage effect".into(),
-            ));
-        };
-        let event = ctx.storage_handle.send_storage_effect(storage).await;
-        match reader.step(event, None) {
-            Ok(Some(next)) => effect = next,
-            Ok(None) => return Ok(reader.entry().filter(SecretEntry::complete)),
-            Err(error) => return Err(unavailable(error.to_string())),
-        }
-    }
+    let read = drive(ReadEntry::new(realm_id, owner, name), ctx).await;
+    read.map_err(|error| ReleaseError::Unavailable(error.to_string()))
 }
 
 pub async fn open(

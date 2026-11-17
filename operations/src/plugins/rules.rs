@@ -17,12 +17,13 @@ use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::entry::ReadEntry;
 use super::grants::covers;
 use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
 use crate::driver::{DriverContext, drive};
 use crate::secrets::SecretChange;
-use crate::secrets::owner::{EntryReader, OwnerChange, OwnerSecretError, OwnerSecretOperation};
+use crate::secrets::owner::{OwnerChange, OwnerSecretError, OwnerSecretOperation};
 
 /// Which install state a rule edit may still write for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,22 +66,8 @@ pub async fn edit_rules(
         return Ok(false);
     }
     let owner = SecretOwner::Group(group_id);
-    let mut reader = EntryReader::new(actor.realm_id, &owner, name);
-    let mut effect = reader.start(None);
-    loop {
-        let aruna_core::effects::Effect::Storage(storage) = effect else {
-            return Err(RuleError::Unreadable(
-                "the reader asked for another effect".into(),
-            ));
-        };
-        let event = ctx.storage_handle.send_storage_effect(storage).await;
-        match reader.step(event, None)? {
-            Some(next) => effect = next,
-            None => break,
-        }
-    }
-    let entry = reader.entry().filter(|entry| entry.complete());
-    let entry = entry.ok_or(RuleError::Missing)?;
+    let read = drive(ReadEntry::new(actor.realm_id, &owner, name), ctx).await?;
+    let entry = read.ok_or(RuleError::Missing)?;
     let Some(SecretBody::Info(info)) = entry.info.as_ref().map(|info| &info.body) else {
         return Err(RuleError::Missing);
     };
