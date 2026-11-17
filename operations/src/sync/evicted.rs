@@ -174,7 +174,7 @@ mod tests {
     };
     use aruna_core::errors::StorageError;
     use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+        check_abort, rejects_events, rejects_finalize, sample_events,
     };
     use aruna_core::structs::placement::record::PlacementRef;
     use std::time::Duration;
@@ -208,8 +208,19 @@ mod tests {
         }
     }
 
-    fn write_of(operation: &ReemitEvictedOperation, index: usize) -> Effect {
-        operation.writes[index].clone()
+    /// The outbox record of the one unbatched write in `effects`.
+    fn written_record(effects: &[Effect]) -> aruna_core::document::DocumentOutboxRecord {
+        let [
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                value,
+                txn_id: None,
+                ..
+            }),
+        ] = effects
+        else {
+            panic!("expected one outbox write, got {effects:?}");
+        };
+        postcard::from_bytes(value).expect("outbox record decodes")
     }
 
     fn written() -> Event {
@@ -234,16 +245,15 @@ mod tests {
     #[test]
     fn writes_then_schedules() {
         let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1), evicted(2)]);
-        let (first, second) = (write_of(&operation, 0), write_of(&operation, 1));
-        check_trace(
-            &mut operation,
-            &[first],
-            vec![
-                (written(), vec![second]),
-                (written(), vec![schedule_drain_effect()]),
-                (scheduled(), vec![]),
-            ],
+        let first = written_record(&operation.start());
+        assert_eq!(first.outbox_id, evicted(1).event_id);
+        let second = written_record(&operation.step(written()));
+        assert_eq!(second.outbox_id, evicted(2).event_id);
+        assert_eq!(
+            operation.step(written()).as_slice(),
+            &[schedule_drain_effect()]
         );
+        assert!(operation.step(scheduled()).is_empty());
         let outcome = operation.finalize().expect("re-emit finishes");
         assert_eq!(
             outcome,
@@ -257,15 +267,8 @@ mod tests {
 
     #[test]
     fn records_keep_ids() {
-        let operation = ReemitEvictedOperation::new(node(), vec![evicted(3)]);
-        let Effect::Storage(aruna_core::effects::StorageEffect::Write { value, txn_id, .. }) =
-            write_of(&operation, 0)
-        else {
-            panic!("re-emit must start with an outbox write");
-        };
-        assert_eq!(txn_id, None);
-        let record: aruna_core::document::DocumentOutboxRecord =
-            postcard::from_bytes(&value).expect("outbox record decodes");
+        let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(3)]);
+        let record = written_record(&operation.start());
         assert_eq!(record.outbox_id, evicted(3).event_id);
         assert_eq!(record.node_id, node());
     }
@@ -273,12 +276,12 @@ mod tests {
     #[test]
     fn failed_write_incomplete() {
         let mut operation = ReemitEvictedOperation::new(node(), vec![evicted(1), evicted(2)]);
-        let second = write_of(&operation, 1);
         let failed = Event::Storage(StorageEvent::Error {
             error: StorageError::Timeout,
         });
         operation.start();
-        assert_eq!(operation.step(failed).as_slice(), &[second]);
+        let second = written_record(&operation.step(failed));
+        assert_eq!(second.outbox_id, evicted(2).event_id);
         assert_eq!(
             operation.step(written()).as_slice(),
             &[schedule_drain_effect()]

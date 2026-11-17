@@ -1258,6 +1258,7 @@ fn schedule_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::MetadataHandle;
     use crate::replication::protocol::{LocationSummaryRequest, ReferenceAdvance};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
@@ -1273,7 +1274,6 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
-    use aruna_tasks::TaskHandle;
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
