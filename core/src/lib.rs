@@ -36,6 +36,7 @@ pub mod metrics;
 pub mod node_vault;
 pub mod onboarding;
 pub mod operation;
+pub mod outbound;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod operation_check;
 pub mod password;

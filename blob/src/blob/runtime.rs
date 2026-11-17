@@ -498,6 +498,11 @@ impl BlobHandle {
         self.handler.egress.repository_request(method, url)
     }
 
+    /// The screened repository client and its egress policy, for the outbound backend.
+    pub fn repository_client(&self) -> (reqwest::Client, EgressPolicy) {
+        self.handler.egress.repository_client()
+    }
+
     /// Holds every tenant backend an effect names for as long as the guard
     /// lives. The driver keeps it for the whole operation, so the metadata
     /// transaction behind the bytes and its rollback are both covered.
