@@ -18,7 +18,7 @@ use tracing::debug;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::api::load_realm_config;
+use crate::realm::load_config::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::protocol::{GraphState, MetadataTransportMessage};
 use crate::placement::read_holder_sets;

@@ -5,7 +5,6 @@
 use super::*;
 use crate::driver::drive;
 use crate::jobs::store::query::find_dedup_plan;
-use crate::metadata::api::load_realm_config;
 use crate::notifications::checks::{
     MAX_FUTURE_SKEW, validate_inbound_batch, validate_inbound_kind, validate_watch_event,
     verify_node_origin,
@@ -20,6 +19,7 @@ use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
+use crate::realm::load_config::load_realm_config;
 use crate::sync::incoming::initialize_incoming_fixture;
 use crate::tests::notifications::create_local_watch;
 use aruna_core::UserId;
@@ -77,6 +77,7 @@ async fn spawn(realm_id: RealmId, secret: [u8; 32]) -> Node {
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,

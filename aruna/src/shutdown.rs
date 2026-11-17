@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use aruna_api::error::ServerSetupError;
 use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
+use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use aruna_tasks::shutdown::Shutdown;
@@ -118,7 +118,7 @@ pub struct NodeShutdown {
     pub task_handle: TaskHandle,
     pub jobs_runtime: Arc<JobsRuntime>,
     pub net_handle: Option<NetHandle>,
-    pub metadata_handle: Option<MetadataHandle>,
+    pub graph_handle: Option<GraphHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub storage_handle: StorageHandle,
     /// Ops listener task; aborted at the very end so `/readyz` and `/healthz`
@@ -361,8 +361,8 @@ impl NodeShutdown {
         }
 
         // 8. Flush the metadata store.
-        let mut metadata_flushed = self.metadata_handle.is_none();
-        if let Some(metadata_handle) = self.metadata_handle.as_ref() {
+        let mut metadata_flushed = self.graph_handle.is_none();
+        if let Some(graph_handle) = self.graph_handle.as_ref() {
             phase(
                 "metadata",
                 phase_slice(
@@ -371,7 +371,7 @@ impl NodeShutdown {
                     METADATA_SLICE,
                 ),
                 async {
-                    if let Err(error) = metadata_handle.flush_persistence().await {
+                    if let Err(error) = graph_handle.flush_persistence().await {
                         error!(error = %error, "Failed to flush metadata persistence during shutdown");
                     } else {
                         metadata_flushed = true;
@@ -610,7 +610,7 @@ mod tests {
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             storage_handle,
             ops: None,
@@ -973,6 +973,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

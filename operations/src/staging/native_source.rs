@@ -33,7 +33,7 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::api::load_realm_config;
+use crate::realm::load_config::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
@@ -705,6 +705,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

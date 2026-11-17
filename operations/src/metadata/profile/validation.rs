@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use aruna_core::effects::StorageEffect;
@@ -10,45 +10,40 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::VALIDATION_STATUS_KEYSPACE;
 use aruna_core::metadata::{
-    MetadataBatch, MetadataError, MetadataQuadOp, MetadataRawRevision, MetadataValidationViolation,
-    ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
-    ProfileValidationState, ProfileValidationStatus, is_rocrate_specification,
+    MetadataError, MetadataRawRevision, MetadataValidationViolation, ProfileValidationCompleteness,
+    ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
+    ProfileValidationStatus, is_rocrate_specification,
 };
 use aruna_core::storage_entries::{profile_validation_entry, profile_validation_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis as now_ms;
 use aruna_core::types::{GroupId, TxnId};
 use craqle::ShaclValidationResult;
-use oxrdf::{Dataset, GraphName, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Quad, Term};
-use oxttl::NQuadsParser;
+use oxrdf::{Dataset, NamedNode, NamedOrBlankNode, Term};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::MetadataHandle;
-use crate::metadata::api::ExportMetadataResult;
-use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-use crate::metadata::forward::{PROFILE_DOCUMENT_PREFIX, export_profile_routed};
-use crate::metadata::profile::shacl::{
-    CRAQLE_BASE_IRI, ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+use super::rules::{
+    DCTERMS_CONFORMS_TO, DX_PROFILE, EVALUATOR_NAME, data_graph, has_type, not_profiled_status,
+    objects, profile_tags, stale_status, submission_profile_tag,
 };
+use crate::driver::DriverContext;
+use crate::metadata::api::export_types::ExportMetadataResult;
+use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
+use crate::metadata::forward::read::export_profile_routed;
 use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{StorageReadError, parse_registry_read, read_document_registry};
+use aruna_core::profile_shapes::{
+    ProfileShaclError, ProfileShaclReport, ProfileShapes, VALIDATION_GRAPH_IRI,
+};
+use aruna_graph::GraphHandle;
 
 const SH: &str = "http://www.w3.org/ns/shacl#";
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-const DCTERMS_CONFORMS_TO: &str = "http://purl.org/dc/terms/conformsTo";
-const SCHEMA_CONFORMS_TO: &str = "http://schema.org/conformsTo";
-const SCHEMA_HTTPS_CONFORMS: &str = "https://schema.org/conformsTo";
-const SCHEMA_ABOUT: &str = "http://schema.org/about";
-const SCHEMA_HTTPS_ABOUT: &str = "https://schema.org/about";
 const SCHEMA_ENCODING_FORMAT: &str = "http://schema.org/encodingFormat";
 const HTTPS_ENCODING_FORMAT: &str = "https://schema.org/encodingFormat";
 const SCHEMA_TEXT: &str = "http://schema.org/text";
 const SCHEMA_HTTPS_TEXT: &str = "https://schema.org/text";
-const DX_PROFILE: &str = "http://www.w3.org/ns/dx/prof/Profile";
 const PROFILE_PUBLIC_PREFIX: &str = "https://w3id.org/aruna/profile/";
-const EVALUATOR_NAME: &str = "craqle-shacl-core/0.3";
-
 /// Authoritative backend SHACL support for Profile validation: craqle's native
 /// SHACL Core Subset v1 engine. Anything outside it (SHACL-SPARQL/JS/AF, custom
 /// targets, recursion, RDF-star, remote `owl:imports`) fails closed with `unsupported_constraint`.
@@ -150,51 +145,14 @@ pub fn profile_public_iri(profile_id: Ulid) -> String {
     format!("{PROFILE_PUBLIC_PREFIX}{profile_id}")
 }
 
-pub fn equivalent_profile_iris(iri: &str) -> Vec<String> {
+pub(crate) fn equivalent_profile_iris(iri: &str) -> Vec<String> {
     profile_from_iri(iri).map_or_else(
         || vec![iri.to_string()],
         |profile_id| vec![profile_public_iri(profile_id)],
     )
 }
 
-pub(crate) fn submission_profile_tag(jsonld: &str) -> bool {
-    data_graph(jsonld)
-        .map(|(data, root)| !profile_tags(&data, &root).is_empty())
-        .unwrap_or(true)
-}
-
-/// Refuses a Profile root outside `profiles/`, the only path clients list as Profiles.
-pub(crate) fn profile_path_rule(
-    document_path: &str,
-    profile: impl FnOnce() -> bool,
-) -> Result<(), MetadataError> {
-    let path = MetadataRegistryRecord::normalize_document_path(document_path);
-    if path.starts_with(PROFILE_DOCUMENT_PREFIX) || !profile() {
-        return Ok(());
-    }
-    Err(MetadataError::InvalidInput(
-        "Profiles must be stored under profiles/; use a document path that starts with profiles/"
-            .to_string(),
-    ))
-}
-
-pub(crate) fn crate_is_profile(jsonld: &str) -> bool {
-    data_graph(jsonld).is_ok_and(|(data, root)| has_type(&data, &root, DX_PROFILE))
-}
-
-pub(crate) fn batch_adds_profile(batch: &MetadataBatch) -> bool {
-    let (root, rdf_type, profile) = (
-        format!("<{}>", batch.graph_iri),
-        format!("<{RDF_TYPE}>"),
-        format!("<{DX_PROFILE}>"),
-    );
-    batch.ops.iter().any(|op| {
-        matches!(op, MetadataQuadOp::Add { subject, predicate, object, .. }
-            if *subject == root && *predicate == rdf_type && *object == profile)
-    })
-}
-
-pub async fn validate_submission(
+pub(crate) async fn validate_submission(
     context: &DriverContext,
     document_id: Ulid,
     group_id: GroupId,
@@ -391,7 +349,7 @@ struct ProfileAssessment {
 }
 
 async fn evaluate_profile(
-    metadata: &MetadataHandle,
+    metadata: &GraphHandle,
     profile: &ResolvedProfile,
     jsonld: &str,
 ) -> Result<ProfileAssessment, MetadataError> {
@@ -511,8 +469,8 @@ fn single_profile_tag(
 fn evaluator_handle<'a>(
     context: &'a DriverContext,
     profile_revision: Option<&str>,
-) -> Result<&'a MetadataHandle, MetadataError> {
-    match context.metadata_handle.as_ref() {
+) -> Result<&'a GraphHandle, MetadataError> {
+    match context.graph_handle.as_ref() {
         Some(metadata) if metadata.profile_validation_available() => Ok(metadata),
         _ => Err(unavailable_error(
             "validator_unavailable",
@@ -569,40 +527,6 @@ fn profiled_status(
     }
 }
 
-pub fn not_profiled_status(document_id: Ulid) -> ProfileValidationStatus {
-    ProfileValidationStatus {
-        document_id,
-        dataset_revision: Ulid::nil(),
-        state: ProfileValidationState::NotProfiled,
-        profile_id: None,
-        profile_iri: None,
-        profile_revision: None,
-        evaluator: EVALUATOR_NAME.to_string(),
-        validated_at_ms: Some(now_ms()),
-        findings: Vec::new(),
-        completeness: ProfileValidationCompleteness::Complete,
-        stale_reason: None,
-        dataset_digest: None,
-    }
-}
-
-pub fn stale_status(document_id: Ulid, reason: &str) -> ProfileValidationStatus {
-    ProfileValidationStatus {
-        document_id,
-        dataset_revision: Ulid::nil(),
-        state: ProfileValidationState::Stale,
-        profile_id: None,
-        profile_iri: None,
-        profile_revision: None,
-        evaluator: EVALUATOR_NAME.to_string(),
-        validated_at_ms: None,
-        findings: Vec::new(),
-        completeness: ProfileValidationCompleteness::Incomplete,
-        stale_reason: Some(reason.to_string()),
-        dataset_digest: None,
-    }
-}
-
 pub async fn load_validation_status(
     context: &DriverContext,
     document_id: Ulid,
@@ -626,7 +550,8 @@ pub async fn load_validation_status(
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataError::Backend(format!(
-            "unexpected profile validation status read: {other:?}"
+            "unexpected profile validation status read: {}",
+            other.label()
         ))),
     }
 }
@@ -650,7 +575,10 @@ pub async fn current_validation_status(
     // A built-in Profile carries no id, so no registry row can age it out.
     let pinned = status.profile_id.zip(status.profile_revision.clone());
     if let Some((profile_id, validated_revision)) = pinned {
-        match read_registry(context, profile_id).await {
+        match load_document_record(context, profile_id)
+            .await
+            .map_err(map_registry_error)
+        {
             Ok(Some(profile)) if profile.last_event_id.to_string() == validated_revision => {}
             Ok(Some(_)) => {
                 status.state = ProfileValidationState::Stale;
@@ -763,7 +691,8 @@ pub async fn revalidate_current(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
             return Err(MetadataError::Backend(format!(
-                "unexpected profile validation status write: {other:?}"
+                "unexpected profile validation status write: {}",
+                other.label()
             )));
         }
     }
@@ -779,7 +708,8 @@ pub async fn revalidate_current(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(MetadataError::Backend(format!(
-            "unexpected profile revalidation commit: {other:?}"
+            "unexpected profile revalidation commit: {}",
+            other.label()
         ))),
     }
 }
@@ -815,7 +745,10 @@ async fn resolve_registered_profile(
     let Some(profile_id) = profile_from_iri(requested_iri) else {
         return Err(profile_not_registered(requested_iri));
     };
-    let record = match read_registry(context, profile_id).await {
+    let record = match load_document_record(context, profile_id)
+        .await
+        .map_err(map_registry_error)
+    {
         Ok(Some(record)) => record,
         Ok(None) => return Err(profile_not_registered(requested_iri)),
         Err(_) => {
@@ -913,19 +846,6 @@ fn cache_shapes(context: &DriverContext, profile_id: Ulid, revision: Ulid, shape
     }
 }
 
-async fn read_registry(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<Option<MetadataRegistryRecord>, MetadataError> {
-    parse_registry_read(
-        context
-            .storage_handle
-            .send_effect(read_document_registry(document_id, None))
-            .await,
-    )
-    .map_err(map_registry_error)
-}
-
 fn map_registry_error(error: StorageReadError) -> MetadataError {
     match error {
         StorageReadError::Storage(error) => error.into(),
@@ -941,66 +861,6 @@ fn profile_from_iri(iri: &str) -> Option<Ulid> {
     let id = Ulid::from_string(value).ok()?;
     aruna_core::MetaResourceId::from_bytes(id.to_bytes()).ok()?;
     Some(id)
-}
-
-fn data_graph(jsonld: &str) -> Result<(Dataset, NamedOrBlankNode), MetadataError> {
-    let canonical = craqle::canonicalize_jsonld(jsonld)
-        .map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
-    let mut dataset = Dataset::new();
-    for quad in NQuadsParser::new().for_slice(canonical.nquads.as_bytes()) {
-        let quad = quad.map_err(|error| MetadataError::InvalidInput(error.to_string()))?;
-        dataset.insert(&quad);
-        if !quad.graph_name.is_default_graph() {
-            dataset.insert(&Quad::new(
-                quad.subject,
-                quad.predicate,
-                quad.object,
-                GraphName::DefaultGraph,
-            ));
-        }
-    }
-    let root = crate_root(&dataset).ok_or_else(|| {
-        MetadataError::InvalidInput(
-            "RO-Crate descriptor does not identify a root entity".to_string(),
-        )
-    })?;
-    Ok((dataset, root))
-}
-
-/// The entity the metadata descriptor is `about`; an `about` of any other entity names no root.
-fn crate_root(dataset: &Dataset) -> Option<NamedOrBlankNode> {
-    for predicate in [SCHEMA_ABOUT, SCHEMA_HTTPS_ABOUT] {
-        let predicate = NamedNode::new_unchecked(predicate);
-        for quad in dataset.quads_for_predicate(&predicate) {
-            let descriptor = matches!(quad.subject, NamedOrBlankNodeRef::NamedNode(subject)
-                if subject.as_str().strip_prefix(CRAQLE_BASE_IRI) == Some("ro-crate-metadata.json"));
-            if !quad.graph_name.is_default_graph() || !descriptor {
-                continue;
-            }
-            if let Some(root) = term_as_node(quad.object.into_owned()) {
-                return Some(root);
-            }
-        }
-    }
-    None
-}
-
-fn profile_tags(dataset: &Dataset, root: &NamedOrBlankNode) -> Vec<String> {
-    let mut tags = BTreeSet::new();
-    for predicate in [
-        DCTERMS_CONFORMS_TO,
-        SCHEMA_CONFORMS_TO,
-        SCHEMA_HTTPS_CONFORMS,
-    ] {
-        for object in objects(dataset, root, predicate) {
-            if let Term::NamedNode(iri) = object
-                && !is_rocrate_specification(iri.as_str())
-            {
-                tags.insert(iri.as_str().to_string());
-            }
-        }
-    }
-    tags.into_iter().collect()
 }
 
 fn profile_shapes(dataset: &Dataset) -> Result<Vec<String>, String> {
@@ -1037,29 +897,6 @@ fn profile_shapes(dataset: &Dataset) -> Result<Vec<String>, String> {
         }
     }
     Ok(shapes)
-}
-
-fn objects(dataset: &Dataset, subject: &NamedOrBlankNode, predicate: &str) -> Vec<Term> {
-    let predicate = NamedNode::new_unchecked(predicate);
-    dataset
-        .quads_for_subject(subject)
-        .filter(|quad| quad.graph_name.is_default_graph() && quad.predicate == predicate.as_ref())
-        .map(|quad| quad.object.into_owned())
-        .collect()
-}
-
-fn has_type(dataset: &Dataset, subject: &NamedOrBlankNode, class: &str) -> bool {
-    objects(dataset, subject, RDF_TYPE)
-        .iter()
-        .any(|term| matches!(term, Term::NamedNode(value) if value.as_str() == class))
-}
-
-fn term_as_node(term: Term) -> Option<NamedOrBlankNode> {
-    match term {
-        Term::NamedNode(node) => Some(NamedOrBlankNode::NamedNode(node)),
-        Term::BlankNode(node) => Some(NamedOrBlankNode::BlankNode(node)),
-        _ => None,
-    }
 }
 
 fn default_message(component: &str) -> &'static str {
@@ -1136,6 +973,7 @@ fn unavailable_error(code: &str, message: &str, revision: Option<&str>) -> Metad
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::profile::rules::crate_is_profile;
     use aruna_core::metadata::CRATE_PROFILE_IRI;
     use aruna_core::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
     use craqle::{EncodedTerm, ShaclMessage};
@@ -1419,6 +1257,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

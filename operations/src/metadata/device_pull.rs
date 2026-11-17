@@ -115,7 +115,7 @@ impl PullRegistry {
 }
 
 /// Serves one forwarded sync pull.
-pub async fn serve_sync_pull(
+pub(crate) async fn serve_sync_pull(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -128,7 +128,7 @@ pub async fn serve_sync_pull(
 }
 
 /// Serves one poll of an accepted sync pull.
-pub async fn serve_pull_status(
+pub(crate) async fn serve_pull_status(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -655,7 +655,7 @@ async fn applied_version(context: &Arc<DriverContext>, request: &SyncPull) -> Op
 }
 
 /// Serves one bounded listing of the current heads under a bucket prefix.
-pub async fn serve_list_versions(
+pub(crate) async fn serve_list_versions(
     context: &Arc<DriverContext>,
     peer: NodeId,
     message: MetadataTransportMessage,
@@ -1050,6 +1050,7 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,

@@ -1,23 +1,9 @@
-//! Declares the routed metadata read and write modules and re-exports their entry points.
+//! Declares the routed metadata read and write modules.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod read;
-mod write;
-
-pub(crate) use self::read::{
-    AuthFailure, PROFILE_DOCUMENT_PREFIX, ReadDecision, apply_document_query,
-    apply_forwarded_export, apply_forwarded_profile, export_profile_routed, reduce_holder_reads,
-};
-pub use self::read::{
-    admits_profile_peer, export_profile_local, export_rocrate_here, export_rocrate_routed,
-    get_metadata_routed, route_profile_status,
-};
-pub(crate) use self::write::apply_forwarded_write;
-pub use self::write::{
-    CreateAuthorizedError, PinnedCreate, apply_batch_routed, create_metadata_authorized,
-    create_with_id, route_metadata_create, route_metadata_delete, route_metadata_update,
-};
+pub mod read;
+pub mod write;
 
 #[cfg(test)]
 mod tests;

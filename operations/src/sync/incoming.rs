@@ -16,6 +16,8 @@ use crate::driver::{
     DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
 };
 use crate::jobs::runtime::JobsRuntime;
+use crate::metadata::MetadataHandle;
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::summary_refresh::RefreshUsageOperation;
@@ -43,6 +45,7 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
@@ -54,13 +57,13 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::task::TaskKey;
-use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
+use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms, record_elapsed_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
 use tokio::time::{sleep, timeout};
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -538,24 +541,158 @@ impl OperationsInboundHandler {
         }
     }
 
-    /// Forwards an inbound metadata stream under the rocrate byte limit held by
-    /// this handler; the metadata handle answers the peer itself.
+    /// Answers one inbound metadata stream under the rocrate byte limit held by
+    /// this handler: jobs and plugins requests here, the rest by the metadata domain.
     async fn handle_metadata_stream(&self, stream: BiStream, node_id: NodeId) {
         let Some(metadata_handle) = self.context.metadata_handle.clone() else {
             warn!(peer = %node_id, "Dropping inbound metadata stream without metadata handle");
             return;
         };
-        if let Err(err) = metadata_handle
-            .handle_inbound_stream(
-                &self.context,
-                stream,
-                node_id,
-                self.rocrate_limits.metadata_bytes,
-            )
-            .await
-        {
+        let served = serve_metadata_stream(
+            &self.context,
+            &metadata_handle,
+            stream,
+            node_id,
+            self.rocrate_limits.metadata_bytes,
+        );
+        if let Err(err) = served.await {
             error!(error = ?err, "Failed to process inbound metadata stream");
         }
+    }
+}
+
+#[tracing::instrument(
+    name = "metadata.remote.inbound",
+    level = "debug",
+    skip(context, metadata, stream),
+    fields(
+        peer = ?peer,
+        request = field::Empty,
+        response = field::Empty,
+        read_ms = field::Empty,
+        process_ms = field::Empty,
+        drain_ms = field::Empty,
+        write_ms = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+async fn serve_metadata_stream(
+    context: &Arc<DriverContext>,
+    metadata: &MetadataHandle,
+    mut stream: BiStream,
+    peer: NodeId,
+    metadata_bytes: u64,
+) -> Result<(), MetadataError> {
+    let total_started = Instant::now();
+    let read_started = Instant::now();
+    let request = metadata.read_request(&mut stream).await?;
+    let span = Span::current();
+    record_elapsed_ms(&span, "read_ms", read_started);
+
+    let process_started = Instant::now();
+    let deadline = request.audit_deadline;
+    let audit = request.audit.then_some(deadline);
+    let (response, response_body) =
+        match peer_request(context, metadata, peer, request.message).await {
+            Ok(response) => (response, None),
+            Err(message) => {
+                metadata
+                    .answer_request(context, peer, metadata_bytes, deadline, message)
+                    .await
+            }
+        };
+    record_elapsed_ms(&span, "process_ms", process_started);
+    MetadataHandle::write_answer(stream, audit, &response, response_body).await?;
+    drop(request.budget);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    Ok(())
+}
+
+/// Answers a metadata transport request of the jobs or plugins domain, or hands the
+/// request back for the metadata domain.
+async fn peer_request(
+    context: &Arc<DriverContext>,
+    metadata: &MetadataHandle,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
+    match message {
+        MetadataTransportMessage::StoreArtifact { chunk } => {
+            let stored = crate::plugins::artifacts::serve_store(context, peer, chunk);
+            let result = Box::pin(stored).await;
+            Ok(MetadataTransportMessage::ArtifactStored { result })
+        }
+        MetadataTransportMessage::FetchArtifact { digest, index } => {
+            let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest, index);
+            let result = Box::pin(fetched).await;
+            Ok(MetadataTransportMessage::FetchedArtifact { result })
+        }
+        MetadataTransportMessage::ProbeClock => {
+            let result = Box::pin(crate::plugins::clock::serve_clock(context, peer)).await;
+            Ok(MetadataTransportMessage::ClockProbed { result })
+        }
+        MetadataTransportMessage::ForwardEvents { batch } => {
+            let decided = crate::plugins::worker::serve_events(context, peer, batch);
+            let result = Box::pin(decided).await;
+            Ok(MetadataTransportMessage::EventsDecided { result })
+        }
+        MetadataTransportMessage::ReleaseSecret { request } => {
+            let keys = (metadata.realm_seal_key(), metadata.realm_vault_key());
+            let released = crate::plugins::release::serve_release(context, keys, peer, request);
+            let result = Box::pin(released).await;
+            Ok(MetadataTransportMessage::SecretReleased { result })
+        }
+        MetadataTransportMessage::CheckNodeSecret { name, kind } => {
+            let checked = crate::plugins::bound::serve_node_check(context, peer, name, kind);
+            let result = Box::pin(checked).await;
+            Ok(MetadataTransportMessage::NodeSecretChecked { result })
+        }
+        record @ (MetadataTransportMessage::ForwardJobRecord { .. }
+        | MetadataTransportMessage::ForwardRecordPage { .. }) => {
+            let answer = Box::pin(async {
+                crate::jobs::records::transport::serve_job_record(context, peer, record).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardLaunchOffer { launch } => {
+            let answer = Box::pin(async {
+                crate::jobs::records::transport::serve_launch_offer(context, peer, *launch).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardJobSubmission {
+            auth_token,
+            submission_id,
+            request,
+        } => {
+            let answer = Box::pin(async {
+                crate::jobs::lifecycle::ingress::serve_submission(
+                    context,
+                    peer,
+                    auth_token,
+                    submission_id,
+                    *request,
+                )
+                .await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ResolveJobInputs {
+            auth_token,
+            request,
+        } => {
+            let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
+                context, peer, auth_token, *request,
+            );
+            let result = Box::pin(resolved).await;
+            Ok(MetadataTransportMessage::ResolvedJobInputs { result })
+        }
+        MetadataTransportMessage::JobInputPage { submission, digest } => {
+            let page = crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+            let page = Box::pin(page).await;
+            Ok(MetadataTransportMessage::InputPageResult { page })
+        }
+        message => Err(message),
     }
 }
 
@@ -1399,6 +1536,7 @@ mod tests {
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -1485,6 +1623,7 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
@@ -1525,6 +1664,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -1768,6 +1908,7 @@ mod tests {
                 net_handle: Some(net_b.clone()),
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
@@ -1816,20 +1957,26 @@ mod tests {
             )
             .await
             .unwrap();
-            let metadata_handle = MetadataHandle::new(
+            let graph_handle = aruna_graph::GraphHandle::open(
                 dir.path().join("metadata"),
                 net.node_id(),
-                storage.clone(),
-                Some(net.clone()),
                 Some(net.document_sync_node()),
                 Some(net.document_sync_database()),
+                aruna_graph::GraphOptions::default(),
             )
             .unwrap();
+            let metadata_handle = MetadataHandle::new(
+                dir.path().join("metadata"),
+                storage.clone(),
+                Some(net.clone()),
+                Default::default(),
+            );
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
                 blob_handle: None,
                 metadata_handle: Some(metadata_handle),
+                graph_handle: Some(graph_handle),
                 task_handle: None,
                 compute_handle: None,
                 outbound_handle: None,
@@ -1948,6 +2095,7 @@ mod tests {
                     net_handle: Some(net_b.clone()),
                     blob_handle: Some(blob_handle),
                     metadata_handle: None,
+                    graph_handle: None,
                     task_handle: None,
                     compute_handle: None,
                     outbound_handle: None,
@@ -2174,6 +2322,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

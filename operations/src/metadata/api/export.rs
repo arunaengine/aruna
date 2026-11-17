@@ -106,7 +106,8 @@ pub(super) async fn export_raw(
                     Err(MetadataApiError::Internal(error.to_string()))
                 }
                 other => Err(MetadataApiError::Internal(format!(
-                    "unexpected read snapshot commit event: {other:?}"
+                    "unexpected read snapshot commit event: {}",
+                    other.label()
                 ))),
             }
         }
@@ -157,7 +158,7 @@ pub(super) async fn export_raw_txn(
         crate::metadata::raw_revision::load_raw_view(context, record.document_id, Some(txn_id))
             .await
             .map_err(|error| match error {
-                crate::metadata::raw_revision::RawReadError::LimitExceeded(_) => {
+                crate::metadata::raw_events::RawReadError::LimitExceeded(_) => {
                     MetadataApiError::ServiceUnavailable
                 }
                 error => MetadataApiError::Internal(error.to_string()),
@@ -175,12 +176,11 @@ async fn export_rocrate_jsonld(
     context: &DriverContext,
     graph_iri: &str,
 ) -> Result<String, MetadataApiError> {
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_jsonld(graph_iri.to_string())
+    crate::metadata::export_rocrate_jsonld(context, graph_iri.to_string())
         .await
         .map_err(map_event_error)
 }
@@ -193,9 +193,9 @@ pub(super) async fn export_summary_jsonld(
     graph_iri: &str,
     cursor: Ulid,
 ) -> Result<String, MetadataApiError> {
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     // The handle rejects deleted graphs before every export, so a hit has to
     // re-check the authoritative lifecycle record itself.
@@ -206,8 +206,7 @@ pub(super) async fn export_summary_jsonld(
         summary_cache().remove(graph_iri);
     }
 
-    let summary = handle
-        .export_summary_jsonld(graph_iri.to_string())
+    let summary = crate::metadata::export_summary_jsonld(context, graph_iri.to_string())
         .await
         .map_err(map_event_error)?;
     summary_cache().insert(graph_iri, cursor, &summary, Instant::now());
@@ -225,12 +224,11 @@ async fn export_rocrate_page(
         return Err(MetadataApiError::BadRequest);
     }
     let limit = limit.unwrap_or(PAGE_DEFAULT).clamp(1, PAGE_MAX);
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_page(graph_iri.to_string(), limit, offset, after)
+    crate::metadata::export_rocrate_page(context, graph_iri.to_string(), limit, offset, after)
         .await
         .map_err(map_event_error)
 }

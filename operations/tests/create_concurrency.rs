@@ -12,8 +12,9 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_operations::driver::DriverContext;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
+use aruna_operations::metadata::create_entry::create_metadata_document;
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 
@@ -43,19 +44,25 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
             .ok_or("invalid storage path")?,
     )?;
     let node_id = iroh::SecretKey::generate().public();
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         temp_dir.path().join("metadata"),
         node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
         storage.clone(),
         None,
-        None,
-        None,
-    )?;
+        Default::default(),
+    );
     let context = Arc::new(DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,

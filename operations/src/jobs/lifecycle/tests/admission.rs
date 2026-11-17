@@ -27,8 +27,8 @@ use crate::jobs::lifecycle::ingress::submit_external_job;
 use crate::jobs::lifecycle::routing::family_status;
 use crate::jobs::store::query::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::AuthToken;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
+use aruna_core::metadata::AuthToken;
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")

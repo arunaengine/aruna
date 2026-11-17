@@ -83,7 +83,7 @@ async fn realm_session_idle(context: &DriverContext) -> u64 {
     let Some(net) = context.net_handle.as_ref() else {
         return IDLE_AFTER_MS;
     };
-    crate::metadata::api::load_realm_config(context, *net.realm_id())
+    crate::realm::load_config::load_realm_config(context, *net.realm_id())
         .await
         .map(|config| config.compute.session_idle_ms)
         .filter(|value| *value > 0)

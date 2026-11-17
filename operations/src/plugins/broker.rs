@@ -68,21 +68,23 @@ use crate::auth::request_authorization::AuthorizeError;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, ListVisibleRequest,
-    MetadataApiError, MetadataListOrder, RoCrateExportView, list_visible_documents,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
 };
+use crate::metadata::api::list::list_visible_documents;
+use crate::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
 use crate::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use crate::metadata::forward::{
-    CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
-    get_metadata_routed, route_metadata_update,
+use crate::metadata::forward::read::{export_rocrate_routed, get_metadata_routed};
+use crate::metadata::forward::write::{
+    CreateAuthorizedError, PinnedCreate, create_with_id, route_metadata_update,
 };
-use crate::metadata::handle::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
+use aruna_core::entity_patch::craqle_patch_request;
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
 
 /// Entries of one metadata or object listing page.

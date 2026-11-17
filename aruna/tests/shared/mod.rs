@@ -1079,18 +1079,24 @@ async fn initialize_context(
 ) -> TestResult<Arc<DriverContext>> {
     storage_handle.open_vault(vault);
     let task_handle = TaskHandle::new();
-    let metadata_handle = if let Some(config) = full_storage_config {
+    let (metadata_handle, graph_handle) = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
-        Some(MetadataHandle::new(
+        let graph = aruna_graph::GraphHandle::open(
             &config.metadata_storage_path,
             net.node_id(),
-            storage_handle.clone(),
-            Some(net.clone()),
             Some(net.document_sync_node()),
             Some(net.document_sync_database()),
-        )?)
+            Default::default(),
+        )?;
+        let metadata = MetadataHandle::new(
+            &config.metadata_storage_path,
+            storage_handle.clone(),
+            Some(net.clone()),
+            Default::default(),
+        );
+        (Some(metadata), Some(graph))
     } else {
-        None
+        (None, None)
     };
     let blob_handle = if let Some(config) = full_storage_config {
         Some(
@@ -1111,6 +1117,7 @@ async fn initialize_context(
         net_handle: Some(net),
         blob_handle,
         metadata_handle,
+        graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: compute,
         outbound_handle: None,

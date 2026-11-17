@@ -6,30 +6,31 @@ use crate::device::replica::ReplicaRecord;
 use crate::device::replica_store::read_replica;
 use crate::device::selection::keep_read;
 use crate::driver::DriverContext;
-use crate::metadata::api::ExportMetadataRequest;
-use crate::metadata::api::ExportMetadataResult;
-use crate::metadata::api::GetVisibleRequest;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::RoCrateExportView;
-use crate::metadata::api::ensure_record_readable;
-use crate::metadata::api::export_metadata_rocrate;
-use crate::metadata::api::get_visible_document;
-use crate::metadata::api::load_live_record;
-use crate::metadata::api::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
+use crate::metadata::api::export::export_metadata_rocrate;
+use crate::metadata::api::export::get_visible_document;
+use crate::metadata::api::export_types::ExportMetadataRequest;
+use crate::metadata::api::export_types::ExportMetadataResult;
+use crate::metadata::api::export_types::GetVisibleRequest;
+use crate::metadata::api::export_types::RoCrateExportView;
+use crate::metadata::api::export_types::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
+use crate::metadata::api::read::ensure_record_readable;
+use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::resolve_metadata_id;
+use crate::metadata::profile::rules::PROFILE_DOCUMENT_PREFIX;
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::raw_revision::MetadataRawView;
 use crate::metadata::raw_revision::load_raw_view;
+use crate::metadata::revision_read::MetadataRawView;
 use crate::placement::process_placements::load_realm_config;
 use crate::placement::read_holder_sets;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::peer_trust::PeerTrust;
 use crate::realm::peer_trust::ensure_peer_trust;
 use aruna_core::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MaterializationState;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::MetadataQueryResults;
@@ -127,9 +128,9 @@ pub(super) async fn device_export(
         None,
     )
     .await?;
-    let handle = context
+    context
         .metadata_handle
-        .clone()
+        .as_ref()
         .ok_or(MetadataApiError::ServiceUnavailable)?;
     match request.view {
         RoCrateExportView::Full => Ok(ExportMetadataResult::Full {
@@ -139,8 +140,7 @@ pub(super) async fn device_export(
         RoCrateExportView::Raw => {
             let merged = if replica.findings > 0 {
                 Some(
-                    handle
-                        .export_rocrate_jsonld(record.graph_iri.clone())
+                    crate::metadata::export_rocrate_jsonld(context, record.graph_iri.clone())
                         .await
                         .map_err(|_| MetadataApiError::ServiceUnavailable)?,
                 )
@@ -164,22 +164,21 @@ pub(super) async fn device_export(
             })
         }
         RoCrateExportView::Summary => Ok(ExportMetadataResult::Summary {
-            jsonld: handle
-                .export_summary_jsonld(record.graph_iri.clone())
+            jsonld: crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
                 .await
                 .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
         RoCrateExportView::Page => Ok(ExportMetadataResult::Page {
-            page: handle
-                .export_rocrate_page(
-                    record.graph_iri.clone(),
-                    request.limit.unwrap_or(100).clamp(1, 1_000),
-                    request.offset,
-                    request.after.clone(),
-                )
-                .await
-                .map_err(|_| MetadataApiError::ServiceUnavailable)?,
+            page: crate::metadata::export_rocrate_page(
+                context,
+                record.graph_iri.clone(),
+                request.limit.unwrap_or(100).clamp(1, 1_000),
+                request.offset,
+                request.after.clone(),
+            )
+            .await
+            .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
     }
@@ -740,10 +739,6 @@ pub(super) fn ensure_export_limit(
     Ok(())
 }
 
-/// The only document path the Profile validation channel serves. Serving
-/// nothing else is the whole authorization of a fetch that asserts no user.
-pub(crate) const PROFILE_DOCUMENT_PREFIX: &str = "profiles/";
-
 /// Reads one registered Profile at an exact revision so a holder can validate a
 /// Dataset without a caller. Infrastructure nodes use the user-less purpose-bound
 /// channel; devices read a replica or ask under their owner's authority only.
@@ -1104,8 +1099,7 @@ pub(crate) async fn apply_document_query(
     )
     .await
     .map_err(read_error)?;
-    metadata
-        .query_authorized_local(auth, Some(vec![record.graph_iri]), sparql)
+    crate::metadata::query_authorized_local(context, auth, Some(vec![record.graph_iri]), sparql)
         .await
         .map_err(|_| MetadataReadError::Unavailable)
 }

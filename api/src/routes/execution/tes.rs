@@ -726,7 +726,7 @@ pub async fn create_task(
 
     let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -903,7 +903,7 @@ pub async fn get_task(
 
     let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -1187,7 +1187,7 @@ pub async fn cancel_task(
     };
     let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),

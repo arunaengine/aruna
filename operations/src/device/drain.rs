@@ -26,7 +26,7 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     mint_forward_document,
 };
-use crate::metadata::forward::{apply_batch_routed, route_metadata_create};
+use crate::metadata::forward::write::{apply_batch_routed, route_metadata_create};
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::placement::process_placements::load_realm_config;
 

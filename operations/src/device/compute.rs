@@ -15,7 +15,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::{list_owned_jobs, submit_execution_job};
 use crate::jobs::submit::{SubmitJobError, SubmitJobResult};
-use crate::metadata::api::load_realm_config;
+use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::node_state::DrainStateOperation;
@@ -366,6 +366,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

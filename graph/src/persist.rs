@@ -8,14 +8,13 @@ use std::thread;
 use std::time::Instant;
 
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataRequestDurability};
-use aruna_core::telemetry::record_elapsed_ms;
+use aruna_core::telemetry::{record_elapsed_ms, record_error};
 use tracing::{debug_span, field, warn};
 
-use super::MetadataInner;
-use super::effects::record_error;
+use crate::GraphInner;
 
-pub(super) fn flush_sync_journal(
-    inner: &MetadataInner,
+pub(crate) fn flush_sync_journal(
+    inner: &GraphInner,
     effect_name: &'static str,
     graph_iri: Option<&str>,
 ) -> Result<(), MetadataError> {
@@ -26,12 +25,18 @@ pub(super) fn flush_sync_journal(
         "metadata.backend.document_sync.flush",
         effect = effect_name,
         graph_iri = graph_iri.unwrap_or("<none>"),
-        mode = inner.sync_persist_policy.label(),
+        mode = if inner.sync_all { "sync_all" } else { "buffer" },
         elapsed_ms = field::Empty,
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(inner.sync_persist_policy.as_fjall()));
+    let result = span.in_scope(|| {
+        db.persist(if inner.sync_all {
+            fjall::PersistMode::SyncAll
+        } else {
+            fjall::PersistMode::Buffer
+        })
+    });
     record_elapsed_ms(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -47,8 +52,8 @@ pub(super) fn flush_sync_journal(
     }
 }
 
-pub(super) fn flush_metadata_persistence(
-    inner: &MetadataInner,
+pub(crate) fn flush_metadata_persistence(
+    inner: &GraphInner,
     effect_name: &'static str,
     graph_iri: Option<&str>,
 ) -> Result<(), MetadataError> {
@@ -59,7 +64,7 @@ pub(super) fn flush_metadata_persistence(
     flush_sync_journal(inner, effect_name, graph_iri)
 }
 
-pub(super) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
+pub(crate) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
     match effect {
         MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => {
             false
@@ -98,7 +103,7 @@ pub(super) fn effect_persists_sync(effect: &MetadataEffect) -> bool {
     }
 }
 
-pub(super) fn effect_defers_persist(effect: &MetadataEffect) -> bool {
+pub(crate) fn effect_defers_persist(effect: &MetadataEffect) -> bool {
     match effect {
         MetadataEffect::CreateCrate { request } => {
             request.durability == MetadataRequestDurability::WalAlreadyDurable
@@ -114,15 +119,8 @@ pub(super) fn effect_defers_persist(effect: &MetadataEffect) -> bool {
     }
 }
 
-pub(super) fn effect_skips_lifecycle(effect: &MetadataEffect) -> bool {
-    matches!(
-        effect,
-        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. }
-    )
-}
-
-pub(super) fn schedule_deferred_persist(
-    inner: Arc<MetadataInner>,
+pub(crate) fn schedule_deferred_persist(
+    inner: Arc<GraphInner>,
     effect_name: &'static str,
     graph_iri: Option<String>,
 ) {
@@ -177,7 +175,7 @@ pub(super) fn schedule_deferred_persist(
     }
 }
 
-fn run_deferred_flush(inner: &MetadataInner, effect_name: &'static str, graph_iri: Option<&str>) {
+fn run_deferred_flush(inner: &GraphInner, effect_name: &'static str, graph_iri: Option<&str>) {
     let span = debug_span!(
         "metadata.backend.deferred_persist",
         effect = effect_name,

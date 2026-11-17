@@ -68,6 +68,7 @@ async fn fixture() -> Fixture {
         net_handle: Some(net),
         blob_handle: Some(blob),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,

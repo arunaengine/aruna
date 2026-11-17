@@ -19,8 +19,8 @@ use tracing::debug;
 
 use crate::driver::DriverContext;
 use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::api::load_realm_config;
 use crate::placement::resolve_shard_holders;
+use crate::realm::load_config::load_realm_config;
 use aruna_core::structs::execution::job::record_keys::submission_prefix;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

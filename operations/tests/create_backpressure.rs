@@ -44,20 +44,26 @@ async fn spawn_probe_node(with_drains: bool) -> Result<ProbeNode, BoxError> {
             .ok_or("invalid storage path")?,
     )?;
     let node_id = iroh::SecretKey::generate().public();
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         temp_dir.path().join("metadata"),
         node_id,
+        None,
+        None,
+        aruna_graph::GraphOptions::default(),
+    )?;
+    let metadata_handle = MetadataHandle::new(
+        temp_dir.path().join("metadata"),
         storage.clone(),
         None,
-        None,
-        None,
-    )?;
+        Default::default(),
+    );
     let task_handle = with_drains.then(TaskHandle::new);
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: task_handle.clone(),
         compute_handle: None,
         outbound_handle: None,

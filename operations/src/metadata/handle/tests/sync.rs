@@ -1,13 +1,12 @@
-//! Tests sync bucket creation, delete rules, stream timeouts and journal flush policies.
+//! Tests sync bucket creation, delete rules and stream timeouts.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::transport::with_sync_timeout;
-use super::auth::{auth_storage, node_id_seed, realm_fixture};
+use super::auth::{node_id_seed, realm_fixture};
 use super::*;
 use crate::metadata::handle::transport::read_budget;
 use crate::s3::bucket::get::GetBucketOperation;
-use craqle::CraqleFjallPersistMode;
 #[test]
 fn workspace_delete_allowed() {
     let (_, realm_id, user_id) = realm_fixture();
@@ -106,6 +105,7 @@ async fn sync_creates_bucket() {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
         outbound_handle: None,
@@ -176,44 +176,4 @@ async fn header_timeout() {
 #[tokio::test(start_paused = true)]
 async fn body_timeout() {
     assert_timeout(&[0, 0, 0, 0, 8], true).await;
-}
-#[test]
-fn sync_defaults_buffered() {
-    let options = MetadataHandleOptions::default();
-
-    assert_eq!(options.sync_persist_policy, FjallPersistPolicy::Buffer);
-}
-#[test]
-fn set_sync_policy() {
-    let options = MetadataHandleOptions::default()
-        .with_search_storage(MetadataSearchStorage::Memory)
-        .with_sync_policy(FjallPersistPolicy::SyncAll);
-
-    assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
-    assert_eq!(options.sync_persist_policy, FjallPersistPolicy::SyncAll);
-}
-#[tokio::test]
-async fn flush_without_sync() {
-    let (_storage_dir, storage) = auth_storage();
-    let metadata_dir = tempdir().expect("metadata dir");
-    let metadata_handle = MetadataHandle::new_with_options(
-        metadata_dir.path(),
-        node_id_seed(1),
-        storage,
-        None,
-        None,
-        None,
-        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
-    )
-    .expect("metadata handle opens");
-
-    assert_eq!(
-        metadata_handle.inner.node.graph_store_persist_mode(),
-        CraqleFjallPersistMode::Buffer
-    );
-
-    metadata_handle
-        .flush_persistence()
-        .await
-        .expect("metadata persistence flushes");
 }

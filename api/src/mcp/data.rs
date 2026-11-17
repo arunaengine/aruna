@@ -19,7 +19,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::driver::{bucket_snapshot, drive, gate_context};
-use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
+use aruna_operations::metadata::api::fanout::search_buckets_distributed;
+use aruna_operations::metadata::api::search_types::BucketSearchRequest;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

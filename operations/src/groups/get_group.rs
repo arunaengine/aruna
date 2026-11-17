@@ -347,6 +347,7 @@ mod test {
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
             outbound_handle: None,

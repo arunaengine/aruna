@@ -33,10 +33,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{
     DeviceGroupDocuments, MAX_DEVICE_GROUPS, MetadataTransportMessage, RealmDocuments,
 };
+use crate::realm::load_config::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use crate::realm::node_name::NodeDisplays;
 use aruna_core::node_state::InstallInfoOperation;
@@ -1052,6 +1052,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

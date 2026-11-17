@@ -29,21 +29,27 @@ pub(crate) fn metadata_test() -> MetadataTest {
     let storage_handle =
         storage::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
             .expect("storage opens");
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .expect("metadata handle");
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage_handle.clone(),
+        None,
+        Default::default(),
+    );
     MetadataTest {
         context: DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

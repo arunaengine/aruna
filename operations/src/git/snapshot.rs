@@ -102,12 +102,11 @@ pub(super) async fn current(
     }) {
         return Ok(None);
     }
-    let handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(GitError::Unavailable)?;
-    let jsonld = handle
-        .export_rocrate_jsonld(document.graph_iri.clone())
+    let jsonld = crate::metadata::export_rocrate_jsonld(context, document.graph_iri.clone())
         .await
         .map_err(|_| GitError::Unavailable)?;
     Ok(Some((document.last_event_id, jsonld)))

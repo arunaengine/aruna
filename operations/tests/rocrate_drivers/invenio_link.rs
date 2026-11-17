@@ -435,7 +435,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
     assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
     let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
-    let found = Box::pin(aruna_operations::metadata::secondary_ids::lookup_local(
+    let found = Box::pin(aruna_operations::metadata::identifier_lookup::lookup_local(
         &fixture.context,
         fixture.actor.realm_id,
         Some(&auth),

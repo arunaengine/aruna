@@ -2,34 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::pin::pin;
-
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::PersistentIdMapping;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::secondary_id::{
-    IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier, index_document, secondary_id_prefix,
-};
+use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
 use aruna_core::types::{Effects, TxnId};
 use byteview::ByteView;
-use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::api::{MetadataApiError, can_read_record};
-use crate::metadata::get_document::load_document_record;
-use crate::metadata::persistent_id::{
-    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping,
-    read_mapping_effect, transition_entries,
+use crate::metadata::id_mapping::{
+    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping_effect,
+    transition_entries,
 };
-use crate::storage_read::scan_pages;
 
 const COMMIT_ATTEMPTS: usize = 4;
 
@@ -220,7 +208,7 @@ impl Operation for AddIdentifiersOperation {
                 self.fail(PersistentIdError::Storage(error))
             }
             (state, event) => {
-                let message = format!("unexpected event {event:?} in state {state:?}");
+                let message = format!("unexpected event {} in state {state:?}", event.label());
                 self.fail(PersistentIdError::Unavailable(message))
             }
         }
@@ -259,72 +247,10 @@ pub struct IdentifierMatch {
     pub origin: IdentifierOrigin,
 }
 
-/// Every readable document in this node's reverse index that holds the identifier.
-/// Unreadable and deleted documents are skipped, so a miss never reveals that they exist.
-pub async fn lookup_local(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    auth: Option<&AuthContext>,
-    kind: SecondaryIdKind,
-    value: &str,
-    endpoint: Option<&str>,
-) -> Result<Vec<IdentifierMatch>, MetadataApiError> {
-    let prefix = ByteView::from(secondary_id_prefix(kind, value, endpoint));
-    let mut pages = pin!(scan_pages(
-        &ctx.storage_handle,
-        SECONDARY_ID_KEYSPACE,
-        Some(prefix)
-    ));
-    let mut documents = Vec::new();
-    while let Some(page) = pages.try_next().await.map_err(MetadataApiError::Internal)? {
-        documents.extend(
-            page.iter()
-                .filter_map(|(key, _)| index_document(key.as_ref())),
-        );
-    }
-    documents.sort();
-    documents.dedup();
-    let mut matches = Vec::new();
-    for document_id in documents {
-        let record = load_document_record(ctx, document_id)
-            .await
-            .map_err(|_| MetadataApiError::ServiceUnavailable)?;
-        let Some(record) = record else {
-            continue;
-        };
-        if !can_read_record(ctx, realm_id, auth, &record).await? {
-            continue;
-        }
-        let mapping = read_mapping(ctx, document_id)
-            .await
-            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-        let Some(mapping) = mapping.filter(|mapping| !mapping.is_retired()) else {
-            continue;
-        };
-        let origin = mapping
-            .secondary_identifiers
-            .iter()
-            .filter(|held| {
-                held.kind == kind
-                    && held.value == value
-                    && endpoint.is_none_or(|endpoint| held.endpoint.as_deref() == Some(endpoint))
-            })
-            .map(|held| held.origin)
-            .min();
-        let Some(origin) = origin else {
-            continue;
-        };
-        matches.push(IdentifierMatch {
-            document_id,
-            pid: mapping.is_active().then_some(mapping.pid),
-            origin,
-        });
-    }
-    Ok(matches)
-}
-
 /// Merges answers from several nodes: one entry per document, `Published` first, then by id.
-pub fn merge_matches(answers: impl IntoIterator<Item = IdentifierMatch>) -> Vec<IdentifierMatch> {
+pub(crate) fn merge_matches(
+    answers: impl IntoIterator<Item = IdentifierMatch>,
+) -> Vec<IdentifierMatch> {
     let mut merged: Vec<IdentifierMatch> = Vec::new();
     for answer in answers {
         match merged
@@ -345,13 +271,16 @@ pub fn merge_matches(answers: impl IntoIterator<Item = IdentifierMatch>) -> Vec<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
+    use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
     use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::secondary_id::SecondaryIdKind;
 
-    fn mapping(document_id: Ulid) -> PersistentIdMapping {
+    pub(crate) fn mapping(document_id: Ulid) -> PersistentIdMapping {
         PersistentIdMapping::requested(
             document_id,
             false,
@@ -386,7 +315,7 @@ mod tests {
         })
     }
 
-    fn read_event(value: Option<&PersistentIdMapping>) -> Event {
+    pub(crate) fn read_event(value: Option<&PersistentIdMapping>) -> Event {
         Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(Vec::new()),
             value: value.map(|mapping| ByteView::from(mapping.to_bytes().unwrap())),

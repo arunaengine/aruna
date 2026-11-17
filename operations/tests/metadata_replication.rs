@@ -38,10 +38,11 @@ use aruna_operations::metadata::delete_document::{DeleteDocumentError, DeleteDoc
 use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::{project_create_events, replay_event_log};
+use aruna_operations::metadata::send_metadata_effect;
 use aruna_operations::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use aruna_operations::metadata::update_entry::update_metadata_document;
 use aruna_operations::placement::{
     PlacementResolutionContext, choose_origin_bucket, held_buckets, resolve_shard_holders,
     strategy_for_target, subject_bytes,
@@ -898,15 +899,10 @@ async fn long_history() -> Result<(), Box<dyn std::error::Error>> {
         wait_for_convergence("edits did not reach every node", || async {
             let mut pending = 0;
             for node in &nodes {
-                let event = node
-                    .context
-                    .metadata_handle
-                    .as_ref()
-                    .ok_or("metadata handle missing")?
-                    .send_effect(Effect::Metadata(MetadataEffect::GraphSnapshot {
-                        graph_iri: created.record.graph_iri.clone(),
-                    }))
-                    .await;
+                let snapshot = MetadataEffect::GraphSnapshot {
+                    graph_iri: created.record.graph_iri.clone(),
+                };
+                let event = send_metadata_effect(&node.context, snapshot).await;
                 let Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) = event
                 else {
                     return Err("graph state unreadable".into());
@@ -1597,14 +1593,13 @@ async fn wait_metadata_absence(
             .await
             .is_err();
             let graph_absent = matches!(
-                node.context
-                    .metadata_handle
-                    .as_ref()
-                    .unwrap()
-                    .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+                send_metadata_effect(
+                    &node.context,
+                    MetadataEffect::ExportRoCrate {
                         graph_iri: graph_iri.to_string(),
-                    }))
-                    .await,
+                    },
+                )
+                .await,
                 Event::Metadata(MetadataEvent::Error { .. })
             );
             if !(document_absent && graph_absent) {

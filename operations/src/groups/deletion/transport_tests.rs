@@ -30,17 +30,23 @@ async fn connect_fixture(fixture: &mut Fixture, seed: u8) -> NetHandle {
     )
     .await
     .unwrap();
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         fixture.dir.path().join("metadata"),
         net.node_id(),
-        fixture.context.storage_handle.clone(),
-        Some(net.clone()),
         Some(net.document_sync_node()),
         Some(net.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    let metadata = MetadataHandle::new(
+        fixture.dir.path().join("metadata"),
+        fixture.context.storage_handle.clone(),
+        Some(net.clone()),
+        Default::default(),
+    );
     fixture.context.net_handle = Some(net.clone());
     fixture.context.metadata_handle = Some(metadata);
+    fixture.context.graph_handle = Some(graph);
     net.reload_realm_peers().await.unwrap();
     net
 }

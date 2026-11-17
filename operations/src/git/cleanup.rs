@@ -5,7 +5,7 @@
 use super::state::{Ancestry, reduce};
 use super::{GitError, lfs, objects, records};
 use crate::driver::{DriverContext, drive};
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_core::UserId;
 use aruna_core::git::{

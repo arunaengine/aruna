@@ -40,7 +40,8 @@ use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
-use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
+use crate::metadata::api::export_types::RoCrateExportView;
+use crate::metadata::api::preflight_types::{ReferenceNodeExecution, ReferenceNodeRequest};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::bucket::search::BucketPage;
@@ -48,7 +49,7 @@ use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
 use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
-pub use aruna_core::metadata::{AuthToken, AuthTokenError};
+use aruna_core::metadata::AuthToken;
 
 pub(crate) const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 const AUDIT_FRAME_OVERHEAD: usize = 256;
@@ -583,10 +584,10 @@ pub enum MetadataTransportMessage {
     /// One node's data link postings for the caller's lookup, read under the caller's token.
     DataLinks {
         auth_token: Option<AuthToken>,
-        request: Box<crate::metadata::api::LinkNodeRequest>,
+        request: Box<crate::metadata::api::links::types::LinkNodeRequest>,
     },
     DataLinkResults {
-        result: Result<Box<crate::metadata::api::LinkNodePage>, MetadataReadError>,
+        result: Result<Box<crate::metadata::api::links::types::LinkNodePage>, MetadataReadError>,
     },
     /// The group that owns a local bucket, asked by a management node for a database mark.
     BucketOwner {
@@ -603,7 +604,7 @@ pub enum MetadataTransportMessage {
         limit: usize,
     },
     SetPreviewResults {
-        result: Result<Box<crate::metadata::api::SetPreviewPage>, MetadataReadError>,
+        result: Result<Box<crate::metadata::api::links::types::SetPreviewPage>, MetadataReadError>,
     },
     /// A staging job the former coordinator of a range hands over in transfer `transfer_id`.
     StagingSpec {
@@ -891,7 +892,7 @@ pub enum WriteAuthError {
     Forbidden,
 }
 
-pub async fn write_message(
+pub(crate) async fn write_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {

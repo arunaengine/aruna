@@ -1,187 +1,26 @@
-//! Pages registry records by update time and sweeps stale timestamp index keys.
+//! Runs the timestamp index sweep and deletes index keys.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::events::{Event, StorageEvent};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::UPDATED_INDEX_KEYSPACE;
-use aruna_core::storage_entries::{parse_updated_key, updated_index_key};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::Key;
 use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
-use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::repository::StorageReadError;
-use crate::storage_read::parse_storage_scan;
+use crate::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
 
-/// Storage rows scanned per index batch while assembling one enumeration page.
-const INDEX_SCAN_BATCH: usize = 256;
-/// Index keys validated by one sweep pass, and stale keys per delete batch.
-const SWEEP_SCAN_LIMIT: usize = 4_096;
-const SWEEP_DELETE_BATCH: usize = 128;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-
-/// One page of registry records ordered by `updated_at_ms`, plus stale index
-/// keys the caller may sweep.
-pub struct UpdatedRecordsPage {
-    pub records: Vec<MetadataRegistryRecord>,
-    /// Exclusive cursor to resume after; `None` when the window is exhausted.
-    pub next_after: Option<Key>,
-    /// Index keys whose record moved to a newer datestamp or was deleted. Safe to
-    /// delete in a sweep; skipping them keeps this read path read-only.
-    pub stale_keys: Vec<Key>,
-}
-
-/// Enumerate registry records whose `updated_at_ms` is in `[from_ms, until_ms]`,
-/// ascending, up to `limit` records, local realm only. Keys are validated
-/// against the current record; stale keys are skipped, never under-listing.
-pub async fn enumerate_updated(
-    context: &DriverContext,
-    from_ms: u64,
-    until_ms: u64,
-    after: Option<Key>,
-    limit: usize,
-) -> Result<UpdatedRecordsPage, StorageReadError> {
-    let mut records = Vec::new();
-    let mut stale_keys = Vec::new();
-    let mut start = match after {
-        Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(updated_index_key(from_ms, Ulid::nil())),
-    };
-
-    loop {
-        let event = context
-            .storage_handle
-            .send_effect(iter_effect(start.clone()))
-            .await;
-        let (entries, iter_next) = parse_storage_scan(event)?;
-        if entries.is_empty() {
-            break;
-        }
-
-        for (key, _) in entries {
-            let (updated_at_ms, document_id) =
-                parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
-            if updated_at_ms > until_ms {
-                return Ok(UpdatedRecordsPage {
-                    records,
-                    next_after: None,
-                    stale_keys,
-                });
-            }
-            match load_document_record(context, document_id).await? {
-                Some(record) if record.updated_at_ms == updated_at_ms => {
-                    records.push(record);
-                    if records.len() >= limit {
-                        return Ok(UpdatedRecordsPage {
-                            records,
-                            next_after: Some(key),
-                            stale_keys,
-                        });
-                    }
-                }
-                _ => stale_keys.push(key),
-            }
-        }
-
-        match iter_next {
-            Some(next) => start = IterStart::After(next),
-            None => break,
-        }
-    }
-
-    Ok(UpdatedRecordsPage {
-        records,
-        next_after: None,
-        stale_keys,
-    })
-}
-
-/// One bounded sweep pass: how many stale keys it deleted and where to resume.
-pub struct SweepPass {
-    pub deleted: usize,
-    pub next_after: Option<Key>,
-}
-
-/// Deletes index keys whose record moved to a newer datestamp or was deleted.
-/// Racing a concurrent write is benign: the writer re-adds the current key,
-/// and readers validate every key against the record regardless.
-pub async fn sweep_stale_keys(
-    context: &DriverContext,
-    after: Option<Key>,
-) -> Result<SweepPass, StorageReadError> {
-    sweep_bounded(context, after, SWEEP_SCAN_LIMIT).await
-}
-
-async fn sweep_bounded(
-    context: &DriverContext,
-    after: Option<Key>,
-    scan_limit: usize,
-) -> Result<SweepPass, StorageReadError> {
-    let mut start = match after {
-        Some(cursor) => IterStart::After(cursor),
-        None => IterStart::At(updated_index_key(0, Ulid::nil())),
-    };
-    let mut stale = Vec::new();
-    let mut deleted = 0usize;
-    let mut scanned = 0usize;
-    let mut resume = None;
-
-    'scan: loop {
-        let event = context
-            .storage_handle
-            .send_effect(iter_effect(start.clone()))
-            .await;
-        let (entries, iter_next) = parse_storage_scan(event)?;
-        if entries.is_empty() {
-            break;
-        }
-
-        for (key, _) in entries {
-            let (updated_at_ms, document_id) =
-                parse_updated_key(key.as_ref()).map_err(StorageReadError::Conversion)?;
-            scanned += 1;
-            resume = Some(key.clone());
-            match load_document_record(context, document_id).await? {
-                Some(record) if record.updated_at_ms == updated_at_ms => {}
-                _ => stale.push(key),
-            }
-            if stale.len() >= SWEEP_DELETE_BATCH {
-                deleted +=
-                    delete_index_keys(context, UPDATED_INDEX_KEYSPACE, std::mem::take(&mut stale))
-                        .await?;
-            }
-            if scanned >= scan_limit {
-                break 'scan;
-            }
-        }
-
-        match iter_next {
-            Some(next) => start = IterStart::After(next),
-            None => {
-                resume = None;
-                break;
-            }
-        }
-    }
-
-    deleted += delete_index_keys(context, UPDATED_INDEX_KEYSPACE, stale).await?;
-    Ok(SweepPass {
-        deleted,
-        next_after: resume,
-    })
-}
 
 /// Runs the sweep on the shutdown supervisor, resuming from the previous pass so
 /// no single pass walks the whole index.
-pub fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
+pub(crate) fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
     let token = shutdown.token();
     shutdown.spawn(async move {
         let mut cursor = None;
@@ -190,7 +29,8 @@ pub fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
                 _ = token.cancelled() => return,
                 _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
             }
-            match sweep_stale_keys(&context, cursor.take()).await {
+            let sweep = TimestampSweepOperation::new(cursor.take(), SWEEP_SCAN_LIMIT);
+            match drive(sweep, &context).await {
                 Ok(pass) => cursor = pass.next_after,
                 Err(error) => warn!(error = ?error, "Metadata timestamp-index sweep failed"),
             }
@@ -198,19 +38,9 @@ pub fn spawn_index_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
     });
 }
 
-fn iter_effect(start: IterStart) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: UPDATED_INDEX_KEYSPACE.to_string(),
-        prefix: None,
-        start: Some(start),
-        limit: INDEX_SCAN_BATCH,
-        txn_id: None,
-    })
-}
-
 /// Untransacted batch delete of index keys in one keyspace, returning how many
 /// were dropped.
-pub async fn delete_index_keys(
+pub(crate) async fn delete_index_keys(
     context: &DriverContext,
     keyspace: &str,
     keys: Vec<Key>,
@@ -243,16 +73,15 @@ pub async fn delete_index_keys(
 mod tests {
     use super::*;
     use crate::metadata::repository::create_outbox_entries;
-    use aruna_core::NodeId;
+    use crate::metadata::updated_page::UpdatedPageOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::{
-        MetadataAuditOperation, MetadataAuditRecord,
-    };
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_storage::storage;
     use tempfile::tempdir;
+    use ulid::Ulid;
 
     fn record(document_id: Ulid, updated_at_ms: u64) -> MetadataRegistryRecord {
         MetadataRegistryRecord {
@@ -275,20 +104,6 @@ mod tests {
         }
     }
 
-    fn audit(record: &MetadataRegistryRecord) -> MetadataAuditRecord {
-        MetadataAuditRecord {
-            realm_id: record.realm_id,
-            group_id: record.group_id,
-            document_id: record.document_id,
-            graph_iri: record.graph_iri.clone(),
-            user_id: Default::default(),
-            node_id: NodeId::from_bytes(&[1u8; 32]).expect("node id"),
-            operation: MetadataAuditOperation::Create,
-            occurred_at_ms: record.updated_at_ms,
-            details: None,
-        }
-    }
-
     fn context() -> (DriverContext, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let context = DriverContext {
@@ -296,6 +111,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -304,7 +120,13 @@ mod tests {
     }
 
     async fn store(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
+        let writes = create_outbox_entries(
+            record,
+            &crate::tests::metadata::create_audit(record),
+            Ulid::generate(),
+            None,
+        )
+        .unwrap();
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
@@ -329,7 +151,7 @@ mod tests {
         store(&context, &early).await;
         store(&context, &mid).await;
 
-        let page = enumerate_updated(&context, 150, 250, None, 10)
+        let page = drive(UpdatedPageOperation::new(150, 250, None, 10), &context)
             .await
             .unwrap();
         let stamps: Vec<u64> = page.records.iter().map(|r| r.updated_at_ms).collect();
@@ -347,7 +169,7 @@ mod tests {
         record.updated_at_ms = 500;
         store(&context, &record).await;
 
-        let page = enumerate_updated(&context, 0, 1000, None, 10)
+        let page = drive(UpdatedPageOperation::new(0, 1000, None, 10), &context)
             .await
             .unwrap();
         let stamps: Vec<u64> = page.records.iter().map(|r| r.updated_at_ms).collect();
@@ -372,7 +194,7 @@ mod tests {
             Event::Storage(StorageEvent::BatchDeleteResult { .. })
         ));
 
-        let page = enumerate_updated(&context, 0, u64::MAX, None, 10)
+        let page = drive(UpdatedPageOperation::new(0, u64::MAX, None, 10), &context)
             .await
             .unwrap();
         assert!(page.records.is_empty());
@@ -390,11 +212,16 @@ mod tests {
         let current = record(Ulid::from_bytes([41; 16]), 200);
         store(&context, &current).await;
 
-        let pass = sweep_stale_keys(&context, None).await.unwrap();
+        let pass = drive(
+            TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(pass.deleted, 1);
         assert!(pass.next_after.is_none());
 
-        let page = enumerate_updated(&context, 0, u64::MAX, None, 10)
+        let page = drive(UpdatedPageOperation::new(0, u64::MAX, None, 10), &context)
             .await
             .unwrap();
         let stamps: Vec<u64> = page.records.iter().map(|r| r.updated_at_ms).collect();
@@ -416,7 +243,9 @@ mod tests {
         let mut cursor = None;
         let mut deleted = 0usize;
         for _ in 0..64 {
-            let pass = sweep_bounded(&context, cursor.take(), 2).await.unwrap();
+            let pass = drive(TimestampSweepOperation::new(cursor.take(), 2), &context)
+                .await
+                .unwrap();
             deleted += pass.deleted;
             cursor = pass.next_after;
             if cursor.is_none() {
@@ -438,12 +267,14 @@ mod tests {
             )
             .await;
         }
-        let first = enumerate_updated(&context, 0, 1000, None, 2).await.unwrap();
+        let first = drive(UpdatedPageOperation::new(0, 1000, None, 2), &context)
+            .await
+            .unwrap();
         assert_eq!(first.records.len(), 2);
         let cursor = first.next_after.clone();
         assert!(cursor.is_some());
 
-        let second = enumerate_updated(&context, 0, 1000, cursor, 10)
+        let second = drive(UpdatedPageOperation::new(0, 1000, cursor, 10), &context)
             .await
             .unwrap();
         assert_eq!(second.records.len(), 3);

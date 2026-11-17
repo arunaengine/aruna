@@ -135,13 +135,12 @@ async fn rejoin_peer(
         fjall_persist_policy: joiner.config.fjall_persist_policy,
     };
     let peer = NetHandle::new(config, context_storage.clone()).await?;
-    let metadata = match MetadataHandle::new(
+    let graph = match aruna_graph::GraphHandle::open(
         directory.path().join("metadata"),
         peer.node_id(),
-        context_storage.clone(),
-        Some(peer.clone()),
         Some(peer.document_sync_node()),
         Some(peer.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
     ) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -149,11 +148,18 @@ async fn rejoin_peer(
             return Err(error.into());
         }
     };
+    let metadata = MetadataHandle::new(
+        directory.path().join("metadata"),
+        context_storage.clone(),
+        Some(peer.clone()),
+        Default::default(),
+    );
     let context = Arc::new(DriverContext {
         storage_handle: context_storage,
         net_handle: Some(peer.clone()),
         blob_handle: None,
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
         outbound_handle: None,

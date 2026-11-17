@@ -21,8 +21,9 @@ use crate::auth::bearer_token::{
 };
 use crate::driver::DriverContext;
 use crate::metadata::contact::PeerContacts;
-use crate::metadata::protocol::{AuthToken, MetadataReadError};
+use crate::metadata::protocol::MetadataReadError;
 use crate::realm::peer_trust::{PeerTrust, RealmPeerError, ensure_peer_trust};
+use aruna_core::metadata::AuthToken;
 
 impl MetadataHandle {
     /// Validates a forwarded caller's bearer token and confirms the forwarding
@@ -374,7 +375,8 @@ async fn ensure_peer_configured(
         }
         Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
-            "unexpected realm config read result for `{realm_id}`: {other:?}"
+            "unexpected realm config read result for `{realm_id}`: {}",
+            other.label()
         ))),
     }
 }
@@ -402,7 +404,8 @@ where
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
         Event::Storage(StorageEvent::Error { error }) => Err(MetadataError::Storage(error)),
         other => Err(MetadataError::Backend(format!(
-            "unexpected metadata auth state read result: {other:?}"
+            "unexpected metadata auth state read result: {}",
+            other.label()
         ))),
     }
 }
@@ -412,7 +415,7 @@ pub(super) async fn config_digest_matches(
     realm_id: RealmId,
     expected: &[u8; 32],
 ) -> bool {
-    super::super::api::load_realm_config(context, realm_id)
+    crate::realm::load_config::load_realm_config(context, realm_id)
         .await
         .and_then(|config| config.digest().ok())
         .as_ref()

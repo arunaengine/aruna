@@ -44,7 +44,7 @@ use aruna_operations::groups::remove_role::{
 use aruna_operations::groups::update_group::{
     GroupChange, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
 };
-use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

@@ -206,6 +206,8 @@ mod tests {
             metadata_handle: None,
             task_handle: None,
             compute_handle: None,
+            graph_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([7; 32]);
         let kpis = realm_kpis(&context, realm_id, Some(2)).await;

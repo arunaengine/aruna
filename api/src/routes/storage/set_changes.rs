@@ -145,7 +145,7 @@ async fn admin(
     auth: AuthContext,
     bearer: Option<ValidatedBearer>,
     (group_id, set_id): (Ulid, Ulid),
-) -> ServerResult<(AuthContext, Option<aruna_operations::metadata::AuthToken>)> {
+) -> ServerResult<(AuthContext, Option<aruna_core::metadata::AuthToken>)> {
     ensure_group_admin(state, &auth, group_id).await?;
     owned_status(state, group_id, set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;

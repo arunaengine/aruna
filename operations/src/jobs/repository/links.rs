@@ -25,7 +25,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
-use crate::metadata::persistent_id::MappingRoute;
+use crate::metadata::id_mapping::MappingRoute;
 use crate::placement::fence;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 

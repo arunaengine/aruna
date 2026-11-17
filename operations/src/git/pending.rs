@@ -5,11 +5,11 @@
 use super::snapshot::execute;
 use super::{GitError, records};
 use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,
-    update_metadata_document,
 };
+use crate::metadata::update_entry::update_metadata_document;
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
@@ -73,7 +73,7 @@ async fn apply_one(
     document: &MetadataRegistryRecord,
     merge: &PendingMerge,
 ) -> Result<(), GitError> {
-    let metadata = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(GitError::Unavailable)?;
@@ -84,11 +84,13 @@ async fn apply_one(
         .ok_or(GitError::Unavailable)?;
     let mut files = super::dataset::target(context, store, document, merge).await?;
     for _ in 0..8 {
-        let exported = metadata
-            .send_metadata_effect(MetadataEffect::ExportVersioned {
+        let exported = crate::metadata::send_metadata_effect(
+            context,
+            MetadataEffect::ExportVersioned {
                 graph_iri: document.graph_iri.clone(),
-            })
-            .await;
+            },
+        )
+        .await;
         let MetadataEvent::VersionedExport {
             jsonld, version, ..
         } = (match exported {
@@ -229,6 +231,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,

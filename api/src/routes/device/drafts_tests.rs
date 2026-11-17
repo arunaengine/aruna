@@ -31,15 +31,20 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         dir.path().join("metadata"),
         node_id,
-        storage.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    let metadata = MetadataHandle::new(
+        dir.path().join("metadata"),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let state = Arc::new(
         ServerState::new(
             Arc::new(DriverContext {
@@ -47,6 +52,7 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: Some(metadata),
+                graph_handle: Some(graph),
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
                 outbound_handle: None,

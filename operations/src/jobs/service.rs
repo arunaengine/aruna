@@ -55,9 +55,9 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::metadata::api::load_realm_config;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use crate::realm::load_config::load_realm_config;
 use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
@@ -434,7 +434,7 @@ pub async fn submit_mint_pid(
     spec: MintPersistentSpec,
     local_node_id: NodeId,
     retention_ms: u64,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
     let (job_id, created) = crate::metadata::persistent_id::forward::submit_pid_routed(
         context,
@@ -731,7 +731,7 @@ pub async fn read_record_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<Option<JobRecord>, JobRouteError> {
     Ok(route_record(context, user_id, job_id, auth_token)
         .await?
@@ -743,7 +743,7 @@ pub async fn read_staging_routed(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     route_record(context, user_id, job_id, auth_token).await
 }
@@ -767,7 +767,7 @@ async fn route_record(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<Option<(JobRecord, Option<StagingJobCheckpoint>)>, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return read_record_data(context, user_id, job_id)
@@ -967,7 +967,7 @@ pub async fn read_job_routed(
     context: &DriverContext,
     auth: &AuthContext,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<RoutedJobStatus, JobRouteError> {
     let user_id = auth.user_id;
     // An external job is answered from the family projection, which any node
@@ -1124,7 +1124,7 @@ pub async fn read_report_routed(
     expected_digest: Option<[u8; 32]>,
     last_key: Option<Vec<u8>>,
     limit: usize,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let user_id = auth.user_id;
     let job_id = if drive(AliasFamilyOperation::new(job_id), context)
@@ -1266,7 +1266,7 @@ pub async fn read_owned_artifact(
         return Err("artifact record does not match its blob location".to_string());
     }
     let document_path =
-        crate::metadata::get_document::load_document_record(context, spec.document_id)
+        crate::metadata::record_reads::load_document_record(context, spec.document_id)
             .await
             .map_err(|error| match error {
                 StorageReadError::Storage(error) => error.to_string(),
@@ -1289,7 +1289,7 @@ pub async fn read_artifact_routed(
     job_id: JobId,
     now_ms: u64,
     range: Option<Range<u64>>,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<(ArtifactLookup, Option<ArtifactRead>), JobRouteError> {
     if context.net_handle.is_none() {
         let lookup = read_owned_artifact(context, user_id, job_id, now_ms)
@@ -1495,7 +1495,7 @@ async fn family_cancel(
     context: &DriverContext,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Option<Result<RoutedCancelOutcome, JobRouteError>> {
     let auth = AuthContext {
         user_id,
@@ -1526,7 +1526,7 @@ pub async fn cancel_job_routed(
     runtime: &JobsRuntime,
     user_id: UserId,
     job_id: JobId,
-    auth_token: Option<crate::metadata::AuthToken>,
+    auth_token: Option<aruna_core::metadata::AuthToken>,
 ) -> Result<RoutedCancelOutcome, JobRouteError> {
     let Some(net) = context.net_handle.as_ref() else {
         return cancel_owned_job(context, runtime, user_id, job_id)
@@ -1654,6 +1654,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -1919,6 +1920,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -1977,6 +1979,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -2016,6 +2019,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
@@ -2074,6 +2078,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
             outbound_handle: None,

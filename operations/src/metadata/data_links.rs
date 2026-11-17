@@ -241,7 +241,7 @@ fn expect_ok(event: Event) -> Result<(), DataLinkError> {
         Event::Storage(StorageEvent::BatchWriteResult { .. })
         | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -267,7 +267,7 @@ pub(crate) async fn iter_page(
             next_start_after,
         }) => Ok((values, next_start_after)),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
@@ -535,7 +535,7 @@ async fn settle_unverified(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+        other => return Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     };
     let current = match storage
         .send_storage_effect(StorageEffect::Read {
@@ -550,7 +550,7 @@ async fn settle_unverified(
             let _ = storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(DataLinkError::UnexpectedEvent(format!("{other:?}")));
+            return Err(DataLinkError::UnexpectedEvent(other.label().to_string()));
         }
     };
     let mut writes = Vec::new();
@@ -664,7 +664,7 @@ async fn read_value(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(DataLinkError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
     }
 }
 

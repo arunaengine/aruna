@@ -1059,7 +1059,7 @@ async fn drs_part_of(
     bearer: Option<String>,
     resolved: &ResolvedObject,
 ) -> Option<DrsPartOf> {
-    let found = aruna_operations::metadata::api::part_of(
+    let found = aruna_operations::metadata::api::links::part_of(
         state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),

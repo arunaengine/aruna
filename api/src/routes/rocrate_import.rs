@@ -23,7 +23,7 @@ use aruna_operations::jobs::import::upload::{
 };
 use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
-use aruna_operations::metadata::create_document::mint_job_document;
+use aruna_operations::metadata::create_entry::mint_job_document;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::staging::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation,

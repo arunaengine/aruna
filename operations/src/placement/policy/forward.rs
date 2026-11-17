@@ -14,10 +14,11 @@ use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{authorize_forwarded_caller, forward_auth_error};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::policy::create::{
     CreatePolicyConfig, CreatePolicyError, CreatePolicyOperation,
 };
+use aruna_core::metadata::AuthToken;
 
 /// Why a routed publication did not commit. The local outcome and the delivery
 /// outcome stay distinguishable, so a reused id is never reported as an

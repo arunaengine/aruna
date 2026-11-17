@@ -49,9 +49,9 @@ use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
-use crate::metadata::api::load_realm_config;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use crate::placement::resolve_shard_holders;
+use crate::realm::load_config::load_realm_config;
 use aruna_core::node_state::DrainStateOperation;
 use aruna_core::node_state::ReadInfoOperation;
 

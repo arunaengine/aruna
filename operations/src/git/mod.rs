@@ -24,7 +24,7 @@ use self::changes::PropertyConflict;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{parse_lifecycle_read, read_lifecycle_effect};
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, GitRepository, GitRequest};

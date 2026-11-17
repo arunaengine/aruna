@@ -6,23 +6,20 @@
 // Every metadata node answers from its own postings within one budget; results merge by
 // document id and say whether they are complete.
 
-pub(super) mod types;
+pub mod types;
 
 use self::types::{
     LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
     PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, merge_pages, merge_previews,
 };
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, CurrentVersionPointer, VersionKey, bucket_permission_path, object_permission_path,
-};
+use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
 
 use aruna_core::structs::storage::data::link::LinkPosting;
 use aruna_core::types::GroupId;
 
 use super::{
-    ApiQueryMode, AuthContext, BTreeMap, BlobVersion, DriverContext, Event, MetadataApiError,
+    ApiQueryMode, AuthContext, BTreeMap, DriverContext, Event, MetadataApiError,
     MetadataFanoutOperation, MetadataFanoutScope, MetadataNodeCall, MetadataReadError, NodeId,
     RealmId, Span, StorageEffect, StorageEvent, Ulid, can_read_record, fanout_bearer,
     load_live_record, map_read_error, metadata_node_call, reference_document_title,
@@ -32,6 +29,7 @@ use crate::metadata::data_links::{
     LinkBudget, key_prefixes, read_postings, set_postings, truncated_documents,
     unsettled_documents, unverified_versions,
 };
+use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 const NODE_SEEKS: usize = 1100;
@@ -518,14 +516,18 @@ pub async fn file_queries(
             GetBucketError::NotFound => MetadataApiError::NotFound,
             other => MetadataApiError::Internal(other.to_string()),
         })?;
-    let version_id = match version_id {
-        Some(version_id) => Some(version_id),
-        None => read_head(context, bucket, key).await?,
-    };
-    let version = match version_id {
-        Some(version_id) => read_version(context, bucket, key, version_id).await?,
-        None => None,
-    };
+    let ObjectVersion {
+        version_id,
+        version,
+    } = crate::driver::drive(
+        ObjectVersionOperation::new(bucket, key, version_id),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        ObjectVersionError::Key(_) => MetadataApiError::BadRequest,
+        other => MetadataApiError::Internal(other.to_string()),
+    })?;
     let scope = bucket_scope(realm_id, node_id, bucket, &info);
     let mut queries = vec![LinkQuery::KeyPrefixes {
         scope,
@@ -544,38 +546,6 @@ pub async fn file_queries(
         queries.push(LinkQuery::Exact(DataLink::Hash(hash)));
     }
     Ok(queries)
-}
-
-async fn read_head(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<Ulid>, MetadataApiError> {
-    let head = BlobHeadKey::new(bucket, key)
-        .to_bytes()
-        .map_err(|_| MetadataApiError::BadRequest)?;
-    Ok(read_row(context, BLOB_HEAD_KEYSPACE, head)
-        .await?
-        .map(|value| CurrentVersionPointer::from_bytes(&value))
-        .transpose()
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?
-        .map(|pointer| pointer.version_id))
-}
-
-async fn read_version(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-) -> Result<Option<BlobVersion>, MetadataApiError> {
-    let row = VersionKey::new(bucket, key, version_id)
-        .to_bytes()
-        .map_err(|_| MetadataApiError::BadRequest)?;
-    read_row(context, BLOB_VERSIONS_KEYSPACE, row)
-        .await?
-        .map(|value| BlobVersion::from_bytes(&value))
-        .transpose()
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))
 }
 
 async fn read_row(
@@ -598,7 +568,7 @@ async fn read_row(
         Event::Storage(StorageEvent::Error { error }) => {
             Err(MetadataApiError::Internal(error.to_string()))
         }
-        other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => Err(MetadataApiError::Internal(other.label().to_string())),
     }
 }
 

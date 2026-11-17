@@ -215,6 +215,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: Some(registry.clone()),
         outbound_handle: None,

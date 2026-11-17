@@ -8,11 +8,11 @@ use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use aruna_core::structs::{MintPersistentSpec, PersistentIdFailure};
 use aruna_core::time::unix_timestamp_millis;
 
-use crate::metadata::AuthToken;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::persistent_id::forward::{
     add_identifiers_routed, fail_pid_routed, mint_pid_routed,
 };
+use aruna_core::metadata::AuthToken;
 
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 

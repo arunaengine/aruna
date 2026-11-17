@@ -1,4 +1,4 @@
-//! Tests graph lifecycle: live group records, scan caps, tombstone blocking and sync flush.
+//! Tests graph lifecycle: live group records, scan caps and tombstone blocking.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -14,7 +14,6 @@ use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
 use byteview::ByteView;
-use craqle::CraqleFjallPersistMode;
 async fn store_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
     match storage
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -51,8 +50,7 @@ async fn group_records_live() {
     store_entries(&storage, writes).await;
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let records = handle
-        .list_group_records(group_id, 16)
+    let records = list_group_records(&handle, group_id, 16)
         .await
         .expect("group listing succeeds");
 
@@ -75,11 +73,10 @@ async fn group_records_capped() {
     store_entries(&storage, writes).await;
     let (_metadata_dir, handle) = memory_handle(storage);
 
-    let within = handle
-        .list_group_records(group_id, 2)
+    let within = list_group_records(&handle, group_id, 2)
         .await
         .expect("group listing succeeds");
-    let over = handle.list_group_records(group_id, 1).await;
+    let over = list_group_records(&handle, group_id, 1).await;
 
     assert_eq!(within.len(), 2);
     assert!(matches!(
@@ -91,16 +88,22 @@ async fn group_records_capped() {
 async fn tombstone_blocks_apply() {
     let (_storage_dir, storage) = auth_storage();
     let metadata_dir = tempdir().expect("metadata dir");
-    let metadata_handle = MetadataHandle::new_with_options(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         node_id_seed(3),
-        storage.clone(),
         None,
         None,
-        None,
-        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+        aruna_graph::GraphOptions::default()
+            .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
+    let metadata_handle = graph_context(storage.clone(), metadata_handle, graph_handle);
     let record = registry_record("datasets/fenced");
     let held = metadata_graph_fence(&record.graph_iri)
         .acquire()
@@ -109,8 +112,9 @@ async fn tombstone_blocks_apply() {
     let graph_iri = record.graph_iri.clone();
     let task_handle = metadata_handle.clone();
     let task = tokio::spawn(async move {
-        task_handle
-            .send_metadata_effect(MetadataEffect::CreateCrate {
+        send_metadata_effect(
+            &task_handle,
+            MetadataEffect::CreateCrate {
                 request: MetadataCrateRequest {
                     graph_iri,
                     name: "fenced".to_string(),
@@ -124,8 +128,9 @@ async fn tombstone_blocks_apply() {
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor: None,
                 },
-            })
-            .await
+            },
+        )
+        .await
     });
     tokio::task::yield_now().await;
 
@@ -161,46 +166,11 @@ async fn tombstone_blocks_apply() {
     ));
     assert!(
         !metadata_handle
-            .inner
-            .node
-            .contains_graph(&GraphId::new(&record.graph_iri))
+            .graph_handle
+            .as_ref()
+            .expect("graph store")
+            .contains_graph(record.graph_iri.clone())
+            .await
             .expect("graph probe succeeds")
     );
-}
-#[tokio::test]
-async fn flush_with_sync() {
-    let (_storage_dir, storage) = auth_storage();
-    let metadata_dir = tempdir().expect("metadata dir");
-    let document_sync_dir = tempdir().expect("document sync dir");
-    let document_sync_db = fjall::OptimisticTxDatabase::builder(
-        document_sync_dir
-            .path()
-            .to_str()
-            .expect("document sync path"),
-    )
-    .manual_journal_persist(true)
-    .open()
-    .expect("document sync db opens");
-    let metadata_handle = MetadataHandle::new_with_options(
-        metadata_dir.path(),
-        node_id_seed(2),
-        storage,
-        None,
-        None,
-        Some(document_sync_db),
-        MetadataHandleOptions::default()
-            .with_search_storage(MetadataSearchStorage::Memory)
-            .with_sync_policy(FjallPersistPolicy::SyncAll),
-    )
-    .expect("metadata handle opens");
-
-    assert_eq!(
-        metadata_handle.inner.node.graph_store_persist_mode(),
-        CraqleFjallPersistMode::SyncAll
-    );
-
-    metadata_handle
-        .flush_persistence()
-        .await
-        .expect("metadata and document sync persistence flush");
 }

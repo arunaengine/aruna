@@ -40,7 +40,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 
 use crate::tasks::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
 
@@ -51,11 +52,9 @@ use super::queue_storage::{
     MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
     start_write_transaction,
 };
-use super::raw_revision::{RawReadError, RawStateCache};
-use super::repository::{
-    StorageReadError, parse_lifecycle_read, parse_status_read, read_lifecycle_effect,
-    read_status_effect,
-};
+use super::raw_events::RawReadError;
+use super::raw_revision::RawStateCache;
+use super::repository::{StorageReadError, parse_status_read, read_status_effect};
 
 const MATERIALIZATION_PAGE_SIZE: usize = 512;
 const MATERIALIZATION_BATCH_SIZE: usize = 512;
@@ -216,28 +215,10 @@ impl From<MetadataIriError> for MetadataMaterializationError {
     }
 }
 
-pub fn schedule_materialization() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainMaterializationQueue,
-        after: Duration::ZERO,
-    })
-}
-
-pub fn new_materialization_job(
-    event: &MetadataEventRecord,
-    due_at_ms: u64,
-) -> MetadataMaterializationRecord {
-    MetadataMaterializationRecord::new(event, due_at_ms)
-}
-
-pub fn new_pending_status(
-    event: &MetadataEventRecord,
-    updated_at_ms: u64,
-) -> MaterializationStatusRecord {
-    MaterializationStatusRecord::pending(event, updated_at_ms)
-}
-
-pub async fn restore_materialization_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_materialization_timer(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+) {
     match next_timer_after(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
@@ -255,7 +236,7 @@ pub async fn restore_materialization_timer(storage: &StorageHandle, task_handle:
     }
 }
 
-pub async fn next_timer_after(
+pub(crate) async fn next_timer_after(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataMaterializationError> {
     let now_ms = unix_timestamp_millis();
@@ -477,16 +458,18 @@ async fn schedule_completed_syncs(
     if syncs.is_empty() {
         return;
     }
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return;
-    };
+    }
     for sync in syncs {
-        match metadata_handle
-            .send_effect(Effect::Metadata(MetadataEffect::SyncBestEffort {
+        match send_graph_effect(
+            context,
+            Effect::Metadata(MetadataEffect::SyncBestEffort {
                 graph_iri: sync.graph_iri.clone(),
                 peers: sync.peers,
-            }))
-            .await
+            }),
+        )
+        .await
         {
             Event::Metadata(MetadataEvent::GraphSyncScheduled { .. }) => {}
             Event::Metadata(MetadataEvent::Error { error, .. }) => {
@@ -827,9 +810,9 @@ async fn batch_read_values(
             Ok(values.into_iter().map(|(_, value)| value).collect())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -869,6 +852,19 @@ fn requeue_after_ms(parks: u32) -> u64 {
     u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Runs one metadata effect on the graph store; any other effect is refused.
+async fn send_graph_effect(context: &DriverContext, effect: Effect) -> Event {
+    match effect {
+        Effect::Metadata(effect) => {
+            crate::metadata::handle::send_metadata_effect(context, effect).await
+        }
+        _ => Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::InvalidEffect,
+        }),
+    }
+}
+
 #[cfg(test)]
 async fn read_dead_letter(
     storage: &StorageHandle,
@@ -888,16 +884,16 @@ async fn read_dead_letter(
         }) => Ok(postcard::from_bytes(&value).ok()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
 /// Returns due dead letters to the queue and clears their terminal status, so a
 /// node converges once the cause clears. Dead letters the document has moved
 /// past are dropped instead. Returns the number of jobs requeued.
-pub async fn requeue_dead_letters(
+pub(crate) async fn requeue_dead_letters(
     storage: &StorageHandle,
 ) -> Result<usize, MetadataMaterializationError> {
     let now_ms = unix_timestamp_millis();
@@ -920,9 +916,9 @@ pub async fn requeue_dead_letters(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1004,7 +1000,7 @@ async fn requeue_dead_letter(
     };
     let status = MaterializationStatusRecord {
         failures: job.failures,
-        ..new_pending_status(&event, unix_timestamp_millis())
+        ..MaterializationStatusRecord::pending(&event, unix_timestamp_millis())
     };
     let txn_id = start_write_transaction(storage).await?;
     let result = requeue_in_txn(storage, txn_id, &job, &status).await;
@@ -1093,9 +1089,9 @@ async fn transactional_batch_write(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1116,34 +1112,10 @@ async fn transactional_batch_delete(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
-}
-
-pub async fn enqueue_job(
-    context: &DriverContext,
-    event: &MetadataEventRecord,
-) -> Result<(), MetadataMaterializationError> {
-    let now = unix_timestamp_millis();
-    let status = new_pending_status(event, now);
-    let job = new_materialization_job(event, now);
-    write_status_job(&context.storage_handle, &status, &job).await?;
-    if let Some(task_handle) = context.task_handle.as_ref() {
-        match task_handle.send_effect(schedule_materialization()).await {
-            Event::Task(aruna_core::task::TaskEvent::TimerScheduled { .. }) => {}
-            Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(message));
-            }
-            other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
-            }
-        }
-    }
-    Ok(())
 }
 
 async fn read_document_job(
@@ -1172,9 +1144,9 @@ async fn read_document_job(
         },
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1211,9 +1183,9 @@ async fn scan_due_jobs(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1520,11 +1492,9 @@ async fn process_materialization_job(
         }
         Err(error) => return Err(error),
     };
-    if metadata_graph_deleted::<MetadataMaterializationError>(
-        &context.storage_handle,
-        &event.record.graph_iri,
-    )
-    .await?
+    if drive(GraphDeletedOperation::new(&event.record.graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataMaterializationError>)?
     {
         return Ok(ProcessedMaterializationJob::completed(
             CompletedMaterializationJob {
@@ -1678,9 +1648,9 @@ async fn load_group_jobs(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -1771,9 +1741,9 @@ async fn read_create_event(
             })
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1884,15 +1854,15 @@ async fn mark_capture(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
 /// Whether a job of the document published a Git snapshot whose graph is not stored yet. The
 /// job's finish batch stores the graph and removes the row together; a dependency wait has none.
-pub async fn capture_pending(
+pub(crate) async fn capture_pending(
     storage: &StorageHandle,
     document_id: Ulid,
 ) -> Result<bool, MetadataMaterializationError> {
@@ -1908,9 +1878,9 @@ pub async fn capture_pending(
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1935,9 +1905,9 @@ pub async fn materialization_jobs_exist(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
         let Some((key, _value)) = values.into_iter().next() else {
@@ -2017,9 +1987,9 @@ async fn prune_jobs(
             Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataMaterializationError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
         let mut deletes = Vec::new();
@@ -2103,9 +2073,9 @@ async fn delete_materialization_entries(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -2130,21 +2100,6 @@ fn job_key_parts(key: &[u8]) -> Option<(u64, Ulid, Ulid)> {
     ))
 }
 
-pub(crate) async fn metadata_graph_deleted<E: From<StorageError> + From<ConversionError>>(
-    storage: &StorageHandle,
-    graph_iri: &str,
-) -> Result<bool, E> {
-    let event = storage
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event)
-        .map(|record| record.is_some_and(|record| record.is_deleted()))
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => error.into(),
-            StorageReadError::Conversion(error) => error.into(),
-        })
-}
-
 struct MaterializedCreateEvent {
     raw_revision: Option<MetadataRawRevision>,
     raw_state_write: (String, ByteView, ByteView),
@@ -2164,17 +2119,15 @@ async fn materialize_create_event(
     }
     let raw_plan =
         crate::metadata::raw_revision::prepare_raw_event(context, event, raw_state_cache).await?;
-    let metadata_handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
-    match metadata_handle
-        .send_effect(graph_materialization_effect(
-            event,
-            raw_plan.revision.as_ref(),
-            raw_plan.rebuild,
-        ))
-        .await
+    match send_graph_effect(
+        context,
+        graph_materialization_effect(event, raw_plan.revision.as_ref(), raw_plan.rebuild),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::CreateCrateResult { .. })
         | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. })
@@ -2187,9 +2140,9 @@ async fn materialize_create_event(
             })
         }
         Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -2202,53 +2155,57 @@ async fn merge_batch_event(
     change: Effect,
     raw_state_cache: &mut RawStateCache,
 ) -> Result<MaterializedCreateEvent, MetadataMaterializationError> {
-    let metadata_handle = context
+    context
         .metadata_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
     // A batch carries quads only, so the event's visibility is applied here the
     // way a crate replacement used to carry it.
-    match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::SetGraphPolicy {
+    match send_graph_effect(
+        context,
+        Effect::Metadata(MetadataEffect::SetGraphPolicy {
             graph_iri: event.record.graph_iri.clone(),
             policy: MetadataGraphPolicy {
                 public: event.record.public,
                 permission_paths: vec![event.record.permission_path.clone()],
             }
             .normalized(),
-        }))
-        .await
+        }),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::GraphPolicySet { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
-    match metadata_handle.send_effect(change).await {
+    match send_graph_effect(context, change).await {
         Event::Metadata(MetadataEvent::BatchMerged { .. })
         | Event::Metadata(MetadataEvent::SnapshotInstalled { .. }) => {}
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
-    let render = match metadata_handle
-        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+    let render = match send_graph_effect(
+        context,
+        Effect::Metadata(MetadataEffect::ExportRoCrate {
             graph_iri: event.record.graph_iri.clone(),
-        }))
-        .await
+        }),
+    )
+    .await
     {
         Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => jsonld,
         Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error.into()),
         other => {
-            return Err(MetadataMaterializationError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataMaterializationError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let mut status = assess_render(
@@ -2289,13 +2246,11 @@ async fn project_materialized_iris(
     (Vec<(String, ByteView, ByteView)>, Vec<(String, ByteView)>),
     MetadataMaterializationError,
 > {
-    let metadata_handle = context
-        .metadata_handle
+    let graph = context
+        .graph_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
-    let references = metadata_handle
-        .snapshot_iri_references(event.record.graph_iri.clone())
-        .await?;
+    let references = graph.iri_references(event.record.graph_iri.clone()).await?;
     let mut links =
         super::data_links::project_links(&event.record.graph_iri, event.event_id, &references);
     super::data_links::associate_versions(&context.storage_handle, &mut links)
@@ -2502,31 +2457,6 @@ fn is_terminal_error(error: &MetadataMaterializationError) -> bool {
         materialization_failure_kind(error),
         MaterializationFailureKind::Terminal
     )
-}
-
-async fn write_status_job(
-    storage: &StorageHandle,
-    status: &MaterializationStatusRecord,
-    job: &MetadataMaterializationRecord,
-) -> Result<(), MetadataMaterializationError> {
-    let writes = vec![
-        materialization_status_entry(status)?,
-        materialization_job_entry(job)?,
-        document_job_entry(job)?,
-    ];
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataMaterializationError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
 }
 
 async fn job_is_live(
