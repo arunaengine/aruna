@@ -541,19 +541,8 @@ pub(in crate::document_sync) async fn store_watch_change(
             vec![(target.storage_keyspace().to_string(), target.storage_key())]
         };
 
-        match replace_batch_in(storage, txn_id, deletes, writes).await {
-            Ok(()) => return Ok(true),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, deletes, writes).await? {
+            return Ok(true);
         }
     }
     Err(NetError::Dht(

@@ -716,6 +716,9 @@ pub enum DocumentEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
+    /// Applies the stored events of these topics to local state; the runner
+    /// carries it out through the net handle, which also reloads realm peers.
+    ReconcileTopics { topics: Vec<irokle::TopicId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

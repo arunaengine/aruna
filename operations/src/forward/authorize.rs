@@ -27,7 +27,7 @@ use ulid::Ulid;
 
 pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) -> bool {
     config
-        .node_kind(node_id)
+        .node_kind(&node_id)
         .is_some_and(RealmNodeKind::is_sync_eligible)
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn is_sync_eligible(config: &RealmConfigDocument, node_id: NodeId) ->
 /// config names, whatever token it managed to present. Other kinds are not
 /// owner-bound, so any authenticated caller may travel through them.
 pub(crate) fn peer_acts_for(config: &RealmConfigDocument, peer: NodeId, user_id: UserId) -> bool {
-    match config.node_kind(peer).and_then(RealmNodeKind::owner) {
+    match config.node_kind(&peer).and_then(RealmNodeKind::owner) {
         Some(owner) => owner == user_id,
         None => true,
     }

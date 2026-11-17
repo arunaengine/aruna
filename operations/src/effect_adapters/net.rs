@@ -11,6 +11,11 @@ use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
+    if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
+        return Event::Net(NetEvent::DocumentSync(
+            reconcile_topics(context, topics).await,
+        ));
+    }
     if let Some(net_handle) = &context.net_handle {
         Box::pin(net_handle.send_effect(Effect::Net(effect))).await
     } else {
@@ -29,6 +34,31 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             }
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
+    }
+}
+
+/// Reconciles through the handle, which also reloads realm peers after a realm config change.
+async fn reconcile_topics(
+    context: &DriverContext,
+    topics: Vec<irokle::TopicId>,
+) -> DocumentNetEvent {
+    let Some(net_handle) = &context.net_handle else {
+        return DocumentNetEvent::Error {
+            target: None,
+            error: "net handle unavailable".to_string(),
+        };
+    };
+    match Box::pin(net_handle.reconcile_sync_topics(topics)).await {
+        Ok(result) => DocumentNetEvent::DocumentsReconciled {
+            applied: result.applied(),
+            targets: result.targets,
+            metadata_create_events: result.metadata_create_events,
+            metadata_graph_tombstones: result.metadata_graph_tombstones,
+        },
+        Err(error) => DocumentNetEvent::Error {
+            target: None,
+            error: error.to_string(),
+        },
     }
 }
 

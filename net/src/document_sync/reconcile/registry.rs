@@ -197,19 +197,8 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         }
 
         let entries = base_entries.clone();
-        match replace_batch_in(storage, txn_id, Vec::new(), entries).await {
-            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(())),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, Vec::new(), entries).await? {
+            return Ok(MetadataPlacementOutcome::Accepted(()));
         }
     }
     Err(NetError::Dht(
@@ -272,19 +261,8 @@ pub(in crate::document_sync) async fn store_graph_lifecycle(
             .map(registry_delete_entries)
             .unwrap_or_default();
         let writes = vec![(key_space.clone(), key.clone(), primary_bytes.clone().into())];
-        match replace_batch_in(storage, txn_id, deletes, writes).await {
-            Ok(()) => return Ok(true),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, deletes, writes).await? {
+            return Ok(true);
         }
     }
     Err(NetError::Dht(
@@ -355,19 +333,8 @@ pub(in crate::document_sync) async fn store_document_lifecycle(
                 .await;
             return Ok(false);
         }
-        match replace_batch_in(storage, txn_id, deletes, writes.unwrap_or_default()).await {
-            Ok(()) => return Ok(true),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, deletes, writes.unwrap_or_default()).await? {
+            return Ok(true);
         }
     }
     Err(NetError::Dht(
@@ -446,19 +413,8 @@ pub(in crate::document_sync) async fn store_pid_mapping(
         {
             writes.push(entry);
         }
-        match replace_batch_in(storage, txn_id, deletes, writes).await {
-            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, deletes, writes).await? {
+            return Ok(MetadataPlacementOutcome::Accepted(true));
         }
     }
     Err(NetError::Dht(
@@ -539,19 +495,8 @@ pub(in crate::document_sync) async fn store_policy_document(
         {
             writes.push(entry);
         }
-        match replace_batch_in(storage, txn_id, Vec::new(), writes).await {
-            Ok(()) => return Ok(MetadataPlacementOutcome::Accepted(true)),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, Vec::new(), writes).await? {
+            return Ok(MetadataPlacementOutcome::Accepted(true));
         }
     }
     Err(NetError::Dht(
@@ -693,19 +638,8 @@ pub(in crate::document_sync) async fn delete_registry_record(
                 .await;
             return Ok(());
         }
-        match replace_batch_in(storage, txn_id, deletes, Vec::new()).await {
-            Ok(()) => return Ok(()),
-            Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-            }
-            Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(error);
-            }
+        if commit_batch(storage, txn_id, deletes, Vec::new()).await? {
+            return Ok(());
         }
     }
     Err(NetError::Dht(
