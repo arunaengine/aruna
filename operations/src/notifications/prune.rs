@@ -1163,3 +1163,291 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::tests::notifications::{record, user};
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const NOW_MS: u64 = 400 * 24 * 60 * 60 * 1000;
+
+    fn iter(key_space: &str, start_after: Option<Key>, limit: usize) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit,
+            txn_id: None,
+        })
+    }
+
+    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: next,
+        })
+    }
+
+    fn space(key_space: &str, key: Key) -> (KeySpace, Key) {
+        (key_space.to_string(), key)
+    }
+
+    fn outlived() -> Value {
+        Value::from(0u64.to_be_bytes().to_vec())
+    }
+
+    #[test]
+    fn prune_success_trace() {
+        let due = record(user(1, 2), NotificationClass::Direct, 1_000);
+        let index = notification_prune_key(&due);
+        let direct = notification_inbox_key(due.recipient, 1_000, due.notification_id);
+        let transient = notification_inbox_key(
+            due.recipient,
+            (1_000 + DIRECT_TTL_MS).saturating_sub(TRANSIENT_TTL_MS),
+            due.notification_id,
+        );
+        let cutoff = Key::from(b"cutoff".to_vec());
+        let txn_id = TxnId::from_parts(7, 7);
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        check_trace(
+            &mut operation,
+            &[iter(PRUNE_INDEX_KEYSPACE, None, 4)],
+            vec![
+                (
+                    page(vec![(index.clone(), Value::from(Vec::new()))], None),
+                    vec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![
+                            space(NOTIFICATION_INBOX_KEYSPACE, direct.clone()),
+                            space(NOTIFICATION_INBOX_KEYSPACE, transient.clone()),
+                        ],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchReadResult {
+                        values: vec![
+                            (direct.clone(), Some(Value::from(vec![1]))),
+                            (transient, None),
+                        ],
+                    }),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes: vec![
+                            space(PRUNE_INDEX_KEYSPACE, index),
+                            space(NOTIFICATION_INBOX_KEYSPACE, direct),
+                        ],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![iter(NOTIFICATION_INBOX_KEYSPACE, None, 4)],
+                ),
+                (
+                    page(Vec::new(), None),
+                    vec![iter(NOTIFICATION_CUTOFF_KEYSPACE, None, 4)],
+                ),
+                (
+                    page(vec![(cutoff.clone(), outlived())], None),
+                    vec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+                    vec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![space(NOTIFICATION_CUTOFF_KEYSPACE, cutoff.clone())],
+                        txn_id: Some(txn_id),
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchReadResult {
+                        values: vec![(cutoff.clone(), Some(outlived()))],
+                    }),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes: vec![space(NOTIFICATION_CUTOFF_KEYSPACE, cutoff)],
+                        txn_id: Some(txn_id),
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
+                    vec![],
+                ),
+            ],
+        );
+        let outcome = operation.finalize().expect("prune finishes");
+        assert_eq!(outcome.expired, 1);
+        assert_eq!(outcome.rearm(), NOTIFICATION_POLL_AFTER);
+    }
+
+    #[test]
+    fn future_row_stops_index() {
+        let future = record(user(1, 2), NotificationClass::Direct, NOW_MS);
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.start();
+        let index = (notification_prune_key(&future), Value::from(Vec::new()));
+        let effects = operation.step(page(vec![index], Some(Key::from(vec![9]))));
+        assert_eq!(
+            effects.as_slice(),
+            [iter(NOTIFICATION_INBOX_KEYSPACE, None, 4)]
+        );
+        operation.step(page(Vec::new(), None));
+        operation.step(page(Vec::new(), None));
+        let outcome = operation.finalize().expect("prune finishes");
+        assert_eq!(
+            outcome.next_due_after,
+            Some(Duration::from_millis(DIRECT_TTL_MS))
+        );
+        assert_eq!(outcome.rearm(), NOTIFICATION_POLL_AFTER);
+    }
+
+    #[test]
+    fn storage_error_fails() {
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.start();
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(PruneError::Storage(StorageError::Timeout))
+        );
+    }
+
+    fn in_cutoff_read() -> PruneNotificationsOperation {
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.start();
+        operation.step(page(Vec::new(), None));
+        operation.step(page(Vec::new(), None));
+        operation.step(page(vec![(Key::from(vec![1]), outlived())], None));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TxnId::from_parts(7, 7),
+        }));
+        operation
+    }
+
+    #[test]
+    fn txn_error_aborts() {
+        let mut operation = in_cutoff_read();
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TxnId::from_parts(7, 7)
+            })]
+        );
+        assert!(operation.finalize().is_err());
+    }
+
+    #[test]
+    fn commit_conflict_continues() {
+        let mut operation = in_cutoff_read();
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(Key::from(vec![1]), None)],
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.finalize().is_ok());
+    }
+
+    #[test]
+    fn unexpected_events_fail() {
+        let make = || {
+            let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+            operation.start();
+            operation
+        };
+        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
+        let refusals = rejects_events(make, sample_events, expected);
+        assert!(!refusals.is_empty());
+    }
+
+    #[test]
+    fn abort_per_phase() {
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        let mut operation = in_cutoff_read();
+        check_abort(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: TxnId::from_parts(7, 7),
+            })],
+        );
+    }
+
+    #[test]
+    fn unfinished_prune_fails() {
+        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
+        operation.start();
+        rejects_finalize(operation);
+        rejects_finalize(RestorePruneOperation::new(NOW_MS));
+    }
+
+    #[test]
+    fn restore_trace() {
+        let mut operation = RestorePruneOperation::new(NOW_MS);
+        let malformed = (Key::from(vec![1, 2]), Value::from(Vec::new()));
+        let arm = |after| {
+            Effect::Task(TaskEffect::ShortenTimer {
+                key: TaskKey::PruneNotifications,
+                after,
+            })
+        };
+        check_trace(
+            &mut operation,
+            &[iter(PRUNE_INDEX_KEYSPACE, None, 1)],
+            vec![
+                (
+                    page(vec![malformed.clone()], None),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes: vec![space(PRUNE_INDEX_KEYSPACE, malformed.0)],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![arm(Duration::ZERO)],
+                ),
+                (
+                    Event::Task(TaskEvent::TimerScheduled {
+                        key: TaskKey::PruneNotifications,
+                        after: Duration::ZERO,
+                    }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+
+        let mut empty = RestorePruneOperation::new(NOW_MS);
+        empty.start();
+        assert_eq!(
+            empty.step(page(Vec::new(), None)).as_slice(),
+            [arm(NOTIFICATION_POLL_AFTER)]
+        );
+        let failed = empty.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "closed".to_string(),
+        }));
+        assert!(failed.is_empty());
+        assert!(empty.finalize().is_err());
+    }
+}
