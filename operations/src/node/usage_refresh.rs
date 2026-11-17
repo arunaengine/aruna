@@ -177,7 +177,8 @@ impl RefreshUsageOperation {
                 if let Some(start) = next_start_after {
                     return Ok(Self::summary_page(Some(start)));
                 }
-                let Stage::ClearScan(deletes) = std::mem::replace(&mut self.stage, Stage::ClearDelete)
+                let Stage::ClearScan(deletes) =
+                    std::mem::replace(&mut self.stage, Stage::ClearDelete)
                 else {
                     return Err(RefreshUsageError::UnexpectedEvent("scanning the summary"));
                 };
@@ -229,7 +230,9 @@ impl RefreshUsageOperation {
 
     fn sum(&mut self, event: Event) -> Result<Effects, RefreshUsageError> {
         let Stage::Summary(summary) = &mut self.stage else {
-            return Err(RefreshUsageError::UnexpectedEvent("summing the realm usage"));
+            return Err(RefreshUsageError::UnexpectedEvent(
+                "summing the realm usage",
+            ));
         };
         let effects = summary.step(event);
         if !summary.is_complete() {
@@ -237,7 +240,9 @@ impl RefreshUsageOperation {
         }
         let Stage::Summary(summary) = std::mem::replace(&mut self.stage, Stage::Done(Ok(())))
         else {
-            return Err(RefreshUsageError::UnexpectedEvent("summing the realm usage"));
+            return Err(RefreshUsageError::UnexpectedEvent(
+                "summing the realm usage",
+            ));
         };
         match summary.finalize() {
             Ok(_) => {}
@@ -338,7 +343,9 @@ mod state_machine_tests {
     };
     use aruna_core::structs::storage::distribution::DistributionBinding;
     use aruna_core::structs::storage::format::Compression;
-    use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys, usage_summary_key};
+    use aruna_core::structs::storage::usage::{
+        UsageCounters, global_shard_keys, usage_summary_key,
+    };
     use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::Value;
 
@@ -398,7 +405,12 @@ mod state_machine_tests {
         Effect::Storage(StorageEffect::BatchRead {
             reads: global_shard_keys()
                 .into_iter()
-                .map(|key| (aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+                .map(|key| {
+                    (
+                        aruna_core::keyspaces::USAGE_STATS_KEYSPACE.to_string(),
+                        Key::from(key),
+                    )
+                })
                 .collect(),
             txn_id: None,
         })
@@ -409,11 +421,17 @@ mod state_machine_tests {
         let mut operation = config_changed();
         let summary = summary_key(GROUP);
         let deletes = vec![
-            (NODE_STATS_KEYSPACE.to_string(), Key::from(SUMMARY_GLOBAL_KEY.to_vec())),
+            (
+                NODE_STATS_KEYSPACE.to_string(),
+                Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
+            ),
             (NODE_STATS_KEYSPACE.to_string(), summary.clone()),
         ];
         let buckets = vec![
-            (Key::from(b"plain".to_vec()), bucket(Ulid::from_parts(7, 7), false)),
+            (
+                Key::from(b"plain".to_vec()),
+                bucket(Ulid::from_parts(7, 7), false),
+            ),
             (Key::from(b"spire".to_vec()), bucket(GROUP, true)),
         ];
         check_trace(
@@ -421,7 +439,10 @@ mod state_machine_tests {
             &RefreshUsageOperation::summary_page(None),
             vec![
                 (
-                    page(vec![(summary.clone(), Value::from(vec![1]))], Some(summary.clone())),
+                    page(
+                        vec![(summary.clone(), Value::from(vec![1]))],
+                        Some(summary.clone()),
+                    ),
                     RefreshUsageOperation::summary_page(Some(summary)).to_vec(),
                 ),
                 (
@@ -538,7 +559,10 @@ mod state_machine_tests {
             operation.step(failed()).to_vec(),
             RefreshUsageOperation::bucket_page(None).to_vec()
         );
-        operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+        operation.step(page(
+            vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))],
+            None,
+        ));
         assert!(operation.step(failed()).is_empty());
         assert_eq!(operation.finalize(), Ok(()));
 
@@ -558,7 +582,10 @@ mod state_machine_tests {
         operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
         }));
-        operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+        operation.step(page(
+            vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))],
+            None,
+        ));
         operation.step(Event::Storage(StorageEvent::BatchWriteResult {
             entries: Vec::new(),
         }));
@@ -585,7 +612,10 @@ mod state_machine_tests {
         };
         for (label, effects, error) in rejects_events(started, sample_events, scan) {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, RefreshUsageError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, RefreshUsageError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let waking = || {
             let mut operation = started();
@@ -593,7 +623,10 @@ mod state_machine_tests {
             operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
                 entries: Vec::new(),
             }));
-            operation.step(page(vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))], None));
+            operation.step(page(
+                vec![(Key::from(b"spire".to_vec()), bucket(GROUP, true))],
+                None,
+            ));
             operation.step(Event::Storage(StorageEvent::BatchWriteResult {
                 entries: Vec::new(),
             }));
@@ -602,10 +635,16 @@ mod state_machine_tests {
         let task = |event: &Event| matches!(event, Event::Task(_));
         for (label, effects, error) in rejects_events(waking, sample_events, task) {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, RefreshUsageError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, RefreshUsageError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let fresh = || config_changed();
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
     }
 
     #[test]

@@ -1011,8 +1011,9 @@ pub async fn stream_notifications(
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
-    let (dashboard_epoch, dashboard_revisions) =
-        context.subscribe_dashboard_changes().ok_or(ServerError::ServiceUnavailable)?;
+    let (dashboard_epoch, dashboard_revisions) = context
+        .subscribe_dashboard_changes()
+        .ok_or(ServerError::ServiceUnavailable)?;
 
     let holder = resolve_user_holder(context.as_ref(), recipient)
         .await

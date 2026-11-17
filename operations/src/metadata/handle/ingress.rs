@@ -34,8 +34,8 @@ use super::{
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::node::read_info::ReadInfoOperation;
 use crate::metadata::protocol::{AuthToken, MetadataReadError, MetadataTransportMessage};
+use crate::node::read_info::ReadInfoOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};

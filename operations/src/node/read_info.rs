@@ -82,7 +82,12 @@ impl Operation for ReadInfoOperation {
         let reads = self
             .node_ids
             .iter()
-            .map(|node_id| (NODE_INFO_KEYSPACE.to_string(), Key::from(node_info_key(*node_id))))
+            .map(|node_id| {
+                (
+                    NODE_INFO_KEYSPACE.to_string(),
+                    Key::from(node_info_key(*node_id)),
+                )
+            })
             .collect();
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads,
@@ -130,7 +135,10 @@ mod state_machine_tests {
             node_id,
             executors: Vec::new(),
             labels: Default::default(),
-            urls: NodeUrls { api: None, s3: None },
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
             utilization: NodeUtilization {
                 storage_bytes_used: 0,
                 documents_held: None,
@@ -152,7 +160,12 @@ mod state_machine_tests {
         Effect::Storage(StorageEffect::BatchRead {
             reads: node_ids
                 .iter()
-                .map(|node_id| (NODE_INFO_KEYSPACE.to_string(), Key::from(node_info_key(*node_id))))
+                .map(|node_id| {
+                    (
+                        NODE_INFO_KEYSPACE.to_string(),
+                        Key::from(node_info_key(*node_id)),
+                    )
+                })
                 .collect(),
             txn_id: None,
         })

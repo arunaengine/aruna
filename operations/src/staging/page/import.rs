@@ -5,8 +5,8 @@
 use crate::connectors::repository::{parse_secret_read, read_secret_effect};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::distribution::guard::{authority_read, authority_rows, write_epochs};
-use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::replication::queue::schedule_blob_drain;
+use crate::s3::usage::{RowChange, UsageCounterUpdate, schedule_snapshot_publish};
 use crate::staging::page::rows::{
     MAX_PAGE_ENTRIES, PageGuards, PreparedRows, check_guards, decode_heads, guard_reads,
     head_range, head_reads, interval_heads, page_rows, version_reads,

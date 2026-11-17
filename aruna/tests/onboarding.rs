@@ -84,14 +84,20 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
-    let issuer_info = drive(ReadInfoOperation::new(vec![seed.net.node_id()]), joiner.context.as_ref())
-        .await?
-        .remove(&seed.net.node_id())
-        .expect("issuer node info should be fetched from the onboarding ticket");
-    let seed_info = drive(ReadInfoOperation::new(vec![seed.net.node_id()]), seed.context.as_ref())
-        .await?
-        .remove(&seed.net.node_id())
-        .expect("seed fixture should publish issuer node info");
+    let issuer_info = drive(
+        ReadInfoOperation::new(vec![seed.net.node_id()]),
+        joiner.context.as_ref(),
+    )
+    .await?
+    .remove(&seed.net.node_id())
+    .expect("issuer node info should be fetched from the onboarding ticket");
+    let seed_info = drive(
+        ReadInfoOperation::new(vec![seed.net.node_id()]),
+        seed.context.as_ref(),
+    )
+    .await?
+    .remove(&seed.net.node_id())
+    .expect("seed fixture should publish issuer node info");
     assert_eq!(issuer_info.node_id, seed_info.node_id);
     assert_eq!(issuer_info.labels, seed_info.labels);
     assert_eq!(issuer_info.urls, seed_info.urls);
@@ -111,10 +117,13 @@ async fn joiner_bootstraps_documents() -> TestResult<()> {
         .find(|node| node.node_id == joiner.config.node_id)
         .expect("joiner should be in the placement view")
         .labels;
-    let joiner_info = drive(ReadInfoOperation::new(vec![joiner.config.node_id]), joiner.context.as_ref())
-        .await?
-        .remove(&joiner.config.node_id)
-        .expect("joiner startup should seed its node info after fetching realm config");
+    let joiner_info = drive(
+        ReadInfoOperation::new(vec![joiner.config.node_id]),
+        joiner.context.as_ref(),
+    )
+    .await?
+    .remove(&joiner.config.node_id)
+    .expect("joiner startup should seed its node info after fetching realm config");
     assert_eq!(joiner_info.node_id, joiner.config.node_id);
     assert_eq!(joiner_info.labels, selector_labels);
     assert_eq!(joiner_info.labels.get("fixture").unwrap(), "joiner");

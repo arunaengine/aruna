@@ -14,10 +14,6 @@ use crate::blob::records::{
 use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, record_read};
 use crate::distribution::inventory::{AddedVersion, stamp_head, stamp_version, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
-use crate::s3::usage::{
-    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_snapshot_publish,
-};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
@@ -28,6 +24,10 @@ use crate::s3::purge_fence::{
     PurgeFenceError, check_publication, check_write_fence, publication_read, write_fence_read,
 };
 use crate::s3::row_fence::{FenceError, RowFence};
+use crate::s3::usage::{
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    schedule_snapshot_publish,
+};
 use crate::s3::write_cleanup::{CleanupStep, WriteCleanup};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

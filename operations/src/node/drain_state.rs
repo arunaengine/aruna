@@ -79,7 +79,12 @@ impl Operation for DrainStateOperation {
 
     fn start(&mut self) -> Effects {
         self.started = true;
-        let read = |key: &[u8]| (COMPUTE_DEPARTURE_KEYSPACE.to_string(), Key::from(key.to_vec()));
+        let read = |key: &[u8]| {
+            (
+                COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                Key::from(key.to_vec()),
+            )
+        };
         smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![read(OPERATOR_DRAIN_KEY), read(DEPARTURE_KEY)],
             txn_id: None,
@@ -118,9 +123,13 @@ mod state_machine_tests {
     use super::*;
 
     fn batch(drain: Option<Vec<u8>>, departure: Option<Vec<u8>>) -> Event {
-        let row = |key: &[u8], value: Option<Vec<u8>>| (Key::from(key.to_vec()), value.map(Value::from));
+        let row =
+            |key: &[u8], value: Option<Vec<u8>>| (Key::from(key.to_vec()), value.map(Value::from));
         Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![row(OPERATOR_DRAIN_KEY, drain), row(DEPARTURE_KEY, departure)],
+            values: vec![
+                row(OPERATOR_DRAIN_KEY, drain),
+                row(DEPARTURE_KEY, departure),
+            ],
         })
     }
 
@@ -134,7 +143,12 @@ mod state_machine_tests {
     }
 
     fn read_effect() -> Effect {
-        let read = |key: &[u8]| (COMPUTE_DEPARTURE_KEYSPACE.to_string(), Key::from(key.to_vec()));
+        let read = |key: &[u8]| {
+            (
+                COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                Key::from(key.to_vec()),
+            )
+        };
         Effect::Storage(StorageEffect::BatchRead {
             reads: vec![read(OPERATOR_DRAIN_KEY), read(DEPARTURE_KEY)],
             txn_id: None,
@@ -174,11 +188,16 @@ mod state_machine_tests {
         let mut garbled = DrainStateOperation::new();
         garbled.start();
         garbled.step(batch(None, Some(vec![0xff; 3])));
-        assert!(matches!(garbled.finalize(), Err(DrainStateError::Decode(_))));
+        assert!(matches!(
+            garbled.finalize(),
+            Err(DrainStateError::Decode(_))
+        ));
 
         let mut short = DrainStateOperation::new();
         short.start();
-        short.step(Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }));
+        short.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: Vec::new(),
+        }));
         assert_eq!(short.finalize(), Err(DrainStateError::UnexpectedEvent));
     }
 
@@ -189,12 +208,7 @@ mod state_machine_tests {
             operation.start();
             operation
         };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::Error { .. })
-            )
-        };
+        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::Error { .. }));
         for (label, effects, error) in rejects_events(started, sample_events, expected) {
             assert!(effects.is_empty(), "{label} emitted effects");
             assert_eq!(error, DrainStateError::UnexpectedEvent, "{label}");

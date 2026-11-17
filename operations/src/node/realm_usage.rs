@@ -13,8 +13,8 @@ use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_ST
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::usage::{
-    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters, usage_group_key, usage_group_prefix,
-    usage_node_id, usage_summary_key,
+    NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounterError, UsageCounters,
+    usage_group_key, usage_group_prefix, usage_node_id, usage_summary_key,
 };
 use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
@@ -388,7 +388,8 @@ mod state_machine_tests {
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
     use aruna_core::structs::storage::usage::{
         NodeUsageSnapshot, SUMMARY_GLOBAL_KEY, USAGE_GLOBAL_PREFIX, UsageCounters,
-        global_shard_keys, usage_global_key, usage_group_key, usage_group_prefix, usage_summary_key,
+        global_shard_keys, usage_global_key, usage_group_key, usage_group_prefix,
+        usage_summary_key,
     };
     use aruna_core::types::{GroupId, Key, Value};
     use ulid::Ulid;
@@ -421,7 +422,12 @@ mod state_machine_tests {
         Value::from(postcard::to_allocvec(&config).unwrap())
     }
 
-    fn snapshot_row(key: Vec<u8>, node_id: NodeId, used: UsageCounters, replicas: u64) -> (Key, Value) {
+    fn snapshot_row(
+        key: Vec<u8>,
+        node_id: NodeId,
+        used: UsageCounters,
+        replicas: u64,
+    ) -> (Key, Value) {
         let snapshot = NodeUsageSnapshot {
             node_id,
             counters: used,
@@ -510,7 +516,11 @@ mod state_machine_tests {
     fn summary_write(global: &RealmUsage, group: &RealmUsage) -> Effect {
         let row = |key: Vec<u8>, total: &RealmUsage| {
             let value = total.counters.to_bytes().unwrap();
-            (NODE_STATS_KEYSPACE.to_string(), Key::from(key), Value::from(value))
+            (
+                NODE_STATS_KEYSPACE.to_string(),
+                Key::from(key),
+                Value::from(value),
+            )
         };
         Effect::Storage(StorageEffect::BatchWrite {
             writes: vec![
@@ -594,7 +604,8 @@ mod state_machine_tests {
             ],
         ];
         for events in prefixes {
-            let mut operation = RealmUsageOperation::summary(node(1), Some(REALM), true, vec![GROUP]);
+            let mut operation =
+                RealmUsageOperation::summary(node(1), Some(REALM), true, vec![GROUP]);
             operation.start();
             for event in events {
                 assert!(!operation.step(event).is_empty());
@@ -609,7 +620,8 @@ mod state_machine_tests {
     #[test]
     fn rejects_stray_events() {
         let started = || {
-            let mut operation = RealmUsageOperation::new(node(1), Some(REALM), RealmUsageScope::Global);
+            let mut operation =
+                RealmUsageOperation::new(node(1), Some(REALM), RealmUsageScope::Global);
             operation.start();
             operation
         };

@@ -22,7 +22,6 @@ use tracing::debug;
 use super::routing::{family_projection, status_view};
 use super::witness::{WitnessExplain, has_deadline};
 use crate::driver::{DriverContext, drive};
-use crate::node::read_info::ReadInfoOperation;
 use crate::jobs::JobRouteError;
 use crate::jobs::records::keys::submission_prefix;
 use crate::jobs::records::rows::from_bytes;
@@ -30,6 +29,7 @@ use crate::jobs::records::{
     AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation, load_kind_complete,
 };
 use crate::jobs::store::iter_prefix_page;
+use crate::node::read_info::ReadInfoOperation;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;

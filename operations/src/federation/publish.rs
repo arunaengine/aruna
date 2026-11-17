@@ -109,7 +109,11 @@ fn decide(
 
 /// Whether a captured publication still matches the current settings: this node still
 /// reports, and the mode, registry URL and descriptor issue time are unchanged.
-pub(crate) fn still_due(config: &RealmConfigDocument, node_id: NodeId, publication: &Publication) -> bool {
+pub(crate) fn still_due(
+    config: &RealmConfigDocument,
+    node_id: NodeId,
+    publication: &Publication,
+) -> bool {
     let Some(settings) = config.federation.as_ref() else {
         return false;
     };
@@ -436,15 +440,15 @@ impl Operation for PublishSoonOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::tasks::task_persistence::read_timer;
+    use aruna_core::UserId;
+    use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::handle::Handle;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };
-    use aruna_core::time::unix_timestamp_secs;
-    use crate::tasks::task_persistence::read_timer;
-    use aruna_core::UserId;
-    use aruna_core::federation::{AcceptedRealms, FederationSettings};
     use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::time::unix_timestamp_secs;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -666,7 +670,11 @@ mod tests {
         assert_eq!(skipped, Ok(false));
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
         // Without a task handle the runner still persists the due time before it refuses.
-        let armed = drive(PublishSoonOperation::new(config.realm_id, reporter()), &context).await;
+        let armed = drive(
+            PublishSoonOperation::new(config.realm_id, reporter()),
+            &context,
+        )
+        .await;
         assert!(matches!(armed, Err(PublishError::Timer(_))));
         let due = read_timer(storage, &key).await.unwrap().unwrap();
         let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
@@ -750,7 +758,10 @@ mod tests {
         check_trace(
             &mut operation,
             &[soon_read(config.realm_id)],
-            vec![(soon_config(&config), vec![soon_timer()]), (scheduled, vec![])],
+            vec![
+                (soon_config(&config), vec![soon_timer()]),
+                (scheduled, vec![]),
+            ],
         );
         assert_eq!(operation.finalize(), Ok(true));
 
@@ -795,7 +806,10 @@ mod tests {
             key: Some(TaskKey::PublishRegistration),
             message: "full".to_string(),
         }));
-        assert_eq!(refused.finalize(), Err(PublishError::Timer("full".to_string())));
+        assert_eq!(
+            refused.finalize(),
+            Err(PublishError::Timer("full".to_string()))
+        );
     }
 
     #[test]
@@ -814,7 +828,10 @@ mod tests {
         };
         for (label, effects, error) in rejects_events(started, sample_events, expected) {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, PublishError::UnexpectedEvent { .. }), "{label}");
+            assert!(
+                matches!(error, PublishError::UnexpectedEvent { .. }),
+                "{label}"
+            );
         }
         let arming = || {
             let mut operation = started();
@@ -824,10 +841,16 @@ mod tests {
         let expected = |event: &Event| matches!(event, Event::Task(TaskEvent::Error { .. }));
         for (label, effects, error) in rejects_events(arming, sample_events, expected) {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, PublishError::UnexpectedEvent { .. }), "{label}");
+            assert!(
+                matches!(error, PublishError::UnexpectedEvent { .. }),
+                "{label}"
+            );
         }
         let fresh = || PublishSoonOperation::new(config.realm_id, reporter());
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
     }
 
     #[test]

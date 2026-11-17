@@ -174,19 +174,25 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
         "node info document did not propagate over the shared topic",
         || async {
             Ok(usize::from(
-                drive(ReadInfoOperation::new(vec![publisher_id]), peer.context.as_ref())
-                    .await
-                    .map_err(std::io::Error::other)?
-                    .is_empty(),
+                drive(
+                    ReadInfoOperation::new(vec![publisher_id]),
+                    peer.context.as_ref(),
+                )
+                .await
+                .map_err(std::io::Error::other)?
+                .is_empty(),
             ))
         },
     )
     .await?;
-    let received = drive(ReadInfoOperation::new(vec![publisher_id]), peer.context.as_ref())
-        .await
-        .map_err(std::io::Error::other)?
-        .remove(&publisher_id)
-        .expect("node info document present after convergence");
+    let received = drive(
+        ReadInfoOperation::new(vec![publisher_id]),
+        peer.context.as_ref(),
+    )
+    .await
+    .map_err(std::io::Error::other)?
+    .remove(&publisher_id)
+    .expect("node info document present after convergence");
 
     assert_eq!(received.node_id, publisher_id);
     assert!(received.executors.is_empty());

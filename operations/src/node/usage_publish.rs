@@ -14,9 +14,9 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
-    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters, dirty_group_id, dirty_group_key, dirty_share_id,
-    usage_global_key, usage_group_id, usage_group_key, usage_node_id,
-    usage_snapshot_key,
+    DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters,
+    dirty_group_id, dirty_group_key, dirty_share_id, usage_global_key, usage_group_id,
+    usage_group_key, usage_node_id, usage_snapshot_key,
 };
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
@@ -285,8 +285,8 @@ pub async fn publish_refresh_snapshots(
     let (published, observed_markers) =
         publish_retaining_markers(ctx, node_id, realm_id, full).await?;
     if !published.is_empty()
-        && let Err(error) = recompute_summary(ctx, node_id, published.global, published.groups.clone())
-            .await
+        && let Err(error) =
+            recompute_summary(ctx, node_id, published.global, published.groups.clone()).await
     {
         if let Err(retry_error) = signal_snapshot_retry(ctx, &published, &observed_markers).await {
             return Err(format!(

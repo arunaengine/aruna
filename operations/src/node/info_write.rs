@@ -11,7 +11,9 @@ use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE};
+use aruna_core::keyspaces::{
+    COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
+};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::RealmId;
@@ -181,7 +183,9 @@ impl InfoWriteOperation {
     fn begin(&mut self) -> Effects {
         self.attempts += 1;
         self.phase = Phase::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     /// Ends the run and releases its open transaction; the runner still sends the abort.
@@ -224,7 +228,10 @@ impl InfoWriteOperation {
         self.phase = Phase::Read(txn_id);
         Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
-                (NODE_INFO_KEYSPACE.to_string(), Key::from(node_info_key(node_id))),
+                (
+                    NODE_INFO_KEYSPACE.to_string(),
+                    Key::from(node_info_key(node_id))
+                ),
                 (
                     COMPUTE_DEPARTURE_KEYSPACE.to_string(),
                     Key::from(OPERATOR_DRAIN_KEY.to_vec()),
@@ -329,9 +336,7 @@ impl InfoWriteOperation {
                 self.phase = Phase::Done(Err(error.into()));
                 smallvec![]
             }
-            (Phase::Read(txn_id) | Phase::Write(txn_id), _) => {
-                self.abort_with(txn_id, unexpected)
-            }
+            (Phase::Read(txn_id) | Phase::Write(txn_id), _) => self.abort_with(txn_id, unexpected),
             _ => {
                 self.phase = Phase::Done(unexpected);
                 smallvec![]
@@ -443,7 +448,10 @@ mod state_machine_tests {
             node_id: node(),
             executors: Vec::new(),
             labels: BTreeMap::new(),
-            urls: NodeUrls { api: None, s3: None },
+            urls: NodeUrls {
+                api: None,
+                s3: None,
+            },
             utilization: NodeUtilization {
                 storage_bytes_used: 0,
                 documents_held: None,
@@ -502,7 +510,10 @@ mod state_machine_tests {
     fn row_read() -> Effect {
         Effect::Storage(StorageEffect::BatchRead {
             reads: vec![
-                (NODE_INFO_KEYSPACE.to_string(), Key::from(node_info_key(node()))),
+                (
+                    NODE_INFO_KEYSPACE.to_string(),
+                    Key::from(node_info_key(node())),
+                ),
                 (
                     COMPUTE_DEPARTURE_KEYSPACE.to_string(),
                     Key::from(OPERATOR_DRAIN_KEY.to_vec()),
@@ -622,7 +633,10 @@ mod state_machine_tests {
         };
         for (row, change) in [(None, leaving()), (Some(document(2)), snapshots)] {
             let mut operation = reading(change);
-            assert_eq!(operation.step(rows(row.as_ref(), false)).to_vec(), vec![rollback()]);
+            assert_eq!(
+                operation.step(rows(row.as_ref(), false)).to_vec(),
+                vec![rollback()]
+            );
             assert_eq!(operation.finalize(), Ok(false));
         }
         // The operator's flag drains the advertisement although the change does not.
@@ -671,7 +685,10 @@ mod state_machine_tests {
             ],
         });
         assert_eq!(garbled.step(row).to_vec(), vec![rollback()]);
-        assert!(matches!(garbled.finalize(), Err(InfoWriteError::Document(_))));
+        assert!(matches!(
+            garbled.finalize(),
+            Err(InfoWriteError::Document(_))
+        ));
 
         let mut unknown = reading(leaving());
         unknown.step(rows(Some(&document(1)), false));
@@ -692,10 +709,16 @@ mod state_machine_tests {
         };
         for (label, effects, error) in rejects_events(|| reading(leaving()), sample_events, open) {
             assert_eq!(effects.to_vec(), vec![rollback()], "{label}");
-            assert!(matches!(error, InfoWriteError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, InfoWriteError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let fresh = || revise(leaving());
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
     }
 
     #[test]

@@ -1423,9 +1423,12 @@ async fn owner_origin(
     state: &ServerState,
     node_id: aruna_core::NodeId,
 ) -> Result<Option<String>, DrsError> {
-    let documents = drive(ReadInfoOperation::new(vec![node_id]), state.get_ctx().as_ref())
-        .await
-        .map_err(|error| DrsError::internal(error.to_string()))?;
+    let documents = drive(
+        ReadInfoOperation::new(vec![node_id]),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| DrsError::internal(error.to_string()))?;
     let Some(published) = documents.get(&node_id).and_then(|doc| doc.urls.api.clone()) else {
         return Ok(None);
     };

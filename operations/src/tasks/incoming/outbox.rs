@@ -1192,7 +1192,10 @@ impl OperationsTaskHandler {
                 if let Err(error) = deleted {
                     warn!(task_id = ?retry_key, error = %error, "Failed to delete document sync outbox records");
                     outcome.retry_needed = true;
-                } else if refresh_targets.iter().any(DocumentTarget::changes_dashboard) {
+                } else if refresh_targets
+                    .iter()
+                    .any(DocumentTarget::changes_dashboard)
+                {
                     self.context.notify_dashboard_change();
                 }
             }

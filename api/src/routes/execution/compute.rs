@@ -12,8 +12,8 @@ use aruna_core::structs::placement::compute_config::{
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_operations::driver::drive;
-use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::drain_state::DrainStateOperation;
+use aruna_operations::node::heartbeat::held_heartbeats;
 use aruna_operations::node::node_info::{group_demand, set_operator_drain};
 use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
@@ -662,15 +662,15 @@ pub async fn get_compute_snapshots(
         .await
         .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let departure = drain.departure.map(|report| DepartureBody {
-            departed_at_ms: report.departed_at_ms,
-            membership_generation: report.membership_generation,
-            unresolved: report
-                .unresolved
-                .iter()
-                .map(ulid::Ulid::to_string)
-                .collect(),
-            truncated: report.truncated,
-        });
+        departed_at_ms: report.departed_at_ms,
+        membership_generation: report.membership_generation,
+        unresolved: report
+            .unresolved
+            .iter()
+            .map(ulid::Ulid::to_string)
+            .collect(),
+        truncated: report.truncated,
+    });
     Ok(Json(ComputeSnapshotsResponse {
         operator_draining: drain.operator_draining,
         nodes,

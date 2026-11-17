@@ -942,10 +942,10 @@ mod tests {
     use crate::node::realm_usage::{
         RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
     };
-    use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::node::usage_publish::{
         clear_consumed_markers, publish_refresh_snapshots, publish_usage_snapshots,
     };
+    use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::node::usage_refresh::RefreshUsageOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::keyspaces::{
@@ -967,12 +967,12 @@ mod tests {
     use aruna_core::structs::storage::format::{FrameLayout, StoredFormat, StoredLayout};
     use aruna_core::structs::storage::multipart::MultipartUpload;
     use aruna_core::structs::storage::multipart::MultipartUploadStatus;
+    use aruna_core::structs::storage::usage::usage_hash_key;
+    use aruna_core::structs::storage::usage::{BucketCounters, global_shard_index};
     use aruna_core::structs::storage::usage::{
         SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
         usage_summary_key,
     };
-    use aruna_core::structs::storage::usage::usage_hash_key;
-    use aruna_core::structs::storage::usage::{BucketCounters, global_shard_index};
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -2878,7 +2878,11 @@ mod state_machine_tests {
         });
         for (value, complete) in [(None, true), (Some(Value::from(vec![1])), false)] {
             let mut operation = UsageCompleteOperation::new();
-            check_trace(&mut operation, &[marker_read.clone()], vec![(read(value), vec![])]);
+            check_trace(
+                &mut operation,
+                &[marker_read.clone()],
+                vec![(read(value), vec![])],
+            );
             assert_eq!(operation.finalize(), Ok(complete));
         }
         let mut failed = UsageCompleteOperation::new();

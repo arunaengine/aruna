@@ -24,8 +24,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::s3::usage::UsageCompleteOperation;
 use crate::replication::members::bound_record;
+use crate::s3::usage::UsageCompleteOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageError {

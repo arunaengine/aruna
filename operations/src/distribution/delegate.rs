@@ -24,8 +24,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::node::read_info::ReadInfoOperation;
 use crate::forward::authorize::is_sync_eligible;
+use crate::node::read_info::ReadInfoOperation;
 use crate::placement::process_placements::load_realm_config;
 
 /// How long an issued delegation is valid.

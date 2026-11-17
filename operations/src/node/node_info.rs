@@ -506,9 +506,12 @@ async fn revise_node_info(
     change: InfoChange,
 ) -> Result<bool, String> {
     let now = unix_timestamp_millis();
-    drive(InfoWriteOperation::revise(realm_id, node_id, change, now), ctx)
-        .await
-        .map_err(|error| error.to_string())
+    drive(
+        InfoWriteOperation::revise(realm_id, node_id, change, now),
+        ctx,
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 /// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
@@ -546,7 +549,6 @@ fn merge_view(
     let (totals, truncated) = aruna_core::compute::quota::merge_demand(snapshots.iter(), group_id);
     (totals, truncated || missing)
 }
-
 
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking

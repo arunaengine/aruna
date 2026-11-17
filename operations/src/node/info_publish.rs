@@ -144,7 +144,9 @@ impl PublishInfoOperation {
             return self.finish(Ok(()));
         }
         self.phase = Phase::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn reread(&mut self, txn_id: TxnId, value: Option<Value>) -> Effects {
@@ -462,7 +464,10 @@ mod state_machine_tests {
         };
         for (label, effects, error) in rejects_events(reading, sample_events, batch) {
             assert!(effects.is_empty(), "{label} emitted effects");
-            assert!(matches!(error, PublishInfoError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, PublishInfoError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let rollback = Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN });
         let reread = |event: &Event| {
@@ -473,10 +478,16 @@ mod state_machine_tests {
         };
         for (label, effects, error) in rejects_events(settling, sample_events, reread) {
             assert_eq!(effects.to_vec(), vec![rollback.clone()], "{label}");
-            assert!(matches!(error, PublishInfoError::UnexpectedEvent(_)), "{label}");
+            assert!(
+                matches!(error, PublishInfoError::UnexpectedEvent(_)),
+                "{label}"
+            );
         }
         let fresh = || PublishInfoOperation::new(REALM, node(), false);
-        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
     }
 
     #[test]

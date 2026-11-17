@@ -1280,9 +1280,12 @@ async fn multipart_releases_observation() {
 async fn reported_bytes(h: &Harness, group_id: Ulid) -> u64 {
     let realm_id = h.driver.node_and_realm().map(|(_, realm_id)| realm_id);
     let scope = RealmUsageScope::Group(group_id);
-    let totals = drive(RealmUsageOperation::new(h.node_id, realm_id, scope), &h.driver)
-        .await
-        .unwrap();
+    let totals = drive(
+        RealmUsageOperation::new(h.node_id, realm_id, scope),
+        &h.driver,
+    )
+    .await
+    .unwrap();
     totals[0].counters.logical_bytes
 }
 

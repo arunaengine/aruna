@@ -243,9 +243,12 @@ async fn device_fetches_nodes() -> TestResult<()> {
         fetch_realm_documents(&device.context, FETCH_BUDGET).await,
         "the device beat must fetch the realm documents"
     );
-    let documents = drive(ReadInfoOperation::new(node_ids.clone()), device.context.as_ref())
-        .await
-        .map_err(std::io::Error::other)?;
+    let documents = drive(
+        ReadInfoOperation::new(node_ids.clone()),
+        device.context.as_ref(),
+    )
+    .await
+    .map_err(std::io::Error::other)?;
     assert_eq!(documents.len(), node_ids.len());
     for (node_id, urls) in expected {
         assert_eq!(

@@ -964,7 +964,10 @@ async fn reconcile_inbound_topics(
     if applied == 0 {
         return true;
     }
-    let dashboard_changed = targets.targets.iter().any(DocumentTarget::changes_dashboard);
+    let dashboard_changed = targets
+        .targets
+        .iter()
+        .any(DocumentTarget::changes_dashboard);
     let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
         .targets
