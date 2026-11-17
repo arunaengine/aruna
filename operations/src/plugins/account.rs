@@ -7,8 +7,6 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, USER_KEYSPACE,
 };
@@ -23,6 +21,7 @@ use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::{GroupId, RoleId};
 
 use super::grants::{InstallScope, READ_ROLE, WRITE_ROLE, role_name};
+use super::rows::read_rows;
 use crate::driver::{DriverContext, drive};
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::remove_role::{RemoveGroupConfig, RemoveGroupOperation};
@@ -316,20 +315,14 @@ pub(crate) async fn prerequisites_held(
     Ok(true)
 }
 
+/// One row, read on its own.
 pub(crate) async fn read_row(
     ctx: &DriverContext,
-    key_space: &str,
+    key_space: &'static str,
     key: Vec<u8>,
 ) -> Result<Option<Vec<u8>>, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(format!("{other:?}")),
-    }
+    let read = drive(read_rows(vec![(key_space, key)]), ctx).await;
+    Ok(read.map_err(|error| error.0)?.into_iter().next().flatten())
 }
 
 /// Whether the account acts for a plugin install; it changes only through that install.
