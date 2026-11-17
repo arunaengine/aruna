@@ -8,15 +8,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use aruna_core::StructuredId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
@@ -24,6 +22,7 @@ use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::{MetadataHandle, send_metadata_effect};
 use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -144,15 +143,10 @@ async fn assert_graph_exists(
     context: &Arc<DriverContext>,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match context
-        .metadata_handle
-        .as_ref()
-        .expect("metadata handle installed")
-        .send_effect(Effect::Metadata(MetadataEffect::ContainsGraph {
-            graph_iri: graph_iri.to_string(),
-        }))
-        .await
-    {
+    let contains = MetadataEffect::ContainsGraph {
+        graph_iri: graph_iri.to_string(),
+    };
+    match send_metadata_effect(context, contains).await {
         Event::Metadata(MetadataEvent::ContainsGraphResult { exists: true, .. }) => Ok(()),
         Event::Metadata(MetadataEvent::ContainsGraphResult { exists: false, .. }) => {
             Err("metadata graph was not restored after reopen".into())

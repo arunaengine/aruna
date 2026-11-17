@@ -40,7 +40,7 @@ use aruna_operations::metadata::update_document::{
     update_metadata_document,
 };
 use aruna_operations::metadata::{
-    MetadataHandle, MetadataHandleOptions, materialization_queue::process_materialization_batch,
+    MetadataHandle, materialization_queue::process_materialization_batch,
     projector::drain_projection_queue,
 };
 use aruna_storage::FjallStorage;

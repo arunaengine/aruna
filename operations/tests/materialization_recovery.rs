@@ -5,9 +5,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::MATERIALIZATION_JOB_KEYSPACE;
 use aruna_core::metadata::{
     ApplyRoCrateRequest, MaterializationState, MaterializationStatusRecord, MetadataBatch,

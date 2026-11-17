@@ -7,8 +7,10 @@ use super::search::{GraphVisibilityScope, LifecycleVisibility, record_for_graph}
 use super::search::{filter_candidate_records, select_visible_records};
 use super::*;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::events::Event;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::ApplyRoCrateRequest;
+use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::storage_entries::graph_lifecycle_key;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::{RealmNodeKind, TokenRevocation};

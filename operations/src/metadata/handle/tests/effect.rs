@@ -10,7 +10,6 @@ use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataCrateRequest;
 use aruna_core::metadata::MetadataGraphPolicy;
 use aruna_core::metadata::MetadataRequestDurability;
-use craqle::CraqleError;
 use serde_json::Value;
 pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) {
     let metadata_dir = tempdir().expect("metadata dir");
@@ -23,8 +22,12 @@ pub(super) fn memory_handle(storage: StorageHandle) -> (TempDir, DriverContext) 
             .with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
     )
     .expect("metadata handle opens");
-    let metadata_handle =
-        MetadataHandle::new(metadata_dir.path(), storage, None, Default::default());
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        storage.clone(),
+        None,
+        Default::default(),
+    );
     let metadata_handle = graph_context(storage, metadata_handle, graph_handle);
     (metadata_dir, metadata_handle)
 }
@@ -327,7 +330,7 @@ async fn policy_mints_nothing() {
     .expect("metadata handle opens");
     let handle = MetadataHandle::new(
         dir.path().join("metadata"),
-        storage,
+        storage.clone(),
         None,
         Default::default(),
     );

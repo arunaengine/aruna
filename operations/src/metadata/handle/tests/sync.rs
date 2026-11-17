@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::transport::with_sync_timeout;
-use super::auth::{auth_storage, node_id_seed, realm_fixture};
+use super::auth::{node_id_seed, realm_fixture};
 use super::*;
 use crate::metadata::handle::transport::read_budget;
 use crate::s3::bucket::get::GetBucketOperation;

@@ -866,7 +866,10 @@ async fn export_here_copy() {
 async fn list_uses_registry() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.metadata_handle
+        .as_ref()
+        .expect("metadata handle installed")
+        .expire_visibility_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
@@ -888,7 +891,10 @@ async fn list_uses_registry() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
 
-    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.metadata_handle
+        .as_ref()
+        .expect("metadata handle installed")
+        .expire_visibility_caches();
 
     let (_, Json(listed)) = list_metadata_documents(
         State(test.state.clone()),
@@ -926,7 +932,10 @@ async fn list_uses_registry() {
 async fn tombstone_hides_listing() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_graph_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.metadata_handle
+        .as_ref()
+        .expect("metadata handle installed")
+        .expire_visibility_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
