@@ -653,6 +653,36 @@ async fn peer_request(
             let result = Box::pin(checked).await;
             Ok(MetadataTransportMessage::NodeSecretChecked { result })
         }
+        record @ (MetadataTransportMessage::ForwardJobRecord { .. }
+        | MetadataTransportMessage::ForwardRecordPage { .. }) => {
+            let answer = Box::pin(async {
+                crate::jobs::records::serve_job_record(context, peer, record).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardLaunchOffer { launch } => {
+            let answer = Box::pin(async {
+                crate::jobs::records::serve_launch_offer(context, peer, *launch).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardJobSubmission {
+            auth_token,
+            submission_id,
+            request,
+        } => {
+            let answer = Box::pin(async {
+                crate::jobs::lifecycle::ingress::serve_submission(
+                    context,
+                    peer,
+                    auth_token,
+                    submission_id,
+                    *request,
+                )
+                .await
+            });
+            Ok(answer.await)
+        }
         MetadataTransportMessage::ResolveJobInputs {
             auth_token,
             request,

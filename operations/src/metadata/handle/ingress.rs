@@ -919,36 +919,6 @@ impl MetadataHandle {
                 })
                 .await
             }
-            record @ (MetadataTransportMessage::ForwardJobRecord { .. }
-            | MetadataTransportMessage::ForwardRecordPage { .. }) => {
-                Box::pin(async {
-                    crate::jobs::records::serve_job_record(context, peer, record).await
-                })
-                .await
-            }
-            MetadataTransportMessage::ForwardLaunchOffer { launch } => {
-                Box::pin(async {
-                    crate::jobs::records::serve_launch_offer(context, peer, *launch).await
-                })
-                .await
-            }
-            MetadataTransportMessage::ForwardJobSubmission {
-                auth_token,
-                submission_id,
-                request,
-            } => {
-                Box::pin(async {
-                    crate::jobs::lifecycle::ingress::serve_submission(
-                        context,
-                        peer,
-                        auth_token,
-                        submission_id,
-                        *request,
-                    )
-                    .await
-                })
-                .await
-            }
             forward @ MetadataTransportMessage::ForwardCreatePolicy { .. } => {
                 Box::pin(async {
                     crate::placement::policy::apply_forwarded_policy(context, peer, forward).await
@@ -1238,10 +1208,6 @@ impl MetadataHandle {
             | MetadataTransportMessage::ForwardPlacementPolicy { .. }
             | MetadataTransportMessage::ForwardVaultChange { .. }
             | MetadataTransportMessage::FetchVaultRecords { .. }
-            | MetadataTransportMessage::ForwardJobRecord { .. }
-            | MetadataTransportMessage::ForwardRecordPage { .. }
-            | MetadataTransportMessage::ForwardLaunchOffer { .. }
-            | MetadataTransportMessage::ForwardJobSubmission { .. }
             | MetadataTransportMessage::ForwardCreatePolicy { .. }
             | MetadataTransportMessage::ForwardSyncPull { .. }
             | MetadataTransportMessage::ForwardPullStatus { .. }
