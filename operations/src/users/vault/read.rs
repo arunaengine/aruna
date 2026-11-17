@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
     Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, StorageEffect, VaultFetchEffect, VaultQuery,
@@ -12,7 +13,7 @@ use aruna_core::effects::{
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
 use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
@@ -268,8 +269,6 @@ pub(crate) struct LocalRecordsOperation {
     user_id: UserId,
     heads: bool,
     keys: Vec<UserKeyRecord>,
-    reading: bool,
-    output: Option<Result<VaultRecords, MetadataReadError>>,
 }
 
 impl LocalRecordsOperation {
@@ -278,63 +277,52 @@ impl LocalRecordsOperation {
             user_id,
             heads,
             keys: Vec::new(),
-            reading: false,
-            output: None,
         }
     }
 
-    fn finish(&mut self, output: Result<VaultRecords, MetadataReadError>) -> Effects {
-        self.reading = false;
-        self.output = Some(output);
-        smallvec![]
+    fn page(&self, after: Option<Key>) -> Next<VaultRecords> {
+        let (space, limit) = match self.heads {
+            true => (VAULT_REVISION_KEYSPACE, MAX_VAULT_HEADS),
+            false => (USER_KEY_KEYSPACE, MAX_KEY_RECORDS),
+        };
+        Next::Call(IoCall::Page {
+            space: space.to_string(),
+            prefix: user_record_prefix(self.user_id),
+            after,
+            limit,
+        })
     }
 }
 
-impl EffectOperation for LocalRecordsOperation {
+impl Operation for LocalRecordsOperation {
     type Output = VaultRecords;
     type Error = MetadataReadError;
 
-    fn start(&mut self) -> Effects {
-        self.reading = true;
-        smallvec![page_effect(self.user_id, self.heads, None)]
+    fn first(&mut self) -> Result<Next<VaultRecords>, MetadataReadError> {
+        Ok(self.page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.finish(Err(MetadataReadError::Unavailable));
+    fn next(&mut self, result: IoResult) -> Result<Next<VaultRecords>, MetadataReadError> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(MetadataReadError::Unavailable);
         };
-        if !self.reading {
-            return self.finish(Err(MetadataReadError::Unavailable));
-        }
-        match decode_page(self.heads, values) {
+        match decode_page(self.heads, rows) {
             Ok(VaultRecords::Keys(keys)) => {
                 self.keys.extend(keys);
                 retain_newest_keys(&mut self.keys);
-                if let Some(start) = next_start_after {
-                    return smallvec![page_effect(self.user_id, false, Some(start))];
-                }
-                let keys = std::mem::take(&mut self.keys);
-                self.finish(Ok(VaultRecords::Keys(keys)))
+                Ok(match next {
+                    Some(after) => self.page(Some(after)),
+                    None => Next::Done(VaultRecords::Keys(std::mem::take(&mut self.keys))),
+                })
             }
-            Ok(heads) => self.finish(Ok(heads)),
-            Err(_) => self.finish(Err(MetadataReadError::Unavailable)),
+            Ok(heads) => Ok(Next::Done(heads)),
+            Err(_) => Err(MetadataReadError::Unavailable),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    /// A runner failure is answered as unavailable, never retried as a conflict.
+    fn is_conflict(_error: &MetadataReadError) -> bool {
+        false
     }
 }
 
@@ -415,9 +403,6 @@ pub(crate) fn fetch_effect(fetch: &VaultFetchEffect) -> Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_core::structs::placement::record::PlacementRef;
@@ -748,11 +733,8 @@ mod tests {
         }
     }
 
-    fn page(values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })
+    fn local_page(heads: bool, after: Option<Key>) -> Next<VaultRecords> {
+        LocalRecordsOperation::new(user(7), heads).page(after)
     }
 
     #[test]
@@ -761,18 +743,17 @@ mod tests {
         let rows = key_rows();
         let cursor = rows[63].0.clone();
         let mut operation = LocalRecordsOperation::new(user(7), false);
-        check_trace(
-            &mut operation,
-            &[page_effect(user(7), false, None)],
-            vec![
-                (
-                    page(rows[..64].to_vec(), Some(cursor.clone())),
-                    vec![page_effect(user(7), false, Some(cursor))],
-                ),
-                (page(rows[64..].to_vec(), None), vec![]),
-            ],
-        );
-        let VaultRecords::Keys(keys) = operation.finalize().unwrap() else {
+        assert_eq!(operation.first(), Ok(local_page(false, None)));
+        let answer = operation.next(IoResult::Page {
+            rows: rows[..64].to_vec(),
+            next: Some(cursor.clone()),
+        });
+        assert_eq!(answer, Ok(local_page(false, Some(cursor))));
+        let answer = operation.next(IoResult::Page {
+            rows: rows[64..].to_vec(),
+            next: None,
+        });
+        let Ok(Next::Done(VaultRecords::Keys(keys))) = answer else {
             panic!("expected keys");
         };
         assert_eq!(keys.len(), MAX_KEY_RECORDS);
@@ -784,47 +765,30 @@ mod tests {
     fn serves_heads_once() {
         // Heads are bounded by one page; a cursor after it is not followed.
         let mut operation = LocalRecordsOperation::new(user(7), true);
-        assert_eq!(
-            operation.start().into_vec(),
-            vec![page_effect(user(7), true, None)]
-        );
-        let more = Some(Key::from(vec![1u8]));
-        assert!(operation.step(page(Vec::new(), more)).is_empty());
-        assert_eq!(operation.finalize(), Ok(VaultRecords::Heads(Vec::new())));
+        assert_eq!(operation.first(), Ok(local_page(true, None)));
+        let answer = operation.next(IoResult::Page {
+            rows: Vec::new(),
+            next: Some(Key::from(vec![1u8])),
+        });
+        assert_eq!(answer, Ok(Next::Done(VaultRecords::Heads(Vec::new()))));
     }
 
     #[test]
     fn local_read_failures() {
-        // A storage error or an undecodable row answers unavailable.
+        // An undecodable row or an answer that is not a page answers unavailable.
         let mut operation = LocalRecordsOperation::new(user(7), false);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(operation.finalize(), Err(MetadataReadError::Unavailable));
-        let mut operation = LocalRecordsOperation::new(user(7), false);
-        operation.start();
+        operation.first().unwrap();
         let broken = vec![(Key::from(vec![1u8]), Value::from(vec![0xff; 3]))];
-        operation.step(page(broken, None));
-        assert_eq!(operation.finalize(), Err(MetadataReadError::Unavailable));
-    }
-
-    #[test]
-    fn local_rejects_events() {
-        // Before start every event fails the read, without effects.
-        let make = || LocalRecordsOperation::new(user(7), false);
-        for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert_eq!(error, MetadataReadError::Unavailable, "{label}");
-        }
-    }
-
-    #[test]
-    fn local_abort_finalize() {
-        // The local read only reads: abort has nothing to clean up, and an early finalize fails.
+        let answer = operation.next(IoResult::Page {
+            rows: broken,
+            next: None,
+        });
+        assert_eq!(answer, Err(MetadataReadError::Unavailable));
         let mut operation = LocalRecordsOperation::new(user(7), false);
-        operation.start();
-        assert!(operation.abort().is_empty());
-        rejects_finalize(operation);
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Err(MetadataReadError::Unavailable)
+        );
     }
 }

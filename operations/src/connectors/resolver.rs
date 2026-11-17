@@ -5,12 +5,14 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::SourceResolutionError;
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::OFFERED_DIRECTORY_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::keyspaces::{OFFERED_DIRECTORY_KEYSPACE, SOURCE_INDEX_KEYSPACE};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::repository::invenio::REFERENCE_GROUP;
+use aruna_core::rows;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::execution::offered_directory::{
     OFFERED_DIRECTORY_BUCKET, OFFERED_DIRECTORY_ROOT, OfferedDirectory,
@@ -20,16 +22,16 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
-use aruna_core::types::{Effects, GroupId, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, TxnId};
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, iter_connectors_effect, parse_connector_iter, parse_connector_read,
-    parse_secret_read, read_connector_effect, read_secret_effect,
+    StorageReadError, iter_connectors_effect, parse_connector_iter, parse_secret_read,
+    read_secret_effect, source_connector_key,
 };
 use crate::connectors::root_record::{parse_root, read_root};
 use crate::harvest::create_connector::INVENIO_TOKEN;
+use crate::storage_read::decode_row;
 use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
@@ -55,18 +57,9 @@ pub struct ResolveBindingInput {
 /// Connector pages one source root match reads; a group has few connectors.
 const MATCH_PAGES: usize = 8;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum ResolveConnectorState {
-    Init,
-    ReadConnector,
-    ReadSecret,
-    Finish,
-    Error,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The call a binding resolution waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResolveBindingState {
-    Init,
     /// Reads the root record a stored compact binding names, to put its settings back.
     ReadRoot,
     /// Looks for a connector of the group with the reference's source root.
@@ -75,8 +68,6 @@ enum ResolveBindingState {
     ReadOfferedDirectory,
     ReadRepository,
     ReadRepositorySecret,
-    Finish,
-    Error,
 }
 
 impl From<StorageReadError> for SourceResolutionError {
@@ -91,93 +82,67 @@ impl From<StorageReadError> for SourceResolutionError {
 #[derive(Debug, PartialEq)]
 pub struct ResolveConnectorOperation {
     input: ResolveConnectorInput,
-    state: ResolveConnectorState,
     connector: Option<SourceConnector>,
-    output: Option<Result<ResolvedSourceConnector, SourceResolutionError>>,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ResolveBindingOperation {
     input: ResolveBindingInput,
     state: ResolveBindingState,
-    output: Option<Result<ResolvedSourceAccess, SourceResolutionError>>,
     pages: usize,
     /// The current weight hint of the connector matched by source root, passed to the reader.
     matched_weight: Option<String>,
+}
+
+type Resolved = Result<Next<ResolvedSourceAccess>, SourceResolutionError>;
+
+/// Passes `effect` through as the next call.
+fn call(effect: Effect) -> Resolved {
+    Ok(Next::Call(effect.into()))
 }
 
 impl ResolveConnectorOperation {
     pub fn new(input: ResolveConnectorInput) -> Self {
         Self {
             input,
-            state: ResolveConnectorState::Init,
             connector: None,
-            output: None,
         }
     }
+}
 
-    fn emit_error(&mut self, error: SourceResolutionError) -> Effects {
-        self.state = ResolveConnectorState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+impl Operation for ResolveConnectorOperation {
+    type Output = ResolvedSourceConnector;
+    type Error = SourceResolutionError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SourceResolutionError> {
+        validate_source_path(&self.input.source_path, self.input.allow_root)?;
+        Ok(Next::Call(rows::read_row(
+            SOURCE_INDEX_KEYSPACE,
+            source_connector_key(self.input.group_id, self.input.connector_id),
+        )))
     }
 
-    fn handle_init(&mut self) -> Effects {
-        if let Err(error) = validate_source_path(&self.input.source_path, self.input.allow_root) {
-            return self.emit_error(error);
-        }
-
-        self.state = ResolveConnectorState::ReadConnector;
-        smallvec![read_connector_effect(
-            self.input.group_id,
-            self.input.connector_id,
-            None,
-        )]
-    }
-
-    fn handle_connector_read(&mut self, event: Event) -> Effects {
-        match parse_connector_read(event) {
-            Ok(Some(connector)) => {
-                self.connector = Some(connector);
-                self.state = ResolveConnectorState::ReadSecret;
-                smallvec![read_secret_effect(self.input.connector_id, None)]
-            }
-            Ok(None) => self.emit_error(SourceResolutionError::NotFound),
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let secret = match parse_secret_read(event, self.input.connector_id) {
-            Ok(secret) => secret,
-            Err(error) => return self.emit_error(error.into()),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SourceResolutionError> {
+        let Some(connector) = self.connector.take() else {
+            let connector = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+            self.connector = Some(connector.ok_or(SourceResolutionError::NotFound)?);
+            let read = read_secret_effect(self.input.connector_id, None);
+            return Ok(Next::Call(read.into()));
         };
-
-        let Some(connector) = self.connector.clone() else {
-            return self.emit_error(SourceResolutionError::ResolveFailed);
-        };
-
-        let access = match build_source_access(
+        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        let access = build_source_access(
             connector.kind,
             &connector.public_config,
             secret.clone().map(|secret| secret.secret_config),
             &self.input.source_path,
             None,
             self.input.allow_root,
-        ) {
-            Ok(access) => access,
-            Err(error) => return self.emit_error(error),
-        };
-
-        self.state = ResolveConnectorState::Finish;
-        let secret_fingerprint = secret.as_ref().map(secret_fingerprint);
-
-        self.output = Some(Ok(ResolvedSourceConnector {
+        )?;
+        Ok(Next::Done(ResolvedSourceConnector {
             connector,
-            secret_fingerprint,
+            secret_fingerprint: secret.as_ref().map(secret_fingerprint),
             access,
-        }));
-        smallvec![]
+        }))
     }
 }
 
@@ -185,79 +150,50 @@ impl ResolveBindingOperation {
     pub fn new(input: ResolveBindingInput) -> Self {
         Self {
             input,
-            state: ResolveBindingState::Init,
-            output: None,
+            state: ResolveBindingState::ReadSecret,
             pages: 0,
             matched_weight: None,
         }
     }
 
-    fn emit_error(&mut self, error: SourceResolutionError) -> Effects {
-        self.state = ResolveBindingState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
+    fn resolve(&mut self) -> Resolved {
         if let Some(digest) = self.input.source.descriptor.root {
             self.state = ResolveBindingState::ReadRoot;
-            return smallvec![Effect::Storage(read_root(digest, None))];
+            return call(Effect::Storage(read_root(digest, None)));
         }
-        if self.input.source.descriptor.kind == SourceConnectorKind::ArunaNative {
-            let access = match build_binding_access(&self.input.source, None) {
-                Ok(access) => access,
-                Err(error) => return self.emit_error(error),
-            };
-            self.state = ResolveBindingState::Finish;
-            self.output = Some(Ok(access));
-            return smallvec![];
+        match self.input.source.descriptor.kind {
+            SourceConnectorKind::ArunaNative => {
+                return Ok(Next::Done(build_binding_access(&self.input.source, None)?));
+            }
+            SourceConnectorKind::LocalDirectory => {
+                self.state = ResolveBindingState::ReadOfferedDirectory;
+                return call(read_offered_effect(&self.input.source)?);
+            }
+            SourceConnectorKind::Invenio => {
+                self.state = ResolveBindingState::ReadRepository;
+                return call(repository_read_effect(&self.input.source)?);
+            }
+            _ => {}
         }
-
-        if self.input.source.descriptor.kind == SourceConnectorKind::LocalDirectory {
-            let effect = match read_offered_effect(&self.input.source) {
-                Ok(effect) => effect,
-                Err(error) => return self.emit_error(error),
-            };
-            self.state = ResolveBindingState::ReadOfferedDirectory;
-            return smallvec![effect];
-        }
-
-        if self.input.source.descriptor.kind == SourceConnectorKind::Invenio {
-            let effect = match repository_read_effect(&self.input.source) {
-                Ok(effect) => effect,
-                Err(error) => return self.emit_error(error),
-            };
-            self.state = ResolveBindingState::ReadRepository;
-            return smallvec![effect];
-        }
-
         if self.input.source.connector_id.is_none()
             && let Some(group_id) = self.input.group_id
         {
             self.state = ResolveBindingState::MatchConnector;
             self.pages = 1;
-            return smallvec![iter_connectors_effect(group_id, None, None)];
+            return call(iter_connectors_effect(group_id, None, None));
         }
         self.read_secret()
     }
 
-    fn read_secret(&mut self) -> Effects {
-        let effect = match binding_secret_effect(&self.input.source, None) {
-            Ok(effect) => effect,
-            Err(error) => return self.emit_error(error),
-        };
-
+    fn read_secret(&mut self) -> Resolved {
         self.state = ResolveBindingState::ReadSecret;
-        smallvec![effect]
+        call(binding_secret_effect(&self.input.source, None)?)
     }
 
     /// Takes the group's connector with the reference's source root: the same kind, public
     /// configuration and login namespace. The path stays the reference's own.
-    fn handle_match(&mut self, event: Event) -> Effects {
-        let (connectors, next) = match parse_connector_iter(event) {
-            Ok(page) => page,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn matched(&mut self, event: Event) -> Resolved {
+        let (connectors, next) = parse_connector_iter(event)?;
         let descriptor = &self.input.source.descriptor;
         let matched = connectors.iter().find(|connector| {
             connector.kind == descriptor.kind
@@ -272,50 +208,32 @@ impl ResolveBindingOperation {
         match (next, self.input.group_id) {
             (Some(next), Some(group_id)) if self.pages < MATCH_PAGES => {
                 self.pages += 1;
-                smallvec![iter_connectors_effect(group_id, Some(next), None)]
+                call(iter_connectors_effect(group_id, Some(next), None))
             }
-            _ => self.emit_error(SourceResolutionError::ResolveFailed),
+            _ => Err(SourceResolutionError::ResolveFailed),
         }
     }
 
-    fn handle_root_read(&mut self, event: Event) -> Effects {
-        let root = match parse_root(event) {
-            Ok(Some(root)) => root,
-            Ok(None) => return self.emit_error(SourceResolutionError::ResolveFailed),
-            Err(error) => return self.emit_error(error.into()),
-        };
-        match RootEntry::hydrate(&self.input.source, &root) {
-            Ok(Some(full)) => {
-                self.input.source = full;
-                self.handle_init()
-            }
-            Ok(None) => self.emit_error(SourceResolutionError::ResolveFailed),
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn root_read(&mut self, event: Event) -> Resolved {
+        let root = parse_root(event)?.ok_or(SourceResolutionError::ResolveFailed)?;
+        let full = RootEntry::hydrate(&self.input.source, &root)?;
+        self.input.source = full.ok_or(SourceResolutionError::ResolveFailed)?;
+        self.resolve()
     }
 
-    fn handle_secret_read(&mut self, event: Event) -> Effects {
-        let mut access = match resolve_binding_access(&self.input.source, event) {
-            Ok(access) => access,
-            Err(error) => return self.emit_error(error),
-        };
+    fn secret_read(&mut self, event: Event) -> Resolved {
+        let mut access = resolve_binding_access(&self.input.source, event)?;
         if let Some(weight) = self.matched_weight.take() {
             let ResolvedSourceAccess::OpenDal { config, .. } = &mut access;
             config.insert(SOURCE_WEIGHT.to_string(), weight);
         }
-
-        self.state = ResolveBindingState::Finish;
-        self.output = Some(Ok(access));
-        smallvec![]
+        Ok(Next::Done(access))
     }
 
     /// The token is used only while the connector still points at the bound endpoint,
     /// so a connector moved to another host never sends its new token to the old one.
-    fn handle_repository_read(&mut self, event: Event) -> Effects {
-        let connector = match crate::harvest::repository::parse_connector_read(event) {
-            Ok(connector) => connector,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn repository_read(&mut self, event: Event) -> Resolved {
+        let connector = crate::harvest::repository::parse_connector_read(event)?;
         let bound = self.input.source.descriptor.public_config.get("endpoint");
         match (connector, self.input.source.connector_id) {
             (Some(connector), Some(connector_id))
@@ -323,132 +241,51 @@ impl ResolveBindingOperation {
                     && bound.is_some_and(|bound| same_endpoint(bound, &connector.endpoint)) =>
             {
                 self.state = ResolveBindingState::ReadRepositorySecret;
-                smallvec![crate::harvest::repository::read_secret_effect(
+                call(crate::harvest::repository::read_secret_effect(
                     connector_id,
-                    None
-                )]
+                    None,
+                ))
             }
             _ => self.finish_repository(None),
         }
     }
 
-    fn handle_repository_secret(&mut self, event: Event) -> Effects {
-        match crate::harvest::repository::parse_secret_read(event) {
-            Ok(secret) => self.finish_repository(secret.map(|secret| secret.secret_config)),
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn finish_repository(&mut self, secret: Option<HashMap<String, String>>) -> Effects {
+    fn finish_repository(&mut self, secret: Option<HashMap<String, String>>) -> Resolved {
         let secret = secret.map(|mut secret| {
             secret.retain(|key, _| key == INVENIO_TOKEN);
             secret
         });
-        match build_binding_access(&self.input.source, secret) {
-            Ok(access) => {
-                self.state = ResolveBindingState::Finish;
-                self.output = Some(Ok(access));
-                smallvec![]
-            }
-            Err(error) => self.emit_error(error),
-        }
-    }
-
-    fn handle_offered_read(&mut self, event: Event) -> Effects {
-        let access = match resolve_offered_access(&self.input.source, event) {
-            Ok(access) => access,
-            Err(error) => return self.emit_error(error),
-        };
-
-        self.state = ResolveBindingState::Finish;
-        self.output = Some(Ok(access));
-        smallvec![]
+        Ok(Next::Done(build_binding_access(
+            &self.input.source,
+            secret,
+        )?))
     }
 }
 
-impl EffectOperation for ResolveConnectorOperation {
-    type Output = ResolvedSourceConnector;
-    type Error = SourceResolutionError;
-
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ResolveConnectorState::Init => self.handle_init(),
-            ResolveConnectorState::ReadConnector => self.handle_connector_read(event),
-            ResolveConnectorState::ReadSecret => self.handle_secret_read(event),
-            ResolveConnectorState::Finish => smallvec![],
-            ResolveConnectorState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ResolveConnectorState::Finish | ResolveConnectorState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ResolveConnectorState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(SourceResolutionError::ResolveFailed);
-        }
-
-        self.output.ok_or(SourceResolutionError::ResolveFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-impl EffectOperation for ResolveBindingOperation {
+impl Operation for ResolveBindingOperation {
     type Output = ResolvedSourceAccess;
     type Error = SourceResolutionError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Resolved {
+        self.resolve()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Resolved {
+        let event = rows::event(result)?;
         match self.state {
-            ResolveBindingState::Init => self.handle_init(),
-            ResolveBindingState::ReadRoot => self.handle_root_read(event),
-            ResolveBindingState::MatchConnector => self.handle_match(event),
-            ResolveBindingState::ReadSecret => self.handle_secret_read(event),
-            ResolveBindingState::ReadOfferedDirectory => self.handle_offered_read(event),
-            ResolveBindingState::ReadRepository => self.handle_repository_read(event),
-            ResolveBindingState::ReadRepositorySecret => self.handle_repository_secret(event),
-            ResolveBindingState::Finish => smallvec![],
-            ResolveBindingState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ResolveBindingState::Finish | ResolveBindingState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ResolveBindingState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
+            ResolveBindingState::ReadRoot => self.root_read(event),
+            ResolveBindingState::MatchConnector => self.matched(event),
+            ResolveBindingState::ReadSecret => self.secret_read(event),
+            ResolveBindingState::ReadOfferedDirectory => Ok(Next::Done(resolve_offered_access(
+                &self.input.source,
+                event,
+            )?)),
+            ResolveBindingState::ReadRepository => self.repository_read(event),
+            ResolveBindingState::ReadRepositorySecret => {
+                let secret = crate::harvest::repository::parse_secret_read(event)?;
+                self.finish_repository(secret.map(|secret| secret.secret_config))
             }
-            return Err(SourceResolutionError::ResolveFailed);
         }
-
-        self.output.ok_or(SourceResolutionError::ResolveFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -1262,10 +1099,11 @@ mod tests {
             source,
             group_id: None,
         });
-        assert!(operation.start().is_empty());
-        assert!(operation.is_complete());
+        let Ok(Next::Done(access)) = operation.first() else {
+            panic!("a native binding resolves without I/O");
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
+            access,
             ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::ArunaNative,
                 config: HashMap::from([

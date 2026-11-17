@@ -20,6 +20,7 @@ pub use revoke::{RevokeS3Config, RevokeS3Operation};
 pub use touch::{TouchS3Config, TouchS3Operation};
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
@@ -89,6 +90,17 @@ pub enum S3SessionError {
         expected: &'static str,
         received: &'static str,
     },
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for S3SessionError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl S3SessionError {

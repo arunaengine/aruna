@@ -4,15 +4,14 @@
 
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -31,22 +30,11 @@ pub struct ListUsersOutput {
     pub next_start_after: Option<String>,
 }
 
+/// Checks the caller's permission, then pages through the realm's users.
 #[derive(Debug, PartialEq)]
 pub struct ListUsersOperation {
     input: ListUsersInput,
-    state: ListUsersState,
     users: Vec<User>,
-    storage_start_after: Option<Key>,
-    output: Option<Result<ListUsersOutput, ListUsersError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ListUsersState {
-    Init,
-    Auth,
-    ListUsers,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -69,178 +57,114 @@ pub enum ListUsersError {
     NotFinished,
 }
 
+impl From<IoError> for ListUsersError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ListUsers".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl ListUsersOperation {
     pub fn new(mut input: ListUsersInput) -> Self {
         input.limit = input.limit.max(1);
         Self {
             input,
-            state: ListUsersState::Init,
             users: Vec::new(),
-            storage_start_after: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: ListUsersError) -> Effects {
-        self.state = ListUsersState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(ListUsersError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn start_after_key(&self) -> Result<Option<Key>, ListUsersError> {
-        match (&self.storage_start_after, &self.input.start_after) {
-            (Some(key), _) => Ok(Some(key.clone())),
-            (None, Some(user_id)) => {
-                Ok(Some(UserId::from_string(user_id)?.to_storage_key().into()))
-            }
-            (None, None) => Ok(None),
-        }
-    }
-
-    fn emit_list_users(&mut self) -> Result<Effects, ListUsersError> {
-        self.state = ListUsersState::ListUsers;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USER_KEYSPACE.to_string(),
-            prefix: Some(UserId::storage_prefix(self.input.self_realm_id)),
-            start: self.start_after_key()?.map(IterStart::After),
+    fn page(&self, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: USER_KEYSPACE.to_string(),
+            prefix: UserId::storage_prefix(self.input.self_realm_id),
+            after,
             limit: self.input.limit.saturating_add(1),
-            txn_id: None,
-        })])
+        }
     }
 
-    fn handle_auth_result(&mut self, event: Event) -> Effects {
+    fn authorized(&mut self, event: Event) -> Result<Next<ListUsersOutput>, ListUsersError> {
         let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected_event(
-                "Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })",
+            return Err(ListUsersError::UnexpectedEvent {
+                state: "Auth".to_string(),
+                expected: "authorization result",
                 got,
-            );
+            });
         };
-
-        match allowed {
-            Ok(true) => match self.emit_list_users() {
-                Ok(effects) => effects,
-                Err(error) => self.fail(error),
-            },
-            Ok(false) => self.fail(ListUsersError::Unauthorized),
-            Err(error) => self.fail(error.into()),
+        if !allowed? {
+            return Err(ListUsersError::Unauthorized);
         }
+        let after = (self.input.start_after.as_deref())
+            .map(UserId::from_string)
+            .transpose()?
+            .map(|user_id| Key::from(user_id.to_storage_key()));
+        Ok(Next::Call(self.page(after)))
     }
 
-    fn handle_list_users(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult {
-            values,
+    fn finish(&mut self, next_start_after: Option<String>) -> Next<ListUsersOutput> {
+        Next::Done(ListUsersOutput {
+            users: std::mem::take(&mut self.users),
             next_start_after,
-        }) = event
-        else {
-            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
-        };
+        })
+    }
+}
 
-        match self.collect_users(values, next_start_after) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
+impl Operation for ListUsersOperation {
+    type Output = ListUsersOutput;
+    type Error = ListUsersError;
+
+    fn first(&mut self) -> Result<Next<ListUsersOutput>, ListUsersError> {
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.input.auth_context.clone(),
+            path: format!("/{}/admin/u/**", self.input.self_realm_id),
+            required_permission: Permission::READ,
+        });
+        let child = boxed_suboperation(check, |allowed| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn collect_users(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        next_start_after: Option<Key>,
-    ) -> Result<Effects, ListUsersError> {
-        for (key, value) in values {
-            let key_user_id = UserId::from_storage_key(&key)?;
-            if key_user_id.realm_id != self.input.self_realm_id {
+    fn next(&mut self, result: IoResult) -> Result<Next<ListUsersOutput>, ListUsersError> {
+        let (rows, next) = match result {
+            IoResult::Event(event) => return self.authorized(*event),
+            IoResult::Page { rows, next } => (rows, next),
+            other => {
+                return Err(ListUsersError::UnexpectedEvent {
+                    state: "ListUsers".to_string(),
+                    expected: "authorization result or IoResult::Page",
+                    got: other.label(),
+                });
+            }
+        };
+        for (key, value) in rows {
+            if UserId::from_storage_key(&key)?.realm_id != self.input.self_realm_id {
                 continue;
             }
-
             let user = User::from_bytes(&value)?;
             if user.user_id.realm_id == self.input.self_realm_id {
                 self.users.push(user);
             }
         }
-
         if self.users.len() > self.input.limit {
             self.users.truncate(self.input.limit);
             let next_start_after = self.users.last().map(|user| user.user_id.to_string());
-            return Ok(self.emit_finish(next_start_after));
+            return Ok(self.finish(next_start_after));
         }
-
-        if let Some(next_start_after) = next_start_after {
-            self.storage_start_after = Some(next_start_after);
-            return self.emit_list_users();
+        match next {
+            Some(after) => Ok(Next::Call(self.page(Some(after)))),
+            None => Ok(self.finish(None)),
         }
-
-        Ok(self.emit_finish(None))
-    }
-
-    fn emit_finish(&mut self, next_start_after: Option<String>) -> Effects {
-        self.state = ListUsersState::Finish;
-        self.output = Some(Ok(ListUsersOutput {
-            users: std::mem::take(&mut self.users),
-            next_start_after,
-        }));
-        smallvec![]
-    }
-}
-
-impl EffectOperation for ListUsersOperation {
-    type Output = ListUsersOutput;
-    type Error = ListUsersError;
-
-    fn start(&mut self) -> Effects {
-        self.state = ListUsersState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.input.auth_context.clone(),
-                path: format!("/{}/admin/u/**", self.input.self_realm_id),
-                required_permission: Permission::READ,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            ListUsersState::Auth => self.handle_auth_result(event),
-            ListUsersState::ListUsers => self.handle_list_users(event),
-            ListUsersState::Init | ListUsersState::Finish | ListUsersState::Error => {
-                let got = event.label();
-                self.unexpected_event("no event in a terminal state", got)
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListUsersState::Finish | ListUsersState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListUsersError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -248,10 +172,9 @@ impl EffectOperation for ListUsersOperation {
 mod pure_tests {
     use super::{ListUsersError, ListUsersInput, ListUsersOperation, ListUsersOutput};
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, IterStart, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{rejects_events, sample_events};
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::events::{Event, SubOperationEvent};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
@@ -294,10 +217,17 @@ mod pure_tests {
         }
     }
 
-    fn authorize(operation: &mut ListUsersOperation) -> aruna_core::types::Effects {
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ))
+    fn answer(allowed: bool) -> IoResult {
+        let event = SubOperationEvent::AuthorizationResult {
+            allowed: Ok(allowed),
+        };
+        IoResult::Event(Box::new(Event::SubOperation(event)))
+    }
+
+    type Turn = Result<Next<ListUsersOutput>, ListUsersError>;
+
+    fn authorize(operation: &mut ListUsersOperation) -> Turn {
+        operation.next(answer(true))
     }
 
     #[test]
@@ -306,26 +236,16 @@ mod pure_tests {
         let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
 
         assert!(matches!(
-            operation.start().first(),
-            Some(Effect::SubOperation(_))
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        let effects = authorize(&mut operation);
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix,
-                start,
-                limit,
-                txn_id,
-            }) => {
-                assert_eq!(key_space, aruna_core::USER_KEYSPACE);
-                assert_eq!(prefix.as_ref(), Some(&UserId::storage_prefix(realm_id)));
-                assert_eq!(start, &None);
-                assert_eq!(*limit, 11);
-                assert_eq!(txn_id, &None);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        let scan = IoCall::Page {
+            space: aruna_core::USER_KEYSPACE.to_string(),
+            prefix: UserId::storage_prefix(realm_id),
+            after: None,
+            limit: 11,
+        };
+        assert_eq!(authorize(&mut operation), Ok(Next::Call(scan)));
     }
 
     #[test]
@@ -337,11 +257,11 @@ mod pure_tests {
         let carol = user(realm_id, 4, "carol");
         let foreign = user(foreign_realm_id, 5, "foreign");
         let mut operation = ListUsersOperation::new(input(realm_id, 2, None));
-        operation.start();
-        authorize(&mut operation);
+        operation.first().unwrap();
+        authorize(&mut operation).unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let page = IoResult::Page {
+            rows: vec![
                 (
                     alice.user_id.to_storage_key().into(),
                     alice
@@ -368,18 +288,13 @@ mod pure_tests {
                         .into(),
                 ),
             ],
-            next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize().unwrap(),
-            ListUsersOutput {
-                users: vec![alice.clone(), bob.clone()],
-                next_start_after: Some(bob.user_id.to_string()),
-            }
-        );
+            next: None,
+        };
+        let output = ListUsersOutput {
+            users: vec![alice.clone(), bob.clone()],
+            next_start_after: Some(bob.user_id.to_string()),
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(output)));
     }
 
     #[test]
@@ -388,48 +303,28 @@ mod pure_tests {
         let start_after = user(realm_id, 6, "cursor").user_id;
         let mut operation =
             ListUsersOperation::new(input(realm_id, 10, Some(start_after.to_string())));
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = authorize(&mut operation);
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            }) => {
-                assert_eq!(key.as_ref(), start_after.to_storage_key().as_slice());
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        assert!(matches!(
+            authorize(&mut operation),
+            Ok(Next::Call(IoCall::Page { after: Some(key), .. }))
+                if key.as_ref() == start_after.to_storage_key().as_slice()
+        ));
     }
 
     #[test]
     fn unauthorized_fails() {
+        // A refused caller reads no user; an answer of another kind fails the listing.
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let mut operation = ListUsersOperation::new(input(realm_id, 10, None));
-        operation.start();
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(answer(false)),
+            Err(ListUsersError::Unauthorized)
+        );
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(ListUsersError::UnexpectedEvent { .. })
         ));
-
-        assert!(effects.is_empty());
-        assert!(operation.finalize().is_err());
-    }
-
-    // A state that expects no event must reject one instead of ignoring it.
-    #[test]
-    fn terminal_rejects_event() {
-        let realm_id = RealmId::from_bytes([7u8; 32]);
-        let make = || ListUsersOperation::new(input(realm_id, 10, None));
-        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(
-                    error,
-                    ListUsersError::UnexpectedEvent { .. } | ListUsersError::StorageError(_)
-                ),
-                "{error:?}"
-            );
-        }
     }
 }

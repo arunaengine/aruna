@@ -5,26 +5,23 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{
     RepositoryConnector, RepositoryConnectorKind, RepositoryConnectorSecret,
 };
-use aruna_core::structs::identity::group_delete::GroupWriteError;
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::structs::identity::group_delete::{GroupWriteError, check_group_write};
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::groups::fence::{parse_group_record, read_group_record};
+use crate::groups::fence::group_fence_key;
 use crate::harvest::create_connector::{CreateConnectorError, validate_connector};
 use crate::harvest::read_connector::ConnectorView;
-use crate::harvest::repository::{
-    connector_key, connector_secret_key, connector_writes, read_secret_effect,
-};
+use crate::harvest::repository::{connector_key, connector_secret_key, connector_writes};
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateConnectorInput {
@@ -79,88 +76,53 @@ pub enum UpdateConnectorError {
     Unexpected,
 }
 
+impl From<IoError> for UpdateConnectorError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or(Self::Unexpected, Self::Storage)
+    }
+}
+
+/// The call an update waits for.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
-    ReadRecord,
-    ReadSecret,
-    Write,
+enum Stage {
+    Read,
+    /// The write, then the secret row removal it may need.
+    Write(Vec<(String, Key)>),
     Delete,
-    Commit,
-    Aborting,
-    Finish,
 }
 
 /// Replaces the public definition; the id, group, creator and creation time are kept.
 #[derive(Debug, PartialEq)]
 pub struct UpdateRepositoryOperation {
     input: UpdateConnectorInput,
-    state: State,
-    txn_id: Option<TxnId>,
-    existing: Option<RepositoryConnector>,
-    deletes: Vec<(String, Key)>,
+    stage: Stage,
     view: Option<ConnectorView>,
-    output: Option<Result<ConnectorView, UpdateConnectorError>>,
 }
 
 impl UpdateRepositoryOperation {
     pub fn new(input: UpdateConnectorInput) -> Self {
         Self {
             input,
-            state: State::Init,
-            txn_id: None,
-            existing: None,
-            deletes: Vec::new(),
+            stage: Stage::Read,
             view: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: UpdateConnectorError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    fn read_record(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = State::ReadRecord;
-        smallvec![read_group_record(
-            self.input.group_id,
-            CONNECTOR_INDEX_KEYSPACE,
-            connector_key(self.input.group_id, self.input.connector_id),
-            txn_id,
-        )]
-    }
-
-    fn handle_record(&mut self, event: Event) -> Effects {
-        let record = match parse_group_record(event) {
-            Ok(Some(record)) => record,
-            Ok(None) => return self.fail(UpdateConnectorError::NotFound),
-            Err(error) => return self.fail(error.into()),
-        };
-        match RepositoryConnector::from_bytes(&record) {
-            Ok(existing) => self.existing = Some(existing),
-            Err(error) => return self.fail(GroupWriteError::from(error).into()),
-        }
-        self.state = State::ReadSecret;
-        smallvec![read_secret_effect(self.input.connector_id, self.txn_id)]
-    }
-
-    fn handle_secret(&mut self, event: Event) -> Effects {
-        let stored = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.is_some(),
-            _ => return self.fail(UpdateConnectorError::Unexpected),
-        };
-        let Some(existing) = self.existing.take() else {
-            return self.fail(UpdateConnectorError::Unexpected);
-        };
+    /// Decides the change from the stored record, the group fence and the stored secret row.
+    fn write(
+        &mut self,
+        [record, fence, secret]: [Option<Value>; 3],
+    ) -> Result<Next<ConnectorView>, UpdateConnectorError> {
+        check_group_write(fence.as_deref())?;
+        let record = record.ok_or(UpdateConnectorError::NotFound)?;
+        let existing = RepositoryConnector::from_bytes(&record).map_err(GroupWriteError::from)?;
+        let stored = secret.is_some();
         if existing.kind != self.input.kind {
-            return self.fail(UpdateConnectorError::KindChanged);
+            return Err(UpdateConnectorError::KindChanged);
         }
         if stored && self.input.secret_config.is_none() && existing.endpoint != self.input.endpoint
         {
-            return self.fail(UpdateConnectorError::SecretEndpoint);
+            return Err(UpdateConnectorError::SecretEndpoint);
         }
         let now = SystemTime::now();
         let connector = RepositoryConnector {
@@ -179,115 +141,69 @@ impl UpdateRepositoryOperation {
             None => stored,
             Some(_) => secret.is_some(),
         };
+        let mut deletes = Vec::new();
         if stored && !has_secret_config {
-            self.deletes.push((
+            deletes.push((
                 CONNECTOR_SECRET_KEYSPACE.to_string(),
                 connector_secret_key(connector.connector_id),
             ));
         }
-        let writes = match connector_writes(&connector, secret.as_ref()) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(GroupWriteError::from(error).into()),
-        };
+        let writes =
+            connector_writes(&connector, secret.as_ref()).map_err(GroupWriteError::from)?;
         self.view = Some(ConnectorView {
             connector,
             has_secret_config,
         });
-        self.state = State::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn after_write(&mut self) -> Effects {
-        if self.deletes.is_empty() {
-            return self.commit();
-        }
-        self.state = State::Delete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(UpdateConnectorError::Unexpected);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.stage = Stage::Write(deletes);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for UpdateRepositoryOperation {
+impl Operation for UpdateRepositoryOperation {
     type Output = ConnectorView;
     type Error = UpdateConnectorError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = validate_connector(
+    fn first(&mut self) -> Result<Next<Self::Output>, UpdateConnectorError> {
+        validate_connector(
             &self.input.name,
             self.input.kind,
             &self.input.endpoint,
             &self.input.public_config,
             self.input.secret_config.as_ref().unwrap_or(&HashMap::new()),
-        ) {
-            return self.fail(error.into());
-        }
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        )?;
+        let (group_id, connector_id) = (self.input.group_id, self.input.connector_id);
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                CONNECTOR_INDEX_KEYSPACE.to_string(),
+                connector_key(group_id, connector_id),
+            ),
+            group_fence_key(group_id),
+            (
+                CONNECTOR_SECRET_KEYSPACE.to_string(),
+                connector_secret_key(connector_id),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Aborting {
-            self.state = State::Finish;
-            return smallvec![];
-        }
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.read_record(txn_id)
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, UpdateConnectorError> {
+        match std::mem::replace(&mut self.stage, Stage::Delete) {
+            Stage::Read => self.write(rows::values::<3>(result)?),
+            Stage::Write(deletes) => {
+                rows::done(result)?;
+                Ok(Next::Call(IoCall::Delete(deletes)))
             }
-            (State::ReadRecord, event) => self.handle_record(event),
-            (State::ReadSecret, event) => self.handle_secret(event),
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.after_write()
+            Stage::Delete => {
+                rows::done(result)?;
+                self.view
+                    .take()
+                    .map(Next::Done)
+                    .ok_or(UpdateConnectorError::Unexpected)
             }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.commit()
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = State::Finish;
-                self.output = self.view.take().map(Ok);
-                smallvec![]
-            }
-            _ => self.fail(UpdateConnectorError::Unexpected),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(UpdateConnectorError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) if self.state != State::Commit => {
-                self.state = State::Aborting;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => {
-                self.state = State::Finish;
-                smallvec![]
-            }
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 }
 

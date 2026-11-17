@@ -3,13 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{
     DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent, journal_key,
 };
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, StoreError, Turn, done, unexpected};
+use super::rows::{Scan, StoreError, delete_call, done, page_call, page_of};
 
 /// Rows a journal page holds at most.
 pub const JOURNAL_PAGE: usize = 500;
@@ -19,51 +21,49 @@ pub type JournalRow = (Vec<u8>, SourceEvent);
 
 /// At most `limit` rows of `kind` after the key `after`, oldest first, and the key to continue
 /// after when more may follow. A row that does not decode is skipped.
-pub fn journal_page(kind: u8, after: Option<Vec<u8>>, limit: usize) -> RowsOperation<JournalPage> {
-    RowsOperation::direct(JournalPage(Some(Ask::Page {
-        space: EVENT_JOURNAL_KEYSPACE,
-        prefix: vec![kind],
+pub fn journal_page(kind: u8, after: Option<Vec<u8>>, limit: usize) -> JournalPage {
+    JournalPage(Some(page_call(
+        EVENT_JOURNAL_KEYSPACE,
+        vec![kind],
         after,
         limit,
-    })))
+    )))
 }
 
 #[derive(Debug, PartialEq)]
-pub struct JournalPage(Option<Ask>);
+pub struct JournalPage(Option<IoCall>);
 
-impl Plan for JournalPage {
+impl Operation for JournalPage {
     type Output = (Vec<JournalRow>, Option<Vec<u8>>);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
         let page = self
             .0
             .take()
             .ok_or_else(|| StoreError("paged twice".into()))?;
-        Ok(Turn::Ask(page))
+        Ok(Next::Call(page))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
-        let Answer::Page(rows, next) = answer else {
-            return Err(unexpected(answer));
-        };
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let (rows, next) = page_of(answer)?;
         let rows = (rows.into_iter())
             .filter_map(|(key, value)| Some((key, SourceEvent::from_bytes(&value).ok()?)))
             .collect();
-        Ok(Turn::Finish((rows, next)))
+        Ok(Next::Done((rows, next)))
     }
 }
 
 /// Deletes kept rows journaled longer than the retention ago, and source-id rows past the
 /// dedup horizon, after which a source is not journaled again; returns how many rows.
-pub(crate) fn prune_journal(now_ms: u64) -> RowsOperation<PruneJournal> {
+pub(crate) fn prune_journal(now_ms: u64) -> PruneJournal {
     let kept_from = now_ms.saturating_sub(JOURNAL_RETENTION_MS);
-    RowsOperation::direct(PruneJournal {
+    PruneJournal {
         now_ms,
         cutoff: journal_key(JOURNAL_ROW, kept_from, Ulid::nil()),
         phase: JournalPhase::Kept,
         pruned: 0,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -84,30 +84,28 @@ enum JournalPhase {
 }
 
 impl PruneJournal {
-    fn kept_page() -> Ask {
-        Ask::Page {
-            space: EVENT_JOURNAL_KEYSPACE,
-            prefix: vec![JOURNAL_ROW],
-            after: None,
-            limit: JOURNAL_PAGE,
-        }
+    fn kept_page() -> IoCall {
+        page_call(
+            EVENT_JOURNAL_KEYSPACE,
+            vec![JOURNAL_ROW],
+            None,
+            JOURNAL_PAGE,
+        )
     }
 }
 
-impl Plan for PruneJournal {
+impl Operation for PruneJournal {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
-        Ok(Turn::Ask(Self::kept_page()))
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(Self::kept_page()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, JournalPhase::DeletingSources) {
             JournalPhase::Kept => {
-                let Answer::Page(rows, _) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let (rows, _) = page_of(answer)?;
                 let old: Vec<_> = (rows.into_iter())
                     .map(|(key, _)| key)
                     .take_while(|key| *key < self.cutoff)
@@ -117,22 +115,22 @@ impl Plan for PruneJournal {
                     let scan = Scan::new(EVENT_JOURNAL_KEYSPACE, vec![SOURCE_ROW]);
                     let ask = scan.ask();
                     self.phase = JournalPhase::Sources(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 }
                 self.pruned += old.len();
                 self.phase = JournalPhase::DeletingKept;
-                Ok(Turn::Ask(Ask::Delete(old)))
+                Ok(Next::Call(delete_call(old)))
             }
             JournalPhase::DeletingKept => {
                 done(answer)?;
                 self.phase = JournalPhase::Kept;
-                Ok(Turn::Ask(Self::kept_page()))
+                Ok(Next::Call(Self::kept_page()))
             }
             JournalPhase::Sources(mut scan) => {
                 let Some(sources) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = JournalPhase::Sources(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 let old: Vec<_> = (sources.into_iter())
                     .filter(|(_, value)| {
@@ -144,11 +142,11 @@ impl Plan for PruneJournal {
                     .map(|(key, _)| (EVENT_JOURNAL_KEYSPACE, key))
                     .collect();
                 self.pruned += old.len();
-                Ok(Turn::Ask(Ask::Delete(old)))
+                Ok(Next::Call(delete_call(old)))
             }
             JournalPhase::DeletingSources => {
                 done(answer)?;
-                Ok(Turn::Finish(self.pruned))
+                Ok(Next::Done(self.pruned))
             }
         }
     }
@@ -166,6 +164,7 @@ pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<So
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use crate::plugins::rows::page_result;
     use crate::plugins::rows::{scan_rows, write_rows};
     use crate::plugins::runs::tests::opened;
     use aruna_core::plugin_runs::{SourceKind, journal_entries};
@@ -275,30 +274,30 @@ mod tests {
         let old = journal_key(JOURNAL_ROW, 10, Ulid::from_parts(1, 1));
         let young = journal_key(JOURNAL_ROW, 60, Ulid::from_parts(1, 2));
         let page = vec![(old.clone(), Vec::new()), (young.clone(), Vec::new())];
-        let deleted = Ask::Delete(vec![(EVENT_JOURNAL_KEYSPACE, old)]);
+        let deleted = delete_call(vec![(EVENT_JOURNAL_KEYSPACE, old)]);
         assert_eq!(
-            plan.next(Answer::Page(page, None)).unwrap(),
-            Turn::Ask(deleted)
+            plan.next(page_result(page, None)).unwrap(),
+            Next::Call(deleted)
         );
         assert!(matches!(
-            plan.next(Answer::Done).unwrap(),
-            Turn::Ask(Ask::Page { .. })
+            plan.next(IoResult::Done).unwrap(),
+            Next::Call(IoCall::Page { .. })
         ));
         let page = vec![(young, Vec::new())];
         assert!(matches!(
-            plan.next(Answer::Page(page, None)).unwrap(),
-            Turn::Ask(Ask::Page { .. })
+            plan.next(page_result(page, None)).unwrap(),
+            Next::Call(IoCall::Page { .. })
         ));
         // A source row past the dedup horizon goes; a recent one stays.
         let anchor = |at: u64| at.to_be_bytes().to_vec();
         let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
-        let next = plan.next(Answer::Page(sources, None)).unwrap();
+        let next = plan.next(page_result(sources, None)).unwrap();
         let expected = if 100 > 1 + DEDUP_RETENTION_MS { 1 } else { 0 };
-        let Turn::Ask(Ask::Delete(keys)) = next else {
+        let Next::Call(IoCall::Delete(keys)) = next else {
             panic!("old source rows are deleted");
         };
         assert_eq!(keys.len(), expected);
-        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1 + expected));
+        assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1 + expected));
     }
 
     #[test]
@@ -307,12 +306,12 @@ mod tests {
         assert!(plan.first().is_err());
         let rows = vec![(b"j1".to_vec(), Vec::new())];
         let next = Some(b"j1".to_vec());
-        let Turn::Finish((events, after)) = plan.next(Answer::Page(rows, next.clone())).unwrap()
+        let Next::Done((events, after)) = plan.next(page_result(rows, next.clone())).unwrap()
         else {
             panic!("a page answers its readable rows");
         };
         assert!(events.is_empty());
         assert_eq!(after, next);
-        assert!(plan.next(Answer::Done).is_err());
+        assert!(plan.next(IoResult::Done).is_err());
     }
 }

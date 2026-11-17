@@ -4,12 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,99 +19,38 @@ pub struct WipeDeviceConfig {
 #[derive(Debug, PartialEq)]
 pub struct WipeDeviceOperation {
     config: WipeDeviceConfig,
-    state: WipeDeviceState,
-    output: Option<Result<NodeId, WipeDeviceError>>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum WipeDeviceState {
-    Init,
-    SyncStorage,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WipeDeviceError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error("the confirmation does not name this node")]
     ConfirmationMismatch,
-    #[error("wiping the device did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
 }
 
 impl WipeDeviceOperation {
     pub fn new(config: WipeDeviceConfig) -> Self {
-        Self {
-            config,
-            state: WipeDeviceState::Init,
-            output: None,
-        }
+        Self { config }
     }
 }
 
-impl EffectOperation for WipeDeviceOperation {
+impl Operation for WipeDeviceOperation {
     type Output = NodeId;
     type Error = WipeDeviceError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<NodeId>, WipeDeviceError> {
         if self.config.confirm_node_id != self.config.node_id.to_string() {
-            return fail(self, WipeDeviceError::ConfirmationMismatch);
+            return Err(WipeDeviceError::ConfirmationMismatch);
         }
         // Everything accepted so far is made durable before the tree goes, so
         // an interrupted wipe leaves a consistent store rather than a torn one.
-        self.state = WipeDeviceState::SyncStorage;
-        smallvec![Effect::Storage(StorageEffect::SyncAll)]
+        Ok(Next::Call(IoCall::Sync))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, WipeDeviceError::StorageError(error));
-            }
-            other => other,
-        };
-
-        match self.state {
-            WipeDeviceState::SyncStorage => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::SyncAllFinished) = event else {
-                    return fail(
-                        self,
-                        WipeDeviceError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "sync all finished",
-                            got,
-                        },
-                    );
-                };
-                self.state = WipeDeviceState::Finish;
-                self.output = Some(Ok(self.config.node_id));
-                smallvec![]
-            }
-            WipeDeviceState::Init | WipeDeviceState::Finish | WipeDeviceState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, WipeDeviceState::Finish | WipeDeviceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(WipeDeviceError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<NodeId>, WipeDeviceError> {
+        done(result)?;
+        Ok(Next::Done(self.config.node_id))
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -122,70 +58,47 @@ impl EffectOperation for WipeDeviceOperation {
     }
 }
 
-fn fail(operation: &mut WipeDeviceOperation, error: WipeDeviceError) -> Effects {
-    operation.state = WipeDeviceState::Error;
-    operation.output = Some(Err(error));
-    smallvec![]
-}
-
 #[cfg(test)]
 mod pure_tests {
-    use super::{WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation, WipeDeviceState};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use super::{WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation};
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+    use aruna_core::operation::Operation;
 
     fn node() -> aruna_core::NodeId {
         iroh::SecretKey::from_bytes(&[8u8; 32]).public()
     }
 
+    fn wipe(confirm_node_id: String) -> WipeDeviceOperation {
+        WipeDeviceOperation::new(WipeDeviceConfig {
+            node_id: node(),
+            confirm_node_id,
+        })
+    }
+
     #[test]
     fn refuses_wrong_confirmation() {
-        let mut operation = WipeDeviceOperation::new(WipeDeviceConfig {
-            node_id: node(),
-            confirm_node_id: "another-node".to_string(),
-        });
-        assert!(operation.start().is_empty());
-        assert!(operation.is_complete());
+        let mut operation = wipe("another-node".to_string());
         assert_eq!(
-            operation.finalize(),
+            operation.first(),
             Err(WipeDeviceError::ConfirmationMismatch)
         );
     }
 
     #[test]
     fn syncs_before_finishing() {
-        let node_id = node();
-        let mut operation = WipeDeviceOperation::new(WipeDeviceConfig {
-            node_id,
-            confirm_node_id: node_id.to_string(),
-        });
-        let effects = operation.start();
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::SyncAll)].as_slice()
-        );
-        assert!(!operation.is_complete());
-        operation.step(Event::Storage(StorageEvent::SyncAllFinished));
-        assert_eq!(operation.finalize(), Ok(node_id));
+        let mut operation = wipe(node().to_string());
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Sync)));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(node())));
     }
 
     #[test]
-    fn rejects_wrong_event() {
+    fn rejects_wrong_result() {
         // A durability barrier that never confirmed must not read as wiped.
-        let node_id = node();
-        let mut operation = WipeDeviceOperation::new(WipeDeviceConfig {
-            node_id,
-            confirm_node_id: node_id.to_string(),
-        });
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: ulid::Ulid::from_parts(1, 1),
-        }));
-        assert_eq!(operation.state, WipeDeviceState::Error);
+        let mut operation = wipe(node().to_string());
+        operation.first().unwrap();
         assert!(matches!(
-            operation.finalize(),
-            Err(WipeDeviceError::UnexpectedEvent { .. })
+            operation.next(IoResult::Woke),
+            Err(WipeDeviceError::Io(IoError::Unexpected { .. }))
         ));
     }
 }

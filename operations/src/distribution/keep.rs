@@ -5,22 +5,21 @@
 
 // The copy becomes an attachment row, or a cache entry that evicts the oldest entries for room.
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
 use aruna_core::structs::storage::distribution::on_use::{
     Attachment, CACHE_TOTALS_KEY, CacheEntry, CacheTotals, FillClaim, KeptKind, attachment_key,
 };
-use aruna_core::types::{Effects, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -37,17 +36,11 @@ pub enum KeepError {
     Conversion(#[from] ConversionError),
     #[error("operation did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
 }
 
-fn unexpected(state: &'static str, event: Event) -> KeepError {
-    KeepError::UnexpectedEvent {
-        state,
-        got: event.label(),
+impl From<IoError> for KeepError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
     }
 }
 
@@ -59,25 +52,13 @@ pub enum Claimed {
     Busy,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaimState {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Abort,
-    Done,
-}
-
-/// Claims one fill: absent or stale claims are taken, a fresh one of another fill is not.
+/// Claims one fill in one transaction: absent or stale claims are taken, a fresh one of another
+/// fill is not.
 #[derive(Debug, PartialEq)]
 pub struct ClaimFillOperation {
     key: Vec<u8>,
     claim: FillClaim,
-    state: ClaimState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<Claimed, KeepError>>,
+    written: bool,
 }
 
 impl ClaimFillOperation {
@@ -85,118 +66,47 @@ impl ClaimFillOperation {
         Self {
             key,
             claim,
-            state: ClaimState::Init,
-            txn_id: None,
-            output: None,
+            written: false,
         }
     }
 
-    fn fail(&mut self, error: KeepError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = ClaimState::Done;
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            ClaimState::Init => "init",
-            ClaimState::Start => "start",
-            ClaimState::Read => "read",
-            ClaimState::Write => "write",
-            ClaimState::Commit => "commit",
-            ClaimState::Abort => "abort",
-            ClaimState::Done => "done",
+    fn claim_held(&mut self, value: Option<Value>) -> Result<Next<Claimed>, KeepError> {
+        let held = value.as_deref().map(FillClaim::from_bytes).transpose()?;
+        let busy = held.is_some_and(|held| {
+            held.claim_id != self.claim.claim_id && !held.stale(self.claim.claimed_at_ms)
+        });
+        if busy {
+            return Ok(Next::Done(Claimed::Busy));
         }
+        self.written = true;
+        let row = (
+            FILL_CLAIM_KEYSPACE.to_string(),
+            self.key.clone().into(),
+            self.claim.to_bytes()?.into(),
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
-impl EffectOperation for ClaimFillOperation {
+impl Operation for ClaimFillOperation {
     type Output = Claimed;
     type Error = KeepError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ClaimState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<Claimed>, KeepError> {
+        Ok(Next::Call(read_row(FILL_CLAIM_KEYSPACE, self.key.clone())))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
+    fn next(&mut self, result: IoResult) -> Result<Next<Claimed>, KeepError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(Claimed::Claimed));
         }
-        match (self.state, event) {
-            (ClaimState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = ClaimState::Read;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: FILL_CLAIM_KEYSPACE.to_string(),
-                    key: self.key.clone().into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let held = match value.as_deref().map(FillClaim::from_bytes).transpose() {
-                    Ok(held) => held,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let busy = held.is_some_and(|held| {
-                    held.claim_id != self.claim.claim_id && !held.stale(self.claim.claimed_at_ms)
-                });
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                if busy {
-                    self.output = Some(Ok(Claimed::Busy));
-                    self.state = ClaimState::Abort;
-                    self.txn_id = None;
-                    return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-                }
-                let value = match self.claim.to_bytes() {
-                    Ok(value) => value,
-                    Err(error) => return self.fail(error.into()),
-                };
-                self.state = ClaimState::Write;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: FILL_CLAIM_KEYSPACE.to_string(),
-                    key: self.key.clone().into(),
-                    value: value.into(),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (ClaimState::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id.take() else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                self.state = ClaimState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (ClaimState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.output = Some(Ok(Claimed::Claimed));
-                self.state = ClaimState::Done;
-                smallvec![]
-            }
-            (ClaimState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.state = ClaimState::Done;
-                smallvec![]
-            }
-            (_, event) => {
-                let error = unexpected(self.state_name(), event);
-                self.fail(error)
-            }
-        }
+        let [value] = values::<1>(result)?;
+        self.claim_held(value)
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == ClaimState::Done
-    }
-
-    fn finalize(self) -> Result<Claimed, KeepError> {
-        self.output.unwrap_or(Err(KeepError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.fail(KeepError::NotFinished)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
@@ -230,94 +140,97 @@ pub enum Published {
     Unkept,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PublishState {
-    Init,
-    Start,
+/// What the pending call of a publish does.
+#[derive(Clone, Debug, PartialEq)]
+enum PublishStep {
     /// Reads the set's fence row and record: a deleted, departing or departed member keeps
     /// nothing new.
     ReadFence,
     ReadCache,
     Evict,
+    /// Deletes the claim and the evicted rows, then writes these rows, if any.
+    Delete(Vec<(String, Key, Value)>),
     Write,
-    Commit,
-    Done,
 }
+
+type PublishNext = Result<Next<Published>, KeepError>;
 
 /// Publishes a verified copy and releases its fill claim in one transaction.
 #[derive(Debug, PartialEq)]
 pub struct PublishKeptOperation {
     copy: KeptCopy,
-    state: PublishState,
-    txn_id: Option<TxnId>,
+    step: PublishStep,
     totals: CacheTotals,
     /// Bytes the cache still has to free, and what this admission frees.
     needed: u64,
     evicted: Vec<CacheEntry>,
     pages: usize,
-    output: Option<Result<Published, KeepError>>,
+    /// The order page to read after, while evicting.
+    after: Option<Key>,
+    output: Option<Published>,
 }
 
 impl PublishKeptOperation {
     pub fn new(copy: KeptCopy) -> Self {
         Self {
             copy,
-            state: PublishState::Init,
-            txn_id: None,
+            step: PublishStep::ReadFence,
             totals: CacheTotals::default(),
             needed: 0,
             evicted: Vec::new(),
             pages: 0,
+            after: None,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: KeepError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = PublishState::Done;
-        abort_effects(&mut self.txn_id)
-    }
-
     /// Leaves the cache unchanged; the claim is released without a trace.
-    fn unkept(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(KeepError::NotFinished);
-        };
-        self.output = Some(Ok(Published::Unkept));
-        self.state = PublishState::Write;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: FILL_CLAIM_KEYSPACE.to_string(),
-            key: self.copy.claim_key.clone().into(),
-            txn_id: Some(txn_id),
-        })]
+    fn unkept(&mut self) -> PublishNext {
+        self.output = Some(Published::Unkept);
+        self.step = PublishStep::Write;
+        let claim = (FILL_CLAIM_KEYSPACE.to_string(), self.copy.claim_key.clone().into());
+        Ok(Next::Call(IoCall::Delete(vec![claim])))
     }
 
-    fn read_order(&mut self, after: Option<Key>) -> Effects {
+    fn read_order(&mut self) -> PublishNext {
         if self.pages >= EVICTION_PAGES {
             return self.unkept();
         }
         self.pages += 1;
-        self.state = PublishState::Evict;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: CACHE_ORDER_KEYSPACE.to_string(),
-            prefix: None,
-            start: after.map(IterStart::After),
+        self.step = PublishStep::Evict;
+        Ok(Next::Call(IoCall::Page {
+            space: CACHE_ORDER_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.after.take(),
             limit: EVICTION_PAGE,
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
-    fn handle_cache(&mut self, values: Vec<(Key, Option<aruna_core::types::Value>)>) -> Effects {
-        let (Some((_, existing)), Some((_, totals))) = (values.first(), values.get(1)) else {
-            return self.fail(KeepError::NotFinished);
-        };
+    fn handle_fence(&mut self, fence: Option<Value>, record: Option<Value>) -> PublishNext {
+        if !LocalFence::decode(fence.as_deref())?.receiving() {
+            return self.unkept();
+        }
+        // Departure cleanup drops the fence row last; the record no longer names us then.
+        let view = record.as_deref().map(DistributionView::from_bytes).transpose()?;
+        let member = view.is_some_and(|view| view.snapshot().member(self.copy.member_id).is_some());
+        if self.copy.kind == KeptKind::Attachment {
+            return match member {
+                true => self.write_kept(),
+                false => self.unkept(),
+            };
+        }
+        self.step = PublishStep::ReadCache;
+        Ok(Next::Call(IoCall::Read(vec![
+            (CACHE_ENTRY_KEYSPACE.to_string(), self.copy.identity.to_vec().into()),
+            (CACHE_ENTRY_KEYSPACE.to_string(), CACHE_TOTALS_KEY.to_vec().into()),
+        ])))
+    }
+
+    fn handle_cache(&mut self, existing: Option<Value>, totals: Option<Value>) -> PublishNext {
         if existing.is_some() {
             return self.unkept();
         }
-        self.totals = match totals.as_deref().map(CacheTotals::from_bytes).transpose() {
-            Ok(totals) => totals.unwrap_or_default(),
-            Err(error) => return self.fail(error.into()),
-        };
+        self.totals = totals.as_deref().map(CacheTotals::from_bytes).transpose()?.unwrap_or_default();
         if self.copy.size > self.copy.capacity {
             return self.unkept();
         }
@@ -325,83 +238,59 @@ impl PublishKeptOperation {
         self.needed = after.saturating_sub(self.copy.capacity);
         match self.needed {
             0 => self.write_kept(),
-            _ => self.read_order(None),
+            _ => self.read_order(),
         }
     }
 
-    fn handle_order(
-        &mut self,
-        values: Vec<(Key, aruna_core::types::Value)>,
-        next: Option<Key>,
-    ) -> Effects {
+    fn handle_order(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> PublishNext {
         for (_, value) in values {
             if self.needed == 0 {
                 break;
             }
-            let entry = match CacheEntry::from_bytes(&value) {
-                Ok(entry) => entry,
-                Err(error) => return self.fail(error.into()),
-            };
+            let entry = CacheEntry::from_bytes(&value)?;
             self.needed = self.needed.saturating_sub(entry.size);
             self.evicted.push(entry);
         }
         match (self.needed, next) {
             (0, _) => self.write_kept(),
-            (_, Some(next)) => self.read_order(Some(next)),
+            (_, Some(next)) => {
+                self.after = Some(next);
+                self.read_order()
+            }
             // The totals promise more bytes than the order rows hold; keep nothing.
             (_, None) => self.unkept(),
         }
     }
 
-    fn write_kept(&mut self) -> Effects {
+    fn write_kept(&mut self) -> PublishNext {
         let copy = &self.copy;
         let mut writes = Vec::new();
         let mut deletes = vec![(
             FILL_CLAIM_KEYSPACE.to_string(),
             copy.claim_key.clone().into(),
         )];
-        let encoded = match copy.kind {
-            KeptKind::Attachment => Attachment {
-                blake3: copy.blake3,
-                location: copy.location.clone(),
-            }
-            .to_bytes()
-            .map(|value| {
+        match copy.kind {
+            KeptKind::Attachment => {
+                let value = Attachment {
+                    blake3: copy.blake3,
+                    location: copy.location.clone(),
+                }
+                .to_bytes()?;
                 let key = attachment_key(copy.set_id, copy.version_id);
                 writes.push((ATTACHMENT_KEYSPACE.to_string(), key.into(), value.into()));
-            }),
-            KeptKind::Cache => self.cache_rows(&mut writes, &mut deletes),
-        };
-        if let Err(error) = encoded {
-            return self.fail(error.into());
+            }
+            KeptKind::Cache => self.cache_rows(&mut writes, &mut deletes)?,
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(KeepError::NotFinished);
-        };
-        self.output = Some(Ok(Published::Kept {
-            evicted: self
-                .evicted
-                .iter()
-                .map(|entry| entry.location.clone())
-                .collect(),
-        }));
-        self.state = PublishState::Write;
-        smallvec![
-            Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            }),
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: Some(txn_id),
-            }),
-        ]
+        let evicted = (self.evicted.iter()).map(|entry| entry.location.clone()).collect();
+        self.output = Some(Published::Kept { evicted });
+        self.step = PublishStep::Delete(writes);
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
     /// The rows of a new cache entry, the evictions and the new totals.
     fn cache_rows(
         &self,
-        writes: &mut Vec<(String, Key, aruna_core::types::Value)>,
+        writes: &mut Vec<(String, Key, Value)>,
         deletes: &mut Vec<(String, Key)>,
     ) -> Result<(), ConversionError> {
         let copy = &self.copy;
@@ -440,142 +329,48 @@ impl PublishKeptOperation {
         Ok(())
     }
 
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            PublishState::Init => "init",
-            PublishState::Start => "start",
-            PublishState::ReadFence => "read_fence",
-            PublishState::ReadCache => "read_cache",
-            PublishState::Evict => "evict",
-            PublishState::Write => "write",
-            PublishState::Commit => "commit",
-            PublishState::Done => "done",
-        }
-    }
 }
 
-impl EffectOperation for PublishKeptOperation {
+impl Operation for PublishKeptOperation {
     type Output = Published;
     type Error = KeepError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PublishState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> PublishNext {
+        let set_key = LocalFence::key(self.copy.set_id);
+        Ok(Next::Call(IoCall::Read(vec![
+            (DISTRIBUTION_FENCE_KEYSPACE.to_string(), set_key.clone().into()),
+            (DISTRIBUTION_KEYSPACE.to_string(), set_key.into()),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (PublishState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = PublishState::ReadFence;
-                let set_key = LocalFence::key(self.copy.set_id);
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-                            set_key.clone().into()
-                        ),
-                        (DISTRIBUTION_KEYSPACE.to_string(), set_key.into()),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
+    fn next(&mut self, result: IoResult) -> PublishNext {
+        match std::mem::replace(&mut self.step, PublishStep::Write) {
+            PublishStep::ReadFence => {
+                let [fence, record] = values::<2>(result)?;
+                self.handle_fence(fence, record)
             }
-            (PublishState::ReadFence, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let (Some((_, fence)), Some((_, record))) = (values.first(), values.get(1)) else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                match LocalFence::decode(fence.as_deref()) {
-                    Ok(fence) if !fence.receiving() => return self.unkept(),
-                    Ok(_) => {}
-                    Err(error) => return self.fail(error.into()),
-                }
-                // Departure cleanup drops the fence row last; the record no longer names us then.
-                let view = match record
-                    .as_deref()
-                    .map(DistributionView::from_bytes)
-                    .transpose()
-                {
-                    Ok(view) => view,
-                    Err(error) => return self.fail(error.into()),
-                };
-                let member =
-                    view.is_some_and(|view| view.snapshot().member(self.copy.member_id).is_some());
-                if self.copy.kind == KeptKind::Attachment && !member {
-                    return self.unkept();
-                }
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                if self.copy.kind == KeptKind::Attachment {
-                    return self.write_kept();
-                }
-                self.state = PublishState::ReadCache;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            CACHE_ENTRY_KEYSPACE.to_string(),
-                            self.copy.identity.to_vec().into()
-                        ),
-                        (
-                            CACHE_ENTRY_KEYSPACE.to_string(),
-                            CACHE_TOTALS_KEY.to_vec().into()
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
+            PublishStep::ReadCache => {
+                let [existing, totals] = values::<2>(result)?;
+                self.handle_cache(existing, totals)
             }
-            (PublishState::ReadCache, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.handle_cache(values)
+            PublishStep::Evict => {
+                let (rows, next) = result.page()?;
+                self.handle_order(rows, next)
             }
-            (
-                PublishState::Evict,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.handle_order(values, next_start_after),
-            // The batch delete and batch write each answer; the commit follows the write.
-            (PublishState::Write, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                smallvec![]
+            PublishStep::Delete(writes) => {
+                done(result)?;
+                Ok(Next::Call(IoCall::Write(writes)))
             }
-            (
-                PublishState::Write,
-                Event::Storage(
-                    StorageEvent::BatchWriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => {
-                let Some(txn_id) = self.txn_id.take() else {
-                    return self.fail(KeepError::NotFinished);
-                };
-                self.state = PublishState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (PublishState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = PublishState::Done;
-                smallvec![]
-            }
-            (_, event) => {
-                let error = unexpected(self.state_name(), event);
-                self.fail(error)
+            PublishStep::Write => {
+                done(result)?;
+                let output = self.output.take().ok_or(KeepError::NotFinished)?;
+                Ok(Next::Done(output))
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == PublishState::Done
-    }
-
-    fn finalize(self) -> Result<Published, KeepError> {
-        self.output.unwrap_or(Err(KeepError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.fail(KeepError::NotFinished)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 

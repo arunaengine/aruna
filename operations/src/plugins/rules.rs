@@ -17,7 +17,7 @@ use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::entry::ReadEntry;
+use super::entry::{EntryError, ReadEntry};
 use super::grants::covers;
 use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
@@ -40,6 +40,8 @@ pub enum RuleError {
     Missing,
     #[error(transparent)]
     Secret(#[from] OwnerSecretError),
+    #[error(transparent)]
+    Read(#[from] EntryError),
     #[error("the install record cannot be read: {0}")]
     Unreadable(String),
 }
@@ -95,7 +97,6 @@ pub(crate) async fn edit_rules(
         readable: false,
         now_ms: unix_timestamp_millis(),
         write_ids: [(); 3].map(|_| Ulid::generate()),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), ctx).await?;
     Ok(true)

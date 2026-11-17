@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -15,9 +16,7 @@ use aruna_core::structs::storage::release::{
     CrateBytes, CrateRead, CrateReadError, ReleaseEffect, ReleaseEvent,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_core::types::Effects;
 use serde_json::Value;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -36,8 +35,8 @@ pub enum ViewError {
     Unavailable(String),
     #[error("the release crate is not valid JSON")]
     Malformed,
-    #[error("unexpected event: {0}")]
-    UnexpectedEvent(String),
+    #[error("could not read the release crate: {0}")]
+    Io(#[from] IoError),
 }
 
 /// One file a release pins, as its crate names it.
@@ -89,35 +88,16 @@ pub struct ViewConfig {
     pub page: FilePage,
 }
 
-#[derive(Debug, PartialEq)]
-enum ViewState {
-    Init,
-    Crate,
-    Finish,
-}
-
 /// Reads one release crate version with the caller's identity, checks its release tag and
 /// lists one page of the files it pins.
 #[derive(Debug, PartialEq)]
 pub struct ReleaseViewOperation {
     config: ViewConfig,
-    state: ViewState,
-    output: Option<Result<ReleaseView, ViewError>>,
 }
 
 impl ReleaseViewOperation {
     pub fn new(config: ViewConfig) -> Self {
-        Self {
-            config,
-            state: ViewState::Init,
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, output: Result<ReleaseView, ViewError>) -> Effects {
-        self.state = ViewState::Finish;
-        self.output = Some(output);
-        smallvec![]
+        Self { config }
     }
 
     fn on_crate(&self, read: Result<CrateBytes, CrateReadError>) -> Result<ReleaseView, ViewError> {
@@ -141,12 +121,11 @@ impl ReleaseViewOperation {
     }
 }
 
-impl EffectOperation for ReleaseViewOperation {
+impl Operation for ReleaseViewOperation {
     type Output = ReleaseView;
     type Error = ViewError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ViewState::Crate;
+    fn first(&mut self) -> Result<Next<ReleaseView>, ViewError> {
         let config = &self.config;
         let read = CrateRead {
             bucket: config.bucket.clone(),
@@ -158,30 +137,21 @@ impl EffectOperation for ReleaseViewOperation {
             node_id: config.node_id,
         };
         let effect = ReleaseEffect::ReadCrate(Box::new(read));
-        smallvec![Effect::Net(NetEffect::Release(Box::new(effect)))]
+        let effect = Effect::Net(NetEffect::Release(Box::new(effect)));
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (ViewState::Crate, Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read)))) => {
-                let output = self.on_crate(read);
-                self.finish(output)
+    fn next(&mut self, result: IoResult) -> Result<Next<ReleaseView>, ViewError> {
+        match result.event()? {
+            Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(read))) => {
+                Ok(Next::Done(self.on_crate(read)?))
             }
-            (_, event) => self.finish(Err(ViewError::UnexpectedEvent(event.label().to_string()))),
+            other => Err(IoError::Unexpected {
+                expected: "ReleaseEvent::CrateRead",
+                got: other.label(),
+            }
+            .into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == ViewState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or_else(|| Err(ViewError::UnexpectedEvent("not finished".into())))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

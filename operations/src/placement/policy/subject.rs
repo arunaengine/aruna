@@ -60,6 +60,8 @@ pub enum SubjectScanError {
     Conversion(#[from] aruna_core::errors::ConversionError),
     #[error("unexpected event in state {0}")]
     InvalidEvent(&'static str),
+    #[error(transparent)]
+    Io(#[from] aruna_core::calls::IoError),
 }
 
 #[derive(Debug, PartialEq)]

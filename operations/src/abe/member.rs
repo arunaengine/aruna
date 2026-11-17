@@ -3,14 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{KeyAction, KeyError, KeyOperation, KeyResult};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::GROUP_ENCRYPTED_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use ulid::Ulid;
 
 /// Runs one member key operation per encrypted bucket and member, best effort.
@@ -26,7 +25,6 @@ pub struct MemberKeysOperation {
     scanned: bool,
     pending: Vec<(String, UserId)>,
     opened: Vec<Ulid>,
-    output: Option<Result<Vec<Ulid>, KeyError>>,
 }
 impl MemberKeysOperation {
     pub fn new(
@@ -45,13 +43,12 @@ impl MemberKeysOperation {
             scanned: false,
             pending: Vec::new(),
             opened: Vec::new(),
-            output: None,
         }
     }
-    fn next(&mut self) -> Effects {
+    /// The key operation of the next bucket and member, or the opened requests.
+    fn request(&mut self) -> Next<Vec<Ulid>> {
         let Some((bucket, member)) = self.pending.pop() else {
-            self.output = Some(Ok(std::mem::take(&mut self.opened)));
-            return smallvec![];
+            return Next::Done(std::mem::take(&mut self.opened));
         };
         let action = KeyAction::Member(member);
         let operation = KeyOperation::new(bucket, self.auth.clone(), self.node, action, self.now);
@@ -66,30 +63,29 @@ impl MemberKeysOperation {
             };
             Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids })
         });
-        smallvec![Effect::SubOperation(sub)]
+        Next::Call(IoCall::Child(sub))
     }
 }
-impl EffectOperation for MemberKeysOperation {
+impl Operation for MemberKeysOperation {
     type Output = Vec<Ulid>;
     type Error = KeyError;
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Vec<Ulid>>, KeyError> {
         self.members.retain(|member| !member.is_nil());
         if self.members.is_empty() {
-            return self.next();
+            return Ok(self.request());
         }
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
-            prefix: Some(self.group_id.to_bytes().to_vec().into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: GROUP_ENCRYPTED_KEYSPACE.to_string(),
+            prefix: self.group_id.to_bytes().to_vec().into(),
+            after: None,
             limit: usize::MAX,
-            txn_id: None
-        })]
+        }))
     }
-    fn step(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::IterResult { values, .. }) if !self.scanned => {
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<Ulid>>, KeyError> {
+        match result {
+            IoResult::Page { rows, .. } if !self.scanned => {
                 self.scanned = true;
-                for (key, _) in values {
+                for (key, _) in rows {
                     let Some(Ok(bucket)) = key.get(16..).map(std::str::from_utf8) else {
                         continue;
                     };
@@ -97,28 +93,17 @@ impl EffectOperation for MemberKeysOperation {
                         self.pending.push((bucket.to_string(), *member));
                     }
                 }
-                self.next()
+                Ok(self.request())
             }
-            Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids })
-                if self.scanned =>
-            {
-                self.opened.extend(request_ids);
-                self.next()
-            }
-            _ => {
-                self.output = Some(Err(KeyError::Storage));
-                smallvec![]
-            }
+            IoResult::Event(event) if self.scanned => match *event {
+                Event::SubOperation(SubOperationEvent::KeyRequestsOpened { request_ids }) => {
+                    self.opened.extend(request_ids);
+                    Ok(self.request())
+                }
+                _ => Err(KeyError::Storage),
+            },
+            _ => Err(KeyError::Storage),
         }
-    }
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-    fn finalize(self) -> Result<Vec<Ulid>, KeyError> {
-        self.output.unwrap_or(Err(KeyError::Storage))
-    }
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -143,15 +128,25 @@ mod tests {
         let members = vec![UserId::nil(realm_id), foreign];
         let mut operation = MemberKeysOperation::new(auth, node, group_id, members, 1);
         assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
         ));
         assert_eq!(operation.members, vec![foreign]);
         let key = [&group_id.to_bytes()[..], b"bucket"].concat();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(key.into(), Vec::new().into())],
-            next_start_after: None,
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let page = IoResult::Page {
+            rows: vec![(key.into(), Vec::new().into())],
+            next: None,
+        };
+        assert!(matches!(
+            operation.next(page),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let opened = Event::SubOperation(SubOperationEvent::KeyRequestsOpened {
+            request_ids: vec![Ulid::from_bytes([5; 16])],
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(opened))),
+            Ok(Next::Done(vec![Ulid::from_bytes([5; 16])]))
+        );
     }
 }

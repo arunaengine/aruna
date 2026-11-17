@@ -194,6 +194,15 @@ pub enum SourceResolutionError {
     ResolveFailed,
 }
 
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for SourceResolutionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        let error = (error.into_storage())
+            .unwrap_or_else(|other| StorageError::ReadError(other.to_string()));
+        Self::StorageError(error)
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StorageError {
     #[error("Key not found")]

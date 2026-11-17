@@ -1,10 +1,10 @@
-//! Tests the chat head and turn operations against caps, stale revisions and storage errors.
+//! Tests the chat head and turn operations as calls and results against caps and stale revisions.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::events::StorageEvent;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{
     AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_TURN_BYTES,
@@ -15,10 +15,6 @@ const CHAT: &str = "c-1";
 
 fn user() -> UserId {
     UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32]))
-}
-
-fn txn() -> Ulid {
-    Ulid::from_bytes([6; 16])
 }
 
 fn head(chat_id: &str, next_seq: u32, bytes: u64) -> AssistantChatHead {
@@ -45,67 +41,28 @@ fn turn(seq: u32, payload: &str) -> AssistantChatTurn {
     }
 }
 
-fn started() -> Event {
-    Event::Storage(StorageEvent::TransactionStarted { txn_id: txn() })
+fn head_value(head: Option<&AssistantChatHead>) -> IoResult {
+    IoResult::Values(vec![head.map(|head| head.to_bytes().unwrap().into())])
 }
 
-fn committed() -> Event {
-    Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() })
+fn heads_rows(heads: &[AssistantChatHead]) -> IoResult {
+    let rows = (heads.iter())
+        .map(|head| {
+            let key = head_key(user(), &head.chat_id);
+            (key, head.to_bytes().unwrap().into())
+        })
+        .collect();
+    IoResult::Page { rows, next: None }
 }
 
-fn head_read(head: Option<&AssistantChatHead>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: head_key(user(), CHAT),
-        value: head.map(|head| head.to_bytes().unwrap().into()),
-    })
-}
-
-fn heads_iter(heads: &[AssistantChatHead]) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: heads
-            .iter()
-            .map(|head| {
-                (
-                    head_key(user(), &head.chat_id),
-                    head.to_bytes().unwrap().into(),
-                )
-            })
-            .collect(),
-        next_start_after: None,
-    })
-}
-
-fn turns_iter(turns: &[AssistantChatTurn]) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: turns
-            .iter()
-            .map(|turn| {
-                (
-                    turn_key(user(), CHAT, turn.seq),
-                    turn.to_bytes().unwrap().into(),
-                )
-            })
-            .collect(),
-        next_start_after: None,
-    })
-}
-
-fn written() -> Event {
-    Event::Storage(StorageEvent::WriteResult {
-        key: head_key(user(), CHAT),
-    })
-}
-
-fn batch_written() -> Event {
-    Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    })
-}
-
-fn batch_deleted() -> Event {
-    Event::Storage(StorageEvent::BatchDeleteResult {
-        entries: Vec::new(),
-    })
+fn turns_rows(turns: &[AssistantChatTurn]) -> IoResult {
+    let rows = (turns.iter())
+        .map(|turn| {
+            let key = turn_key(user(), CHAT, turn.seq);
+            (key, turn.to_bytes().unwrap().into())
+        })
+        .collect();
+    IoResult::Page { rows, next: None }
 }
 
 fn read_op(after: Option<u32>) -> ReadChatOperation {
@@ -142,43 +99,53 @@ fn delete_op() -> DeleteChatOperation {
     DeleteChatOperation::new(user(), CHAT.to_string(), 70)
 }
 
-fn is_iter(effects: &Effects, key_space: &str) -> bool {
-    matches!(
-        effects.first(),
-        Some(Effect::Storage(StorageEffect::Iter { key_space: space, .. })) if space == key_space
-    )
-}
-
-fn is_write(effects: &Effects) -> bool {
-    matches!(
-        effects.first(),
-        Some(Effect::Storage(StorageEffect::Write { .. }))
-    )
-}
-
-fn is_batch_write(effects: &Effects) -> bool {
-    matches!(
-        effects.first(),
-        Some(Effect::Storage(StorageEffect::BatchWrite { .. }))
-    )
-}
-
-fn iter_start(effects: &Effects) -> Option<(Key, usize)> {
-    match effects.first() {
-        Some(Effect::Storage(StorageEffect::Iter {
-            start: Some(IterStart::At(key)),
-            limit,
-            ..
-        })) => Some((key.clone(), *limit)),
-        _ => None,
+/// The call of a turn, failing the test on an outcome or an error.
+fn call<T: std::fmt::Debug>(turn: Result<Next<T>, ChatStoreError>) -> IoCall {
+    match turn {
+        Ok(Next::Call(call)) => call,
+        other => panic!("expected a call, got {other:?}"),
     }
 }
 
-fn deleted_keys(effects: &Effects) -> Vec<(String, Key)> {
-    match effects.first() {
-        Some(Effect::Storage(StorageEffect::BatchDelete { deletes, .. })) => deletes.clone(),
-        _ => panic!("expected a batch delete, got {effects:?}"),
+fn done<T: std::fmt::Debug>(turn: Result<Next<T>, ChatStoreError>) -> T {
+    match turn {
+        Ok(Next::Done(output)) => output,
+        other => panic!("expected an outcome, got {other:?}"),
     }
+}
+
+fn is_heads_page(call: &IoCall) -> bool {
+    matches!(call, IoCall::Page { space, .. } if space == CHAT_HEAD_KEYSPACE)
+}
+
+/// The first seq and the limit of a turn page.
+fn turns_from(call: &IoCall) -> (u32, usize) {
+    let IoCall::Page {
+        space,
+        prefix,
+        after,
+        limit,
+    } = call
+    else {
+        panic!("expected a turn page, got {call:?}");
+    };
+    assert_eq!(space, CHAT_TURN_KEYSPACE);
+    assert_eq!(*prefix, ByteView::from(turn_prefix(user(), CHAT)));
+    let from = after.as_ref().map_or(0, |after| {
+        let bytes = after.to_vec();
+        let seq: [u8; 4] = bytes[bytes.len() - 4..].try_into().unwrap();
+        u32::from_be_bytes(seq) + 1
+    });
+    (from, *limit)
+}
+
+fn written_head(call: &IoCall) -> AssistantChatHead {
+    let IoCall::Write(rows) = call else {
+        panic!("expected a write, got {call:?}");
+    };
+    let (_, key, value) = rows.last().unwrap();
+    assert_eq!(*key, head_key(user(), CHAT));
+    AssistantChatHead::from_bytes(value.as_ref()).unwrap()
 }
 
 #[test]
@@ -191,12 +158,9 @@ fn lists_live_heads() {
     let mut gone = head("c", 1, 5);
     gone.deleted_at = Some(11);
     let mut operation = ListChatOperation::new(user());
-    assert!(is_iter(&operation.start(), CHAT_HEAD_KEYSPACE));
-    assert!(!operation.is_complete());
-    operation.step(heads_iter(&[old.clone(), gone, new.clone()]));
-
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize().unwrap(), vec![new, old]);
+    assert!(is_heads_page(&call(operation.first())));
+    let listed = done(operation.next(heads_rows(&[old.clone(), gone, new.clone()])));
+    assert_eq!(listed, vec![new, old]);
 }
 
 #[test]
@@ -204,87 +168,54 @@ fn reads_after_seq() {
     // `after` below first_seq starts at first_seq; above it starts one past `after`.
     let mut stored = head(CHAT, 130, 9);
     stored.first_seq = 10;
+    for (after, from) in [(Some(3), 10), (Some(20), 21), (None, 10)] {
+        let mut operation = read_op(after);
+        operation.first().unwrap();
+        let page = call(operation.next(head_value(Some(&stored))));
+        assert_eq!(turns_from(&page), (from, usize::MAX));
+    }
     let mut operation = read_op(Some(3));
-    operation.start();
-    let effects = operation.step(head_read(Some(&stored)));
-    assert_eq!(
-        iter_start(&effects),
-        Some((turn_key(user(), CHAT, 10), usize::MAX))
-    );
-    operation.step(turns_iter(&[turn(10, "x"), turn(11, "y")]));
-    assert_eq!(
-        operation.finalize().unwrap(),
-        vec![turn(10, "x"), turn(11, "y")]
-    );
-
-    let mut operation = read_op(Some(20));
-    operation.start();
-    let effects = operation.step(head_read(Some(&stored)));
-    assert_eq!(
-        iter_start(&effects),
-        Some((turn_key(user(), CHAT, 21), usize::MAX))
-    );
-
-    let mut operation = read_op(None);
-    operation.start();
-    let effects = operation.step(head_read(Some(&stored)));
-    assert_eq!(
-        iter_start(&effects),
-        Some((turn_key(user(), CHAT, 10), usize::MAX))
-    );
+    operation.first().unwrap();
+    operation.next(head_value(Some(&stored))).unwrap();
+    let turns = done(operation.next(turns_rows(&[turn(10, "x"), turn(11, "y")])));
+    assert_eq!(turns, vec![turn(10, "x"), turn(11, "y")]);
 }
 
 #[test]
 fn refuses_missing_chat() {
-    // Unknown is not found; a tombstone is deleted. A write also releases its transaction.
+    // Unknown is not found; a tombstone is deleted.
     let mut gone = head(CHAT, 2, 4);
     gone.deleted_at = Some(12);
-
-    let mut read = read_op(None);
-    read.start();
-    assert!(read.step(head_read(None)).is_empty());
-    assert_eq!(read.finalize().unwrap_err(), ChatStoreError::NotFound);
-
-    let mut read = read_op(None);
-    read.start();
-    read.step(head_read(Some(&gone)));
-    assert_eq!(read.finalize().unwrap_err(), ChatStoreError::Deleted);
-
-    let mut write = turn_op(2, "x");
-    write.start();
-    write.step(started());
-    assert_eq!(write.step(head_read(None)).len(), 1);
-    assert_eq!(write.finalize().unwrap_err(), ChatStoreError::NotFound);
-
-    let mut write = turn_op(2, "x");
-    write.start();
-    write.step(started());
-    assert_eq!(write.step(head_read(Some(&gone))).len(), 1);
-    assert_eq!(write.finalize().unwrap_err(), ChatStoreError::Deleted);
-
+    let error = |stored: Option<&AssistantChatHead>| match stored {
+        None => ChatStoreError::NotFound,
+        Some(_) => ChatStoreError::Deleted,
+    };
+    for stored in [None, Some(&gone)] {
+        let mut read = read_op(None);
+        read.first().unwrap();
+        assert_eq!(read.next(head_value(stored)), Err(error(stored)));
+        let mut write = turn_op(2, "x");
+        write.first().unwrap();
+        assert_eq!(write.next(head_value(stored)), Err(error(stored)));
+    }
     let mut rename = head_op(None);
-    rename.start();
-    rename.step(started());
-    assert_eq!(rename.step(head_read(Some(&gone))).len(), 1);
-    assert_eq!(rename.finalize().unwrap_err(), ChatStoreError::Deleted);
+    rename.first().unwrap();
+    assert_eq!(
+        rename.next(head_value(Some(&gone))),
+        Err(ChatStoreError::Deleted)
+    );
 }
 
 #[test]
 fn creates_a_head() {
     let mut operation = head_op(None);
-    assert_eq!(operation.start().len(), 1);
-    operation.step(started());
-    let effects = operation.step(head_read(None));
-    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
-    let effects = operation.step(heads_iter(&[head("other", 1, 1)]));
-    assert!(is_write(&effects));
-    operation.step(written());
-    operation.step(committed());
-
-    assert!(operation.is_complete());
-    let saved = operation.finalize().unwrap();
+    assert!(operation.transaction());
+    assert_eq!(call(operation.first()), read_head(user(), CHAT));
+    assert!(is_heads_page(&call(operation.next(head_value(None)))));
+    let write = call(operation.next(heads_rows(&[head("other", 1, 1)])));
+    assert_eq!(written_head(&write).title, "Run QC");
+    let saved = done(operation.next(IoResult::Done));
     assert_eq!(saved.chat_id, CHAT);
-    assert_eq!(saved.title, "Run QC");
     assert_eq!(saved.subject.as_deref(), Some("subject"));
     assert_eq!(
         (
@@ -305,37 +236,28 @@ fn refuses_chat_cap() {
         .map(|index| head(&format!("c{index}"), 1, 1))
         .collect();
     let mut operation = head_op(None);
-    operation.start();
-    operation.step(started());
-    operation.step(head_read(None));
-    let cleanup = operation.step(heads_iter(&heads));
-    assert_eq!(cleanup.len(), 1);
+    operation.first().unwrap();
+    operation.next(head_value(None)).unwrap();
     assert_eq!(
-        operation.finalize().unwrap_err(),
-        ChatStoreError::TooLarge(CHAT_CAP)
+        operation.next(heads_rows(&heads)),
+        Err(ChatStoreError::TooLarge(CHAT_CAP))
     );
 
     heads[0].deleted_at = Some(1);
     let mut operation = head_op(None);
-    operation.start();
-    operation.step(started());
-    operation.step(head_read(None));
-    assert!(is_write(&operation.step(heads_iter(&heads))));
+    operation.first().unwrap();
+    operation.next(head_value(None)).unwrap();
+    let write = call(operation.next(heads_rows(&heads)));
+    assert!(matches!(write, IoCall::Write(_)));
 }
 
 #[test]
 fn renames_with_revision() {
     let mut operation = head_op(Some(3));
-    operation.start();
-    operation.step(started());
-    assert!(is_write(
-        &operation.step(head_read(Some(&head(CHAT, 4, 9))))
-    ));
-    operation.step(written());
-    operation.step(committed());
-
-    let saved = operation.finalize().unwrap();
-    assert_eq!(saved.title, "Run QC");
+    operation.first().unwrap();
+    let write = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
+    assert_eq!(written_head(&write).title, "Run QC");
+    let saved = done(operation.next(IoResult::Done));
     assert_eq!(
         (
             saved.revision,
@@ -351,45 +273,41 @@ fn renames_with_revision() {
 #[test]
 fn refuses_stale_head() {
     let mut operation = head_op(Some(2));
-    operation.start();
-    operation.step(started());
-    assert_eq!(operation.step(head_read(Some(&head(CHAT, 4, 9)))).len(), 1);
-    assert_eq!(operation.finalize().unwrap_err(), ChatStoreError::Stale);
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(head_value(Some(&head(CHAT, 4, 9)))),
+        Err(ChatStoreError::Stale)
+    );
 
     // No expectation overwrites.
     let mut operation = head_op(None);
-    operation.start();
-    operation.step(started());
-    assert!(is_write(
-        &operation.step(head_read(Some(&head(CHAT, 4, 9))))
-    ));
+    operation.first().unwrap();
+    let write = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
+    assert!(matches!(write, IoCall::Write(_)));
 }
 
 #[test]
 fn appends_a_turn() {
     let mut operation = turn_op(4, "abcd");
-    assert_eq!(operation.start().len(), 1);
-    operation.step(started());
-    let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
-    let effects = operation.step(heads_iter(&[head(CHAT, 4, 9), head("other", 1, 100)]));
-    let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first() else {
-        panic!("expected a batch write, got {effects:?}");
+    assert!(operation.transaction());
+    operation.first().unwrap();
+    let sum = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
+    assert!(is_heads_page(&sum));
+    let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9), head("other", 1, 100)])));
+    let IoCall::Write(rows) = &write else {
+        panic!("expected a write, got {write:?}");
     };
-    assert_eq!(writes[0].1, turn_key(user(), CHAT, 4));
-    assert_eq!(writes[1].1, head_key(user(), CHAT));
+    assert_eq!(rows[0].1, turn_key(user(), CHAT, 4));
     assert_eq!(
-        AssistantChatTurn::from_bytes(writes[0].2.as_ref()).unwrap(),
+        AssistantChatTurn::from_bytes(rows[0].2.as_ref()).unwrap(),
         AssistantChatTurn {
             seq: 4,
             payload: "abcd".to_string(),
             updated_at: 50
         }
     );
-    operation.step(batch_written());
-    operation.step(committed());
-
-    let saved = operation.finalize().unwrap();
+    let saved = done(operation.next(IoResult::Done));
+    assert_eq!(saved, written_head(&write));
     assert_eq!(
         (
             saved.first_seq,
@@ -406,19 +324,12 @@ fn appends_a_turn() {
 fn rewrites_the_tail() {
     // The old tail's bytes are released; next_seq stays.
     let mut operation = turn_op(3, "abcdef");
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    assert_eq!(iter_start(&effects), Some((turn_key(user(), CHAT, 3), 1)));
-    let effects = operation.step(turns_iter(&[turn(3, "abcd")]));
-    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
-    assert!(is_batch_write(
-        &operation.step(heads_iter(&[head(CHAT, 4, 9)]))
-    ));
-    operation.step(batch_written());
-    operation.step(committed());
-
-    let saved = operation.finalize().unwrap();
+    operation.first().unwrap();
+    let page = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
+    assert_eq!(turns_from(&page), (3, 1));
+    assert!(is_heads_page(&call(operation.next(turns_rows(&[turn(3, "abcd")])))));
+    let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9)])));
+    let saved = written_head(&write);
     assert_eq!(
         (saved.first_seq, saved.next_seq, saved.bytes, saved.revision),
         (0, 4, 11, 4)
@@ -431,22 +342,20 @@ fn trims_old_turns() {
     let mut full = head(CHAT, 130, 500);
     full.first_seq = 10;
     let mut operation = turn_op(130, "new");
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(head_read(Some(&full)));
-    assert_eq!(iter_start(&effects), Some((turn_key(user(), CHAT, 10), 1)));
-    let effects = operation.step(turns_iter(&[turn(10, "old!!")]));
-    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
-    let effects = operation.step(heads_iter(&[full.clone()]));
+    operation.first().unwrap();
+    let page = call(operation.next(head_value(Some(&full))));
+    assert_eq!(turns_from(&page), (10, 1));
+    operation.next(turns_rows(&[turn(10, "old!!")])).unwrap();
+    let trim = call(operation.next(heads_rows(&[full.clone()])));
     assert_eq!(
-        deleted_keys(&effects),
-        vec![(CHAT_TURN_KEYSPACE.to_string(), turn_key(user(), CHAT, 10))]
+        trim,
+        IoCall::Delete(vec![(
+            CHAT_TURN_KEYSPACE.to_string(),
+            turn_key(user(), CHAT, 10)
+        )])
     );
-    assert!(is_batch_write(&operation.step(batch_deleted())));
-    operation.step(batch_written());
-    operation.step(committed());
-
-    let saved = operation.finalize().unwrap();
+    let write = call(operation.next(IoResult::Done));
+    let saved = written_head(&write);
     assert_eq!(
         (saved.first_seq, saved.next_seq, saved.bytes),
         (11, 131, 498)
@@ -458,12 +367,10 @@ fn refuses_wrong_seq() {
     // Anything but next_seq or the tail is stale, and the error names next_seq.
     for seq in [2, 5] {
         let mut operation = turn_op(seq, "x");
-        operation.start();
-        operation.step(started());
-        assert_eq!(operation.step(head_read(Some(&head(CHAT, 4, 9)))).len(), 1);
+        operation.first().unwrap();
         assert_eq!(
-            operation.finalize().unwrap_err(),
-            ChatStoreError::StaleTurn { next_seq: 4 }
+            operation.next(head_value(Some(&head(CHAT, 4, 9)))),
+            Err(ChatStoreError::StaleTurn { next_seq: 4 })
         );
     }
 }
@@ -473,31 +380,23 @@ fn refuses_stale_revision() {
     // An append and a tail rewrite from an older read both stop; a matching one goes on.
     for seq in [3, 4] {
         let mut operation = turn_op_at(seq, 2);
-        operation.start();
-        operation.step(started());
-        assert_eq!(operation.step(head_read(Some(&head(CHAT, 4, 9)))).len(), 1);
+        operation.first().unwrap();
         assert_eq!(
-            operation.finalize().unwrap_err(),
-            ChatStoreError::StaleTurn { next_seq: 4 }
+            operation.next(head_value(Some(&head(CHAT, 4, 9)))),
+            Err(ChatStoreError::StaleTurn { next_seq: 4 })
         );
     }
     let mut operation = turn_op_at(4, 3);
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    assert!(is_iter(&effects, CHAT_HEAD_KEYSPACE));
+    operation.first().unwrap();
+    let sum = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
+    assert!(is_heads_page(&sum));
 }
 
 #[test]
 fn refuses_large_turn() {
     let payload = "x".repeat(MAX_TURN_BYTES + 1);
     let mut operation = WriteTurnOperation::new(user(), CHAT.to_string(), 0, payload, None, 50);
-
-    assert!(operation.start().is_empty());
-    assert_eq!(
-        operation.finalize().unwrap_err(),
-        ChatStoreError::TooLarge(TURN_CAP)
-    );
+    assert_eq!(operation.first(), Err(ChatStoreError::TooLarge(TURN_CAP)));
 }
 
 #[test]
@@ -505,43 +404,31 @@ fn refuses_over_budget() {
     // The bytes a write releases count in the user's favour.
     let other = head("other", 1, MAX_ASSISTANT_BYTES - 12);
     let mut operation = turn_op(4, "abcd");
-    operation.start();
-    operation.step(started());
-    operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    let cleanup = operation.step(heads_iter(&[head(CHAT, 4, 9), other.clone()]));
-    assert_eq!(cleanup.len(), 1);
+    operation.first().unwrap();
+    operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
     assert_eq!(
-        operation.finalize().unwrap_err(),
-        ChatStoreError::TooLarge(BUDGET_CAP)
+        operation.next(heads_rows(&[head(CHAT, 4, 9), other.clone()])),
+        Err(ChatStoreError::TooLarge(BUDGET_CAP))
     );
 
     let mut operation = turn_op(3, "abcd");
-    operation.start();
-    operation.step(started());
-    operation.step(head_read(Some(&head(CHAT, 4, 9))));
-    operation.step(turns_iter(&[turn(3, "abcd")]));
-    assert!(is_batch_write(
-        &operation.step(heads_iter(&[head(CHAT, 4, 9), other]))
-    ));
+    operation.first().unwrap();
+    operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
+    operation.next(turns_rows(&[turn(3, "abcd")])).unwrap();
+    let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9), other])));
+    assert!(matches!(write, IoCall::Write(_)));
 }
 
 #[test]
 fn deletes_once() {
     let mut operation = delete_op();
-    assert_eq!(operation.start().len(), 1);
-    operation.step(started());
-    let effects = operation.step(head_read(Some(&head(CHAT, 2, 8))));
-    assert_eq!(
-        iter_start(&effects),
-        Some((turn_key(user(), CHAT, 0), usize::MAX))
-    );
-    let effects = operation.step(turns_iter(&[turn(0, "a"), turn(1, "b")]));
-    assert_eq!(deleted_keys(&effects).len(), 2);
-    let effects = operation.step(batch_deleted());
-    let Some(Effect::Storage(StorageEffect::Write { value, .. })) = effects.first() else {
-        panic!("expected the tombstone write, got {effects:?}");
-    };
-    let tombstone = AssistantChatHead::from_bytes(value.as_ref()).unwrap();
+    assert!(operation.transaction());
+    operation.first().unwrap();
+    let page = call(operation.next(head_value(Some(&head(CHAT, 2, 8)))));
+    assert_eq!(turns_from(&page), (0, usize::MAX));
+    let delete = call(operation.next(turns_rows(&[turn(0, "a"), turn(1, "b")])));
+    assert!(matches!(&delete, IoCall::Delete(keys) if keys.len() == 2));
+    let tombstone = written_head(&call(operation.next(IoResult::Done)));
     assert_eq!(tombstone.deleted_at, Some(70));
     assert_eq!(
         (
@@ -552,245 +439,79 @@ fn deletes_once() {
         ),
         (0, 2, 2, 4)
     );
-    operation.step(written());
-    operation.step(committed());
-
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize().unwrap(), ());
+    done(operation.next(IoResult::Done));
 }
 
 #[test]
 fn skips_missing_chat() {
-    // Unknown or already deleted: the transaction is released and the delete succeeds.
-    let mut operation = delete_op();
-    operation.start();
-    operation.step(started());
-    let cleanup = operation.step(head_read(None));
-    assert!(matches!(
-        cleanup.first(),
-        Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-    ));
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize().unwrap(), ());
-
+    // Unknown or already deleted: the delete succeeds without a write.
     let mut gone = head(CHAT, 2, 8);
     gone.deleted_at = Some(1);
-    let mut operation = delete_op();
-    operation.start();
-    operation.step(started());
-    assert_eq!(operation.step(head_read(Some(&gone))).len(), 1);
-    assert!(operation.finalize().is_ok());
-
-    // No live turns: the tombstone is written without a batch delete.
-    let mut operation = delete_op();
-    operation.start();
-    operation.step(started());
-    operation.step(head_read(Some(&head(CHAT, 0, 0))));
-    assert!(is_write(&operation.step(turns_iter(&[]))));
-}
-
-fn expect_unexpected<O: EffectOperation<Error = ChatStoreError>>(
-    mut operation: O,
-    events: Vec<Event>,
-    wrong: Event,
-    cleanup: usize,
-) {
-    operation.start();
-    for event in events {
-        operation.step(event);
+    for stored in [None, Some(&gone)] {
+        let mut operation = delete_op();
+        operation.first().unwrap();
+        done(operation.next(head_value(stored)));
     }
-    assert_eq!(operation.step(wrong).len(), cleanup);
-    assert!(operation.is_complete());
-    assert!(matches!(
-        operation.finalize().unwrap_err(),
-        ChatStoreError::UnexpectedEvent { .. }
-    ));
+
+    // No live turns: the tombstone is written without a delete.
+    let mut operation = delete_op();
+    operation.first().unwrap();
+    operation.next(head_value(Some(&head(CHAT, 0, 0)))).unwrap();
+    let write = call(operation.next(turns_rows(&[])));
+    assert!(matches!(write, IoCall::Write(_)));
 }
 
 #[test]
-fn rejects_unexpected_events() {
-    // Each state accepts one event kind; anything else fails and aborts the transaction.
-    let stored = head(CHAT, 4, 9);
-    let mut full = head(CHAT, 130, 500);
-    full.first_seq = 10;
-    let live = || head_read(Some(&stored));
-
-    expect_unexpected(ListChatOperation::new(user()), vec![], started(), 0);
-    expect_unexpected(read_op(None), vec![], started(), 0);
-    expect_unexpected(read_op(None), vec![live()], head_read(None), 0);
-
-    expect_unexpected(head_op(None), vec![], head_read(None), 0);
-    expect_unexpected(head_op(None), vec![started()], started(), 1);
-    expect_unexpected(
-        head_op(None),
-        vec![started(), head_read(None)],
-        written(),
-        1,
-    );
-    expect_unexpected(head_op(None), vec![started(), live()], head_read(None), 1);
-    expect_unexpected(
-        head_op(None),
-        vec![started(), live(), written()],
-        written(),
-        1,
-    );
-
-    expect_unexpected(turn_op(4, "x"), vec![], head_read(None), 0);
-    expect_unexpected(turn_op(4, "x"), vec![started()], started(), 1);
-    expect_unexpected(turn_op(3, "x"), vec![started(), live()], written(), 1);
-    expect_unexpected(turn_op(4, "x"), vec![started(), live()], written(), 1);
-    expect_unexpected(
-        turn_op(130, "x"),
-        vec![
-            started(),
-            head_read(Some(&full)),
-            turns_iter(&[turn(10, "old")]),
-            heads_iter(&[full.clone()]),
-        ],
-        written(),
-        1,
-    );
-    expect_unexpected(
-        turn_op(4, "x"),
-        vec![started(), live(), heads_iter(&[])],
-        written(),
-        1,
-    );
-    expect_unexpected(
-        turn_op(4, "x"),
-        vec![started(), live(), heads_iter(&[]), batch_written()],
-        written(),
-        1,
-    );
-
-    expect_unexpected(delete_op(), vec![], head_read(None), 0);
-    expect_unexpected(delete_op(), vec![started()], started(), 1);
-    expect_unexpected(delete_op(), vec![started(), live()], written(), 1);
-    expect_unexpected(
-        delete_op(),
-        vec![started(), live(), turns_iter(&[turn(0, "a")])],
-        written(),
-        1,
-    );
-    expect_unexpected(
-        delete_op(),
-        vec![started(), live(), turns_iter(&[])],
-        batch_deleted(),
-        1,
-    );
-    expect_unexpected(
-        delete_op(),
-        vec![started(), live(), turns_iter(&[]), written()],
-        written(),
-        1,
-    );
-}
-
-#[test]
-fn aborts_on_error() {
-    let error = || {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })
+fn rejects_wrong_results() {
+    // A result of another kind than the call fails with the runner's unexpected error.
+    let unexpected = |turn: Result<Next<AssistantChatHead>, ChatStoreError>| {
+        assert!(matches!(
+            turn,
+            Err(ChatStoreError::Io(IoError::Unexpected { .. }))
+        ));
     };
-    let mut write = turn_op(4, "x");
-    write.start();
-    write.step(started());
-    assert_eq!(write.step(error()).len(), 1);
-    assert!(write.is_complete());
+    let mut operation = head_op(None);
+    operation.first().unwrap();
+    unexpected(operation.next(IoResult::Done));
+    let mut operation = turn_op(4, "x");
+    operation.first().unwrap();
+    operation.next(head_value(Some(&head(CHAT, 4, 9)))).unwrap();
+    unexpected(operation.next(head_value(None)));
+}
+
+#[test]
+fn conflict_is_storage() {
+    // A lost conflict keeps the storage error the api maps to 409, and counts as a conflict.
+    let error = ChatStoreError::from(IoError::Conflict);
     assert_eq!(
-        write.finalize().unwrap_err(),
+        error,
         ChatStoreError::Storage(StorageError::TransactionConflict)
     );
-
-    let mut rename = head_op(None);
-    rename.start();
-    rename.step(started());
-    assert_eq!(rename.step(error()).len(), 1);
-    assert!(rename.finalize().is_err());
-
-    let mut delete = delete_op();
-    delete.start();
-    delete.step(started());
-    assert_eq!(delete.step(error()).len(), 1);
-    assert!(delete.finalize().is_err());
-
-    let mut list = ListChatOperation::new(user());
-    list.start();
-    assert!(list.step(error()).is_empty());
-    assert!(list.finalize().is_err());
-
-    let mut read = read_op(None);
-    read.start();
-    assert!(read.step(error()).is_empty());
-    assert_eq!(
-        read.finalize().unwrap_err(),
-        ChatStoreError::Storage(StorageError::TransactionConflict)
-    );
+    assert!(WriteTurnOperation::is_conflict(&error));
 }
 
 #[test]
 fn rejects_corrupt_records() {
-    let corrupt = || {
-        Event::Storage(StorageEvent::ReadResult {
-            key: head_key(user(), CHAT),
-            value: Some(vec![0xff; 3].into()),
-        })
-    };
+    let corrupt = || IoResult::Values(vec![Some(vec![0xff; 3].into())]);
     let mut read = read_op(None);
-    read.start();
-    read.step(corrupt());
+    read.first().unwrap();
     assert!(matches!(
-        read.finalize().unwrap_err(),
-        ChatStoreError::Conversion(_)
+        read.next(corrupt()),
+        Err(ChatStoreError::Conversion(_))
     ));
 
     let mut write = turn_op(0, "x");
-    write.start();
-    write.step(started());
-    assert_eq!(write.step(corrupt()).len(), 1);
+    write.first().unwrap();
     assert!(matches!(
-        write.finalize().unwrap_err(),
-        ChatStoreError::Conversion(_)
+        write.next(corrupt()),
+        Err(ChatStoreError::Conversion(_))
     ));
 
     let mut list = ListChatOperation::new(user());
-    list.start();
-    list.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![(head_key(user(), CHAT), vec![0xff; 3].into())],
-        next_start_after: None,
-    }));
+    list.first().unwrap();
+    let rows = vec![(head_key(user(), CHAT), vec![0xff; 3].into())];
     assert!(matches!(
-        list.finalize().unwrap_err(),
-        ChatStoreError::Conversion(_)
+        list.next(IoResult::Page { rows, next: None }),
+        Err(ChatStoreError::Conversion(_))
     ));
-}
-
-#[test]
-fn finalize_needs_completion() {
-    let mut operation = turn_op(0, "x");
-    assert!(!operation.is_complete());
-    // A step before start behaves like start.
-    assert_eq!(operation.step(head_read(None)).len(), 1);
-    assert!(operation.abort().is_empty());
-    assert_eq!(
-        operation.finalize().unwrap_err(),
-        ChatStoreError::NotFinished
-    );
-    assert_eq!(
-        ListChatOperation::new(user()).finalize().unwrap_err(),
-        ChatStoreError::NotFinished
-    );
-    assert_eq!(
-        read_op(None).finalize().unwrap_err(),
-        ChatStoreError::NotFinished
-    );
-    assert_eq!(
-        head_op(None).finalize().unwrap_err(),
-        ChatStoreError::NotFinished
-    );
-    assert_eq!(
-        delete_op().finalize().unwrap_err(),
-        ChatStoreError::NotFinished
-    );
 }

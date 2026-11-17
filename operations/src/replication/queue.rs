@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::IoError;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -45,6 +46,17 @@ pub enum BlobQueueError {
     UnexpectedEvent(String),
     #[error("a parked copy job could not wake: {0}")]
     Wake(String),
+    #[error("blob replication queue I/O failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for BlobQueueError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 pub fn schedule_blob_drain() -> Effect {

@@ -2,11 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use aruna_core::errors::StorageError;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
-use aruna_core::types::Key;
 use ulid::Ulid;
 
 use super::*;
@@ -45,34 +44,26 @@ fn policy(seed: u8) -> VerifiedPolicy {
     VerifiedPolicy::verify(policy).expect("policy verifies")
 }
 
-fn read(value: Option<Value>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value,
-    })
+fn values(value: Option<Value>) -> IoResult {
+    IoResult::Values(vec![value])
 }
 
-fn config_read() -> Effect {
-    read_effect(
-        &DocumentTarget::RealmConfig {
-            realm_id: realm_id(),
-        },
-        None,
-    )
+fn config_read() -> Next<PolicyAnswer> {
+    let config = DocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    };
+    Next::Call(IoCall::Read(vec![read_row(&config)]))
 }
 
-fn policy_read(policy: &VerifiedPolicy) -> Effect {
+fn policy_read(policy: &VerifiedPolicy) -> Next<PolicyAnswer> {
     let target = placement_policy_target(policy.policy_ref().policy_id);
-    Effect::Storage(StorageEffect::Read {
-        key_space: target.storage_keyspace().to_string(),
-        key: target.storage_key(),
-        txn_id: None,
-    })
+    let row = (target.storage_keyspace().to_string(), target.storage_key());
+    Next::Call(IoCall::Read(vec![row]))
 }
 
-fn stored_config() -> Event {
+fn stored_config() -> IoResult {
     let (config, _) = realm_view(&config(), admin_user(realm_id()));
-    read(Some(config))
+    values(Some(config))
 }
 
 #[test]
@@ -82,15 +73,10 @@ fn serves_stored_policy() {
     let document = signed_document(realm_id(), &policy, 1);
     let row = Value::from(document.to_bytes().unwrap());
     let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy.policy_ref());
-    check_trace(
-        &mut operation,
-        &[config_read()],
-        vec![
-            (stored_config(), vec![policy_read(&policy)]),
-            (read(Some(row)), vec![]),
-        ],
-    );
-    assert_eq!(operation.finalize(), Ok(Ok(Some(Box::new(document)))));
+    assert_eq!(operation.first(), Ok(config_read()));
+    assert_eq!(operation.next(stored_config()), Ok(policy_read(&policy)));
+    let answer = operation.next(values(Some(row)));
+    assert_eq!(answer, Ok(Next::Done(Ok(Some(Box::new(document))))));
 }
 
 #[test]
@@ -98,12 +84,9 @@ fn refuses_device_peer() {
     // A user device never gets a policy, and no policy row is read for it.
     let policy = policy(8);
     let mut operation = ServePolicyOperation::new(realm_id(), node(2), policy.policy_ref());
-    check_trace(
-        &mut operation,
-        &[config_read()],
-        vec![(stored_config(), vec![])],
-    );
-    assert_eq!(operation.finalize(), Ok(Err(MetadataReadError::Forbidden)));
+    operation.first().unwrap();
+    let answer = operation.next(stored_config());
+    assert_eq!(answer, Ok(Next::Done(Err(MetadataReadError::Forbidden))));
 }
 
 #[test]
@@ -115,61 +98,34 @@ fn other_rows_none() {
     for row in [None, Some(other), Some(foreign)] {
         let row = row.map(|document| Value::from(document.to_bytes().unwrap()));
         let mut operation = ServePolicyOperation::new(realm_id(), node(1), asked.policy_ref());
-        operation.start();
-        operation.step(stored_config());
-        operation.step(read(row));
-        assert_eq!(operation.finalize(), Ok(Ok(None)));
+        operation.first().unwrap();
+        operation.next(stored_config()).unwrap();
+        assert_eq!(operation.next(values(row)), Ok(Next::Done(Ok(None))));
     }
 }
 
 #[test]
 fn read_failures_unavailable() {
-    // A missing config, a storage error and an undecodable row answer unavailable.
+    // A missing config, an undecodable row, a wrong answer or a runner failure is unavailable.
     let policy = policy(8);
-    let error = || {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        })
-    };
+    let unavailable = Ok(Next::Done(Err(MetadataReadError::Unavailable)));
     let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy.policy_ref());
-    operation.start();
-    operation.step(read(None));
+    operation.first().unwrap();
+    assert_eq!(operation.next(values(None)), unavailable);
+    let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy.policy_ref());
+    operation.first().unwrap();
+    operation.next(stored_config()).unwrap();
     assert_eq!(
-        operation.finalize(),
-        Ok(Err(MetadataReadError::Unavailable))
+        operation.next(values(Some(Value::from(vec![0xff; 4])))),
+        unavailable
     );
     let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy.policy_ref());
-    operation.start();
-    operation.step(error());
+    operation.first().unwrap();
     assert_eq!(
-        operation.finalize(),
-        Ok(Err(MetadataReadError::Unavailable))
+        operation.next(IoResult::Done),
+        Err(MetadataReadError::Unavailable)
     );
-    let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy.policy_ref());
-    operation.start();
-    operation.step(stored_config());
-    operation.step(read(Some(Value::from(vec![0xff; 4]))));
-    assert_eq!(
-        operation.finalize(),
-        Ok(Err(MetadataReadError::Unavailable))
-    );
-}
-
-#[test]
-fn rejects_unexpected_events() {
-    // Before start every event fails the operation, without effects.
-    let make = || ServePolicyOperation::new(realm_id(), node(1), policy(8).policy_ref());
-    for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(error, MetadataReadError::Unavailable, "{label}");
-    }
-}
-
-#[test]
-fn abort_and_finalize() {
-    // Serving only reads: abort has nothing to clean up, and an early finalize fails.
-    let mut operation = ServePolicyOperation::new(realm_id(), node(1), policy(8).policy_ref());
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
+    let error = MetadataReadError::from(IoError::Storage(StorageError::Timeout));
+    assert_eq!(error, MetadataReadError::Unavailable);
+    assert!(!ServePolicyOperation::is_conflict(&error));
 }

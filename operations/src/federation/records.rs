@@ -3,21 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{decode, done, encode, encoded_row, read_row, values};
 use aruna_core::structs::execution::job::{
     JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
 };
 use aruna_core::transfer::{ExportGrant, ImportIntent};
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -82,41 +80,29 @@ pub(crate) enum RecordOutcome {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum RecordError {
-    #[error("transfer record storage failed: {0}")]
-    Storage(String),
+    #[error(transparent)]
+    Io(#[from] IoError),
     #[error("transfer record is invalid: {0}")]
     Invalid(String),
-    #[error("unexpected transfer record event")]
-    Unexpected,
-    #[error("transfer record change lost a transaction conflict")]
-    Conflict,
 }
 
 #[derive(Debug, PartialEq)]
-enum State {
-    Start,
+enum Phase {
     Read,
     Job,
     Write,
-    Commit,
-    Finish,
 }
 
+type Turn = Result<Next<RecordOutcome>, RecordError>;
+
+/// Changes one transfer record in the runner's write transaction; a lost conflict reruns it.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RecordOperation {
     change: RecordChange,
-    state: State,
-    txn_id: Option<TxnId>,
+    phase: Phase,
     /// The bound upload this attempt confirmed stale, with the writes that retire it.
     confirmed: Option<(Ulid, Writes)>,
     pending: Option<RecordOutcome>,
-    output: Option<Result<RecordOutcome, RecordError>>,
-}
-
-fn encode<T: serde::Serialize>(value: &T) -> Result<Value, RecordError> {
-    postcard::to_allocvec(value)
-        .map(Value::from)
-        .map_err(|error| RecordError::Invalid(error.to_string()))
 }
 
 fn entry(key: &[u8], value: Value) -> (String, Key, Value) {
@@ -127,26 +113,14 @@ impl RecordOperation {
     pub fn new(change: RecordChange) -> Self {
         Self {
             change,
-            state: State::Start,
-            txn_id: None,
+            phase: Phase::Read,
             confirmed: None,
             pending: None,
-            output: None,
         }
-    }
-
-    fn fail(&mut self, error: RecordError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Finish;
-        self.abort()
     }
 
     /// The writes and outcome for the stored value of the key.
     fn decide(&self, stored: Option<&[u8]>) -> Result<(Writes, RecordOutcome), RecordError> {
-        let decode = |bytes: &[u8]| {
-            postcard::from_bytes::<GrantRecord>(bytes)
-                .map_err(|error| RecordError::Invalid(error.to_string()))
-        };
         Ok(match (&self.change, stored) {
             (RecordChange::StoreGrant { .. }, Some(bytes)) => {
                 (Vec::new(), RecordOutcome::Grant(decode(bytes)?))
@@ -156,7 +130,7 @@ impl RecordOperation {
                 RecordOutcome::Grant(record.clone()),
             ),
             (RecordChange::RevokeGrant { key }, Some(bytes)) => {
-                let mut record = decode(bytes)?;
+                let mut record: GrantRecord = decode(bytes)?;
                 record.revoked = true;
                 (
                     vec![entry(key, encode(&record)?)],
@@ -197,8 +171,7 @@ impl RecordOperation {
                 }
             }
             (RecordChange::ConsumeConfirmation { record_key }, Some(bytes)) => {
-                let mut record = postcard::from_bytes::<ImportRecord>(bytes)
-                    .map_err(|error| RecordError::Invalid(error.to_string()))?;
+                let mut record: ImportRecord = decode(bytes)?;
                 if !record.confirmed {
                     return Ok((Vec::new(), RecordOutcome::Confirmed(false)));
                 }
@@ -220,48 +193,31 @@ impl RecordOperation {
     }
 
     /// Decides the change for the stored value of the key and writes it.
-    fn apply(&mut self, stored: Option<&[u8]>) -> Effects {
-        let (writes, outcome) = match self.decide(stored) {
-            Ok(decision) => decision,
-            Err(error) => return self.fail(error),
-        };
-        self.pending = Some(outcome);
+    fn apply(&mut self, stored: Option<&[u8]>) -> Turn {
+        let (writes, outcome) = self.decide(stored)?;
         if writes.is_empty() {
-            return self.commit();
+            return Ok(Next::Done(outcome));
         }
-        self.state = State::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        self.pending = Some(outcome);
+        self.phase = Phase::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     /// Checks the bound stale upload again from the reads of this transaction.
-    fn check_stale(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
-        let (Some(stale), Ok([(_, binding), (_, upload), (_, dedup)])) =
-            (self.stale(), <[(Key, Option<Value>); 3]>::try_from(values))
-        else {
-            return self.fail(RecordError::Unexpected);
-        };
+    fn check_stale(&mut self, stale: &StaleUpload, result: IoResult) -> Turn {
+        let [binding, upload, dedup] = values::<3>(result)?;
         if binding.as_deref() != Some(stale.upload_id.to_bytes().as_slice()) {
             return self.apply(binding.as_deref());
         }
         if let Some(upload) = upload {
-            return match postcard::from_bytes(upload.as_ref()) {
-                Ok(upload) => self.confirm(&stale, Some(upload), false),
-                Err(error) => self.fail(RecordError::Invalid(error.to_string())),
-            };
+            return self.confirm(stale, Some(decode(&upload)?), false);
         }
         match dedup.and_then(|value| parse_dedup_value(value.as_ref()).ok()) {
             Some((job_id, _)) => {
-                self.state = State::Job;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: JOB_KEYSPACE.to_string(),
-                    key: job_record_key(job_id),
-                    txn_id: self.txn_id,
-                })]
+                self.phase = Phase::Job;
+                Ok(Next::Call(read_row(JOB_KEYSPACE, job_record_key(job_id))))
             }
-            None => self.confirm(&stale, None, false),
+            None => self.confirm(stale, None, false),
         }
     }
 
@@ -271,132 +227,71 @@ impl RecordOperation {
         stale: &StaleUpload,
         upload: Option<RoCrateUploadRecord>,
         job_held: bool,
-    ) -> Effects {
+    ) -> Turn {
         if upload_stale(upload.as_ref(), job_held, stale.now_ms) {
             let mut retire = Vec::new();
             // Pinning the expiry makes a racing claim conflict on commit, then refuse the upload.
             if let Some(mut upload) = upload {
                 upload.expires_at_ms = 0;
-                match encode(&upload) {
-                    Ok(value) => retire.push((
-                        ROCRATE_UPLOAD_KEYSPACE.to_string(),
-                        upload_key(stale.upload_id),
-                        value,
-                    )),
-                    Err(error) => return self.fail(error),
-                }
+                let key = upload_key(stale.upload_id);
+                retire.push(encoded_row(ROCRATE_UPLOAD_KEYSPACE, key, &upload)?);
             }
             self.confirmed = Some((stale.upload_id, retire));
         }
         self.apply(Some(stale.upload_id.to_bytes().as_slice()))
     }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RecordError::Unexpected);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
 }
 
-impl EffectOperation for RecordOperation {
+impl Operation for RecordOperation {
     type Output = RecordOutcome;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Start;
-        self.confirmed = None;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Turn {
+        let key = (FEDERATION_KEYSPACE.to_string(), self.change.key().to_vec().into());
+        // A stale upload is read in this transaction, so a racing claim conflicts.
+        let reads = match self.stale() {
+            Some(stale) => vec![
+                key,
+                (
+                    ROCRATE_UPLOAD_KEYSPACE.to_string(),
+                    upload_key(stale.upload_id),
+                ),
+                (DEDUP_INDEX_KEYSPACE.to_string(), stale.dedup_key.into()),
+            ],
+            None => vec![key],
+        };
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                let key: Key = self.change.key().to_vec().into();
-                // A stale upload is read in this transaction, so a racing claim conflicts.
-                if let Some(stale) = self.stale() {
-                    let reads = vec![
-                        (FEDERATION_KEYSPACE.to_string(), key),
-                        (
-                            ROCRATE_UPLOAD_KEYSPACE.to_string(),
-                            upload_key(stale.upload_id),
-                        ),
-                        (DEDUP_INDEX_KEYSPACE.to_string(), stale.dedup_key.into()),
-                    ];
-                    return smallvec![Effect::Storage(StorageEffect::BatchRead {
-                        reads,
-                        txn_id: Some(txn_id),
-                    })];
-                }
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: FEDERATION_KEYSPACE.to_string(),
-                    key,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.apply(value.as_deref())
-            }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.check_stale(values)
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (&self.phase, self.stale()) {
+            (Phase::Read, Some(stale)) => self.check_stale(&stale, result),
+            (Phase::Read, None) => {
+                let [stored] = values::<1>(result)?;
+                self.apply(stored.as_deref())
             }
             // The stale upload is gone; it stays bound while an import job holds the key.
-            (State::Job, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let held = value.is_some_and(|value| JobRecord::from_bytes(value.as_ref()).is_ok());
-                match self.stale() {
-                    Some(stale) => self.confirm(&stale, None, held),
-                    None => self.fail(RecordError::Unexpected),
-                }
+            (Phase::Job, Some(stale)) => {
+                let [job] = values::<1>(result)?;
+                let held = job.is_some_and(|value| JobRecord::from_bytes(value.as_ref()).is_ok());
+                self.confirm(&stale, None, held)
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.commit(),
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = State::Finish;
-                self.output = Some(self.pending.take().ok_or(RecordError::Unexpected));
-                smallvec![]
+            (Phase::Write, _) => {
+                done(result)?;
+                let unfinished = RecordError::Io(IoError::Unfinished);
+                self.pending.take().map(Next::Done).ok_or(unfinished)
             }
-            // A racing writer committed first: the runner reruns the change, which rereads.
-            (
-                State::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => {
-                self.txn_id = None;
-                self.fail(RecordError::Conflict)
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => {
-                if self.state == State::Commit {
-                    self.txn_id = None;
-                }
-                self.fail(RecordError::Storage(error.to_string()))
-            }
-            _ => self.fail(RecordError::Unexpected),
+            (Phase::Job, None) => Err(IoError::Unfinished.into()),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn finalize(self) -> Result<RecordOutcome, RecordError> {
-        self.output.unwrap_or(Err(RecordError::Unexpected))
-    }
-
-    fn is_conflict(error: &RecordError) -> bool {
-        *error == RecordError::Conflict
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map(|txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })])
-            .unwrap_or_default()
+    /// Six attempts in all, as the change's own retry had.
+    fn conflict_retries() -> u32 {
+        5
     }
 }
 
@@ -449,23 +344,8 @@ mod tests {
         }
     }
 
-    fn started(txn: u8) -> Event {
-        Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([txn; 16]),
-        })
-    }
-
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Value::from),
-        })
-    }
-
-    fn committed(txn: u8) -> Event {
-        Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([txn; 16]),
-        })
+    fn stored(rows: Vec<Option<Vec<u8>>>) -> IoResult {
+        IoResult::Values(rows.into_iter().map(|row| row.map(Value::from)).collect())
     }
 
     #[test]
@@ -477,41 +357,27 @@ mod tests {
             record: record.clone(),
         };
         let mut operation = RecordOperation::new(change.clone());
-        operation.start();
-        operation.step(started(1));
-        let effects = operation.step(read(None));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::BatchWrite { .. })
-        ));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let conflict = StorageError::TransactionConflict;
-        assert!(
-            operation
-                .step(Event::Storage(StorageEvent::Error { error: conflict }))
-                .is_empty()
+        let read = vec![(FEDERATION_KEYSPACE.to_string(), b"grant".to_vec().into())];
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+        assert!(wrote(&operation.next(stored(vec![None]))).is_some());
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Done(RecordOutcome::Grant(record.clone())))
         );
-        let error = operation.finalize().unwrap_err();
-        assert!(RecordOperation::is_conflict(&error));
-        // The runner's retry runs a fresh change, which rereads the record.
+        // The runner reruns a lost commit as a fresh change, which rereads the record.
+        assert!(RecordOperation::is_conflict(&IoError::Conflict.into()));
+        assert_eq!(RecordOperation::conflict_retries(), 5);
         let mut operation = RecordOperation::new(change);
-        operation.start();
-        operation.step(started(2));
+        operation.first().unwrap();
         let revoked = GrantRecord {
             revoked: true,
             ..record
         };
-        let stored = postcard::to_allocvec(&revoked).unwrap();
-        let effects = operation.step(read(Some(stored)));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::CommitTransaction { .. })
-        ));
-        operation.step(committed(2));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(RecordOutcome::Grant(revoked)));
+        let row = postcard::to_allocvec(&revoked).unwrap();
+        assert_eq!(
+            operation.next(stored(vec![Some(row)])),
+            Ok(Next::Done(RecordOutcome::Grant(revoked)))
+        );
     }
 
     /// Binds upload `[2; 16]` to the import key, replacing a still stale `stale` upload.
@@ -560,23 +426,17 @@ mod tests {
     }
 
     /// The rows a stale binding check reads; with `job`, the dedup row names job `[7; 16]`.
-    fn checked(binding: Ulid, upload: Option<&RoCrateUploadRecord>, job: bool) -> Event {
+    fn checked(binding: Ulid, upload: Option<&RoCrateUploadRecord>, job: bool) -> IoResult {
         let upload = upload.map(|upload| postcard::to_allocvec(upload).unwrap());
         let job_id = aruna_core::structs::execution::job::JobId::from_bytes([7; 16]);
         let dedup =
             job.then(|| aruna_core::structs::execution::job::encode_dedup_value(job_id, [0; 32]));
-        let values = [Some(binding.to_bytes().to_vec()), upload, dedup];
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: values
-                .into_iter()
-                .map(|value| (Vec::new().into(), value.map(Value::from)))
-                .collect(),
-        })
+        stored(vec![Some(binding.to_bytes().to_vec()), upload, dedup])
     }
 
-    fn wrote(effects: &Effects) -> Option<Writes> {
-        match effects.first() {
-            Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => Some(writes.clone()),
+    fn wrote(turn: &Turn) -> Option<Writes> {
+        match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => Some(writes.clone()),
             _ => None,
         }
     }
@@ -586,34 +446,26 @@ mod tests {
         // Another upload already bound to the key is kept and nothing is written.
         let winner = Ulid::from_bytes([1; 16]);
         let mut operation = RecordOperation::new(binding(None));
-        operation.start();
-        operation.step(started(1));
-        let effects = operation.step(read(Some(winner.to_bytes().to_vec())));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::CommitTransaction { .. })
-        ));
-        operation.step(committed(1));
-        assert_eq!(operation.finalize(), Ok(RecordOutcome::Bound(winner)));
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(stored(vec![Some(winner.to_bytes().to_vec())])),
+            Ok(Next::Done(RecordOutcome::Bound(winner)))
+        );
         // A stale upload gives way in the same transaction; a newer binding is kept.
-        let replace = |stored: Ulid| {
+        let replace = |bound: Ulid| {
             let mut operation = RecordOperation::new(binding(stale(winner)));
-            operation.start();
-            operation.step(started(2));
-            let effects = operation.step(checked(stored, None, false));
-            let wrote = wrote(&effects).is_some();
-            if wrote {
-                operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }));
+            operation.first().unwrap();
+            let turn = operation.next(checked(bound, None, false));
+            match wrote(&turn) {
+                Some(_) => (true, operation.next(IoResult::Done)),
+                None => (false, turn),
             }
-            operation.step(committed(2));
-            (wrote, operation.finalize())
         };
         let replaced = Ulid::from_bytes([2; 16]);
-        assert_eq!(replace(winner), (true, Ok(RecordOutcome::Bound(replaced))));
+        let bound = |upload| -> Turn { Ok(Next::Done(RecordOutcome::Bound(upload))) };
+        assert_eq!(replace(winner), (true, bound(replaced)));
         let newer = Ulid::from_bytes([3; 16]);
-        assert_eq!(replace(newer), (false, Ok(RecordOutcome::Bound(newer))));
+        assert_eq!(replace(newer), (false, bound(newer)));
     }
 
     #[test]
@@ -624,30 +476,19 @@ mod tests {
         let owner = grant_record().principal;
         let mut upload = crate::jobs::import::upload::tests::upload_record(owner, old, 10);
         let mut operation = RecordOperation::new(binding(stale(old)));
-        operation.start();
-        operation.step(started(1));
-        let writes = wrote(&operation.step(checked(old, Some(&upload), false))).unwrap();
+        operation.first().unwrap();
+        let writes = wrote(&operation.next(checked(old, Some(&upload), false))).unwrap();
         let retired: RoCrateUploadRecord = postcard::from_bytes(&writes[2].2).unwrap();
         assert_eq!((writes.len(), retired.expires_at_ms), (3, 0));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let conflict = StorageError::TransactionConflict;
-        operation.step(Event::Storage(StorageEvent::Error { error: conflict }));
-        assert_eq!(operation.finalize(), Err(RecordError::Conflict));
         let mut operation = RecordOperation::new(binding(stale(old)));
-        operation.start();
-        operation.step(started(2));
+        operation.first().unwrap();
         upload.claimed_by = Some(aruna_core::structs::execution::job::JobId::from_bytes(
             [7; 16],
         ));
-        let effects = operation.step(checked(old, Some(&upload), false));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::CommitTransaction { .. })
-        ));
-        operation.step(committed(2));
-        assert_eq!(operation.finalize(), Ok(RecordOutcome::Bound(old)));
+        assert_eq!(
+            operation.next(checked(old, Some(&upload), false)),
+            Ok(Next::Done(RecordOutcome::Bound(old)))
+        );
     }
 
     #[test]
@@ -674,17 +515,13 @@ mod tests {
             None,
         );
         let job = job.to_bytes().unwrap();
-        for (stored, kept) in [(Some(job), true), (None, false)] {
+        for (row, kept) in [(Some(job), true), (None, false)] {
             let mut operation = RecordOperation::new(binding(stale(old)));
-            operation.start();
-            operation.step(started(1));
-            let effects = operation.step(checked(old, None, true));
-            assert!(matches!(
-                &effects[0],
-                Effect::Storage(StorageEffect::Read { key_space, .. }) if key_space == JOB_KEYSPACE
-            ));
-            let effects = operation.step(read(stored));
-            assert_eq!(wrote(&effects).is_none(), kept);
+            operation.first().unwrap();
+            let read = read_row(JOB_KEYSPACE, job_record_key(JobId::from_bytes([7; 16])));
+            assert_eq!(operation.next(checked(old, None, true)), Ok(Next::Call(read)));
+            let turn = operation.next(stored(vec![row]));
+            assert_eq!(wrote(&turn).is_none(), kept);
         }
     }
 }

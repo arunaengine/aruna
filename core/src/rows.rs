@@ -24,6 +24,36 @@ pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Value>; N], Io
     }
 }
 
+/// The value of a one-row read; a missing row is `None`.
+pub fn value(result: IoResult) -> Result<Option<Value>, IoError> {
+    let [value] = values::<1>(result)?;
+    Ok(value)
+}
+
+/// The values of a read of any number of rows, in the order they were asked for.
+pub fn all_values(result: IoResult) -> Result<Vec<Option<Value>>, IoError> {
+    match result {
+        IoResult::Values(values) => Ok(values),
+        other => Err(unexpected("IoResult::Values", &other)),
+    }
+}
+
+/// The rows of one page and the key to continue after.
+pub fn page(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+    match result {
+        IoResult::Page { rows, next } => Ok((rows, next)),
+        other => Err(unexpected("IoResult::Page", &other)),
+    }
+}
+
+/// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
+pub fn event(result: IoResult) -> Result<crate::events::Event, IoError> {
+    match result {
+        IoResult::Event(event) => Ok(*event),
+        other => Err(unexpected("IoResult::Event", &other)),
+    }
+}
+
 /// The decoded value of a one-row read; a missing row is `None`.
 pub fn decoded<T: DeserializeOwned>(result: IoResult) -> Result<Option<T>, IoError> {
     let [value] = values::<1>(result)?;
@@ -92,9 +122,7 @@ impl PrefixPages {
 
     /// The rows of the page that answered [`Self::call`].
     pub fn take(&mut self, result: IoResult) -> Result<Vec<(Key, Value)>, IoError> {
-        let IoResult::Page { rows, next } = result else {
-            return Err(unexpected("IoResult::Page", &result));
-        };
+        let (rows, next) = page(result)?;
         self.done = next.is_none();
         self.after = next;
         Ok(rows)

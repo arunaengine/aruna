@@ -2,32 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{
     CONNECTOR_INDEX_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, LINK_CONNECTOR_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::operation::Operation;
+use aruna_core::rows;
+use aruna_core::structs::execution::harvest::RepositoryConnector;
+use aruna_core::types::GroupId;
 use byteview::ByteView;
-use smallvec::smallvec;
 use ulid::Ulid;
 
-use crate::harvest::repository::{
-    connector_key, connector_secret_key, parse_connector_read, read_connector_effect,
-};
+use crate::harvest::repository::{connector_key, connector_secret_key};
 use crate::harvest::update_connector::UpdateConnectorError;
 
+/// The call a delete waits for.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
-    ReadRecord,
-    ReadLinks,
+enum Stage {
+    Record,
+    Links,
     Delete,
-    Commit,
-    Aborting,
-    Finish,
 }
 
 /// Removes a connector and its secret together unless a link uses it; a second delete is not found.
@@ -35,9 +29,7 @@ enum State {
 pub struct DeleteRepositoryOperation {
     group_id: GroupId,
     connector_id: Ulid,
-    state: State,
-    txn_id: Option<TxnId>,
-    output: Option<Result<(), UpdateConnectorError>>,
+    stage: Stage,
 }
 
 impl DeleteRepositoryOperation {
@@ -45,117 +37,61 @@ impl DeleteRepositoryOperation {
         Self {
             group_id,
             connector_id,
-            state: State::Init,
-            txn_id: None,
-            output: None,
+            stage: Stage::Record,
         }
-    }
-
-    fn fail(&mut self, error: UpdateConnectorError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
     }
 }
 
-impl EffectOperation for DeleteRepositoryOperation {
+impl Operation for DeleteRepositoryOperation {
     type Output = ();
     type Error = UpdateConnectorError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<()>, UpdateConnectorError> {
+        Ok(Next::Call(rows::read_row(
+            CONNECTOR_INDEX_KEYSPACE,
+            connector_key(self.group_id, self.connector_id),
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Aborting {
-            self.state = State::Finish;
-            return smallvec![];
-        }
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::ReadRecord;
-                smallvec![read_connector_effect(
-                    self.group_id,
-                    self.connector_id,
-                    Some(txn_id)
-                )]
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, UpdateConnectorError> {
+        match self.stage {
+            Stage::Record => {
+                let record = rows::value(result)?.ok_or(UpdateConnectorError::NotFound)?;
+                RepositoryConnector::from_bytes(&record)
+                    .map_err(|_| UpdateConnectorError::Unexpected)?;
+                self.stage = Stage::Links;
+                Ok(Next::Call(IoCall::Page {
+                    space: LINK_CONNECTOR_KEYSPACE.to_string(),
+                    prefix: ByteView::from(self.connector_id.to_bytes().to_vec()),
+                    after: None,
+                    limit: 1,
+                }))
             }
-            (State::ReadRecord, event) => match parse_connector_read(event) {
-                Ok(Some(_)) => {
-                    self.state = State::ReadLinks;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: LINK_CONNECTOR_KEYSPACE.to_string(),
-                        prefix: Some(ByteView::from(self.connector_id.to_bytes().to_vec())),
-                        start: None,
-                        limit: 1,
-                        txn_id: self.txn_id,
-                    })]
+            Stage::Links => {
+                if !rows::page(result)?.0.is_empty() {
+                    return Err(UpdateConnectorError::InUse);
                 }
-                Ok(None) => self.fail(UpdateConnectorError::NotFound),
-                Err(_) => self.fail(UpdateConnectorError::Unexpected),
-            },
-            (State::ReadLinks, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                if !values.is_empty() {
-                    return self.fail(UpdateConnectorError::InUse);
-                }
-                self.state = State::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![
-                        (
-                            CONNECTOR_INDEX_KEYSPACE.to_string(),
-                            connector_key(self.group_id, self.connector_id),
-                        ),
-                        (
-                            CONNECTOR_SECRET_KEYSPACE.to_string(),
-                            connector_secret_key(self.connector_id),
-                        ),
-                    ],
-                    txn_id: self.txn_id,
-                })]
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(vec![
+                    (
+                        CONNECTOR_INDEX_KEYSPACE.to_string(),
+                        connector_key(self.group_id, self.connector_id),
+                    ),
+                    (
+                        CONNECTOR_SECRET_KEYSPACE.to_string(),
+                        connector_secret_key(self.connector_id),
+                    ),
+                ])))
             }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = State::Commit;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.fail(UpdateConnectorError::Unexpected),
-                }
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = State::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            _ => self.fail(UpdateConnectorError::Unexpected),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(UpdateConnectorError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) if self.state != State::Commit => {
-                self.state = State::Aborting;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => {
-                self.state = State::Finish;
-                smallvec![]
+            Stage::Delete => {
+                rows::done(result)?;
+                Ok(Next::Done(()))
             }
         }
+    }
+
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
@@ -165,6 +101,8 @@ mod tests {
     use crate::driver::drive;
     use crate::harvest::read_connector::ListRepositoryOperation;
     use crate::harvest::update_connector::tests::{context, create};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
 
     #[tokio::test]
     async fn delete_scoped_group() {

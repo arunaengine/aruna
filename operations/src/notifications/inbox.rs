@@ -5,26 +5,26 @@
 use std::collections::BTreeMap;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
+    InboxWriteOutcome, NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
     notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
 };
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, TxnId, Value};
 use thiserror::Error;
+
+use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InboxError {
     #[error("notification inbox upsert conflicted")]
     Conflict,
-    #[error("notification inbox upsert conflicted twice")]
-    ConflictedTwice,
     #[error(transparent)]
     Storage(StorageError),
     #[error("stored notification record: {0}")]
@@ -33,32 +33,19 @@ pub enum InboxError {
     Encode(String),
     #[error("notification transient count for recipient {0} exceeds cap {TRANSIENT_USER_CAP}")]
     TransientCap(UserId),
-    #[error("unexpected event in {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
-    #[error("the notification inbox upsert did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
 }
 
-impl From<StorageError> for InboxError {
-    fn from(error: StorageError) -> Self {
+impl From<IoError> for InboxError {
+    fn from(error: IoError) -> Self {
         match error {
-            StorageError::TransactionConflict => InboxError::Conflict,
-            error => InboxError::Storage(error),
+            IoError::Conflict => InboxError::Conflict,
+            IoError::Storage(StorageError::TransactionConflict) => InboxError::Conflict,
+            IoError::Storage(error) => InboxError::Storage(error),
+            error => InboxError::Io(error),
         }
     }
-}
-
-/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
-/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
-/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InboxWriteOutcome {
-    pub written: usize,
-    pub recipients: Vec<UserId>,
-    pub purged: usize,
-    pub cutoffs: usize,
-    /// Batch records the inbox holds after the write, new or already present, never discarded.
-    pub held: Vec<NotificationRecord>,
 }
 
 /// One paged scan of a recipient's inbox: the purge it serves, or the transient count.
@@ -70,9 +57,6 @@ struct InboxScan {
 
 #[derive(Debug, Default, PartialEq)]
 enum UpsertState {
-    #[default]
-    Init,
-    Start,
     /// Reads the deletion time of each notice's bucket.
     ReadCutoffs {
         checked: Vec<usize>,
@@ -95,47 +79,20 @@ enum UpsertState {
         seen: usize,
         scan: InboxScan,
     },
+    #[default]
     WriteRows,
-    Commit,
-    Abort,
-    /// Aborts the conflicted transaction before the one more run.
-    Retry,
-    Done,
-    Failed(InboxError),
 }
 
-impl UpsertState {
-    fn name(&self) -> &'static str {
-        match self {
-            UpsertState::Init => "init",
-            UpsertState::Start => "start",
-            UpsertState::ReadCutoffs { .. } => "read cutoffs",
-            UpsertState::Purge { .. } => "purge scan",
-            UpsertState::ReadTimes { .. } => "read deletion times",
-            UpsertState::WriteTimes => "write deletion times",
-            UpsertState::DeleteRows => "delete purged rows",
-            UpsertState::ReadExisting => "read existing rows",
-            UpsertState::Count { .. } => "count transient rows",
-            UpsertState::WriteRows => "write rows",
-            UpsertState::Commit => "commit",
-            UpsertState::Abort => "abort",
-            UpsertState::Retry => "retry",
-            UpsertState::Done => "done",
-            UpsertState::Failed(_) => "failed",
-        }
-    }
-}
+type Turn = Result<Next<InboxWriteOutcome>, InboxError>;
 
 /// Idempotent holder-local upsert that skips stored keys, so a duplicate keeps a mark-read. A
-/// bucket deletion removes its bucket's notices and keeps its time to drop late ones. An upsert
-/// in its own transaction runs once more after a conflict.
+/// bucket deletion removes its bucket's notices and keeps its time to drop late ones. It runs
+/// in its own transaction, or in the caller's open one, which the caller commits and retries.
 #[derive(Debug, PartialEq)]
 pub struct UpsertInboxOperation {
     records: Vec<NotificationRecord>,
-    /// The caller's transaction; `None` when the operation opens and ends its own.
+    /// The caller's transaction; `None` when the runner opens and ends one.
     outer_txn: Option<TxnId>,
-    txn_id: Option<TxnId>,
-    retried: bool,
     state: UpsertState,
     kept: Vec<usize>,
     purges: Vec<usize>,
@@ -160,9 +117,7 @@ impl UpsertInboxOperation {
         Self {
             records,
             outer_txn,
-            txn_id: outer_txn,
-            retried: false,
-            state: UpsertState::Init,
+            state: UpsertState::default(),
             kept: Vec::new(),
             purges: Vec::new(),
             deletes: Vec::new(),
@@ -173,76 +128,34 @@ impl UpsertInboxOperation {
         }
     }
 
-    fn txn(&self) -> TxnId {
-        self.txn_id.unwrap_or_default()
-    }
-
-    fn owned_txn(&self) -> Option<TxnId> {
-        self.txn_id.filter(|_| self.outer_txn.is_none())
-    }
-
-    fn begin(&mut self) -> Effects {
-        self.kept.clear();
-        self.purges.clear();
-        self.deletes.clear();
-        self.times.clear();
-        self.writes.clear();
-        self.counts.clear();
-        self.outcome = InboxWriteOutcome::default();
-        match self.outer_txn {
-            Some(_) => self.read_cutoffs(),
-            None => {
-                self.txn_id = None;
-                self.state = UpsertState::Start;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-        }
-    }
-
-    fn fail(&mut self, error: InboxError) -> Effects {
-        if error == InboxError::Conflict && self.outer_txn.is_none() && !self.retried {
-            self.retried = true;
-            let abort = self.abort_txn();
-            if abort.is_empty() {
-                return self.begin();
-            }
-            self.state = UpsertState::Retry;
-            return abort;
-        }
-        let error = match error {
-            InboxError::Conflict if self.outer_txn.is_none() => InboxError::ConflictedTwice,
-            error => error,
+    /// The storage call, in the caller's transaction when there is one.
+    fn call(&self, call: IoCall) -> Turn {
+        let Some(txn_id) = self.outer_txn else {
+            return Ok(Next::Call(call));
         };
-        let abort = self.abort_txn();
-        self.state = UpsertState::Failed(error);
-        abort
-    }
-
-    fn abort_txn(&mut self) -> Effects {
-        match self.owned_txn() {
-            Some(txn_id) => {
-                self.txn_id = None;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
-    }
-
-    fn unexpected(&mut self, state: UpsertState, event: Event) -> Effects {
-        self.state = state;
-        let error = match event {
-            Event::Storage(StorageEvent::Error { error }) => error.into(),
-            other => InboxError::UnexpectedEvent {
-                state: self.state.name(),
-                got: format!("{other:?}"),
+        let txn_id = Some(txn_id);
+        let effect = match call {
+            IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id },
+            IoCall::Page {
+                space,
+                prefix,
+                after,
+                limit,
+            } => StorageEffect::Iter {
+                key_space: space,
+                prefix: Some(prefix),
+                start: after.map(IterStart::After),
+                limit,
+                txn_id,
             },
+            IoCall::Write(writes) => StorageEffect::BatchWrite { writes, txn_id },
+            IoCall::Delete(deletes) => StorageEffect::BatchDelete { deletes, txn_id },
+            other => return Ok(Next::Call(other)),
         };
-        self.fail(error)
+        Ok(Next::Call(IoCall::Effect(Effect::Storage(effect))))
     }
 
-    fn read_cutoffs(&mut self) -> Effects {
+    fn read_cutoffs(&mut self) -> Turn {
         let (purges, rest): (Vec<usize>, Vec<usize>) = (0..self.records.len()).partition(|&at| {
             matches!(
                 self.records[at].kind,
@@ -265,7 +178,7 @@ impl UpsertInboxOperation {
             return self.next_purge(0);
         }
         self.state = UpsertState::ReadCutoffs { checked };
-        self.batch_read(reads)
+        self.call(IoCall::Read(reads))
     }
 
     fn keep(&mut self, at: usize, cutoff: Option<u64>) {
@@ -277,24 +190,16 @@ impl UpsertInboxOperation {
         }
     }
 
-    fn batch_read(&self, reads: Vec<(KeySpace, Key)>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(self.txn()),
-        })]
-    }
-
-    fn scan(&self, scan: &InboxScan, limit: usize) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
-            prefix: Some(notification_inbox_prefix(scan.recipient)),
-            start: scan.next.clone().map(IterStart::After),
+    fn scan(&self, scan: &InboxScan, limit: usize) -> Turn {
+        self.call(IoCall::Page {
+            space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            prefix: notification_inbox_prefix(scan.recipient),
+            after: scan.next.clone(),
             limit,
-            txn_id: Some(self.txn()),
-        })]
+        })
     }
 
-    fn next_purge(&mut self, at: usize) -> Effects {
+    fn next_purge(&mut self, at: usize) -> Turn {
         let Some(&purge) = self.purges.get(at) else {
             return self.read_times();
         };
@@ -302,9 +207,9 @@ impl UpsertInboxOperation {
             recipient: self.records[purge].recipient,
             next: None,
         };
-        let effects = self.scan(&scan, TRANSIENT_USER_CAP);
+        let turn = self.scan(&scan, TRANSIENT_USER_CAP);
         self.state = UpsertState::Purge { at, scan };
-        effects
+        turn
     }
 
     fn purge_page(
@@ -313,14 +218,12 @@ impl UpsertInboxOperation {
         scan: InboxScan,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Effects {
+    ) -> Turn {
         let purge = &self.records[self.purges[at]];
         let mut removed = 0;
         for (_, value) in values {
-            let record = match NotificationRecord::from_bytes(&value) {
-                Ok(record) => record,
-                Err(error) => return self.fail(InboxError::Decode(error.to_string())),
-            };
+            let record = NotificationRecord::from_bytes(&value)
+                .map_err(|error| InboxError::Decode(error.to_string()))?;
             if purge.purges(&record) {
                 self.deletes.extend(inbox_delete_entries(&record));
                 removed += 1;
@@ -335,9 +238,9 @@ impl UpsertInboxOperation {
                 recipient: scan.recipient,
                 next: Some(next),
             };
-            let effects = self.scan(&scan, TRANSIENT_USER_CAP);
+            let turn = self.scan(&scan, TRANSIENT_USER_CAP);
             self.state = UpsertState::Purge { at, scan };
-            return effects;
+            return turn;
         }
         if let Some(key) = cutoff_key(purge) {
             let time = self.times.entry(key).or_insert(purge.created_at_ms);
@@ -346,7 +249,7 @@ impl UpsertInboxOperation {
         self.next_purge(at + 1)
     }
 
-    fn read_times(&mut self) -> Effects {
+    fn read_times(&mut self) -> Turn {
         let times: Vec<(Key, u64)> = std::mem::take(&mut self.times).into_iter().collect();
         if times.is_empty() {
             return self.delete_rows();
@@ -357,16 +260,12 @@ impl UpsertInboxOperation {
             .map(|(key, _)| (space(), key.clone()))
             .collect();
         self.state = UpsertState::ReadTimes { times };
-        self.batch_read(reads)
+        self.call(IoCall::Read(reads))
     }
 
-    fn write_times(
-        &mut self,
-        times: Vec<(Key, u64)>,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Effects {
+    fn write_times(&mut self, times: Vec<(Key, u64)>, values: Vec<Option<Value>>) -> Turn {
         let mut writes = Vec::new();
-        for ((key, time), (_, stored)) in times.into_iter().zip(values) {
+        for ((key, time), stored) in times.into_iter().zip(values) {
             if stored_time(stored.as_ref()).is_none_or(|stored| stored < time) {
                 let time = Value::from(time.to_be_bytes().to_vec());
                 writes.push((NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, time));
@@ -377,27 +276,21 @@ impl UpsertInboxOperation {
             return self.delete_rows();
         }
         self.state = UpsertState::WriteTimes;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(self.txn()),
-        })]
+        self.call(IoCall::Write(writes))
     }
 
-    fn delete_rows(&mut self) -> Effects {
+    fn delete_rows(&mut self) -> Turn {
         let deletes = std::mem::take(&mut self.deletes);
         if deletes.is_empty() {
             return self.read_existing();
         }
         self.state = UpsertState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(self.txn()),
-        })]
+        self.call(IoCall::Delete(deletes))
     }
 
-    fn read_existing(&mut self) -> Effects {
+    fn read_existing(&mut self) -> Turn {
         if self.kept.is_empty() {
-            return self.finish();
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
         }
         let reads = (self.kept.iter())
             .map(|&at| {
@@ -411,21 +304,20 @@ impl UpsertInboxOperation {
             })
             .collect();
         self.state = UpsertState::ReadExisting;
-        self.batch_read(reads)
+        self.call(IoCall::Read(reads))
     }
 
-    fn plan_writes(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn plan_writes(&mut self, values: Vec<Option<Value>>) -> Turn {
         let kept = std::mem::take(&mut self.kept);
-        for (at, (_, existing)) in kept.into_iter().zip(values) {
+        for (at, existing) in kept.into_iter().zip(values) {
             let record = &self.records[at];
             self.outcome.held.push(record.clone());
             if existing.is_some() {
                 continue;
             }
-            match inbox_write_entries(record) {
-                Ok(entries) => self.writes.extend(entries),
-                Err(error) => return self.fail(InboxError::Encode(error.to_string())),
-            }
+            let entries = inbox_write_entries(record)
+                .map_err(|error| InboxError::Encode(error.to_string()))?;
+            self.writes.extend(entries);
             self.outcome.written += 1;
             if !self.outcome.recipients.contains(&record.recipient) {
                 self.outcome.recipients.push(record.recipient);
@@ -445,7 +337,7 @@ impl UpsertInboxOperation {
         self.next_count(0)
     }
 
-    fn next_count(&mut self, at: usize) -> Effects {
+    fn next_count(&mut self, at: usize) -> Turn {
         let Some(&(recipient, _)) = self.counts.get(at) else {
             return self.write_rows();
         };
@@ -453,9 +345,9 @@ impl UpsertInboxOperation {
             recipient,
             next: None,
         };
-        let effects = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
+        let turn = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
         self.state = UpsertState::Count { at, seen: 0, scan };
-        effects
+        turn
     }
 
     fn count_page(
@@ -465,12 +357,10 @@ impl UpsertInboxOperation {
         scan: InboxScan,
         values: Vec<(Key, Value)>,
         next: Option<Key>,
-    ) -> Effects {
+    ) -> Turn {
         for (_, value) in values {
-            let record = match NotificationRecord::from_bytes(&value) {
-                Ok(record) => record,
-                Err(error) => return self.fail(InboxError::Decode(error.to_string())),
-            };
+            let record = NotificationRecord::from_bytes(&value)
+                .map_err(|error| InboxError::Decode(error.to_string()))?;
             if record.class == NotificationClass::Transient {
                 seen = seen.saturating_add(1);
                 if seen >= TRANSIENT_USER_CAP {
@@ -484,148 +374,99 @@ impl UpsertInboxOperation {
                     recipient: scan.recipient,
                     next: Some(next),
                 };
-                let effects = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
+                let turn = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
                 self.state = UpsertState::Count { at, seen, scan };
-                effects
+                turn
             }
             None => self.check_count(at, seen),
         }
     }
 
-    fn check_count(&mut self, at: usize, seen: usize) -> Effects {
+    fn check_count(&mut self, at: usize, seen: usize) -> Turn {
         let (recipient, added) = self.counts[at];
         if seen.saturating_add(added) > TRANSIENT_USER_CAP {
-            return self.fail(InboxError::TransientCap(recipient));
+            return Err(InboxError::TransientCap(recipient));
         }
         self.next_count(at + 1)
     }
 
-    fn write_rows(&mut self) -> Effects {
+    fn write_rows(&mut self) -> Turn {
         let writes = std::mem::take(&mut self.writes);
         if writes.is_empty() {
-            return self.finish();
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
         }
         self.state = UpsertState::WriteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(self.txn()),
-        })]
-    }
-
-    /// Ends the caller's run, or commits its own transaction; one that changed nothing aborts.
-    fn finish(&mut self) -> Effects {
-        let Some(txn_id) = self.owned_txn() else {
-            self.state = UpsertState::Done;
-            return smallvec![];
-        };
-        let outcome = &self.outcome;
-        if outcome.written == 0 && outcome.purged == 0 && outcome.cutoffs == 0 {
-            self.state = UpsertState::Abort;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.state = UpsertState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.call(IoCall::Write(writes))
     }
 }
 
-impl EffectOperation for UpsertInboxOperation {
+/// The plain result of a storage effect run in the caller's transaction.
+fn plain(result: IoResult) -> Result<IoResult, InboxError> {
+    let IoResult::Event(Event::Storage(event)) = result else {
+        return Ok(result);
+    };
+    match event {
+        StorageEvent::BatchReadResult { values } => Ok(IoResult::Values(
+            values.into_iter().map(|(_, value)| value).collect(),
+        )),
+        StorageEvent::IterResult {
+            values,
+            next_start_after,
+        } => Ok(IoResult::Page {
+            rows: values,
+            next: next_start_after,
+        }),
+        StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. } => {
+            Ok(IoResult::Done)
+        }
+        StorageEvent::Error { error } => Err(IoError::Storage(error).into()),
+        other => {
+            Err(unexpected("a storage result", &IoResult::Event(Event::Storage(other))).into())
+        }
+    }
+}
+
+impl Operation for UpsertInboxOperation {
     type Output = InboxWriteOutcome;
     type Error = InboxError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         if self.records.is_empty() {
-            self.state = UpsertState::Done;
-            return smallvec![];
+            return Ok(Next::Done(InboxWriteOutcome::default()));
         }
-        self.begin()
+        self.read_cutoffs()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let state = std::mem::take(&mut self.state);
-        match (state, event) {
-            (UpsertState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.read_cutoffs()
-            }
-            (
-                UpsertState::ReadCutoffs { checked },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                for (at, (_, value)) in checked.into_iter().zip(values) {
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (std::mem::take(&mut self.state), plain(result)?) {
+            (UpsertState::ReadCutoffs { checked }, IoResult::Values(values)) => {
+                for (at, value) in checked.into_iter().zip(values) {
                     self.keep(at, stored_time(value.as_ref()));
                 }
                 self.kept.sort_unstable();
                 self.next_purge(0)
             }
-            (
-                UpsertState::Purge { at, scan },
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.purge_page(at, scan, values, next_start_after),
-            (
-                UpsertState::ReadTimes { times },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.write_times(times, values),
-            (UpsertState::WriteTimes, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.delete_rows()
+            (UpsertState::Purge { at, scan }, IoResult::Page { rows, next }) => {
+                self.purge_page(at, scan, rows, next)
             }
-            (UpsertState::DeleteRows, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.read_existing()
+            (UpsertState::ReadTimes { times }, IoResult::Values(values)) => {
+                self.write_times(times, values)
             }
-            (
-                UpsertState::ReadExisting,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.plan_writes(values),
-            (
-                UpsertState::Count { at, seen, scan },
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.count_page(at, seen, scan, values, next_start_after),
-            (UpsertState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.finish()
+            (UpsertState::WriteTimes, IoResult::Done) => self.delete_rows(),
+            (UpsertState::DeleteRows, IoResult::Done) => self.read_existing(),
+            (UpsertState::ReadExisting, IoResult::Values(values)) => self.plan_writes(values),
+            (UpsertState::Count { at, seen, scan }, IoResult::Page { rows, next }) => {
+                self.count_page(at, seen, scan, rows, next)
             }
-            (UpsertState::Retry, Event::Storage(_)) => self.begin(),
-            (UpsertState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }))
-            | (
-                UpsertState::Abort,
-                Event::Storage(
-                    StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
-                ),
-            ) => {
-                self.txn_id = None;
-                self.state = UpsertState::Done;
-                smallvec![]
+            (UpsertState::WriteRows, IoResult::Done) => {
+                Ok(Next::Done(std::mem::take(&mut self.outcome)))
             }
-            // A failed commit ended the transaction already.
-            (UpsertState::Commit, Event::Storage(StorageEvent::Error { error })) => {
-                self.txn_id = None;
-                self.fail(error.into())
-            }
-            (state, event) => self.unexpected(state, event),
+            (_, other) => Err(unexpected("an inbox storage result", &other).into()),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, UpsertState::Done | UpsertState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            UpsertState::Done => Ok(self.outcome),
-            UpsertState::Failed(error) => Err(error),
-            _ => Err(InboxError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.owned_txn() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        self.outer_txn.is_none()
     }
 }
 
@@ -979,12 +820,9 @@ mod tests {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::notifications::{record, user};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     const TXN: TxnId = TxnId::from_parts(5, 5);
 
@@ -1000,166 +838,70 @@ mod state_machine_tests {
         )
     }
 
-    fn conflict() -> Event {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })
-    }
-
     #[test]
-    fn upsert_success_trace() {
+    fn upsert_success_calls() {
         let record = notice();
         let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
-        let writes = inbox_write_entries(&record).unwrap();
-        check_trace(
-            &mut upsert,
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })],
-            vec![
-                (
-                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
-                    vec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: vec![(NOTIFICATION_INBOX_KEYSPACE.to_string(), inbox_key(&record))],
-                        txn_id: Some(TXN),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchReadResult {
-                        values: vec![(inbox_key(&record), None)],
-                    }),
-                    vec![Effect::Storage(StorageEffect::BatchWrite {
-                        writes,
-                        txn_id: Some(TXN),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchWriteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: TXN,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
-                    vec![],
-                ),
-            ],
-        );
-        let outcome = upsert.finalize().unwrap();
+        assert!(upsert.transaction());
+        let space = NOTIFICATION_INBOX_KEYSPACE.to_string();
         assert_eq!(
-            (outcome.written, outcome.recipients, outcome.held),
-            (1, vec![record.recipient], vec![record])
+            upsert.first(),
+            Ok(Next::Call(IoCall::Read(vec![(space, inbox_key(&record))])))
+        );
+        let Ok(Next::Call(IoCall::Write(writes))) = upsert.next(IoResult::Values(vec![None]))
+        else {
+            panic!("one write");
+        };
+        assert_eq!(writes, inbox_write_entries(&record).unwrap());
+        let Ok(Next::Done(outcome)) = upsert.next(IoResult::Done) else {
+            panic!("done");
+        };
+        assert_eq!(
+            (outcome.written, outcome.recipients),
+            (1, vec![record.recipient])
         );
     }
 
     #[test]
-    fn redelivery_aborts() {
+    fn redelivery_writes_nothing() {
         let record = notice();
         let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
-        upsert.start();
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        let effects = upsert.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(inbox_key(&record), Some(Value::from(vec![1])))],
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TXN
-            })]
-        );
-        upsert.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TXN,
-        }));
-        let outcome = upsert.finalize().unwrap();
-        assert_eq!((outcome.written, outcome.held.len()), (0, 1));
+        upsert.first().unwrap();
+        let stored = IoResult::Values(vec![Some(Value::from(vec![1]))]);
+        let Ok(Next::Done(outcome)) = upsert.next(stored) else {
+            panic!("done");
+        };
+        assert_eq!((outcome.written, outcome.held), (0, vec![record]));
     }
 
     #[test]
-    fn conflict_runs_twice() {
-        let mut upsert = UpsertInboxOperation::new(vec![notice()]);
-        upsert.start();
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        let abort = upsert.step(conflict());
-        assert_eq!(
-            abort.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TXN
-            })]
-        );
-        let again = upsert.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TXN,
-        }));
-        assert_eq!(
-            again.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        upsert.step(conflict());
-        assert_eq!(upsert.finalize(), Err(InboxError::ConflictedTwice));
-    }
-
-    #[test]
-    fn within_reports_conflict() {
+    fn within_caller_transaction() {
         let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
+        assert!(!upsert.transaction());
         assert!(matches!(
-            upsert.start().as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { .. })]
+            upsert.first(),
+            Ok(Next::Call(IoCall::Effect(Effect::Storage(
+                StorageEffect::BatchRead {
+                    txn_id: Some(TXN),
+                    ..
+                }
+            ))))
         ));
-        assert!(upsert.step(conflict()).is_empty());
-        assert_eq!(upsert.finalize(), Err(InboxError::Conflict));
+        let conflict = Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        });
+        assert_eq!(
+            upsert.next(IoResult::Event(conflict)),
+            Err(InboxError::Conflict)
+        );
     }
 
     #[test]
     fn empty_batch_done() {
         let mut upsert = UpsertInboxOperation::new(Vec::new());
-        assert!(upsert.start().is_empty());
-        assert_eq!(upsert.finalize(), Ok(InboxWriteOutcome::default()));
-    }
-
-    #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut upsert = UpsertInboxOperation::new(vec![notice()]);
-            upsert.start();
-            upsert
-        };
-        let started = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::TransactionStarted { .. })
-            )
-        };
-        let refusals = rejects_events(make, sample_events, started);
-        assert!(!refusals.is_empty());
-    }
-
-    #[test]
-    fn abort_per_phase() {
-        let mut upsert = UpsertInboxOperation::new(vec![notice()]);
-        upsert.start();
-        check_abort(&mut upsert, &[]);
-        upsert.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        check_abort(
-            &mut upsert,
-            &[Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TXN,
-            })],
-        );
-        let mut within = UpsertInboxOperation::within(vec![notice()], TXN);
-        within.start();
-        check_abort(&mut within, &[]);
-        rejects_finalize(within);
+        assert_eq!(upsert.first(), Ok(Next::Done(InboxWriteOutcome::default())));
+        let mut other = UpsertInboxOperation::new(vec![notice()]);
+        other.first().unwrap();
+        assert!(other.next(IoResult::Woke).is_err());
     }
 }

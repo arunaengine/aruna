@@ -5,6 +5,7 @@
 
 use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
@@ -16,7 +17,8 @@ use aruna_core::link::{
     LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, fresh_local,
     link_secret,
 };
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
@@ -33,8 +35,6 @@ use crate::auth::revoke_token::{
 use crate::users::update_user::{
     AliasChange, UpdateUserError, UpdateUserInput, UpdateUserOperation,
 };
-
-/// Commit conflicts a link or unlink rereads ownership for before it gives up.
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LinkLoginError {
@@ -68,6 +68,17 @@ pub enum LinkLoginError {
     NotFinished,
     #[error("unexpected event for the link operation state")]
     UnexpectedEvent,
+}
+
+impl From<IoError> for LinkLoginError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { .. } | IoError::Codec(_) => Self::UnexpectedEvent,
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+        }
+    }
 }
 
 fn user_read(user_id: &UserId) -> (String, ByteView) {
@@ -133,25 +144,15 @@ pub struct ConfirmLinkConfig {
 #[derive(Debug, PartialEq)]
 pub struct ConfirmLinkOperation {
     config: ConfirmLinkConfig,
-    /// The read of `start` is out and unanswered.
-    reading: bool,
-    output: Option<Result<Signed<LinkConfirmation>, LinkLoginError>>,
 }
 
 impl ConfirmLinkOperation {
     pub fn new(config: ConfirmLinkConfig) -> Self {
-        Self {
-            config,
-            reading: false,
-            output: None,
-        }
+        Self { config }
     }
 
-    fn sign(&self, event: Event) -> Result<Signed<LinkConfirmation>, LinkLoginError> {
-        let values = batch_values(event)?;
-        let [user, realm] = values.as_slice() else {
-            return Err(LinkLoginError::NotFinished);
-        };
+    fn sign(&self, result: IoResult) -> Result<Signed<LinkConfirmation>, LinkLoginError> {
+        let [user, realm] = values::<2>(result)?;
         usable_account(user.as_ref())?;
         let settings = read_config(realm.as_ref())?
             .federation
@@ -180,44 +181,22 @@ impl ConfirmLinkOperation {
     }
 }
 
-impl EffectOperation for ConfirmLinkOperation {
+impl Operation for ConfirmLinkOperation {
     type Output = Signed<LinkConfirmation>;
     type Error = LinkLoginError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Self::Output>, LinkLoginError> {
         let config = &self.config;
         if !fresh_local(&config.auth_context, config.auth_time, config.now) {
-            self.output = Some(Err(LinkLoginError::LocalRefused));
-            return smallvec![];
+            return Err(LinkLoginError::LocalRefused);
         }
         let auth = &config.auth_context;
-        self.reading = true;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![user_read(&auth.user_id), config_read(auth)],
-            txn_id: None,
-        })]
+        let reads = vec![user_read(&auth.user_id), config_read(auth)];
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        // Only the read of `start` answers; before it and once decided, events are refused.
-        self.output = Some(if std::mem::take(&mut self.reading) {
-            self.sign(event)
-        } else {
-            Err(LinkLoginError::UnexpectedEvent)
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LinkLoginError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, LinkLoginError> {
+        self.sign(result).map(Next::Done)
     }
 }
 
@@ -752,8 +731,7 @@ mod tests {
         let now = 10_000;
         for auth_time in [Some(now - MAX_LINK_SECS - 1), None] {
             let mut stale = confirm(local(2), auth_time, now);
-            assert!(stale.start().is_empty());
-            assert_eq!(stale.finalize(), Err(LinkLoginError::LocalRefused));
+            assert_eq!(stale.first(), Err(LinkLoginError::LocalRefused));
             let mut linking = link(local(2), confirmation(now), now);
             linking.config.auth_time = auth_time;
             assert!(linking.start().is_empty());
@@ -761,8 +739,7 @@ mod tests {
         }
         let mut api = confirm(local(2), Some(now), now);
         api.config.auth_context = session(local(2), SessionKind::Api);
-        assert!(api.start().is_empty());
-        assert_eq!(api.finalize(), Err(LinkLoginError::LocalRefused));
+        assert_eq!(api.first(), Err(LinkLoginError::LocalRefused));
     }
 
     #[test]
@@ -774,15 +751,6 @@ mod tests {
                 txn_id: Ulid::nil(),
             })
         };
-        let mut confirm = confirm(local(2), None, now);
-        confirm.start();
-        confirm.step(event());
-        assert_eq!(confirm.finalize(), Err(LinkLoginError::UnexpectedEvent));
-        let mut early = self::confirm(local(2), Some(now), now);
-        early.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: Vec::new(),
-        }));
-        assert_eq!(early.finalize(), Err(LinkLoginError::UnexpectedEvent));
         let mut linking = link(local(2), confirmation(now), now);
         linking.config.auth_time = None;
         linking.start();

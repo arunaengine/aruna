@@ -6,13 +6,15 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CONNECTOR_PRUNE_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::rows;
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
@@ -60,25 +62,12 @@ fn queue_read(limit: usize) -> Effect {
 /// Re-arms the pruning timer while queued work remains; the queue rows are the durable state.
 #[derive(Debug, PartialEq)]
 pub struct RestorePruneOperation {
-    state: PruneState,
-    output: Option<Result<(), PruneError>>,
+    scheduling: bool,
 }
 
 impl RestorePruneOperation {
     pub fn new() -> Self {
-        Self {
-            state: PruneState::Init,
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, output: Result<(), PruneError>) -> Effects {
-        self.state = match output {
-            Ok(()) => PruneState::Finish,
-            Err(_) => PruneState::Error,
-        };
-        self.output = Some(output);
-        smallvec![]
+        Self { scheduling: false }
     }
 }
 
@@ -88,46 +77,36 @@ impl Default for RestorePruneOperation {
     }
 }
 
-impl EffectOperation for RestorePruneOperation {
+impl Operation for RestorePruneOperation {
     type Output = ();
     type Error = PruneError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PruneState::Queue;
-        smallvec![queue_read(1)]
+    fn first(&mut self) -> Result<Next<()>, PruneError> {
+        Ok(Next::Call(IoCall::Effect(Box::new(queue_read(1)))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (PruneState::Queue, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, PruneError> {
+        match (self.scheduling, rows::event(result)?) {
+            (false, Event::Storage(StorageEvent::IterResult { values, .. })) => {
                 if values.is_empty() {
-                    return self.finish(Ok(()));
+                    return Ok(Next::Done(()));
                 }
-                self.state = PruneState::Schedule;
-                smallvec![schedule_prune()]
+                self.scheduling = true;
+                Ok(Next::Call(IoCall::Effect(Box::new(schedule_prune()))))
             }
-            (PruneState::Schedule, Event::Task(TaskEvent::Error { message, .. })) => {
-                self.finish(Err(PruneError::Schedule(message)))
+            (true, Event::Task(TaskEvent::Error { message, .. })) => {
+                Err(PruneError::Schedule(message))
             }
-            (PruneState::Schedule, Event::Task(_)) => self.finish(Ok(())),
-            (_, Event::Storage(StorageEvent::Error { error })) => self.finish(Err(error.into())),
-            (state, event) => self.finish(Err(PruneError::UnexpectedEvent {
-                state,
-                received: event.label(),
-            })),
+            (true, Event::Task(_)) => Ok(Next::Done(())),
+            (_, event) => {
+                let expected = "StorageEvent::IterResult or a TaskEvent";
+                Err(IoError::Unexpected {
+                    expected,
+                    got: event.label(),
+                }
+                .into())
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PruneState::Finish | PruneState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PruneError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -258,6 +237,14 @@ pub enum PruneError {
     NotFinished,
     #[error("connector reference pruning was not scheduled: {0}")]
     Schedule(String),
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for PruneError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +252,6 @@ pub enum PruneState {
     Init,
     Queue,
     Page,
-    Schedule,
     StartTransaction,
     ReadRows,
     ReadVersions,
@@ -814,62 +800,39 @@ mod tests {
         let mut operation = PruneReferencesOperation::new();
         operation.start();
         rejects_finalize(operation);
-        let mut restore = RestorePruneOperation::new();
-        restore.start();
-        rejects_finalize(restore);
     }
 
-    // The restore schedules pruning only while a queue row exists.
+    // The restore schedules pruning only while a queue row exists; a failed timer is reported.
     #[test]
     fn restore_schedules_queued() {
+        let event = |event| IoResult::Event(Box::new(event));
+        let schedule = || Next::Call(IoCall::Effect(Box::new(schedule_prune())));
         let mut restore = RestorePruneOperation::new();
-        check_trace(
-            &mut restore,
-            &[queue_read(1)],
-            vec![(iter_result(Vec::new()), Vec::new())],
-        );
-        assert_eq!(restore.finalize(), Ok(()));
+        let read = Next::Call(IoCall::Effect(Box::new(queue_read(1))));
+        assert_eq!(restore.first(), Ok(read));
+        let empty = restore.next(event(iter_result(Vec::new())));
+        assert_eq!(empty, Ok(Next::Done(())));
 
         let mut restore = RestorePruneOperation::new();
+        restore.first().unwrap();
+        let queued = restore.next(event(iter_result(vec![queued_row(1)])));
+        assert_eq!(queued, Ok(schedule()));
         let scheduled = Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::PruneConnectorReferences,
             after: Duration::ZERO,
         });
-        check_trace(
-            &mut restore,
-            &[queue_read(1)],
-            vec![
-                (iter_result(vec![queued_row(1)]), vec![schedule_prune()]),
-                (scheduled, Vec::new()),
-            ],
-        );
-        assert_eq!(restore.finalize(), Ok(()));
-    }
-
-    // A failed read or a failed timer is reported; other events are refused.
-    #[test]
-    fn restore_reports_failure() {
-        let mut restore = RestorePruneOperation::new();
-        restore.start();
-        restore.step(storage_error());
-        assert_eq!(restore.finalize(), Err(StorageError::Timeout.into()));
+        assert_eq!(restore.next(event(scheduled)), Ok(Next::Done(())));
 
         let mut restore = RestorePruneOperation::new();
-        restore.start();
-        restore.step(iter_result(vec![queued_row(1)]));
-        restore.step(Event::Task(TaskEvent::Error {
+        restore.first().unwrap();
+        restore
+            .next(event(iter_result(vec![queued_row(1)])))
+            .unwrap();
+        let failed = Event::Task(TaskEvent::Error {
             key: None,
             message: "down".to_string(),
-        }));
-        assert_eq!(
-            restore.finalize(),
-            Err(PruneError::Schedule("down".to_string()))
-        );
-
-        let refusals = rejects_events(RestorePruneOperation::new, sample_events, |event| {
-            matches!(event, Event::Storage(StorageEvent::Error { .. }))
         });
-        assert_eq!(refusals.len(), sample_events().len() - 1);
-        check_abort(&mut RestorePruneOperation::new(), &[]);
+        let failed = restore.next(event(failed));
+        assert_eq!(failed, Err(PruneError::Schedule("down".to_string())));
     }
 }

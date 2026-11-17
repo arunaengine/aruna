@@ -14,3 +14,14 @@ pub mod read_source;
 pub mod reference;
 pub mod snapshot;
 pub mod snapshot_reuse;
+
+use aruna_core::calls::IoCall;
+use aruna_core::effects::Effect;
+
+/// The call for an effect the connector resolver builds: a sub-operation runs as a child.
+pub(crate) fn child_call(effect: Effect) -> IoCall {
+    match effect {
+        Effect::SubOperation(child) => IoCall::Child(child),
+        other => IoCall::Effect(Box::new(other)),
+    }
+}

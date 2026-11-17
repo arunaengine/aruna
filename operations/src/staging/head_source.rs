@@ -2,15 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::child_call;
 use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -28,158 +29,78 @@ pub struct HeadSourceResult {
     pub metadata: SourceMetadata,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HeadSourceState {
-    Init,
-    ResolveConnector,
-    HeadSource,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum HeadSourceError {
+    #[error(transparent)]
+    Io(#[from] IoError),
     #[error(transparent)]
     Resolve(#[from] SourceResolutionError),
     #[error(transparent)]
     Staging(#[from] StagingSourceError),
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: HeadSourceState,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("Head staging source failed")]
-    HeadSourceFailed,
+    #[error("unexpected staging answer {0}")]
+    UnexpectedEvent(&'static str),
 }
 
+/// Resolves the connector, then heads the source path.
 #[derive(Debug, PartialEq)]
 pub struct HeadSourceOperation {
     input: HeadSourceInput,
-    state: HeadSourceState,
-    connector: Option<SourceConnector>,
-    secret_fingerprint: Option<[u8; 16]>,
-    output: Option<Result<HeadSourceResult, HeadSourceError>>,
+    resolved: Option<(SourceConnector, Option<[u8; 16]>)>,
 }
 
 impl HeadSourceOperation {
     pub fn new(input: HeadSourceInput) -> Self {
         Self {
             input,
-            state: HeadSourceState::Init,
-            connector: None,
-            secret_fingerprint: None,
-            output: None,
+            resolved: None,
         }
     }
 
-    fn emit_error(&mut self, error: HeadSourceError) -> Effects {
-        self.state = HeadSourceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn emit_unexpected(&mut self, expected: &'static str, event: &Event) -> Effects {
-        self.emit_error(HeadSourceError::UnexpectedEvent {
-            state: self.state.clone(),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = HeadSourceState::ResolveConnector;
-        smallvec![resolve_connector_effect(ResolveConnectorInput {
-            group_id: self.input.group_id,
-            connector_id: self.input.connector_id,
-            source_path: self.input.source_path.clone(),
-            allow_root: false,
-        })]
-    }
-
-    fn handle_resolved_connector(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) => {
-                match *result {
-                    Ok(resolved) => {
-                        self.connector = Some(resolved.connector);
-                        self.secret_fingerprint = resolved.secret_fingerprint;
-                        self.state = HeadSourceState::HeadSource;
-                        smallvec![Effect::StagingSource(StagingSourceEffect::Head {
-                            access: resolved.access,
-                        })]
-                    }
-                    Err(error) => self.emit_error(error.into()),
-                }
-            }
-            other => self.emit_unexpected(
-                "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                &other,
-            ),
-        }
-    }
-
-    fn handle_head_result(&mut self, event: Event) -> Effects {
-        match event {
-            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
-                let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(HeadSourceError::HeadSourceFailed);
-                };
-
-                self.state = HeadSourceState::Finish;
-                self.output = Some(Ok(HeadSourceResult {
-                    connector,
-                    secret_fingerprint: self.secret_fingerprint,
-                    metadata,
-                }));
-                smallvec![]
-            }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.emit_error(error.into())
-            }
-            other => self.emit_unexpected(
-                "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                &other,
-            ),
-        }
+    fn head(&mut self, event: Event) -> Result<IoCall, HeadSourceError> {
+        let Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) = event
+        else {
+            return Err(HeadSourceError::UnexpectedEvent(event.label()));
+        };
+        let resolved = (*result)?;
+        self.resolved = Some((resolved.connector, resolved.secret_fingerprint));
+        let head = StagingSourceEffect::Head {
+            access: resolved.access,
+        };
+        Ok(IoCall::Effect(Box::new(Effect::StagingSource(head))))
     }
 }
 
-impl EffectOperation for HeadSourceOperation {
+impl Operation for HeadSourceOperation {
     type Output = HeadSourceResult;
     type Error = HeadSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<HeadSourceResult>, HeadSourceError> {
+        Ok(Next::Call(child_call(resolve_connector_effect(
+            ResolveConnectorInput {
+                group_id: self.input.group_id,
+                connector_id: self.input.connector_id,
+                source_path: self.input.source_path.clone(),
+                allow_root: false,
+            },
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            HeadSourceState::Init => self.handle_init(),
-            HeadSourceState::ResolveConnector => self.handle_resolved_connector(event),
-            HeadSourceState::HeadSource => self.handle_head_result(event),
-            HeadSourceState::Finish => smallvec![],
-            HeadSourceState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, HeadSourceState::Finish | HeadSourceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == HeadSourceState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
+    fn next(&mut self, result: IoResult) -> Result<Next<HeadSourceResult>, HeadSourceError> {
+        let event = result.event()?;
+        let Some((connector, secret_fingerprint)) = self.resolved.take() else {
+            return Ok(Next::Call(self.head(event)?));
+        };
+        match event {
+            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+                Ok(Next::Done(HeadSourceResult {
+                    connector,
+                    secret_fingerprint,
+                    metadata,
+                }))
             }
-            return Err(HeadSourceError::HeadSourceFailed);
+            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
+            other => Err(HeadSourceError::UnexpectedEvent(other.label())),
         }
-
-        self.output.ok_or(HeadSourceError::HeadSourceFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -187,6 +108,7 @@ impl EffectOperation for HeadSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
     use crate::tests::staging::{
         create_http_connector, sample_connector, sample_metadata, sample_resolved_connector,
         setup_driver_context,
@@ -200,122 +122,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn start_emits_resolve() {
-        let mut operation = HeadSourceOperation::new(sample_input());
+    fn answer(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
 
-        let effects = operation.start();
-
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        assert_eq!(operation.state, HeadSourceState::ResolveConnector);
+    fn resolved(result: Result<ResolvedSourceConnector, SourceResolutionError>) -> IoResult {
+        answer(Event::SubOperation(
+            SubOperationEvent::SourceConnectorResolved {
+                result: Box::new(result),
+            },
+        ))
     }
 
     #[test]
     fn resolved_emits_head() {
         let mut operation = HeadSourceOperation::new(sample_input());
-        operation.start();
-        let resolved = sample_resolved_connector();
-        let expected_access = resolved.access.clone();
-        let expected_connector = resolved.connector.clone();
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(resolved)),
-            },
-        ));
-
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Head { access })]
-                if access == &expected_access
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert_eq!(operation.state, HeadSourceState::HeadSource);
-        assert_eq!(operation.connector, Some(expected_connector));
+        let resolved_connector = sample_resolved_connector();
+        let head = StagingSourceEffect::Head {
+            access: resolved_connector.access.clone(),
+        };
+        let call = IoCall::Effect(Box::new(Effect::StagingSource(head)));
+        let effect = operation.next(resolved(Ok(resolved_connector)));
+        assert_eq!(effect, Ok(Next::Call(call)));
     }
 
     #[test]
     fn exposes_resolve_error() {
         let mut operation = HeadSourceOperation::new(sample_input());
-        operation.start();
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Err(SourceResolutionError::NotFound)),
-            },
-        ));
-
-        assert!(effects.is_empty());
+        operation.first().unwrap();
         assert_eq!(
-            operation.finalize(),
-            Err(HeadSourceError::Resolve(SourceResolutionError::NotFound,)),
+            operation.next(resolved(Err(SourceResolutionError::NotFound))),
+            Err(HeadSourceError::Resolve(SourceResolutionError::NotFound)),
         );
     }
 
     #[test]
     fn head_finishes_operation() {
         let mut operation = HeadSourceOperation::new(sample_input());
-        operation.start();
-        let expected_connector = sample_connector();
-        let expected_metadata = sample_metadata();
-        let resolved = sample_resolved_connector();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(resolved)),
-            },
-        ));
-
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-            metadata: expected_metadata.clone(),
+        operation.first().unwrap();
+        operation
+            .next(resolved(Ok(sample_resolved_connector())))
+            .unwrap();
+        let headed = answer(Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: sample_metadata(),
         }));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.state, HeadSourceState::Finish);
         assert_eq!(
-            operation.finalize(),
-            Ok(HeadSourceResult {
-                connector: expected_connector,
+            operation.next(headed),
+            Ok(Next::Done(HeadSourceResult {
+                connector: sample_connector(),
                 secret_fingerprint: None,
-                metadata: expected_metadata,
-            })
+                metadata: sample_metadata(),
+            }))
         );
     }
 
     #[test]
     fn exposes_staging_error() {
         let mut operation = HeadSourceOperation::new(sample_input());
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(sample_resolved_connector())),
-            },
-        ));
-
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        operation.first().unwrap();
+        operation
+            .next(resolved(Ok(sample_resolved_connector())))
+            .unwrap();
+        let failed = answer(Event::StagingSource(StagingSourceEvent::Error {
             error: StagingSourceError::NotFound,
         }));
-
-        assert!(effects.is_empty());
         assert_eq!(
-            operation.finalize(),
-            Err(HeadSourceError::Staging(StagingSourceError::NotFound,)),
+            operation.next(failed),
+            Err(HeadSourceError::Staging(StagingSourceError::NotFound)),
         );
     }
 
     #[test]
     fn unexpected_describes_event() {
         let mut operation = HeadSourceOperation::new(sample_input());
-        operation.start();
-
-        let effects = operation.step(Event::Search());
-
-        assert!(effects.is_empty());
+        operation.first().unwrap();
         assert_eq!(
-            operation.finalize(),
-            Err(HeadSourceError::UnexpectedEvent {
-                state: HeadSourceState::ResolveConnector,
-                expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                got: "Event::Search",
-            })
+            operation.next(answer(Event::Search())),
+            Err(HeadSourceError::UnexpectedEvent("Event::Search"))
         );
     }
 

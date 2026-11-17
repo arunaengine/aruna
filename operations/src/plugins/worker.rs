@@ -34,7 +34,6 @@ use ulid::Ulid;
 use super::account::prerequisites_held;
 use super::artifacts::fetch_artifact;
 use super::artifacts::local_config;
-use super::bound::ReleaseKeys;
 use super::broker::{RunBroker, absent};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
@@ -66,8 +65,7 @@ use super::replay::{
     COVERAGE_ROW, CoverageRow, StartReplay, growth, replay_page, replay_rows, replay_scan, row_key,
 };
 use super::rows::{
-    RowsOperation, Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows,
-    write_rows,
+    Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows, write_rows,
 };
 use super::runs::{
     ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, ended, expired_runs, read_run, save_run,
@@ -105,8 +103,6 @@ pub struct Worker {
     backoff: tokio::sync::Mutex<Backoff>,
     /// Sends connection requests instead of the node's egress client, in tests.
     outbound: Mutex<Option<Arc<dyn Outbound>>>,
-    /// Releases with these realm keys instead of the node's, in tests.
-    keys: Mutex<Option<ReleaseKeys>>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
     tasks: TaskTracker,
@@ -141,7 +137,6 @@ impl Worker {
             reasons: Mutex::new(HashMap::new()),
             backoff: tokio::sync::Mutex::default(),
             outbound: Mutex::new(None),
-            keys: Mutex::new(None),
             rechecked: AtomicU64::new(0),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
@@ -258,13 +253,6 @@ impl Worker {
         }
     }
 
-    /// Releases secrets with `keys` instead of the node's realm keys.
-    pub fn use_keys(&self, keys: ReleaseKeys) {
-        if let Ok(mut held) = self.keys.lock() {
-            *held = Some(keys);
-        }
-    }
-
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
     async fn forward(
         &self,
@@ -357,9 +345,6 @@ impl Worker {
         let outbound = self.outbound.lock().ok().and_then(|held| held.clone());
         if let Some(outbound) = outbound {
             broker = broker.with_outbound(outbound);
-        }
-        if let Some(keys) = self.keys.lock().ok().and_then(|held| held.clone()) {
-            broker = broker.with_keys(keys);
         }
         let broker = Arc::new(broker);
         let ended = self.attempt(&run, broker.clone(), cancel).await;
@@ -636,7 +621,7 @@ async fn decide(
     // Its dedup record would be gone, so a run now could repeat one already made.
     if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
         let late = GapCount::new(local, row, GapReason::Late);
-        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
+        drive(LateEvent(late), ctx).await?;
         return Ok(Outcome::Expired);
     }
     let verdict = judge(ctx, config, local, row, now_ms).await?;
@@ -856,7 +841,7 @@ pub(crate) async fn notify_work(
         let finished = event_run(config, install, &event, now_ms);
         let _admitting = ADMISSIONS.lock().await;
         let notify = NotifyWork::new(install.install_id, row.work_id, finished);
-        match drive(RowsOperation::transaction(notify), ctx).await {
+        match drive(notify, ctx).await {
             Ok(true) => notified += 1,
             Ok(false) => {}
             // A full queue takes the completion at a later pass.
@@ -894,7 +879,7 @@ pub(crate) async fn recheck_waiting(
             },
         };
         let settle = SettleWaiting::new(key, waiting, verdict, (local, now_ms));
-        drive(RowsOperation::transaction(settle), ctx).await?;
+        drive(settle, ctx).await?;
         left += 1;
     }
     Ok(left)
@@ -948,7 +933,7 @@ pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
             None => None,
         };
         let replay = StartReplay::new(target, (next, old), (start, by), now_ms);
-        drive(RowsOperation::direct(replay), ctx).await?;
+        drive(replay, ctx).await?;
         started += 1;
     }
     Ok(started)

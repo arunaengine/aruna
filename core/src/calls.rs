@@ -2,14 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::any::{Any, type_name};
+use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::time::Duration;
 
 use smallvec::smallvec;
+use tracing::warn;
 
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
-use crate::operation::{EffectOperation, HoldScope, Operation, SubOperation};
+use crate::operation::{
+    EffectOperation, HoldScope, Operation, Runnable, SubOperation, boxed_suboperation,
+};
+use crate::structs::storage::distribution::accounting::RangeCounters;
+use crate::structs::storage::usage::{BucketDelta, UsageDelta};
 use crate::types::{Effects, Key, KeySpace, TxnId, Value};
 
 /// One I/O request of an operation. Storage reads, pages, writes and deletes run in the
@@ -34,13 +42,37 @@ pub enum IoCall {
     /// A net, blob, metadata, task, staging source, local file or other storage effect, answered
     /// by the event of the same family. Transaction control effects are refused.
     Effect(Box<Effect>),
-    /// A child operation, answered by the event its result maps to.
+    /// A child operation, answered by the event its result maps to; see [`IoCall::child`].
     Child(Box<dyn SubOperation>),
     /// Independent effects run at the same time. An all-at-once group is answered once; a
     /// window answers each member, then `GroupEvent::Closed`.
     Group(EffectGroup),
     /// A wake after this long on the runner's clock.
     Delay(Duration),
+    /// Adds usage deltas to the latest stored counters when the operation's transaction
+    /// commits; needs `transaction()`. Answered by `Done`.
+    AddUsage {
+        space: KeySpace,
+        deltas: Vec<(Key, UsageDelta)>,
+        buckets: Vec<(Key, BucketDelta)>,
+    },
+    /// Adds range counter deltas when the operation's transaction commits, like `AddUsage`.
+    AddCounters {
+        space: KeySpace,
+        deltas: Vec<(Key, RangeCounters)>,
+    },
+}
+
+/// A sub-operation, group or delay effect becomes its own call; any other effect passes through.
+impl From<Effect> for IoCall {
+    fn from(effect: Effect) -> Self {
+        match effect {
+            Effect::SubOperation(child) => Self::Child(child),
+            Effect::Group(group) => Self::Group(group),
+            Effect::Delay(after) => Self::Delay(after),
+            other => Self::Effect(Box::new(other)),
+        }
+    }
 }
 
 /// The answer to an [`IoCall`].
@@ -54,11 +86,70 @@ pub enum IoResult {
     },
     /// A write, delete or sync finished.
     Done,
-    /// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
+    /// The event that answered an `IoCall::Effect`, or an `IoCall::Child` that maps to an event.
     Event(Box<Event>),
     Group(GroupEvent),
     /// The delay passed.
     Woke,
+    /// The outcome of a child made with [`IoCall::child`]; read it with [`IoResult::child`].
+    Child(ChildOutcome),
+}
+
+impl IoCall {
+    /// Runs `operation` of either kind as a child; its result comes back as [`IoResult::Child`].
+    pub fn child<O, K>(operation: O) -> Self
+    where
+        O: Runnable<K> + 'static,
+        K: 'static,
+        O::Output: PartialEq + 'static,
+        O::Error: PartialEq + 'static,
+    {
+        Self::Child(boxed_suboperation(operation, |result| {
+            Event::Child(ChildOutcome::new(result))
+        }))
+    }
+}
+
+/// A child's `Result<Output, Error>`, boxed so events stay free of operation types.
+pub struct ChildOutcome(Box<dyn ChildValue>);
+
+trait ChildValue: Any + Send + Debug {
+    fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
+}
+
+impl<T: Any + Send + Debug + PartialEq> ChildValue for T {
+    fn eq_dyn(&self, other: &dyn ChildValue) -> bool {
+        (other as &dyn Any).downcast_ref::<T>() == Some(self)
+    }
+}
+
+impl ChildOutcome {
+    /// Wraps a child's result; a group member child maps its outcome with this.
+    pub fn new<T, E>(result: Result<T, E>) -> Self
+    where
+        T: Send + Debug + PartialEq + 'static,
+        E: Send + Debug + PartialEq + 'static,
+    {
+        Self(Box::new(result))
+    }
+
+    /// The child's result, or `None` when the child's output or error has another type.
+    pub fn take<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
+        let value: Box<dyn Any> = self.0;
+        value.downcast::<Result<T, E>>().ok().map(|result| *result)
+    }
+}
+
+impl Debug for ChildOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl PartialEq for ChildOutcome {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_dyn(&*other.0)
+    }
 }
 
 impl IoResult {
@@ -71,6 +162,65 @@ impl IoResult {
             Self::Event(event) => event.label(),
             Self::Group(_) => "IoResult::Group",
             Self::Woke => "IoResult::Woke",
+            Self::Child(_) => "IoResult::Child",
+        }
+    }
+
+    /// The result of a child made with [`IoCall::child`] whose output is `T` and error `E`.
+    pub fn child<T: 'static, E: 'static>(self) -> Result<Result<T, E>, IoError> {
+        let expected = type_name::<Result<T, E>>();
+        match self {
+            Self::Child(outcome) => outcome
+                .take()
+                .ok_or_else(|| unexpected(expected, "a child of another type")),
+            other => Err(unexpected(expected, other.label())),
+        }
+    }
+
+    fn other(&self, expected: &'static str) -> IoError {
+        IoError::Unexpected {
+            expected,
+            got: self.label(),
+        }
+    }
+
+    /// The values of a read, or the error naming the result that came instead.
+    pub fn values(self) -> Result<Vec<Option<Value>>, IoError> {
+        match self {
+            Self::Values(values) => Ok(values),
+            other => Err(other.other("IoResult::Values")),
+        }
+    }
+
+    /// The value of a read of exactly one row.
+    pub fn value(self) -> Result<Option<Value>, IoError> {
+        match self {
+            Self::Values(values) if values.len() == 1 => Ok(values.into_iter().next().flatten()),
+            other => Err(other.other("IoResult::Values with one value")),
+        }
+    }
+
+    /// The end of a write, a delete or a sync.
+    pub fn done(self) -> Result<(), IoError> {
+        match self {
+            Self::Done => Ok(()),
+            other => Err(other.other("IoResult::Done")),
+        }
+    }
+
+    /// The rows of a page and the key to continue after.
+    pub fn page(self) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+        match self {
+            Self::Page { rows, next } => Ok((rows, next)),
+            other => Err(other.other("IoResult::Page")),
+        }
+    }
+
+    /// The event that answered an effect or a child.
+    pub fn event(self) -> Result<Event, IoError> {
+        match self {
+            Self::Event(event) => Ok(*event),
+            other => Err(other.other("IoResult::Event")),
         }
     }
 }
@@ -82,6 +232,12 @@ pub enum Next<T> {
     Done(T),
     /// Only after a window member: add no member and wait for the next result.
     Wait,
+    /// The outcome, then `calls` made in order after the commit, outside any transaction.
+    /// Their answers and failures never change the outcome; failures are logged.
+    Then {
+        output: T,
+        calls: Vec<IoCall>,
+    },
 }
 
 /// An I/O failure the runner reports into the operation's error type.
@@ -106,6 +262,48 @@ pub enum IoError {
     Codec(String),
 }
 
+impl IoError {
+    /// The storage failure this error is, a lost conflict as `TransactionConflict`; any other
+    /// error as it is.
+    pub fn into_storage(self) -> Result<StorageError, IoError> {
+        match self {
+            Self::Conflict => Ok(StorageError::TransactionConflict),
+            Self::Storage(error) => Ok(error),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<IoError> for StorageError {
+    /// A storage failure as itself, a conflict as the transaction conflict, any other as a read
+    /// error naming it.
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => error,
+            IoError::Conflict => StorageError::TransactionConflict,
+            other => StorageError::ReadError(other.to_string()),
+        }
+    }
+}
+
+/// A runner failure as an authorization error: storage faults stay storage errors, a conflict
+/// stays the storage conflict, so the conflict check finds it.
+impl From<IoError> for crate::errors::AuthorizationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "call".to_string(),
+                expected,
+                got: got.to_string(),
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+            IoError::Codec(reason) => Self::StorageError(StorageError::ReadError(reason)),
+        }
+    }
+}
+
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
 /// storage calls in one write transaction when the operation asks for one, commits its outcome
 /// and aborts on an error.
@@ -123,7 +321,14 @@ enum State<O, E> {
     /// Waits for the transaction that this storage call needs.
     Starting(IoCall),
     Waiting(Wait),
-    Committing(O),
+    /// Waits for the commit; the calls run after it.
+    Committing(O, Vec<IoCall>),
+    /// The committed outcome while the calls after the commit run.
+    After {
+        output: O,
+        calls: VecDeque<IoCall>,
+        wait: Wait,
+    },
     Finished(Result<O, E>),
 }
 
@@ -204,9 +409,10 @@ impl<P: Operation> CallRun<P> {
 
     fn advance(&mut self, mut turn: Result<Next<P::Output>, P::Error>) -> Effects {
         loop {
-            let call = match turn {
+            let mut call = match turn {
                 Err(error) => return self.fail(error),
-                Ok(Next::Done(output)) => return self.finish(output),
+                Ok(Next::Done(output)) => return self.finish(output, Vec::new()),
+                Ok(Next::Then { output, calls }) => return self.finish(output, calls),
                 Ok(Next::Wait) => {
                     let got = "Next::Wait outside a window";
                     return self.fail(unexpected("a call or an outcome", got));
@@ -217,7 +423,7 @@ impl<P: Operation> CallRun<P> {
                 turn = self.operation.next(result);
                 continue;
             }
-            if self.transaction && self.txn_id.is_none() && in_storage(&call) {
+            if self.transaction && self.txn_id.is_none() && in_storage(&mut call) {
                 self.state = State::Starting(call);
                 let start = StorageEffect::StartTransaction { read: false };
                 return smallvec![Effect::Storage(start)];
@@ -249,30 +455,67 @@ impl<P: Operation> CallRun<P> {
         }
     }
 
-    fn finish(&mut self, output: P::Output) -> Effects {
+    fn finish(&mut self, output: P::Output, calls: Vec<IoCall>) -> Effects {
         match self.txn_id {
             Some(txn_id) => {
-                self.state = State::Committing(output);
+                self.state = State::Committing(output, calls);
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             None => {
-                self.state = State::Finished(Ok(output));
-                smallvec![]
+                let calls = self.drain_after_commit(calls);
+                self.after(output, calls)
             }
         }
     }
 
-    /// Ends with `error`; an open transaction is aborted unless its commit was sent.
+    /// Appends the effects of the operation's `after_commit` to its calls after the commit.
+    fn drain_after_commit(&mut self, calls: Vec<IoCall>) -> VecDeque<IoCall> {
+        let mut calls: VecDeque<IoCall> = calls.into();
+        while let Some(effect) = self.operation.after_commit() {
+            calls.push_back(IoCall::Effect(Box::new(effect)));
+        }
+        calls
+    }
+
+    /// Makes the next call after the commit; a refused call is logged and skipped.
+    fn after(&mut self, output: P::Output, mut calls: VecDeque<IoCall>) -> Effects {
+        while let Some(call) = calls.pop_front() {
+            if empty_result(&call).is_some() {
+                continue;
+            }
+            match call_effect(call, None) {
+                Ok((wait, effect)) => {
+                    self.state = State::After {
+                        output,
+                        calls,
+                        wait,
+                    };
+                    return smallvec![effect];
+                }
+                Err(error) => warn!(%error, "A call after the commit was refused"),
+            }
+        }
+        self.state = State::Finished(Ok(output));
+        smallvec![]
+    }
+
+    /// Ends with `error`: aborts an open transaction unless its commit was sent, then sends the
+    /// operation's cleanup calls outside any transaction.
     fn fail(&mut self, error: impl Into<P::Error>) -> Effects {
-        let committing = matches!(self.state, State::Committing(_));
+        let committing = matches!(self.state, State::Committing(..));
         self.state = State::Finished(Err(error.into()));
-        match committing {
+        let mut effects = match committing {
             true => {
                 self.txn_id = None;
                 smallvec![]
             }
             false => abort_effects(&mut self.txn_id),
-        }
+        };
+        let cleanup = self.operation.abort().into_iter();
+        effects.extend(
+            cleanup.filter_map(|call| call_effect(call, None).ok().map(|(_, effect)| effect)),
+        );
+        effects
     }
 }
 
@@ -299,21 +542,50 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                 other => self.deliver(Wait::Window, other),
             },
             State::Waiting(wait) => self.deliver(wait, event),
-            State::Committing(output) => match event {
+            State::Committing(output, calls) => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { txn_id })
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
-                    self.state = State::Finished(Ok(output));
-                    smallvec![]
+                    {
+                        let calls = self.drain_after_commit(calls);
+                        self.after(output, calls)
+                    }
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
-                    self.state = State::Committing(output);
+                    self.state = State::Committing(output, calls);
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }
             },
-            State::Created | State::Finished(_) => self.fail(unexpected("no event", event.label())),
+            State::After {
+                output,
+                calls,
+                wait: Wait::Window,
+            } if matches!(event, Event::Group(GroupEvent::Member { .. })) => {
+                let wait = Wait::Window;
+                self.state = State::After {
+                    output,
+                    calls,
+                    wait,
+                };
+                smallvec![]
+            }
+            State::After {
+                output,
+                calls,
+                wait,
+            } => {
+                if let Err(error) = answer(wait, event) {
+                    warn!(%error, "A call after the commit failed");
+                }
+                self.after(output, calls)
+            }
+            State::Created | State::Finished(_) => {
+                let late = unexpected("no event", event.label());
+                self.state = State::Finished(Err(late.into()));
+                smallvec![]
+            }
         }
     }
 
@@ -324,13 +596,21 @@ impl<P: Operation> EffectOperation for CallRun<P> {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             State::Finished(result) => result,
+            State::After { output, .. } => Ok(output),
             _ => Err(IoError::Unfinished.into()),
         }
     }
 
     fn abort(&mut self) -> Effects {
-        match self.state {
-            State::Committing(_) | State::Finished(_) => smallvec![],
+        match std::mem::replace(&mut self.state, State::Created) {
+            State::After { output, .. } => {
+                self.state = State::Finished(Ok(output));
+                smallvec![]
+            }
+            state @ (State::Committing(..) | State::Finished(_)) => {
+                self.state = state;
+                smallvec![]
+            }
             _ => self.fail(IoError::Aborted),
         }
     }
@@ -407,9 +687,14 @@ fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
         (Wait::Written, Event::Storage(StorageEvent::BatchWriteResult { .. }))
         | (Wait::Deleted, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
         | (Wait::Synced, Event::Storage(StorageEvent::SyncAllFinished)) => Ok(IoResult::Done),
+        // A refused storage effect fails like a storage call, a lost conflict as a conflict.
+        (Wait::Family(Family::Storage), event @ Event::Storage(StorageEvent::Error { .. })) => {
+            Err(failure("a storage event", event))
+        }
         (Wait::Family(family), event) if event_family(&event) == Some(family) => {
             Ok(IoResult::Event(Box::new(event)))
         }
+        (Wait::Child, Event::Child(outcome)) => Ok(IoResult::Child(outcome)),
         (Wait::Child, event) => Ok(IoResult::Event(Box::new(event))),
         (Wait::Group, Event::Group(finished @ GroupEvent::Finished { .. }))
         | (Wait::Window, Event::Group(finished @ GroupEvent::Closed)) => {
@@ -430,12 +715,22 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the operation's transaction.
-fn in_storage(call: &IoCall) -> bool {
-    matches!(
-        call,
-        IoCall::Read(_) | IoCall::Page { .. } | IoCall::Write(_) | IoCall::Delete(_)
-    )
+/// Whether the call runs in the operation's transaction: a storage call, or a storage effect
+/// that takes a transaction id and names none.
+fn in_storage(call: &mut IoCall) -> bool {
+    match call {
+        IoCall::Read(_)
+        | IoCall::Page { .. }
+        | IoCall::Write(_)
+        | IoCall::Delete(_)
+        | IoCall::AddUsage { .. }
+        | IoCall::AddCounters { .. } => true,
+        IoCall::Effect(effect) => match effect.as_mut() {
+            Effect::Storage(storage) => storage.txn_slot().is_some_and(|slot| slot.is_none()),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), IoError> {
@@ -465,7 +760,15 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
             StorageEffect::BatchDelete { deletes, txn_id },
         ),
         IoCall::Sync => (Wait::Synced, StorageEffect::SyncAll),
-        IoCall::Effect(effect) => return Ok((Wait::Family(effect_family(&effect)?), *effect)),
+        IoCall::Effect(mut effect) => {
+            if let Effect::Storage(storage) = effect.as_mut()
+                && let Some(slot) = storage.txn_slot()
+                && slot.is_none()
+            {
+                *slot = txn_id;
+            }
+            return Ok((Wait::Family(effect_family(&effect)?), *effect));
+        }
         IoCall::Child(child) => return Ok((Wait::Child, Effect::SubOperation(child))),
         IoCall::Group(group) => {
             let wait = match group.form {
@@ -475,6 +778,27 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
             return Ok((wait, Effect::Group(group)));
         }
         IoCall::Delay(after) => return Ok((Wait::Delay, Effect::Delay(after))),
+        IoCall::AddUsage {
+            space,
+            deltas,
+            buckets,
+        } => (
+            Wait::Written,
+            StorageEffect::AddUsage {
+                key_space: space,
+                deltas,
+                buckets,
+                txn_id: txn_id.ok_or(unexpected("a transaction", "IoCall::AddUsage"))?,
+            },
+        ),
+        IoCall::AddCounters { space, deltas } => (
+            Wait::Written,
+            StorageEffect::AddCounters {
+                key_space: space,
+                deltas,
+                txn_id: txn_id.ok_or(unexpected("a transaction", "IoCall::AddCounters"))?,
+            },
+        ),
     };
     Ok((wait, Effect::Storage(storage)))
 }
@@ -497,7 +821,9 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
             StorageEffect::StartTransaction { .. }
             | StorageEffect::CommitTransaction { .. }
             | StorageEffect::AbortTransaction { .. }
-            | StorageEffect::BeginUsageRebuild { .. },
+            | StorageEffect::BeginUsageRebuild { .. }
+            | StorageEffect::AddUsage { .. }
+            | StorageEffect::AddCounters { .. },
         ) => Err(unexpected(expected, "a transaction control effect")),
         Effect::Storage(_) => Ok(Family::Storage),
         Effect::SubOperation(_) => Err(unexpected(expected, "Effect::SubOperation")),
@@ -525,7 +851,8 @@ fn event_family(event: &Event) -> Option<Family> {
         | Event::Stream()
         | Event::Group(_)
         | Event::Delayed
-        | Event::Hung { .. } => None,
+        | Event::Hung { .. }
+        | Event::Child(_) => None,
     }
 }
 

@@ -64,6 +64,8 @@ pub enum Event {
     Hung {
         effect: &'static str,
     },
+    /// The typed outcome of a child made with `IoCall::child`; never persisted.
+    Child(crate::calls::ChildOutcome),
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -182,6 +184,22 @@ pub enum SubOperationEvent {
     /// The emission stored no notification; its failure as text.
     NotificationsFailed {
         reason: String,
+    },
+    /// Whether a watch subscription change was stored, or its failure as text.
+    WatchStored {
+        result: Result<bool, String>,
+    },
+    /// One notification delivery job was queued, or its failure as text.
+    DeliveryQueued {
+        result: Result<(), String>,
+    },
+    /// What a notification inbox upsert stored, or its failure as text.
+    InboxUpserted {
+        result: Result<crate::structs::execution::notification::InboxWriteOutcome, String>,
+    },
+    /// A page of outlived notification deletion times was pruned, or its failure as text.
+    CutoffsPruned {
+        result: Result<(), String>,
     },
 }
 
@@ -953,6 +971,10 @@ impl Event {
                     CopySealed,
                     CopyWoken,
                     NotificationsFailed,
+                    WatchStored,
+                    DeliveryQueued,
+                    InboxUpserted,
+                    CutoffsPruned,
                 }
             ),
             Event::Task(event) => variant_label!(
@@ -974,6 +996,7 @@ impl Event {
             ),
             Event::Delayed => "Event::Delayed",
             Event::Hung { .. } => "Event::Hung",
+            Event::Child(_) => "Event::Child",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(

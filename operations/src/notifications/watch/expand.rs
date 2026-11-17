@@ -7,7 +7,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::execution::notification::NotificationRecord;
+use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
     watch_retry_prefix, watch_subscription_key,
@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::driver::DriverContext;
 use crate::driver::drive;
-use crate::notifications::inbox::{InboxError, InboxWriteOutcome, UpsertInboxOperation};
+use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::protocol::{
     EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, RETRY_BATCH_CAP,

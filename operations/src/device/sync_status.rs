@@ -20,7 +20,7 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 
-use super::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry, PublishState, RequeueFailedOperation};
+use super::publish_queue::{ClaimStateOperation, PUBLISH_PAGE_SIZE, PublishEntry, PublishState};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state};
 use super::replica_store::list_replicas;
 use super::scan_rows::ScanRowsOperation;
@@ -227,8 +227,13 @@ pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
 }
 
 async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
-    if let Err(error) = drive(RequeueFailedOperation::new(now_ms), context).await {
-        warn!(error = %error, "Failed to requeue the failed publish entries");
+    for entry in read_publish_entries(context).await {
+        let Some(state) = entry.retry_failed(now_ms) else {
+            continue;
+        };
+        if let Err(error) = drive(ClaimStateOperation::new(entry, state), context).await {
+            warn!(error = %error, "Failed to requeue a failed publish entry");
+        }
     }
 }
 

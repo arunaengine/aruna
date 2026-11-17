@@ -4,7 +4,8 @@
 
 use aruna_core::UserId;
 use aruna_core::auth::valid_token_lifetime;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::permission_path::validate_restriction_limits;
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionRef, TokenClaims,
@@ -13,7 +14,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use base64::Engine;
 use chrono::Months;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -28,18 +28,10 @@ pub struct CreateTokenConfig {
     pub restrictions: Option<Vec<PathRestriction>>,
 }
 
+/// Mints the token without I/O; the keys are part of the node capabilities.
 #[derive(Debug, PartialEq)]
 pub struct CreateTokenOperation {
     config: CreateTokenConfig,
-    state: CreateTokenState,
-    output: Option<Result<String, CreateTokenError>>,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum CreateTokenState {
-    Init,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -56,6 +48,12 @@ pub enum CreateTokenError {
     RestrictionsTooLarge,
     #[error(transparent)]
     EncodingError(#[from] jsonwebtoken::errors::Error),
+}
+
+impl From<IoError> for CreateTokenError {
+    fn from(_: IoError) -> Self {
+        Self::NotFinished
+    }
 }
 
 pub fn mint_token(config: &CreateTokenConfig) -> Result<String, CreateTokenError> {
@@ -141,52 +139,22 @@ pub fn mint_login_token(
 impl CreateTokenOperation {
     pub fn new(config: CreateTokenConfig) -> Result<Self, CreateTokenError> {
         if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
-            Err(CreateTokenError::NotEnoughCapabilities)
-        } else {
-            Ok(CreateTokenOperation {
-                config,
-                state: CreateTokenState::Init,
-                output: None,
-            })
+            return Err(CreateTokenError::NotEnoughCapabilities);
         }
-    }
-    pub fn emit_token(&mut self) -> Result<(), CreateTokenError> {
-        self.output = Some(Ok(mint_token(&self.config)?));
-        Ok(())
+        Ok(CreateTokenOperation { config })
     }
 }
-impl EffectOperation for CreateTokenOperation {
-    type Output = String;
 
+impl Operation for CreateTokenOperation {
+    type Output = String;
     type Error = CreateTokenError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
-        if let Err(err) = self.emit_token() {
-            self.state = CreateTokenState::Error;
-            self.output = Some(Err(err));
-        } else {
-            self.state = CreateTokenState::Finish;
-        }
-        smallvec![]
+    fn first(&mut self) -> Result<Next<String>, CreateTokenError> {
+        mint_token(&self.config).map(Next::Done)
     }
 
-    fn step(&mut self, _events: aruna_core::events::Event) -> aruna_core::types::Effects {
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateTokenState::Finish | CreateTokenState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateTokenError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> aruna_core::types::Effects {
-        smallvec![]
+    fn next(&mut self, _result: IoResult) -> Result<Next<String>, CreateTokenError> {
+        Err(CreateTokenError::NotFinished)
     }
 }
 
@@ -198,6 +166,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::{
         NodeCapabilities, SessionKind, SessionRef, TokenClaims,
     };
@@ -261,10 +230,7 @@ mod test {
         })
         .unwrap();
 
-        assert_eq!(
-            operation.emit_token(),
-            Err(CreateTokenError::LifetimeTooLong)
-        );
+        assert_eq!(operation.first(), Err(CreateTokenError::LifetimeTooLong));
     }
 
     #[test]

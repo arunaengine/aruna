@@ -75,7 +75,7 @@ pub async fn process_mirror_repairs(
     local_node: NodeId,
 ) -> Result<SyncMirrorResult, SyncMirrorError> {
     let now_ms = unix_timestamp_millis();
-    let scan = drive(ScanRepairsOperation::new(now_ms), context).await?;
+    let scan = drive(ScanRepairsOperation::new(), context).await?;
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut claimed = false;
@@ -119,7 +119,7 @@ pub async fn process_mirror_repairs(
 /// Re-arms the repair timer at startup from the stored records.
 pub async fn restore_mirror_timer(context: &DriverContext, task_handle: &TaskHandle) {
     let now_ms = unix_timestamp_millis();
-    let after = match drive(ScanRepairsOperation::new(now_ms), context).await {
+    let after = match drive(ScanRepairsOperation::new(), context).await {
         Ok(scan) if !scan.records.is_empty() || scan.has_more_due => Duration::ZERO,
         Ok(scan) => match scan.next_due_ms {
             Some(due_at) => Duration::from_millis(due_at.saturating_sub(now_ms)),
