@@ -29,7 +29,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::delegate::{prune_nonces, spend_nonce};
+use crate::distribution::delegate::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
@@ -322,10 +322,12 @@ async fn prepare_granted(
         return Err(NativeReferenceReject::AccessDenied);
     }
     let expires = granted.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
-    spend_nonce(context, granted.nonce, expires)
-        .await
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    prune_nonces(context, now).await;
+    drive(
+        SpendNonceOperation::new(granted.nonce, expires, now),
+        context,
+    )
+    .await
+    .map_err(|_| NativeReferenceReject::AccessDenied)?;
     let auth_context = AuthContext {
         user_id: grant.user_id,
         realm_id: grant.realm_id,
@@ -382,10 +384,12 @@ async fn prepare_delegated(
         return Err(NativeReferenceReject::AccessDenied);
     }
     let expires = delegation.issued_at.saturating_add(2 * MAX_REQUEST_SECS);
-    spend_nonce(context, delegation.nonce, expires)
-        .await
-        .map_err(|_| NativeReferenceReject::AccessDenied)?;
-    prune_nonces(context, now).await;
+    drive(
+        SpendNonceOperation::new(delegation.nonce, expires, now),
+        context,
+    )
+    .await
+    .map_err(|_| NativeReferenceReject::AccessDenied)?;
     let auth_context = AuthContext {
         user_id: delegation.user_id,
         realm_id: delegation.realm_id,

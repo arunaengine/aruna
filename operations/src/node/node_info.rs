@@ -1214,6 +1214,15 @@ pub async fn read_info_documents(
     Ok(documents)
 }
 
+/// The published endpoints of a node, from its info document.
+pub async fn node_urls(ctx: &DriverContext, node_id: NodeId) -> Option<NodeUrls> {
+    read_info_documents(ctx, &[node_id])
+        .await
+        .ok()?
+        .remove(&node_id)
+        .map(|document| document.urls)
+}
+
 /// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
 /// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
 /// forward past the handler's own post-run re-arm.

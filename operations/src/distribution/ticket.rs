@@ -18,8 +18,8 @@ use aruna_core::structs::storage::distribution::ticket::{
 use thiserror::Error;
 
 use crate::auth::bearer_token::grant_valid;
-use crate::distribution::delegate::{DelegateError, prune_nonces, spend_nonce};
-use crate::driver::DriverContext;
+use crate::distribution::delegate::{DelegateError, SpendNonceOperation};
+use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
 
@@ -100,13 +100,15 @@ pub async fn redeem_ticket(
         Err(_) => return Err(RedeemError::Unavailable),
     }
     let expires = ticket.expires_at.saturating_add(SPENT_MARGIN_SECS);
-    spend_nonce(context, ticket.nonce, expires)
-        .await
-        .map_err(|error| match error {
-            DelegateError::Replayed => RedeemError::Replayed,
-            _ => RedeemError::Unavailable,
-        })?;
-    prune_nonces(context, now).await;
+    drive(
+        SpendNonceOperation::new(ticket.nonce, expires, now),
+        context,
+    )
+    .await
+    .map_err(|error| match error {
+        DelegateError::Replayed => RedeemError::Replayed,
+        _ => RedeemError::Unavailable,
+    })?;
     Ok(AuthContext {
         user_id: ticket.user_id,
         realm_id,

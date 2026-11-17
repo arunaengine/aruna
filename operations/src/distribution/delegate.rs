@@ -10,20 +10,21 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::DELEGATION_NONCE_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::storage::distribution::delegation::{
     BodyTrailer, Delegation, DelegationError, MAX_VALID_SECS, Payload, SignedDelegation,
 };
-use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_core::types::GroupId;
+use aruna_core::types::{Effects, GroupId, TxnId};
+use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
 
@@ -135,8 +136,11 @@ pub async fn accept_delegation(
         return Err(DelegateError::Issuer);
     }
     let expires = delegation.issued_at.saturating_add(2 * MAX_VALID_SECS);
-    spend_nonce(context, delegation.nonce, expires).await?;
-    prune_nonces(context, now).await;
+    drive(
+        SpendNonceOperation::new(delegation.nonce, expires, now),
+        context,
+    )
+    .await?;
     Ok(delegation)
 }
 
@@ -147,126 +151,405 @@ fn nonce_key(expires: u64, nonce: [u8; 16]) -> Vec<u8> {
     key
 }
 
-async fn storage(context: &DriverContext, effect: StorageEffect) -> Result<Event, DelegateError> {
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(match error {
-            StorageError::TransactionConflict => DelegateError::Replayed,
-            _ => DelegateError::Unavailable,
-        }),
-        event => Ok(event),
-    }
+/// Records a nonce as spent in one transaction, durably until it expires, so a restart never
+/// accepts it again; then deletes one bounded page of nonce rows that expired before `now`.
+/// A failed prune does not fail the spend.
+#[derive(Debug, PartialEq)]
+pub struct SpendNonceOperation {
+    key: Vec<u8>,
+    now: u64,
+    state: SpendState,
+    txn_id: Option<TxnId>,
+    output: Option<Result<(), DelegateError>>,
 }
 
-/// Records a nonce as spent in one transaction, durably until it expires; a restart never
-/// accepts it again.
-pub async fn spend_nonce(
-    context: &DriverContext,
-    nonce: [u8; 16],
-    expires: u64,
-) -> Result<(), DelegateError> {
-    let start = StorageEffect::StartTransaction { read: false };
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
-        storage(context, start).await?
-    else {
-        return Err(DelegateError::Unavailable);
-    };
-    let key = nonce_key(expires, nonce);
-    let read = StorageEffect::Read {
-        key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
-        key: key.clone().into(),
-        txn_id: Some(txn_id),
-    };
-    let spent = match storage(context, read).await {
-        Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => Ok(value.is_some()),
-        Ok(_) => Err(DelegateError::Unavailable),
-        Err(error) => Err(error),
-    };
-    let write = StorageEffect::Write {
-        key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
-        key: key.into(),
-        value: Vec::new().into(),
-        txn_id: Some(txn_id),
-    };
-    let written = match spent {
-        Ok(false) => storage(context, write).await.map(|_| ()),
-        Ok(true) => Err(DelegateError::Replayed),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = written {
-        let _ = storage(context, StorageEffect::AbortTransaction { txn_id }).await;
-        return Err(error);
-    }
-    storage(context, StorageEffect::CommitTransaction { txn_id })
-        .await
-        .map(|_| ())
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpendState {
+    Init,
+    Start,
+    Read,
+    Write,
+    Commit,
+    Abort,
+    Page,
+    Prune,
+    Finish,
+    Error,
 }
 
-/// Deletes one bounded page of nonce rows that expired before `now`.
-pub async fn prune_nonces(context: &DriverContext, now: u64) {
-    let page = StorageEffect::Iter {
-        key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: PRUNE_PAGE,
-        txn_id: None,
-    };
-    let Ok(Event::Storage(StorageEvent::IterResult { values, .. })) = storage(context, page).await
-    else {
-        return;
-    };
-    let deletes: Vec<_> = values
-        .into_iter()
-        .filter(|(key, _)| {
-            key.get(..8)
-                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
-                .is_some_and(|expires| u64::from_be_bytes(expires) < now)
-        })
-        .map(|(key, _)| (DELEGATION_NONCE_KEYSPACE.to_string(), key))
-        .collect();
-    if !deletes.is_empty() {
-        let delete = StorageEffect::BatchDelete {
-            deletes,
+impl SpendNonceOperation {
+    pub fn new(nonce: [u8; 16], expires: u64, now: u64) -> Self {
+        Self {
+            key: nonce_key(expires, nonce),
+            now,
+            state: SpendState::Init,
             txn_id: None,
-        };
-        let _ = storage(context, delete).await;
+            output: None,
+        }
+    }
+
+    fn storage(&mut self, state: SpendState, effect: StorageEffect) -> Effects {
+        self.state = state;
+        smallvec![Effect::Storage(effect)]
+    }
+
+    /// Aborts the open transaction, if any, and ends with `error`.
+    fn fail(&mut self, error: DelegateError) -> Effects {
+        self.output = Some(Err(error));
+        match self.txn_id.take() {
+            Some(txn_id) => self.storage(
+                SpendState::Abort,
+                StorageEffect::AbortTransaction { txn_id },
+            ),
+            None => {
+                self.state = SpendState::Error;
+                smallvec![]
+            }
+        }
+    }
+
+    fn done(&mut self) -> Effects {
+        self.state = SpendState::Finish;
+        smallvec![]
     }
 }
 
-/// The published endpoints of a node, from its info document.
-pub async fn node_urls(context: &DriverContext, node_id: NodeId) -> Option<NodeUrls> {
-    crate::node::node_info::read_info_documents(context, &[node_id])
-        .await
-        .ok()?
-        .remove(&node_id)
-        .map(|document| document.urls)
+/// A storage failure while spending: a conflict means another acceptance spent the nonce.
+fn spend_error(error: StorageError) -> DelegateError {
+    match error {
+        StorageError::TransactionConflict => DelegateError::Replayed,
+        _ => DelegateError::Unavailable,
+    }
+}
+
+impl Operation for SpendNonceOperation {
+    type Output = ();
+    type Error = DelegateError;
+
+    fn start(&mut self) -> Effects {
+        self.storage(
+            SpendState::Start,
+            StorageEffect::StartTransaction { read: false },
+        )
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let Event::Storage(event) = event else {
+            return self.fail(DelegateError::Unavailable);
+        };
+        match (self.state, event) {
+            (SpendState::Start, StorageEvent::TransactionStarted { txn_id }) => {
+                self.txn_id = Some(txn_id);
+                let read = StorageEffect::Read {
+                    key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+                    key: self.key.clone().into(),
+                    txn_id: Some(txn_id),
+                };
+                self.storage(SpendState::Read, read)
+            }
+            (SpendState::Read, StorageEvent::ReadResult { value: Some(_), .. }) => {
+                self.fail(DelegateError::Replayed)
+            }
+            (SpendState::Read, StorageEvent::ReadResult { value: None, .. }) => {
+                let write = StorageEffect::Write {
+                    key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+                    key: self.key.clone().into(),
+                    value: Vec::new().into(),
+                    txn_id: self.txn_id,
+                };
+                self.storage(SpendState::Write, write)
+            }
+            (SpendState::Write, StorageEvent::WriteResult { .. }) => match self.txn_id.take() {
+                Some(txn_id) => self.storage(
+                    SpendState::Commit,
+                    StorageEffect::CommitTransaction { txn_id },
+                ),
+                None => self.fail(DelegateError::Unavailable),
+            },
+            (SpendState::Commit, StorageEvent::TransactionCommitted { .. }) => {
+                self.output = Some(Ok(()));
+                let page = StorageEffect::Iter {
+                    key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+                    prefix: None,
+                    start: None,
+                    limit: PRUNE_PAGE,
+                    txn_id: None,
+                };
+                self.storage(SpendState::Page, page)
+            }
+            (SpendState::Page, StorageEvent::IterResult { values, .. }) => {
+                let deletes: Vec<_> = values
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        key.get(..8)
+                            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                            .is_some_and(|expires| u64::from_be_bytes(expires) < self.now)
+                    })
+                    .map(|(key, _)| (DELEGATION_NONCE_KEYSPACE.to_string(), key))
+                    .collect();
+                if deletes.is_empty() {
+                    return self.done();
+                }
+                let delete = StorageEffect::BatchDelete {
+                    deletes,
+                    txn_id: None,
+                };
+                self.storage(SpendState::Prune, delete)
+            }
+            (SpendState::Page | SpendState::Prune, StorageEvent::Error { .. })
+            | (SpendState::Prune, StorageEvent::BatchDeleteResult { .. }) => self.done(),
+            (SpendState::Abort, _) => {
+                self.state = SpendState::Error;
+                smallvec![]
+            }
+            (SpendState::Commit, StorageEvent::Error { error }) => {
+                // A failed commit leaves no transaction to abort.
+                self.txn_id = None;
+                self.fail(spend_error(error))
+            }
+            (_, StorageEvent::Error { error }) => self.fail(spend_error(error)),
+            (_, _) => self.fail(DelegateError::Unavailable),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, SpendState::Finish | SpendState::Error)
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match self.state {
+            SpendState::Finish | SpendState::Error => {
+                self.output.unwrap_or(Err(DelegateError::Unavailable))
+            }
+            _ => Err(DelegateError::Unavailable),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::distribution::test_store::{context, get, open};
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    async fn spend(
+        context: &DriverContext,
+        nonce: u8,
+        expires: u64,
+        now: u64,
+    ) -> Result<(), DelegateError> {
+        drive(SpendNonceOperation::new([nonce; 16], expires, now), context).await
+    }
 
     #[tokio::test]
     async fn nonces_spend_once() {
         let (_dir, handle) = open();
         let context = context(&handle);
-        assert_eq!(spend_nonce(&context, [1; 16], 50).await, Ok(()));
+        assert_eq!(spend(&context, 1, 50, 0).await, Ok(()));
         assert_eq!(
-            spend_nonce(&context, [1; 16], 50).await,
+            spend(&context, 1, 50, 0).await,
             Err(DelegateError::Replayed)
         );
-        assert_eq!(spend_nonce(&context, [2; 16], 50).await, Ok(()));
+        assert_eq!(spend(&context, 2, 50, 0).await, Ok(()));
     }
 
     #[tokio::test]
     async fn expired_nonces_pruned() {
         let (_dir, handle) = open();
         let context = context(&handle);
-        spend_nonce(&context, [1; 16], 10).await.unwrap();
-        spend_nonce(&context, [2; 16], 90).await.unwrap();
-        prune_nonces(&context, 50).await;
+        spend(&context, 1, 10, 0).await.unwrap();
+        spend(&context, 2, 90, 50).await.unwrap();
         let key = DELEGATION_NONCE_KEYSPACE;
         assert!(get(&handle, key, nonce_key(10, [1; 16])).await.is_none());
         assert!(get(&handle, key, nonce_key(90, [2; 16])).await.is_some());
+    }
+
+    const TXN: TxnId = Ulid::from_bytes([9; 16]);
+
+    fn stored(event: StorageEvent) -> Event {
+        Event::Storage(event)
+    }
+
+    fn nonce_row(expires: u64) -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+            key: nonce_key(expires, [1; 16]).into(),
+            txn_id: Some(TXN),
+        })
+    }
+
+    fn prune_page() -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+            prefix: None,
+            start: None,
+            limit: PRUNE_PAGE,
+            txn_id: None,
+        })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    // A fresh nonce is written and committed, then expired rows are deleted.
+    #[test]
+    fn spends_and_prunes() {
+        let key = nonce_key(50, [1; 16]);
+        let expired = nonce_key(10, [2; 16]);
+        let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
+        check_trace(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    stored(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![nonce_row(50)],
+                ),
+                (
+                    stored(StorageEvent::ReadResult {
+                        key: key.clone().into(),
+                        value: None,
+                    }),
+                    vec![Effect::Storage(StorageEffect::Write {
+                        key_space: DELEGATION_NONCE_KEYSPACE.to_string(),
+                        key: key.clone().into(),
+                        value: Vec::new().into(),
+                        txn_id: Some(TXN),
+                    })],
+                ),
+                (
+                    stored(StorageEvent::WriteResult {
+                        key: key.clone().into(),
+                    }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: TXN,
+                    })],
+                ),
+                (
+                    stored(StorageEvent::TransactionCommitted { txn_id: TXN }),
+                    vec![prune_page()],
+                ),
+                (
+                    stored(StorageEvent::IterResult {
+                        values: vec![
+                            (expired.clone().into(), Vec::new().into()),
+                            (key.into(), Vec::new().into()),
+                        ],
+                        next_start_after: None,
+                    }),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes: vec![(DELEGATION_NONCE_KEYSPACE.to_string(), expired.into())],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    stored(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    Vec::new(),
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    // A spent nonce aborts the transaction and reports a replay; a failed prune keeps the spend.
+    #[test]
+    fn replay_aborts() {
+        let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
+        operation.start();
+        operation.step(stored(StorageEvent::TransactionStarted { txn_id: TXN }));
+        let read = StorageEvent::ReadResult {
+            key: nonce_key(50, [1; 16]).into(),
+            value: Some(Vec::new().into()),
+        };
+        assert_eq!(operation.step(stored(read)).as_slice(), [abort()]);
+        assert!(!operation.is_complete());
+        operation.step(stored(StorageEvent::TransactionAborted { txn_id: TXN }));
+        assert_eq!(operation.finalize(), Err(DelegateError::Replayed));
+
+        let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
+        operation.start();
+        operation.step(stored(StorageEvent::TransactionStarted { txn_id: TXN }));
+        operation.step(stored(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+        operation.step(stored(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+        operation.step(stored(StorageEvent::TransactionCommitted { txn_id: TXN }));
+        let error = StorageError::Timeout;
+        assert!(
+            operation
+                .step(stored(StorageEvent::Error { error }))
+                .is_empty()
+        );
+        assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    // A conflict is a replay, other failures leave the nonce unspent; a failed commit has no
+    // transaction left to abort.
+    #[test]
+    fn storage_errors_map() {
+        let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
+        operation.start();
+        let error = StorageError::TransactionConflict;
+        assert!(
+            operation
+                .step(stored(StorageEvent::Error { error }))
+                .is_empty()
+        );
+        assert_eq!(operation.finalize(), Err(DelegateError::Replayed));
+
+        let mut operation = SpendNonceOperation::new([1; 16], 50, 40);
+        operation.start();
+        operation.step(stored(StorageEvent::TransactionStarted { txn_id: TXN }));
+        operation.step(stored(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        }));
+        operation.step(stored(StorageEvent::WriteResult {
+            key: Vec::new().into(),
+        }));
+        let error = StorageError::Timeout;
+        assert!(
+            operation
+                .step(stored(StorageEvent::Error { error }))
+                .is_empty()
+        );
+        assert_eq!(operation.finalize(), Err(DelegateError::Unavailable));
+    }
+
+    // Events outside each phase are refused; abort ends an open transaction.
+    #[test]
+    fn rejects_unexpected() {
+        let fresh = || SpendNonceOperation::new([1; 16], 50, 40);
+        assert_eq!(
+            rejects_events(fresh, sample_events, |_| false).len(),
+            sample_events().len()
+        );
+        let reading = || {
+            let mut operation = fresh();
+            operation.start();
+            operation.step(stored(StorageEvent::TransactionStarted { txn_id: TXN }));
+            operation
+        };
+        let mut operation = reading();
+        assert_eq!(operation.step(Event::Search()).as_slice(), [abort()]);
+        let mut operation = reading();
+        assert_eq!(operation.abort().as_slice(), [abort()]);
+        assert!(fresh().abort().is_empty());
+        rejects_finalize(fresh());
+        rejects_finalize(reading());
     }
 }

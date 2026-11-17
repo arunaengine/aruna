@@ -18,6 +18,7 @@ use aruna_core::structs::storage::share::{
     TicketBody, client_network,
 };
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::distribution::delegate::SpendNonceOperation;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, get_object_routed};
@@ -724,10 +725,8 @@ pub async fn download_file(
     )
     .await?;
     let ctx = state.get_ctx();
-    aruna_operations::distribution::delegate::spend_nonce(&ctx, ticket.nonce, ticket.expires_at)
-        .await
-        .map_err(|_| unavailable())?;
-    aruna_operations::distribution::delegate::prune_nonces(&ctx, now).await;
+    let spend = SpendNonceOperation::new(ticket.nonce, ticket.expires_at, now);
+    drive(spend, &ctx).await.map_err(|_| unavailable())?;
     let permit = download::admit(&state, LocalKey::Ip(ip)).map_err(|error| match error {
         AdmissionError::Total => {
             ServerError::ServiceUnavailableReason("download capacity exhausted".into())
