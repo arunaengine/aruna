@@ -14,8 +14,7 @@ use std::collections::BTreeMap;
 
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done};
-use super::store::{Rows, StoreError, decode};
+use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, Rows, StoreError, decode};
 
 /// How a row's install stands in the realm config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

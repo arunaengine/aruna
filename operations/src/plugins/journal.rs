@@ -5,13 +5,11 @@
 
 use aruna_core::keyspaces::EVENT_JOURNAL_KEYSPACE;
 use aruna_core::plugin_runs::{
-    DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent,
-    journal_entries, journal_key,
+    DEDUP_RETENTION_MS, JOURNAL_RETENTION_MS, JOURNAL_ROW, SOURCE_ROW, SourceEvent, journal_key,
 };
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, unexpected};
-use super::store::StoreError;
+use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, unexpected, StoreError};
 
 /// Rows a journal page holds at most.
 pub const JOURNAL_PAGE: usize = 500;
@@ -151,6 +149,14 @@ impl Plan for PruneJournal {
             }
         }
     }
+}
+
+/// The journal rows this node has not matched yet, at most a hundred.
+#[cfg(test)]
+pub(crate) async fn pending_events(ctx: &crate::driver::DriverContext) -> Vec<SourceEvent> {
+    let page = journal_page(aruna_core::plugin_runs::PENDING_ROW, None, 100);
+    let (rows, _) = crate::driver::drive(page, ctx).await.unwrap();
+    rows.into_iter().map(|(_, event)| event).collect()
 }
 
 #[cfg(test)]

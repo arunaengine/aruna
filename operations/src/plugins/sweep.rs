@@ -18,8 +18,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::account::read_row;
-use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, unexpected};
-use super::store::StoreError;
+use super::rows::{Answer, Ask, Plan, RowsOperation, Turn, unexpected, StoreError};
 use crate::driver::{DriverContext, drive};
 use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
 

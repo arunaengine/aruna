@@ -1641,14 +1641,7 @@ mod tests {
 
     /// The plugin journal rows this node has not matched yet.
     async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
-        let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let page = crate::plugins::journal::journal_page(pending, None, 100);
-        let page = crate::driver::drive(page, context).await;
-        page.unwrap()
-            .0
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect()
+        crate::plugins::journal::pending_events(context).await
     }
 
     async fn stored(context: &DriverContext, relationship: &SyncRelationship) {

@@ -14,8 +14,7 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use super::ArtifactBytes;
 use super::artifacts::ArtifactError;
-use super::rows::{self, Row, Scan, read_rows, row, sync_all, writes};
-use super::store::StoreError;
+use super::rows::{self, Row, Scan, read_rows, row, sync_all, writes, StoreError};
 use crate::driver::{DriverContext, drive};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.

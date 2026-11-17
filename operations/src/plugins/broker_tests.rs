@@ -1577,7 +1577,7 @@ async fn unprojected_event_refused() {
     let txn = Txn::direct(&broker.ctx);
     let logged = (
         event_log_key(document, event.event_id).to_vec(),
-        crate::plugins::store::encode(&event).unwrap(),
+        crate::plugins::rows::encode(&event).unwrap(),
     );
     txn.write(EVENT_LOG_KEYSPACE, vec![logged]).await.unwrap();
     let marker = (

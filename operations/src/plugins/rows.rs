@@ -8,7 +8,21 @@ use aruna_core::operation::Operation;
 use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
 use smallvec::smallvec;
 
-use super::store::{Rows, StoreError};
+
+/// A storage failure, with the event that was not expected.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("plugin run storage failed: {0}")]
+pub struct StoreError(pub String);
+
+pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
+
+pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
+    postcard::to_allocvec(value).map_err(|error| StoreError(error.to_string()))
+}
+
+pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
+    postcard::from_bytes(bytes).map_err(|error| StoreError(error.to_string()))
+}
 
 /// One storage request of a plan.
 #[derive(Clone, Debug, PartialEq, Eq)]

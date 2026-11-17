@@ -9,8 +9,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::intents::settled_row;
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, row, unexpected, values};
-use super::store::{StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, row, unexpected, values, StoreError, decode, encode};
 
 /// Bytes of one key, of one value, and of all keys and values of one install.
 pub const MAX_STATE_KEY: usize = 256;

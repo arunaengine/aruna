@@ -7,7 +7,7 @@ use super::*;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::worker::match_journal;
 use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
-use crate::plugins::store::decode;
+use crate::plugins::rows::decode;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced,
 };

@@ -24,14 +24,12 @@ use ulid::Ulid;
 use super::account::prerequisites_held;
 use super::artifacts::local_config;
 use super::check::{RunScope, check_call};
-use super::dispatch::{event_run, event_trigger};
+use super::dispatch::event_run;
+use super::matcher::event_trigger;
 use super::forward::{Decisions, EventBatch, Outcome};
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values,
-};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row as row_of, unexpected, values, Rows, StoreError, decode, encode};
 use super::runs::{ADMISSIONS, Admission, RunError};
-use super::store::{Rows, StoreError, decode, encode};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::mutate_placement::node_kind;

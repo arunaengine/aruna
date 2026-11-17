@@ -12,7 +12,7 @@ use aruna_core::time::unix_timestamp_millis;
 use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
-use crate::plugins::store::encode;
+use crate::plugins::rows::encode;
 use crate::plugins::worker::tests::{created, installed, worker};
 
 async fn count(fixture: &Fixture, space: &str) -> usize {

@@ -26,11 +26,7 @@ use ulid::Ulid;
 
 use super::matcher::Outbox;
 use super::receiver::lost_reason;
-use super::rows::{
-    Answer, Ask, Plan, RowsOperation, Scan, Turn, done, row as row_of, scan_rows, unexpected,
-    values,
-};
-use super::store::{Rows, StoreError, decode, encode};
+use super::rows::{Answer, Ask, Plan, RowsOperation, Scan, Turn, done, row as row_of, scan_rows, unexpected, values, Rows, StoreError, decode, encode};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::dot_applied;
 

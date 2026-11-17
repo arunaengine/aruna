@@ -23,9 +23,8 @@ use super::install::{pick_version, read_config, read_manifest};
 use super::rate::take_hook;
 use super::receiver::lost_reason;
 use super::release::{ReleaseKeys, ReleaseRequest};
-use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values};
+use super::rows::{Answer, Ask, Plan, Row, RowsOperation, Turn, done, row, values, encode};
 use super::runs::{ADMISSIONS, Admission, RunError};
-use super::store::encode;
 use crate::driver::{DriverContext, drive};
 
 /// Headers removed before a request is stored: hop-by-hop ones and the relay mark. The check
