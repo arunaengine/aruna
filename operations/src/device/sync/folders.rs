@@ -39,8 +39,8 @@ use crate::staging::offered_directory::{
 };
 
 use super::repository::{
-    MAX_SYNCED_FOLDERS, SyncUpload, bucket_folder, folder_bucket, folder_entry, folder_key,
-    key_path, scan_folder, scan_folders,
+    MAX_SYNCED_FOLDERS, SyncUpload, folder_bucket, folder_entry, folder_key, key_path, scan_folder,
+    scan_folders,
 };
 use super::rows::{
     abort_txn, commit_txn, delete_rows, read_value, scan_page, start_txn, sync_all, write_rows,
