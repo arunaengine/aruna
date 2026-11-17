@@ -407,3 +407,155 @@ where
     }
 }
 
+/// The run crate a settled execution owes: its writer job and a pending crate status.
+fn crate_obligation(record: &JobRecord) -> Result<JobWrites, JobMutationError> {
+    let JobPayload::Execution(spec) = &record.payload else {
+        return Ok(Vec::new());
+    };
+    // A stopped notebook session keeps its report; it is no run to describe.
+    if session_of(spec).is_some() {
+        return Ok(Vec::new());
+    }
+    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    let mut child = JobRecord::new(
+        crate_job_id(record.job_id),
+        JobPayload::WriteRunCrate {
+            for_job: record.job_id,
+        },
+        record.created_by,
+        record.owner_node_id,
+        now_ms,
+        now_ms,
+        Some(crate_dedup_key(record.job_id)),
+    );
+    child.retention_ms = record.retention_ms;
+    let storage = |error: ConversionError| JobMutationError::Storage(error.to_string());
+    let mut writes = job_insert_entries(&child).map_err(storage)?;
+    let pending = RunCrateStatus::Pending.to_bytes().map_err(storage)?;
+    writes.push((
+        RUN_CRATE_KEYSPACE.to_string(),
+        run_crate_key(record.job_id),
+        ByteView::from(pending),
+    ));
+    Ok(writes)
+}
+
+/// The cleanup job of a settled execution, which revokes its workspace credential.
+fn cleanup_obligation(record: &JobRecord) -> Result<JobWrites, JobMutationError> {
+    if !matches!(&record.payload, JobPayload::Execution(_)) {
+        return Ok(Vec::new());
+    }
+    let access_key = UserAccess::build_access_key(&workspace_credential_id(record.job_id))
+        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+    let now_ms = record.finished_at_ms.unwrap_or(record.updated_at_ms);
+    let mut child = JobRecord::new(
+        cleanup_job_id(record.job_id),
+        JobPayload::TerminalCleanup {
+            for_job: record.job_id,
+            attempt: record.attempt_intent.clone(),
+            access_key,
+        },
+        record.created_by,
+        record.owner_node_id,
+        now_ms,
+        now_ms,
+        Some(cleanup_dedup_key(record.job_id)),
+    );
+    child.retention_ms = record.retention_ms;
+    job_insert_entries(&child).map_err(|error| JobMutationError::Storage(error.to_string()))
+}
+
+fn missing() -> JobMutationError {
+    JobMutationError::Storage("job mutation lost its record".to_string())
+}
+
+fn unexpected(result: &IoResult) -> JobMutationError {
+    JobMutationError::Storage(format!(
+        "unexpected job mutation result: {}",
+        result.label()
+    ))
+}
+
+/// One job mutation in its own write transaction. A lost conflict is retried by the caller with
+/// a fresh run, so the closures run again on the current row.
+pub(crate) struct MutateJobOperation<F, G>(MutateJobCalls<F, G>);
+
+impl<F, G> std::fmt::Debug for MutateJobOperation<F, G> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl<F, G> PartialEq for MutateJobOperation<F, G> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<F, G> MutateJobOperation<F, G>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError>,
+{
+    pub(crate) fn new(job_id: JobId, mutate: F, guard: Option<G>) -> Self {
+        Self(MutateJobCalls::new(job_id, mutate, guard))
+    }
+}
+
+impl<F, G> Operation for MutateJobOperation<F, G>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
+    G: FnMut(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError> + Send,
+{
+    type Output = JobRecord;
+    type Error = JobMutationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Mutated {
+        self.0.first()
+    }
+
+    fn next(&mut self, result: IoResult) -> Mutated {
+        self.0.next(result)
+    }
+}
+
+/// A mutation without a guard names this guard type.
+pub(crate) type NoGuard = fn(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError>;
+
+/// What one attempt of a job write leaves: `None` after a lost conflict that is retried, once
+/// a short growing pause passed; otherwise the result, or the `exhausted` error after the last
+/// of [`MUTATE_MAX_ATTEMPTS`] attempts.
+pub(crate) async fn settle_attempt<T>(
+    result: Result<T, JobMutationError>,
+    attempt: u32,
+    exhausted: &str,
+) -> Option<Result<T, JobMutationError>> {
+    match result {
+        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
+            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+            None
+        }
+        Err(JobMutationError::Conflict) => {
+            Some(Err(JobMutationError::Storage(exhausted.to_string())))
+        }
+        other => Some(other),
+    }
+}
+
+/// Forwards a call of folded job mutation calls; only calls and the outcome come from them.
+pub(crate) fn forward<T>(next: Next<JobRecord>) -> Result<Next<T>, JobMutationError> {
+    match next {
+        Next::Call(call) => Ok(Next::Call(call)),
+        other => Err(JobMutationError::Storage(format!(
+            "job mutation calls ended early: {}",
+            match other {
+                Next::Wait => "Next::Wait",
+                _ => "an outcome",
+            }
+        ))),
+    }
+}

@@ -297,7 +297,7 @@ async fn commit_success<G>(
     mut gate: G,
 ) -> Result<JobRecord, JobMutationError>
 where
-    G: FnMut(&JobRecord) -> JobMutation,
+    G: FnMut(&JobRecord) -> JobMutation + Send,
 {
     let proof = result.clone();
     mutate_job_guarded(
