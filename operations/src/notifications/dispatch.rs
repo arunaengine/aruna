@@ -5,10 +5,8 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;
+use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord,
-};
 use aruna_core::structs::execution::notification_watch::{
     WatchAuthorizationBinding, WatchEventMask, WatchInterestEntry, WatchSubscription,
 };
@@ -23,17 +21,10 @@ use crate::notifications::client::{
     HolderRequestOperation, listed, marked_read, unread_counted, watch_created, watch_deleted,
     watches_listed,
 };
-use crate::notifications::list::{
-    LIST_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation, SCAN_MAX_ROWS,
-    UNREAD_COUNT_CAP,
-};
-use crate::notifications::mark_read::{MarkReadInput, MarkReadOperation};
+use crate::notifications::holder::{HolderAnswer, HolderRead, HolderReadOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::watch::authorization::{
-    authorize_notification, list_authorized_subscriptions,
-};
+use crate::notifications::watch::authorization::list_authorized_subscriptions;
 use crate::notifications::watch::digest::InterestOperation;
-use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
     WatchSubscriptionError,
@@ -140,9 +131,13 @@ pub async fn list_for_user(
 ) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        list_on_holder(context, recipient, cursor, limit)
-            .await
-            .map_err(NotificationDispatchError::Internal)
+        match read_on_holder(context, recipient, HolderRead::List { cursor, limit }).await? {
+            HolderAnswer::Listed {
+                records,
+                next_cursor,
+            } => Ok((records, next_cursor)),
+            other => Err(other_answer(other)),
+        }
     } else {
         context
             .net_handle
@@ -159,110 +154,18 @@ pub async fn list_for_user(
     }
 }
 
-async fn notification_is_visible(
+/// Reads `recipient`'s inbox on this node, its holder, as the recipient sees it.
+async fn read_on_holder(
     context: &DriverContext,
     recipient: UserId,
-    record: &NotificationRecord,
-) -> Result<bool, String> {
-    if !matches!(
-        record.kind,
-        NotificationKind::MetadataCreated { .. }
-            | NotificationKind::DataUploaded { .. }
-            | NotificationKind::SyncCompleted { .. }
-            | NotificationKind::SyncFailed { .. }
-    ) {
-        return Ok(record.watch_authorization.is_none());
-    }
-    let Some(authorization) = record.watch_authorization.as_ref() else {
-        return Ok(false);
-    };
-    if record.class != NotificationClass::Transient || record.recipient != recipient {
-        return Ok(false);
-    }
-    match authorize_notification(context, recipient, &record.kind, authorization).await? {
-        WatchAuthorization::Authorized => Ok(true),
-        WatchAuthorization::Denied(_) => Ok(false),
-        WatchAuthorization::Unavailable(error) => Err(error),
-    }
+    read: HolderRead,
+) -> Result<HolderAnswer, NotificationDispatchError> {
+    let answer = drive(HolderReadOperation::new(recipient, read), context).await;
+    answer.map_err(|error| NotificationDispatchError::Internal(error.to_string()))
 }
 
-/// Reauthorizes persisted resource-watch records at the inbox-holder boundary.
-/// Suppressed rows do not consume the caller's page, so revocation cannot hide
-/// older ordinary notifications behind a page of stale watch records.
-pub(crate) async fn list_on_holder(
-    context: &DriverContext,
-    recipient: UserId,
-    mut cursor: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
-    let limit = limit.clamp(1, LIST_MAX_LIMIT);
-    let mut records = Vec::with_capacity(limit);
-
-    loop {
-        let output = drive(
-            ListNotificationsOperation::new(ListNotificationsInput {
-                recipient,
-                cursor,
-                limit: limit - records.len(),
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-
-        for record in output.records {
-            if notification_is_visible(context, recipient, &record).await? {
-                records.push(record);
-            }
-        }
-
-        if records.len() == limit || output.next_cursor.is_none() {
-            return Ok((records, output.next_cursor));
-        }
-        cursor = output.next_cursor;
-    }
-}
-
-pub(crate) async fn unread_on_holder(
-    context: &DriverContext,
-    recipient: UserId,
-) -> Result<(u32, bool), String> {
-    let mut cursor = None;
-    let mut count = 0usize;
-    let mut examined = 0usize;
-
-    loop {
-        let output = drive(
-            ListNotificationsOperation::new(ListNotificationsInput {
-                recipient,
-                cursor,
-                limit: UNREAD_COUNT_CAP.min(SCAN_MAX_ROWS - examined),
-            }),
-            context,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        examined += output.records.len();
-
-        for record in output.records {
-            if record.read_at_ms.is_none()
-                && notification_is_visible(context, recipient, &record).await?
-            {
-                if count == UNREAD_COUNT_CAP {
-                    return Ok((count as u32, true));
-                }
-                count += 1;
-            }
-        }
-
-        if examined >= SCAN_MAX_ROWS && output.next_cursor.is_some() {
-            return Ok((count as u32, true));
-        }
-        match output.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok((count as u32, false)),
-        }
-    }
+fn other_answer(answer: HolderAnswer) -> NotificationDispatchError {
+    NotificationDispatchError::Internal(format!("unexpected holder answer {answer:?}"))
 }
 
 pub async fn unread_for_user(
@@ -272,9 +175,10 @@ pub async fn unread_for_user(
 ) -> Result<(u32, bool), NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        unread_on_holder(context, recipient)
-            .await
-            .map_err(NotificationDispatchError::Internal)
+        match read_on_holder(context, recipient, HolderRead::Unread).await? {
+            HolderAnswer::Unread { count, capped } => Ok((count, capped)),
+            other => Err(other_answer(other)),
+        }
     } else {
         context
             .net_handle
@@ -295,9 +199,16 @@ pub async fn mark_for_user(
 ) -> Result<u32, NotificationDispatchError> {
     let holder = resolve_holder(context, recipient).await?;
     if holder == local_node_id {
-        let marked = mark_on_holder(context, recipient, ids, up_to_ms)
-            .await
-            .map_err(NotificationDispatchError::Internal)?;
+        let now_ms = unix_timestamp_millis();
+        let mark = HolderRead::Mark {
+            ids,
+            up_to_ms,
+            now_ms,
+        };
+        let marked = match read_on_holder(context, recipient, mark).await? {
+            HolderAnswer::Marked(marked) => marked,
+            other => return Err(other_answer(other)),
+        };
         if marked > 0
             && let Some(net_handle) = context.net_handle.as_ref()
         {
@@ -316,56 +227,6 @@ pub async fn mark_for_user(
         };
         let answer = drive(HolderRequestOperation::new(holder, mark), context).await;
         marked_read(answer).map_err(NotificationDispatchError::Remote)
-    }
-}
-
-pub(crate) async fn mark_on_holder(
-    context: &DriverContext,
-    recipient: UserId,
-    mut ids: Vec<Ulid>,
-    up_to_ms: Option<u64>,
-) -> Result<u32, String> {
-    if ids.len() > crate::notifications::mark_read::MARK_MAX_IDS {
-        return Err("mark read id count exceeds cap".to_string());
-    }
-    if ids.is_empty() && up_to_ms.is_none() {
-        return Ok(0);
-    }
-    ids.sort_unstable();
-    ids.dedup();
-    let mut cursor = None;
-    let mut marked = 0u32;
-    let now_ms = unix_timestamp_millis();
-    loop {
-        let (records, next_cursor) =
-            list_on_holder(context, recipient, cursor, LIST_MAX_LIMIT).await?;
-        let visible_ids: Vec<_> = records
-            .into_iter()
-            .filter(|record| {
-                record.read_at_ms.is_none()
-                    && (ids.binary_search(&record.notification_id).is_ok()
-                        || up_to_ms.is_some_and(|limit| record.created_at_ms <= limit))
-            })
-            .map(|record| record.notification_id)
-            .collect();
-        for chunk in visible_ids.chunks(crate::notifications::mark_read::MARK_MAX_IDS) {
-            marked += drive(
-                MarkReadOperation::new(MarkReadInput {
-                    recipient,
-                    ids: chunk.to_vec(),
-                    up_to_ms: None,
-                    now_ms,
-                }),
-                context,
-            )
-            .await
-            .map_err(|error| error.to_string())?
-            .marked as u32;
-        }
-        match next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return Ok(marked),
-        }
     }
 }
 
