@@ -5,6 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::types::{Key, KeySpace, Value};
 
 /// A storage failure, with the answer that was not expected.
@@ -25,7 +26,7 @@ pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
 }
 
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
-    postcard::from_bytes(bytes).map_err(|error| StoreError(error.to_string()))
+    Ok(rows::decode(bytes)?)
 }
 
 /// A read of these rows, in this order.
@@ -282,30 +283,25 @@ impl Operation for Change {
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
-        match answer {
-            IoResult::Done => Ok(Next::Done(())),
-            other => Err(unexpected(other)),
-        }
+        done(answer)?;
+        Ok(Next::Done(()))
     }
 }
 
 /// The `N` values of a read of `N` rows.
 pub fn values<const N: usize>(result: IoResult) -> Result<[Option<Vec<u8>>; N], StoreError> {
-    <[_; N]>::try_from(all_values(result)?)
-        .map_err(|values| StoreError(format!("{} values for {N} rows", values.len())))
+    let values = rows::values::<N>(result)?;
+    Ok(values.map(|value| value.map(|value| value.to_vec())))
 }
 
 /// Checks that a write or delete was answered.
 pub fn done(result: IoResult) -> Result<(), StoreError> {
-    match result {
-        IoResult::Done => Ok(()),
-        other => Err(unexpected(other)),
-    }
+    Ok(rows::done(result)?)
 }
 
 /// An answer the operation did not ask for.
 pub fn unexpected(result: IoResult) -> StoreError {
-    StoreError(format!("unexpected answer {result:?}"))
+    StoreError(format!("unexpected answer {}", result.label()))
 }
 
 /// The answer to a read, from plain bytes.
