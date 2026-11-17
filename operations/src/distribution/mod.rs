@@ -12,6 +12,7 @@ pub mod counts;
 pub mod create;
 pub mod delegate;
 pub mod feed_walks;
+mod fence_row;
 pub mod forward;
 pub mod guard;
 pub mod handoff;
