@@ -309,75 +309,83 @@ async fn signal_snapshot_retry(
     published: &PublishedUsage,
     observed_markers: &[(Key, Value)],
 ) -> Result<(), String> {
-    write_retry_markers(&ctx.storage_handle, published, observed_markers).await?;
+    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+    let markers = retry_markers(published, observed_markers, generation);
+    drive(RetrySignalOperation::new(markers), ctx)
+        .await
+        .map_err(|error| format!("retry marker write failed: {error}"))
+}
 
-    let Some(task_handle) = ctx.task_handle.as_ref() else {
-        return Ok(());
-    };
-    match task_handle.send_effect(schedule_snapshot_publish()).await {
-        Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
-        Event::Task(TaskEvent::Error { message, .. }) => {
-            warn!(message = %message, "Failed to schedule usage snapshot retry");
-            Ok(())
+/// Marker rows for the published scopes a concurrent write did not mark already, so the next
+/// publish retries them; none when nothing was published.
+fn retry_markers(
+    published: &PublishedUsage,
+    observed_markers: &[(Key, Value)],
+    generation: Value,
+) -> Vec<(String, Key, Value)> {
+    let observed_keys: HashSet<&[u8]> = (observed_markers.iter())
+        .map(|(key, _)| key.as_ref())
+        .collect();
+    let mut keys = Vec::with_capacity(published.groups.len() + usize::from(published.global));
+    if published.global {
+        keys.push(DIRTY_GLOBAL_KEY.to_vec());
+    }
+    keys.extend(published.groups.iter().map(|group_id| dirty_group_key(*group_id)));
+    (keys.into_iter())
+        .filter(|key| !observed_keys.contains(key.as_slice()))
+        .map(|key| (NODE_STATS_KEYSPACE.to_string(), Key::from(key), generation.clone()))
+        .collect()
+}
+
+/// Writes the retry markers, then moves the debounced publish timer up. A refused timer is only
+/// logged: the markers alone keep the retry for the next run.
+#[derive(Debug, PartialEq)]
+struct RetrySignalOperation {
+    markers: Vec<(String, Key, Value)>,
+    scheduling: bool,
+}
+
+impl RetrySignalOperation {
+    fn new(markers: Vec<(String, Key, Value)>) -> Self {
+        Self {
+            markers,
+            scheduling: false,
         }
-        other => {
-            warn!(
-                event = other.label(),
-                "Unexpected usage snapshot retry schedule result"
-            );
-            Ok(())
-        }
+    }
+
+    fn schedule(&mut self) -> Result<Next<()>, IoError> {
+        self.scheduling = true;
+        Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))))
     }
 }
 
-async fn write_retry_markers(
-    storage: &StorageHandle,
-    published: &PublishedUsage,
-    observed_markers: &[(Key, Value)],
-) -> Result<(), String> {
-    if published.is_empty() {
-        return Ok(());
-    }
+impl Operation for RetrySignalOperation {
+    type Output = ();
+    type Error = IoError;
 
-    let observed_keys: HashSet<Vec<u8>> = observed_markers
-        .iter()
-        .map(|(key, _)| key.as_ref().to_vec())
-        .collect();
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
-    let mut writes: Vec<(String, Key, Value)> =
-        Vec::with_capacity(published.groups.len() + usize::from(published.global));
-    if published.global && !observed_keys.contains(DIRTY_GLOBAL_KEY) {
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
-            generation.clone(),
-        ));
-    }
-    for group_id in &published.groups {
-        let marker_key = dirty_group_key(*group_id);
-        if observed_keys.contains(&marker_key) {
-            continue;
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        if self.markers.is_empty() {
+            return self.schedule();
         }
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(marker_key),
-            generation.clone(),
-        ));
-    }
-    if writes.is_empty() {
-        return Ok(());
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.markers))))
     }
 
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("retry marker write failed: {}", other.label())),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if !self.scheduling {
+            done(result)?;
+            return self.schedule();
+        }
+        match result.event()? {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(message = %message, "Failed to schedule usage snapshot retry");
+            }
+            other => warn!(
+                event = other.label(),
+                "Unexpected usage snapshot retry schedule result"
+            ),
+        }
+        Ok(Next::Done(()))
     }
 }
 
@@ -540,6 +548,36 @@ mod tests {
             Ok(Next::Call(IoCall::Delete(deletes)))
         );
         assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn retry_marks_then_schedules() {
+        // Scopes a concurrent write marked already keep their marker; then the timer moves up.
+        let group = GroupId::from_bytes([3; 16]);
+        let published = PublishedUsage {
+            global: true,
+            groups: vec![group],
+        };
+        let seen = vec![(Key::from(DIRTY_GLOBAL_KEY.to_vec()), Value::from(vec![1]))];
+        let generation = Value::from(vec![2]);
+        let markers = retry_markers(&published, &seen, generation.clone());
+        let marker = (
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(dirty_group_key(group)),
+            generation,
+        );
+        assert_eq!(markers, vec![marker.clone()]);
+        let mut operation = RetrySignalOperation::new(markers);
+        let write = Ok(Next::Call(IoCall::Write(vec![marker])));
+        assert_eq!(operation.first(), write);
+        let timer = Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))));
+        assert_eq!(operation.next(IoResult::Done), timer);
+        let refused = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "full".to_string(),
+        });
+        let answer = operation.next(IoResult::Event(Box::new(refused)));
+        assert_eq!(answer, Ok(Next::Done(())));
     }
 
     #[test]
