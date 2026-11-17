@@ -21,12 +21,12 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::dispatch;
 use aruna_operations::notifications::dispatch::{
-    InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_for_user,
-    delete_for_user, list_for_user, mark_for_user, resolve_user_holder, subscribe_inbox_wakes,
-    unread_for_user,
+    InboxWakeReceiver, NotificationDispatchError, create_for_user, delete_for_user, list_for_user,
+    mark_for_user, resolve_user_holder, subscribe_inbox_wakes, unread_for_user,
 };
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
+use aruna_operations::notifications::user_call::WatchDispatchError;
 use aruna_operations::notifications::watch::authorization::evaluate_watch_creation;
 use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

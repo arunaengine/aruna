@@ -7,7 +7,6 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
-use aruna_core::events::Event;
 use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification_watch::{
@@ -15,11 +14,10 @@ use aruna_core::structs::execution::notification_watch::{
     WatchInterestDigest, WatchInterestEntry, interest_dirty_key, interest_node_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::unexpected;
@@ -86,7 +84,6 @@ enum InterestState {
     Scan,
     Read,
     Write,
-    Schedule(bool),
 }
 
 /// The step on this node's watch interest a caller asks for.
@@ -136,9 +133,12 @@ impl InterestOperation {
         }
     }
 
+    /// Requests the debounced publish once the step is stored.
     fn schedule(&mut self, changed: bool) -> Next<bool> {
-        self.state = InterestState::Schedule(changed);
-        Next::Call(IoCall::Effect(schedule_publish_effect()))
+        Next::Then {
+            output: changed,
+            calls: vec![IoCall::from(schedule_publish_effect())],
+        }
     }
 }
 
@@ -198,12 +198,6 @@ impl Operation for InterestOperation {
                 Ok(Next::Call(IoCall::Write(vec![row])))
             }
             (InterestState::Write, IoResult::Done) => Ok(Next::Done(true)),
-            (InterestState::Schedule(changed), IoResult::Event(Event::Task(task))) => {
-                if let TaskEvent::Error { message, .. } = task {
-                    warn!(%message, "Failed to schedule watch interest publish");
-                }
-                Ok(Next::Done(changed))
-            }
             (_, other) => Err(unexpected("a watch interest result", &other).into()),
         }
     }
@@ -216,11 +210,11 @@ mod call_tests {
 
     const REALM: RealmId = RealmId([3; 32]);
 
-    fn scheduled() -> IoResult {
-        IoResult::Event(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::PublishWatchInterest,
-            after: WATCH_PUBLISH_DEBOUNCE,
-        }))
+    fn scheduled() -> Next<bool> {
+        Next::Then {
+            output: true,
+            calls: vec![IoCall::from(schedule_publish_effect())],
+        }
     }
 
     #[test]
@@ -256,11 +250,7 @@ mod call_tests {
     fn mark_then_publish() {
         let mut mark = InterestOperation::mark(REALM);
         assert!(matches!(mark.first(), Ok(Next::Call(IoCall::Write(rows))) if rows.len() == 1));
-        assert_eq!(
-            mark.next(IoResult::Done),
-            Ok(Next::Call(IoCall::Effect(schedule_publish_effect())))
-        );
-        assert_eq!(mark.next(scheduled()), Ok(Next::Done(true)));
+        assert_eq!(mark.next(IoResult::Done), Ok(scheduled()));
     }
 
     #[test]
@@ -272,19 +262,16 @@ mod call_tests {
             next: None,
         };
         assert_eq!(restore.next(empty), Ok(Next::Done(false)));
-        let mut failed = InterestOperation::publish();
-        failed.first().unwrap();
-        let error = Event::Task(TaskEvent::Error {
-            key: None,
-            message: "closed".to_string(),
-        });
-        assert_eq!(failed.next(IoResult::Event(error)), Ok(Next::Done(true)));
+        assert_eq!(InterestOperation::publish().first(), Ok(scheduled()));
     }
 
     #[test]
     fn other_results_fail() {
         let mut mark = InterestOperation::mark(REALM);
         mark.first().unwrap();
-        assert!(matches!(mark.next(scheduled()), Err(InterestError::Io(_))));
+        assert!(matches!(
+            mark.next(IoResult::Woke),
+            Err(InterestError::Io(_))
+        ));
     }
 }

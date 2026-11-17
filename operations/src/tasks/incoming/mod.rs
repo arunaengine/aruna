@@ -63,7 +63,7 @@ use crate::device::sync::{
 };
 use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::groups::backends::drain::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
@@ -740,7 +740,13 @@ impl OperationsTaskHandler {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
             return;
         };
-        let after = match drive(operation, self.context.as_ref()).await {
+        // A lost commit conflict reruns a fresh copy, as the operation's conflict hook decides.
+        let seed = key
+            .storage_key()
+            .map(|key| key.to_vec())
+            .unwrap_or_default();
+        let build = || operation.clone();
+        let after = match drive_retry(build, self.context.as_ref(), &seed).await {
             Ok(after) => after,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");

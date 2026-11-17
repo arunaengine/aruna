@@ -39,6 +39,7 @@ impl WatchAuthorizationDenial {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchAuthorization {
     Authorized,
     Denied(WatchAuthorizationDenial),

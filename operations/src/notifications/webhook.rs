@@ -7,27 +7,21 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::execution::job::JobResultPayload;
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{
     URL_BYTES, WebhookDeliverySpec, WebhookSubscription, valid_url,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_outbound::Backoffs;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
-use crate::notifications::email::{job_error, no_transport};
-use crate::notifications::send::SendOperation;
+use crate::notifications::email::{job_outcome, no_transport};
 use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
-use crate::notifications::settings::{
-    Delivery, MetadataPeers, SettingPeers, delivery_setting, managers,
-};
+use crate::notifications::webhook_job::WebhookJobOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum WebhookError {
@@ -107,73 +101,18 @@ async fn write_webhook(
     Ok(WebhookSubscription::from_bytes(&bytes)?)
 }
 
-/// Sends one signed delivery when this node's current setting has the webhook on. A 4xx answer
-/// other than 408 and 429 is permanent; while no management node opens the secret, the job
-/// waits without an attempt.
+/// Runs the webhook job of `spec` until the job is cancelled or the node shuts down.
 pub(crate) async fn run_webhook_job(ctx: &JobContext, spec: &WebhookDeliverySpec) -> JobRunOutcome {
-    let (Some(_), Some(outbound)) = (&ctx.driver.metadata_handle, &ctx.driver.outbound_handle)
-    else {
+    if ctx.driver.metadata_handle.is_none() || ctx.driver.outbound_handle.is_none() {
         return no_transport();
-    };
+    }
     let local = (ctx.driver.net_handle.as_ref()).map_or(ctx.owner_node_id, |net| net.node_id());
-    let peers = MetadataPeers {
-        ctx: &ctx.driver,
-        local,
-    };
-    let now_ms = unix_timestamp_millis();
-    deliver_webhook(ctx, spec, &peers, outbound.backoffs(), now_ms).await
-}
-
-pub(crate) async fn deliver_webhook(
-    ctx: &JobContext,
-    spec: &WebhookDeliverySpec,
-    peers: &dyn SettingPeers,
-    backoffs: &Backoffs,
-    now_ms: u64,
-) -> JobRunOutcome {
-    let recipient = spec.notification.recipient;
-    let config = drive(GetConfigOperation::new(recipient.realm_id), &ctx.driver).await;
-    let managers = config.ok().map(|config| managers(&config));
-    let record = &spec.notification;
-    let channel = SettingChannel::Webhook;
-    let delivery = delivery_setting(
-        &ctx.driver,
-        peers,
-        backoffs,
-        record,
-        channel,
-        managers.as_deref(),
-        now_ms,
-    );
-    let delivery = tokio::select! {
+    let job = WebhookJobOperation::new(spec.clone(), local, unix_timestamp_millis());
+    tokio::select! {
         biased;
-        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
-        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
-        delivery = delivery => delivery,
-    };
-    let winner = match delivery {
-        Delivery::Skip => {
-            return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
-        }
-        Delivery::Wait(error, delay) => return JobRunOutcome::DeferredFor(error, delay),
-        Delivery::Send(winner) => winner,
-    };
-    let subscription = WebhookSubscription::from_bytes(&winner.bytes).ok();
-    let (Some(url), Some(secret)) = (subscription.and_then(|found| found.url), winner.secret)
-    else {
-        return JobRunOutcome::Succeeded(JobResultPayload::Webhook { status: None });
-    };
-    let now_s = unix_timestamp_millis() / 1000;
-    let send = SendOperation::webhook(spec, &url, secret.expose(), now_s);
-    let sent = tokio::select! {
-        biased;
-        () = ctx.cancel.cancelled() => return JobRunOutcome::Cancelled,
-        () = ctx.shutdown.cancelled() => return JobRunOutcome::Interrupted,
-        sent = drive(send, &ctx.driver) => sent,
-    };
-    match sent {
-        Ok(status) => JobRunOutcome::Succeeded(JobResultPayload::Webhook { status }),
-        Err(error) => JobRunOutcome::Failed(job_error(error)),
+        () = ctx.cancel.cancelled() => JobRunOutcome::Cancelled,
+        () = ctx.shutdown.cancelled() => JobRunOutcome::Interrupted,
+        outcome = drive(job, &ctx.driver) => job_outcome(outcome),
     }
 }
 
