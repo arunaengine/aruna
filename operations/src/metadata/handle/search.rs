@@ -828,7 +828,7 @@ pub(super) async fn resolve_visibility_scope(
     )
     .await;
     // Request policy removes denied records from both eager and SPARQL paths.
-    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
         &context,
         records
             .iter()

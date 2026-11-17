@@ -25,7 +25,7 @@ pub use super::bound::{Refusal, ReleaseError, ReleaseKeys};
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
 use super::store::Txn;
-use crate::auth::request_policy::PolicyEvaluator;
+use crate::auth::enforcement::PolicyEvaluator;
 use crate::driver::DriverContext;
 
 /// What a run asks of the secret bound to one slot.

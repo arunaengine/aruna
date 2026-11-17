@@ -33,7 +33,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use crate::distribution::delegate::{prune_nonces, spend_nonce};
 use crate::driver::{DriverContext, drive};

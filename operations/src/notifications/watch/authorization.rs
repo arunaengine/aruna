@@ -21,9 +21,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
-};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::enforcement::{PolicyEnforcementError, enforce_policies};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::subscriptions::list_watch_subscriptions;

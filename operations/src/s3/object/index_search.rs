@@ -25,7 +25,7 @@ use super::{
     SearchNodePage, SearchObjectsError, SearchObjectsInput, authorize, batch_read, build_hits,
     changed_until, finish_read, load_live, retain_matches, start_read,
 };
-use crate::auth::request_policy::PolicyEvaluator;
+use crate::auth::enforcement::PolicyEvaluator;
 use crate::distribution::index_feed::{range_progress, state_key};
 use crate::distribution::key_index::{KeyPage, KeyQuery, MetaTerms, RangeIndexes};
 use crate::driver::DriverContext;

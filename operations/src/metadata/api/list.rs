@@ -89,7 +89,7 @@ pub async fn list_visible_documents(
     .await;
     // RBAC/public visibility is additionally constrained by the metadata.read
     // request policies, loaded once per distinct group (fail-closed on error).
-    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
         context,
         records
             .iter()

@@ -14,7 +14,8 @@ use aruna_core::types::GroupId;
 use serde_json::Value as JsonValue;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, drive_until};

@@ -59,9 +59,8 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
 use crate::blob::hidden::delete_hidden;
 use crate::blob::holders::GetHoldersOperation;
 use aruna_core::managed_copy::{

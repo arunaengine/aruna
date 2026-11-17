@@ -4,10 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, enforce_policies,
-    policy_request_with,
-};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator, enforce_policies};
 use crate::driver::{DriverContext, drive};
 use aruna_core::NodeId;
 use aruna_core::errors::{AuthorizationError, StorageError};
@@ -134,7 +132,7 @@ pub struct BucketAccess {
     auth: AuthContext,
     bucket_path: String,
     rules: crate::auth::permission_rules::PermissionRules,
-    policies: crate::auth::request_policy::PolicyEvaluator,
+    policies: crate::auth::enforcement::PolicyEvaluator,
 }
 
 impl BucketAccess {

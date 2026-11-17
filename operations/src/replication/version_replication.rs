@@ -5,7 +5,8 @@
 use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
-use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::enforcement::PolicyEvaluator;
 use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };

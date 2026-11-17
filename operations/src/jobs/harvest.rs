@@ -27,7 +27,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::AuthorizeError;
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::forward::authorize::{CreateScope, authorize_create};
 use crate::forward::transport::MetadataWriteError;
 use crate::harvest::oai_pmh::mapping::dc_to_jsonld;

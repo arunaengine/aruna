@@ -287,7 +287,7 @@ pub(crate) async fn local_path_candidates(
         records.iter().map(|record| record.group_id),
     )
     .await;
-    let evaluators = crate::auth::request_policy::PolicyEvaluator::load_bulk(
+    let evaluators = crate::auth::enforcement::PolicyEvaluator::load_bulk(
         context,
         records
             .iter()

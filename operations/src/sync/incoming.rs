@@ -8,9 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
-};
+use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
 use crate::blob::permission_paths::ResolvePathsOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::QuotaOperation;

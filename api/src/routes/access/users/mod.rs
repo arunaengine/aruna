@@ -1219,7 +1219,7 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::auth::request_policy::enforce_policies(
+    aruna_operations::auth::enforcement::enforce_policies(
         &state.get_ctx(),
         state.get_realm_id(),
         &aruna_operations::auth::request_policy::policy_request_with(
@@ -1231,7 +1231,7 @@ pub(crate) async fn authorize_directory(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::enforcement::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),

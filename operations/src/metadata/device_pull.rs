@@ -28,7 +28,8 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};

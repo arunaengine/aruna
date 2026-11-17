@@ -1671,7 +1671,7 @@ fn granted<T>(
     loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
 ) -> Result<Option<T>, String> {
     use crate::auth::request_authorization::AuthorizeError;
-    use crate::auth::request_policy::PolicyEnforcementError;
+    use crate::auth::enforcement::PolicyEnforcementError;
     match loaded {
         Ok(access) => Ok(Some(access)),
         Err(AuthorizeError::PermissionDenied)
@@ -2668,7 +2668,7 @@ mod tests {
     #[test]
     fn retries_unavailable_policy() {
         use crate::auth::request_authorization::AuthorizeError;
-        use crate::auth::request_policy::PolicyEnforcementError;
+        use crate::auth::enforcement::PolicyEnforcementError;
         let unavailable = PolicyEnforcementError::Unavailable("down".to_string());
         assert!(granted::<()>(Err(AuthorizeError::Policy(unavailable))).is_err());
         let denied = PolicyEnforcementError::Denied {

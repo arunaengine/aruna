@@ -521,7 +521,7 @@ async fn job_access(
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
         Ok(_) | Err(AuthorizeError::PermissionDenied) => Ok(None),
         Err(AuthorizeError::Policy(
-            crate::auth::request_policy::PolicyEnforcementError::Denied { .. },
+            crate::auth::enforcement::PolicyEnforcementError::Denied { .. },
         )) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
@@ -534,7 +534,8 @@ pub(crate) async fn still_admin(
     auth: &aruna_core::structs::identity::auth::AuthContext,
     group_id: GroupId,
 ) -> Result<bool, String> {
-    use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+    use crate::auth::request_policy::PolicyRequestExtras;
+    use crate::auth::enforcement::PolicyEnforcementError;
     let path = format!("/{}/g/{group_id}/admin/**", auth.realm_id);
     let checked = crate::auth::request_authorization::authorize(
         context,

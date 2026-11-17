@@ -10,7 +10,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
+use crate::auth::request_policy::PolicyRequestExtras;
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::driver::DriverContext;
 use crate::jobs::store::{read_crate_status, read_run_link};
 

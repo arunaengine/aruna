@@ -2899,7 +2899,7 @@ impl S3 for ArunaS3Service {
 
         // DeleteObjects has no object key in its path: load the realm and
         // group policy sets once and decide every entry against them.
-        let policy_evaluator = aruna_operations::auth::request_policy::PolicyEvaluator::load(
+        let policy_evaluator = aruna_operations::auth::enforcement::PolicyEvaluator::load(
             &self.state,
             self.realm_id,
             Some(user_access.group_id),

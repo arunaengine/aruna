@@ -17,9 +17,8 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
 use aruna_core::time::unix_timestamp_secs as now_timestamp;
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
+use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_operations::auth::enforcement::enforce_policies;
 use aruna_operations::driver::drive;
 use aruna_operations::onboarding::consume_secret::ConsumeSecretError;
 use aruna_operations::onboarding::create_secret::{

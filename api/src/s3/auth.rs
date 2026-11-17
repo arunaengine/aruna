@@ -26,9 +26,8 @@ use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
 use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
+use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_operations::auth::enforcement::enforce_policies;
 use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
 use aruna_operations::distribution::routing::{delegated_range, delegated_read};
 use aruna_operations::driver::{DriverContext, drive};
