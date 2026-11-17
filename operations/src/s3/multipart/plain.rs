@@ -613,6 +613,7 @@ impl CompleteUploadOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::s3::fence_done;
     use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, IMPORTED_OBJECT_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{
         BackendImport, DEFAULT_PATTERN, ImportedObject, object_key,
@@ -1077,16 +1078,6 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::ReadResult {
             key: Vec::new().into(),
             value: Some(vec![1].into()),
-        }))
-    }
-
-    /// Answers the rows and the commit of a fenced record write.
-    fn fence_done(operation: &mut CompleteUploadOperation) -> Effects {
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_parts(77, 7),
         }))
     }
 
