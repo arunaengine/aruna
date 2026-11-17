@@ -89,7 +89,7 @@ pub(super) async fn start_walk(
     if checkpoint.queue_head < checkpoint.queue_tail {
         let row = queue_key(ctx.job_id, checkpoint.queue_head);
         match read_state::<StagingJobDirectory>(
-            &ctx.driver.storage_handle,
+            &ctx.driver,
             STAGING_QUEUE_KEYSPACE,
             row,
             "staging queue read",
@@ -167,7 +167,7 @@ pub(super) async fn clear_rows(
             .into_iter()
             .map(|(key, _)| (key_space.to_string(), key))
             .collect();
-        batch_delete(storage, deletes, None).await?;
+        batch_delete(&ctx.driver, deletes, None).await?;
     }
 }
 

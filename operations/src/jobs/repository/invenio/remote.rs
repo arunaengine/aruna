@@ -91,7 +91,7 @@ async fn link_client<'a>(
     context: &'a DriverContext,
     link: &RepositoryLink,
 ) -> Result<InvenioClient<'a>, TransferError> {
-    let credential = read_secret(&context.storage_handle, link.link_id)
+    let credential = read_secret(context, link.link_id)
         .await
         .map_err(|error| TransferError::Retryable(error.to_string()))?
         .filter(|secret| secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint)

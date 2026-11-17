@@ -381,6 +381,7 @@ mod tests {
         let tempdir = tempfile::tempdir().unwrap();
         let storage_handle =
             aruna_storage::storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = crate::testing::test_context(storage_handle.clone());
         let node_id = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let claim_token = Ulid::from_bytes([6; 16]);
         let job_id = JobId::from_bytes([7; 16]);
@@ -398,7 +399,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&storage_handle, &record)
+        crate::jobs::store::query::insert_job(&context, &record)
             .await
             .unwrap();
         let driver = DriverContext {

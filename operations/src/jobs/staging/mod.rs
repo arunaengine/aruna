@@ -58,7 +58,7 @@ async fn read_main(
     job_id: JobId,
 ) -> Result<Option<StagingJobCheckpoint>, String> {
     read_state(
-        &context.storage_handle,
+        context,
         STAGING_STATE_KEYSPACE,
         checkpoint_key(job_id, None),
         "staging checkpoint read",
@@ -544,7 +544,7 @@ pub(super) async fn persist_slot(
         ByteView::from(value),
     ));
     put_job_rows(
-        &ctx.driver.storage_handle,
+        &ctx.driver,
         ctx.job_id,
         ctx.claim_token,
         writes,

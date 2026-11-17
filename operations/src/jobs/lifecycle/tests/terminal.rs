@@ -172,7 +172,7 @@ async fn publishes_terminal_success() {
         attempt_epoch: 0,
     };
     let commit = record_attempt_intent(
-        &ctx.storage_handle,
+        &ctx,
         physical(),
         TOKEN,
         intent,
@@ -185,7 +185,7 @@ async fn publishes_terminal_success() {
     let executor = family.target.public();
     let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
     let control = reserve_output_commits(
-        &ctx.storage_handle,
+        &ctx,
         physical(),
         &destinations,
         &Default::default(),

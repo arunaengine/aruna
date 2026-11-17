@@ -935,7 +935,7 @@ async fn clear_deadline(
             deadline_index_key(family),
         ),
     ];
-    if batch_delete(&context.storage_handle, deletes, Some(txn_id))
+    if batch_delete(context, deletes, Some(txn_id))
         .await
         .is_err()
     {
@@ -967,7 +967,7 @@ async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) 
     }
     if current.is_err()
         || batch_delete(
-            &context.storage_handle,
+            context,
             vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
             Some(txn_id),
         )
@@ -1030,7 +1030,7 @@ async fn replace_deadline(
         let previous_key = deadline_key(family, previous.due_at_ms);
         if previous_key != deadline_key(family, next.due_at_ms)
             && batch_delete(
-                &context.storage_handle,
+                context,
                 vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
                 Some(txn_id),
             )

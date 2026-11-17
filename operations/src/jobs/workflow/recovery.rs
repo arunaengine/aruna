@@ -38,10 +38,9 @@ pub(super) async fn recover_failed_submit(
     cancel: &CancellationToken,
     error: BackendError,
 ) -> bool {
-    let storage = &context.storage_handle;
     if matches!(&error, BackendError::Cancelled)
         || cancel.is_cancelled()
-        || read_job_record(storage, job_id, None)
+        || read_job_record(context, job_id, None)
             .await
             .ok()
             .flatten()
@@ -53,7 +52,7 @@ pub(super) async fn recover_failed_submit(
         .await;
         return false;
     }
-    let record = match read_job_record(storage, job_id, None).await {
+    let record = match read_job_record(context, job_id, None).await {
         Ok(Some(record)) => record,
         _ => return false,
     };
@@ -67,7 +66,7 @@ pub(super) async fn recover_failed_submit(
             let status = evidence.status;
             if status.is_terminal() {
                 let running = match begin_external_running(
-                    storage,
+                    context,
                     job_id,
                     token,
                     status.started_at_ms,
@@ -100,7 +99,7 @@ pub(super) async fn recover_failed_submit(
                 return false;
             }
             let running = match begin_external_running(
-                storage,
+                context,
                 job_id,
                 token,
                 status.started_at_ms,
@@ -153,7 +152,7 @@ pub(super) async fn recover_failed_submit(
                 }
             };
             let running = match begin_external_running(
-                storage,
+                context,
                 job_id,
                 token,
                 status.started_at_ms,
@@ -183,7 +182,7 @@ pub(super) async fn recover_failed_submit(
                 return false;
             };
             if record_attempt_tombstone(
-                storage,
+                context,
                 job_id,
                 token,
                 fence.attempt_epoch,
@@ -257,7 +256,7 @@ async fn retire_failed_submit(
         return;
     };
     if record_attempt_tombstone(
-        &context.storage_handle,
+        context,
         job_id,
         token,
         fence.attempt_epoch,
@@ -317,7 +316,7 @@ pub(super) async fn park_attempt(
     error: JobError,
 ) {
     match mark_indeterminate(
-        &context.storage_handle,
+        context,
         job_id,
         token,
         error,
@@ -331,7 +330,7 @@ pub(super) async fn park_attempt(
             // A cancelled run settles as cancelled, so the family does not run it elsewhere.
             let record = match record.cancel_requested {
                 true => match set_cancel_requested(
-                    &context.storage_handle,
+                    context,
                     job_id,
                     unix_timestamp_millis(),
                 )
@@ -363,7 +362,7 @@ pub(super) async fn pre_submit_failure(
         return;
     }
     match requeue_before_attempt(
-        &context.storage_handle,
+        context,
         job_id,
         token,
         unix_timestamp_millis(),
