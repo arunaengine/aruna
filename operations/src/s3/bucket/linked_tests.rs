@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::job_pages::{job_access, process_linked, still_admin, store};
 use crate::s3::bucket::job_progress::JobStep;
 use crate::s3::bucket::rename::tests::{
@@ -12,7 +12,7 @@ use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE};
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::linked_job::RemapPlan;
+use aruna_core::structs::storage::linked_job::{LinkedTask, RemapPlan};
 use ulid::Ulid;
 
 fn grant() -> TokenGrant {

@@ -6,6 +6,7 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::checked_rename::authorized_rename;
 use crate::tests::records::node;
 use crate::tests::s3::{test_context, test_storage};
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{DEFAULT_PATTERN, ExternalObject, object_key};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, ManagedCopyKey, ManagedCopyState,
