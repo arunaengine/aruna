@@ -43,10 +43,10 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, create_outbox_record,
-    parse_status_read, read_document_registry, read_status_effect, registry_outbox_record,
-    schedule_materialization,
+    parse_status_read, read_status_effect, registry_outbox_record, schedule_materialization,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::realm::get_config::{GetConfigError, GetConfigOperation};
@@ -439,7 +439,7 @@ pub async fn project_create_events(
             let existing_registry = match registry_cache.get(&document_id) {
                 Some(record) => record.clone(),
                 None => {
-                    let record = read_existing_registry(context, document_id).await?;
+                    let record = load_document_record(context, document_id).await?;
                     registry_cache.insert(document_id, None);
                     record
                 }
@@ -457,7 +457,7 @@ pub async fn project_create_events(
         let existing_registry = match registry_cache.get(&document_id) {
             Some(record) => record.clone(),
             None => {
-                let record = read_existing_registry(context, document_id).await?;
+                let record = load_document_record(context, document_id).await?;
                 registry_cache.insert(document_id, record.clone());
                 record
             }
@@ -1163,26 +1163,6 @@ fn audit_record(event: &MetadataEventRecord, message: Option<&str>) -> MetadataA
     }
 }
 
-async fn read_existing_registry(
-    context: &DriverContext,
-    document_id: ulid::Ulid,
-) -> Result<Option<MetadataRegistryRecord>, MetadataProjectionError> {
-    match context
-        .storage_handle
-        .send_effect(read_document_registry(document_id, None))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value).map_err(ConversionError::from))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(
-            other.label().to_string(),
-        )),
-    }
-}
-
 async fn read_materialization_status(
     context: &DriverContext,
     document_id: Ulid,
@@ -1191,10 +1171,16 @@ async fn read_materialization_status(
         .storage_handle
         .send_effect(read_status_effect(document_id, None))
         .await;
-    parse_status_read(event).map_err(|error| match error {
-        StorageReadError::Storage(error) => error.into(),
-        StorageReadError::Conversion(error) => error.into(),
-    })
+    Ok(parse_status_read(event)?)
+}
+
+impl From<StorageReadError> for MetadataProjectionError {
+    fn from(error: StorageReadError) -> Self {
+        match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
+        }
+    }
 }
 
 async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataProjectionError> {
