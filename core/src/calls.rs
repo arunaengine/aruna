@@ -216,7 +216,7 @@ impl<P: Operation> CallRun<P> {
 
     fn advance(&mut self, mut turn: Result<Next<P::Output>, P::Error>) -> Effects {
         loop {
-            let call = match turn {
+            let mut call = match turn {
                 Err(error) => return self.fail(error),
                 Ok(Next::Done(output)) => return self.finish(output),
                 Ok(Next::Wait) => {
@@ -229,7 +229,7 @@ impl<P: Operation> CallRun<P> {
                 turn = self.operation.next(result);
                 continue;
             }
-            if self.transaction && self.txn_id.is_none() && in_storage(&call) {
+            if self.transaction && self.txn_id.is_none() && in_storage(&mut call) {
                 self.state = State::Starting(call);
                 let start = StorageEffect::StartTransaction { read: false };
                 return smallvec![Effect::Storage(start)];
@@ -442,12 +442,14 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the operation's transaction.
-fn in_storage(call: &IoCall) -> bool {
-    matches!(
-        call,
-        IoCall::Read(_) | IoCall::Page { .. } | IoCall::Write(_) | IoCall::Delete(_)
-    )
+/// Whether the call runs in the operation's transaction: a storage call, or a storage effect
+/// that takes a transaction id and names none.
+fn in_storage(call: &mut IoCall) -> bool {
+    match call {
+        IoCall::Read(_) | IoCall::Page { .. } | IoCall::Write(_) | IoCall::Delete(_) => true,
+        IoCall::Effect(Effect::Storage(effect)) => effect.txn_slot().is_some_and(|slot| slot.is_none()),
+        _ => false,
+    }
 }
 
 fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), IoError> {
@@ -477,7 +479,15 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
             StorageEffect::BatchDelete { deletes, txn_id },
         ),
         IoCall::Sync => (Wait::Synced, StorageEffect::SyncAll),
-        IoCall::Effect(effect) => return Ok((Wait::Family(effect_family(&effect)?), effect)),
+        IoCall::Effect(mut effect) => {
+            if let Effect::Storage(storage) = &mut effect
+                && let Some(slot) = storage.txn_slot()
+                && slot.is_none()
+            {
+                *slot = txn_id;
+            }
+            return Ok((Wait::Family(effect_family(&effect)?), effect));
+        }
         IoCall::Child(child) => return Ok((Wait::Child, Effect::SubOperation(child))),
         IoCall::Group(group) => {
             let wait = match group.form {

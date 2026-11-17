@@ -94,6 +94,27 @@ fn read_a() -> IoCall {
 }
 
 #[test]
+fn effects_join_transaction() {
+    // A passed-through storage effect without a transaction id runs in the operation's one.
+    let entry = crate::node_vault::VaultEntry::new(
+        crate::node_vault::VaultPurpose::NamedSecret,
+        ulid::Ulid::from_parts(1, 1),
+    );
+    let delete = StorageEffect::VaultDelete {
+        entry,
+        txn_id: None,
+    };
+    let mut operation = run(script(vec![IoCall::Effect(storage(delete))]), true);
+    let start = storage(StorageEffect::StartTransaction { read: false });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let joined = StorageEffect::VaultDelete {
+        entry,
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(joined)]);
+}
+
+#[test]
 fn transaction_commits_outcome() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
     let mut operation = run(script(vec![read_a(), IoCall::Write(write.clone())]), true);
