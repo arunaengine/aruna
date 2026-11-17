@@ -28,9 +28,3 @@ pub mod sources;
 pub mod storage_check;
 pub mod storage_move;
 pub mod token_list;
-
-pub use key::{
-    extend as key_extend, grant as key_grant, install as key_install, lock as key_lock,
-    recovery as key_recovery, removal as key_removal, restart as key_restart, rows as key_rows,
-    startup as key_startup, unlock as key_unlock,
-};

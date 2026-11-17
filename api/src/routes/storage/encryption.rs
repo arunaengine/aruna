@@ -30,9 +30,9 @@ use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
+use aruna_operations::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
+use aruna_operations::s3::bucket::key::rows::SettingsError;
 use aruna_operations::s3::bucket::key::wake::activate_and_wake;
-use aruna_operations::s3::bucket::key_install::{InstallInput, InstallKeyOperation};
-use aruna_operations::s3::bucket::key_rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };

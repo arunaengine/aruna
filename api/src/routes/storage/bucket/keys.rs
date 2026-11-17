@@ -24,14 +24,14 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{drive, now_ms};
 use aruna_operations::s3::bucket::holders::LookupKeysOperation;
-use aruna_operations::s3::bucket::key::wake::activate_and_wake;
-use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
-use aruna_operations::s3::bucket::key_grant::{GrantError, GrantHolderOperation, GrantInput};
-use aruna_operations::s3::bucket::key_lock::{LockBucketOperation, LockError, LockInput};
-use aruna_operations::s3::bucket::key_removal::{
+use aruna_operations::s3::bucket::key::extend::{ExtendBucketOperation, ExtendError, ExtendInput};
+use aruna_operations::s3::bucket::key::grant::{GrantError, GrantHolderOperation, GrantInput};
+use aruna_operations::s3::bucket::key::lock::{LockBucketOperation, LockError, LockInput};
+use aruna_operations::s3::bucket::key::removal::{
     RemovalError, RemovalInput, RemoveHolderOperation,
 };
-use aruna_operations::s3::bucket::key_unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
+use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
+use aruna_operations::s3::bucket::key::wake::activate_and_wake;
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
 use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
