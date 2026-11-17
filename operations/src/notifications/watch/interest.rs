@@ -446,6 +446,538 @@ async fn sync_eligible_nodes(
         .map_err(|error| error.to_string())
 }
 
+/// Why a publish run stopped; the timer runs it again after the debounce.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct PublishError(pub String);
+
+impl From<IoError> for PublishError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+fn failed(error: impl ToString) -> PublishError {
+    PublishError(error.to_string())
+}
+
+/// Deletes each observed dirty marker only if its stored generation still matches the one the
+/// publish run read. A marker dirtied again meanwhile makes the commit conflict, which keeps
+/// every marker for the next run.
+#[derive(Debug, PartialEq)]
+pub struct ClearMarkersOperation {
+    observed: Vec<(Key, Value)>,
+    deleting: bool,
+}
+
+impl ClearMarkersOperation {
+    pub fn new(observed: Vec<(Key, Value)>) -> Self {
+        Self {
+            observed,
+            deleting: false,
+        }
+    }
+}
+
+impl Operation for ClearMarkersOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let space = || WATCH_INTEREST_KEYSPACE.to_string();
+        let reads = self.observed.iter().map(|(key, _)| (space(), key.clone()));
+        Ok(Next::Call(IoCall::Read(reads.collect())))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.deleting {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let current = result.values()?;
+        let deletes: Vec<(KeySpace, Key)> = std::mem::take(&mut self.observed)
+            .into_iter()
+            .zip(current)
+            .filter(|((_, observed), current)| current.as_ref() == Some(observed))
+            .map(|((key, _), _)| (WATCH_INTEREST_KEYSPACE.to_string(), key))
+            .collect();
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// The digest of one realm and whether an authorization check failed while building it.
+#[derive(Clone, Debug, PartialEq)]
+struct RealmDigest {
+    realm_id: RealmId,
+    config: Option<RealmConfigDocument>,
+    digest: Option<WatchInterestDigest>,
+    check_failed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+enum PublishState {
+    #[default]
+    Markers,
+    Config,
+    Drain,
+    List,
+    Filter,
+    Current,
+    Write,
+    Replicate,
+    Pending,
+    Retry,
+    Clear,
+    Again,
+    Table,
+}
+
+/// One publish run over up to `DIRTY_REALM_CAP` dirty realms: drains each realm's retry queue,
+/// rebuilds its digest from the watches held and authorized here, writes and replicates changed
+/// digests, then consumes the markers. Its output is whether it published a digest.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PublishInterestOperation {
+    node: Option<NodeId>,
+    state: PublishState,
+    markers: Vec<(Key, Value)>,
+    more: bool,
+    realms: VecDeque<RealmId>,
+    current: Option<RealmDigest>,
+    writes: Vec<(KeySpace, Key, Value)>,
+    targets: VecDeque<RealmId>,
+    replicated: Option<RealmId>,
+    retries: VecDeque<RealmId>,
+    published: bool,
+}
+
+type PublishTurn = Result<Next<bool>, PublishError>;
+
+impl PublishInterestOperation {
+    /// `node` is this node, `None` without a net transport.
+    pub fn new(node: Option<NodeId>) -> Self {
+        Self {
+            node,
+            state: PublishState::Markers,
+            markers: Vec::new(),
+            more: false,
+            realms: VecDeque::new(),
+            current: None,
+            writes: Vec::new(),
+            targets: VecDeque::new(),
+            replicated: None,
+            retries: VecDeque::new(),
+            published: false,
+        }
+    }
+
+    fn node(&self) -> Result<NodeId, PublishError> {
+        self.node
+            .ok_or_else(|| failed("watch interest publish without a node"))
+    }
+
+    fn markers_read(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> PublishTurn {
+        self.more = next.is_some() || rows.len() > DIRTY_REALM_CAP;
+        self.markers = rows.into_iter().take(DIRTY_REALM_CAP).collect();
+        if self.markers.is_empty() {
+            return Ok(Next::Done(false));
+        }
+        let realms: BTreeSet<RealmId> = (self.markers.iter())
+            .filter_map(|(key, _)| dirty_interest_realm(key.as_ref()))
+            .collect();
+        // Malformed markers only are dropped, so they cannot loop forever.
+        self.realms = realms.into_iter().collect();
+        self.next_realm()
+    }
+
+    fn next_realm(&mut self) -> PublishTurn {
+        let Some(realm_id) = self.realms.pop_front() else {
+            return self.write();
+        };
+        self.current = Some(RealmDigest {
+            realm_id,
+            config: None,
+            digest: None,
+            check_failed: false,
+        });
+        self.state = PublishState::Config;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn realm(&mut self) -> Result<&mut RealmDigest, PublishError> {
+        self.current
+            .as_mut()
+            .ok_or_else(|| failed(IoError::Unfinished))
+    }
+
+    fn configured(&mut self, config: Result<RealmConfigDocument, GetConfigError>) -> PublishTurn {
+        let config = config.map_err(|error| {
+            failed(format!(
+                "failed to read realm config for watch interest: {error}"
+            ))
+        })?;
+        let node = self.node()?;
+        let current = self.realm()?;
+        let drain = RetryDrainOperation::new(current.realm_id, config.clone(), node);
+        current.config = Some(config);
+        self.state = PublishState::Drain;
+        Ok(Next::Call(IoCall::child(drain)))
+    }
+
+    fn list(&mut self) -> PublishTurn {
+        let realm_id = self.realm()?.realm_id;
+        self.state = PublishState::List;
+        let list = ListWatchesOperation::new(WatchScope::Realm(realm_id));
+        Ok(Next::Call(IoCall::child(list)))
+    }
+
+    /// Filters the realm's watches; an oversized scan publishes a catch-all entry instead.
+    fn listed(&mut self, listed: Result<WatchPage, WatchSubscriptionError>) -> PublishTurn {
+        let node = self.node()?;
+        let subscriptions = match listed {
+            Ok(page) => page.subscriptions,
+            Err(WatchSubscriptionError::Storage(error))
+                if error.contains("subscription scan cap reached") =>
+            {
+                self.realm()?.digest = Some(catchall_digest(node));
+                return self.read_current();
+            }
+            Err(error) => return Err(failed(error)),
+        };
+        let current = self.realm()?;
+        let config = current
+            .config
+            .as_ref()
+            .ok_or_else(|| failed(IoError::Unfinished))?;
+        let filter = WatchFilterOperation::realm(current.realm_id, config, node, subscriptions)
+            .map_err(failed)?;
+        self.state = PublishState::Filter;
+        Ok(Next::Call(IoCall::child(filter)))
+    }
+
+    fn filtered(&mut self, filtered: AuthorizedWatchSubscriptions) -> PublishTurn {
+        let node = self.node()?;
+        let watches = filtered.subscriptions.into_iter();
+        let entries = watches.map(|watch| (watch.path_prefix, watch.event_mask));
+        let digest = WatchInterestDigest::from_subscriptions(node, entries);
+        let current = self.realm()?;
+        match digest_over(&digest).map_err(failed)? {
+            true => current.digest = Some(catchall_digest(node)),
+            false => {
+                current.digest = Some(digest);
+                current.check_failed = filtered.check_failed;
+            }
+        }
+        self.read_current()
+    }
+
+    fn read_current(&mut self) -> PublishTurn {
+        let node = self.node()?;
+        let realm_id = self.realm()?.realm_id;
+        let space = || WATCH_INTEREST_KEYSPACE.to_string();
+        let reads = vec![
+            (space(), Key::from(interest_node_key(realm_id, node))),
+            (space(), Key::from(interest_pending_key(realm_id))),
+        ];
+        self.state = PublishState::Current;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// Queues the realm's changed digest with its pending marker, and the realm for replication
+    /// while a digest or an earlier pending marker waits.
+    fn compared(&mut self, values: Vec<Option<Value>>) -> PublishTurn {
+        let node = self.node()?;
+        let current = self
+            .current
+            .take()
+            .ok_or_else(|| failed(IoError::Unfinished))?;
+        let realm_id = current.realm_id;
+        if current.check_failed {
+            self.retries.push_back(realm_id);
+        }
+        let [stored, pending] = <[Option<Value>; 2]>::try_from(values)
+            .map_err(|_| failed("watch interest digest read count mismatch"))?;
+        let digest = current.digest.ok_or_else(|| failed(IoError::Unfinished))?;
+        let digest = Value::from(digest.to_bytes().map_err(failed)?);
+        let changed = stored.as_ref() != Some(&digest);
+        if changed {
+            let space = || WATCH_INTEREST_KEYSPACE.to_string();
+            let digest_key = Key::from(interest_node_key(realm_id, node));
+            let pending_key = Key::from(interest_pending_key(realm_id));
+            self.writes.push((space(), digest_key, digest));
+            self.writes
+                .push((space(), pending_key, Value::from(Vec::new())));
+        }
+        if changed || pending.is_some() {
+            self.targets.push_back(realm_id);
+        }
+        self.next_realm()
+    }
+
+    /// Persists the changed digests with their pending markers in one batch.
+    fn write(&mut self) -> PublishTurn {
+        self.published = !self.targets.is_empty();
+        self.state = PublishState::Write;
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+    }
+
+    /// Replicates the next realm's digest on its realm topic.
+    fn replicate(&mut self) -> PublishTurn {
+        let Some(realm_id) = self.targets.pop_front() else {
+            return self.retry();
+        };
+        let node_id = self.node()?;
+        self.replicated = Some(realm_id);
+        self.state = PublishState::Replicate;
+        let replicate = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![DocumentTarget::WatchInterest { realm_id, node_id }],
+            // Watch-interest digests ride one shared realm topic; steady-state digest
+            // publishers must not fork genesis.
+            allow_genesis: false,
+        });
+        Ok(Next::Call(IoCall::child(replicate)))
+    }
+
+    /// Keeps a retry generation for a realm whose permission lookup failed; its fail-closed
+    /// digest still retracts stale interest at once.
+    fn retry(&mut self) -> PublishTurn {
+        let Some(realm_id) = self.retries.pop_front() else {
+            self.state = PublishState::Clear;
+            let clear = ClearMarkersOperation::new(std::mem::take(&mut self.markers));
+            return Ok(Next::Call(IoCall::child(clear)));
+        };
+        self.state = PublishState::Retry;
+        Ok(Next::Call(IoCall::child(InterestOperation::mark(realm_id))))
+    }
+
+    /// Asks for another run while markers wait, then refreshes the cache after a publish.
+    fn again(&mut self) -> PublishTurn {
+        if self.more {
+            self.more = false;
+            self.state = PublishState::Again;
+            return Ok(Next::Call(IoCall::child(InterestOperation::publish())));
+        }
+        if !self.published {
+            return Ok(Next::Done(false));
+        }
+        // The local write bypasses the reconcile path that refreshes the cache for remotes.
+        self.state = PublishState::Table;
+        Ok(Next::Call(IoCall::child(RebuildTableOperation::default())))
+    }
+}
+
+impl Operation for PublishInterestOperation {
+    type Output = bool;
+    type Error = PublishError;
+
+    fn first(&mut self) -> PublishTurn {
+        if self.node.is_none() {
+            warn!("Cannot publish watch interest without net handle");
+            return Ok(Next::Done(false));
+        }
+        Ok(Next::Call(IoCall::Page {
+            space: WATCH_INTEREST_KEYSPACE.to_string(),
+            prefix: Key::from(WATCH_DIRTY_PREFIX.to_vec()),
+            after: None,
+            limit: DIRTY_REALM_CAP.saturating_add(1),
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishTurn {
+        match std::mem::take(&mut self.state) {
+            PublishState::Markers => {
+                let (rows, next) = result.page()?;
+                self.markers_read(rows, next)
+            }
+            PublishState::Config => {
+                self.configured(result.child::<RealmConfigDocument, GetConfigError>()?)
+            }
+            PublishState::Drain => {
+                if let Err(error) = result.child::<(), RetryDrainError>()? {
+                    let realm_id = self.realm()?.realm_id;
+                    warn!(%realm_id, %error, "Watch event retry remains pending");
+                }
+                self.list()
+            }
+            PublishState::List => self.listed(result.child::<WatchPage, WatchSubscriptionError>()?),
+            PublishState::Filter => {
+                let filtered = result.child::<AuthorizedWatchSubscriptions, WatchCheckError>()?;
+                self.filtered(filtered.map_err(failed)?)
+            }
+            PublishState::Current => self.compared(result.values()?),
+            PublishState::Write => {
+                result.done()?;
+                self.replicate()
+            }
+            PublishState::Replicate => {
+                let replicated = result.child::<(), ReplicateDocumentsError>()?;
+                replicated.map_err(|error| {
+                    failed(format!("watch interest replication failed: {error}"))
+                })?;
+                let realm_id = self
+                    .replicated
+                    .take()
+                    .ok_or_else(|| failed(IoError::Unfinished))?;
+                self.state = PublishState::Pending;
+                let pending = (
+                    WATCH_INTEREST_KEYSPACE.to_string(),
+                    interest_pending_key(realm_id),
+                );
+                Ok(Next::Call(IoCall::Delete(vec![(
+                    pending.0,
+                    Key::from(pending.1),
+                )])))
+            }
+            PublishState::Pending => {
+                result.done()?;
+                self.replicate()
+            }
+            PublishState::Retry => {
+                result.child::<bool, InterestError>()?.map_err(failed)?;
+                self.retry()
+            }
+            PublishState::Clear => {
+                // A conflict means a marker was dirtied again; it stays for the next run.
+                match result.child::<(), IoError>()? {
+                    Ok(()) | Err(IoError::Conflict) => self.again(),
+                    Err(error) => Err(failed(error)),
+                }
+            }
+            PublishState::Again => {
+                let _ = result.child::<bool, InterestError>()?;
+                self.again()
+            }
+            PublishState::Table => {
+                let table = result.child::<WatchInterestTable, InterestError>()?;
+                let table = table.unwrap_or_else(|error| {
+                    warn!(%error, "Failed to scan watch interest digests");
+                    WatchInterestTable::default()
+                });
+                let replace = NetEffect::ReplaceInterest(Box::new(table));
+                Ok(Next::Then {
+                    output: true,
+                    calls: vec![IoCall::from(Effect::Net(replace))],
+                })
+            }
+        }
+    }
+}
+
+/// What refreshing the interest cache waits for.
+#[derive(Debug, Default, PartialEq)]
+enum RefreshState {
+    #[default]
+    Mark,
+    Table,
+}
+
+/// After document reconciliation: marks realms whose watches, authorization or config changed,
+/// and rebuilds the cached interest of realms whose digests or membership changed. A failed
+/// rebuild clears that realm's interest, since membership is a security boundary.
+#[derive(Debug, PartialEq)]
+pub struct RefreshInterestOperation {
+    state: RefreshState,
+    marks: VecDeque<RealmId>,
+    realms: VecDeque<RealmId>,
+    current: Option<RealmId>,
+    updates: Vec<IoCall>,
+}
+
+impl RefreshInterestOperation {
+    /// `local_realm` is this node's realm, which a group authorization change belongs to.
+    pub fn new(targets: &[DocumentTarget], local_realm: RealmId) -> Self {
+        let mut realms: BTreeSet<RealmId> = BTreeSet::new();
+        let mut dirty: BTreeSet<RealmId> = BTreeSet::new();
+        for target in targets {
+            match target {
+                DocumentTarget::WatchInterest { realm_id, .. } => {
+                    realms.insert(*realm_id);
+                }
+                DocumentTarget::WatchSubscription { owner, .. } => {
+                    dirty.insert(owner.realm_id);
+                }
+                DocumentTarget::GroupAuthorization { .. } => {
+                    dirty.insert(local_realm);
+                }
+                DocumentTarget::RealmAuthorization { realm_id } => {
+                    dirty.insert(*realm_id);
+                }
+                DocumentTarget::RealmConfig { realm_id } => {
+                    realms.insert(*realm_id);
+                    dirty.insert(*realm_id);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            state: RefreshState::Mark,
+            marks: dirty.into_iter().collect(),
+            realms: realms.into_iter().collect(),
+            current: None,
+            updates: Vec::new(),
+        }
+    }
+
+    fn next_step(&mut self) -> Result<Next<()>, IoError> {
+        if let Some(realm_id) = self.marks.pop_front() {
+            self.current = Some(realm_id);
+            self.state = RefreshState::Mark;
+            return Ok(Next::Call(IoCall::child(InterestOperation::mark(realm_id))));
+        }
+        if let Some(realm_id) = self.realms.pop_front() {
+            self.current = Some(realm_id);
+            self.state = RefreshState::Table;
+            return Ok(Next::Call(IoCall::child(RebuildTableOperation::realm(
+                realm_id,
+            ))));
+        }
+        let calls = std::mem::take(&mut self.updates);
+        if calls.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        Ok(Next::Then { output: (), calls })
+    }
+}
+
+impl Operation for RefreshInterestOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        self.next_step()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let realm_id = self.current.take().ok_or(IoError::Unfinished)?;
+        match self.state {
+            RefreshState::Mark => {
+                if let Err(error) = result.child::<bool, InterestError>()? {
+                    warn!(%realm_id, %error, "Failed to schedule watch interest rebuild after document reconciliation");
+                }
+            }
+            RefreshState::Table => {
+                let nodes = match result.child::<WatchInterestTable, InterestError>()? {
+                    Ok(mut table) => table.take_realm(realm_id),
+                    Err(error) => {
+                        warn!(%realm_id, %error, "Cleared watch interest after failed realm refresh");
+                        Default::default()
+                    }
+                };
+                let update = NetEffect::UpdateRealmInterest { realm_id, nodes };
+                self.updates.push(IoCall::from(Effect::Net(update)));
+            }
+        }
+        self.next_step()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
