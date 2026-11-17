@@ -5,6 +5,7 @@
 pub mod drain_state;
 pub mod heartbeat;
 pub mod holder_choice;
+mod info_write;
 pub mod node_info;
 pub mod read_info;
 pub mod realm_usage;
