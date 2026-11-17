@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -28,6 +29,16 @@ pub enum PurgeFenceError {
     /// The distributed bucket write lost its authority before it committed.
     #[error(transparent)]
     Distribution(GuardError),
+}
+
+impl From<IoError> for PurgeFenceError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Unexpected(other.to_string()),
+        }
+    }
 }
 
 pub fn fence_key(bucket: &str) -> Key {

@@ -7,10 +7,7 @@ use std::sync::Arc;
 
 use aruna_compute::ExecutorRegistry;
 use aruna_core::compute::{ExecutorCapability, ExecutorKind, NetworkAccess, ResourceEnvelope};
-use aruna_core::effects::{
-    HolderList, JobRecordEffect, JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS, PageLimit,
-    ReceiptFrame,
-};
+use aruna_core::effects::{JobRecordFrame, LaunchFrame, MAX_RECORD_HOLDERS, ReceiptFrame};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{DeclinedPolicy, LaunchDecline};
 use aruna_core::id::NodeId;
@@ -349,6 +346,7 @@ pub(crate) fn classify(error: &LifecycleError) -> CommitVerdict {
         LifecycleError::NotHolder | LifecycleError::RealmConfigMissing => CommitVerdict::Drained,
         LifecycleError::GroupWrite(_)
         | LifecycleError::Conversion(_)
+        | LifecycleError::Codec(_)
         | LifecycleError::Record(_)
         | LifecycleError::Family(_)
         | LifecycleError::Store(_)
@@ -844,23 +842,13 @@ async fn fetch_family(
     holders.retain(|holder| *holder != scheduler);
     holders.truncate(MAX_RECORD_HOLDERS.saturating_sub(1));
     holders.insert(0, scheduler);
-    let Ok(holders) = HolderList::new(holders) else {
-        return;
-    };
-    let fetched = drive(
-        FetchFamilyOperation::new(JobRecordEffect::Fetch {
-            realm_id,
-            placement,
-            holders,
-            submission_id: family.submission_id,
-            request_digest: Some(family.request_digest),
-            cursor: None,
-            limit: PageLimit::default(),
-            deadline: FETCH_DEADLINE,
-        }),
-        context.as_ref(),
-    )
-    .await;
+    let fetch = FetchFamilyOperation::new(
+        placement,
+        holders,
+        (family.submission_id, family.request_digest),
+        FETCH_DEADLINE,
+    );
+    let fetched = drive(fetch, context.as_ref()).await;
     let Ok((source, records)) = fetched else {
         return;
     };

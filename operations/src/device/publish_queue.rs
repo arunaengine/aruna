@@ -4,23 +4,22 @@
 
 use crate::device::retry::RetryView;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::scan_rows::{ScanRowsError, ScanRowsOperation};
 use crate::auth::error::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
@@ -270,43 +269,25 @@ pub fn scan_publish_queue(start_after: Option<Key>, txn_id: Option<TxnId>) -> Ef
     })
 }
 
-pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
-        key: publish_key(draft_id),
-        txn_id,
-    })
+/// The call that reads one queued draft.
+pub(super) fn read_entry(draft_id: Ulid) -> IoCall {
+    read_row(DEVICE_INTAKE_KEYSPACE, publish_key(draft_id))
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ClaimError {
-    #[error("unexpected {0} while claiming a queued draft")]
-    UnexpectedEvent(&'static str),
-    #[error("claiming a queued draft did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaimStep {
-    Init,
-    Start,
-    Read,
-    Write,
-    Commit,
-    Abort,
-    Finish,
-}
-
-/// Stores `next` only while the entry still carries the state the scan read, and outputs
-/// whether that committed. A delete committed in between therefore wins instead of the entry
-/// coming back as `Publishing`.
+/// Stores `next` only while the entry still carries the state the scan read, in one
+/// transaction, and outputs whether the entry was claimed. A delete committed in between
+/// therefore wins instead of the entry coming back as `Publishing`.
 #[derive(Debug, PartialEq)]
 pub struct ClaimStateOperation {
     entry: PublishEntry,
     next: PublishState,
-    step: ClaimStep,
-    txn_id: Option<TxnId>,
-    output: Option<Result<bool, ClaimError>>,
+    written: bool,
 }
 
 impl ClaimStateOperation {
@@ -314,231 +295,58 @@ impl ClaimStateOperation {
         Self {
             entry,
             next,
-            step: ClaimStep::Init,
-            txn_id: None,
-            output: None,
+            written: false,
         }
     }
 
-    /// Ends with `output`, aborting the transaction first when one is open.
-    fn end(&mut self, output: Result<bool, ClaimError>) -> Effects {
-        self.output = Some(output);
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.step = ClaimStep::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.step = ClaimStep::Finish;
-                smallvec![]
-            }
-        }
-    }
-
-    fn write(&mut self, current: Option<PublishEntry>) -> Effects {
+    fn write(&mut self, current: Option<PublishEntry>) -> Next<bool> {
         if !current.is_some_and(|current| current.state == self.entry.state) {
-            return self.end(Ok(false));
+            return Next::Done(false);
         }
         let claimed = entry_with_state(&self.entry, self.next.clone());
-        let Ok((key_space, key, value)) = publish_entry(&claimed) else {
+        let Ok(row) = publish_entry(&claimed) else {
             warn!(draft_id = %self.entry.draft_id, "Failed to encode a queued draft");
-            return self.end(Ok(false));
+            return Next::Done(false);
         };
-        self.step = ClaimStep::Write;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: self.txn_id,
-        })]
+        self.written = true;
+        Next::Call(IoCall::Write(vec![row]))
     }
 }
 
-impl EffectOperation for ClaimStateOperation {
+impl Operation for ClaimStateOperation {
     type Output = bool;
     type Error = ClaimError;
 
-    fn start(&mut self) -> Effects {
-        self.step = ClaimStep::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Result<Next<bool>, ClaimError> {
+        Ok(Next::Call(read_entry(self.entry.draft_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let draft_id = self.entry.draft_id;
-        match (self.step, event) {
-            (ClaimStep::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.step = ClaimStep::Read;
-                smallvec![read_publish_entry(draft_id, Some(txn_id))]
-            }
-            (ClaimStep::Start, Event::Storage(StorageEvent::Error { .. })) => {
-                warn!(%draft_id, "Failed to open a transaction for a queued draft");
-                self.end(Ok(false))
-            }
-            (ClaimStep::Read, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                let current = value.and_then(|bytes| PublishEntry::from_bytes(&bytes).ok());
-                self.write(current)
-            }
-            (ClaimStep::Read | ClaimStep::Write, Event::Storage(StorageEvent::Error { .. })) => {
-                self.end(Ok(false))
-            }
-            (ClaimStep::Write, Event::Storage(StorageEvent::WriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id.take() else {
-                    return self.end(Ok(false));
-                };
-                self.step = ClaimStep::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (ClaimStep::Commit, event) => {
-                let committed = matches!(
-                    event,
-                    Event::Storage(StorageEvent::TransactionCommitted { .. })
-                );
-                self.end(Ok(committed))
-            }
-            (ClaimStep::Abort, _) => {
-                self.step = ClaimStep::Finish;
-                smallvec![]
-            }
-            (_, event) => self.end(Err(ClaimError::UnexpectedEvent(event.label()))),
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
+        if self.written {
+            done(result)?;
+            return Ok(Next::Done(true));
         }
+        let [stored] = values::<1>(result)?;
+        let current = stored.and_then(|bytes| PublishEntry::from_bytes(&bytes).ok());
+        Ok(self.write(current))
     }
 
-    fn is_complete(&self) -> bool {
-        self.step == ClaimStep::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ClaimError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
-    }
-}
-
-/// Moves every failed, retryable queued draft back into the queue at `now_ms`, each only while
-/// it still carries the state the scan read. Outputs how many were moved back.
-#[derive(Debug, PartialEq)]
-pub struct RequeueFailedOperation {
-    now_ms: u64,
-    scan: Option<ScanRowsOperation>,
-    /// Drafts still to move back with their next state, the next one last.
-    pending: Vec<(PublishEntry, PublishState)>,
-    claim: Option<ClaimStateOperation>,
-    requeued: usize,
-    output: Option<Result<usize, ScanRowsError>>,
-}
-
-impl RequeueFailedOperation {
-    pub fn new(now_ms: u64) -> Self {
-        Self {
-            now_ms,
-            scan: None,
-            pending: Vec::new(),
-            claim: None,
-            requeued: 0,
-            output: None,
-        }
-    }
-
-    fn next_claim(&mut self) -> Effects {
-        let Some((entry, state)) = self.pending.pop() else {
-            self.output = Some(Ok(self.requeued));
-            return smallvec![];
-        };
-        let mut claim = ClaimStateOperation::new(entry, state);
-        let effects = claim.start();
-        self.claim = Some(claim);
-        effects
-    }
-}
-
-impl EffectOperation for RequeueFailedOperation {
-    type Output = usize;
-    type Error = ScanRowsError;
-
-    fn start(&mut self) -> Effects {
-        let mut scan = ScanRowsOperation::new(DEVICE_INTAKE_KEYSPACE, None, PUBLISH_PAGE_SIZE);
-        let effects = scan.start();
-        self.scan = Some(scan);
-        effects
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Some(mut claim) = self.claim.take() {
-            let effects = claim.step(event);
-            if !claim.is_complete() {
-                self.claim = Some(claim);
-                return effects;
-            }
-            if claim.finalize() == Ok(true) {
-                self.requeued += 1;
-            }
-            return self.next_claim();
-        }
-        let Some(mut scan) = self.scan.take() else {
-            self.output = Some(Err(ScanRowsError::UnexpectedEvent(event.label())));
-            return smallvec![];
-        };
-        let effects = scan.step(event);
-        if !scan.is_complete() {
-            self.scan = Some(scan);
-            return effects;
-        }
-        let rows = match scan.finalize() {
-            Ok(rows) => rows,
-            Err(error) => {
-                self.output = Some(Err(error));
-                return smallvec![];
-            }
-        };
-        let entries = rows
-            .iter()
-            .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok());
-        self.pending = entries
-            .filter_map(|entry| Some((entry.retry_failed(self.now_ms)?, entry)))
-            .map(|(state, entry)| (entry, state))
-            .collect();
-        self.pending.reverse();
-        self.next_claim()
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ScanRowsError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.claim {
-            Some(claim) => claim.abort(),
-            None => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::{
-        ClaimError, ClaimStateOperation, PUBLISH_PAGE_SIZE, PublishEntry, PublishState,
-        RequeueFailedOperation, entry_with_state, publish_entry, publish_key, read_publish_entry,
+        ClaimStateOperation, DEVICE_INTAKE_KEYSPACE, PublishEntry, PublishState, entry_with_state,
+        publish_entry, publish_key,
     };
-    use crate::device::scan_rows::ScanRowsOperation;
     use crate::tests::device::record;
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
-    use aruna_core::operation::EffectOperation;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
     use craqle::VectorClock;
     use ulid::Ulid;
@@ -664,8 +472,6 @@ mod pure_tests {
         ));
     }
 
-    const TXN: Ulid = Ulid::from_bytes([9; 16]);
-
     fn publishing() -> PublishState {
         PublishState::Publishing {
             document_id: Ulid::from_parts(4, 4),
@@ -674,145 +480,45 @@ mod pure_tests {
         }
     }
 
-    fn storage(event: StorageEvent) -> Event {
-        Event::Storage(event)
+    fn stored(entry: &PublishEntry) -> IoResult {
+        IoResult::Values(vec![Some(entry.to_bytes().unwrap().into())])
     }
 
-    fn stored(entry: &PublishEntry) -> Event {
-        storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(entry.to_bytes().unwrap().into()),
-        })
-    }
-
-    fn abort() -> Effect {
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
-    }
-
-    // An entry still in the scanned state is claimed in one transaction.
+    // An entry still in the scanned state is claimed in the operation's transaction.
     #[test]
     fn claims_unchanged_entry() {
         let entry = entry();
-        let (key_space, key, value) =
-            publish_entry(&entry_with_state(&entry, publishing())).unwrap();
-        let write = Effect::Storage(StorageEffect::Write {
-            key_space,
-            key: key.clone(),
-            value,
-            txn_id: Some(TXN),
-        });
         let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
-        check_trace(
-            &mut claim,
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })],
-            vec![
-                (
-                    storage(StorageEvent::TransactionStarted { txn_id: TXN }),
-                    vec![read_publish_entry(entry.draft_id, Some(TXN))],
-                ),
-                (stored(&entry), vec![write]),
-                (
-                    storage(StorageEvent::WriteResult { key }),
-                    vec![Effect::Storage(StorageEffect::CommitTransaction {
-                        txn_id: TXN,
-                    })],
-                ),
-                (
-                    storage(StorageEvent::TransactionCommitted { txn_id: TXN }),
-                    Vec::new(),
-                ),
-            ],
+        assert!(claim.transaction());
+        let read = (
+            DEVICE_INTAKE_KEYSPACE.to_string(),
+            publish_key(entry.draft_id),
         );
-        assert_eq!(claim.finalize(), Ok(true));
+        assert_eq!(claim.first(), Ok(Next::Call(IoCall::Read(vec![read]))));
+        let row = publish_entry(&entry_with_state(&entry, publishing())).unwrap();
+        assert_eq!(
+            claim.next(stored(&entry)),
+            Ok(Next::Call(IoCall::Write(vec![row])))
+        );
+        assert_eq!(claim.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
-    // An entry that moved on or went away is left alone and the transaction aborted.
+    // An entry that moved on or went away is left alone; another result fails.
     #[test]
     fn moved_entry_kept() {
         let entry = entry();
-        let started = || storage(StorageEvent::TransactionStarted { txn_id: TXN });
         let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
-        claim.start();
-        claim.step(started());
-        check_abort(
-            &mut ClaimStateOperation {
-                txn_id: Some(TXN),
-                ..ClaimStateOperation::new(entry.clone(), publishing())
-            },
-            &[abort()],
-        );
+        claim.first().unwrap();
         let moved = entry_with_state(&entry, publishing());
-        assert_eq!(claim.step(stored(&moved)).into_vec(), vec![abort()]);
-        let aborted = storage(StorageEvent::TransactionAborted { txn_id: TXN });
-        assert!(claim.step(aborted).is_empty());
-        assert_eq!(claim.finalize(), Ok(false));
-
+        assert_eq!(claim.next(stored(&moved)), Ok(Next::Done(false)));
         let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
-        claim.start();
-        claim.step(storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(claim.finalize(), Ok(false));
-    }
-
-    // Unstarted claims refuse every event, abort nothing and never finish early.
-    #[test]
-    fn claim_rejects_unexpected() {
-        let fresh = || ClaimStateOperation::new(entry(), publishing());
-        let refused = rejects_events(fresh, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        assert!(matches!(refused[0].2, ClaimError::UnexpectedEvent(_)));
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
-    }
-
-    // A failed, retryable draft is claimed again; other drafts are left alone.
-    #[test]
-    fn requeues_failed_drafts() {
-        let mut failed = entry();
-        failed.state = PublishState::Failed {
-            reason: "unreachable".to_string(),
-            retryable: true,
-            document_id: None,
-        };
-        let pending = entry();
-        let next = failed.retry_failed(5).unwrap();
-        let rows = [&pending, &failed].map(|entry| {
-            let (_, key, value) = publish_entry(entry).unwrap();
-            (key, value)
-        });
-        let page = storage(StorageEvent::IterResult {
-            values: rows.to_vec(),
-            next_start_after: None,
-        });
-        let scan = ScanRowsOperation::new(
-            aruna_core::keyspaces::DEVICE_INTAKE_KEYSPACE,
-            None,
-            PUBLISH_PAGE_SIZE,
-        )
-        .start();
-        let claim = ClaimStateOperation::new(failed, next).start();
-        let mut requeue = RequeueFailedOperation::new(5);
-        check_trace(&mut requeue, &scan, vec![(page, claim.into_vec())]);
-        assert!(!requeue.is_complete());
-
-        let mut requeue = RequeueFailedOperation::new(5);
-        requeue.start();
-        let empty = storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        });
-        assert!(requeue.step(empty).is_empty());
-        assert_eq!(requeue.finalize(), Ok(0));
-
-        let fresh = || RequeueFailedOperation::new(5);
+        claim.first().unwrap();
         assert_eq!(
-            rejects_events(fresh, sample_events, |_| false).len(),
-            sample_events().len()
+            claim.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
         );
-        rejects_finalize(fresh());
-        assert!(fresh().abort().is_empty());
+        let mut claim = ClaimStateOperation::new(entry, publishing());
+        claim.first().unwrap();
+        assert!(claim.next(IoResult::Woke).is_err());
     }
 }

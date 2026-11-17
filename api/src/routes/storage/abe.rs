@@ -204,18 +204,12 @@ pub async fn envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::IoError;
 
     #[test]
     fn storage_unavailable_maps() {
-        let mut operation = EnvelopeOperation::new("b".into(), "k".into(), Ulid::generate());
-        operation.start();
-        operation.step(aruna_core::events::Event::Storage(
-            aruna_core::events::StorageEvent::Error {
-                error: aruna_core::errors::StorageError::Timeout,
-            },
-        ));
-        let error = operation.finalize().unwrap_err();
+        let timeout = IoError::Storage(aruna_core::errors::StorageError::Timeout);
+        let error = AbeError::from(timeout);
         assert_eq!(error, AbeError::Unavailable);
         assert!(matches!(abe_error(error), ServerError::ServiceUnavailable));
     }

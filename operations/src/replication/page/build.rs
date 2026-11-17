@@ -5,22 +5,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::distribution::Publication;
 use aruna_core::structs::storage::distribution::source_root::SourceRoot;
 use aruna_core::structs::storage::replication::ReplicationItemKind;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use super::{PAGE_BYTES, PAGE_RECORDS};
@@ -50,11 +48,20 @@ pub enum BuildError {
     Conversion(#[from] ConversionError),
     #[error("the source bucket is missing")]
     BucketMissing,
-    #[error("unexpected event while building a page: {0}")]
-    UnexpectedEvent(String),
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("could not build a page: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for BuildError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<Vec<Built>>, BuildError>;
 
 /// Queued member jobs of one bucket, member and publication.
 #[derive(Clone, Debug, PartialEq)]
@@ -64,34 +71,24 @@ pub struct BuildInput {
     pub jobs: Vec<BlobJobRecord>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BuildState {
-    Init,
-    ReadRows,
-    ReadRoots,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, PartialEq)]
 pub struct PageBuildOperation {
     input: BuildInput,
-    state: BuildState,
     group_id: GroupId,
     versions: Vec<Option<BlobVersion>>,
     heads: Vec<Option<CurrentVersionPointer>>,
-    output: Option<Result<Vec<Built>, BuildError>>,
+    /// The root digests read, in read order, once the rows were taken.
+    roots: Option<Vec<[u8; 32]>>,
 }
 
 impl PageBuildOperation {
     pub fn new(input: BuildInput) -> Self {
         Self {
             input,
-            state: BuildState::Init,
             group_id: GroupId::nil(),
             versions: Vec::new(),
             heads: Vec::new(),
-            output: None,
+            roots: None,
         }
     }
 
@@ -114,11 +111,11 @@ impl PageBuildOperation {
         Ok(reads)
     }
 
-    fn accept_rows(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, BuildError> {
+    fn accept_rows(&mut self, values: Vec<Option<Value>>) -> Step {
         if values.len() != 1 + 2 * self.input.jobs.len() {
             return Err(StorageError::ReadError("short page build read".to_string()).into());
         }
-        let mut values = values.into_iter().map(|(_, value)| value);
+        let mut values = values.into_iter();
         let bucket = values.next().flatten().ok_or(BuildError::BucketMissing)?;
         self.group_id = BucketInfo::from_bytes(&bucket)?.group_id;
         for _ in 0..self.input.jobs.len() {
@@ -140,28 +137,24 @@ impl PageBuildOperation {
         if digests.is_empty() {
             return self.finish(BTreeMap::new());
         }
-        self.state = BuildState::ReadRoots;
-        let reads = (digests.into_iter())
+        let digests: Vec<_> = digests.into_iter().collect();
+        let reads = (digests.iter())
             .map(|digest| (ROOT_RECORD_KEYSPACE.to_string(), digest.to_vec().into()))
             .collect();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })])
+        self.roots = Some(digests);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn accept_roots(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, BuildError> {
+    fn accept_roots(&mut self, digests: Vec<[u8; 32]>, values: Vec<Option<Value>>) -> Step {
         let mut roots = BTreeMap::new();
-        for (key, value) in values {
-            let (Ok(digest), Some(value)) = (<[u8; 32]>::try_from(key.as_ref()), value) else {
-                continue;
-            };
+        for (digest, value) in digests.into_iter().zip(values) {
+            let Some(value) = value else { continue };
             roots.insert(digest, SourceRoot::from_bytes(&value)?);
         }
         self.finish(roots)
     }
 
-    fn finish(&mut self, roots: BTreeMap<[u8; 32], SourceRoot>) -> Result<Effects, BuildError> {
+    fn finish(&mut self, roots: BTreeMap<[u8; 32], SourceRoot>) -> Step {
         let mut keys = BTreeSet::new();
         let mut bytes = 0usize;
         let mut built = Vec::with_capacity(self.input.jobs.len());
@@ -200,9 +193,7 @@ impl PageBuildOperation {
             bytes += size;
             built.push(Built::Record(Box::new(manifest)));
         }
-        self.state = BuildState::Finish;
-        self.output = Some(Ok(built));
-        Ok(smallvec![])
+        Ok(Next::Done(built))
     }
 }
 
@@ -263,55 +254,19 @@ pub(crate) fn reference_manifest(
     })
 }
 
-impl EffectOperation for PageBuildOperation {
+impl Operation for PageBuildOperation {
     type Output = Vec<Built>;
     type Error = BuildError;
 
-    fn start(&mut self) -> Effects {
-        match self.rows() {
-            Ok(reads) => {
-                self.state = BuildState::ReadRows;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: None,
-                })]
-            }
-            Err(error) => {
-                self.state = BuildState::Error;
-                self.output = Some(Err(error.into()));
-                smallvec![]
-            }
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(IoCall::Read(self.rows()?)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        let values = result.values()?;
+        match self.roots.take() {
+            Some(digests) => self.accept_roots(digests, values),
+            None => self.accept_rows(values),
         }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (self.state, event) {
-            (BuildState::ReadRows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.accept_rows(values)
-            }
-            (BuildState::ReadRoots, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.accept_roots(values)
-            }
-            (BuildState::Finish | BuildState::Error, _) => return smallvec![],
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(BuildError::UnexpectedEvent(event.label().to_string())),
-        };
-        result.unwrap_or_else(|error| {
-            self.state = BuildState::Error;
-            self.output = Some(Err(error));
-            smallvec![]
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, BuildState::Finish | BuildState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(BuildError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }

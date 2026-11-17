@@ -2,14 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchOfferEffect, NetEffect};
-use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
-use tracing::debug;
+use std::time::Duration;
+
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, MetadataRequestEffect, NetEffect};
+use aruna_core::events::{Event, LaunchDecline, MetadataAnswer, NetEvent};
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
+use tracing::{debug, warn};
 
 use super::LifecycleError;
+use crate::metadata::protocol::{MetadataTransportMessage, decode_message, encode_message};
 
 /// What a target answered to one offer.
 #[derive(Debug, PartialEq)]
@@ -20,80 +23,90 @@ pub enum OfferOutcome {
     Unavailable,
 }
 
-/// Offers one durable launch to its target and returns the answer verbatim.
+/// Offers one durable launch to a remote target and returns the answer verbatim. A launch
+/// planned onto this node is admitted by its caller instead: no transport dials itself.
 #[derive(Debug, PartialEq)]
 pub struct OfferLaunchOperation {
-    effect: Option<LaunchOfferEffect>,
-    outcome: Option<Result<OfferOutcome, LifecycleError>>,
-    sent: bool,
+    target: NodeId,
+    frame: Option<Vec<u8>>,
+    timeout: Duration,
 }
 
 impl OfferLaunchOperation {
-    pub fn new(effect: LaunchOfferEffect) -> Self {
+    pub fn new(target: NodeId, launch: LaunchFrame, timeout: Duration) -> Self {
+        let message = MetadataTransportMessage::ForwardLaunchOffer {
+            launch: Box::new(launch),
+        };
+        let frame = encode_message(&message)
+            .inspect_err(|error| warn!(error = %error, "Launch offer frame does not encode"))
+            .ok();
         Self {
-            effect: Some(effect),
-            outcome: None,
-            sent: false,
+            target,
+            frame,
+            timeout,
         }
     }
 }
 
-impl EffectOperation for OfferLaunchOperation {
+impl Operation for OfferLaunchOperation {
     type Output = OfferOutcome;
     type Error = LifecycleError;
 
-    fn start(&mut self) -> Effects {
-        let Some(effect) = self.effect.take() else {
-            self.outcome = Some(Err(LifecycleError::NotFinished));
-            return smallvec![];
+    fn first(&mut self) -> Result<Next<OfferOutcome>, LifecycleError> {
+        let Some(frame) = self.frame.take() else {
+            return Ok(Next::Done(OfferOutcome::Unavailable));
         };
-        self.sent = true;
-        smallvec![Effect::Net(NetEffect::LaunchOffer(Box::new(effect)))]
+        Ok(Next::Call(IoCall::Effect(Effect::Net(
+            NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
+                peer: self.target,
+                frame,
+                timeout: self.timeout,
+            })),
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if !self.sent {
-            self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-                state: "Settled".to_string(),
-                expected: "no further event",
-                got: event.label(),
-            }));
-            return smallvec![];
-        }
-        self.outcome = Some(match event {
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Accepted { receipt, .. })) => {
-                match JobRecordFrame::new(receipt.into_inner()) {
-                    Ok(frame) => Ok(OfferOutcome::Accepted(frame)),
-                    Err(error) => Err(LifecycleError::Store(error.into())),
-                }
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Declined { target, reason })) => {
-                debug!(peer = %target, reason = ?reason, "Execution target declined a launch");
-                Ok(OfferOutcome::Declined(reason))
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(message))) => {
-                debug!(message, "Execution target did not answer the offer");
-                Ok(OfferOutcome::Unavailable)
-            }
-            other => Err(LifecycleError::UnexpectedEvent {
+    fn next(&mut self, result: IoResult) -> Result<Next<OfferOutcome>, LifecycleError> {
+        let IoResult::Event(Event::Net(NetEvent::MetadataAnswer(answer))) = result else {
+            return Err(LifecycleError::UnexpectedEvent {
                 state: "Offer".to_string(),
-                expected: "launch offer result",
-                got: other.label(),
-            }),
-        });
-        self.sent = false;
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+                expected: "metadata answer",
+                got: "another result",
+            });
+        };
+        let MetadataAnswer { result, .. } = *answer;
+        let reply = match result {
+            Ok(bytes) => decode_message(&bytes).map_err(|error| error.to_string()),
+            Err(error) => Err(format!("{error:?}")),
+        };
+        Ok(Next::Done(match reply {
+            Ok(MetadataTransportMessage::ForwardedLaunchOffer {
+                result: Ok(receipt),
+            }) => match JobRecordFrame::new(receipt.into_inner()) {
+                Ok(frame) => OfferOutcome::Accepted(frame),
+                Err(error) => return Err(LifecycleError::Store(error.into())),
+            },
+            Ok(MetadataTransportMessage::ForwardedLaunchOffer {
+                result: Err(reason),
+            }) => {
+                debug!(peer = %self.target, reason = ?reason, "Execution target declined a launch");
+                OfferOutcome::Declined(reason)
+            }
+            Ok(other) => {
+                debug!(
+                    peer = %self.target,
+                    reply = crate::metadata::transport_message_kind(&other),
+                    "Execution target answered a launch offer with another message"
+                );
+                OfferOutcome::Unavailable
+            }
+            Err(message) => {
+                debug!(message, "Execution target did not answer the offer");
+                OfferOutcome::Unavailable
+            }
+        }))
     }
 }
+
+#[cfg(test)]
+#[path = "offer_tests.rs"]
+mod state_machine_tests;

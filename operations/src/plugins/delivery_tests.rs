@@ -17,14 +17,14 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::JobRunOutcome;
-use crate::jobs::plugin_work::run_plugin_work;
-use crate::jobs::plugin_work::tests::job_context;
 use crate::jobs::store::query::insert_job;
 use crate::jobs::store::state::read_job_record;
 use crate::plugins::finished::{drop_completion, retry_run, waits_for};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::settle_work;
+use crate::plugins::plugin_work::run_plugin_work;
+use crate::plugins::plugin_work::tests::job_context;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, read_run};
 use crate::plugins::state::{MAX_STATE_BYTES, MAX_STATE_VALUE, put_state, remove_state};

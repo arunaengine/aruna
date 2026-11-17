@@ -4,21 +4,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::errors::StorageError;
 use aruna_core::federation::{FederationError, Signed};
 use aruna_core::handoff::descriptor_digest;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::transfer::{
     ExportGrant, ImportDestination, ImportIntent, MAX_TRANSFER_SECS, TransferError, check_grant,
     check_intent, import_key,
 };
-use aruna_core::types::Effects;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::document_repository::GetConfigError;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum TransferAdmitError {
@@ -38,52 +40,34 @@ pub enum TransferAdmitError {
     UnexpectedEvent,
 }
 
-/// Reads the realm config, then decides once from it.
-#[derive(Debug, PartialEq)]
-struct ConfigStep<T> {
-    read: Option<GetConfigOperation>,
-    output: Option<Result<T, TransferAdmitError>>,
+impl From<IoError> for TransferAdmitError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => StorageError::TransactionConflict.into(),
+            IoError::Storage(error) => error.into(),
+            IoError::Unexpected { .. } | IoError::Codec(_) => Self::UnexpectedEvent,
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::NotFinished,
+        }
+    }
 }
 
-impl<T> ConfigStep<T> {
-    fn new(realm_id: RealmId) -> Self {
-        Self {
-            read: Some(GetConfigOperation::new(realm_id)),
-            output: None,
-        }
+impl From<StorageError> for TransferAdmitError {
+    fn from(error: StorageError) -> Self {
+        Self::Config(GetConfigError::StorageError(error))
     }
+}
 
-    fn start(&mut self) -> Effects {
-        self.read
-            .as_mut()
-            .map(EffectOperation::start)
-            .unwrap_or_default()
-    }
+/// The read of the realm config that both decisions start from.
+fn read_config(realm_id: RealmId) -> IoCall {
+    let target = DocumentTarget::RealmConfig { realm_id };
+    read_row(target.storage_keyspace(), target.storage_key())
+}
 
-    fn step(
-        &mut self,
-        event: Event,
-        decide: impl FnOnce(RealmConfigDocument) -> Result<T, TransferAdmitError>,
-    ) -> Effects {
-        let Some(read) = self.read.as_mut() else {
-            self.output = Some(Err(TransferAdmitError::UnexpectedEvent));
-            return Effects::new();
-        };
-        let effects = read.step(event);
-        if read.is_complete()
-            && let Some(read) = self.read.take()
-        {
-            self.output = Some(read.finalize().map_err(Into::into).and_then(decide));
-        }
-        effects
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.read
-            .as_mut()
-            .map(EffectOperation::abort)
-            .unwrap_or_default()
-    }
+/// The realm config of [`read_config`]; a missing one is not found.
+fn realm_config(result: IoResult) -> Result<RealmConfigDocument, TransferAdmitError> {
+    let [value] = values::<1>(result)?;
+    let value = value.ok_or(GetConfigError::DocumentNotFound)?;
+    Ok(RealmConfigDocument::from_bytes(&value).map_err(GetConfigError::from)?)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,55 +88,38 @@ pub struct IssueIntentConfig {
 #[derive(Debug, PartialEq)]
 pub struct IssueIntentOperation {
     config: IssueIntentConfig,
-    step: ConfigStep<Signed<ImportIntent>>,
 }
 
 impl IssueIntentOperation {
     pub fn new(config: IssueIntentConfig) -> Self {
-        let step = ConfigStep::new(config.realm_id);
-        Self { config, step }
+        Self { config }
     }
 }
 
-impl EffectOperation for IssueIntentOperation {
+impl Operation for IssueIntentOperation {
     type Output = Signed<ImportIntent>;
     type Error = TransferAdmitError;
 
-    fn start(&mut self) -> Effects {
-        self.step.start()
+    fn first(&mut self) -> Result<Next<Self::Output>, TransferAdmitError> {
+        Ok(Next::Call(read_config(self.config.realm_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, TransferAdmitError> {
         let config = &self.config;
-        self.step.step(event, |realm| {
-            let settings = realm.federation.ok_or(TransferAdmitError::Disabled)?;
-            let intent = ImportIntent {
-                realm_id: config.realm_id,
-                descriptor_digest: descriptor_digest(&settings.descriptor)?,
-                principal: config.principal,
-                destination: config.destination.clone(),
-                max_bytes: config.max_bytes,
-                nonce: config.nonce.clone(),
-                issued_at: config.now,
-                expires_at: config.now.saturating_add(MAX_TRANSFER_SECS),
-                intent_id: config.intent_id,
-            };
-            Ok(Signed::sign(intent, &config.node_capabilities)?)
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        self.step.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.step
-            .output
-            .unwrap_or(Err(TransferAdmitError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.step.abort()
+        let realm = realm_config(result)?;
+        let settings = realm.federation.ok_or(TransferAdmitError::Disabled)?;
+        let intent = ImportIntent {
+            realm_id: config.realm_id,
+            descriptor_digest: descriptor_digest(&settings.descriptor)?,
+            principal: config.principal,
+            destination: config.destination.clone(),
+            max_bytes: config.max_bytes,
+            nonce: config.nonce.clone(),
+            issued_at: config.now,
+            expires_at: config.now.saturating_add(MAX_TRANSFER_SECS),
+            intent_id: config.intent_id,
+        };
+        Ok(Next::Done(Signed::sign(intent, &config.node_capabilities)?))
     }
 }
 
@@ -171,58 +138,41 @@ pub struct AdmitTransferConfig {
 #[derive(Debug, PartialEq)]
 pub struct AdmitTransferOperation {
     config: AdmitTransferConfig,
-    step: ConfigStep<String>,
 }
 
 impl AdmitTransferOperation {
     pub fn new(config: AdmitTransferConfig) -> Self {
-        let step = ConfigStep::new(config.realm_id);
-        Self { config, step }
+        Self { config }
     }
 }
 
-impl EffectOperation for AdmitTransferOperation {
+impl Operation for AdmitTransferOperation {
     type Output = String;
     type Error = TransferAdmitError;
 
-    fn start(&mut self) -> Effects {
-        self.step.start()
+    fn first(&mut self) -> Result<Next<String>, TransferAdmitError> {
+        Ok(Next::Call(read_config(self.config.realm_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<String>, TransferAdmitError> {
         let config = &self.config;
-        self.step.step(event, |realm| {
-            let (intent, grant, now) = (&config.intent, &config.grant, config.now);
-            let settings = realm
-                .federation
-                .as_ref()
-                .ok_or(TransferAdmitError::Disabled)?;
-            let secret = config.secret.as_deref();
-            check_intent(intent, &config.realm_id, &settings.descriptor, secret, now)?;
-            check_grant(grant, intent, now)?;
-            let payload = &intent.payload;
-            if realm
-                .user_cutoff(&payload.principal, now)
-                .is_some_and(|cutoff| payload.issued_at < cutoff)
-            {
-                return Err(TransferAdmitError::CutOff);
-            }
-            Ok(import_key(&grant.payload, &payload.destination)?)
-        })
-    }
-
-    fn is_complete(&self) -> bool {
-        self.step.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.step
-            .output
-            .unwrap_or(Err(TransferAdmitError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.step.abort()
+        let realm = realm_config(result)?;
+        let (intent, grant, now) = (&config.intent, &config.grant, config.now);
+        let settings = realm
+            .federation
+            .as_ref()
+            .ok_or(TransferAdmitError::Disabled)?;
+        let secret = config.secret.as_deref();
+        check_intent(intent, &config.realm_id, &settings.descriptor, secret, now)?;
+        check_grant(grant, intent, now)?;
+        let payload = &intent.payload;
+        if realm
+            .user_cutoff(&payload.principal, now)
+            .is_some_and(|cutoff| payload.issued_at < cutoff)
+        {
+            return Err(TransferAdmitError::CutOff);
+        }
+        Ok(Next::Done(import_key(&grant.payload, &payload.destination)?))
     }
 }
 
@@ -260,22 +210,6 @@ mod tests {
         let digest = descriptor_digest(&descriptor()).unwrap();
         assert_eq!(issued.payload.descriptor_digest, digest);
         assert_eq!(issued.payload.expires_at, NOW + MAX_TRANSFER_SECS);
-    }
-
-    #[test]
-    fn decided_step_closed() {
-        // After the decision every further event is refused instead of ignored.
-        let mut step = ConfigStep::<u8>::new(realm(2));
-        step.read = None;
-        step.output = Some(Ok(1));
-        let event = Event::Storage(aruna_core::events::StorageEvent::TransactionAborted {
-            txn_id: ulid::Ulid::nil(),
-        });
-        step.step(event, |_| Ok(2));
-        assert!(matches!(
-            step.output,
-            Some(Err(TransferAdmitError::UnexpectedEvent))
-        ));
     }
 
     #[tokio::test]

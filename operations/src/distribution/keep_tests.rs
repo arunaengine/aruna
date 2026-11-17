@@ -110,6 +110,32 @@ async fn claims_fill_once() {
     );
 }
 
+// The claim row is read and written in one transaction; a fresh foreign claim writes nothing.
+#[test]
+fn claim_calls() {
+    let claim = |claim_id: u8, claimed_at_ms: u64| FillClaim {
+        claim_id: id(claim_id),
+        claimed_at_ms,
+    };
+    let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(1, 1_000));
+    assert!(operation.transaction());
+    let read = read_row(FILL_CLAIM_KEYSPACE, b"fill".to_vec());
+    assert_eq!(operation.first(), Ok(Next::Call(read)));
+    let row = (
+        FILL_CLAIM_KEYSPACE.to_string(),
+        b"fill".to_vec().into(),
+        claim(1, 1_000).to_bytes().unwrap().into(),
+    );
+    let absent = IoResult::Values(vec![None]);
+    assert_eq!(operation.next(absent), Ok(Next::Call(IoCall::Write(vec![row]))));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(Claimed::Claimed)));
+
+    let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(2, 1_001));
+    operation.first().unwrap();
+    let held = IoResult::Values(vec![Some(claim(1, 1_000).to_bytes().unwrap().into())]);
+    assert_eq!(operation.next(held), Ok(Next::Done(Claimed::Busy)));
+}
+
 // An attachment row names the verified copy and publishing releases the claim.
 #[tokio::test]
 async fn publishes_attachment() {

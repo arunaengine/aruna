@@ -90,7 +90,7 @@ use aruna_operations::auth::check_permissions::{
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::auth::request_authorization::{BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{DriverContext, drive, drive_until, node_routing};
+use aruna_operations::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::placement::policy::GateOperation;
@@ -3169,9 +3169,10 @@ impl S3 for ArunaS3Service {
                 }
                 return Err(error);
             }
-            if let Err(error) = drive(
-                CreateRelationshipOperation::activate(relationship.clone()),
+            if let Err(error) = drive_retry(
+                || CreateRelationshipOperation::activate(relationship.clone()),
                 &self.state,
+                &relationship.id.to_bytes(),
             )
             .await
             .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))

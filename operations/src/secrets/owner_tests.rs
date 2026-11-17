@@ -79,7 +79,6 @@ async fn run(
         now_ms: u64::from(seed),
         write_ids: [1, 2, 3]
             .map(|part| Ulid::from_bytes([seed, part, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), ctx).await
 }
@@ -202,65 +201,6 @@ async fn readback_audits_first() {
     assert_eq!(drive(read, &ctx).await, Err(OwnerSecretError::NotReadable));
 }
 
-#[test]
-fn parent_transaction_kept() {
-    // Inside a parent's transaction the change writes there and leaves commit and abort to it.
-    let actor = actor();
-    let parent = Ulid::from_bytes([77; 16]);
-    let input = OwnerChange {
-        realm_id: actor.realm_id,
-        node_id: actor.node_id,
-        owner: group(),
-        actor: actor.user_id,
-        change: create(),
-        readable: false,
-        now_ms: 1,
-        write_ids: [1, 2, 3].map(|part| Ulid::from_bytes([part; 16])),
-        txn_id: Some(parent),
-    };
-    let mut operation = OwnerSecretOperation::new(input);
-    let effects = operation.start();
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { txn_id: Some(id), .. })] if *id == parent
-    ));
-    let key = aruna_core::types::Key::from(Vec::new());
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key,
-        value: None,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { .. })]
-    ));
-    let page = StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    };
-    let effects = operation.step(Event::Storage(page));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { txn_id: Some(id), .. })] if *id == parent
-    ));
-    let key = aruna_core::types::Key::from(Vec::new());
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key,
-        value: None,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchWrite { txn_id: Some(id), .. })] if *id == parent
-    ));
-    assert!(
-        operation.abort().is_empty(),
-        "the parent aborts its own transaction"
-    );
-    let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: vec![],
-    }));
-    assert!(effects.is_empty() && operation.is_complete());
-}
-
 fn named(name: &str) -> SecretChange {
     let SecretChange::Create {
         kind,
@@ -352,21 +292,23 @@ async fn readback_needs_audit() {
     let owner = SecretOwner::User(actor().user_id);
     run(&ctx, owner, create(), true, 10).await.unwrap();
     let mut read = ReadbackOperation::new(actor().realm_id, owner, name(), actor().user_id);
-    let mut effects = read.start();
-    while let Some(effect) = effects.pop() {
-        let Effect::Storage(storage) = effect else {
-            panic!("only storage effects, got {effect:?}");
-        };
-        let event = match storage {
-            StorageEffect::BatchWrite { .. } => Event::Storage(StorageEvent::Error {
-                error: aruna_core::errors::StorageError::WriteError("disk full".to_string()),
-            }),
-            other => ctx.storage_handle.send_storage_effect(other).await,
-        };
-        effects = read.step(event);
-    }
-    assert!(read.is_complete());
-    assert!(matches!(read.finalize(), Err(OwnerSecretError::Storage(_))));
+    let mut next = read.first().unwrap();
+    let writes = loop {
+        match next {
+            Next::Call(IoCall::Effect(effect)) => {
+                let Effect::Storage(storage) = *effect else {
+                    panic!("only storage effects, got {effect:?}");
+                };
+                let event = ctx.storage_handle.send_storage_effect(storage).await;
+                next = read.next(IoResult::Event(Box::new(event))).unwrap();
+            }
+            Next::Call(IoCall::Write(writes)) => break writes,
+            other => panic!("expected the audit write, got {other:?}"),
+        }
+    };
+    assert!(!writes.is_empty());
+    let refused = read.next(IoResult::Values(Vec::new()));
+    assert!(matches!(refused, Err(OwnerSecretError::Io(_))));
 }
 
 #[tokio::test]
@@ -430,90 +372,4 @@ async fn group_widening_notified() {
         other => panic!("unexpected {other:?}"),
     };
     assert_eq!(rows, 1, "the one group admin is told");
-}
-
-/// A group widening change written inside a transaction this test owns, then committed or not.
-async fn widen_in_parent(ctx: &DriverContext, commit: bool) -> usize {
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
-    use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
-    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
-    let group_id = Ulid::from_bytes([7; 16]);
-    let auth =
-        GroupAuthorizationDocument::default_group_doc(actor().user_id, actor().realm_id, group_id);
-    let write = StorageEffect::Write {
-        key_space: AUTH_KEYSPACE.to_string(),
-        key: group_id.to_bytes().to_vec().into(),
-        value: auth.to_bytes(&actor()).unwrap().into(),
-        txn_id: None,
-    };
-    ctx.storage_handle.send_storage_effect(write).await;
-    let started = StorageEffect::StartTransaction { read: false };
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
-        ctx.storage_handle.send_storage_effect(started).await
-    else {
-        panic!("a transaction starts");
-    };
-    let rule = UseRule {
-        consumer: SecretConsumer::Plugin {
-            plugin_id: "announcer".to_string(),
-            install_id: Ulid::from_bytes([3; 16]),
-        },
-        delivery: Delivery::Inject,
-        origins: vec!["https://api.example.org".to_string()],
-        paths: Vec::new(),
-        methods: Vec::new(),
-        response: ResponseExposure::Status,
-        groups: Vec::new(),
-    };
-    let mut change = create();
-    if let SecretChange::Create { uses, .. } = &mut change {
-        *uses = vec![rule];
-    }
-    let input = OwnerChange {
-        realm_id: actor().realm_id,
-        node_id: actor().node_id,
-        owner: group(),
-        actor: actor().user_id,
-        change,
-        readable: false,
-        now_ms: 1,
-        write_ids: [1, 2, 3].map(|part| Ulid::from_bytes([20 + part; 16])),
-        txn_id: Some(txn_id),
-    };
-    drive(OwnerSecretOperation::new(input), ctx).await.unwrap();
-    let end = match commit {
-        true => StorageEffect::CommitTransaction { txn_id },
-        false => StorageEffect::AbortTransaction { txn_id },
-    };
-    ctx.storage_handle.send_storage_effect(end).await;
-    let iter = StorageEffect::Iter {
-        key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: 10,
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(iter).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values.len(),
-        other => panic!("unexpected {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn parent_decides_notice() {
-    // The notice rows live and die with the parent's transaction.
-    let dir = tempdir().unwrap();
-    let ctx = seeded(dir.path().to_str().unwrap()).await;
-    assert_eq!(
-        widen_in_parent(&ctx, false).await,
-        0,
-        "an aborted parent sends nothing"
-    );
-    assert!(listed(&ctx, group()).await.is_empty());
-    assert_eq!(
-        widen_in_parent(&ctx, true).await,
-        1,
-        "a committed parent keeps the notice"
-    );
-    assert_eq!(listed(&ctx, group()).await.len(), 1);
 }

@@ -3,36 +3,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key::rows::{SettingsError, audit_row, authority_read, parse_authority};
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use crate::s3::bucket::key::rows::{
+    SettingsError, audit_row, authority_keys, keyless, parse_authority,
+};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketHolder, BucketKeyError, BucketKeyRef, CopyTarget, GrantState, HolderOrigin, SealedCopy,
 };
 use aruna_core::structs::storage::holders::{HolderState, KeyLookup};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GrantStep {
-    Init,
-    StartTransaction,
     ReadBucket,
     ReadGrant,
     SealCopies,
     WriteGrant,
-    CommitTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -50,15 +47,22 @@ pub enum GrantError {
     /// The granting user lost the group admin role before the grant committed.
     #[error("the caller is no group admin")]
     NotAdmin,
-    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: &'static str,
-    },
-    #[error("the grant did not finish")]
-    NotFinished,
+    #[error("sealed copies name another key or user")]
+    ForeignCopy,
+    #[error("the grant failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for GrantError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<GrantResult>, GrantError>;
 
 /// A grant by an authorized group admin; `lookup` is the grantee's key directory answer.
 #[derive(Debug, PartialEq)]
@@ -83,42 +87,33 @@ pub struct GrantResult {
 pub struct GrantHolderOperation {
     input: GrantInput,
     step: GrantStep,
-    txn_id: Option<TxnId>,
     key: Option<BucketKeyRef>,
     grant: Option<BucketHolder>,
-    output: Option<Result<GrantResult, GrantError>>,
+    output: Option<GrantResult>,
 }
 
 impl GrantHolderOperation {
     pub fn new(input: GrantInput) -> Self {
         Self {
             input,
-            step: GrantStep::Init,
-            txn_id: None,
+            step: GrantStep::ReadBucket,
             key: None,
             grant: None,
             output: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<GrantError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        let effects = self.abort();
-        self.step = GrantStep::Error;
-        effects
-    }
-
     /// The granting admin is checked again against the authorization read in this transaction.
-    fn read_grant(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn read_grant(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
         let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-        let settings = match parse_authority(values, realm_id, group_id) {
-            Ok(state) if state.admins.contains(&self.input.granted_by) => state.settings,
-            Ok(_) => return self.fail(GrantError::NotAdmin),
-            Err(error) => return self.fail(error),
-        };
-        let Some(key) = settings.active_key() else {
-            return self.fail(GrantError::NotEncrypted);
-        };
+        let state = parse_authority(values, realm_id, group_id)?;
+        if !state.admins.contains(&self.input.granted_by) {
+            return Err(GrantError::NotAdmin);
+        }
+        let key = state
+            .settings
+            .active_key()
+            .ok_or(GrantError::NotEncrypted)?;
         self.key = Some(key);
         let grant = BucketHolder {
             bucket_id: key.bucket_id,
@@ -128,25 +123,18 @@ impl GrantHolderOperation {
             granted_by: self.input.granted_by,
             granted_at_ms: self.input.now_ms,
         };
-        let read = StorageEffect::Read {
-            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
-            key: grant.key().into(),
-            txn_id: self.txn_id,
-        };
+        let read = read_row(BUCKET_HOLDER_KEYSPACE, grant.key());
         self.grant = Some(grant);
         self.step = GrantStep::ReadGrant;
-        smallvec![Effect::Storage(read)]
+        Ok(Next::Call(read))
     }
 
     /// An earlier grant keeps who granted it and when; the user's keys get copies if they can.
-    fn seal(&mut self, existing: Option<Value>) -> Effects {
+    fn seal(&mut self, existing: Option<Value>) -> Step {
         if let Some(existing) = existing {
-            match BucketHolder::from_bytes(&existing) {
-                Ok(existing) if existing.origin == HolderOrigin::Explicit => {
-                    self.grant = Some(existing)
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error),
+            let existing = BucketHolder::from_bytes(&existing)?;
+            if existing.origin == HolderOrigin::Explicit {
+                self.grant = Some(existing);
             }
         }
         let (Some(key), KeyLookup::Keys(keys)) = (self.key, &self.input.lookup) else {
@@ -166,21 +154,22 @@ impl GrantHolderOperation {
             return self.write(Vec::new());
         }
         self.step = GrantStep::SealCopies;
-        smallvec![Effect::Blob(BlobEffect::SealUnlocked {
+        let seal = Effect::Blob(BlobEffect::SealUnlocked {
             key,
             realm_id: self.input.realm_id,
             node_id: self.input.node_id,
             holders,
-        })]
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(seal))))
     }
 
-    fn write(&mut self, copies: Vec<SealedCopy>) -> Effects {
+    fn write(&mut self, copies: Vec<SealedCopy>) -> Step {
         let (Some(key), Some(mut grant)) = (self.key, self.grant.take()) else {
-            return self.fail(GrantError::NotFinished);
+            return Err(GrantError::ForeignCopy);
         };
         let foreign = |copy: &SealedCopy| copy.key != key || copy.user_id != grant.user_id;
         if copies.iter().any(foreign) {
-            return self.fail(GrantError::NotFinished);
+            return Err(GrantError::ForeignCopy);
         }
         grant.state = match copies.is_empty() {
             true => GrantState::Pending,
@@ -188,14 +177,12 @@ impl GrantHolderOperation {
         };
         let mut writes = Vec::new();
         for copy in &copies {
-            match copy.to_bytes() {
-                Ok(value) => writes.push((
-                    KEY_COPY_KEYSPACE.to_string(),
-                    copy.key().into(),
-                    value.into(),
-                )),
-                Err(error) => return self.fail(error),
-            }
+            let value = copy.to_bytes()?;
+            writes.push((
+                KEY_COPY_KEYSPACE.to_string(),
+                copy.key().into(),
+                value.into(),
+            ));
         }
         // The grant and its audit record commit together.
         let record = BucketAuditRecord {
@@ -213,117 +200,65 @@ impl GrantHolderOperation {
             reason: Some(format!("granted to {}", grant.user_id)),
             outcome: AuditOutcome::Applied,
         };
-        match audit_row(&record) {
-            Ok(row) => writes.push(row),
-            Err(error) => return self.fail(error),
-        }
-        match grant.to_bytes() {
-            Ok(value) => writes.push((
-                BUCKET_HOLDER_KEYSPACE.to_string(),
-                grant.key().into(),
-                value.into(),
-            )),
-            Err(error) => return self.fail(error),
-        }
+        writes.push(audit_row(&record)?);
+        let value = grant.to_bytes()?;
+        writes.push((
+            BUCKET_HOLDER_KEYSPACE.to_string(),
+            grant.key().into(),
+            value.into(),
+        ));
         let state = match (&self.input.lookup, copies.is_empty()) {
             (_, false) => HolderState::Ready,
             (KeyLookup::Keys(_), true) => HolderState::Pending,
             (KeyLookup::Missing, true) => HolderState::MissingKey,
             (KeyLookup::Unavailable, true) => HolderState::Unavailable,
         };
-        self.output = Some(Ok(GrantResult { grant, state }));
+        self.output = Some(GrantResult { grant, state });
         self.step = GrantStep::WriteGrant;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for GrantHolderOperation {
+impl Operation for GrantHolderOperation {
     type Output = GrantResult;
     type Error = GrantError;
 
-    fn start(&mut self) -> Effects {
-        self.step = GrantStep::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
+        let reads = authority_keys(&self.input.bucket, realm_id, group_id);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone());
-        }
-        match (self.step, event) {
-            (
-                GrantStep::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.step = GrantStep::ReadBucket;
-                let (realm_id, group_id) = (self.input.realm_id, self.input.group_id);
-                smallvec![authority_read(
-                    &self.input.bucket,
-                    realm_id,
-                    group_id,
-                    Some(txn_id)
-                )]
-            }
-            (GrantStep::ReadBucket, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.read_grant(values)
-            }
-            (GrantStep::ReadGrant, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.seal(value)
-            }
-            (GrantStep::SealCopies, Event::Blob(BlobEvent::CopiesSealed { copies })) => {
-                self.write(copies)
-            }
-            // A locked generation cannot seal now; the next unlock seals the pending grant.
-            (
-                GrantStep::SealCopies,
-                Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))),
-            ) => self.write(Vec::new()),
-            (GrantStep::WriteGrant, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(GrantError::NotFinished);
-                };
-                self.step = GrantStep::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (
-                GrantStep::CommitTransaction,
-                Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-            ) if Some(txn_id) == self.txn_id => {
-                self.txn_id = None;
-                self.step = GrantStep::Finish;
-                smallvec![]
-            }
-            (GrantStep::Finish | GrantStep::Error, _) => smallvec![],
-            (_, Event::Blob(BlobEvent::Error(error))) => self.fail(error),
-            (state, received) => self.fail(GrantError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.step, GrantStep::Finish | GrantStep::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn next(&mut self, result: IoResult) -> Step {
         match self.step {
-            GrantStep::Finish | GrantStep::Error => {
-                self.output.unwrap_or(Err(GrantError::NotFinished))
+            GrantStep::ReadBucket => self.read_grant(keyless(result.values()?)),
+            GrantStep::ReadGrant => self.seal(result.value()?),
+            GrantStep::SealCopies => match result.event()? {
+                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.write(copies),
+                // A locked generation cannot seal now; the next unlock seals the pending grant.
+                Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                    self.write(Vec::new())
+                }
+                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                other => Err(IoError::Unexpected {
+                    expected: "BlobEvent::CopiesSealed",
+                    got: other.label(),
+                }
+                .into()),
+            },
+            GrantStep::WriteGrant => {
+                result.done()?;
+                let output = self
+                    .output
+                    .take()
+                    .ok_or(GrantError::Io(IoError::Unfinished))?;
+                Ok(Next::Done(output))
             }
-            _ => Err(GrantError::NotFinished),
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 }
 

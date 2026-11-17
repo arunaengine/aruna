@@ -5,27 +5,26 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::JobRecordFrame;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use tracing::warn;
 
 use super::{OUTBOX_DRAIN_BATCH, PublishRecordConfig, PublishRecordOperation};
-use crate::document_repository::GetConfigOperation;
 use crate::jobs::lifecycle::LifecycleError;
-use aruna_core::placement::resolve_shard_holders;
-use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
 
-/// One drain pass. Every local failure ends the pass with "entries remain", so
-/// the timer retries later; only an event that fits no phase is an error.
+/// One drain pass. A missing realm config ends the pass with "entries remain", so the timer
+/// retries later; a failed storage call fails the pass, which the timer also retries.
 #[derive(Debug, PartialEq)]
 pub struct DrainOutboxOperation {
     realm_id: RealmId,
@@ -34,13 +33,12 @@ pub struct DrainOutboxOperation {
     entries: VecDeque<Key>,
     next_cursor: Option<Key>,
     phase: Phase,
-    outcome: Option<Result<bool, LifecycleError>>,
 }
 
+/// The call the pass waits on.
 #[derive(Debug, PartialEq)]
 enum Phase {
-    Init,
-    Config(GetConfigOperation),
+    Config,
     Cursor,
     Scan,
     Record(Key),
@@ -48,8 +46,9 @@ enum Phase {
     Publish(Box<PublishRecordOperation>),
     WriteCursor,
     Rescan,
-    Done,
 }
+
+type Step = Result<Next<bool>, LifecycleError>;
 
 impl DrainOutboxOperation {
     /// One pass of `local`, a node of realm `realm_id`.
@@ -60,81 +59,46 @@ impl DrainOutboxOperation {
             realm: None,
             entries: VecDeque::new(),
             next_cursor: None,
-            phase: Phase::Init,
-            outcome: None,
+            phase: Phase::Config,
         }
-    }
-
-    fn finish(&mut self, remaining: bool) -> Effects {
-        self.outcome = Some(Ok(remaining));
-        self.phase = Phase::Done;
-        smallvec![]
-    }
-
-    /// Ends a pass that cannot go on; the entries stay queued for the next one.
-    fn retry_later(&mut self, what: &str, error: impl std::fmt::Display) -> Effects {
-        warn!(error = %error, "Job family outbox {what} failed");
-        self.finish(true)
-    }
-
-    fn unexpected(&mut self, phase: &'static str, event: &Event) -> Effects {
-        self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-            state: phase.to_string(),
-            expected: "event of the current drain phase",
-            got: event.label(),
-        }));
-        self.phase = Phase::Done;
-        smallvec![]
     }
 
     fn cursor_key() -> Key {
         Key::from(OUTBOX_CURSOR_KEY.to_vec())
     }
 
-    fn scan(&mut self, start_after: Option<Key>, limit: usize) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
+    fn scan(&mut self, after: Option<Key>, limit: usize) -> Step {
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_OUTBOX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit,
-            txn_id: None,
-        })]
+        }))
     }
 
     /// Reads the record of the next entry with a valid key, or writes the cursor at the end.
-    fn next_entry(&mut self) -> Effects {
+    fn next_entry(&mut self) -> Step {
         while let Some(key) = self.entries.pop_front() {
             if JobRecordKey::from_bytes(&key).is_err() {
                 continue;
             }
             self.phase = Phase::Record(key.clone());
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: FAMILY_RECORD_KEYSPACE.to_string(),
+            return Ok(Next::Call(IoCall::Read(vec![(
+                FAMILY_RECORD_KEYSPACE.to_string(),
                 key,
-                txn_id: None,
-            })];
+            )])));
         }
         self.phase = Phase::WriteCursor;
-        let key_space = NODE_STATE_KEYSPACE.to_string();
-        let key = Self::cursor_key();
-        smallvec![Effect::Storage(match self.next_cursor.take() {
-            Some(value) => StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            },
-            None => StorageEffect::Delete {
-                key_space,
-                key,
-                txn_id: None,
-            },
-        })]
+        let row = (NODE_STATE_KEYSPACE.to_string(), Self::cursor_key());
+        Ok(Next::Call(match self.next_cursor.take() {
+            Some(value) => IoCall::Write(vec![(row.0, row.1, value)]),
+            None => IoCall::Delete(vec![row]),
+        }))
     }
 
     /// Offers one stored record to the holders other than this node, or clears
     /// its entry when no other holder exists.
-    fn offer(&mut self, key: Key, frame: JobRecordFrame) -> Effects {
+    fn offer(&mut self, key: Key, frame: JobRecordFrame) -> Step {
         let (Ok(record_key), Some(realm)) = (JobRecordKey::from_bytes(&key), self.realm.as_ref())
         else {
             return self.next_entry();
@@ -153,48 +117,32 @@ impl DrainOutboxOperation {
             .collect();
         if holders.is_empty() {
             self.phase = Phase::Clear;
-            return smallvec![Effect::Storage(StorageEffect::Delete {
-                key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
+            return Ok(Next::Call(IoCall::Delete(vec![(
+                FAMILY_OUTBOX_KEYSPACE.to_string(),
                 key,
-                txn_id: None,
-            })];
+            )])));
         }
         let mut publish = PublishRecordOperation::new(PublishRecordConfig {
-            realm_id: self.realm_id,
             placement,
             holders,
             record: Box::new(frame),
             key: record_key,
         });
-        let effects = publish.start();
+        let step = publish.first();
         self.phase = Phase::Publish(Box::new(publish));
-        self.after_publish(effects)
+        self.after_publish(step)
     }
 
-    /// Hands the publish's effects on, or moves to the next entry once it ended.
-    fn after_publish(&mut self, effects: Effects) -> Effects {
-        if !effects.is_empty() {
-            return effects;
-        }
-        match std::mem::replace(&mut self.phase, Phase::Done) {
-            Phase::Publish(publish) if publish.is_complete() => {
-                if let Err(error) = publish.finalize() {
-                    warn!(error = %error, "Job record replication failed");
-                }
+    /// Hands the publish's calls on, or moves to the next entry once it ended.
+    fn after_publish(&mut self, step: Result<Next<bool>, LifecycleError>) -> Step {
+        match step {
+            Ok(Next::Done(_)) => self.next_entry(),
+            Ok(next) => Ok(next),
+            Err(error) => {
+                warn!(error = %error, "Job record replication failed");
                 self.next_entry()
             }
-            Phase::Publish(_) => self.finish_stalled(),
-            phase => {
-                self.phase = phase;
-                effects
-            }
         }
-    }
-
-    fn finish_stalled(&mut self) -> Effects {
-        self.outcome = Some(Err(LifecycleError::NotFinished));
-        self.phase = Phase::Done;
-        smallvec![]
     }
 }
 
@@ -204,115 +152,101 @@ fn stored_frame(value: Option<&[u8]>) -> Option<JobRecordFrame> {
     JobRecordFrame::new(envelope).ok()
 }
 
-impl EffectOperation for DrainOutboxOperation {
+/// The single value a one-row read answered.
+fn single(result: IoResult) -> Result<Option<aruna_core::types::Value>, LifecycleError> {
+    match result {
+        IoResult::Values(values) => Ok(values.into_iter().next().flatten()),
+        _ => Err(LifecycleError::UnexpectedEvent {
+            state: "drain".to_string(),
+            expected: "one row",
+            got: "another result",
+        }),
+    }
+}
+
+impl Operation for DrainOutboxOperation {
     type Output = bool;
     type Error = LifecycleError;
 
-    fn start(&mut self) -> Effects {
-        let mut config = GetConfigOperation::new(self.realm_id);
-        let effects = config.start();
-        self.phase = Phase::Config(config);
-        effects
+    fn first(&mut self) -> Step {
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![(
+            config.storage_keyspace().to_string(),
+            config.storage_key(),
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.phase, Phase::Done) {
-            Phase::Config(mut config) => {
-                let effects = config.step(event);
-                if !config.is_complete() {
-                    self.phase = Phase::Config(config);
-                    return effects;
-                }
-                match config.finalize() {
-                    Ok(realm) => {
+    fn next(&mut self, result: IoResult) -> Step {
+        match std::mem::replace(&mut self.phase, Phase::WriteCursor) {
+            Phase::Config => {
+                let realm = single(result)?.map(|value| RealmConfigDocument::from_bytes(&value));
+                match realm {
+                    Some(Ok(realm)) => {
                         self.realm = Some(Box::new(realm));
                         self.phase = Phase::Cursor;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: NODE_STATE_KEYSPACE.to_string(),
-                            key: Self::cursor_key(),
-                            txn_id: None,
-                        })]
+                        Ok(Next::Call(IoCall::Read(vec![(
+                            NODE_STATE_KEYSPACE.to_string(),
+                            Self::cursor_key(),
+                        )])))
                     }
-                    Err(error) => self.retry_later("realm config read", error),
+                    Some(Err(error)) => {
+                        warn!(error = %error, "Job family outbox realm config read failed");
+                        Ok(Next::Done(true))
+                    }
+                    None => {
+                        warn!("Job family outbox realm config is missing");
+                        Ok(Next::Done(true))
+                    }
                 }
             }
-            Phase::Cursor => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.phase = Phase::Scan;
-                    self.scan(value, OUTBOX_DRAIN_BATCH)
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.retry_later("cursor read", error)
-                }
-                other => self.unexpected("cursor", &other),
+            Phase::Cursor => {
+                let cursor = single(result)?;
+                self.phase = Phase::Scan;
+                self.scan(cursor, OUTBOX_DRAIN_BATCH)
+            }
+            Phase::Scan => {
+                let IoResult::Page { rows, next } = result else {
+                    return Err(unfit("outbox page"));
+                };
+                self.entries = rows.into_iter().map(|(key, _)| key).collect();
+                self.next_cursor = next;
+                self.next_entry()
+            }
+            Phase::Record(key) => match stored_frame(single(result)?.as_deref()) {
+                Some(frame) => self.offer(key, frame),
+                None => self.next_entry(),
             },
-            Phase::Scan => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    self.entries = values.into_iter().map(|(key, _)| key).collect();
-                    self.next_cursor = next_start_after;
-                    self.next_entry()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.retry_later("scan", error),
-                other => self.unexpected("scan", &other),
-            },
-            Phase::Record(key) => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    match stored_frame(value.as_deref()) {
-                        Some(frame) => self.offer(key, frame),
-                        None => self.next_entry(),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { .. }) => self.next_entry(),
-                other => self.unexpected("record", &other),
-            },
-            Phase::Clear => match event {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => self.next_entry(),
-                // A failed clear ends the pass before the cursor moves past the entry.
-                Event::Storage(StorageEvent::Error { .. }) => self.finish(true),
-                other => self.unexpected("clear", &other),
+            Phase::Clear => match result {
+                IoResult::Done => self.next_entry(),
+                _ => Err(unfit("outbox delete")),
             },
             Phase::Publish(mut publish) => {
-                let effects = publish.step(event);
+                let step = publish.next(result);
                 self.phase = Phase::Publish(publish);
-                self.after_publish(effects)
+                self.after_publish(step)
             }
-            Phase::WriteCursor => match event {
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ) => {
+            Phase::WriteCursor => match result {
+                IoResult::Done => {
                     self.phase = Phase::Rescan;
                     self.scan(None, 1)
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.retry_later("cursor write", error)
-                }
-                other => self.unexpected("write cursor", &other),
+                _ => Err(unfit("cursor write")),
             },
-            Phase::Rescan => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    self.finish(!values.is_empty())
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.retry_later("rescan", error),
-                other => self.unexpected("rescan", &other),
+            Phase::Rescan => match result {
+                IoResult::Page { rows, .. } => Ok(Next::Done(!rows.is_empty())),
+                _ => Err(unfit("outbox rescan")),
             },
-            Phase::Init => self.unexpected("init", &event),
-            Phase::Done => self.unexpected("done", &event),
         }
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Done)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+fn unfit(expected: &'static str) -> LifecycleError {
+    LifecycleError::UnexpectedEvent {
+        state: "drain".to_string(),
+        expected,
+        got: "another result",
     }
 }
 

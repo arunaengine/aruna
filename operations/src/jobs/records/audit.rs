@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, FetchCursor, IterStart, PageLimit, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, FetchCursor, PageLimit, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_CONFLICT_KEYSPACE, FAMILY_RECORD_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, SubmissionId,
 };
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 
 use super::{MAX_CONFLICT_ROWS, RecordStoreError};
 use aruna_core::structs::execution::job::record_keys::{
@@ -58,16 +58,12 @@ pub struct FamilyAuditOperation {
     records: Vec<JobRecordEnvelope>,
     last: Option<JobRecordKey>,
     state: AuditState,
-    outcome: Option<Result<AuditPage, RecordStoreError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuditState {
-    Init,
     Page,
     Conflicts,
-    Finish,
-    Error,
 }
 
 impl FamilyAuditOperation {
@@ -76,12 +72,11 @@ impl FamilyAuditOperation {
             config,
             records: Vec::new(),
             last: None,
-            state: AuditState::Init,
-            outcome: None,
+            state: AuditState::Page,
         }
     }
 
-    fn keep_page(&mut self, values: Vec<(Key, aruna_core::types::Value)>) {
+    fn keep_page(&mut self, values: Vec<(Key, Value)>) {
         for (key, value) in values {
             let Ok(record_key) = JobRecordKey::from_bytes(&key) else {
                 continue;
@@ -93,119 +88,96 @@ impl FamilyAuditOperation {
         }
     }
 
-    fn settle(&mut self, conflicts: Vec<ConflictRecord>) -> Effects {
+    fn settle(&mut self, conflicts: Vec<ConflictRecord>) -> Next<AuditPage> {
         // A short page is the end of the scope, so no cursor is minted for it.
         let next = match self.records.len() >= self.config.limit.get() {
             true => self.last.as_ref().and_then(|key| cursor_of(key).ok()),
             false => None,
         };
-        self.outcome = Some(Ok(AuditPage {
+        Next::Done(AuditPage {
             records: std::mem::take(&mut self.records),
             next,
             conflicts,
-        }));
-        self.state = AuditState::Finish;
-        smallvec![]
+        })
     }
 
-    fn fail(&mut self, error: RecordStoreError) -> Effects {
-        self.outcome = Some(Err(error));
-        self.state = AuditState::Error;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> RecordStoreError {
+        RecordStoreError::unexpected(&self.state, expected, got)
     }
 }
 
-impl EffectOperation for FamilyAuditOperation {
+impl Operation for FamilyAuditOperation {
     type Output = AuditPage;
     type Error = RecordStoreError;
 
-    fn start(&mut self) -> Effects {
-        let start = match self.config.cursor.as_ref().map(cursor_key) {
-            Some(Ok(key)) => Some(IterStart::After(record_key(&key))),
-            Some(Err(error)) => return self.fail(error.into()),
+    fn first(&mut self) -> Result<Next<AuditPage>, RecordStoreError> {
+        let after = match self.config.cursor.as_ref().map(cursor_key).transpose()? {
+            Some(key) => Some(record_key(&key)),
             None => None,
         };
-        self.state = AuditState::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(self.config.scope.prefix()),
-            start,
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: self.config.scope.prefix(),
+            after,
             limit: self.config.limit.get(),
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            AuditState::Page => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    self.keep_page(values);
-                    if self.config.cursor.is_some() {
-                        return self.settle(Vec::new());
-                    }
-                    self.state = AuditState::Conflicts;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
+    fn next(&mut self, result: IoResult) -> Result<Next<AuditPage>, RecordStoreError> {
+        match (self.state, result) {
+            (AuditState::Page, IoResult::Page { rows, .. }) => {
+                self.keep_page(rows);
+                if self.config.cursor.is_some() {
+                    return Ok(self.settle(Vec::new()));
+                }
+                self.state = AuditState::Conflicts;
+                // A plain storage effect, so a failed conflict read comes back as an event.
+                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+                    StorageEffect::Iter {
                         key_space: FAMILY_CONFLICT_KEYSPACE.to_string(),
                         prefix: Some(self.config.scope.prefix()),
                         start: None,
                         limit: MAX_CONFLICT_ROWS,
                         txn_id: None,
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record page", other.label()),
-            },
-            AuditState::Conflicts => match event {
+                    },
+                )))))
+            }
+            (AuditState::Conflicts, IoResult::Event(event)) => match *event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     let conflicts = values
                         .into_iter()
                         .filter_map(|(_, value)| from_bytes::<ConflictRecord>(&value).ok())
                         .collect();
-                    self.settle(conflicts)
+                    Ok(self.settle(conflicts))
                 }
                 // Conflict evidence is diagnostic: a failed read must not deny
                 // the audit page itself.
-                Event::Storage(StorageEvent::Error { .. }) => self.settle(Vec::new()),
-                other => self.unexpected("conflict page", other.label()),
+                Event::Storage(StorageEvent::Error { .. }) => Ok(self.settle(Vec::new())),
+                other => Err(self.unexpected("conflict page", other.label())),
             },
-            AuditState::Init | AuditState::Finish | AuditState::Error => {
-                self.unexpected("no event in a terminal state", event.label())
-            }
+            (AuditState::Page, other) => Err(self.unexpected("record page", other.label())),
+            (AuditState::Conflicts, other) => Err(self.unexpected("conflict page", other.label())),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AuditState::Finish | AuditState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(RecordStoreError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::effects::PageLimit;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::effects::{Effect, PageLimit};
+    use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::execution::job::SubmissionId;
 
-    use super::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+    use super::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
     use crate::jobs::records::RecordStoreError;
 
-    fn empty_page() -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        })
+    fn empty_page() -> IoResult {
+        IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        }
     }
 
     fn operation() -> FamilyAuditOperation {
@@ -216,24 +188,34 @@ mod tests {
         })
     }
 
-    // A state that expects no event rejects one instead of ignoring it.
-    #[test]
-    fn rejects_terminal_event() {
-        let mut early = operation();
-        assert!(early.step(empty_page()).is_empty());
-        assert!(matches!(
-            early.finalize(),
-            Err(RecordStoreError::UnexpectedEvent { .. })
-        ));
+    fn empty_audit() -> Next<AuditPage> {
+        Next::Done(AuditPage {
+            records: Vec::new(),
+            next: None,
+            conflicts: Vec::new(),
+        })
+    }
 
+    #[test]
+    fn keeps_page_without_conflicts() {
         let mut audit = operation();
-        audit.start();
-        audit.step(empty_page());
-        audit.step(empty_page());
-        assert!(audit.is_complete());
-        assert!(audit.step(empty_page()).is_empty());
+        assert!(matches!(audit.first(), Ok(Next::Call(IoCall::Page { .. }))));
         assert!(matches!(
-            audit.finalize(),
+            audit.next(empty_page()),
+            Ok(Next::Call(IoCall::Effect(effect))) if matches!(*effect, Effect::Storage(_))
+        ));
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        });
+        assert_eq!(audit.next(IoResult::Event(Box::new(failed))), Ok(empty_audit()));
+    }
+
+    #[test]
+    fn rejects_unfit_result() {
+        let mut audit = operation();
+        audit.first().expect("record page");
+        assert!(matches!(
+            audit.next(IoResult::Done),
             Err(RecordStoreError::UnexpectedEvent { .. })
         ));
     }

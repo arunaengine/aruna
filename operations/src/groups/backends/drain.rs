@@ -13,7 +13,9 @@ use crate::driver::{DriverContext, drive};
 /// longer holds anything. Runs after the reclaim sweep, which is what empties
 /// them; a backend on `retain` keeps its rows and so is never removed.
 pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, String> {
-    let disabled = drive(DisabledScanOperation::default(), context).await?;
+    let disabled = drive(DisabledScanOperation::default(), context)
+        .await
+        .map_err(|error| error.to_string())?;
     if disabled.is_empty() {
         return Ok(0);
     }
@@ -23,7 +25,9 @@ pub async fn remove_drained_backends(context: &DriverContext) -> Result<usize, S
     if idle.is_empty() {
         return Ok(0);
     }
-    let holding = drive(HoldingScanOperation::default(), context).await?;
+    let holding = drive(HoldingScanOperation::default(), context)
+        .await
+        .map_err(|error| error.to_string())?;
 
     let mut removed = 0usize;
     for (record, generation) in idle {

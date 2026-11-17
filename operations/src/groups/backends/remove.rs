@@ -3,14 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{RecordReadError, backend_key, index_key, parse_read};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, GroupStorage, GroupStorageSecret,
@@ -29,51 +30,29 @@ const SCAN_PAGE_SIZE: usize = 512;
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct DisabledScanOperation {
     disabled: Vec<GroupStorage>,
-    reading: bool,
-    output: Option<Result<Vec<GroupStorage>, String>>,
 }
 
-impl EffectOperation for DisabledScanOperation {
+impl Operation for DisabledScanOperation {
     type Output = Vec<GroupStorage>;
-    type Error = String;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.reading = true;
-        smallvec![scan_page(STORAGE_BACKEND_KEYSPACE, None)]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(scan_page(STORAGE_BACKEND_KEYSPACE, None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let (values, next) = match scan_result(self.reading, event) {
-            Ok(page) => page,
-            Err(error) => return finish(&mut self.reading, &mut self.output, Err(error)),
-        };
-        for (_, value) in values {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let (rows, next) = scan_rows(result)?;
+        for (_, value) in rows {
             match GroupStorage::from_bytes(value.as_ref()) {
                 Ok(record) if record.disabled => self.disabled.push(record),
                 Ok(_) => {}
                 Err(error) => warn!(error = %error, "Skipping undecodable storage backend record"),
             }
         }
-        match next {
-            Some(next) => smallvec![scan_page(STORAGE_BACKEND_KEYSPACE, Some(next))],
-            None => {
-                let disabled = std::mem::take(&mut self.disabled);
-                finish(&mut self.reading, &mut self.output, Ok(disabled))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or_else(|| Err("backend scan never finished".to_string()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match next {
+            Some(next) => scan_page(STORAGE_BACKEND_KEYSPACE, Some(next)),
+            None => Next::Done(std::mem::take(&mut self.disabled)),
+        })
     }
 }
 
@@ -91,8 +70,6 @@ const HOLDING_KEYSPACES: [&str; 3] = [
 pub(crate) struct HoldingScanOperation {
     keyspace: usize,
     holding: BTreeSet<BackendRef>,
-    reading: bool,
-    output: Option<Result<BTreeSet<BackendRef>, String>>,
 }
 
 impl HoldingScanOperation {
@@ -127,78 +104,47 @@ impl HoldingScanOperation {
     }
 }
 
-impl EffectOperation for HoldingScanOperation {
+impl Operation for HoldingScanOperation {
     type Output = BTreeSet<BackendRef>;
-    type Error = String;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.reading = true;
-        smallvec![scan_page(HOLDING_KEYSPACES[0], None)]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(scan_page(HOLDING_KEYSPACES[0], None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let (values, next) = match scan_result(self.reading, event) {
-            Ok(page) => page,
-            Err(error) => return finish(&mut self.reading, &mut self.output, Err(error)),
-        };
-        self.collect(values);
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let (rows, next) = scan_rows(result)?;
+        self.collect(rows);
         if let Some(next) = next {
-            return smallvec![scan_page(HOLDING_KEYSPACES[self.keyspace], Some(next))];
+            return Ok(scan_page(HOLDING_KEYSPACES[self.keyspace], Some(next)));
         }
         self.keyspace += 1;
-        match HOLDING_KEYSPACES.get(self.keyspace) {
-            Some(key_space) => smallvec![scan_page(key_space, None)],
-            None => {
-                let holding = std::mem::take(&mut self.holding);
-                finish(&mut self.reading, &mut self.output, Ok(holding))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or_else(|| Err("holding scan never finished".to_string()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match HOLDING_KEYSPACES.get(self.keyspace) {
+            Some(key_space) => scan_page(key_space, None),
+            None => Next::Done(std::mem::take(&mut self.holding)),
+        })
     }
 }
 
-fn scan_page(key_space: &str, start: Option<Key>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: None,
-        start: start.map(IterStart::After),
+/// The next page of a whole keyspace; the empty prefix matches every row.
+fn scan_page<T>(key_space: &str, after: Option<Key>) -> Next<T> {
+    Next::Call(IoCall::Page {
+        space: key_space.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
         limit: SCAN_PAGE_SIZE,
-        txn_id: None,
     })
 }
 
-/// One page of a running scan; anything else ends it with the reason.
-fn scan_result(reading: bool, event: Event) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
-    match event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) if reading => Ok((values, next_start_after)),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {}", other.label())),
+/// The rows of a page, or the runner's refusal of any other answer.
+fn scan_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoError> {
+    match result {
+        IoResult::Page { rows, next } => Ok((rows, next)),
+        _ => Err(IoError::Unexpected {
+            expected: "a page of a backend scan",
+            got: "another result",
+        }),
     }
-}
-
-fn finish<T>(
-    reading: &mut bool,
-    output: &mut Option<Result<T, String>>,
-    result: Result<T, String>,
-) -> Effects {
-    *reading = false;
-    *output = Some(result);
-    smallvec![]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -442,9 +388,7 @@ impl EffectOperation for RemoveBackendOperation {
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
@@ -546,11 +490,8 @@ pub(super) mod tests {
         }
     }
 
-    fn page(values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        })
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
     }
 
     #[test]
@@ -565,18 +506,18 @@ pub(super) mod tests {
         let cursor = backend_key(enabled.backend_id);
         let broken = (Key::from(vec![1u8]), Value::from(vec![0xff; 3]));
         let mut operation = DisabledScanOperation::default();
-        check_trace(
-            &mut operation,
-            &[scan_page(STORAGE_BACKEND_KEYSPACE, None)],
-            vec![
-                (
-                    page(vec![row(&disabled), row(&enabled)], Some(cursor.clone())),
-                    vec![scan_page(STORAGE_BACKEND_KEYSPACE, Some(cursor))],
-                ),
-                (page(vec![broken], None), vec![]),
-            ],
+        assert_eq!(
+            operation.first(),
+            Ok(scan_page(STORAGE_BACKEND_KEYSPACE, None))
         );
-        assert_eq!(operation.finalize(), Ok(vec![disabled]));
+        let rows = vec![row(&disabled), row(&enabled)];
+        let answer = operation.next(page(rows, Some(cursor.clone())));
+        assert_eq!(
+            answer,
+            Ok(scan_page(STORAGE_BACKEND_KEYSPACE, Some(cursor)))
+        );
+        let answer = operation.next(page(vec![broken], None));
+        assert_eq!(answer, Ok(Next::Done(vec![disabled])));
     }
 
     #[test]
@@ -585,50 +526,33 @@ pub(super) mod tests {
         let backend = BackendRef::Group(Ulid::from_bytes([4u8; 16]));
         let key = BlobLocationKey::new([6u8; 32], EncodingClass::Raw, backend.clone());
         let mut operation = HoldingScanOperation::default();
-        check_trace(
-            &mut operation,
-            &[scan_page(BLOB_LOCATIONS_KEYSPACE, None)],
-            vec![
-                (
-                    page(vec![(key.to_bytes().into(), Value::from(Vec::new()))], None),
-                    vec![scan_page(BLOB_CLEANUP_KEYSPACE, None)],
-                ),
-                (
-                    page(Vec::new(), None),
-                    vec![scan_page(UPLOAD_KEYSPACE, None)],
-                ),
-                (page(Vec::new(), None), vec![]),
-            ],
+        assert_eq!(
+            operation.first(),
+            Ok(scan_page(BLOB_LOCATIONS_KEYSPACE, None))
         );
-        assert_eq!(operation.finalize(), Ok(BTreeSet::from([backend])));
+        let rows = vec![(key.to_bytes().into(), Value::from(Vec::new()))];
+        let answer = operation.next(page(rows, None));
+        assert_eq!(answer, Ok(scan_page(BLOB_CLEANUP_KEYSPACE, None)));
+        let answer = operation.next(page(Vec::new(), None));
+        assert_eq!(answer, Ok(scan_page(UPLOAD_KEYSPACE, None)));
+        let answer = operation.next(page(Vec::new(), None));
+        assert_eq!(answer, Ok(Next::Done(BTreeSet::from([backend]))));
     }
 
     #[test]
     fn scan_failures_end() {
-        // A storage error ends a scan with its reason, and a page before start is refused.
+        // An answer that is not a page ends either scan.
         let mut operation = HoldingScanOperation::default();
-        operation.start();
-        let error = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(operation.step(error).is_empty());
-        assert!(operation.finalize().is_err());
-        let refusals = rejects_events(DisabledScanOperation::default, sample_events, |_| false);
-        assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
-        let refusals = rejects_events(HoldingScanOperation::default, sample_events, |_| false);
-        assert!(refusals.iter().all(|(_, effects, _)| effects.is_empty()));
-    }
-
-    #[test]
-    fn scan_abort_finalize() {
-        // The scans only read: abort has nothing to clean up, and an early finalize fails.
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(IoError::Unexpected { .. })
+        ));
         let mut operation = DisabledScanOperation::default();
-        operation.start();
-        assert!(operation.abort().is_empty());
-        rejects_finalize(operation);
-        let mut operation = HoldingScanOperation::default();
-        operation.start();
-        assert!(operation.abort().is_empty());
-        rejects_finalize(operation);
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Woke),
+            Err(IoError::Unexpected { .. })
+        ));
     }
 }

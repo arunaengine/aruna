@@ -2,14 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -27,16 +25,6 @@ pub struct InspectSecretInput {
 #[derive(Debug, PartialEq)]
 pub struct InspectSecretOperation {
     input: InspectSecretInput,
-    state: InspectSecretState,
-    output: Option<Result<OnboardingSecretRecord, InspectSecretError>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum InspectSecretState {
-    Init,
-    ReadRecords,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -63,143 +51,79 @@ pub enum InspectSecretError {
     },
 }
 
-impl InspectSecretOperation {
-    pub fn new(input: InspectSecretInput) -> Self {
-        Self {
-            input,
-            state: InspectSecretState::Init,
-            output: None,
+impl From<IoError> for InspectSecretError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ReadRecords".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
         }
     }
 }
 
-impl EffectOperation for InspectSecretOperation {
+impl InspectSecretOperation {
+    pub fn new(input: InspectSecretInput) -> Self {
+        Self { input }
+    }
+
+    fn check(
+        &self,
+        record: OnboardingSecretRecord,
+        state: OnboardingSecretState,
+    ) -> Result<OnboardingSecretRecord, InspectSecretError> {
+        let claimed_by = match &state {
+            OnboardingSecretState::Finalizing { node_id } => Some(node_id),
+            _ => None,
+        };
+        let own_claim = claimed_by == Some(&self.input.node_id);
+        if claimed_by.is_some() && !own_claim {
+            return Err(InspectSecretError::AlreadyClaimed);
+        }
+        if record.expires_at < self.input.now && !own_claim {
+            return Err(InspectSecretError::Expired);
+        }
+        if record.secret_hash != self.input.secret_hash {
+            return Err(InspectSecretError::InvalidSecret);
+        }
+        Ok(record)
+    }
+}
+
+impl Operation for InspectSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = InspectSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = InspectSecretState::ReadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    ONBOARDING_KEYSPACE.to_string(),
-                    secret_record_key(self.input.enrollment_id),
-                ),
-                (
-                    ONBOARDING_KEYSPACE.to_string(),
-                    secret_state_key(self.input.enrollment_id),
-                ),
-            ],
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<OnboardingSecretRecord>, InspectSecretError> {
+        let enrollment_id = self.input.enrollment_id;
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_record_key(enrollment_id),
+            ),
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_state_key(enrollment_id),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.state = InspectSecretState::Error;
-                self.output = Some(Err(InspectSecretError::StorageError(error)));
-                return smallvec![];
-            }
-            other => other,
-        };
-
-        match self.state {
-            InspectSecretState::ReadRecords => {
-                let got = event.label();
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    self.state = InspectSecretState::Error;
-                    self.output = Some(Err(InspectSecretError::UnexpectedEvent {
-                        state: "ReadRecords".to_string(),
-                        expected: "batch read result",
-                        got,
-                    }));
-                    return smallvec![];
-                };
-                let [(_, record_value), (_, state_value)] = values.as_slice() else {
-                    self.state = InspectSecretState::Error;
-                    self.output = Some(Err(InspectSecretError::UnexpectedEvent {
-                        state: "ReadRecords".to_string(),
-                        expected: "record and state batch read result",
-                        got: "a batch of another length",
-                    }));
-                    return smallvec![];
-                };
-
-                let Some(value) = record_value else {
-                    self.state = InspectSecretState::Error;
-                    self.output = Some(Err(InspectSecretError::NotFound));
-                    return smallvec![];
-                };
-
-                let record = match postcard::from_bytes::<OnboardingSecretRecord>(value) {
-                    Ok(record) => record,
-                    Err(error) => {
-                        self.state = InspectSecretState::Error;
-                        self.output = Some(Err(InspectSecretError::ConversionError(error.into())));
-                        return smallvec![];
-                    }
-                };
-                let secret_state = match resolve_secret_state(&record, state_value.as_ref()) {
-                    Ok(secret_state) => secret_state,
-                    Err(error) => {
-                        self.state = InspectSecretState::Error;
-                        self.output = Some(Err(InspectSecretError::ConversionError(error)));
-                        return smallvec![];
-                    }
-                };
-
-                let validation = if matches!(
-                    &secret_state,
-                    OnboardingSecretState::Finalizing { node_id }
-                        if node_id != &self.input.node_id
-                ) {
-                    Err(InspectSecretError::AlreadyClaimed)
-                } else if record.expires_at < self.input.now
-                    && !matches!(
-                        &secret_state,
-                        OnboardingSecretState::Finalizing { node_id }
-                            if node_id == &self.input.node_id
-                    )
-                {
-                    Err(InspectSecretError::Expired)
-                } else if record.secret_hash != self.input.secret_hash {
-                    Err(InspectSecretError::InvalidSecret)
-                } else {
-                    Ok(record)
-                };
-
-                match validation {
-                    Ok(record) => {
-                        self.state = InspectSecretState::Finish;
-                        self.output = Some(Ok(record));
-                    }
-                    Err(error) => {
-                        self.state = InspectSecretState::Error;
-                        self.output = Some(Err(error));
-                    }
-                }
-                smallvec![]
-            }
-            InspectSecretState::Init | InspectSecretState::Finish | InspectSecretState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            InspectSecretState::Finish | InspectSecretState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(InspectSecretError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<OnboardingSecretRecord>, InspectSecretError> {
+        let [record, state] = values::<2>(result)?;
+        let record = record.ok_or(InspectSecretError::NotFound)?;
+        let record: OnboardingSecretRecord =
+            postcard::from_bytes(&record).map_err(ConversionError::from)?;
+        let state = resolve_secret_state(&record, state.as_ref())?;
+        self.check(record, state).map(Next::Done)
     }
 }
 

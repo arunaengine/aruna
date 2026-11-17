@@ -5,30 +5,30 @@
 use std::collections::VecDeque;
 
 use aruna_core::NodeId;
-use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
 use aruna_core::structs::execution::job::{JobId, JobPayload, WorkspaceMode, user_dedup_key};
 use aruna_core::structs::execution::notification::{NotificationKind, NotificationRecord};
 use aruna_core::structs::execution::webhook::WebhookDeliverySpec;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::jobs::JOB_RETENTION_MS;
 use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec, mint_configured_job};
+use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EnqueueError {
-    #[error("{channel} delivery queue: {source}")]
+    #[error("{channel} delivery queue: {reason}")]
     Submit {
         channel: &'static str,
-        source: SubmitJobError,
+        reason: String,
     },
-    #[error("the delivery queue did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// Queues a webhook job per share upload and an email job per email-category notice unless the
@@ -37,10 +37,10 @@ pub enum EnqueueError {
 #[derive(Debug, PartialEq)]
 pub struct EnqueueDeliveriesOperation {
     waiting: VecDeque<(&'static str, SubmitJobOperation)>,
-    current: Option<(&'static str, SubmitJobOperation)>,
-    /// Events still owed to the closing effects of the last finished submit.
-    owed: usize,
-    result: Option<Result<(), EnqueueError>>,
+    /// The channel of the submit that runs.
+    current: &'static str,
+    /// A job id that could not be minted, returned before any submit runs.
+    failed: Option<EnqueueError>,
 }
 
 impl EnqueueDeliveriesOperation {
@@ -75,9 +75,8 @@ impl EnqueueDeliveriesOperation {
         }
         let mut operation = Self {
             waiting: VecDeque::with_capacity(deliveries.len()),
-            current: None,
-            owed: 0,
-            result: None,
+            current: "delivery",
+            failed: None,
         };
         for (channel, record, payload) in deliveries {
             let name = format!("{channel}/{}", record.notification_id);
@@ -85,7 +84,8 @@ impl EnqueueDeliveriesOperation {
             let job_id = match mint(config, owner_node, &dedup_key) {
                 Ok(job_id) => job_id,
                 Err(source) => {
-                    operation.result = Some(Err(EnqueueError::Submit { channel, source }));
+                    let reason = source.to_string();
+                    operation.failed = Some(EnqueueError::Submit { channel, reason });
                     break;
                 }
             };
@@ -105,36 +105,16 @@ impl EnqueueDeliveriesOperation {
         operation
     }
 
-    /// Starts the next submit, and ends once none is left or one failed.
-    fn next(&mut self) -> Effects {
-        while self.result.is_none() {
-            let Some((channel, mut submit)) = self.waiting.pop_front() else {
-                self.result = Some(Ok(()));
-                break;
-            };
-            let effects = submit.start();
-            if !submit.is_complete() {
-                self.current = Some((channel, submit));
-                return effects;
-            }
-            self.settle(channel, submit);
-            if !effects.is_empty() {
-                return self.close(effects);
-            }
-        }
-        smallvec![]
-    }
-
-    /// Runs the closing effects of a finished submit before the next one starts.
-    fn close(&mut self, effects: Effects) -> Effects {
-        self.owed = effects.len();
-        effects
-    }
-
-    fn settle(&mut self, channel: &'static str, submit: SubmitJobOperation) {
-        if let Err(source) = submit.finalize() {
-            self.result = Some(Err(EnqueueError::Submit { channel, source }));
-        }
+    /// Runs the next submit as a child, or ends once none is left.
+    fn submit(&mut self) -> Next<()> {
+        let Some((channel, submit)) = self.waiting.pop_front() else {
+            return Next::Done(());
+        };
+        self.current = channel;
+        Next::Call(IoCall::Child(boxed_suboperation(submit, |result| {
+            let result = result.map(|_| ()).map_err(|error| error.to_string());
+            Event::SubOperation(SubOperationEvent::DeliveryQueued { result })
+        })))
     }
 }
 
@@ -147,66 +127,36 @@ fn mint(
     mint_configured_job(config.ok_or_else(unavailable)?, owner_node, dedup_key)
 }
 
-impl EffectOperation for EnqueueDeliveriesOperation {
+impl Operation for EnqueueDeliveriesOperation {
     type Output = ();
     type Error = EnqueueError;
 
-    fn start(&mut self) -> Effects {
-        self.next()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if self.owed > 0 {
-            self.owed -= 1;
-            return match self.owed {
-                0 => self.next(),
-                _ => smallvec![],
-            };
-        }
-        let Some((channel, mut submit)) = self.current.take() else {
-            let got = format!("{event:?}");
-            let source = SubmitJobError::UnexpectedEvent(got);
-            self.result = Some(Err(EnqueueError::Submit {
-                channel: "delivery",
-                source,
-            }));
-            return smallvec![];
-        };
-        let effects = submit.step(event);
-        if !submit.is_complete() {
-            self.current = Some((channel, submit));
-            return effects;
-        }
-        self.settle(channel, submit);
-        match effects.is_empty() {
-            true => self.next(),
-            false => self.close(effects),
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        match self.failed.take() {
+            Some(error) => Err(error),
+            None => Ok(self.submit()),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(EnqueueError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.current.as_mut() {
-            Some((_, submit)) => submit.abort(),
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match result {
+            IoResult::Event(Event::SubOperation(SubOperationEvent::DeliveryQueued { result })) => {
+                result.map_err(|reason| EnqueueError::Submit {
+                    channel: self.current,
+                    reason,
+                })?;
+                Ok(self.submit())
+            }
+            other => Err(unexpected("SubOperationEvent::DeliveryQueued", &other).into()),
         }
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::operation_check::rejects_finalize;
     use aruna_core::structs::execution::notification::NotificationClass;
 
     fn upload() -> NotificationRecord {
@@ -229,22 +179,26 @@ mod state_machine_tests {
         config
     }
 
+    fn queued(result: Result<(), String>) -> IoResult {
+        IoResult::Event(Event::SubOperation(SubOperationEvent::DeliveryQueued {
+            result,
+        }))
+    }
+
     #[test]
     fn nothing_to_queue() {
         let notice = record(user(1, 2), NotificationClass::Direct, 1_000);
         let config = RealmConfigDocument::new(user(1, 2).realm_id, Vec::new(), 3);
         let mut enqueue =
             EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[notice], 1_000);
-        assert!(enqueue.start().is_empty());
-        assert_eq!(enqueue.finalize(), Ok(()));
+        assert_eq!(enqueue.first(), Ok(Next::Done(())));
     }
 
     #[test]
     fn unplaced_job_fails() {
         let mut enqueue = EnqueueDeliveriesOperation::new(node_id(1), None, &[upload()], 1_000);
-        assert!(enqueue.start().is_empty());
         assert!(matches!(
-            enqueue.finalize(),
+            enqueue.first(),
             Err(EnqueueError::Submit {
                 channel: "webhook",
                 ..
@@ -257,21 +211,18 @@ mod state_machine_tests {
         let config = placed();
         let mut enqueue =
             EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
+        assert!(matches!(enqueue.first(), Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(enqueue.next(queued(Ok(()))), Ok(Next::Done(())));
+        let mut failed =
+            EnqueueDeliveriesOperation::new(node_id(1), Some(&config), &[upload()], 1_000);
+        failed.first().unwrap();
         assert!(matches!(
-            enqueue.start().as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction { .. })]
+            failed.next(queued(Err("full".to_string()))),
+            Err(EnqueueError::Submit {
+                channel: "webhook",
+                ..
+            })
         ));
-        enqueue.abort();
-        rejects_finalize(enqueue);
-    }
-
-    #[test]
-    fn stray_event_fails() {
-        let mut enqueue = EnqueueDeliveriesOperation::new(node_id(1), None, &[], 1_000);
-        enqueue.start();
-        let mut done = EnqueueDeliveriesOperation::new(node_id(1), None, &[], 1_000);
-        assert!(done.step(Event::Search()).is_empty());
-        assert!(done.finalize().is_err());
-        assert_eq!(enqueue.finalize(), Ok(()));
+        assert!(failed.next(IoResult::Done).is_err());
     }
 }

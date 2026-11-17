@@ -6,24 +6,26 @@ use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailPreference};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::GetConfigOperation;
+use crate::document_repository::{GetConfigError, read_effect};
 use crate::notifications::setting_rows::{
     SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
+use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmailError {
@@ -39,6 +41,15 @@ pub enum EmailError {
     NotVerified,
     #[error("email is not configured in this realm")]
     NotConfigured,
+}
+
+impl From<IoError> for EmailError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            error => Self::Setting(SettingError::Io(error)),
+        }
+    }
 }
 
 /// One email opt-in; ids and time come from the caller, as does the address format check.
@@ -58,13 +69,12 @@ pub struct EmailOptIn {
 #[derive(Debug, Default, PartialEq)]
 enum OptInState {
     #[default]
-    Init,
-    Config(Box<GetConfigOperation>),
+    Config,
     User,
     Write(Box<WriteSettingOperation>),
-    Done(Box<EmailPreference>),
-    Failed(EmailError),
 }
+
+type Turn = Result<Next<EmailPreference>, EmailError>;
 
 /// Turns on email for known categories to the account's verified address, in a realm with an
 /// email profile. The address is sealed to the realm key, so only management nodes open it.
@@ -78,49 +88,37 @@ impl SetEmailOperation {
     pub fn new(opt_in: EmailOptIn) -> Self {
         Self {
             opt_in: Some(opt_in),
-            state: OptInState::Init,
+            state: OptInState::Config,
         }
     }
 
-    fn fail(&mut self, error: EmailError) -> Effects {
-        self.state = OptInState::Failed(error);
-        smallvec![]
-    }
-
-    fn configured(&mut self, config: GetConfigOperation) -> Effects {
-        let Some(opt_in) = self.opt_in.as_ref() else {
-            return self.fail(EmailError::NotVerified);
-        };
-        let config = match config.finalize() {
-            Ok(config) => config,
-            Err(error) => return self.fail(SettingError::Config(error.to_string()).into()),
-        };
+    /// Checks the realm's email profile and the categories, then reads the account.
+    fn configured(&mut self, value: Option<&[u8]>) -> Turn {
+        let config = value
+            .ok_or(GetConfigError::DocumentNotFound)
+            .and_then(|value| Ok(RealmConfigDocument::from_bytes(value)?))
+            .map_err(|error| SettingError::Config(error.to_string()))?;
         if config.email.is_none() {
-            return self.fail(EmailError::NotConfigured);
+            return Err(EmailError::NotConfigured);
         }
+        let opt_in = self.opt_in.as_ref().ok_or(EmailError::NotVerified)?;
         let categories = &opt_in.categories;
         let known =
             (categories.iter()).all(|category| EMAIL_CATEGORIES.contains(&category.as_str()));
         if categories.is_empty() || !known {
-            return self.fail(EmailError::InvalidCategories);
+            return Err(EmailError::InvalidCategories);
         }
         self.state = OptInState::User;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: opt_in.owner.to_bytes().into(),
-            txn_id: None,
-        })]
+        Ok(Next::Call(read_row(USER_KEYSPACE, opt_in.owner.to_bytes())))
     }
 
     /// Writes the opt-in when `user` holds the address its sign-in provider verified.
-    fn checked(&mut self, user: Option<User>) -> Effects {
-        let Some(opt_in) = self.opt_in.take() else {
-            return self.fail(EmailError::NotVerified);
-        };
+    fn checked(&mut self, user: Option<User>) -> Turn {
+        let opt_in = self.opt_in.take().ok_or(EmailError::NotVerified)?;
         let hash = user.and_then(|user| user.attributes.get(EMAIL_HASH_ATTRIBUTE).cloned());
         let verified = hash.is_some_and(|hash| hash == email_hash(&opt_in.address));
         if !verified || !opt_in.address_valid {
-            return self.fail(EmailError::NotVerified);
+            return Err(EmailError::NotVerified);
         }
         let write = SettingWrite {
             owner: opt_in.owner,
@@ -133,107 +131,62 @@ impl SetEmailOperation {
                 address: Some(SecretBytes::new(opt_in.address.into_bytes())),
             },
         };
-        let mut write = WriteSettingOperation::new(write);
-        let effects = write.start();
-        self.state = OptInState::Write(Box::new(write));
-        effects
-    }
-
-    fn written(&mut self, write: WriteSettingOperation) -> Effects {
-        let preference = write
-            .finalize()
-            .map_err(EmailError::from)
-            .and_then(|bytes| Ok(EmailPreference::from_bytes(&bytes)?));
-        match preference {
-            Ok(preference) => {
-                self.state = OptInState::Done(Box::new(preference));
-                smallvec![]
-            }
-            Err(error) => self.fail(error),
-        }
+        let mut write = Box::new(WriteSettingOperation::new(write));
+        let turn = write.first();
+        self.state = OptInState::Write(write);
+        written(turn)
     }
 }
 
-impl EffectOperation for SetEmailOperation {
+/// The preference a finished setting write stored, or its next call.
+fn written(turn: Result<Next<Vec<u8>>, SettingError>) -> Turn {
+    match turn? {
+        Next::Call(call) => Ok(Next::Call(call)),
+        Next::Done(bytes) => Ok(Next::Done(EmailPreference::from_bytes(&bytes)?)),
+        Next::Wait => Ok(Next::Wait),
+    }
+}
+
+impl Operation for SetEmailOperation {
     type Output = EmailPreference;
     type Error = EmailError;
 
-    fn start(&mut self) -> Effects {
-        let Some(opt_in) = self.opt_in.as_ref() else {
-            return self.fail(EmailError::NotVerified);
-        };
-        let mut config = GetConfigOperation::new(opt_in.owner.realm_id);
-        let effects = config.start();
-        if config.is_complete() {
-            return self.configured(config);
-        }
-        self.state = OptInState::Config(Box::new(config));
-        effects
+    fn first(&mut self) -> Turn {
+        let opt_in = self.opt_in.as_ref().ok_or(EmailError::NotVerified)?;
+        let realm_id = opt_in.owner.realm_id;
+        let read = read_effect(&DocumentTarget::RealmConfig { realm_id }, None);
+        Ok(Next::Call(IoCall::Effect(read)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (OptInState::Config(mut config), event) => {
-                let effects = config.step(event);
-                if config.is_complete() {
-                    return self.configured(*config);
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (&mut self.state, result) {
+            // A failed config read means the realm cannot be checked now, not a storage fault.
+            (OptInState::Config, IoResult::Event(Event::Storage(event))) => match event {
+                StorageEvent::ReadResult { value, .. } => self.configured(value.as_deref()),
+                StorageEvent::Error { error } => {
+                    Err(SettingError::Config(GetConfigError::from(error).to_string()).into())
                 }
-                self.state = OptInState::Config(config);
-                effects
-            }
-            (OptInState::User, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                match value.as_deref().map(User::from_bytes).transpose() {
-                    Ok(user) => self.checked(user),
-                    Err(error) => self.fail(error.into()),
+                other => {
+                    let other = IoResult::Event(Event::Storage(other));
+                    Err(unexpected("the realm config read", &other).into())
                 }
+            },
+            (OptInState::User, result @ IoResult::Values(_)) => {
+                let [value] = values::<1>(result)?;
+                let user = value.as_deref().map(User::from_bytes).transpose()?;
+                self.checked(user)
             }
-            (OptInState::User, Event::Storage(StorageEvent::Error { error })) => {
-                self.fail(error.into())
-            }
-            (OptInState::Write(mut write), event) => {
-                let effects = write.step(event);
-                if write.is_complete() {
-                    return self.written(*write);
-                }
-                self.state = OptInState::Write(write);
-                effects
-            }
-            (_, other) => {
-                let error = SettingError::UnexpectedEvent(format!("{other:?}"));
-                self.fail(error.into())
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, OptInState::Done(_) | OptInState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            OptInState::Done(preference) => Ok(*preference),
-            OptInState::Failed(error) => Err(error),
-            _ => Err(SettingError::NotFinished.into()),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.state {
-            OptInState::Config(config) => config.abort(),
-            OptInState::Write(write) => write.abort(),
-            _ => smallvec![],
+            (OptInState::Write(write), result) => written(write.next(result)),
+            (_, other) => Err(unexpected("a config, account or setting result", &other).into()),
         }
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::user;
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
 
     fn opt_in(categories: &[&str]) -> EmailOptIn {
         EmailOptIn {
@@ -251,60 +204,66 @@ mod state_machine_tests {
         }
     }
 
+    fn at_user(categories: &[&str]) -> SetEmailOperation {
+        let mut set = SetEmailOperation::new(opt_in(categories));
+        set.state = OptInState::User;
+        set
+    }
+
     #[test]
     fn reads_config_first() {
         let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
-        let mut config = GetConfigOperation::new(user(1, 2).realm_id);
-        assert_eq!(set.start(), config.start());
-    }
-
-    #[test]
-    fn missing_user_unverified() {
-        let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
-        set.state = OptInState::User;
-        set.step(Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: None,
-        }));
-        assert_eq!(set.finalize(), Err(EmailError::NotVerified));
-    }
-
-    #[test]
-    fn user_read_error() {
-        let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
-        set.state = OptInState::User;
-        set.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
+        let target = DocumentTarget::RealmConfig {
+            realm_id: user(1, 2).realm_id,
+        };
         assert_eq!(
-            set.finalize(),
-            Err(EmailError::Storage(StorageError::Timeout))
+            set.first(),
+            Ok(Next::Call(IoCall::Effect(read_effect(&target, None))))
         );
     }
 
     #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
-            set.state = OptInState::User;
-            set
-        };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        assert!(!rejects_events(make, sample_events, expected).is_empty());
+    fn config_failure_unavailable() {
+        let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
+        let missing = Event::Storage(StorageEvent::ReadResult {
+            key: Vec::new().into(),
+            value: None,
+        });
+        assert!(matches!(
+            set.next(IoResult::Event(missing)),
+            Err(EmailError::Setting(SettingError::Config(_)))
+        ));
+        let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(matches!(
+            set.next(IoResult::Event(failed)),
+            Err(EmailError::Setting(SettingError::Config(_)))
+        ));
     }
 
     #[test]
-    fn abort_and_finalize() {
-        let mut set = SetEmailOperation::new(opt_in(&["share.upload"]));
-        set.start();
-        set.abort();
-        rejects_finalize(set);
-        let mut idle = SetEmailOperation::new(opt_in(&[]));
-        check_abort(&mut idle, &[]);
+    fn missing_user_unverified() {
+        let mut set = at_user(&["share.upload"]);
+        assert_eq!(
+            set.next(IoResult::Values(vec![None])),
+            Err(EmailError::NotVerified)
+        );
+    }
+
+    #[test]
+    fn unexpected_results_fail() {
+        let mut set = at_user(&["share.upload"]);
+        assert!(matches!(
+            set.next(IoResult::Done),
+            Err(EmailError::Setting(SettingError::Io(
+                IoError::Unexpected { .. }
+            )))
+        ));
+        assert_eq!(
+            EmailError::from(IoError::Storage(StorageError::Timeout)),
+            EmailError::Storage(StorageError::Timeout)
+        );
     }
 }

@@ -10,6 +10,7 @@ use ulid::Ulid;
 use url::Url;
 
 use crate::UserId;
+use crate::calls::IoError;
 use crate::federation::{FederationError, RealmDescriptor, Signable, Signed, valid_federation_url};
 use crate::handoff::{HANDOFF_SKEW_SECS, descriptor_digest, secret_nonce};
 use crate::structs::identity::realm::RealmId;
@@ -273,6 +274,12 @@ pub enum GrantError {
     Sign(#[from] FederationError),
     #[error("grant storage failed: {0}")]
     Storage(String),
+}
+
+impl From<IoError> for GrantError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 #[cfg(test)]

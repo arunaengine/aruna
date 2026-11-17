@@ -31,7 +31,9 @@ pub async fn assemble_shard_manifest(
         .net_handle
         .as_ref()
         .ok_or_else(|| "cannot assemble shard manifest without a net handle".to_string())?;
-    let entries = drive(ManifestScanOperation::new(&placement), context).await?;
+    let entries = drive(ManifestScanOperation::new(&placement), context)
+        .await
+        .map_err(|error| error.to_string())?;
     let topic = shard_topic_id(realm_id, &placement);
     let (digest, cursor) = topic_digest_cursor(net_handle, topic);
     Ok(ShardManifest {

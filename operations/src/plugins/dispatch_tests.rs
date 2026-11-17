@@ -6,8 +6,11 @@
 use super::*;
 use crate::driver::drive;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::runs::{list_runs, read_run};
+use crate::plugins::rows::{decode, page_result, values_result};
+use crate::plugins::runs::{TimerRow, list_runs, read_run, read_timer};
 use crate::plugins::worker::tests::installed;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::RUNS_QUEUED;
 use aruna_core::plugin_runs::SourceKind;
 
@@ -144,43 +147,40 @@ fn trigger_indexes_kept() {
 #[test]
 fn timer_occurrences() {
     let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
-    let plan = |now_ms| EnqueueTimer {
-        install: Box::new(install.clone()),
-        handler: "every".into(),
-        interval_ms: 10,
-        now_ms,
-        key: timer_key(install.install_id),
-        phase: TimerPhase::Reading,
-    };
+    let plan = |now_ms| enqueue_timer(&install, "every".into(), 10, now_ms);
     // Before the first interval since activation nothing is due.
     let mut early = plan(14);
-    assert!(matches!(early.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert!(matches!(
+        early.first().unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
     assert_eq!(
-        early.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Finish(false)
+        early.next(values_result(vec![None])).unwrap(),
+        Next::Done(false)
     );
     // Missed occurrences collapse into the latest; a full queue skips it.
     let mut due = plan(37);
     due.first().unwrap();
     assert!(matches!(
-        due.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        due.next(values_result(vec![None])).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
     let full = (0..RUNS_QUEUED)
         .map(|seq| (vec![seq as u8], Vec::new()))
         .collect();
-    let Turn::Ask(Ask::Write(rows)) = due.next(Answer::Page(full, None)).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = due.next(page_result(full, None)).unwrap() else {
         panic!("the timer row is written");
     };
     let row: TimerRow = decode(&rows[0].2).unwrap();
     assert_eq!((row.last_due_ms, row.skipped), (35, 1));
-    assert_eq!(due.next(Answer::Done).unwrap(), Turn::Finish(false));
+    assert_eq!(due.next(IoResult::Done).unwrap(), Next::Done(false));
     let mut queued = plan(37);
     queued.first().unwrap();
-    queued.next(Answer::Values(vec![None])).unwrap();
-    let Turn::Ask(Ask::Write(rows)) = queued.next(Answer::Page(Vec::new(), None)).unwrap() else {
+    queued.next(values_result(vec![None])).unwrap();
+    let Next::Call(IoCall::Write(rows)) = queued.next(page_result(Vec::new(), None)).unwrap()
+    else {
         panic!("the run and the timer row are written");
     };
     assert_eq!(rows.len(), 3);
-    assert_eq!(queued.next(Answer::Done).unwrap(), Turn::Finish(true));
+    assert_eq!(queued.next(IoResult::Done).unwrap(), Next::Done(true));
 }

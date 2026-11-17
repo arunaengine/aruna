@@ -130,65 +130,32 @@ async fn newer_intent_restarts() {
     );
 }
 
-fn cursor_row(value: Option<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: b"cursor".to_vec().into(),
-        value: value.map(Into::into),
-    })
+fn cursor_row(value: Option<Vec<u8>>) -> IoResult {
+    IoResult::Values(vec![value.map(Into::into)])
 }
 
 #[test]
 fn reads_stored_cursor() {
     let stored = BootstrapCursor::start([3; 32], 7);
-    let start = Effect::Storage(StorageEffect::Read {
-        key_space: BOOTSTRAP_KEYSPACE.to_string(),
-        key: b"cursor".to_vec().into(),
-        txn_id: None,
-    });
     let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
-    let steps = vec![(cursor_row(Some(stored.to_bytes().unwrap())), vec![])];
-    aruna_core::operation_check::check_trace(&mut operation, &[start], steps);
-    assert_eq!(operation.finalize(), Ok(Some(stored)));
+    let read = vec![(BOOTSTRAP_KEYSPACE.to_string(), b"cursor".to_vec().into())];
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+    let answer = operation.next(cursor_row(Some(stored.to_bytes().unwrap())));
+    assert_eq!(answer, Ok(Next::Done(Some(stored))));
 }
 
 #[test]
 fn cursor_read_outcomes() {
-    let read = |event: Event| {
-        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
-        operation.start();
-        operation.step(event);
-        operation.finalize()
-    };
-    assert_eq!(read(cursor_row(None)), Ok(None));
+    let read = |result: IoResult| ReadCursorOperation::new(b"cursor".to_vec()).next(result);
+    assert_eq!(read(cursor_row(None)), Ok(Next::Done(None)));
     assert!(matches!(
         read(cursor_row(Some(vec![0xff]))),
         Err(BootstrapError::Conversion(_))
     ));
-    let failed = Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    });
-    assert_eq!(
-        read(failed),
-        Err(BootstrapError::Storage(StorageError::Timeout))
-    );
-}
-
-#[test]
-fn cursor_read_contract() {
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
-    let make = || {
-        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
-        operation.start();
-        operation
-    };
-    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::ReadResult { .. }));
-    let refused = rejects_events(make, sample_events, accepted);
-    assert_eq!(refused.len(), sample_events().len() - 1);
-    let mut fresh = ReadCursorOperation::new(b"cursor".to_vec());
-    check_abort(&mut fresh, &[]);
-    rejects_finalize(fresh);
+    assert!(matches!(
+        read(IoResult::Done),
+        Err(BootstrapError::Io(IoError::Unexpected { .. }))
+    ));
 }
 
 /// A cursor row of `member` for the set of [`set`].
@@ -201,35 +168,35 @@ fn cursor_key(member: u8) -> Key {
     .into()
 }
 
-fn cursor_page(members: &[u8]) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: (members.iter())
+fn cursor_page(members: &[u8]) -> IoResult {
+    IoResult::Page {
+        rows: (members.iter())
             .map(|member| (cursor_key(*member), Vec::<u8>::new().into()))
             .collect(),
-        next_start_after: None,
-    })
+        next: None,
+    }
+}
+
+fn deleted(members: &[u8]) -> Next<bool> {
+    Next::Call(IoCall::Delete(
+        (members.iter())
+            .map(|member| (BOOTSTRAP_KEYSPACE.to_string(), cursor_key(*member)))
+            .collect(),
+    ))
 }
 
 #[test]
 fn clears_set_cursors() {
-    let scan = Effect::Storage(StorageEffect::Iter {
-        key_space: BOOTSTRAP_KEYSPACE.to_string(),
-        prefix: Some(bootstrap_prefix(set()).into()),
-        start: None,
+    let scan = IoCall::Page {
+        space: BOOTSTRAP_KEYSPACE.to_string(),
+        prefix: bootstrap_prefix(set()).into(),
+        after: None,
         limit: 2,
-        txn_id: None,
-    });
-    let delete = Effect::Storage(StorageEffect::BatchDelete {
-        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(4))],
-        txn_id: None,
-    });
-    let deleted = Event::Storage(StorageEvent::BatchDeleteResult {
-        entries: Vec::new(),
-    });
+    };
     let mut operation = ClearCursorsOperation::new(set(), None, 2);
-    let steps = vec![(cursor_page(&[4]), vec![delete]), (deleted, vec![])];
-    aruna_core::operation_check::check_trace(&mut operation, &[scan], steps);
-    assert_eq!(operation.finalize(), Ok(true));
+    assert_eq!(operation.first(), Ok(Next::Call(scan)));
+    assert_eq!(operation.next(cursor_page(&[4])), Ok(deleted(&[4])));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
 }
 
 #[test]
@@ -237,59 +204,9 @@ fn keeps_walked_cursors() {
     // Only the cursors of members no longer walked go; a full page is not all of them.
     let walked = vec![Ulid::from_bytes([4; 16])];
     let mut operation = ClearCursorsOperation::new(set(), Some(walked.clone()), 2);
-    operation.start();
-    let delete = Effect::Storage(StorageEffect::BatchDelete {
-        deletes: vec![(BOOTSTRAP_KEYSPACE.to_string(), cursor_key(5))],
-        txn_id: None,
-    });
-    assert_eq!(operation.step(cursor_page(&[4, 5])).as_slice(), [delete]);
+    assert_eq!(operation.next(cursor_page(&[4, 5])), Ok(deleted(&[5])));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(false)));
     let mut kept = ClearCursorsOperation::new(set(), Some(walked), 2);
-    kept.start();
-    assert!(kept.step(cursor_page(&[4])).is_empty());
-    assert_eq!(kept.finalize(), Ok(true));
-    let mut full = ClearCursorsOperation::new(set(), Some(vec![Ulid::from_bytes([5; 16])]), 1);
-    full.start();
-    assert!(full.step(cursor_page(&[5])).is_empty());
-    assert_eq!(full.finalize(), Ok(false));
-}
-
-#[test]
-fn cursor_clear_contract() {
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
-    let make = || {
-        let mut operation = ClearCursorsOperation::new(set(), None, 2);
-        operation.start();
-        operation
-    };
-    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
-    let refused = rejects_events(make, sample_events, accepted);
-    assert_eq!(refused.len(), sample_events().len() - 1);
-    let deleting = || {
-        let mut operation = ClearCursorsOperation::new(set(), None, 2);
-        operation.start();
-        operation.step(cursor_page(&[4]));
-        operation
-    };
-    let accepted = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::BatchDeleteResult { .. })
-        )
-    };
-    let refused = rejects_events(deleting, sample_events, accepted);
-    assert_eq!(refused.len(), sample_events().len() - 1);
-    let failed = Event::Storage(StorageEvent::Error {
-        error: StorageError::Timeout,
-    });
-    let mut scanning = make();
-    scanning.step(failed);
-    assert_eq!(
-        scanning.finalize(),
-        Err(BootstrapError::Storage(StorageError::Timeout))
-    );
-    let mut fresh = ClearCursorsOperation::new(set(), None, 2);
-    check_abort(&mut fresh, &[]);
-    rejects_finalize(fresh);
+    assert_eq!(kept.next(cursor_page(&[4])), Ok(deleted(&[])));
+    assert_eq!(kept.next(IoResult::Done), Ok(Next::Done(true)));
 }

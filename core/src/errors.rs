@@ -132,6 +132,12 @@ impl BlobError {
     }
 }
 
+impl From<crate::calls::IoError> for BlobError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum StagingSourceError {
     #[error("Channel closed")]
@@ -186,6 +192,15 @@ pub enum SourceResolutionError {
     InvalidSourcePath,
     #[error("Source connector resolution failed")]
     ResolveFailed,
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for SourceResolutionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        let error = (error.into_storage())
+            .unwrap_or_else(|other| StorageError::ReadError(other.to_string()));
+        Self::StorageError(error)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]

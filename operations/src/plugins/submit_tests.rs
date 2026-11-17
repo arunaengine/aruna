@@ -7,9 +7,9 @@ use aruna_core::plugin_installs::PluginInstall;
 
 use super::*;
 use crate::driver::DriverContext;
-use crate::jobs::plugin_work::tests::copier;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
+use crate::plugins::plugin_work::tests::copier;
 use crate::plugins::runs::tests::queued;
 use crate::plugins::work::read_work;
 use crate::s3::object::copy::test::seed_bucket;
@@ -459,7 +459,7 @@ async fn narrowed_download_refused() {
     use aruna_core::secrets::ResponseExposure;
     use aruna_plugins::broker::{Broker, CallContext, Intent, JobDownload};
 
-    use crate::plugins::bound::tests::{ORIGIN, keys, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, hold_keys, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::work::list_work;
     let fixture = Fixture::keyed().await;
@@ -467,7 +467,8 @@ async fn narrowed_download_refused() {
     secret_with(&fixture, &install, ResponseExposure::Status).await;
     let mut scope = scope(&fixture, &install);
     scope.run.settings = format!(r#"{{"catalog_url":"{ORIGIN}"}}"#);
-    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys());
+    hold_keys(&fixture.ctx);
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
     let cx = CallContext {
         run: "run".into(),
         install: install.install_id.to_string(),
@@ -583,7 +584,7 @@ async fn reply_rechecked() {
     use aruna_core::secrets::{ResponseExposure, SecretName};
     use aruna_plugins::broker::{Broker, CallContext};
 
-    use crate::plugins::bound::tests::{ORIGIN, keys, rule_for, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, hold_keys, rule_for, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
     use crate::plugins::work::{WorkChange, reserve, update_work};
@@ -626,8 +627,8 @@ async fn reply_rechecked() {
         version: Ulid::nil(),
     };
     drive(update_work(ids, sent), &fixture.ctx).await.unwrap();
+    hold_keys(&fixture.ctx);
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
-    let broker = broker.with_keys(keys());
     let cx = CallContext {
         run: "run".into(),
         install: install.install_id.to_string(),

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_core::document::DocumentEvent;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
     QuarantineAdminError, QuarantinePageRequest, ReadQuarantineOperation,
@@ -120,9 +120,7 @@ fn map_admin_error(error: QuarantineAdminError) -> ServerError {
     match error {
         QuarantineAdminError::Storage(error) => ServerError::InternalError(error.into()),
         QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.into()),
-        QuarantineAdminError::Unexpected { .. } | QuarantineAdminError::Unfinished => {
-            ServerError::ServiceUnavailable
-        }
+        QuarantineAdminError::Io(_) => ServerError::ServiceUnavailable,
     }
 }
 
@@ -433,8 +431,9 @@ pub async fn prune_quarantine(
     Query(query): Query<QuarantineQuery>,
 ) -> ServerResult<(StatusCode, Json<QuarantinePruneResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
-    let operation = PruneQuarantineOperation::new(page_request(&query)?);
-    let result = drive(operation, &state.get_ctx())
+    let request = page_request(&query)?;
+    let build = || PruneQuarantineOperation::new(request.clone());
+    let result = drive_retry(build, &state.get_ctx(), b"sync-quarantine-prune")
         .await
         .map_err(map_admin_error)?;
 

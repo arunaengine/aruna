@@ -17,7 +17,6 @@ zeroize = { workspace = true }
 # Aruna modules
 aruna-core = { workspace = true }
 aruna-operations = { workspace = true }
-aruna-tasks = { workspace = true }
 aruna-wire = { workspace = true }
 
 # General
@@ -88,6 +87,7 @@ tokio = { workspace = true, features = ["test-util"] }
 aruna-net = { workspace = true }
 tracing-subscriber = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-tasks = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",

@@ -12,13 +12,13 @@ use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
+use crate::plugins::rows::{page_result, values_result};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::decide_batch;
 use crate::plugins::worker::prune_runs;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
-use aruna_core::operation::EffectOperation;
 
 /// A created dataset journaled now, and its forward row for `install`.
 fn event(install: &PluginInstall, resource: &str, now: u64) -> (SourceEvent, ForwardRow) {
@@ -307,15 +307,14 @@ fn verdict_decisions() {
     let row = plain_row("s1");
     // An unavailable check is busy and needs no storage.
     let mut busy = decide_event(Verdict::Unavailable, &row, 9).unwrap();
-    assert!(busy.start().is_empty());
-    assert_eq!(busy.finalize(), Ok(Outcome::Busy));
+    assert_eq!(busy.first(), Ok(Next::Done(Outcome::Busy)));
     // A denial records its outcome at once.
     let mut plan = DecideEvent {
         row: Box::new(row.clone()),
         now_ms: 9,
         phase: DecidePhase::Denying("no".into()),
     };
-    let Turn::Ask(Ask::Write(rows)) = plan.first().unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = plan.first().unwrap() else {
         panic!("a denial writes its dedup record");
     };
     assert_eq!(
@@ -323,7 +322,7 @@ fn verdict_decisions() {
         [seen_row(&row, &Outcome::Denied("no".into()), 9).unwrap()]
     );
     let denied = Outcome::Denied("no".into());
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(denied));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(denied));
     // An unready event holds a queue slot unless the queue is full.
     let mut hold = DecideEvent {
         row: Box::new(row.clone()),
@@ -335,8 +334,8 @@ fn verdict_decisions() {
         .map(|seq| (vec![seq as u8], Vec::new()))
         .collect();
     assert_eq!(
-        hold.next(Answer::Page(full, None)).unwrap(),
-        Turn::Finish(Outcome::Busy)
+        hold.next(page_result(full, None)).unwrap(),
+        Next::Done(Outcome::Busy)
     );
     let mut slot = DecideEvent {
         row: Box::new(row.clone()),
@@ -344,15 +343,15 @@ fn verdict_decisions() {
         phase: DecidePhase::Holding(Hold::new(&row, 9).unwrap()),
     };
     slot.first().unwrap();
-    let Turn::Ask(Ask::Write(rows)) = slot.next(Answer::Page(Vec::new(), None)).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = slot.next(page_result(Vec::new(), None)).unwrap() else {
         panic!("a free slot is taken");
     };
     assert_eq!(rows.len(), 3);
     assert_eq!(
-        slot.next(Answer::Done).unwrap(),
-        Turn::Finish(Outcome::Waiting)
+        slot.next(IoResult::Done).unwrap(),
+        Next::Done(Outcome::Waiting)
     );
-    assert!(slot.next(Answer::Done).is_err());
+    assert!(slot.next(IoResult::Done).is_err());
 }
 
 #[test]
@@ -369,27 +368,30 @@ fn reports_keep_newest() {
         reports: vec![report(3)],
         acked: None,
     };
-    let Turn::Ask(Ask::Read(reads)) = plan.first().unwrap() else {
+    let Next::Call(IoCall::Read(reads)) = plan.first().unwrap() else {
         panic!("the kept reports are read first");
     };
     assert_eq!(reads.len(), 1);
     // A newer kept report wins and nothing is written.
-    let kept = Answer::Values(vec![Some(encode(&report(5).1).unwrap())]);
-    assert_eq!(plan.next(kept).unwrap(), Turn::Ask(Ask::Write(Vec::new())));
+    let kept = values_result(vec![Some(encode(&report(5).1).unwrap())]);
+    assert_eq!(
+        plan.next(kept).unwrap(),
+        Next::Call(IoCall::Write(Vec::new()))
+    );
     let acked = vec![(install, SourceKind::DatasetCreated, GapReason::Full, 5)];
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(acked));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(acked));
 }
 
 #[test]
 fn gap_counts_once() {
     let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let mut gap = GapCount::new(local, &plain_row("s1"), GapReason::Late);
-    let Some(counted) = gap.take(Answer::Values(vec![None])).unwrap() else {
+    let Some(counted) = gap.take(values_result(vec![None])).unwrap() else {
         panic!("the first answer counts the gap");
     };
     let row: GapRow = decode(&counted.2).unwrap();
     assert_eq!((row.count, row.earliest_ms), (1, 5));
-    assert_eq!(gap.take(Answer::Done).unwrap(), None);
+    assert_eq!(gap.take(IoResult::Done).unwrap(), None);
 }
 
 #[test]
@@ -400,7 +402,10 @@ fn seen_records_expire() {
         deleting: None,
         pruned: 0,
     };
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
     let seen = |anchor_ms| {
         let record = SeenRow {
             outcome: Outcome::Queued,
@@ -410,45 +415,43 @@ fn seen_records_expire() {
         encode(&record).unwrap()
     };
     let page = vec![(b"old".to_vec(), seen(1)), (b"new".to_vec(), seen(20))];
-    let next = plan
-        .next(Answer::Page(page, Some(b"new".to_vec())))
-        .unwrap();
-    let deleted = Ask::Delete(vec![(PLUGIN_SEEN_KEYSPACE, b"old".to_vec())]);
-    assert_eq!(next, Turn::Ask(deleted));
-    let Turn::Ask(Ask::Page { after, .. }) = plan.next(Answer::Done).unwrap() else {
+    let next = plan.next(page_result(page, Some(b"new".to_vec()))).unwrap();
+    let deleted = delete_call(vec![(PLUGIN_SEEN_KEYSPACE, b"old".to_vec())]);
+    assert_eq!(next, Next::Call(deleted));
+    let Next::Call(IoCall::Page { after, .. }) = plan.next(IoResult::Done).unwrap() else {
         panic!("the next page follows");
     };
-    assert_eq!(after, Some(b"new".to_vec()));
+    assert_eq!(after.map(|key| key.to_vec()), Some(b"new".to_vec()));
     assert_eq!(
-        plan.next(Answer::Page(Vec::new(), None)).unwrap(),
-        Turn::Ask(Ask::Delete(Vec::new()))
+        plan.next(page_result(Vec::new(), None)).unwrap(),
+        Next::Call(delete_call(Vec::new()))
     );
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
 }
 
 #[test]
 fn seen_outcome_read() {
     let row = plain_row("s1");
     let mut plan = SeenOutcome(seen_key(row.install_id, row.event.kind, &row.event.source));
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
     let (_, _, stored) = seen_row(&row, &Outcome::Queued, 7).unwrap();
     let answer = plan
-        .next(Answer::Values(vec![Some(stored.to_vec())]))
+        .next(values_result(vec![Some(stored.to_vec())]))
         .unwrap();
-    assert_eq!(answer, Turn::Finish(Some(Outcome::Queued)));
-    let missing = plan.next(Answer::Values(vec![None])).unwrap();
-    assert_eq!(missing, Turn::Finish(None));
-    assert!(plan.next(Answer::Done).is_err());
+    assert_eq!(answer, Next::Done(Some(Outcome::Queued)));
+    let missing = plan.next(values_result(vec![None])).unwrap();
+    assert_eq!(missing, Next::Done(None));
+    assert!(plan.next(IoResult::Done).is_err());
 }
 
 #[test]
 fn late_event_counted() {
     let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
     let mut plan = LateEvent(GapCount::new(local, &plain_row("s1"), GapReason::Late));
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
-    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Values(vec![None])).unwrap() else {
+    assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
+    let Next::Call(IoCall::Write(rows)) = plan.next(values_result(vec![None])).unwrap() else {
         panic!("a late event writes its gap row");
     };
     assert_eq!(rows.len(), 1);
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(()));
 }

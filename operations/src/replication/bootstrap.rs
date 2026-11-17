@@ -4,11 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BOOTSTRAP_KEYSPACE, INVENTORY_KEYSPACE, REPLICATION_JOB_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::KeyRange;
@@ -22,8 +23,7 @@ use aruna_core::structs::storage::replication_queue::{
     BlobJobRecord, MemberTarget, ReplicateScopeInput, ReplicateScopeTarget, ReplicationMode,
     blob_job_key,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -65,28 +65,28 @@ pub enum BootstrapError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for BootstrapError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PageState {
-    Init,
-    Start,
     ReadCursor,
     ReadPending,
     ReadPage,
     Write,
-    Commit,
-    Abort,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<PageProgress>, BootstrapError>;
 
 /// Advances one cursor by one page in one transaction: the cursor and the page's jobs commit
 /// together, so a crash repeats at most the last page.
@@ -94,10 +94,8 @@ enum PageState {
 pub struct BootstrapPage {
     config: PageConfig,
     state: PageState,
-    txn_id: Option<TxnId>,
     cursor: BootstrapCursor,
     progress: Option<PageProgress>,
-    output: Option<Result<PageProgress, BootstrapError>>,
 }
 
 impl BootstrapPage {
@@ -105,11 +103,9 @@ impl BootstrapPage {
         let cursor = BootstrapCursor::start(config.intent, config.now_ms);
         Self {
             config,
-            state: PageState::Init,
-            txn_id: None,
+            state: PageState::ReadCursor,
             cursor,
             progress: None,
-            output: None,
         }
     }
 
@@ -118,49 +114,7 @@ impl BootstrapPage {
         bootstrap_key(config.set_id, config.member_id, config.range.range_id)
     }
 
-    fn fail(&mut self, error: BootstrapError) -> Effects {
-        self.state = PageState::Error;
-        self.output = Some(Err(error));
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        let state = match self.state {
-            PageState::Start => "Start",
-            PageState::ReadCursor => "ReadCursor",
-            PageState::ReadPending => "ReadPending",
-            PageState::ReadPage => "ReadPage",
-            PageState::Write => "Write",
-            PageState::Commit => "Commit",
-            PageState::Abort => "Abort",
-            PageState::Init | PageState::Finish | PageState::Error => "Idle",
-        };
-        let got = event.label();
-        self.fail(BootstrapError::UnexpectedEvent { state, got })
-    }
-
-    /// Ends without a write, keeping the cursor as it is.
-    fn settle(&mut self, progress: PageProgress) -> Effects {
-        self.progress = Some(progress);
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = PageState::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => self.finish(),
-        }
-    }
-
-    fn finish(&mut self) -> Effects {
-        self.state = PageState::Finish;
-        self.output = self.progress.map(Ok);
-        smallvec![]
-    }
-
-    fn accept_cursor(&mut self, value: Option<Value>) -> Result<Effects, BootstrapError> {
+    fn accept_cursor(&mut self, value: Option<Value>) -> Step {
         if let Some(stored) = value
             .map(|value| BootstrapCursor::from_bytes(&value))
             .transpose()?
@@ -172,7 +126,7 @@ impl BootstrapPage {
         }
         if self.cursor.done {
             let watermark = self.cursor.watermark;
-            return Ok(self.settle(PageProgress::Done { watermark }));
+            return Ok(Next::Done(PageProgress::Done { watermark }));
         }
         if self.cursor.pending.is_empty() {
             return self.next_page();
@@ -181,18 +135,17 @@ impl BootstrapPage {
         let reads = (self.cursor.pending.iter())
             .map(|key| (REPLICATION_JOB_KEYSPACE.to_string(), Key::from(key.clone())))
             .collect();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+        // Outside the transaction, as before: a delivered job's delete never conflicts it.
+        let read = StorageEffect::BatchRead {
             reads,
             txn_id: None,
-        })])
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(read)))))
     }
 
-    fn accept_pending(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<Effects, BootstrapError> {
+    fn accept_pending(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
         if values.iter().any(|(_, value)| value.is_some()) {
-            return Ok(self.settle(PageProgress::Waiting));
+            return Ok(Next::Done(PageProgress::Waiting));
         }
         self.cursor.pending.clear();
         self.next_page()
@@ -200,7 +153,7 @@ impl BootstrapPage {
 
     /// Reads the next page outside the transaction: live writes into the range never conflict
     /// a page, because the comparator orders whatever arrives twice.
-    fn next_page(&mut self) -> Result<Effects, BootstrapError> {
+    fn next_page(&mut self) -> Step {
         if self.cursor.walked {
             self.cursor.done = true;
             let watermark = self.cursor.watermark;
@@ -215,21 +168,18 @@ impl BootstrapPage {
             None => IterStart::At(lower.into()),
         };
         self.state = PageState::ReadPage;
-        Ok(smallvec![Effect::Storage(StorageEffect::IterRange {
+        let page = StorageEffect::IterRange {
             key_space: INVENTORY_KEYSPACE.to_string(),
             start,
             end: IterEnd::Before(upper.into()),
             limit: self.config.rows,
             max_bytes: PAGE_BYTES,
             txn_id: None,
-        })])
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(page)))))
     }
 
-    fn accept_page(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        more: bool,
-    ) -> Result<Effects, BootstrapError> {
+    fn accept_page(&mut self, values: Vec<(Key, Value)>, more: bool) -> Step {
         let mut writes = Vec::new();
         let mut pending = Vec::new();
         for (key, value) in &values {
@@ -274,10 +224,7 @@ impl BootstrapPage {
         })
     }
 
-    fn write(&mut self, mut writes: Vec<(String, Key, Value)>) -> Result<Effects, BootstrapError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(StorageError::TransactionNotFound.into());
-        };
+    fn write(&mut self, mut writes: Vec<(String, Key, Value)>) -> Step {
         let cursor = self.cursor.to_bytes()?;
         writes.push((
             BOOTSTRAP_KEYSPACE.to_string(),
@@ -285,144 +232,90 @@ impl BootstrapPage {
             cursor.into(),
         ));
         self.state = PageState::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    fn storage_answer(result: IoResult) -> Result<StorageEvent, BootstrapError> {
+        match result.event()? {
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            Event::Storage(event) => Ok(event),
+            other => Err(IoError::Unexpected {
+                expected: "a storage event",
+                got: other.label(),
+            }
+            .into()),
+        }
     }
 }
 
-impl EffectOperation for BootstrapPage {
+impl Operation for BootstrapPage {
     type Output = PageProgress;
     type Error = BootstrapError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PageState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Step {
+        let read = IoCall::Read(vec![(BOOTSTRAP_KEYSPACE.to_string(), self.key().into())]);
+        Ok(Next::Call(read))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (self.state, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (PageState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = PageState::ReadCursor;
-                Ok(smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BOOTSTRAP_KEYSPACE.to_string(),
-                    key: self.key().into(),
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (PageState::ReadCursor, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.accept_cursor(value)
-            }
-            (PageState::ReadPending, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.accept_pending(values)
-            }
-            (
-                PageState::ReadPage,
-                Event::Storage(StorageEvent::IterResult {
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.state {
+            PageState::ReadCursor => self.accept_cursor(result.value()?),
+            PageState::ReadPending => match Self::storage_answer(result)? {
+                StorageEvent::BatchReadResult { values } => self.accept_pending(values),
+                other => Err(unexpected("StorageEvent::BatchReadResult", other)),
+            },
+            PageState::ReadPage => match Self::storage_answer(result)? {
+                StorageEvent::IterResult {
                     values,
                     next_start_after,
-                }),
-            ) => self.accept_page(values, next_start_after.is_some()),
-            (PageState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.txn_id.take() {
-                    Some(txn_id) => {
-                        self.state = PageState::Commit;
-                        Ok(smallvec![Effect::Storage(
-                            StorageEffect::CommitTransaction { txn_id }
-                        )])
-                    }
-                    None => Err(StorageError::TransactionNotFound.into()),
-                }
+                } => self.accept_page(values, next_start_after.is_some()),
+                other => Err(unexpected("StorageEvent::IterResult", other)),
+            },
+            PageState::Write => {
+                result.done()?;
+                let progress = self.progress.ok_or(IoError::Unfinished)?;
+                Ok(Next::Done(progress))
             }
-            (PageState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. }))
-            | (PageState::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                Ok(self.finish())
-            }
-            (_, event) => return self.unexpected(event),
-        };
-        result.unwrap_or_else(|error| self.fail(error))
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PageState::Finish | PageState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(BootstrapError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
         }
     }
+
+    fn transaction(&self) -> bool {
+        true
+    }
+}
+
+fn unexpected(expected: &'static str, event: StorageEvent) -> BootstrapError {
+    let got = Event::Storage(event).label();
+    IoError::Unexpected { expected, got }.into()
 }
 
 /// One stored bootstrap cursor, read on its own key.
 #[derive(Debug, PartialEq)]
 pub struct ReadCursorOperation {
     key: Vec<u8>,
-    result: Option<Result<Option<BootstrapCursor>, BootstrapError>>,
 }
 
 impl ReadCursorOperation {
     pub fn new(key: Vec<u8>) -> Self {
-        Self { key, result: None }
+        Self { key }
     }
 }
 
-impl EffectOperation for ReadCursorOperation {
+impl Operation for ReadCursorOperation {
     type Output = Option<BootstrapCursor>;
     type Error = BootstrapError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BOOTSTRAP_KEYSPACE.to_string(),
-            key: self.key.clone().into(),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<Option<BootstrapCursor>>, BootstrapError> {
+        let read = (BOOTSTRAP_KEYSPACE.to_string(), self.key.clone().into());
+        Ok(Next::Call(IoCall::Read(vec![read])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.result = Some(match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .map(|value| BootstrapCursor::from_bytes(&value))
-                .transpose()
-                .map_err(BootstrapError::from),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(BootstrapError::UnexpectedEvent {
-                state: "ReadCursor",
-                got: other.label(),
-            }),
-        });
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<BootstrapCursor>>, BootstrapError> {
+        let cursor = (result.value()?)
+            .map(|value| BootstrapCursor::from_bytes(&value))
+            .transpose()?;
+        Ok(Next::Done(cursor))
     }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Option<BootstrapCursor>, BootstrapError> {
-        self.result.unwrap_or(Err(BootstrapError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClearState {
-    Scan,
-    Delete,
-    Done,
-    Failed,
 }
 
 /// Deletes one page of at most `limit` bootstrap cursors of a set: all of them, or with
@@ -432,9 +325,7 @@ pub struct ClearCursorsOperation {
     set_id: Ulid,
     walked: Option<Vec<Ulid>>,
     limit: usize,
-    all_read: bool,
-    state: ClearState,
-    error: Option<BootstrapError>,
+    all_read: Option<bool>,
 }
 
 impl ClearCursorsOperation {
@@ -443,16 +334,8 @@ impl ClearCursorsOperation {
             set_id,
             walked,
             limit,
-            all_read: false,
-            state: ClearState::Scan,
-            error: None,
+            all_read: None,
         }
-    }
-
-    fn fail(&mut self, error: BootstrapError) -> Effects {
-        self.state = ClearState::Failed;
-        self.error = Some(error);
-        smallvec![]
     }
 
     /// Whether the cursor row `key` goes: every row, or one of a member no longer walked.
@@ -463,78 +346,33 @@ impl ClearCursorsOperation {
         let member = key.get(16..32).and_then(|id| <[u8; 16]>::try_from(id).ok());
         member.is_some_and(|id| !walked.iter().any(|walked| walked.to_bytes() == id))
     }
-
-    fn scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        self.all_read = values.len() < self.limit;
-        let deletes: Vec<_> = (values.into_iter())
-            .filter(|(key, _)| self.goes(key))
-            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), key))
-            .collect();
-        if deletes.is_empty() {
-            self.state = ClearState::Done;
-            return smallvec![];
-        }
-        self.state = ClearState::Delete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })]
-    }
 }
 
-impl EffectOperation for ClearCursorsOperation {
+impl Operation for ClearCursorsOperation {
     type Output = bool;
     type Error = BootstrapError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ClearState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BOOTSTRAP_KEYSPACE.to_string(),
-            prefix: Some(bootstrap_prefix(self.set_id).into()),
-            start: None,
+    fn first(&mut self) -> Result<Next<bool>, BootstrapError> {
+        Ok(Next::Call(IoCall::Page {
+            space: BOOTSTRAP_KEYSPACE.to_string(),
+            prefix: bootstrap_prefix(self.set_id).into(),
+            after: None,
             limit: self.limit,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (ClearState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.scanned(values)
-            }
-            (ClearState::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.state = ClearState::Done;
-                smallvec![]
-            }
-            (
-                ClearState::Scan | ClearState::Delete,
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.fail(error.into()),
-            (ClearState::Done | ClearState::Failed, _) => smallvec![],
-            (state, other) => self.fail(BootstrapError::UnexpectedEvent {
-                state: match state {
-                    ClearState::Scan => "ScanCursors",
-                    _ => "DeleteCursors",
-                },
-                got: other.label(),
-            }),
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, BootstrapError> {
+        if let Some(all_read) = self.all_read {
+            result.done()?;
+            return Ok(Next::Done(all_read));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ClearState::Done | ClearState::Failed)
-    }
-
-    fn finalize(self) -> Result<bool, BootstrapError> {
-        match (self.state, self.error) {
-            (ClearState::Done, _) => Ok(self.all_read),
-            (_, Some(error)) => Err(error),
-            _ => Err(BootstrapError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let (rows, _) = result.page()?;
+        self.all_read = Some(rows.len() < self.limit);
+        let deletes = (rows.into_iter())
+            .filter(|(key, _)| self.goes(key))
+            .map(|(key, _)| (BOOTSTRAP_KEYSPACE.to_string(), key))
+            .collect();
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 }
 

@@ -36,7 +36,6 @@ use serde_json::Value;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::bound::ReleaseKeys;
 use super::check::{RunScope, authorize_call, check_call, matching};
 use super::creates::{
     Lookup, Step, claim_key, created_text, next_step, settle_key, stored_created,
@@ -56,7 +55,6 @@ use super::outgoing::{
     declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
 };
 use super::rate::take_call;
-use super::release::node_keys;
 use super::rows::{delete_rows, write_rows};
 use super::state::{MAX_STATE_KEY, PutError, put_state, read_state, remove_state};
 use super::submit::{
@@ -95,8 +93,6 @@ pub struct RunBroker {
     ctx: Arc<DriverContext>,
     /// Sends connection requests; the node's screened egress client unless a test replaces it.
     outbound: Arc<dyn Outbound>,
-    /// The realm keys a management node releases group and realm secrets with.
-    keys: ReleaseKeys,
     /// The secrets this run holds, reused while their value is unchanged.
     held: tokio::sync::Mutex<HeldSecrets>,
     /// The values handed to the code, removed from the text the run keeps.
@@ -114,7 +110,6 @@ impl RunBroker {
         lines.log.clear();
         Self {
             outbound: Arc::new(Egress(ctx.blob_handle.clone())),
-            keys: node_keys(&ctx),
             held: tokio::sync::Mutex::default(),
             shown: Mutex::default(),
             ctx,
@@ -122,12 +117,6 @@ impl RunBroker {
             scope,
             changed: AtomicBool::new(false),
         }
-    }
-
-    /// The broker with other realm keys for releases.
-    pub fn with_keys(mut self, keys: ReleaseKeys) -> Self {
-        self.keys = keys;
-        self
     }
 
     /// The broker with another sender for connection requests.
@@ -1564,8 +1553,8 @@ impl RunBroker {
             held: None,
             run_id: Some(self.scope.run.run_id),
         };
-        let place = (self.scope.local, &self.keys);
-        let ask = |request| ask_release(&self.ctx, config, place, request);
+        let local = self.scope.local;
+        let ask = |request| ask_release(&self.ctx, config, local, request);
         let mut held = self.held.lock().await;
         held.obtain(request, ask)
             .await

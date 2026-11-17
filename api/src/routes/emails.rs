@@ -225,10 +225,9 @@ pub(crate) fn setting_error(error: SettingError) -> ServerError {
         SettingError::Config(_) => ServerError::ServiceUnavailableReason(error.to_string()),
         SettingError::Register(_) => ServerError::Conflict(error.to_string()),
         // The write is one local batch, so a failed one stored nothing.
-        SettingError::Build(_)
-        | SettingError::Storage(_)
-        | SettingError::UnexpectedEvent(_)
-        | SettingError::NotFinished => ServerError::InternalError(error.into()),
+        SettingError::Build(_) | SettingError::Storage(_) | SettingError::Io(_) => {
+            ServerError::InternalError(error.into())
+        }
     }
 }
 

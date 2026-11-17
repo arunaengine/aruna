@@ -93,6 +93,15 @@ pub enum JobMutationError {
     Conflict,
 }
 
+impl From<aruna_core::calls::IoError> for JobMutationError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Conflict => Self::Conflict,
+            error => Self::Storage(error.to_string()),
+        }
+    }
+}
+
 /// Outcome of a mutation closure: whether the caller wants the record persisted.
 pub enum JobMutation {
     Persist,

@@ -85,20 +85,6 @@ async fn dispatch_unboxed(
             ))
             .await,
         )),
-        // Job-record replication and launch offers resolve their holders in the
-        // operation and run only the holder round-trips here.
-        Effect::Net(NetEffect::JobRecord(record)) => Event::Net(NetEvent::JobRecord(
-            Box::pin(crate::jobs::records::transport::dispatch_record(
-                context, *record,
-            ))
-            .await,
-        )),
-        Effect::Net(NetEffect::LaunchOffer(offer)) => Event::Net(NetEvent::LaunchOffer(
-            Box::pin(crate::jobs::records::transport::dispatch_offer(
-                context, *offer,
-            ))
-            .await,
-        )),
         // A plugin artifact chunk travels over the metadata transport, which the runner holds.
         Effect::Net(NetEffect::ArtifactStore(store)) => {
             let stored = match context.metadata_handle.as_ref() {

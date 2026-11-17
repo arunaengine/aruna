@@ -3,16 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::fmt::Display;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
-use aruna_core::types::Effects;
 use thiserror::Error;
 
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
@@ -38,8 +38,20 @@ pub struct TimerFailure {
     pub reason: String,
 }
 
+/// When a timer runs again after the runner failed its run, for example on a storage error.
+const TIMER_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+impl From<IoError> for TimerFailure {
+    fn from(error: IoError) -> Self {
+        Self {
+            retry_after: TIMER_RETRY_AFTER,
+            reason: error.to_string(),
+        }
+    }
+}
+
 /// A timer operation decides when its timer runs again.
-pub trait TimerRun: EffectOperation + Sized {
+pub trait TimerRun: Operation + Sized {
     /// The delay before the next run, or `None` when the timer stays off until work arrives.
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<Option<Duration>, TimerFailure>;
 }
@@ -65,46 +77,48 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
     }
 }
 
-impl EffectOperation for TimerOperation {
+/// The next call of a timer operation, or when its timer runs again.
+fn timer_turn<O: TimerRun>(
+    turn: Result<Next<O::Output>, O::Error>,
+) -> Result<Next<Option<Duration>>, TimerFailure> {
+    match turn {
+        Ok(Next::Call(call)) => Ok(Next::Call(call)),
+        Ok(Next::Wait) => Ok(Next::Wait),
+        Ok(Next::Done(output)) => O::rearm(Ok(output)).map(Next::Done),
+        Err(error) => O::rearm(Err(error)).map(Next::Done),
+    }
+}
+
+impl Operation for TimerOperation {
     type Output = Option<Duration>;
     type Error = TimerFailure;
 
-    fn start(&mut self) -> Effects {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => operation.start(),
-            TimerOperation::PruneNotifications(operation) => operation.start(),
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => operation.step(event),
-            TimerOperation::PruneNotifications(operation) => operation.step(event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            TimerOperation::DrainNotificationOutbox(operation) => operation.is_complete(),
-            TimerOperation::PruneNotifications(operation) => operation.is_complete(),
-        }
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         match self {
             TimerOperation::DrainNotificationOutbox(operation) => {
-                DrainOutboxOperation::rearm(operation.finalize())
+                timer_turn::<DrainOutboxOperation>(operation.first())
             }
             TimerOperation::PruneNotifications(operation) => {
-                PruneNotificationsOperation::rearm(operation.finalize())
+                timer_turn::<PruneNotificationsOperation>(operation.first())
             }
         }
     }
 
-    fn abort(&mut self) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            TimerOperation::DrainNotificationOutbox(operation) => operation.abort(),
-            TimerOperation::PruneNotifications(operation) => operation.abort(),
+            TimerOperation::DrainNotificationOutbox(operation) => {
+                timer_turn::<DrainOutboxOperation>(operation.next(result))
+            }
+            TimerOperation::PruneNotifications(operation) => {
+                timer_turn::<PruneNotificationsOperation>(operation.next(result))
+            }
+        }
+    }
+
+    fn transaction(&self) -> bool {
+        match self {
+            TimerOperation::DrainNotificationOutbox(operation) => operation.transaction(),
+            TimerOperation::PruneNotifications(operation) => operation.transaction(),
         }
     }
 }
@@ -148,8 +162,14 @@ pub struct PeerInput<'a> {
 pub struct PeerFailure(pub String);
 
 /// A peer operation produces the answer frame body the shell writes back.
-pub trait PeerRun: EffectOperation + Sized {
+pub trait PeerRun: Operation + Sized {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
+}
+
+impl From<IoError> for PeerFailure {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
 }
 
 /// The operation that answers one peer request frame.
@@ -195,60 +215,68 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
     }
 }
 
+/// The answer frame of a notification peer request; an error closes the stream.
+fn notification_answer<E: Display>(
+    result: Result<NotificationTransportMessage, E>,
+) -> Result<Vec<u8>, PeerFailure> {
+    let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
+    postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+}
+
 impl PeerRun for DeliverBatchOperation {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
-        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+        notification_answer(result)
     }
 }
 
 impl PeerRun for RemoveWatchOperation {
     fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
-        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+        notification_answer(result)
     }
 }
 
-impl EffectOperation for PeerOperation {
+/// The next call of a peer operation, or its answer frame body.
+fn peer_turn<O: PeerRun>(
+    turn: Result<Next<O::Output>, O::Error>,
+) -> Result<Next<Vec<u8>>, PeerFailure> {
+    match turn {
+        Ok(Next::Call(call)) => Ok(Next::Call(call)),
+        Ok(Next::Wait) => Ok(Next::Wait),
+        Ok(Next::Done(output)) => O::answer(Ok(output)).map(Next::Done),
+        Err(error) => O::answer(Err(error)).map(Next::Done),
+    }
+}
+
+impl Operation for PeerOperation {
     type Output = Vec<u8>;
     type Error = PeerFailure;
 
-    fn start(&mut self) -> Effects {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => operation.start(),
-            PeerOperation::RemoveWatch(operation) => operation.start(),
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => operation.step(event),
-            PeerOperation::RemoveWatch(operation) => operation.step(event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => operation.is_complete(),
-            PeerOperation::RemoveWatch(operation) => operation.is_complete(),
-        }
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         match self {
             PeerOperation::DeliverNotifications(operation) => {
-                DeliverBatchOperation::answer(operation.finalize())
+                peer_turn::<DeliverBatchOperation>(operation.first())
             }
             PeerOperation::RemoveWatch(operation) => {
-                RemoveWatchOperation::answer(operation.finalize())
+                peer_turn::<RemoveWatchOperation>(operation.first())
             }
         }
     }
 
-    fn abort(&mut self) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            PeerOperation::DeliverNotifications(operation) => operation.abort(),
-            PeerOperation::RemoveWatch(operation) => operation.abort(),
+            PeerOperation::DeliverNotifications(operation) => {
+                peer_turn::<DeliverBatchOperation>(operation.next(result))
+            }
+            PeerOperation::RemoveWatch(operation) => {
+                peer_turn::<RemoveWatchOperation>(operation.next(result))
+            }
+        }
+    }
+
+    fn transaction(&self) -> bool {
+        match self {
+            PeerOperation::DeliverNotifications(operation) => operation.transaction(),
+            PeerOperation::RemoveWatch(operation) => operation.transaction(),
         }
     }
 }
@@ -256,9 +284,6 @@ impl EffectOperation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::StorageEvent;
-    use aruna_core::operation_check::{check_trace, rejects_finalize};
 
     const INPUT: TimerInput = TimerInput {
         now_ms: 1_000,
@@ -283,41 +308,29 @@ mod tests {
     }
 
     #[test]
-    fn timer_delegates_steps() {
+    fn timer_delegates_calls() {
         let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
         let mut inner = PruneNotificationsOperation::new(1_000, PRUNE_PAGE_SIZE);
-        let first = inner.start();
-        check_trace(&mut operation, first.as_slice(), Vec::new());
-        assert!(matches!(
-            first.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { .. })]
-        ));
+        assert_eq!(
+            operation.first(),
+            timer_turn::<PruneNotificationsOperation>(inner.first())
+        );
+        assert!(!operation.transaction());
+        let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &INPUT);
+        assert_eq!(
+            drain.unwrap().first(),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
     }
 
     #[test]
     fn timer_failure_rearms() {
         let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: aruna_core::errors::StorageError::Timeout,
-        }));
-        assert!(operation.is_complete());
-        let failure = operation.finalize().unwrap_err();
+        operation.first().unwrap();
+        let failure = operation.next(IoResult::Done).unwrap_err();
         assert_eq!(failure.retry_after, NOTIFICATION_RETRY_AFTER);
-    }
-
-    #[test]
-    fn unfinished_timer_fails() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
-        operation.start();
-        rejects_finalize(operation);
-    }
-
-    #[test]
-    fn timer_abort_delegates() {
-        let mut operation = timer_operation(&TaskKey::PruneNotifications, &INPUT).unwrap();
-        operation.start();
-        assert!(operation.abort().is_empty());
+        let runner = TimerFailure::from(IoError::Unfinished);
+        assert_eq!(runner.retry_after, TIMER_RETRY_AFTER);
     }
 
     fn peer_input(alpn: Alpn, frame: &[u8]) -> PeerInput<'_> {
@@ -354,8 +367,9 @@ mod tests {
         };
         let frame = postcard::to_allocvec(&delivery).unwrap();
         let mut operation = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
-        assert!(operation.start().is_empty());
-        let answer = operation.finalize().expect("an empty batch is answered");
+        let Ok(Next::Done(answer)) = operation.first() else {
+            panic!("an empty batch is answered");
+        };
         let decoded: NotificationTransportMessage = postcard::from_bytes(&answer).unwrap();
         assert_eq!(
             decoded,

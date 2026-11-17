@@ -2,20 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
-use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, BucketInfo, VersionKey};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
+use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ObserveError {
@@ -29,11 +28,17 @@ pub enum ObserveError {
     Source(#[from] StagingSourceError),
     #[error("the version is no longer a reference")]
     NotReference,
-    #[error("unexpected event in state {state:?}: {received}")]
-    UnexpectedEvent {
-        state: ObserveState,
-        received: String,
-    },
+    #[error("could not observe the source: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for ObserveError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl ObserveError {
@@ -46,143 +51,101 @@ impl ObserveError {
                 error,
                 SourceResolutionError::StorageError(_) | SourceResolutionError::ResolveFailed
             ),
-            Self::Storage(_) | Self::Source(_) | Self::UnexpectedEvent { .. } => false,
+            Self::Storage(_) | Self::Source(_) | Self::Io(_) => false,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObserveState {
-    Init,
+enum ObserveState {
     ReadVersion,
     ResolveAccess,
     HeadSource,
-    Finish,
-    Error,
 }
+
+type Step = Result<Next<SourceMetadata>, ObserveError>;
 
 /// Reads a reference version, resolves its binding and heads the source once.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ObserveSourceOperation {
     version_key: VersionKey,
     state: ObserveState,
-    output: Option<Result<SourceMetadata, ObserveError>>,
 }
 
 impl ObserveSourceOperation {
     pub(crate) fn new(version_key: VersionKey) -> Self {
         Self {
             version_key,
-            state: ObserveState::Init,
-            output: None,
+            state: ObserveState::ReadVersion,
         }
     }
 
-    fn fail(&mut self, error: ObserveError) -> Effects {
-        self.state = ObserveState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn version_read(&mut self, result: IoResult) -> Step {
+        let mut values = result.values()?.into_iter();
+        let (version, bucket) = (values.next().flatten(), values.next().flatten());
+        let version = version
+            .map(|value| BlobVersion::from_bytes(value.as_ref()))
+            .transpose()?;
+        // The bucket's group may read a reference through its own connector of the root.
+        let group_id = bucket
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?
+            .map(|bucket| bucket.group_id);
+        let Some(BlobVersion {
+            state: BlobVersionState::Reference { source, .. },
+            ..
+        }) = version
+        else {
+            return Err(ObserveError::NotReference);
+        };
+        self.state = ObserveState::ResolveAccess;
+        let resolve = ResolveBindingOperation::new(ResolveBindingInput { source, group_id });
+        let child = boxed_suboperation(resolve, |result| {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
+    }
+}
+
+impl Operation for ObserveSourceOperation {
+    type Output = SourceMetadata;
+    type Error = ObserveError;
+
+    fn first(&mut self) -> Step {
+        let key = self.version_key.to_bytes()?;
+        let bucket = self.version_key.bucket.as_bytes().to_vec();
+        Ok(Next::Call(IoCall::Read(vec![
+            (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()),
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.into()),
+        ])))
     }
 
-    fn step_inner(&mut self, event: Event) -> Result<Effects, ObserveError> {
-        match (self.state, event) {
-            (
-                ObserveState::ReadVersion,
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => {
-                let mut values = values.into_iter().map(|(_, value)| value);
-                let (version, bucket) = (values.next().flatten(), values.next().flatten());
-                let version = version
-                    .map(|value| BlobVersion::from_bytes(value.as_ref()))
-                    .transpose()?;
-                // The bucket's group may read a reference through its own connector of the root.
-                let group_id = bucket
-                    .map(|value| BucketInfo::from_bytes(value.as_ref()))
-                    .transpose()?
-                    .map(|bucket| bucket.group_id);
-                let Some(BlobVersion {
-                    state: BlobVersionState::Reference { source, .. },
-                    ..
-                }) = version
-                else {
-                    return Err(ObserveError::NotReference);
-                };
-                self.state = ObserveState::ResolveAccess;
-                Ok(smallvec![resolve_binding_effect(ResolveBindingInput {
-                    source,
-                    group_id,
-                })])
-            }
+    fn next(&mut self, result: IoResult) -> Step {
+        if self.state == ObserveState::ReadVersion {
+            return self.version_read(result);
+        }
+        match (self.state, result.event()?) {
             (
                 ObserveState::ResolveAccess,
                 Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
             ) => {
                 self.state = ObserveState::HeadSource;
-                Ok(smallvec![Effect::StagingSource(
-                    StagingSourceEffect::Head { access: result? }
-                )])
+                let head = StagingSourceEffect::Head { access: result? };
+                Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
+                    head,
+                )))))
             }
             (
                 ObserveState::HeadSource,
                 Event::StagingSource(StagingSourceEvent::HeadResult { metadata }),
-            ) => {
-                self.state = ObserveState::Finish;
-                self.output = Some(Ok(metadata));
-                Ok(smallvec![])
-            }
+            ) => Ok(Next::Done(metadata)),
             (_, Event::StagingSource(StagingSourceEvent::Error { error })) => Err(error.into()),
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(ObserveError::UnexpectedEvent {
-                state,
-                received: event.label().to_string(),
-            }),
+            (_, event) => Err(IoError::Unexpected {
+                expected: "the version access or the source head",
+                got: event.label(),
+            }
+            .into()),
         }
-    }
-}
-
-impl EffectOperation for ObserveSourceOperation {
-    type Output = SourceMetadata;
-    type Error = ObserveError;
-
-    fn start(&mut self) -> Effects {
-        let key = match self.version_key.to_bytes() {
-            Ok(key) => key,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = ObserveState::ReadVersion;
-        let bucket = self.version_key.bucket.as_bytes().to_vec();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (BLOB_VERSIONS_KEYSPACE.to_string(), key.into()),
-                (S3_BUCKET_KEYSPACE.to_string(), bucket.into()),
-            ],
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if matches!(self.state, ObserveState::Finish | ObserveState::Error) {
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ObserveState::Finish | ObserveState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(ObserveError::UnexpectedEvent {
-            state: self.state,
-            received: "no output".to_string(),
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -240,37 +203,29 @@ mod tests {
             distribution: None,
         };
         let mut operation = ObserveSourceOperation::new(VersionKey::new("b", "k", Ulid::nil()));
-        operation.start();
+        let _ = operation.first();
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    b"v".to_vec().into(),
-                    Some(version.to_bytes().unwrap().into()),
-                ),
-                (
-                    b"b".to_vec().into(),
-                    Some(bucket.to_bytes().unwrap().into()),
-                ),
-            ],
-        }));
+        let next = operation.next(IoResult::Values(vec![
+            Some(version.to_bytes().unwrap().into()),
+            Some(bucket.to_bytes().unwrap().into()),
+        ]));
 
         assert_eq!(operation.state, ObserveState::ResolveAccess);
-        assert!(format!("{effects:?}").contains(&format!("group_id: Some({group_id:?})")));
+        assert!(format!("{next:?}").contains(&format!("group_id: Some({group_id:?})")));
     }
 
     // A failed head fails the observation, so the queued refresh is retried later.
     #[test]
     fn failed_head_retried() {
         let mut operation = ObserveSourceOperation::new(VersionKey::new("b", "k", Ulid::nil()));
-        operation.start();
         operation.state = ObserveState::HeadSource;
 
-        operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        let failed = Event::StagingSource(StagingSourceEvent::Error {
             error: StagingSourceError::ReadError("reset".to_string()),
-        }));
-
-        let error = operation.finalize().unwrap_err();
+        });
+        let error = operation
+            .next(IoResult::Event(Box::new(failed)))
+            .unwrap_err();
         assert!(matches!(
             error,
             ObserveError::Source(StagingSourceError::ReadError(_))

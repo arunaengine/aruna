@@ -3,32 +3,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_target,
 };
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
-use aruna_core::types::{Effects, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use tracing::warn;
 
-use crate::document_repository::read_effect;
+use crate::document_repository::read_row;
 use crate::metadata::protocol::MetadataReadError;
 
 /// The answer a peer gets: the stored document, none, or why it is refused.
 pub type PolicyAnswer = Result<Option<Box<PlacementPolicyDocument>>, MetadataReadError>;
-
-#[derive(Debug, PartialEq)]
-enum ServeState {
-    Init,
-    Config,
-    Policy,
-    Done,
-}
 
 /// Serves one policy document to a peer. The peer must be a sync-eligible node of this realm,
 /// and the answer must hash to the requested ref. The original publication travels with it:
@@ -38,8 +28,7 @@ pub struct ServePolicyOperation {
     realm_id: RealmId,
     peer: NodeId,
     policy_ref: PlacementPolicyRef,
-    state: ServeState,
-    output: Option<Result<PolicyAnswer, MetadataReadError>>,
+    config_read: bool,
 }
 
 impl ServePolicyOperation {
@@ -48,85 +37,59 @@ impl ServePolicyOperation {
             realm_id,
             peer,
             policy_ref,
-            state: ServeState::Init,
-            output: None,
+            config_read: false,
         }
     }
 
-    fn answer(&mut self, answer: PolicyAnswer) -> Effects {
-        self.state = ServeState::Done;
-        self.output = Some(Ok(answer));
-        smallvec![]
-    }
-
-    fn config(&mut self, value: Option<Value>) -> Effects {
+    fn config(&mut self, value: Option<Value>) -> Next<PolicyAnswer> {
         let config = value.and_then(|value| RealmConfigDocument::from_bytes(&value).ok());
         let Some(config) = config else {
-            return self.answer(Err(MetadataReadError::Unavailable));
+            return Next::Done(Err(MetadataReadError::Unavailable));
         };
         if !sync_eligible_peer(&config, self.peer) {
-            return self.answer(Err(MetadataReadError::Forbidden));
+            return Next::Done(Err(MetadataReadError::Forbidden));
         }
+        self.config_read = true;
         let target = placement_policy_target(self.policy_ref.policy_id);
-        self.state = ServeState::Policy;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })]
+        let row = (target.storage_keyspace().to_string(), target.storage_key());
+        Next::Call(IoCall::Read(vec![row]))
     }
 
-    fn policy(&mut self, value: Option<Value>) -> Effects {
+    fn policy(&self, value: Option<Value>) -> Next<PolicyAnswer> {
         let answer = match value {
             None => Ok(None),
             Some(value) => stored_policy(self.realm_id, self.policy_ref, &value),
         };
-        self.answer(answer.map(|document| document.map(Box::new)))
+        Next::Done(answer.map(|document| document.map(Box::new)))
     }
 }
 
-impl EffectOperation for ServePolicyOperation {
+impl Operation for ServePolicyOperation {
     type Output = PolicyAnswer;
     type Error = MetadataReadError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ServeState::Config;
+    fn first(&mut self) -> Result<Next<PolicyAnswer>, MetadataReadError> {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![read_effect(&config, None)]
+        Ok(Next::Call(IoCall::Read(vec![read_row(&config)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::replace(&mut self.state, ServeState::Done), event) {
-            (ServeState::Config, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.config(value)
-            }
-            (ServeState::Policy, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.policy(value)
-            }
-            (
-                ServeState::Config | ServeState::Policy,
-                Event::Storage(StorageEvent::Error { .. }),
-            ) => self.answer(Err(MetadataReadError::Unavailable)),
-            (state, event) => {
-                warn!(state = ?state, event = event.label(), "Unexpected event serving a policy");
-                self.output = Some(Err(MetadataReadError::Unavailable));
-                smallvec![]
-            }
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<PolicyAnswer>, MetadataReadError> {
+        let IoResult::Values(values) = result else {
+            warn!("Unexpected answer serving a policy");
+            return Err(MetadataReadError::Unavailable);
+        };
+        let value = values.into_iter().next().flatten();
+        Ok(match self.config_read {
+            false => self.config(value),
+            true => self.policy(value),
+        })
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<PolicyAnswer, MetadataReadError> {
-        self.output.unwrap_or(Err(MetadataReadError::Unavailable))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    /// A runner failure is answered as unavailable, never retried as a conflict.
+    fn is_conflict(_error: &MetadataReadError) -> bool {
+        false
     }
 }
 
