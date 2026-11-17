@@ -36,9 +36,8 @@ use super::recovery::park_attempt;
 use super::session::write_session_report;
 use super::workspace::{capture_outputs, collect_outputs, merge_outputs};
 use crate::driver::DriverContext;
-use crate::jobs::lifecycle::updates::{
-    SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle,
-};
+use crate::jobs::lifecycle::publish::publish_terminal;
+use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
 
 /// A session the client ended, or that went idle, is a finished job: the work
 /// it did is already in the workspace bucket.

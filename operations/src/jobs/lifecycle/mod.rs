@@ -25,6 +25,7 @@ pub mod ingress;
 pub mod offer;
 pub mod outbox;
 pub mod plan;
+pub mod publish;
 pub mod report;
 pub mod reservation;
 pub mod routing;
