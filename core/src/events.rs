@@ -992,7 +992,14 @@ impl Event {
                 }
             ),
             Event::Session(_) => "Event::Session",
-            Event::Outbound(event) => variant_label!(event, OutboundEvent { Posted, MailSent }),
+            Event::Outbound(event) => variant_label!(
+                event,
+                OutboundEvent {
+                    Posted,
+                    MailSent,
+                    Backoff
+                }
+            ),
         }
     }
 }

@@ -216,5 +216,6 @@ fn outbound_unavailable(effect: &OutboundEffect) -> OutboundEvent {
     match effect {
         OutboundEffect::Post(_) => OutboundEvent::Posted { result: Err(error) },
         OutboundEffect::Mail(_) => OutboundEvent::MailSent { result: Err(error) },
+        OutboundEffect::Backoff(_) => OutboundEvent::Backoff { stored: None },
     }
 }
