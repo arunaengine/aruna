@@ -32,7 +32,6 @@ use aruna_plugins::broker::{
 };
 use aruna_plugins::permission::Permission;
 use async_trait::async_trait;
-use base64::Engine;
 use craqle::GraphId;
 use futures_util::StreamExt;
 use oxrdf::Term;
@@ -50,7 +49,9 @@ use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, wri
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
 use super::marks::{MARKED, is_marked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
-use super::outgoing::{outgoing, request_context};
+use super::outgoing::{
+    declared_method, outgoing, request_context, stored_whole, too_large, whole_text,
+};
 use super::rate::take_call;
 use super::release::ReleaseKeys;
 use super::release::node_keys;
@@ -1715,7 +1716,6 @@ fn install_scope(install: &PluginInstall) -> InstallScope {
     }
 }
 
-/// The manifest's name of a method the guest called.
 /// The expected digests of a download: a known algorithm and a hex digest of its length.
 fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostError> {
     use ChecksumAlgorithm::{Crc32, Crc32c, Md5, Sha1, Sha256};
@@ -1742,19 +1742,6 @@ fn expected(fields: &[Field]) -> Result<Vec<(ChecksumAlgorithm, Vec<u8>)>, HostE
     Ok(found)
 }
 
-fn declared_method(method: aruna_plugins::broker::Method) -> aruna_plugins::connection::Method {
-    use aruna_plugins::broker::Method as Called;
-    use aruna_plugins::connection::Method;
-    match method {
-        Called::Get => Method::Get,
-        Called::Head => Method::Head,
-        Called::Post => Method::Post,
-        Called::Put => Method::Put,
-        Called::Patch => Method::Patch,
-        Called::Delete => Method::Delete,
-    }
-}
-
 /// The whole answer as the code may see it, with echoes of the secret removed.
 fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     let shown = expose_response(
@@ -1773,65 +1760,12 @@ fn whole(fields: &SecretFields, answer: &Answer) -> Response {
     }
 }
 
-pub(crate) fn whole_text(reply: &Response) -> String {
-    let headers: Vec<(&str, &str)> = (reply.headers.iter())
-        .map(|field| (field.name.as_str(), field.value.as_str()))
-        .collect();
-    let body = base64::engine::general_purpose::STANDARD.encode(&reply.body);
-    serde_json::json!({ "status": reply.status, "headers": headers, "body": body }).to_string()
-}
-
-/// The stored reply of a sent request whose answer did not fit the call.
-fn too_large(status: u16) -> String {
-    serde_json::json!({ "status": status, "too_large": true }).to_string()
-}
-
-/// The refusal a stored too-large marker answers with, every time it is replayed.
-fn refuse_large(value: &Value) -> Result<(), HostError> {
-    if value.get("too_large").and_then(Value::as_bool) != Some(true) {
-        return Ok(());
-    }
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let message = format!("the answer with status {status} is larger than the call allows");
-    Err(HostError::new(ErrorKind::Limit, message))
-}
-
 /// A send that has no stored intent: an answer that does not fit is a limit, others unavailable.
 fn send_refusal(error: SendError) -> HostError {
     match error {
         SendError::TooLarge { .. } => HostError::new(ErrorKind::Limit, error.to_string()),
         error => unavailable(error.to_string()),
     }
-}
-
-fn stored_whole(reply: &str) -> Result<Response, HostError> {
-    let broken = || unavailable("a stored whole answer does not decode");
-    let value: Value = serde_json::from_str(reply).map_err(|_| broken())?;
-    refuse_large(&value)?;
-    let status = value
-        .get("status")
-        .and_then(Value::as_u64)
-        .and_then(|s| u16::try_from(s).ok());
-    let headers: Vec<(String, String)> =
-        serde_json::from_value(value.get("headers").cloned().unwrap_or(Value::Null))
-            .map_err(|_| broken())?;
-    let body = value
-        .get("body")
-        .and_then(Value::as_str)
-        .ok_or_else(broken)?;
-    let body = base64::engine::general_purpose::STANDARD
-        .decode(body)
-        .map_err(|_| broken())?;
-    Ok(Response {
-        status: status.ok_or_else(broken)?,
-        headers: (headers.into_iter())
-            .map(|(name, value)| Field { name, value })
-            .collect(),
-        body,
-    })
 }
 
 #[cfg(test)]
