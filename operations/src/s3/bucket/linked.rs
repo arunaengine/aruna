@@ -337,6 +337,7 @@ impl Operation for BucketJobOperation {
 }
 
 /// The job of a bucket as stored: the running one, else the one started last.
+#[derive(Debug, PartialEq)]
 pub struct ShownJobOperation {
     bucket: String,
     result: Option<Result<Option<BucketJob>, LinkedError>>,
@@ -430,6 +431,7 @@ fn shown_job(values: Vec<(Key, Option<Value>)>) -> Result<Option<BucketJob>, Con
 
 /// The files the rename of the move started at `started_at_ms` planned to rename; `None` when
 /// none was stored for that move.
+#[derive(Debug, PartialEq)]
 pub struct RenameTotalOperation {
     bucket: String,
     started_at_ms: u64,

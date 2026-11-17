@@ -17,6 +17,7 @@ zeroize = { workspace = true }
 # Aruna modules
 aruna-core = { workspace = true }
 aruna-operations = { workspace = true }
+aruna-tasks = { workspace = true }
 aruna-wire = { workspace = true }
 
 # General
@@ -83,7 +84,6 @@ aruna-graph = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
-aruna-tasks = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 aruna-net = { workspace = true }
 tracing-subscriber = { workspace = true }

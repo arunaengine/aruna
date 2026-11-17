@@ -1047,7 +1047,7 @@ async fn drive_effects(
             } else if let Some(deadline) = deadline {
                 let managed = managed_effect(&effect);
                 // Managed effects own their timeout and must not be canceled here.
-                let dispatch = Box::pin(dispatch_bounded(
+                let dispatch: BoxFuture<'_, Event> = Box::pin(dispatch_bounded(
                     effect,
                     context,
                     depth,

@@ -453,7 +453,6 @@ async fn fill(
         Some(net_handle.clone()),
         metadata_options,
     );
-    acquired.metadata_handle = Some(metadata_handle.clone());
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
 

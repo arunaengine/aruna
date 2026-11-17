@@ -239,7 +239,7 @@ impl Operation for RawViewOperation {
 
 /// Reads a document's stored raw state outside any transaction.
 #[derive(Debug, PartialEq)]
-pub struct RawStateOperation {
+pub(crate) struct RawStateOperation {
     document_id: Ulid,
     reading: bool,
     output: Option<Result<Option<RawRevisionState>, RawReadError>>,

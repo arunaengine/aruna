@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::handle::Handle;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

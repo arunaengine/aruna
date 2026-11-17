@@ -33,7 +33,17 @@ pub(crate) async fn dispatch_effect(
     dispatch_effect_until(effect, context, depth, None).await
 }
 
-pub(crate) async fn dispatch_effect_until(
+/// Dispatches one effect; the boxed future keeps the recursion through sub operations sized.
+pub(crate) fn dispatch_effect_until(
+    effect: Effect,
+    context: &DriverContext,
+    depth: usize,
+    deadline: Option<tokio::time::Instant>,
+) -> futures_util::future::BoxFuture<'_, Event> {
+    Box::pin(dispatch_unboxed(effect, context, depth, deadline))
+}
+
+async fn dispatch_unboxed(
     effect: Effect,
     context: &DriverContext,
     depth: usize,

@@ -53,7 +53,7 @@ pub async fn bucket_metadata(
 }
 
 /// The metadata a stored row gives the bucket's current incarnation.
-fn current_row(
+pub(super) fn current_row(
     creation: Option<&aruna_core::types::Value>,
     row: Option<&aruna_core::types::Value>,
 ) -> Result<Option<BucketMetadata>, ConversionError> {

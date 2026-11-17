@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::dataset::current_row;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -124,7 +125,7 @@ impl PutMetadataOperation {
         }
     }
 
-    fn unexpected(&mut self, expected: &'static str, received: &'static str) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
         let state = match self.state {
             PutMetadataState::StartTransaction => "StartTransaction",
             PutMetadataState::ReadBucket => "ReadBucket",

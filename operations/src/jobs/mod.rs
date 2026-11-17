@@ -29,7 +29,7 @@ pub mod records;
 pub mod remote_key;
 pub mod repository;
 mod rocrate_jsonld;
-mod route;
+pub mod route;
 pub mod runs;
 pub mod runtime;
 pub mod service;

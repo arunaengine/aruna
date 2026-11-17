@@ -365,6 +365,7 @@ impl Operation for BootstrapPage {
 }
 
 /// One stored bootstrap cursor, read on its own key.
+#[derive(Debug, PartialEq)]
 pub struct ReadCursorOperation {
     key: Vec<u8>,
     result: Option<Result<Option<BootstrapCursor>, BootstrapError>>,
@@ -426,6 +427,7 @@ enum ClearState {
 
 /// Deletes one page of at most `limit` bootstrap cursors of a set: all of them, or with
 /// `walked` only those of members no longer walked. Answers whether the page held all of them.
+#[derive(Debug, PartialEq)]
 pub struct ClearCursorsOperation {
     set_id: Ulid,
     walked: Option<Vec<Ulid>>,

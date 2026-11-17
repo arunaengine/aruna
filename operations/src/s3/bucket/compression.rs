@@ -114,7 +114,7 @@ impl PutCompressionOperation {
         self.bucket.as_bytes().to_vec().into()
     }
 
-    fn unexpected(&mut self, expected: &'static str, received: &'static str) -> Effects {
+    fn unexpected(&mut self, expected: &'static str, received: Event) -> Effects {
         let state = match self.state {
             PutCompressionState::Init => "Init",
             PutCompressionState::StartTransaction => "StartTransaction",

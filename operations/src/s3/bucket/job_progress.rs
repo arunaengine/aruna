@@ -55,6 +55,7 @@ enum ProgressState {
 
 /// Stores a page's progress on the job it ran for; a pause or an abort meanwhile stays, and a
 /// job that another one replaced is left as it is.
+#[derive(Debug, PartialEq)]
 pub struct StoreProgressOperation {
     key: Key,
     job_id: Ulid,
