@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::repository::RepositoryLink;
+use aruna_core::sync_checks::validate_link;
 
 use super::metadata::MetadataOutcome;
 use super::*;
@@ -37,7 +37,7 @@ pub(super) async fn apply_link_event(
             reason,
         )))
     };
-    if actor_id != ::irokle::actor_id_for(topic_id, node_to_peer(&change.current.actor)) {
+    if !published_by(topic_id, actor_id, &change.current.actor) {
         return reject("repository link revision actor is not its publisher".to_string());
     }
     if let Err(reason) = validate_link(&target, bytes.as_deref(), &change) {
@@ -54,42 +54,6 @@ pub(super) async fn apply_link_event(
             reject("repository link has a mismatched placement".to_string())
         }
     }
-}
-
-/// An upsert must carry the change its row derives; a delete must carry its link's event id.
-pub(in crate::document_sync) fn validate_link(
-    target: &DocumentTarget,
-    bytes: Option<&[u8]>,
-    change: &DocumentChange,
-) -> std::result::Result<(), String> {
-    let DocumentTarget::RepositoryLink {
-        document_id,
-        link_id,
-    } = target
-    else {
-        return Err("target is not a repository link".to_string());
-    };
-    match bytes {
-        Some(bytes) => {
-            let link = RepositoryLink::from_bytes(bytes).map_err(|error| error.to_string())?;
-            if link.document_id != *document_id || link.link_id != *link_id {
-                return Err("payload does not match its target".to_string());
-            }
-            if *change != link.sync_change(change.placement) {
-                return Err("revision does not match its sync change".to_string());
-            }
-        }
-        None => {
-            let event_id = Ulid::from_parts(change.current.generation, link_id.random());
-            if change.kind != DocumentChangeKind::Delete
-                || change.base.is_some()
-                || change.current.event_id != event_id
-            {
-                return Err("delete does not match its sync change".to_string());
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Folds one link change, its sidecar and manifest entry into a transaction. A newer revision
@@ -118,21 +82,15 @@ pub(in crate::document_sync) async fn store_link(
         .await;
         match result {
             Ok(Some(outcome)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Ok(outcome);
             }
             Ok(None) => return Ok(MetadataPlacementOutcome::Accepted(true)),
             Err(NetError::Storage(StorageError::TransactionConflict)) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
             }
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 return Err(error);
             }
         }

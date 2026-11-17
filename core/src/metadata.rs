@@ -310,6 +310,16 @@ pub struct MetadataEventRecord {
     pub occurred_at_ms: u64,
 }
 
+impl MetadataEventRecord {
+    /// Whether the event creates its document (a scaffold or an initial RO-Crate).
+    pub fn is_create(&self) -> bool {
+        matches!(
+            self.payload,
+            MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawRevision {
     /// The displayed revision: the last render that passed profile validation.
@@ -931,6 +941,22 @@ pub struct MetadataDeleteRecord {
     pub tombstone: GraphLifecycleRecord,
     #[serde(rename = "deleted_after_event_id")]
     pub deleted_after_id: Ulid,
+}
+
+impl MetadataDeleteRecord {
+    /// Whether this delete tombstones the document `document_id` of `group_id`.
+    pub fn deletes_document(&self, group_id: GroupId, document_id: Ulid) -> bool {
+        self.tombstone.is_deleted()
+            && self.tombstone.group_id == group_id
+            && self.tombstone.document_id == document_id
+    }
+
+    /// Whether this delete covers `record`: the same document and graph, and not older.
+    pub fn covers_graph(&self, record: &GraphLifecycleRecord) -> bool {
+        self.deletes_document(record.group_id, record.document_id)
+            && self.tombstone.graph_iri == record.graph_iri
+            && self.tombstone.updated_at_ms >= record.updated_at_ms
+    }
 }
 
 /// CRDT actor used when materializing `event_id` into the local graph store,

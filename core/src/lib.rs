@@ -4,6 +4,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod admin_checks;
 pub mod admin_documents;
 pub mod alpn;
 pub mod audit;
@@ -13,6 +14,7 @@ pub mod compute;
 pub mod crate_merge;
 pub mod credential_encryption;
 pub mod cursor;
+pub mod deferred_topics;
 pub mod document;
 pub mod download_slots;
 pub mod effects;
@@ -58,6 +60,7 @@ pub mod storage_entries;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;
+pub mod sync_checks;
 pub mod task;
 pub mod telemetry;
 pub mod time;

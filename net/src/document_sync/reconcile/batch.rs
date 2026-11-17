@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 
+use aruna_core::admin_checks::coalescible_config_op;
 use aruna_core::admin_documents::{AdminDocumentEvent, AdminDocumentTarget};
 use aruna_core::document::{DocumentEvent, DocumentTarget};
 use aruna_core::metadata::GraphLifecycleRecord;
@@ -18,7 +19,7 @@ use crate::document_sync::{
 };
 use crate::error::{NetError, Result};
 
-use super::admin::{apply_admin_operation, coalescible_config_op, flush_config_run};
+use super::admin::{apply_admin_operation, flush_config_run};
 use super::distribution::apply_distribution_operation;
 use super::links::apply_link_event;
 use super::metadata::{MetadataOutcome, apply_metadata_event, apply_policy_event};

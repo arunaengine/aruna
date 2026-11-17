@@ -6,7 +6,6 @@ use crate::device::replica::ReplicaRecord;
 use crate::forward::authorize::peer_acts_for;
 use crate::forward::replay::create_record_matches;
 use crate::forward::replay::routed_record_matches;
-use crate::forward::replay::update_record_matches;
 use crate::forward::routing::MetadataWriteRoute;
 use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
@@ -370,7 +369,7 @@ fn response_records_checked() {
 
     let mut changed = record.clone();
     changed.document_path = "docs/two".to_string();
-    assert!(!update_record_matches(&record, &changed));
+    assert!(!record.same_identity(&changed));
 }
 
 #[test]

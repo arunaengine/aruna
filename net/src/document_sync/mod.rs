@@ -22,10 +22,19 @@ use aruna_core::DhtKeyId;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::admin_checks::{
+    AdminOperationFamily, coalescible_config_op, config_mutation_allowed, family_matches_targets,
+    foreign_actor_allowed, has_write_permission, origin_may_publish, revocation_origin_full,
+    revocation_origin_known, service_owner, validate_config_actor, validate_config_target,
+    validate_event_scope, validate_revocation_snapshot, validate_shape,
+};
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
-use aruna_core::auth::valid_revocation_expiry;
+use aruna_core::deferred_topics::{
+    DeferredRegistrationOutcome, DocumentSyncDependency, register_deferred_topic,
+    remove_deferred_topic, satisfied_dependencies,
+};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
     DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
@@ -46,11 +55,10 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord,
 };
 use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-    config_node_path, decode_reducer_state, materialize_group_authorization,
-    materialize_realm_authorization, materialize_user_operation, materialized_group,
-    materialized_realm_config, needs_revocation_index, overlay_group_state, overlay_placement,
-    overlay_realm_config, reduced_admin_target,
+    AdminApplyStatus, AdminDocumentState, RevocationIndex, config_node_path, decode_reducer_state,
+    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
+    materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_state,
+    overlay_placement, overlay_realm_config, reduced_admin_target,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, create_acceptance_entry, create_acceptance_key,
@@ -60,10 +68,7 @@ use aruna_core::storage_entries::{
     stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
     sync_revision_key,
 };
-use aruna_core::structs::execution::notification_watch::{
-    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, interest_dirty_key, interest_node_id, interest_realm_id,
-};
+use aruna_core::structs::execution::notification_watch::{WatchSubscription, interest_dirty_key};
 use aruna_core::structs::identity::auth::Role;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
 use aruna_core::structs::identity::realm::{
@@ -80,14 +85,15 @@ use aruna_core::structs::placement::record::{
     PoolAdmission, admit_band_pool, coordinator_spans,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
-use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
 use aruna_core::structs::{
-    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
-    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
-    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
-    secondary_index_deletes, secondary_index_entries,
+    PersistentIdMapping, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError,
+    SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
+    SyncRejection, build_quarantine_entries, persistent_id_change, persistent_id_key,
+    persistent_id_target, quarantine_usage_entry, secondary_index_deletes, secondary_index_entries,
+};
+use aruna_core::sync_checks::{
+    node_info_supersedes, published_by, validate_node_upsert, validate_pid_mapping,
+    validate_policy_document, validate_usage_upsert, validate_watch_interest, watch_change_applies,
 };
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
@@ -140,8 +146,6 @@ const INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
 const INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const REPLAY_BATCH_LIMIT: usize = 1_024;
-const MAX_DEFERRED_TOPICS: usize = 1_024;
-const TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
 /// an unbounded number of simultaneous sync streams.
 const SHARD_PROBE_CONCURRENCY: usize = 8;
@@ -158,42 +162,6 @@ struct PendingCreateApply {
     lifecycle_revision: Option<DocumentChange>,
     /// The author's commit message for the event's ARC snapshot.
     message: Option<String>,
-}
-
-/// A permanently rejected sync operation awaiting durable evidence. Evidence is
-/// materialized only as the cursor advances past it, so both land in one
-/// transaction; the identity is transport-derived, so undecodable payloads stay keyed.
-struct SyncRejection {
-    identity: SyncQuarantineIdentity,
-    evidence: SyncQuarantineEvidence,
-    reason: String,
-}
-
-impl SyncRejection {
-    fn new(
-        identity: SyncQuarantineIdentity,
-        event: DocumentEvent,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::from_event(&event),
-            reason: reason.into(),
-        }
-    }
-
-    /// Evidence for a payload that could not be decoded into an event at all.
-    fn raw(identity: SyncQuarantineIdentity, bytes: Vec<u8>, reason: impl Into<String>) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::raw(bytes),
-            reason: reason.into(),
-        }
-    }
-
-    fn topic_id(&self) -> ::irokle::TopicId {
-        self.identity.topic
-    }
 }
 
 struct DocumentEventBatch {
@@ -609,35 +577,6 @@ fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
     input.extend_from_slice(subject);
     input.extend_from_slice(peer.as_bytes());
     *DhtKeyId::from_data(&input).as_bytes()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdminOperationFamily {
-    Group,
-    RealmAuthorization,
-    User,
-    RealmConfig,
-    Distribution,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-enum DocumentSyncDependency {
-    RealmConfig(RealmId),
-    RealmAuthorization(RealmId),
-    PlacementStrategy {
-        realm_id: RealmId,
-        strategy_id: Ulid,
-    },
-    /// Roles of the group that owns a placement policy; without them its
-    /// publication authority cannot be decided here.
-    GroupAuthorization(GroupId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredRegistrationOutcome {
-    Inserted,
-    AlreadyRegistered,
-    CapacityExceeded,
 }
 
 #[cfg(test)]

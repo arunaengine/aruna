@@ -17,7 +17,8 @@ use aruna_core::structs::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
-use aruna_net::document_sync::DocumentSyncService;
+use aruna_core::types::Value;
+use aruna_net::DocumentSyncService;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::sync::sync_quarantine::{
     AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,

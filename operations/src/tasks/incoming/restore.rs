@@ -63,7 +63,7 @@ async fn durable_rearm_loop(
             .await;
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
-        restore_mirror_timer(&context.storage_handle, &task_handle).await;
+        restore_mirror_timer(&context, &task_handle).await;
         crate::jobs::repository::link_queue::restore_link_timer(
             &context.storage_handle,
             &task_handle,
@@ -280,7 +280,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_mirror_timer(&context.storage_handle, &task_handle).await;
+        restore_mirror_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }

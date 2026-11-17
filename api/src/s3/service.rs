@@ -130,9 +130,11 @@ use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectOperation};
 use aruna_operations::s3::object::versions::{ListVersionsInput as LOVI, ListVersionsOperation};
 use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorIntent, kick_mirror_repair, stage_mirror_delete, stage_mirror_reconcile,
+    KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent,
 };
-use aruna_operations::sync::sync_relationship::{SyncRelationshipDirection, activate_relationship};
+use aruna_operations::sync::sync_relationship::{
+    CreateRelationshipOperation, SyncRelationshipDirection,
+};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, BucketVersioningStatus,
@@ -3060,25 +3062,34 @@ impl S3 for ArunaS3Service {
             })
             .collect::<Vec<_>>();
 
-        let mut stored = Vec::new();
+        let mut stored: Vec<SyncRelationship> = Vec::new();
         for relationship in &relationships {
-            stage_mirror_reconcile(&self.state, relationship)
-                .await
-                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            drive(
+                MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Reconcile),
+                &self.state,
+            )
+            .await
+            .map_err(|error| s3_error!(InternalError, "{}", error))?;
             if let Err(error) = self
                 .create_sync_mirror(&user_access, relationship, &extras)
                 .await
             {
-                kick_mirror_repair(&self.state).await;
+                let _ = drive(KickRepairOperation::new(), &self.state).await;
                 for created in &stored {
-                    if stage_mirror_delete(&self.state, created).await.is_ok() {
+                    if drive(
+                        MirrorRecordOperation::stage(created.clone(), SyncMirrorIntent::Delete),
+                        &self.state,
+                    )
+                    .await
+                    .is_ok()
+                    {
                         let _ = self
                             .delete_sync_relationship(
                                 created.clone(),
                                 SyncRelationshipDirection::Outgoing,
                             )
                             .await;
-                        kick_mirror_repair(&self.state).await;
+                        let _ = drive(KickRepairOperation::new(), &self.state).await;
                         if self.remove_sync_mirror(created).await {
                             self.clear_mirror_repair(created, SyncMirrorIntent::Delete)
                                 .await;
@@ -3087,21 +3098,30 @@ impl S3 for ArunaS3Service {
                 }
                 return Err(error);
             }
-            if let Err(error) = activate_relationship(&self.state, relationship.clone())
-                .await
-                .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))
+            if let Err(error) = drive(
+                CreateRelationshipOperation::activate(relationship.clone()),
+                &self.state,
+            )
+            .await
+            .map_err(|error| s3_error!(InternalError, "{}", error.to_string()))
             {
                 let mut rollback = stored.clone();
                 rollback.push(relationship.clone());
                 for created in &rollback {
-                    if stage_mirror_delete(&self.state, created).await.is_ok() {
+                    if drive(
+                        MirrorRecordOperation::stage(created.clone(), SyncMirrorIntent::Delete),
+                        &self.state,
+                    )
+                    .await
+                    .is_ok()
+                    {
                         let _ = self
                             .delete_sync_relationship(
                                 created.clone(),
                                 SyncRelationshipDirection::Outgoing,
                             )
                             .await;
-                        kick_mirror_repair(&self.state).await;
+                        let _ = drive(KickRepairOperation::new(), &self.state).await;
                         if self.remove_sync_mirror(created).await {
                             self.clear_mirror_repair(created, SyncMirrorIntent::Delete)
                                 .await;
@@ -3116,15 +3136,18 @@ impl S3 for ArunaS3Service {
         }
 
         for relationship in old_relationships {
-            stage_mirror_delete(&self.state, &relationship)
-                .await
-                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            drive(
+                MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
+                &self.state,
+            )
+            .await
+            .map_err(|error| s3_error!(InternalError, "{}", error))?;
             self.delete_sync_relationship(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             )
             .await?;
-            kick_mirror_repair(&self.state).await;
+            let _ = drive(KickRepairOperation::new(), &self.state).await;
             if self.remove_sync_mirror(&relationship).await {
                 self.clear_mirror_repair(&relationship, SyncMirrorIntent::Delete)
                     .await;
@@ -3169,15 +3192,18 @@ impl S3 for ArunaS3Service {
         let relationships = self.list_xml_relationships(&req.input.bucket).await?;
 
         for relationship in relationships {
-            stage_mirror_delete(&self.state, &relationship)
-                .await
-                .map_err(|error| s3_error!(InternalError, "{}", error))?;
+            drive(
+                MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
+                &self.state,
+            )
+            .await
+            .map_err(|error| s3_error!(InternalError, "{}", error))?;
             self.delete_sync_relationship(
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             )
             .await?;
-            kick_mirror_repair(&self.state).await;
+            let _ = drive(KickRepairOperation::new(), &self.state).await;
             if self.remove_sync_mirror(&relationship).await {
                 self.clear_mirror_repair(&relationship, SyncMirrorIntent::Delete)
                     .await;

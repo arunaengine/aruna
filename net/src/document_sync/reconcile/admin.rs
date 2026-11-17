@@ -450,9 +450,7 @@ pub(in crate::document_sync) async fn apply_group_authorization(
         match result {
             Ok(()) => return Ok(()),
             Err(error) => {
-                let _ = storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
+                let _ = abort_txn(storage, txn_id).await;
                 if !matches!(error, NetError::Storage(StorageError::TransactionConflict)) {
                     return Err(error);
                 }
@@ -782,75 +780,6 @@ pub(in crate::document_sync) async fn apply_realm_authorization(
     ))
 }
 
-/// Realm-config ops the reducer stores as order-insensitive immutable values
-/// and whose validation no other such op can influence: a consecutive run of
-/// them may apply as one read-reduce-write cycle instead of one per event.
-pub(in crate::document_sync) fn coalescible_config_op(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::CandidateMapPublished { .. }
-            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::ConfigTransitionStarted { .. }
-            | AdminDocumentOperation::TransitionBarrierReported { .. }
-            | AdminDocumentOperation::TransitionProofSubmitted { .. }
-            | AdminDocumentOperation::ConfigTransitionAborted { .. }
-            | AdminDocumentOperation::TransitionBucketForced { .. }
-            | AdminDocumentOperation::TransitionStallReported { .. }
-            | AdminDocumentOperation::TransitionDrainReported { .. }
-    )
-}
-
-/// Realm-config operations this document applier owns; every other family has
-/// its own applier.
-fn config_mutation_allowed(op: &AdminDocumentOperation) -> bool {
-    matches!(
-        op,
-        AdminDocumentOperation::ConfigNodeEnsured { .. }
-            | AdminDocumentOperation::ConfigNodeRemoved { .. }
-            | AdminDocumentOperation::OidcProviderUpserted { .. }
-            | AdminDocumentOperation::OidcProviderRemoved { .. }
-            | AdminDocumentOperation::ConfigSettingsSet { .. }
-            | AdminDocumentOperation::ConfigDescriptionSet { .. }
-            | AdminDocumentOperation::ConfigQuotaSet { .. }
-            | AdminDocumentOperation::NodePlacementSet { .. }
-            | AdminDocumentOperation::NodePlacementRemoved { .. }
-            | AdminDocumentOperation::PlacementStrategyUpserted { .. }
-            | AdminDocumentOperation::PlacementStrategyRemoved { .. }
-            | AdminDocumentOperation::ConfigStrategySet { .. }
-            | AdminDocumentOperation::JobFamilySet { .. }
-            | AdminDocumentOperation::StrategyBindingSet { .. }
-            | AdminDocumentOperation::StrategyBindingRemoved { .. }
-            | AdminDocumentOperation::PlacementOverrideSet { .. }
-            | AdminDocumentOperation::PlacementOverrideRemoved { .. }
-            | AdminDocumentOperation::PlacementBindingAppended { .. }
-            | AdminDocumentOperation::HandleRangeGranted { .. }
-            | AdminDocumentOperation::BandPoolAssigned { .. }
-            | AdminDocumentOperation::ConfigPoliciesSet { .. }
-            | AdminDocumentOperation::CandidateMapPublished { .. }
-            | AdminDocumentOperation::ConfigActivationsInitialized { .. }
-            | AdminDocumentOperation::ConfigTransitionStarted { .. }
-            | AdminDocumentOperation::TransitionBarrierReported { .. }
-            | AdminDocumentOperation::TransitionProofSubmitted { .. }
-            | AdminDocumentOperation::ConfigTransitionAborted { .. }
-            | AdminDocumentOperation::TransitionBucketForced { .. }
-            | AdminDocumentOperation::TransitionStallReported { .. }
-            | AdminDocumentOperation::TransitionDrainReported { .. }
-            | AdminDocumentOperation::ConfigComputeSet { .. }
-            | AdminDocumentOperation::ConfigFederationSet { .. }
-            | AdminDocumentOperation::ConfigPortalSet { .. }
-            | AdminDocumentOperation::ConfigReplicasSet { .. }
-            | AdminDocumentOperation::NodeNameSet { .. }
-            | AdminDocumentOperation::NodePlaceSet { .. }
-            | AdminDocumentOperation::ConfigTokenRevoked { .. }
-            | AdminDocumentOperation::MergeCoordinatorSet { .. }
-            | AdminDocumentOperation::ConfigVaultSet { .. }
-            | AdminDocumentOperation::ConfigEmailSet { .. }
-            | AdminDocumentOperation::ConfigSecretSet { .. }
-            | AdminDocumentOperation::ConfigPluginSet { .. }
-            | AdminDocumentOperation::ConfigInstallSet { .. }
-    )
-}
-
 /// Flushes a buffered run of coalescible realm-config events, if any, and
 /// drops the validation snapshot the applied events just outdated.
 pub(in crate::document_sync) async fn flush_config_run(
@@ -1150,98 +1079,19 @@ async fn read_user(
 
 pub(in crate::document_sync) const APPLY_CONFLICT_ATTEMPTS: usize = 64;
 
-/// The realm a realm-config operation addresses: the sync target, payload
-/// target, and document must all name the same realm.
-fn validate_config_target(
-    document_target: &DocumentTarget,
-    event: &AdminDocumentEvent,
-) -> Result<RealmId> {
-    let DocumentTarget::RealmConfig { realm_id } = document_target else {
-        return Err(NetError::Bootstrap(
-            "realm config admin operation sync only supports realm config targets".to_string(),
-        ));
-    };
-    let AdminDocumentTarget::RealmConfig {
-        realm_id: event_realm_id,
-    } = &event.target
-    else {
-        return Err(NetError::Bootstrap(
-            "admin document operation payload target is not a realm config".to_string(),
-        ));
-    };
-    if event_realm_id != realm_id {
-        return Err(NetError::Bootstrap(format!(
-            "replicated realm config admin operation target {realm_id} does not match payload realm id {event_realm_id}"
-        )));
-    }
-    Ok(*realm_id)
-}
-
-/// Whether a realm-config event's origin node and actor belong to the target
-/// realm.
-fn validate_config_actor(realm_id: RealmId, event: &AdminDocumentEvent) -> Result<()> {
-    // A federated user may only revoke its own token, which this realm issued.
-    let own_revocation = matches!(
-        &event.op,
-        AdminDocumentOperation::ConfigTokenRevoked { token_owner, .. }
-            if *token_owner == event.actor.user_id && !token_owner.is_nil()
-    );
-    if event.origin_node_id != event.actor.node_id
-        || event.actor.realm_id != realm_id
-        || (event.actor.user_id.realm_id != realm_id && !own_revocation)
-    {
-        return Err(NetError::Bootstrap(
-            "realm config event actor and origin do not match the target realm".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Re-checks a revocation against the transaction snapshot: the origin must
-/// already be onboarded and the payload valid under the snapshot clock.
-fn validate_revocation_snapshot(
-    previous_config: Option<&RealmConfigDocument>,
-    previous_state: Option<&AdminDocumentState>,
-    event: &AdminDocumentEvent,
-    realm_id: RealmId,
-    raw_now: u64,
-) -> Result<()> {
-    let valid = revocation_origin_known(previous_config, previous_state, event, realm_id);
-    if !valid {
-        return Err(NetError::Bootstrap(
-            "revocation origin is not an onboarded realm node in the transaction snapshot"
-                .to_string(),
-        ));
-    }
-    if let AdminDocumentOperation::ConfigTokenRevoked {
-        token_hash,
-        expires_at,
-        token_owner,
-    } = &event.op
-        && (!aruna_core::auth::valid_token_hash(token_hash)
-            || !valid_revocation_expiry(*expires_at, raw_now)
-            || token_owner.is_nil())
-    {
-        return Err(NetError::Bootstrap(
-            "replicated revocation has invalid hash, expiry, or owner".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 async fn apply_realm_config(
     storage: &StorageHandle,
     document_target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
-    let realm_id = validate_config_target(&document_target, &event)?;
+    let realm_id = validate_config_target(&document_target, &event).map_err(NetError::Bootstrap)?;
     if !config_mutation_allowed(&event.op) {
         return Err(NetError::Bootstrap(
             "realm config admin operation sync only supports node membership updates, OIDC provider updates, settings updates, description updates, quota updates, placement updates, transition updates, policy updates, compute updates, federation updates, portal updates, and token revocations"
                 .to_string(),
         ));
     }
-    validate_config_actor(realm_id, &event)?;
+    validate_config_actor(realm_id, &event).map_err(NetError::Bootstrap)?;
 
     let is_revocation = matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. });
 
@@ -1287,7 +1137,7 @@ async fn apply_realm_config(
         };
 
         if is_revocation
-            && let Err(error) = validate_revocation_snapshot(
+            && let Err(reason) = validate_revocation_snapshot(
                 previous_config.as_ref(),
                 previous_state.as_ref(),
                 &event,
@@ -1295,7 +1145,7 @@ async fn apply_realm_config(
                 raw_now,
             )
         {
-            return Err(abort_error(storage, txn_id, error).await);
+            return Err(abort_error(storage, txn_id, NetError::Bootstrap(reason)).await);
         }
 
         let effective_now = previous_state

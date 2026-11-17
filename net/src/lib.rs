@@ -13,7 +13,7 @@ mod construction;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
-pub mod document_sync;
+pub(crate) mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
@@ -64,7 +64,9 @@ pub use config::{
 };
 pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
+pub use document_sync::{
+    BATCH_TOPIC_LIMIT, DocumentSyncService, PendingEviction, ShardGenesisProbe,
+};
 pub use error::{NetError, Result};
 pub use heartbeat::HeartbeatSlot;
 pub use streams::StreamsService;
