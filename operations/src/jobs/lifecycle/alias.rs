@@ -57,10 +57,9 @@ impl Operation for AliasFamilyOperation {
             _ if !self.started || self.outcome.is_some() => Err(JobRouteError::Unavailable(
                 format!("unexpected storage event: {event:?}"),
             )),
-            Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values
-                .iter()
-                .filter_map(|(key, _)| alias_family(key))
-                .min()),
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                Ok(values.iter().filter_map(|(key, _)| alias_family(key)).min())
+            }
             Event::Storage(StorageEvent::Error { error }) => {
                 Err(JobRouteError::Unavailable(error.to_string()))
             }
@@ -102,7 +101,6 @@ mod state_machine_tests {
     use super::AliasFamilyOperation;
     use crate::jobs::JobRouteError;
     use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_key, alias_prefix};
-
 
     fn job() -> JobId {
         JobId::from_bytes([4u8; 16])

@@ -27,7 +27,10 @@ fn config_read() -> Effects {
 }
 
 fn config_row(family: &Family) -> Event {
-    let bytes = family.config.to_bytes(&actor(node(1))).expect("config encodes");
+    let bytes = family
+        .config
+        .to_bytes(&actor(node(1)))
+        .expect("config encodes");
     Event::Storage(StorageEvent::ReadResult {
         key: Key::from(b"config".to_vec()),
         value: Some(Value::from(bytes.as_slice())),
@@ -117,7 +120,10 @@ fn drain(local: u8) -> DrainOutboxOperation {
 
 /// One signed spec record of `family`, its outbox key and its stored row.
 fn queued(family: &Family) -> (Key, Event) {
-    let envelope = family.sign(&family.holder, JobFamilyRecord::Spec(Box::new(family.spec())));
+    let envelope = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(family.spec())),
+    );
     let key = record_key(&envelope.key());
     let bytes = to_bytes(&envelope).expect("record encodes");
     let row = Event::Storage(StorageEvent::ReadResult {
@@ -135,10 +141,7 @@ fn scanning(family: &Family, local: u8, cursor: Option<Key>) -> DrainOutboxOpera
         &config_read(),
         vec![
             (config_row(family), vec![cursor_read()]),
-            (
-                read(cursor.clone()),
-                vec![scan(cursor, OUTBOX_DRAIN_BATCH)],
-            ),
+            (read(cursor.clone()), vec![scan(cursor, OUTBOX_DRAIN_BATCH)]),
         ],
     );
     drain
@@ -268,7 +271,10 @@ fn clears_without_holders() {
         txn_id: None,
     });
     assert_eq!(drain.step(row).as_slice(), &[clear.clone()]);
-    assert_eq!(drain.step(deleted(key.clone())).as_slice(), &[cursor_write(None)]);
+    assert_eq!(
+        drain.step(deleted(key.clone())).as_slice(),
+        &[cursor_write(None)]
+    );
 
     let mut drain = scanning(&family, 1, None);
     drain.step(page(vec![key], None));

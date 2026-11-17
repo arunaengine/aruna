@@ -32,14 +32,12 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::plan::build_plan;
-use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
-};
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
 
@@ -185,9 +183,12 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
 /// lowest order key, which every holder reduces the same way. An unreadable
 /// claim set leaves the order to the digest alone.
 async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
-    let records = drive(LoadFamilyOperation::kind(family, JobRecordKind::Claim), context)
-        .await
-        .ok()?;
+    let records = drive(
+        LoadFamilyOperation::kind(family, JobRecordKind::Claim),
+        context,
+    )
+    .await
+    .ok()?;
     records
         .iter()
         .filter_map(|envelope| match &envelope.record {

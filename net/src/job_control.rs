@@ -29,7 +29,11 @@ pub struct JobReply {
 
 /// Runs a job-control effect: an unreachable owner is reported so the routing
 /// operation can map it to `Unavailable` (503). The artifact body path stays out of band.
-pub(crate) async fn exchange(net: &NetHandle, owner: NodeId, request: JobRequest) -> JobControlEvent {
+pub(crate) async fn exchange(
+    net: &NetHandle,
+    owner: NodeId,
+    request: JobRequest,
+) -> JobControlEvent {
     match send_request(net, owner, request).await {
         Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
         Err(error) => JobControlEvent::Unavailable(format!("job owner unavailable: {error}")),

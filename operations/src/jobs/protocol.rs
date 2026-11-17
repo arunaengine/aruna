@@ -440,9 +440,7 @@ async fn prepare_cancel(
     auth_token: AuthToken,
     job_id: JobId,
 ) -> PreparedResponse {
-    let requested_family = match drive(AliasFamilyOperation::new(job_id), context)
-        .await
-    {
+    let requested_family = match drive(AliasFamilyOperation::new(job_id), context).await {
         Ok(family) => family,
         Err(error) => return PreparedResponse::new(JobResponse::Unavailable(error.to_string())),
     };
@@ -453,13 +451,12 @@ async fn prepare_cancel(
     // A cancel that already reached this node is never forwarded again: divergent
     // holder views would bounce it. A non-holder answers only for its executions.
     if !holds {
-        let reservations =
-            match drive(HeldReservations::all(), context).await {
-                Ok(reservations) => reservations,
-                Err(error) => {
-                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
-                }
-            };
+        let reservations = match drive(HeldReservations::all(), context).await {
+            Ok(reservations) => reservations,
+            Err(error) => {
+                return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+            }
+        };
         let mut stopped = None;
         for reservation in reservations {
             let matches = match reservation_matches(
@@ -516,15 +513,12 @@ async fn prepare_cancel(
     .await
     {
         Some(Ok(())) => {
-            let reservations =
-                match drive(HeldReservations::all(), context).await {
-                    Ok(reservations) => reservations,
-                    Err(error) => {
-                        return PreparedResponse::new(JobResponse::Unavailable(
-                            error.to_string(),
-                        ));
-                    }
-                };
+            let reservations = match drive(HeldReservations::all(), context).await {
+                Ok(reservations) => reservations,
+                Err(error) => {
+                    return PreparedResponse::new(JobResponse::Unavailable(error.to_string()));
+                }
+            };
             for reservation in reservations {
                 let matches = match reservation_matches(
                     context,
@@ -631,9 +625,9 @@ async fn reservation_matches(
     reservation_alias: JobId,
 ) -> Result<bool, JobRouteError> {
     match requested_family {
-        Some(family) => Ok(drive(AliasFamilyOperation::new(reservation_alias), context)
-        .await?
-            == Some(family)),
+        Some(family) => {
+            Ok(drive(AliasFamilyOperation::new(reservation_alias), context).await? == Some(family))
+        }
         None => Ok(requested_alias == reservation_alias),
     }
 }

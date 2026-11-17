@@ -20,8 +20,8 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
-use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
+use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
 use crate::jobs::lifecycle::routing::family_status;
 use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
 use crate::jobs::store::iter_prefix_page;
@@ -108,7 +108,10 @@ async fn rejects_stale_quota() {
         error,
         LifecycleError::Storage(StorageError::TransactionConflict)
     );
-    assert_eq!(drive(AliasFamilyOperation::new(family.job_id), &ctx).await, Ok(None));
+    assert_eq!(
+        drive(AliasFamilyOperation::new(family.job_id), &ctx).await,
+        Ok(None)
+    );
 }
 
 #[tokio::test]
@@ -160,7 +163,11 @@ async fn replays_matching_claim() {
     assert!(!created);
     assert_eq!(second, first);
     assert_eq!(
-        drive(AliasFamilyOperation::new(JobId::from_bytes([4u8; 16])), &ctx).await,
+        drive(
+            AliasFamilyOperation::new(JobId::from_bytes([4u8; 16])),
+            &ctx
+        )
+        .await,
         Ok(None)
     );
 }

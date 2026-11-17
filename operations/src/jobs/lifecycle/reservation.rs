@@ -35,7 +35,6 @@ use crate::jobs::store::job_insert_entries;
 /// executions than this without its backend ceiling stopping it first.
 pub const MAX_RESERVATION_SCAN: usize = 512;
 
-
 pub fn reservation_key(execution_id: Ulid) -> Key {
     Key::from(execution_id.to_bytes().as_slice())
 }

@@ -17,8 +17,8 @@ use tracing::warn;
 use super::super::store::{put_job_entry, read_job_record};
 use super::workspace::mint_workspace_credential;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::ids::session_of;
 use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::lifecycle::ids::session_of;
 
 /// Registers the interactive session of a session job. `None` is an ordinary
 /// run, or a node with no compute plane.

@@ -10,7 +10,9 @@ use aruna_core::operation::Operation;
 use aruna_core::operation_check::{
     check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
 };
-use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKind, PhysicalExecutionState};
+use aruna_core::structs::execution::job::{
+    JobRecordEnvelope, JobRecordKind, PhysicalExecutionState,
+};
 use aruna_core::types::{Key, Value};
 
 use super::{FamilyReadError, LoadFamilyOperation};

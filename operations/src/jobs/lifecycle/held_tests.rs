@@ -17,8 +17,8 @@ use ulid::Ulid;
 use super::HeldReservations;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::reservation::MAX_RESERVATION_SCAN;
-use aruna_core::compute::quota::JobReservationRecord;
 use crate::jobs::records::rows::to_bytes;
+use aruna_core::compute::quota::JobReservationRecord;
 
 fn row(seed: u8) -> JobReservationRecord {
     JobReservationRecord {

@@ -16,14 +16,14 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::reservation::{
     MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
     ReserveExecutionOperation, fits,
 };
-use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
-use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
@@ -297,10 +297,13 @@ async fn output_binds_receipt() {
         .await
         .expect("offer is admitted");
 
-    let chain = drive(ExecutionChainOperation::of_execution(spec.job_id, execution_id), &ctx)
-        .await
-        .expect("chain read")
-        .expect("chain resolves");
+    let chain = drive(
+        ExecutionChainOperation::of_execution(spec.job_id, execution_id),
+        &ctx,
+    )
+    .await
+    .expect("chain read")
+    .expect("chain resolves");
     let receipt = family.receipt(&launch, 1);
     assert_eq!(chain.family, family.family());
     assert_eq!(chain.spec_digest, spec.spec_digest);

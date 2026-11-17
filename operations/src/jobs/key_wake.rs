@@ -597,8 +597,8 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::jobs::store::read_key_waits;
+        use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;
         use aruna_core::structs::execution::job::JobError;

@@ -10,13 +10,11 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::types::Value;
 
-use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::keys::record_key;
-use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, RecordOrigin,
-};
+use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM, context};
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
@@ -105,9 +103,12 @@ async fn reads_kind_only() {
     let all = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family reads completely");
-    let receipts = drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt), &ctx)
-        .await
-        .expect("receipts read completely");
+    let receipts = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+        &ctx,
+    )
+    .await
+    .expect("receipts read completely");
     assert_eq!(all.len(), 5);
     assert_eq!(receipts.len(), 1);
     assert!(matches!(
@@ -208,10 +209,13 @@ async fn undecodable_blocks_chain() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (spec, receipt) = seed(&ctx, &family).await;
     assert!(
-        drive(ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id), &ctx)
-            .await
-            .expect("chain read")
-            .is_some()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_some()
     );
 
     poison(&ctx, &family).await;
@@ -221,13 +225,20 @@ async fn undecodable_blocks_chain() {
         Err(FamilyReadError::Decode(_))
     ));
     assert!(matches!(
-        drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt), &ctx).await,
+        drive(
+            LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+            &ctx
+        )
+        .await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(
-        drive(ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id), &ctx)
-            .await
-            .expect("chain read")
-            .is_none()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_none()
     );
 }

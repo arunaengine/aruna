@@ -18,16 +18,14 @@ use ulid::Ulid;
 use super::alias::AliasFamilyOperation;
 use super::routing::family_projection;
 use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
-use crate::jobs::records::family::LoadFamilyOperation;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::JobRouteError;
 use crate::jobs::protocol::send_job_request;
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
-};
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::service::kick_drain;
 use crate::jobs::store::{CancelRequestOutcome, JobMutationError, set_cancel_requested};
 use crate::metadata::AuthToken;
@@ -271,7 +269,12 @@ pub(crate) async fn cancel_local_runs(context: &DriverContext, family: JobFamily
     let Some(local) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         return;
     };
-    let receipts = match drive(LoadFamilyOperation::kind(family, JobRecordKind::Receipt), context).await {
+    let receipts = match drive(
+        LoadFamilyOperation::kind(family, JobRecordKind::Receipt),
+        context,
+    )
+    .await
+    {
         Ok(receipts) => receipts,
         Err(error) => {
             warn!(error = %error, "Family receipts unreadable for a local cancel");

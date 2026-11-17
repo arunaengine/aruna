@@ -22,11 +22,11 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
-            NetEffect::JobControl(_) => Event::Net(NetEvent::JobControl(
-                JobControlEvent::Unavailable(
+            NetEffect::JobControl(_) => {
+                Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(
                     "job owner unavailable: network handle unavailable".to_string(),
-                ),
-            )),
+                )))
+            }
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }

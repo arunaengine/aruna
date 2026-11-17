@@ -15,15 +15,13 @@ use aruna_core::structs::identity::auth::AuthContext;
 
 use super::admission_race::{config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
-use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::cancel_family;
 use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::transport::serve_job_record;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
-};
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, user};
@@ -316,9 +314,12 @@ async fn late_cancel_flags() {
         .expect("physical row exists");
     assert!(record.cancel_requested);
     assert_eq!(rows(&ctx, JOB_RESERVATION_KEYSPACE, None).await, 0);
-    let updates = drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Update), &ctx)
-        .await
-        .unwrap();
+    let updates = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Update),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(updates.iter().any(|envelope| matches!(
         &envelope.record,
         JobFamilyRecord::Update(update) if update.state == PhysicalExecutionState::Cancelled
@@ -433,6 +434,10 @@ async fn unrecorded_deletion_kept() {
         .await
         .expect("delete runs");
     assert_eq!(deleted, RunDelete::Deleted);
-    let cancels = drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Cancel), &ctx).await;
+    let cancels = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Cancel),
+        &ctx,
+    )
+    .await;
     assert_eq!(cancels.expect("cancel records load").len(), 1);
 }

@@ -87,7 +87,10 @@ impl LoadFamilyOperation {
         smallvec![]
     }
 
-    fn keep(&mut self, values: Vec<(Key, aruna_core::types::Value)>) -> Result<(), FamilyReadError> {
+    fn keep(
+        &mut self,
+        values: Vec<(Key, aruna_core::types::Value)>,
+    ) -> Result<(), FamilyReadError> {
         for (key, value) in values {
             JobRecordKey::from_bytes(&key).map_err(|_| FamilyReadError::MalformedKey)?;
             self.records.push(from_bytes::<JobRecordEnvelope>(&value)?);

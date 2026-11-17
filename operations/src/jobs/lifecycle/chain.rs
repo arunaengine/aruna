@@ -158,10 +158,7 @@ impl ExecutionChainOperation {
         effects
     }
 
-    fn receipted(
-        &mut self,
-        records: Result<Vec<JobRecordEnvelope>, FamilyReadError>,
-    ) -> Effects {
+    fn receipted(&mut self, records: Result<Vec<JobRecordEnvelope>, FamilyReadError>) -> Effects {
         let (Some(family), Some(execution_id)) = (self.family, self.execution_id) else {
             return self.finish(None);
         };

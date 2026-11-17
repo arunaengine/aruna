@@ -7,23 +7,21 @@ use std::time::Duration;
 
 use aruna_core::effects::{Effect, JobRecordFrame};
 use aruna_core::structs::execution::job::{
-    ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId,
-    JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
+    ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 
+use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::reservation::ReleaseExecutionOperation;
-use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::witness::arm_family;
-use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
-};
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::read_job_record;
 use crate::node::dashboard::notify_dashboard_change;
 
@@ -87,10 +85,13 @@ pub async fn publish_state(
     }
     // The chain is extended only from evidence proven complete: the receipt
     // that authorized it, plus every stored update of this execution.
-    let receipts = drive(LoadFamilyOperation::kind(chain.family, JobRecordKind::Receipt), context)
-        .await
-        .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
-        .ok();
+    let receipts = drive(
+        LoadFamilyOperation::kind(chain.family, JobRecordKind::Receipt),
+        context,
+    )
+    .await
+    .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
+    .ok();
     let receipt = receipts.and_then(|records| receipt_in(&records, chain.execution_id));
     let Some(receipt) = receipt else {
         warn!(
@@ -104,7 +105,12 @@ pub async fn publish_state(
         warn!(execution_id = %chain.execution_id, "Execution receipt digest failed");
         return false;
     };
-    let records = match drive(LoadFamilyOperation::kind(chain.family, JobRecordKind::Update), context).await {
+    let records = match drive(
+        LoadFamilyOperation::kind(chain.family, JobRecordKind::Update),
+        context,
+    )
+    .await
+    {
         Ok(records) => records,
         Err(error) => {
             warn!(error = %error, "Execution update read is incomplete; publication deferred");
@@ -245,10 +251,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
             return false;
         }
     };
-    let chain = ExecutionChainOperation::of_execution(
-        reservation.logical_job_id,
-        reservation.execution_id,
-    );
+    let chain =
+        ExecutionChainOperation::of_execution(reservation.logical_job_id, reservation.execution_id);
     let Ok(Some(chain)) = drive(chain, context).await else {
         warn!(
             job_id = %record.job_id,

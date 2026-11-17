@@ -123,10 +123,7 @@ fn expected(receipt: &ExecutionReceipt) -> ExecutionChain {
 fn resolves_job_chain() {
     let (records, receipt) = run();
     let mut chain = ExecutionChainOperation::of_job(physical());
-    assert_eq!(
-        chain.start(),
-        HeldReservations::of_job(physical()).start()
-    );
+    assert_eq!(chain.start(), HeldReservations::of_job(physical()).start());
     assert_eq!(
         chain.step(held(&[reservation(&receipt)])),
         AliasFamilyOperation::new(fixture().job_id).start()
@@ -200,7 +197,8 @@ fn read_failures_give_none() {
     assert_eq!(chain.finalize(), Ok(None));
 
     // A family without this execution's receipt has no chain either.
-    let mut chain = ExecutionChainOperation::of_execution(fixture().job_id, Ulid::from_bytes([3; 16]));
+    let mut chain =
+        ExecutionChainOperation::of_execution(fixture().job_id, Ulid::from_bytes([3; 16]));
     chain.start();
     chain.step(alias());
     chain.step(receipts(&records));

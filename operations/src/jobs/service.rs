@@ -59,9 +59,9 @@ use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
 
+use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::{self, cancel_family};
 use super::lifecycle::ids::session_of;
-use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
@@ -1156,7 +1156,10 @@ pub async fn read_report_routed(
     auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let user_id = auth.user_id;
-    let job_id = if drive(AliasFamilyOperation::new(job_id), context).await?.is_some() {
+    let job_id = if drive(AliasFamilyOperation::new(job_id), context)
+        .await?
+        .is_some()
+    {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
             Ok((_, Some(physical))) => physical,
             Ok((record, None)) => return Ok(JobReportLookup::Pending(record.state)),
@@ -1574,7 +1577,13 @@ pub async fn cancel_job_routed(
                 .await
                 .map_err(|error| JobRouteError::Unavailable(error.to_string()))?
             {
-                if drive(AliasFamilyOperation::new(reservation.logical_job_id), context).await? == Some(family) {
+                if drive(
+                    AliasFamilyOperation::new(reservation.logical_job_id),
+                    context,
+                )
+                .await?
+                    == Some(family)
+                {
                     runtime.request_cancel(reservation.job_id);
                 }
             }

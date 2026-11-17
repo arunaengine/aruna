@@ -405,9 +405,12 @@ async fn accept_record(
                         ServeError::Unavailable
                     })?;
             }
-            let cancels = drive(LoadFamilyOperation::kind(family, JobRecordKind::Cancel), context.as_ref())
-                .await
-                .map_err(|_| ServeError::Unavailable)?;
+            let cancels = drive(
+                LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
+                context.as_ref(),
+            )
+            .await
+            .map_err(|_| ServeError::Unavailable)?;
             // Admission may promote a pending cancel, and retries must reapply its side effect.
             if !cancels.is_empty() {
                 crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;

@@ -655,10 +655,12 @@ impl OperationsTaskHandler {
             return;
         };
         let drain = DrainOutboxOperation::new(*net.realm_id(), net.node_id());
-        let remaining = drive(drain, self.context.as_ref()).await.unwrap_or_else(|error| {
-            warn!(error = %error, "Job family outbox drain failed");
-            true
-        });
+        let remaining = drive(drain, self.context.as_ref())
+            .await
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "Job family outbox drain failed");
+                true
+            });
         if remaining {
             self.reschedule_timer(TaskKey::DrainFamilyOutbox, OUTBOX_RETRY_AFTER)
                 .await;

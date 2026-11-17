@@ -321,7 +321,10 @@ impl Operation for PublishRecordOperation {
 
 /// Re-arms the replication and witness queues after a restart. Both queues are
 /// durable rows, so the timers only have to be brought back, never the work.
-pub async fn restore_lifecycle_timers(storage: &aruna_storage::StorageHandle, task_handle: &aruna_tasks::TaskHandle) {
+pub async fn restore_lifecycle_timers(
+    storage: &aruna_storage::StorageHandle,
+    task_handle: &aruna_tasks::TaskHandle,
+) {
     let pending = crate::jobs::store::iter_prefix_page(
         storage,
         aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
@@ -335,7 +338,9 @@ pub async fn restore_lifecycle_timers(storage: &aruna_storage::StorageHandle, ta
     .unwrap_or(false);
     let mut timers = vec![schedule_outbox_drain(OUTBOX_RETRY_AFTER)];
     if pending {
-        timers.push(super::witness::schedule_witness_drain(Duration::from_secs(1)));
+        timers.push(super::witness::schedule_witness_drain(Duration::from_secs(
+            1,
+        )));
     }
     for timer in timers {
         if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
