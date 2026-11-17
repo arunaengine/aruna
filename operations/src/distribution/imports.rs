@@ -439,7 +439,7 @@ async fn delete(context: &DriverContext, key: Key) -> Result<(), String> {
     }
 }
 
-pub(super) async fn read_value(
+async fn read_value(
     context: &DriverContext,
     key_space: &str,
     key: Key,
@@ -455,7 +455,7 @@ pub(super) async fn read_value(
     }
 }
 
-pub(super) async fn page(
+async fn page(
     context: &DriverContext,
     key_space: &str,
     prefix: Option<Vec<u8>>,

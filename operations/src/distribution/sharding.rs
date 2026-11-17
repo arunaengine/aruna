@@ -31,6 +31,7 @@ use ulid::Ulid;
 use super::create::submit;
 use super::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
 use super::refill::{RefillConfig, RefillOperation};
+use super::refresh::{RefreshCursor, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::mark_dirty;
@@ -48,6 +49,8 @@ const WALK_PAGES: usize = 8;
 
 /// The account row after which the next pass continues; a restart begins again at the start.
 static CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Where the periodic source refresh goes on; a restart begins again at the start.
+static REFRESH_CURSOR: Mutex<Option<RefreshCursor>> = Mutex::new(None);
 
 /// What tending one range left behind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,10 +69,31 @@ pub async fn maintain_ranges(context: &Arc<DriverContext>) -> Duration {
         warn!(%error, "Handed over imports could not start");
     }
     // Coordinators walk their ranges for the periodic source refresh, a few pages per pass.
-    match super::refresh::refresh_ranges(context).await {
-        Ok(true) => after = Duration::ZERO,
-        Ok(false) => {}
-        Err(error) => warn!(%error, "The periodic source refresh could not run"),
+    if let Some(net) = context.net_handle.as_ref() {
+        let cursor = (REFRESH_CURSOR.lock().ok()).and_then(|mut cursor| cursor.take());
+        let (realm_id, now) = (*net.realm_id(), std::time::SystemTime::now());
+        let pass =
+            RefreshRangesOperation::new(realm_id, net.node_id(), now, cursor.unwrap_or_default());
+        let (busy, cursor) = match drive(pass, context).await {
+            Ok(pass) => (pass.busy, pass.cursor),
+            Err(error) => {
+                warn!(%error, "The periodic source refresh could not run");
+                let record = error.record;
+                (
+                    false,
+                    RefreshCursor {
+                        record,
+                        sweep: None,
+                    },
+                )
+            }
+        };
+        if busy {
+            after = Duration::ZERO;
+        }
+        if let Ok(mut kept) = REFRESH_CURSOR.lock() {
+            *kept = Some(cursor);
+        }
     }
     // Version links metadata could not verify in a set are retried here, a page per pass.
     match crate::metadata::data_links::retry_unverified(context).await {
