@@ -5,7 +5,7 @@
 
 use super::*;
 use aruna_core::UserId;
-use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultPurpose};
+use aruna_core::realm_vault::{RealmVaultEntry, RealmVaultKey, RealmVaultPurpose};
 use aruna_core::structs::identity::realm::RealmId;
 use ed25519_dalek::SigningKey;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -110,7 +110,10 @@ async fn opens_caches_refetches() {
     };
 
     // A key holder opens the record itself and caches nothing.
-    let opened = secret_from(&ctx, Some(&key()), &config, reference, fetch)
+    let (_holder_dir, holder) = context();
+    let keys = aruna_core::realm_vault::RealmKeys::derive(&SigningKey::from_bytes(&[5u8; 32]));
+    holder.storage_handle.open_realm(keys);
+    let opened = secret_from(&holder, &config, reference, fetch)
         .await
         .unwrap();
     assert_eq!(opened.expose(), SECRET);
@@ -118,7 +121,7 @@ async fn opens_caches_refetches() {
 
     // Other nodes fetch once, then answer from the node vault cache.
     for _ in 0..2 {
-        let read = secret_from(&ctx, None, &config, reference, fetch)
+        let read = secret_from(&ctx, &config, reference, fetch)
             .await
             .unwrap();
         assert_eq!(read.expose(), SECRET);
@@ -127,13 +130,13 @@ async fn opens_caches_refetches() {
 
     // A rotation misses the cache and fetches again.
     let (rotated, newer) = realm_config(3);
-    secret_from(&ctx, None, &rotated, newer, fetch)
+    secret_from(&ctx, &rotated, newer, fetch)
         .await
         .unwrap();
     assert_eq!(fetches.load(Ordering::SeqCst), 2);
 
     // A reference ahead of the replicated config waits for replication.
-    let ahead = secret_from(&ctx, None, &config, newer, fetch).await;
+    let ahead = secret_from(&ctx, &config, newer, fetch).await;
     assert!(matches!(ahead, Err(RealmSecretError::NotReplicated)));
 }
 
@@ -142,7 +145,7 @@ async fn prunes_stale_rows() {
     let (_dir, ctx) = context();
     let (config, reference) = realm_config(2);
     let fetch = || async { Ok(SecretBytes::new(SECRET.to_vec())) };
-    secret_from(&ctx, None, &config, reference, fetch)
+    secret_from(&ctx, &config, reference, fetch)
         .await
         .unwrap();
     assert_eq!(prune_secret_cache(&ctx, &config).await, Ok(0));
@@ -224,8 +227,9 @@ mod settings {
         peer: NodeId,
         setting: &(DocumentTarget, Vec<u8>),
     ) -> Result<SecretBytes, MetadataReadError> {
-        let key = RealmSealKey::derive(&realm_key());
-        open_setting(&key, &config(), peer, &setting.0, &setting.1)
+        let keys = aruna_core::realm_vault::RealmKeys::derive(&realm_key());
+        let sealed = sealed_setting(&config(), peer, &setting.0, &setting.1)?;
+        sealed.open(&keys).map_err(setting_error)
     }
 
     #[test]
@@ -272,7 +276,7 @@ mod settings {
     async fn open_needs_key() {
         let (_dir, context) = context();
         let (target, bytes) = email(1, true);
-        let served = serve_open(&context, None, node(2), target, bytes);
+        let served = serve_open(&context, node(2), target, bytes);
         assert_eq!(served.await.err(), Some(MetadataReadError::Unavailable));
     }
 }

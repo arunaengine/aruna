@@ -12,7 +12,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
 use aruna_core::realm_vault::{
-    FetchScope, RealmSealKey, RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord,
+    FetchScope, RealmSealed, RealmSecretRef, RealmVaultError, RealmVaultRecord,
 };
 use aruna_core::structs::execution::setting::{SettingChannel, validate_setting};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
@@ -50,8 +50,7 @@ pub async fn read_realm_secret(
     reference: RealmSecretRef,
 ) -> Result<SecretBytes, RealmSecretError> {
     let metadata = ctx.metadata_handle.as_ref();
-    let key = metadata.and_then(|metadata| metadata.realm_vault_key());
-    secret_from(ctx, key.as_deref(), config, reference, move || async move {
+    secret_from(ctx, config, reference, move || async move {
         let metadata = metadata.ok_or_else(|| {
             RealmSecretError::Unavailable("metadata transport unavailable".to_string())
         })?;
@@ -60,10 +59,9 @@ pub async fn read_realm_secret(
     .await
 }
 
-/// Opens locally with the realm vault key, else reads the cache, else fetches and caches.
+/// Opens with the realm keys this node holds, else reads the cache, else fetches and caches.
 async fn secret_from<F, R>(
     ctx: &DriverContext,
-    key: Option<&RealmVaultKey>,
     config: &RealmConfigDocument,
     reference: RealmSecretRef,
     fetch: F,
@@ -73,8 +71,9 @@ where
     R: Future<Output = Result<SecretBytes, RealmSecretError>>,
 {
     let record = current_record(config, reference).ok_or(RealmSecretError::NotReplicated)?;
-    if let Some(key) = key {
-        return Ok(key.open(&config.realm_id, record)?);
+    match open_sealed(ctx, record_sealed(config, record)).await {
+        Err(RealmVaultError::NoKey) => {}
+        opened => return Ok(opened?),
     }
     let entry = cache_entry(reference);
     let event = ctx
@@ -142,11 +141,9 @@ async fn fetch_secret(
 /// purpose's fetch scope get an answer, and only for the current revision.
 pub(crate) async fn serve_realm_secret(
     ctx: &DriverContext,
-    key: Option<&RealmVaultKey>,
     peer: NodeId,
     request: RealmSecretRef,
 ) -> Result<SecretBytes, MetadataReadError> {
-    let key = key.ok_or(MetadataReadError::Unavailable)?;
     let net_handle = ctx
         .net_handle
         .as_ref()
@@ -155,8 +152,8 @@ pub(crate) async fn serve_realm_secret(
         .await
         .map_err(|_| MetadataReadError::Unavailable)?;
     let record = check_fetch(&config, net_handle.node_id(), peer, request)?;
-    let secret = key
-        .open(&config.realm_id, record)
+    let secret = open_sealed(ctx, record_sealed(&config, record))
+        .await
         .map_err(|_| MetadataReadError::Unavailable)?;
     debug!(%peer, entry = ?request.entry, revision = %request.revision, "Served a realm vault entry");
     Ok(secret)
@@ -188,24 +185,46 @@ fn check_fetch(
 /// only infrastructure peers get an answer, and only for a well-formed setting document.
 pub(crate) async fn serve_open(
     ctx: &DriverContext,
-    key: Option<&RealmSealKey>,
     peer: NodeId,
     target: DocumentTarget,
     bytes: Vec<u8>,
 ) -> Result<SecretBytes, MetadataReadError> {
-    let key = key.ok_or(MetadataReadError::Unavailable)?;
     let config = management_config(ctx).await?;
-    open_setting(key, &config, peer, &target, &bytes)
+    let sealed = sealed_setting(&config, peer, &target, &bytes)?;
+    open_sealed(ctx, sealed).await.map_err(setting_error)
 }
 
-/// Opens the sealed secret of a valid setting document; an off setting has none.
-pub(crate) fn open_setting(
-    key: &RealmSealKey,
+/// A node without the realm keys cannot answer; a secret that does not open is refused.
+fn setting_error(error: RealmVaultError) -> MetadataReadError {
+    match error {
+        RealmVaultError::NoKey => MetadataReadError::Unavailable,
+        _ => MetadataReadError::Forbidden,
+    }
+}
+
+/// Asks the storage backend, which holds the realm keys on a management node, to open `sealed`.
+async fn open_sealed(ctx: &DriverContext, sealed: RealmSealed) -> Result<SecretBytes, RealmVaultError> {
+    let effect = StorageEffect::RealmOpen(Box::new(sealed));
+    match ctx.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::RealmOpened { result }) => result,
+        _ => Err(RealmVaultError::Open),
+    }
+}
+
+fn record_sealed(config: &RealmConfigDocument, record: &RealmVaultRecord) -> RealmSealed {
+    RealmSealed::Record {
+        realm_id: config.realm_id,
+        record: record.clone(),
+    }
+}
+
+/// The sealed secret of a valid setting document; an off setting has none.
+pub(crate) fn sealed_setting(
     config: &RealmConfigDocument,
     peer: NodeId,
     target: &DocumentTarget,
     bytes: &[u8],
-) -> Result<SecretBytes, MetadataReadError> {
+) -> Result<RealmSealed, MetadataReadError> {
     infrastructure_peer(config, peer)?;
     let head = validate_setting(target, bytes).map_err(|_| MetadataReadError::Forbidden)?;
     let (channel, owner, id) =
@@ -216,8 +235,13 @@ pub(crate) fn open_setting(
     let sealed = sealed
         .filter(|_| head.on)
         .ok_or(MetadataReadError::NotFound)?;
-    key.open(&config.realm_id, channel, &owner, id, &sealed)
-        .map_err(|_| MetadataReadError::Forbidden)
+    Ok(RealmSealed::Setting {
+        realm_id: config.realm_id,
+        channel,
+        owner,
+        id,
+        sealed,
+    })
 }
 
 /// The realm config of a node that holds the realm key; other nodes keep no settings.

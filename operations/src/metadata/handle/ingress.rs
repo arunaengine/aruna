@@ -1185,16 +1185,12 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::RealmSecret { entry, revision } => {
                 let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
-                let key = self.realm_vault_key();
-                let served =
-                    crate::realm_vault::serve_realm_secret(context, key.as_deref(), peer, request);
+                let served = crate::realm_vault::serve_realm_secret(context, peer, request);
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::RealmSecretResult { result }, None)
             }
             MetadataTransportMessage::OpenSetting { target, bytes } => {
-                let key = self.realm_seal_key();
-                let served =
-                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
+                let served = crate::realm_vault::serve_open(context, peer, target, bytes);
                 let result = Box::pin(served).await;
                 (MetadataTransportMessage::OpenSettingResult { result }, None)
             }
@@ -1218,11 +1214,7 @@ impl MetadataHandle {
                 (MetadataTransportMessage::EventsDecided { result }, None)
             }
             MetadataTransportMessage::ReleaseSecret { request } => {
-                let keys = crate::plugins::release::ReleaseKeys {
-                    seal: self.realm_seal_key(),
-                    vault: self.realm_vault_key(),
-                };
-                let released = crate::plugins::release::serve_release(context, keys, peer, request);
+                let released = crate::plugins::release::serve_release(context, peer, request);
                 let result = Box::pin(released).await;
                 (MetadataTransportMessage::SecretReleased { result }, None)
             }
