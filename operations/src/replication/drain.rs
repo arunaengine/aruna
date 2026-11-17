@@ -1173,9 +1173,9 @@ pub(super) async fn read_relationships(
         let event = storage
             .send_storage_effect(StorageEffect::Iter {
                 key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-                prefix: Some(sync_relationship_prefix(bucket).into()),
+                prefix: Some(aruna_core::structs::sync_relationship_prefix(bucket).into()),
                 start: start_after.take().map(IterStart::After),
-                limit: REPLICATION_PAGE_SIZE,
+                limit: super::obligations::REPLICATION_PAGE_SIZE,
                 txn_id: None,
             })
             .await;
