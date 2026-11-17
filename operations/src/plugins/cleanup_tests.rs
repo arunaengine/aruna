@@ -13,8 +13,10 @@ use super::*;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::rows::encode;
+use crate::plugins::rows::page_result;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::{created, installed, worker};
+use aruna_core::calls::IoCall;
 
 async fn count(fixture: &Fixture, space: &str) -> usize {
     let txn = Txn::direct(&fixture.ctx);
@@ -98,37 +100,40 @@ fn sweep_by_standing() {
         dropped: 0,
     };
     let replay = |install: Ulid| ([&[b'r'][..], &install.to_bytes()].concat(), Vec::new());
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
     let rows = vec![replay(removing), replay(kept)];
     let gone = vec![(PLUGIN_REPLAYS_KEYSPACE, replay(removing).0)];
     assert_eq!(
-        plan.next(Answer::Page(rows, None)).unwrap(),
-        Turn::Ask(Ask::Delete(gone))
+        plan.next(page_result(rows, None)).unwrap(),
+        Next::Call(delete_call(gone))
     );
     assert!(matches!(
-        plan.next(Answer::Done).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
     // A removing install's waiting row leaves its queue slot first, then the waiting set.
     let waiting = vec![(removing.to_bytes().to_vec(), Vec::new())];
     let queue = vec![(PLUGIN_QUEUE_KEYSPACE, removing.to_bytes().to_vec())];
     let waits = vec![(PLUGIN_WAITING_KEYSPACE, removing.to_bytes().to_vec())];
     assert_eq!(
-        plan.next(Answer::Page(waiting, None)).unwrap(),
-        Turn::Ask(Ask::Delete(queue))
+        plan.next(page_result(waiting, None)).unwrap(),
+        Next::Call(delete_call(queue))
     );
     assert_eq!(
-        plan.next(Answer::Done).unwrap(),
-        Turn::Ask(Ask::Delete(waits))
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(delete_call(waits))
     );
     for _ in 0..2 {
         assert!(matches!(
-            plan.next(Answer::Done).unwrap(),
-            Turn::Ask(Ask::Page { .. })
+            plan.next(IoResult::Done).unwrap(),
+            Next::Call(IoCall::Page { .. })
         ));
-        let empty = plan.next(Answer::Page(Vec::new(), None)).unwrap();
-        assert_eq!(empty, Turn::Ask(Ask::Delete(Vec::new())));
+        let empty = plan.next(page_result(Vec::new(), None)).unwrap();
+        assert_eq!(empty, Next::Call(delete_call(Vec::new())));
     }
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(2));
-    assert!(plan.next(Answer::Done).is_err());
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(2));
+    assert!(plan.next(IoResult::Done).is_err());
 }

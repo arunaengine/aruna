@@ -10,13 +10,13 @@ use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot,
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
 };
-use aruna_core::document::{DocumentChange, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, NodeHeartbeat, RunningJobs};
+use aruna_core::heartbeat::{NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::{
-    COMPUTE_DEPARTURE_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::storage_entries::sync_revision_key;
@@ -25,14 +25,11 @@ use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubject
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, CLASS_LABEL_PREFIX, NodeInfoDocument, NodeUrls, NodeUtilization,
-    node_info_key,
 };
 use aruna_core::structs::storage::routing::BackendCatalog;
-use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
@@ -42,14 +39,14 @@ use crate::jobs::demand::{demand_snapshot, read_reservations};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
-use crate::node::info_write::{InfoChange, InfoWriteOperation};
+use crate::node::info_write::{InfoChange, InfoWriteOperation, revision_generation};
 use crate::placement::policy::{
     SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
 };
 use crate::realm::mutate_placement::node_kind;
 use crate::s3::usage::LoadCountersOperation;
-use aruna_core::node_state::ReadInfoOperation;
-use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
+use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation, SetDrainOperation};
+use aruna_core::node_state::DEPARTURE_KEY;
 use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
@@ -64,7 +61,7 @@ pub async fn seed_info_document(
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    let stored = node_info_row(&ctx.storage_handle, node_id).await?;
+    let stored = node_info_row(ctx, node_id).await?;
     let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
     // The published drain is the operator's durable flag or a departure, never
@@ -211,10 +208,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
         })
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
-            .map(|change| change.current.generation)
-            .unwrap_or_default()),
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(revision_generation(value)),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!(
             "realm config revision read failed: {}",
@@ -233,7 +227,7 @@ pub(crate) async fn refresh_info_heartbeat(
     sequence: u64,
     jobs: Option<RunningJobs>,
 ) -> Result<(), String> {
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(ctx, node_id).await? else {
         return Ok(());
     };
     let now = unix_timestamp_millis();
@@ -266,7 +260,7 @@ pub(crate) async fn refresh_info_heartbeat(
     publish_info(ctx, node_id, realm_id, true).await?;
     let (Some(_), Some(stored)) = (
         ctx.net_handle.as_ref(),
-        node_info_row(&ctx.storage_handle, node_id).await?,
+        node_info_row(ctx, node_id).await?,
     ) else {
         return Ok(());
     };
@@ -346,7 +340,7 @@ pub(crate) async fn set_departure_state(
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(ctx, node_id).await? else {
         return Ok(false);
     };
     // An operator drain outlives a placement observation: returning to the
@@ -391,11 +385,13 @@ pub async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    if operator_drain(ctx).await? == draining {
+    let changed = drive(SetDrainOperation::new(draining), ctx)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !changed {
         return Ok(false);
     }
-    write_operator_drain(ctx, draining).await?;
-    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(ctx, node_id).await? else {
         warn!(
             operator_draining = draining,
             "Operator compute drain recorded before this node advertises"
@@ -427,42 +423,10 @@ pub async fn set_operator_drain(
 }
 
 async fn operator_drain(ctx: &DriverContext) -> Result<bool, String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-            txn_id: None,
-        })
+    drive(DrainStateOperation::new(), ctx)
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain read failed: {}", other.label())),
-    }
-}
-
-async fn write_operator_drain(ctx: &DriverContext, draining: bool) -> Result<(), String> {
-    let key = Key::from(OPERATOR_DRAIN_KEY.to_vec());
-    let effect = match draining {
-        true => StorageEffect::Write {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key,
-            value: Value::from(vec![1u8]),
-            txn_id: None,
-        },
-        false => StorageEffect::Delete {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        },
-    };
-    match ctx.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::WriteResult { .. })
-        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain write failed: {}", other.label())),
-    }
+        .map(|state| state.operator_draining)
+        .map_err(|error| error.to_string())
 }
 
 /// Records the executions this node still holds capacity for. Their
@@ -665,26 +629,13 @@ async fn publish_info(
 }
 
 async fn node_info_row(
-    storage: &StorageHandle,
+    ctx: &DriverContext,
     node_id: NodeId,
 ) -> Result<Option<NodeInfoDocument>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_key(node_id)),
-            txn_id: None,
-        })
+    drive(ReadInfoOperation::new(vec![node_id]), ctx)
         .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes::<NodeInfoDocument>(bytes.as_ref())
-                    .map_err(|error| error.to_string())
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info read failed: {}", other.label())),
-    }
+        .map(|mut documents| documents.remove(&node_id))
+        .map_err(|error| error.to_string())
 }
 
 /// The published endpoints of a node, from its info document.
@@ -694,21 +645,6 @@ pub async fn node_urls(ctx: &DriverContext, node_id: NodeId) -> Option<NodeUrls>
         .ok()?
         .remove(&node_id)
         .map(|document| document.urls)
-}
-
-/// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
-/// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
-/// forward past the handler's own post-run re-arm.
-pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
-    if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
-        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::PublishNodeInfo,
-            after: INFO_PUBLISH_INTERVAL,
-        }))
-        .await
-    {
-        warn!(message = %message, "Failed to arm node info heartbeat timer");
-    }
 }
 
 #[cfg(test)]
@@ -725,7 +661,6 @@ mod tests {
     use aruna_core::keyspaces::{
         FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
     };
-    use aruna_core::node_state::DrainStateOperation;
     use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::execution::job::record_keys::kind_prefix;
     use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
@@ -740,6 +675,7 @@ mod tests {
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::structs::storage::node_info::KIND_LABEL_KEY;
     use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
     fn node(seed: u8) -> NodeId {
@@ -895,7 +831,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -936,7 +872,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            node_info_row(&ctx.storage_handle, local)
+            node_info_row(&ctx, local)
                 .await
                 .unwrap()
                 .is_some()
@@ -973,7 +909,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1019,7 +955,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .expect("node info document persisted");
@@ -1076,7 +1012,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = node_info_row(&ctx.storage_handle, local)
+        let first = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1091,7 +1027,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let second = node_info_row(&ctx.storage_handle, local)
+        let second = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1134,7 +1070,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            node_info_row(&ctx.storage_handle, local)
+            node_info_row(&ctx, local)
                 .await
                 .unwrap()
                 .is_none()
@@ -1446,7 +1382,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .expect("document");
@@ -1596,7 +1532,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = node_info_row(&ctx.storage_handle, local)
+        let before = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1607,7 +1543,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after = node_info_row(&ctx.storage_handle, local)
+        let after = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1683,7 +1619,7 @@ mod tests {
             .await
             .expect("observation completes");
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .expect("document");
@@ -1715,7 +1651,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, true)
             .await
             .unwrap();
-        let departed = node_info_row(&ctx.storage_handle, local)
+        let departed = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1726,7 +1662,7 @@ mod tests {
                 .unwrap()
         );
 
-        let rejoined = node_info_row(&ctx.storage_handle, local)
+        let rejoined = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1761,7 +1697,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let drained = node_info_row(&ctx.storage_handle, local)
+        let drained = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1774,7 +1710,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, false)
             .await
             .unwrap();
-        let observed = node_info_row(&ctx.storage_handle, local)
+        let observed = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1786,7 +1722,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let released = node_info_row(&ctx.storage_handle, local)
+        let released = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1858,21 +1794,21 @@ mod tests {
         .await
         .unwrap();
 
-        write_operator_drain(&ctx, true).await.unwrap();
+        drive(SetDrainOperation::new(true), &ctx).await.unwrap();
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let drained = node_info_row(&ctx.storage_handle, local)
+        let drained = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
         assert!(drained.compute_draining && !drained.leaving);
 
-        write_operator_drain(&ctx, false).await.unwrap();
+        drive(SetDrainOperation::new(false), &ctx).await.unwrap();
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let released = node_info_row(&ctx.storage_handle, local)
+        let released = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1906,7 +1842,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1937,7 +1873,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1965,7 +1901,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let seeded = node_info_row(&ctx.storage_handle, local)
+        let seeded = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1977,7 +1913,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();
@@ -1997,7 +1933,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
-        let stored = node_info_row(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx, local)
             .await
             .unwrap()
             .unwrap();

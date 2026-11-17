@@ -1239,9 +1239,9 @@ fn map_get_error(
 ) -> ServerError {
     match error {
         GetSourceError::NotFound => ServerError::NotFound,
-        GetSourceError::StorageError(_)
-        | GetSourceError::ConversionError(_)
-        | GetSourceError::GetConnectorFailed => ServerError::InternalError(error.into()),
+        GetSourceError::StorageError(_) | GetSourceError::ConversionError(_) => {
+            ServerError::InternalError(error.into())
+        }
     }
 }
 

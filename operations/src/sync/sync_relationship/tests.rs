@@ -3,16 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{rejects_events, sample_events};
+use aruna_core::calls::{IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncState, SyncStatusSnapshot};
 use aruna_core::{NodeId, UserId};
 use aruna_storage::storage::FjallStorage;
+use byteview::ByteView;
 use std::time::SystemTime;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
@@ -192,9 +192,18 @@ async fn create_is_atomic() {
             drive(stage, &context).await.unwrap();
         }
 
+        let (first_seed, second_seed) = (first.id.to_bytes(), second.id.to_bytes());
         let (first_result, second_result) = tokio::join!(
-            drive(CreateRelationshipOperation::new(first), &context),
-            drive(CreateRelationshipOperation::new(second), &context),
+            drive_retry(
+                || CreateRelationshipOperation::new(first.clone()),
+                &context,
+                &first_seed
+            ),
+            drive_retry(
+                || CreateRelationshipOperation::new(second.clone()),
+                &context,
+                &second_seed
+            ),
         );
         assert!(matches!(
             (&first_result, &second_result),
@@ -212,90 +221,114 @@ async fn create_is_atomic() {
     }
 }
 
-// A state that expects no event must reject one instead of ignoring it.
+/// The page call the operations should make, built here independently of `pages`.
+pub(super) fn page_call(
+    direction: SyncRelationshipDirection,
+    bucket: Option<&str>,
+    after: Option<Key>,
+) -> IoCall {
+    IoCall::Page {
+        space: direction.keyspace().to_string(),
+        prefix: ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default()),
+        after,
+        limit: RELATIONSHIP_PAGE_SIZE,
+    }
+}
+
+fn page(rows: Vec<&SyncRelationship>, next: Option<Key>) -> IoResult {
+    let rows = rows
+        .into_iter()
+        .map(|relationship| {
+            let key = storage_key(SyncRelationshipDirection::Incoming, relationship).unwrap();
+            (key, ByteView::from(relationship.to_bytes().unwrap()))
+        })
+        .collect();
+    IoResult::Page { rows, next }
+}
+
 #[test]
-fn terminal_rejects_event() {
-    let stray = || {
-        Event::Storage(StorageEvent::DeleteResult {
-            key: Vec::<u8>::new().into(),
-        })
-    };
-    let page = || {
-        Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        })
-    };
+fn writes_and_deletes() {
     let record = relationship(1, "source-a", "target-a");
-    let store = || {
-        let mut store =
-            StoreRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
-        store.start();
-        store.step(Event::Storage(StorageEvent::WriteResult {
-            key: Vec::<u8>::new().into(),
-        }));
-        store
-    };
-    for (_, effects, error) in rejects_events(store, sample_events, |_| false) {
-        assert!(effects.is_empty());
-        assert!(
-            matches!(
-                error,
-                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
-            ),
-            "{error:?}"
-        );
-    }
+    let incoming = SyncRelationshipDirection::Incoming;
+    let mut store = StoreRelationshipOperation::new(record.clone(), incoming);
+    assert_eq!(
+        store.first(),
+        Ok(Next::Call(write_call(incoming, &record).unwrap()))
+    );
+    assert_eq!(store.next(IoResult::Done), Ok(Next::Done(record.clone())));
+    let mut delete = DeleteRelationshipOperation::new(record.clone(), incoming);
+    assert_eq!(
+        delete.first(),
+        Ok(Next::Call(delete_call(incoming, &record).unwrap()))
+    );
+    assert_eq!(delete.next(IoResult::Done), Ok(Next::Done(())));
+}
 
-    let list = || {
-        let mut list = ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, None);
-        list.start();
-        list.step(page());
-        list
-    };
-    for (_, effects, error) in rejects_events(list, sample_events, |_| false) {
-        assert!(effects.is_empty());
-        assert!(
-            matches!(
-                error,
-                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
-            ),
-            "{error:?}"
-        );
-    }
+#[test]
+fn reads_pages() {
+    let (first, second) = (relationship(1, "s", "t"), relationship(2, "s", "t"));
+    let incoming = SyncRelationshipDirection::Incoming;
+    let after = Some(storage_key(incoming, &first).unwrap());
+    let mut list = ListRelationshipsOperation::new(incoming, Some("t".to_string()));
+    assert_eq!(
+        list.first(),
+        Ok(Next::Call(page_call(incoming, Some("t"), None)))
+    );
+    assert_eq!(
+        list.next(page(vec![&first], after.clone())),
+        Ok(Next::Call(page_call(incoming, Some("t"), after.clone())))
+    );
+    assert_eq!(
+        list.next(page(vec![&second], None)),
+        Ok(Next::Done(vec![first.clone(), second.clone()]))
+    );
+    let mut get = GetRelationshipOperation::new(second.id, incoming);
+    assert_eq!(get.first(), Ok(Next::Call(page_call(incoming, None, None))));
+    assert_eq!(
+        get.next(page(vec![&first], after.clone())),
+        Ok(Next::Call(page_call(incoming, None, after)))
+    );
+    assert_eq!(get.next(page(vec![&second], None)), Ok(Next::Done(second)));
+    let mut missing = GetRelationshipOperation::new(Ulid::nil(), incoming);
+    assert_eq!(
+        missing.next(page(vec![&first], None)),
+        Err(SyncRelationshipError::NotFound)
+    );
+}
 
-    let get = || {
-        let mut get = GetRelationshipOperation::new(record.id, SyncRelationshipDirection::Outgoing);
-        get.start();
-        get.step(page());
-        get
+#[test]
+fn refuses_bad_results() {
+    let record = relationship(1, "source-a", "target-a");
+    let incoming = SyncRelationshipDirection::Incoming;
+    let unexpected = |result: Result<_, SyncRelationshipError>| {
+        matches!(
+            result,
+            Err(SyncRelationshipError::Io(IoError::Unexpected { .. }))
+        )
     };
-    for (_, effects, error) in rejects_events(get, sample_events, |_| false) {
-        assert!(effects.is_empty());
-        assert!(
-            matches!(
-                error,
-                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
-            ),
-            "{error:?}"
-        );
-    }
-
-    let delete = || {
-        let mut delete =
-            DeleteRelationshipOperation::new(record.clone(), SyncRelationshipDirection::Outgoing);
-        delete.start();
-        delete.step(stray());
-        delete
+    let mut store = StoreRelationshipOperation::new(record.clone(), incoming);
+    assert!(unexpected(
+        store.next(IoResult::Values(Vec::new())).map(drop)
+    ));
+    let mut list = ListRelationshipsOperation::new(incoming, None);
+    assert!(unexpected(list.next(IoResult::Done).map(drop)));
+    let mut get = GetRelationshipOperation::new(record.id, incoming);
+    assert!(unexpected(get.next(IoResult::Done).map(drop)));
+    // A row stored under another relationship's key is refused, not returned.
+    let moved = IoResult::Page {
+        rows: vec![(
+            storage_key(incoming, &relationship(2, "s", "t")).unwrap(),
+            ByteView::from(record.to_bytes().unwrap()),
+        )],
+        next: None,
     };
-    for (_, effects, error) in rejects_events(delete, sample_events, |_| false) {
-        assert!(effects.is_empty());
-        assert!(
-            matches!(
-                error,
-                SyncRelationshipError::UnexpectedEvent { .. } | SyncRelationshipError::Storage(_)
-            ),
-            "{error:?}"
-        );
-    }
+    assert!(matches!(
+        list.next(moved),
+        Err(SyncRelationshipError::Conversion(_))
+    ));
+    let storage = SyncRelationshipError::from(IoError::Storage(StorageError::Timeout));
+    assert_eq!(
+        storage,
+        SyncRelationshipError::Storage(StorageError::Timeout)
+    );
 }

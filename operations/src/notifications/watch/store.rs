@@ -3,27 +3,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_USER_CAP, WatchSubscription, watch_subscription_prefix,
 };
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use ulid::Ulid;
 
+use crate::notifications::unexpected;
 use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::records::{
-    WatchReplication, WatchSubscriptionError, watch_subscription_target,
+    WATCH_CAP_REACHED, WatchReplication, WatchSubscriptionError, watch_subscription_target,
 };
 use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
 
 /// What to store.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Change {
     Create(Box<WatchSubscription>),
     Delete { owner: UserId, watch_id: Ulid },
@@ -50,25 +49,110 @@ impl Change {
             Change::Delete { .. } => "delete",
         }
     }
+
+    /// The rows written with the change: the subscription on create, the interest marker,
+    /// and the replication revision and outbox rows on the holder.
+    fn writes(
+        &self,
+        replication: Option<&WatchReplication>,
+    ) -> Result<Vec<(KeySpace, Key, Value)>, String> {
+        let mut writes = Vec::with_capacity(4);
+        if let Change::Create(subscription) = self {
+            writes.push(watch_write_entry(subscription).map_err(|error| error.to_string())?);
+        }
+        writes.push(dirty_marker_write(self.owner().realm_id));
+        if let Some(replication) = replication {
+            let target = watch_subscription_target(self.owner(), self.watch_id());
+            let revision = sync_revision_entry(&target, &replication.revision)
+                .map_err(|error| error.to_string())?;
+            let outbox =
+                outbox_write_entry(&replication.outbox).map_err(|error| error.to_string())?;
+            writes.push(revision);
+            writes.push(outbox);
+        }
+        Ok(writes)
+    }
 }
 
 #[derive(Debug, Default, PartialEq)]
-enum StoreState {
-    #[default]
-    Init,
-    Start,
+enum RowsState {
     /// Create: counts the owner's watches against the per-user cap.
-    Count(TxnId),
+    #[default]
+    Count,
     /// Delete: reads the row so a missing watch changes nothing.
-    Read(TxnId),
-    Remove(TxnId),
-    Write(TxnId),
-    Commit,
-    /// Waits for the abort before it ends with `then`, or runs once more.
-    Abort(Option<Result<bool, WatchSubscriptionError>>),
-    Schedule,
-    Done(bool),
-    Failed(WatchSubscriptionError),
+    Read,
+    Remove,
+    Write,
+}
+
+/// The rows of one change in one transaction; the output is whether anything changed.
+#[derive(Debug, PartialEq)]
+struct WatchRowsOperation {
+    change: Change,
+    replication: Option<WatchReplication>,
+    state: RowsState,
+}
+
+impl WatchRowsOperation {
+    fn write(&mut self) -> Result<Next<bool>, WatchSubscriptionError> {
+        let writes = self
+            .change
+            .writes(self.replication.as_ref())
+            .map_err(WatchSubscriptionError::Storage)?;
+        self.state = RowsState::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for WatchRowsOperation {
+    type Output = bool;
+    type Error = WatchSubscriptionError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let call = match &self.change {
+            Change::Create(subscription) => {
+                self.state = RowsState::Count;
+                IoCall::Page {
+                    space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+                    prefix: watch_subscription_prefix(subscription.owner),
+                    after: None,
+                    limit: WATCH_USER_CAP.saturating_add(1),
+                }
+            }
+            Change::Delete { owner, watch_id } => {
+                let (key_space, key) = watch_delete_entry(*owner, *watch_id);
+                self.state = RowsState::Read;
+                IoCall::Read(vec![(key_space, key)])
+            }
+        };
+        Ok(Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match (std::mem::take(&mut self.state), result) {
+            (RowsState::Count, IoResult::Page { rows, .. }) => {
+                if rows.len() >= WATCH_USER_CAP {
+                    return Err(WatchSubscriptionError::CapExceeded);
+                }
+                self.write()
+            }
+            (RowsState::Read, IoResult::Values(values)) => {
+                if values.into_iter().flatten().next().is_none() {
+                    return Ok(Next::Done(false));
+                }
+                let row = watch_delete_entry(self.change.owner(), self.change.watch_id());
+                self.state = RowsState::Remove;
+                Ok(Next::Call(IoCall::Delete(vec![row])))
+            }
+            (RowsState::Remove, IoResult::Done) => self.write(),
+            (RowsState::Write, IoResult::Done) => Ok(Next::Done(true)),
+            (_, other) => Err(unexpected("a watch row result", &other).into()),
+        }
+    }
+
+    fn transaction(&self) -> bool {
+        true
+    }
 }
 
 /// Creates or deletes one watch in one transaction with the realm's interest marker and, on the
@@ -79,7 +163,6 @@ pub struct StoreWatchOperation {
     change: Change,
     replication: Option<WatchReplication>,
     retried: bool,
-    state: StoreState,
 }
 
 impl StoreWatchOperation {
@@ -96,403 +179,174 @@ impl StoreWatchOperation {
             change,
             replication,
             retried: false,
-            state: StoreState::Init,
         }
     }
 
-    fn begin(&mut self) -> Effects {
-        self.state = StoreState::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn txn(&self) -> Option<TxnId> {
-        match self.state {
-            StoreState::Count(txn_id)
-            | StoreState::Read(txn_id)
-            | StoreState::Remove(txn_id)
-            | StoreState::Write(txn_id) => Some(txn_id),
-            _ => None,
-        }
-    }
-
-    /// Aborts the open transaction, then ends with `then` or runs once more on `None`.
-    fn abort_then(
-        &mut self,
-        txn_id: TxnId,
-        then: Option<Result<bool, WatchSubscriptionError>>,
-    ) -> Effects {
-        self.state = StoreState::Abort(then);
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    /// A conflict runs once more; a second one or any other error ends the store.
-    fn storage_failed(&mut self, txn_id: Option<TxnId>, error: StorageError) -> Effects {
-        let outcome = match error {
-            StorageError::TransactionConflict if !self.retried => {
-                self.retried = true;
-                None
-            }
-            StorageError::TransactionConflict => Some(Err(WatchSubscriptionError::Storage(
-                format!("watch subscription {} conflicted twice", self.change.name()),
-            ))),
-            error => Some(Err(WatchSubscriptionError::Storage(error.to_string()))),
+    /// The rows run as a child, so the drain is scheduled only after their commit.
+    fn rows(&self) -> Next<bool> {
+        let rows = WatchRowsOperation {
+            change: self.change.clone(),
+            replication: self.replication.clone(),
+            state: RowsState::Count,
         };
-        match (txn_id, outcome) {
-            (Some(txn_id), outcome) => self.abort_then(txn_id, outcome),
-            (None, None) => self.begin(),
-            (None, Some(outcome)) => self.finish(outcome),
-        }
+        Next::Call(IoCall::Child(boxed_suboperation(rows, |result| {
+            let result = result.map_err(|error| error.to_string());
+            Event::SubOperation(SubOperationEvent::WatchStored { result })
+        })))
     }
 
-    fn finish(&mut self, outcome: Result<bool, WatchSubscriptionError>) -> Effects {
-        match outcome {
-            Ok(changed) if changed && self.replication.is_some() => {
-                self.state = StoreState::Schedule;
-                smallvec![schedule_drain_effect()]
+    /// The typed error of a stored failure; a first conflict runs the rows once more.
+    fn failed(&mut self, error: String) -> Result<Next<bool>, WatchSubscriptionError> {
+        if error == IoError::Conflict.to_string() {
+            if !self.retried {
+                self.retried = true;
+                return Ok(self.rows());
             }
-            Ok(changed) => {
-                self.state = StoreState::Done(changed);
-                smallvec![]
-            }
-            Err(error) => {
-                self.state = StoreState::Failed(error);
-                smallvec![]
-            }
+            let name = self.change.name();
+            let error = format!("watch subscription {name} conflicted twice");
+            return Err(WatchSubscriptionError::Storage(error));
         }
-    }
-
-    fn fatal(&mut self, txn_id: TxnId, error: impl ToString) -> Effects {
-        let error = WatchSubscriptionError::Storage(error.to_string());
-        self.abort_then(txn_id, Some(Err(error)))
-    }
-
-    /// The rows written with the change: the subscription on create, the interest marker, and
-    /// the replication revision and outbox rows on the holder.
-    fn writes(&self) -> Result<Vec<(KeySpace, Key, Value)>, String> {
-        let mut writes = Vec::with_capacity(4);
-        if let Change::Create(subscription) = &self.change {
-            writes.push(watch_write_entry(subscription).map_err(|error| error.to_string())?);
-        }
-        writes.push(dirty_marker_write(self.change.owner().realm_id));
-        if let Some(replication) = &self.replication {
-            let target = watch_subscription_target(self.change.owner(), self.change.watch_id());
-            let revision = sync_revision_entry(&target, &replication.revision)
-                .map_err(|error| error.to_string())?;
-            let outbox =
-                outbox_write_entry(&replication.outbox).map_err(|error| error.to_string())?;
-            writes.push(revision);
-            writes.push(outbox);
-        }
-        Ok(writes)
-    }
-
-    fn write(&mut self, txn_id: TxnId) -> Effects {
-        match self.writes() {
-            Ok(writes) => {
-                self.state = StoreState::Write(txn_id);
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Err(error) => self.fatal(txn_id, error),
-        }
-    }
-
-    fn started(&mut self, txn_id: TxnId) -> Effects {
-        match &self.change {
-            Change::Create(subscription) => {
-                let prefix = watch_subscription_prefix(subscription.owner);
-                self.state = StoreState::Count(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                    prefix: Some(prefix),
-                    start: None,
-                    limit: WATCH_USER_CAP.saturating_add(1),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Change::Delete { owner, watch_id } => {
-                let (_, key) = watch_delete_entry(*owner, *watch_id);
-                self.state = StoreState::Read(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                    key,
-                    txn_id: Some(txn_id),
-                })]
-            }
+        match error == WATCH_CAP_REACHED {
+            true => Err(WatchSubscriptionError::CapExceeded),
+            false => Err(WatchSubscriptionError::Storage(error)),
         }
     }
 }
 
-impl EffectOperation for StoreWatchOperation {
+impl Operation for StoreWatchOperation {
     type Output = bool;
     type Error = WatchSubscriptionError;
 
-    fn start(&mut self) -> Effects {
-        self.begin()
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(self.rows())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let txn_id = self.txn();
-        match (std::mem::take(&mut self.state), event) {
-            (StoreState::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.started(txn_id)
-            }
-            (
-                StoreState::Count(txn_id),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => {
-                if values.len() >= WATCH_USER_CAP {
-                    return self.abort_then(txn_id, Some(Err(WatchSubscriptionError::CapExceeded)));
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        match result {
+            IoResult::Event(Event::SubOperation(SubOperationEvent::WatchStored { result })) => {
+                match result {
+                    Ok(true) if self.replication.is_some() => {
+                        Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
+                    }
+                    Ok(changed) => Ok(Next::Done(changed)),
+                    Err(error) => self.failed(error),
                 }
-                self.write(txn_id)
             }
-            (StoreState::Read(txn_id), Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if value.is_none() {
-                    return self.abort_then(txn_id, Some(Ok(false)));
-                }
-                let (key_space, key) =
-                    watch_delete_entry(self.change.owner(), self.change.watch_id());
-                self.state = StoreState::Remove(txn_id);
-                smallvec![Effect::Storage(StorageEffect::Delete {
-                    key_space,
-                    key,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (StoreState::Remove(txn_id), Event::Storage(StorageEvent::DeleteResult { .. })) => {
-                self.write(txn_id)
-            }
-            (StoreState::Write(txn_id), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.state = StoreState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (StoreState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.finish(Ok(true))
-            }
-            (StoreState::Abort(then), Event::Storage(_)) => match then {
-                Some(outcome) => self.finish(outcome),
-                None => self.begin(),
-            },
             // The changes are stored; a failed schedule waits for the drain's own re-arm.
-            (StoreState::Schedule, Event::Task(_)) => {
-                self.state = StoreState::Done(true);
-                smallvec![]
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => {
-                self.storage_failed(txn_id, error)
-            }
-            (_, other) => {
-                let error = format!("unexpected storage event: {other:?}");
-                match txn_id {
-                    Some(txn_id) => self.fatal(txn_id, error),
-                    None => self.finish(Err(WatchSubscriptionError::Storage(error))),
-                }
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, StoreState::Done(_) | StoreState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            StoreState::Done(changed) => Ok(changed),
-            StoreState::Failed(error) => Err(error),
-            _ => Err(WatchSubscriptionError::Storage(
-                "the watch store did not finish".to_string(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            IoResult::Event(Event::Task(_)) => Ok(Next::Done(true)),
+            other => Err(unexpected("SubOperationEvent::WatchStored", &other).into()),
         }
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::notifications::user;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
-
-    const TXN: TxnId = TxnId::from_parts(4, 4);
 
     fn subscription() -> WatchSubscription {
         let mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
         WatchSubscription::new(user(1, 2), "meta/x".to_string(), mask, 1_000)
     }
 
-    fn conflict() -> Event {
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })
+    fn rows(change: Change) -> WatchRowsOperation {
+        WatchRowsOperation {
+            change,
+            replication: None,
+            state: RowsState::Count,
+        }
+    }
+
+    fn stored(result: Result<bool, String>) -> IoResult {
+        IoResult::Event(Event::SubOperation(SubOperationEvent::WatchStored {
+            result,
+        }))
     }
 
     #[test]
-    fn missing_delete_trace() {
+    fn missing_delete_calls() {
         let owner = user(1, 2);
         let watch_id = Ulid::from_parts(9, 9);
-        let (_, key) = watch_delete_entry(owner, watch_id);
-        let mut store = StoreWatchOperation::delete(owner, watch_id, None);
-        check_trace(
-            &mut store,
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })],
-            vec![
-                (
-                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
-                    vec![Effect::Storage(StorageEffect::Read {
-                        key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                        key: key.clone(),
-                        txn_id: Some(TXN),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::ReadResult { key, value: None }),
-                    vec![Effect::Storage(StorageEffect::AbortTransaction {
-                        txn_id: TXN,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::TransactionAborted { txn_id: TXN }),
-                    vec![],
-                ),
-            ],
+        let mut rows = rows(Change::Delete { owner, watch_id });
+        assert!(rows.transaction());
+        let (space, key) = watch_delete_entry(owner, watch_id);
+        assert_eq!(
+            rows.first(),
+            Ok(Next::Call(IoCall::Read(vec![(space, key)])))
         );
-        assert_eq!(store.finalize(), Ok(false));
+        assert_eq!(
+            rows.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
+        );
     }
 
     #[test]
     fn cap_reached_refused() {
-        let mut store = StoreWatchOperation::create(subscription(), None);
-        store.start();
-        store.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        let rows = (0..WATCH_USER_CAP)
+        let mut rows = rows(Change::Create(Box::new(subscription())));
+        rows.first().unwrap();
+        let full = (0..WATCH_USER_CAP)
             .map(|at| (Key::from(vec![at as u8]), Value::from(vec![1])))
             .collect();
-        let abort = store.step(Event::Storage(StorageEvent::IterResult {
-            values: rows,
-            next_start_after: None,
-        }));
-        assert_eq!(
-            abort.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TXN
-            })]
-        );
-        store.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TXN,
-        }));
-        assert_eq!(store.finalize(), Err(WatchSubscriptionError::CapExceeded));
+        let page = IoResult::Page {
+            rows: full,
+            next: None,
+        };
+        assert_eq!(rows.next(page), Err(WatchSubscriptionError::CapExceeded));
+    }
+
+    #[test]
+    fn create_writes_rows() {
+        let mut rows = rows(Change::Create(Box::new(subscription())));
+        rows.first().unwrap();
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let Ok(Next::Call(IoCall::Write(writes))) = rows.next(empty) else {
+            panic!("one write");
+        };
+        assert_eq!(writes.len(), 2);
+        assert_eq!(rows.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
     #[test]
     fn conflict_runs_twice() {
         let mut store = StoreWatchOperation::create(subscription(), None);
-        store.start();
-        store.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        store.step(conflict());
-        let again = store.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TXN,
-        }));
-        assert_eq!(
-            again.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
-        store.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        store.step(conflict());
-        store.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: TXN,
-        }));
+        assert!(matches!(store.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let conflict = || stored(Err(IoError::Conflict.to_string()));
         assert!(matches!(
-            store.finalize(),
+            store.next(conflict()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(
+            store.next(conflict()),
             Err(WatchSubscriptionError::Storage(_))
         ));
+        let mut capped = StoreWatchOperation::create(subscription(), None);
+        capped.first().unwrap();
+        let full = stored(Err(WATCH_CAP_REACHED.to_string()));
+        assert_eq!(capped.next(full), Err(WatchSubscriptionError::CapExceeded));
     }
 
     #[test]
-    fn create_writes_rows() {
+    fn holder_schedules_drain() {
         let mut store = StoreWatchOperation::create(subscription(), None);
-        store.start();
-        store.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        let write = store.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = write.as_slice()
-        else {
-            panic!("one batch write: {write:?}");
-        };
-        assert_eq!((writes.len(), *txn_id), (2, Some(TXN)));
-        let commit = store.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        store.first().unwrap();
+        assert_eq!(store.next(stored(Ok(true))), Ok(Next::Done(true)));
+        let mut holder = StoreWatchOperation::create(subscription(), None);
+        holder.replication = Some(
+            crate::notifications::watch::records::watch_delete_replication(
+                crate::tests::locations::node_id(1),
+                user(1, 2),
+                Ulid::from_parts(9, 9),
+                1_000,
+            ),
+        );
+        holder.first().unwrap();
         assert_eq!(
-            commit.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: TXN
-            })]
+            holder.next(stored(Ok(true))),
+            Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
         );
-        store.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TXN,
-        }));
-        assert_eq!(store.finalize(), Ok(true));
-    }
-
-    #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut store = StoreWatchOperation::create(subscription(), None);
-            store.start();
-            store
-        };
-        let expected = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(
-                    StorageEvent::TransactionStarted { .. } | StorageEvent::Error { .. }
-                )
-            )
-        };
-        assert!(!rejects_events(make, sample_events, expected).is_empty());
-    }
-
-    #[test]
-    fn abort_per_phase() {
-        let mut store = StoreWatchOperation::create(subscription(), None);
-        store.start();
-        check_abort(&mut store, &[]);
-        store.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TXN,
-        }));
-        check_abort(
-            &mut store,
-            &[Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TXN,
-            })],
-        );
-        rejects_finalize(store);
     }
 }

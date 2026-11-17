@@ -2,19 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, parse_connector_read, parse_secret_read, read_connector_effect,
-    read_secret_effect,
+    StorageReadError, parse_secret_read, read_secret_effect, source_connector_key,
 };
+use crate::storage_read::decode_row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetSourceInput {
@@ -28,15 +29,6 @@ pub struct GetSourceResult {
     pub has_secret_config: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetSourceState {
-    Init,
-    ReadConnector,
-    ReadSecret,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum GetSourceError {
     #[error(transparent)]
@@ -45,8 +37,6 @@ pub enum GetSourceError {
     ConversionError(#[from] ConversionError),
     #[error("Connector not found")]
     NotFound,
-    #[error("GetSourceConnector failed")]
-    GetConnectorFailed,
 }
 
 impl From<StorageReadError> for GetSourceError {
@@ -58,106 +48,49 @@ impl From<StorageReadError> for GetSourceError {
     }
 }
 
+impl From<IoError> for GetSourceError {
+    fn from(error: IoError) -> Self {
+        StorageReadError::from(error).into()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct GetSourceOperation {
     input: GetSourceInput,
-    state: GetSourceState,
     connector: Option<SourceConnector>,
-    has_secret_config: bool,
-    output: Option<Result<GetSourceResult, GetSourceError>>,
 }
 
 impl GetSourceOperation {
     pub fn new(input: GetSourceInput) -> Self {
         Self {
             input,
-            state: GetSourceState::Init,
             connector: None,
-            has_secret_config: false,
-            output: None,
-        }
-    }
-
-    fn emit_error(&mut self, error: GetSourceError) -> Effects {
-        self.state = GetSourceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = GetSourceState::ReadConnector;
-        smallvec![read_connector_effect(
-            self.input.group_id,
-            self.input.connector_id,
-            None,
-        )]
-    }
-
-    fn handle_connector_read(&mut self, event: Event) -> Effects {
-        match parse_connector_read(event) {
-            Ok(Some(connector)) => {
-                self.connector = Some(connector);
-                self.state = GetSourceState::ReadSecret;
-                smallvec![read_secret_effect(self.input.connector_id, None)]
-            }
-            Ok(None) => self.emit_error(GetSourceError::NotFound),
-            Err(error) => self.emit_error(error.into()),
-        }
-    }
-
-    fn handle_secret_read(&mut self, event: Event) -> Effects {
-        match parse_secret_read(event, self.input.connector_id) {
-            Ok(secret) => {
-                self.has_secret_config = secret.is_some();
-                let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(GetSourceError::GetConnectorFailed);
-                };
-                self.state = GetSourceState::Finish;
-                self.output = Some(Ok(GetSourceResult {
-                    connector,
-                    has_secret_config: self.has_secret_config,
-                }));
-                smallvec![]
-            }
-            Err(error) => self.emit_error(error.into()),
         }
     }
 }
 
-impl EffectOperation for GetSourceOperation {
+impl Operation for GetSourceOperation {
     type Output = GetSourceResult;
     type Error = GetSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<Self::Output>, GetSourceError> {
+        Ok(Next::Call(rows::read_row(
+            SOURCE_INDEX_KEYSPACE,
+            source_connector_key(self.input.group_id, self.input.connector_id),
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            GetSourceState::Init => self.handle_init(),
-            GetSourceState::ReadConnector => self.handle_connector_read(event),
-            GetSourceState::ReadSecret => self.handle_secret_read(event),
-            GetSourceState::Finish => smallvec![],
-            GetSourceState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetSourceState::Finish | GetSourceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetSourceState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(GetSourceError::GetConnectorFailed);
-        }
-
-        self.output.ok_or(GetSourceError::GetConnectorFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, GetSourceError> {
+        let Some(connector) = self.connector.take() else {
+            let connector = decode_row(rows::value(result)?, SourceConnector::from_bytes)?;
+            self.connector = Some(connector.ok_or(GetSourceError::NotFound)?);
+            let read = read_secret_effect(self.input.connector_id, None);
+            return Ok(Next::Call(IoCall::Effect(Box::new(read))));
+        };
+        let secret = parse_secret_read(rows::event(result)?, self.input.connector_id)?;
+        Ok(Next::Done(GetSourceResult {
+            connector,
+            has_secret_config: secret.is_some(),
+        }))
     }
 }

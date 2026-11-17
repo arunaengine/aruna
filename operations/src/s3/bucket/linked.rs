@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::driver::DriverContext;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -11,7 +12,7 @@ use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE, LINKED_JOB_KEYSPACE,
     RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
@@ -57,6 +58,18 @@ pub enum LinkedError {
     Conversion(#[from] ConversionError),
     #[error("unexpected event in a bucket job change")]
     Unexpected,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for LinkedError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// The rows a bucket job change reads, in this order.
@@ -340,58 +353,34 @@ impl EffectOperation for BucketJobOperation {
 #[derive(Debug, PartialEq)]
 pub struct ShownJobOperation {
     bucket: String,
-    result: Option<Result<Option<BucketJob>, LinkedError>>,
 }
 
 impl ShownJobOperation {
     pub fn new(bucket: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
-            result: None,
         }
     }
 }
 
-impl EffectOperation for ShownJobOperation {
+impl Operation for ShownJobOperation {
     type Output = Option<BucketJob>;
     type Error = LinkedError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Option<BucketJob>>, LinkedError> {
         let mut reads = reads(&self.bucket);
         reads.drain(..2);
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.result = Some(match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                shown_job(values).map_err(LinkedError::from)
-            }
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            _ => Err(LinkedError::Unexpected),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Option<BucketJob>, LinkedError> {
-        self.result.unwrap_or(Err(LinkedError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<BucketJob>>, LinkedError> {
+        Ok(Next::Done(shown_job(result.values()?)?))
     }
 }
 
 /// The shown job of the linked job, migration and rename rows, read in that order.
-fn shown_job(values: Vec<(Key, Option<Value>)>) -> Result<Option<BucketJob>, ConversionError> {
-    let mut values = values.into_iter().map(|(_, value)| value);
+fn shown_job(values: Vec<Option<Value>>) -> Result<Option<BucketJob>, ConversionError> {
+    let mut values = values.into_iter();
     let mut next = || values.next().flatten();
     let (linked, migration, rename) = (next(), next(), next());
     let linked = linked.as_deref().map(LinkedJob::from_bytes).transpose()?;
@@ -435,7 +424,6 @@ fn shown_job(values: Vec<(Key, Option<Value>)>) -> Result<Option<BucketJob>, Con
 pub struct RenameTotalOperation {
     bucket: String,
     started_at_ms: u64,
-    result: Option<Result<Option<u64>, LinkedError>>,
 }
 
 impl RenameTotalOperation {
@@ -443,46 +431,31 @@ impl RenameTotalOperation {
         Self {
             bucket: bucket.to_string(),
             started_at_ms,
-            result: None,
         }
     }
 }
 
-impl EffectOperation for RenameTotalOperation {
+impl Operation for RenameTotalOperation {
     type Output = Option<u64>;
     type Error = LinkedError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: RENAME_TOTAL_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().to_vec().into(),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<Option<u64>>, LinkedError> {
+        let key: Key = self.bucket.as_bytes().to_vec().into();
+        Ok(Next::Call(IoCall::Read(vec![(
+            RENAME_TOTAL_KEYSPACE.to_string(),
+            key,
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.result = Some(match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let row = value.as_deref().map(RenameTotal::from_bytes).transpose();
-                row.map(|row| row.and_then(|row| row.for_move(self.started_at_ms)))
-                    .map_err(LinkedError::from)
-            }
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            _ => Err(LinkedError::Unexpected),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Option<u64>, LinkedError> {
-        self.result.unwrap_or(Err(LinkedError::Unexpected))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<u64>>, LinkedError> {
+        let row = result
+            .value()?
+            .as_deref()
+            .map(RenameTotal::from_bytes)
+            .transpose()?;
+        Ok(Next::Done(
+            row.and_then(|row| row.for_move(self.started_at_ms)),
+        ))
     }
 }
 

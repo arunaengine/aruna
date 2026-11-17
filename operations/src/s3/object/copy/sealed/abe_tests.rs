@@ -12,6 +12,7 @@ use aruna_core::keyspaces::{
     ABE_EPOCH_KEYSPACE, ABE_PARAMETERS_KEYSPACE, ABE_REKEY_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BUCKET_KEY_KEYSPACE,
 };
+use aruna_core::operation::Runnable;
 use aruna_core::structs::storage::abe::{
     EnvelopeArchive, EnvelopePlan, check_copy, copy_envelope, create_envelope, create_parameters,
 };
@@ -200,7 +201,7 @@ async fn envelope_of(
     version_id: Ulid,
 ) -> Result<(ObjectEnvelope, EnvelopeArchive), AbeError> {
     let operation = EnvelopeOperation::new("bucket".to_string(), key.to_string(), version_id);
-    run(operation, storage, None, Race::Off).await
+    run(operation.into_machine(), storage, None, Race::Off).await
 }
 
 /// The pending row of a version, whatever bucket key prefixes it.

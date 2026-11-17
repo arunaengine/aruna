@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_HOOKS_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{PluginRun, hook_key, hook_time_key};
 use ulid::Ulid;
 
-use super::rows::{Answer, Ask, Plan, Row, Turn, done, encode, row, values};
+use super::rows::{Row, done, encode, read_call, row, values};
 use super::runs::{Admission, RunError};
 
 /// Headers removed before a request is stored: hop-by-hop ones and the relay mark. The check
@@ -85,46 +87,50 @@ impl AdmitHook {
     }
 }
 
-impl Plan for AdmitHook {
+impl Operation for AdmitHook {
     type Output = bool;
     type Error = RunError;
 
-    fn first(&mut self) -> Result<Turn<bool>, RunError> {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, RunError> {
         match &self.delivery {
-            Some((key, _)) => Ok(Turn::Ask(Ask::Read(vec![(
+            Some((key, _)) => Ok(Next::Call(read_call(vec![(
                 PLUGIN_HOOKS_KEYSPACE,
                 key.clone(),
             )]))),
             None => {
                 self.phase = HookPhase::Admitting;
-                Ok(Turn::Ask(self.admission.ask()))
+                Ok(Next::Call(self.admission.ask()))
             }
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, RunError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, RunError> {
         match self.phase {
             HookPhase::Seen => {
                 let [seen] = values::<1>(answer)?;
                 if seen.is_some() {
-                    return Ok(Turn::Finish(false));
+                    return Ok(Next::Done(false));
                 }
                 self.phase = HookPhase::Admitting;
-                Ok(Turn::Ask(self.admission.ask()))
+                Ok(Next::Call(self.admission.ask()))
             }
             HookPhase::Admitting => {
                 let Some(mut rows) = self.admission.take(answer)? else {
-                    return Ok(Turn::Ask(self.admission.ask()));
+                    return Ok(Next::Call(self.admission.ask()));
                 };
                 if let Some((_, delivery)) = self.delivery.take() {
                     rows.splice(0..0, delivery);
                 }
                 self.phase = HookPhase::Writing;
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             HookPhase::Writing => {
                 done(answer)?;
-                Ok(Turn::Finish(true))
+                Ok(Next::Done(true))
             }
         }
     }

@@ -5,24 +5,14 @@
 use super::LocationSummaryError;
 use crate::replication::version_replication::map_sync_key;
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, sync_relationship_prefix};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
 use std::collections::BTreeSet;
 
 const RELATIONSHIP_PAGE_SIZE: usize = 256;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RelationshipState {
-    Init,
-    Scan,
-    Finish,
-    Error,
-}
 
 /// One destination a copy of this version lands on: the node, plus the bucket
 /// and key it is stored under there. Two relationships to one node with
@@ -43,33 +33,23 @@ pub struct RelationshipNodesOperation {
     bucket: String,
     key: String,
     delete_marker: bool,
+    pages: PrefixPages,
     found: BTreeSet<ReplicaTarget>,
-    state: RelationshipState,
-    output: Option<Result<BTreeSet<ReplicaTarget>, LocationSummaryError>>,
 }
+
+type Targets = BTreeSet<ReplicaTarget>;
 
 impl RelationshipNodesOperation {
     pub fn new(local_node: NodeId, bucket: String, key: String, delete_marker: bool) -> Self {
+        let prefix = sync_relationship_prefix(&bucket);
         Self {
             local_node,
             bucket,
             key,
             delete_marker,
+            pages: PrefixPages::new(RELATIONSHIP_OUT_KEYSPACE, prefix, RELATIONSHIP_PAGE_SIZE),
             found: BTreeSet::new(),
-            state: RelationshipState::Init,
-            output: None,
         }
-    }
-
-    fn scan(&mut self, start_after: Option<Key>) -> Effects {
-        self.state = RelationshipState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
-            prefix: Some(sync_relationship_prefix(&self.bucket).into()),
-            start: start_after.map(IterStart::After),
-            limit: RELATIONSHIP_PAGE_SIZE,
-            txn_id: None,
-        })]
     }
 
     /// The live queue's admission rule minus loop guards needing a write origin this
@@ -97,83 +77,37 @@ impl RelationshipNodesOperation {
             )?,
         })
     }
-
-    fn fail(&mut self, error: LocationSummaryError) -> Effects {
-        self.state = RelationshipState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
 }
 
-impl EffectOperation for RelationshipNodesOperation {
-    type Output = BTreeSet<ReplicaTarget>;
+impl Operation for RelationshipNodesOperation {
+    type Output = Targets;
     type Error = LocationSummaryError;
 
-    fn start(&mut self) -> Effects {
-        self.scan(None)
+    fn first(&mut self) -> Result<Next<Targets>, LocationSummaryError> {
+        Ok(Next::Call(self.pages.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            RelationshipState::Init => self.start(),
-            RelationshipState::Scan => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return self.fail(LocationSummaryError::Unexpected {
-                        state: "relationship_scan",
-                        event: event.label().to_string(),
-                    });
-                };
-                for (_, value) in values {
-                    let relationship = match SyncRelationship::from_bytes(value.as_ref()) {
-                        Ok(relationship) => relationship,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    if let Some(target) = self.target_of(&relationship) {
-                        self.found.insert(target);
-                    }
-                }
-                match next_start_after {
-                    Some(start) => self.scan(Some(start)),
-                    None => {
-                        self.state = RelationshipState::Finish;
-                        self.output = Some(Ok(std::mem::take(&mut self.found)));
-                        smallvec![]
-                    }
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<Targets>, LocationSummaryError> {
+        for (_, value) in self.pages.take(result)? {
+            let relationship = SyncRelationship::from_bytes(value.as_ref())?;
+            if let Some(target) = self.target_of(&relationship) {
+                self.found.insert(target);
             }
-            RelationshipState::Finish | RelationshipState::Error => smallvec![],
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RelationshipState::Finish | RelationshipState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LocationSummaryError::Unexpected {
-            state: "finalize",
-            event: "relationship scan ended without an answer".to_string(),
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.found)))
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
+    use super::{LocationSummaryError, Targets};
     use super::{RelationshipNodesOperation, ReplicaTarget};
     use crate::tests::locations::{node_id, realm_id};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::storage::replication::ArunaArn;
     use aruna_core::structs::{
         ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
@@ -196,14 +130,21 @@ mod pure_tests {
         }
     }
 
-    fn page(relationship: &SyncRelationship) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: vec![(
+    fn page(relationship: &SyncRelationship) -> IoResult {
+        IoResult::Page {
+            rows: vec![(
                 b"k".to_vec().into(),
                 relationship.to_bytes().unwrap().into(),
             )],
-            next_start_after: None,
-        })
+            next: None,
+        }
+    }
+
+    fn finished(done: Result<Next<Targets>, LocationSummaryError>) -> Targets {
+        match done {
+            Ok(Next::Done(targets)) => targets,
+            other => panic!("expected the targets, got {other:?}"),
+        }
     }
 
     fn operation(delete_marker: bool) -> RelationshipNodesOperation {
@@ -220,12 +161,12 @@ mod pure_tests {
         // The copy lands in the relationship's target bucket, so that is the
         // bucket the destination has to be asked about.
         let mut op = operation(false);
-        op.start();
+        let _ = op.first();
 
-        op.step(page(&link("raw", "mirror", true)));
+        let done = op.next(page(&link("raw", "mirror", true)));
 
         assert_eq!(
-            op.finalize().unwrap().into_iter().collect::<Vec<_>>(),
+            finished(done).into_iter().collect::<Vec<_>>(),
             vec![ReplicaTarget {
                 node_id: node_id(6),
                 bucket: "mirror".to_string(),
@@ -244,17 +185,17 @@ mod pure_tests {
             "photos/a.jpg".to_string(),
             false,
         );
-        op.start();
+        let _ = op.first();
         let mut relationship = link("raw", "archive", true);
         relationship.source =
             ArunaArn::s3_object_prefix(realm_id(), node_id(4), "raw", "photos/").unwrap();
         relationship.target =
             ArunaArn::s3_object_prefix(realm_id(), node_id(6), "archive", "images/").unwrap();
 
-        op.step(page(&relationship));
+        let done = op.next(page(&relationship));
 
         assert_eq!(
-            op.finalize().unwrap().into_iter().collect::<Vec<_>>(),
+            finished(done).into_iter().collect::<Vec<_>>(),
             vec![ReplicaTarget {
                 node_id: node_id(6),
                 bucket: "archive".to_string(),
@@ -273,22 +214,22 @@ mod pure_tests {
             "photos/a.jpg".to_string(),
             false,
         );
-        op.start();
+        let _ = op.first();
         let mut second = link("raw", "second", true);
         second.id = Ulid::from_bytes([2u8; 16]);
 
-        op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let done = op.next(IoResult::Page {
+            rows: vec![
                 (
                     b"a".to_vec().into(),
                     link("raw", "mirror", true).to_bytes().unwrap().into(),
                 ),
                 (b"b".to_vec().into(), second.to_bytes().unwrap().into()),
             ],
-            next_start_after: None,
-        }));
+            next: None,
+        });
 
-        let targets = op.finalize().unwrap();
+        let targets = finished(done);
         assert_eq!(targets.len(), 2);
         assert!(targets.iter().all(|target| target.node_id == node_id(6)));
     }
@@ -296,36 +237,36 @@ mod pure_tests {
     #[test]
     fn skips_declined_markers() {
         let mut op = operation(true);
-        op.start();
+        let _ = op.first();
 
-        op.step(page(&link("raw", "mirror", false)));
+        let done = op.next(page(&link("raw", "mirror", false)));
 
-        assert!(op.finalize().unwrap().is_empty());
+        assert!(finished(done).is_empty());
     }
 
     #[test]
     fn skips_paused_link() {
         let mut op = operation(false);
-        op.start();
+        let _ = op.first();
         let mut relationship = link("raw", "mirror", true);
         relationship.state = SyncState::Paused;
 
-        op.step(page(&relationship));
+        let done = op.next(page(&relationship));
 
-        assert!(op.finalize().unwrap().is_empty());
+        assert!(finished(done).is_empty());
     }
 
     #[test]
     fn skips_other_prefix() {
         // A relationship scoped to a prefix the key is not under places no copy.
         let mut op = operation(false);
-        op.start();
+        let _ = op.first();
         let mut relationship = link("raw", "mirror", true);
         relationship.source =
             ArunaArn::s3_object_prefix(realm_id(), node_id(4), "raw", "other/").unwrap();
 
-        op.step(page(&relationship));
+        let done = op.next(page(&relationship));
 
-        assert!(op.finalize().unwrap().is_empty());
+        assert!(finished(done).is_empty());
     }
 }

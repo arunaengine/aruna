@@ -2080,6 +2080,9 @@ async fn sharing_now(
 mod tests {
     use super::*;
     use crate::jobs::blob_request::BlobRequest;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::effects::Effect;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::storage::backend_import::intent_key;
 
     #[test]
@@ -2153,37 +2156,37 @@ mod tests {
         }
     }
 
-    fn listed() -> Event {
-        Event::Blob(BlobEvent::ExternalListed {
+    fn listed() -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(BlobEvent::ExternalListed {
             objects: Vec::new(),
             next: None,
-        })
+        })))
     }
 
     #[test]
     fn checks_blob_answers() {
         let mut request = BlobRequest::new(listing());
-        assert_eq!(request.start().len(), 1);
-        request.step(listed());
-        assert!(request.is_complete());
-        assert!(request.finalize().is_ok());
+        assert_eq!(
+            request.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(listing())))))
+        );
+        assert!(matches!(
+            request.next(listed()),
+            Ok(Next::Done(BlobEvent::ExternalListed { .. }))
+        ));
 
         // Another kind of answer does not end a listing.
         let mut request = BlobRequest::new(listing());
-        request.start();
-        request.step(Event::Blob(BlobEvent::DeleteFinished));
-        assert!(request.is_complete());
-        assert!(request.finalize().is_err());
+        request.first().expect("listing call");
+        let deleted = IoResult::Event(Box::new(Event::Blob(BlobEvent::DeleteFinished)));
+        assert!(request.next(deleted).is_err());
 
-        // Events before the request is sent or after its answer are refused.
+        // A request is sent once, and an answer after its answer is refused.
         let mut request = BlobRequest::new(listing());
-        request.step(listed());
-        assert!(request.finalize().is_err());
-        let mut request = BlobRequest::new(listing());
-        request.start();
-        request.step(listed());
-        request.step(listed());
-        assert!(request.finalize().is_err());
+        request.first().expect("listing call");
+        request.next(listed()).expect("listing answer");
+        assert!(request.next(listed()).is_err());
+        assert!(request.first().is_err());
     }
 
     #[test]

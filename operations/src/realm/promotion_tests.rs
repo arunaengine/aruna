@@ -4,8 +4,6 @@
 
 use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
-use aruna_core::types::Key;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 
@@ -32,14 +30,11 @@ fn pem(key: &SigningKey) -> RealmKeyPem {
     RealmKeyPem(key.to_pkcs8_pem(LineEnding::default()).unwrap().to_string())
 }
 
-fn stored(value: Option<Value>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value,
-    })
+fn stored(value: Option<Value>) -> IoResult {
+    IoResult::Values(vec![value])
 }
 
-fn config_row(document: &RealmConfigDocument) -> Event {
+fn config_row(document: &RealmConfigDocument) -> IoResult {
     stored(Some(realm_view(document, UserId::nil(document.realm_id)).0))
 }
 
@@ -89,27 +84,16 @@ fn stores_handed_key() {
     let handed = pem(&key);
     let request = PromotionRequest::HandKey(handed.clone());
     let mut operation = ServePromotionOperation::new(realm_id, node(2), node(1), request);
-    let write = Effect::Storage(StorageEffect::Write {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(PROMOTED_KEY_ROW),
-        value: ByteView::from(handed.0.as_bytes()),
-        txn_id: None,
-    });
-    let read = read_effect(&DocumentTarget::RealmConfig { realm_id }, None);
-    check_trace(
-        &mut operation,
-        &[read],
-        vec![
-            (config_row(&document), vec![write]),
-            (
-                Event::Storage(StorageEvent::WriteResult {
-                    key: Key::from(Vec::new()),
-                }),
-                vec![],
-            ),
-        ],
+    let read = read_row(&DocumentTarget::RealmConfig { realm_id });
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![read]))));
+    let row = (
+        NODE_STATE_KEYSPACE.to_string(),
+        ByteView::from(PROMOTED_KEY_ROW),
+        ByteView::from(handed.0.as_bytes()),
     );
-    assert_eq!(operation.finalize(), Ok(Ok(true)));
+    let write = Next::Call(IoCall::Write(vec![row]));
+    assert_eq!(operation.next(config_row(&document)), Ok(write));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(Ok(true))));
 }
 
 #[test]
@@ -119,43 +103,41 @@ fn check_reports_ready() {
     let check = |local, peer| {
         let mut operation =
             ServePromotionOperation::new(realm_id, local, peer, PromotionRequest::Check);
-        operation.start();
+        operation.first().unwrap();
         operation
     };
     let mut held = check(node(1), node(1));
-    assert_eq!(held.step(config_row(&document)).len(), 1);
-    held.step(stored(Some(Value::from(b"key".to_vec()))));
-    assert_eq!(held.finalize(), Ok(Ok(true)));
+    let read = (
+        NODE_STATE_KEYSPACE.to_string(),
+        ByteView::from(PROMOTED_KEY_ROW),
+    );
+    let key_read = Ok(Next::Call(IoCall::Read(vec![read])));
+    assert_eq!(held.next(config_row(&document)), key_read);
+    let answer = held.next(stored(Some(Value::from(b"key".to_vec()))));
+    assert_eq!(answer, Ok(Next::Done(Ok(true))));
     let mut server = check(node(2), node(1));
-    assert!(server.step(config_row(&document)).is_empty());
-    assert_eq!(server.finalize(), Ok(Ok(false)));
+    assert_eq!(
+        server.next(config_row(&document)),
+        Ok(Next::Done(Ok(false)))
+    );
     let mut refused = check(node(1), node(2));
-    assert!(refused.step(config_row(&document)).is_empty());
-    assert_eq!(refused.finalize(), Ok(Err(MetadataReadError::Forbidden)));
+    let forbidden = Ok(Next::Done(Err(MetadataReadError::Forbidden)));
+    assert_eq!(refused.next(config_row(&document)), forbidden);
 }
 
 #[test]
-fn rejects_unexpected_events() {
-    // Before start every event fails the serve; a missing config answers unavailable.
+fn unavailable_answers() {
+    // A missing config is answered unavailable; a wrong answer fails the serve.
     let (_, realm_id, _) = realm();
     let make = || ServePromotionOperation::new(realm_id, node(1), node(1), PromotionRequest::Check);
-    for (label, effects, error) in rejects_events(make, sample_events, |_| false) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert_eq!(error, MetadataReadError::Unavailable, "{label}");
-    }
     let mut missing = make();
-    missing.start();
-    missing.step(stored(None));
-    assert_eq!(missing.finalize(), Ok(Err(MetadataReadError::Unavailable)));
-}
-
-#[test]
-fn abort_and_finalize() {
-    // Serving needs no cleanup, and an early finalize fails.
-    let (_, realm_id, _) = realm();
-    let mut operation =
-        ServePromotionOperation::new(realm_id, node(1), node(1), PromotionRequest::Check);
-    operation.start();
-    assert!(operation.abort().is_empty());
-    rejects_finalize(operation);
+    missing.first().unwrap();
+    let unavailable = Ok(Next::Done(Err(MetadataReadError::Unavailable)));
+    assert_eq!(missing.next(stored(None)), unavailable);
+    let mut wrong = make();
+    wrong.first().unwrap();
+    assert_eq!(
+        wrong.next(IoResult::Done),
+        Err(MetadataReadError::Unavailable)
+    );
 }

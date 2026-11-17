@@ -4,20 +4,20 @@
 
 use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::USER_KEYSPACE;
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::done;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::{GroupId, Value};
 use aruna_core::user::validation::{DEACTIVATED_ATTRIBUTE, STOPPED_BY_INSTALL};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::HashMap;
 use thiserror::Error;
 
@@ -65,27 +65,34 @@ pub enum AccountStatusError {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum AccountStatusState {
-    Init,
-    ReadRecords,
-    Authorize { administrator: bool },
-    UpdateUser,
-    WriteCutoff,
-    WriteAudit,
-    Finish,
-    Error,
+impl From<IoError> for AccountStatusError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "AccountStatus".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
+
+type Turn = Result<Next<()>, AccountStatusError>;
 
 /// Account status is a reserved user attribute; deactivation first writes a realm-wide cutoff so
 /// every credential issued before it is denied on every node.
 #[derive(Debug, PartialEq)]
 pub struct AccountStatusOperation {
     config: AccountStatusConfig,
-    state: AccountStatusState,
+    /// Whether the target holds the realm administrator role, known once the records are read.
+    administrator: Option<bool>,
     /// The group owning a service account target, whose administrators may read its audit row.
     owner_group: Option<GroupId>,
-    output: Option<Result<(), AccountStatusError>>,
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
     /// Marks a deactivation as the plugin install's own, not an administrator's.
     by_install: bool,
@@ -95,9 +102,8 @@ impl AccountStatusOperation {
     pub fn new(config: AccountStatusConfig) -> Self {
         Self {
             config,
-            state: AccountStatusState::Init,
+            administrator: None,
             owner_group: None,
-            output: None,
             guard: None,
             by_install: false,
         }
@@ -122,20 +128,6 @@ impl AccountStatusOperation {
         self
     }
 
-    fn fail(&mut self, error: AccountStatusError) -> Effects {
-        self.state = AccountStatusState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(AccountStatusError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
-    }
-
     fn user_read(user_id: &UserId) -> (String, ByteView) {
         (
             USER_KEYSPACE.to_string(),
@@ -143,102 +135,81 @@ impl AccountStatusOperation {
         )
     }
 
-    fn handle_records(&mut self, event: Event) -> Effects {
-        let values = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => return self.unexpected("batch read result", other),
-        };
-        let [(_, target), (_, caller), (_, realm_auth)] = values.as_slice() else {
-            return self.fail(AccountStatusError::NotFound);
-        };
+    fn authorize(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let [target, caller, realm_auth] =
+            <[_; 3]>::try_from(values).map_err(|_| AccountStatusError::NotFound)?;
         // A federated user has no record here; only its credentials can be cut off.
         let target = match target.as_deref().map(User::from_bytes) {
-            Some(Ok(target)) => Some(target),
-            Some(Err(error)) => return self.fail(error.into()),
+            Some(target) => Some(target?),
             None if self.foreign() => None,
-            None => return self.fail(AccountStatusError::NotFound),
+            None => return Err(AccountStatusError::NotFound),
         };
         // Service accounts never manage other accounts, whatever roles they hold.
-        let caller = caller.as_deref().map(User::from_bytes).transpose();
-        match caller {
-            Ok(Some(caller)) if caller.service_group().is_some() => {
-                return self.fail(AccountStatusError::Unauthorized);
-            }
-            Ok(_) => {}
-            Err(error) => return self.fail(error.into()),
+        let caller = caller.as_deref().map(User::from_bytes).transpose()?;
+        if caller.is_some_and(|caller| caller.service_group().is_some()) {
+            return Err(AccountStatusError::Unauthorized);
         }
-        let realm_auth = realm_auth
-            .as_deref()
+        let realm_auth = (realm_auth.as_deref())
             .map(RealmAuthorizationDocument::from_bytes)
-            .transpose();
-        let administrator = match realm_auth {
-            Ok(realm_auth) => holds_admin_role(realm_auth.as_ref(), &self.config.target),
-            Err(error) => return self.fail(error.into()),
-        };
+            .transpose()?;
+        self.administrator = Some(holds_admin_role(realm_auth.as_ref(), &self.config.target));
         let realm_id = self.config.actor.realm_id;
         self.owner_group = target.as_ref().and_then(User::service_group);
         let path = match self.owner_group {
             Some(group_id) => format!("/{realm_id}/g/{group_id}/admin"),
             None => format!("/{realm_id}/admin/config"),
         };
-        self.state = AccountStatusState::Authorize { administrator };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path,
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path,
+            required_permission: Permission::WRITE,
+        });
+        let child = boxed_suboperation(check, |allowed| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn handle_authorized(&mut self, event: Event, administrator: bool) -> Effects {
-        let allowed = match event {
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => allowed,
-            other => return self.unexpected("authorization result", other),
-        };
-        match allowed {
-            Ok(true) => {}
-            Ok(false) => return self.fail(AccountStatusError::Unauthorized),
-            Err(error) => return self.fail(error.into()),
+    fn authorized(&mut self, allowed: Result<bool, AuthorizationError>) -> Turn {
+        if !allowed? {
+            return Err(AccountStatusError::Unauthorized);
         }
         // No deactivation lowers the administrator count, so no count must agree across nodes.
-        if administrator && !self.config.active {
-            return self.fail(AccountStatusError::Administrator);
+        if self.administrator == Some(true) && !self.config.active {
+            return Err(AccountStatusError::Administrator);
         }
         self.next_write()
     }
 
     /// Deactivation cuts credentials off before it marks the account, so a failure between the
     /// two leaves an active account without old credentials, and a retry completes it.
-    fn next_write(&mut self) -> Effects {
+    fn next_write(&mut self) -> Turn {
         if self.config.active {
-            return if self.foreign() {
-                self.finish()
-            } else {
-                self.update_user()
-            };
+            return self.mark();
         }
         // The grace also cuts off tokens another node mints before the status reaches it.
         let cutoff = self.config.now.saturating_add(REVOCATION_GRACE_SECS);
-        self.state = AccountStatusState::WriteCutoff;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            RevokeTokenOperation::new(RevokeTokenConfig {
-                actor: self.config.actor.clone(),
-                token_hash: user_cutoff_hash(&self.config.target),
-                expires_at: user_cutoff_expiry(cutoff),
-                token_owner: self.config.target,
-                admission: RevokeTokenAdmission::Privileged,
-                now: self.config.now,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::TokenRevoked {
+        let revoke = RevokeTokenOperation::new(RevokeTokenConfig {
+            actor: self.config.actor.clone(),
+            token_hash: user_cutoff_hash(&self.config.target),
+            expires_at: user_cutoff_expiry(cutoff),
+            token_owner: self.config.target,
+            admission: RevokeTokenAdmission::Privileged,
+            now: self.config.now,
+        });
+        let child = boxed_suboperation(revoke, |result| {
+            Event::SubOperation(SubOperationEvent::TokenRevoked {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
+            })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn update_user(&mut self) -> Effects {
+    /// Updates the local account, or writes only the audit row for a federated one.
+    fn mark(&mut self) -> Turn {
+        if self.foreign() {
+            return self.finish();
+        }
         let (set_attributes, remove_attributes) = if self.config.active {
             (HashMap::new(), vec![DEACTIVATED_ATTRIBUTE.to_string()])
         } else {
@@ -247,57 +218,26 @@ impl AccountStatusOperation {
                 Vec::new(),
             )
         };
-        self.state = AccountStatusState::UpdateUser;
-        let audit = self.audit_record();
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            UpdateUserOperation::new(UpdateUserInput {
-                actor: self.config.actor.clone(),
-                auth_context: self.config.auth_context.clone(),
-                self_realm_id: self.config.actor.realm_id,
-                user_id: self.config.target.to_string(),
-                name: None,
-                set_attributes,
-                remove_attributes,
-                system: true,
-                alias: None,
-                subject: None,
-            })
-            .audited(audit)
-            .guarded(self.guard),
-            |result| Event::SubOperation(SubOperationEvent::UserUpdated {
+        let update = UpdateUserOperation::new(UpdateUserInput {
+            actor: self.config.actor.clone(),
+            auth_context: self.config.auth_context.clone(),
+            self_realm_id: self.config.actor.realm_id,
+            user_id: self.config.target.to_string(),
+            name: None,
+            set_attributes,
+            remove_attributes,
+            system: true,
+            alias: None,
+            subject: None,
+        })
+        .audited(self.audit_record())
+        .guarded(self.guard);
+        let child = boxed_suboperation(update, |result| {
+            Event::SubOperation(SubOperationEvent::UserUpdated {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
-    }
-
-    fn handle_updated(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::UserUpdated { result: Ok(()) }) => {
-                self.state = AccountStatusState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
-            }
-            Event::SubOperation(SubOperationEvent::UserUpdated { result: Err(error) }) => {
-                self.fail(AccountStatusError::Update(error))
-            }
-            other => self.unexpected("user update result", other),
-        }
-    }
-
-    fn handle_cutoff(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::TokenRevoked { result: Ok(()) }) => {
-                if self.foreign() {
-                    self.finish()
-                } else {
-                    self.update_user()
-                }
-            }
-            Event::SubOperation(SubOperationEvent::TokenRevoked { result: Err(error) }) => {
-                self.fail(AccountStatusError::Cutoff(error))
-            }
-            other => self.unexpected("token revocation result", other),
-        }
+            })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
     fn foreign(&self) -> bool {
@@ -316,27 +256,29 @@ impl AccountStatusOperation {
     }
 
     /// A federated target has no local user row to commit the audit row with.
-    fn finish(&mut self) -> Effects {
-        let writes = match self.audit_record().entries() {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = AccountStatusState::WriteAudit;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })]
+    fn finish(&mut self) -> Turn {
+        let writes = self.audit_record().entries()?;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn handle_audited(&mut self, event: Event) -> Effects {
+    fn answered(&mut self, event: Event) -> Turn {
         match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                self.state = AccountStatusState::Finish;
-                self.output = Some(Ok(()));
-                smallvec![]
+            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
+                self.authorized(allowed)
             }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected("audit write", other),
+            Event::SubOperation(SubOperationEvent::TokenRevoked { result }) => {
+                result.map_err(AccountStatusError::Cutoff)?;
+                self.mark()
+            }
+            Event::SubOperation(SubOperationEvent::UserUpdated { result }) => {
+                result.map_err(AccountStatusError::Update)?;
+                Ok(Next::Done(()))
+            }
+            other => Err(AccountStatusError::UnexpectedEvent {
+                state: "AccountStatus".to_string(),
+                expected: "authorization, token revocation or user update result",
+                got: other.label(),
+            }),
         }
     }
 }
@@ -350,61 +292,36 @@ fn holds_admin_role(realm_auth: Option<&RealmAuthorizationDocument>, target: &Us
     })
 }
 
-impl EffectOperation for AccountStatusOperation {
+impl Operation for AccountStatusOperation {
     type Output = ();
     type Error = AccountStatusError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         // Federated callers never change account status; local admins may cut them off.
         if self.config.auth_context.user_id.realm_id != self.config.actor.realm_id {
-            return self.fail(AccountStatusError::Unauthorized);
+            return Err(AccountStatusError::Unauthorized);
         }
         let realm_id = self.config.actor.realm_id;
         let realm_auth = DocumentTarget::RealmAuthorization { realm_id };
-        self.state = AccountStatusState::ReadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                Self::user_read(&self.config.target),
-                Self::user_read(&self.config.auth_context.user_id),
-                (
-                    realm_auth.storage_keyspace().to_string(),
-                    realm_auth.storage_key()
-                ),
-            ],
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(vec![
+            Self::user_read(&self.config.target),
+            Self::user_read(&self.config.auth_context.user_id),
+            (
+                realm_auth.storage_keyspace().to_string(),
+                realm_auth.storage_key(),
+            ),
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.state, AccountStatusState::Error) {
-            AccountStatusState::ReadRecords => self.handle_records(event),
-            AccountStatusState::Authorize { administrator } => {
-                self.handle_authorized(event, administrator)
-            }
-            AccountStatusState::UpdateUser => self.handle_updated(event),
-            AccountStatusState::WriteCutoff => self.handle_cutoff(event),
-            AccountStatusState::WriteAudit => self.handle_audited(event),
-            AccountStatusState::Init => self.unexpected("no event before start", event),
-            state @ (AccountStatusState::Finish | AccountStatusState::Error) => {
-                self.state = state;
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Turn {
+        match result {
+            IoResult::Values(values) if self.administrator.is_none() => self.authorize(values),
+            IoResult::Event(event) => self.answered(*event),
+            result => {
+                done(result)?;
+                Ok(Next::Done(()))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            AccountStatusState::Finish | AccountStatusState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(AccountStatusError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -484,48 +401,43 @@ mod tests {
         ByteView::from(document.to_bytes(&fixture.actor).unwrap())
     }
 
-    fn records(target: ByteView, caller: Option<ByteView>, realm_auth: ByteView) -> Event {
-        let key = ByteView::from(Vec::new());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (key.clone(), Some(target)),
-                (key.clone(), caller),
-                (key, Some(realm_auth)),
-            ],
-        })
+    fn records(target: ByteView, caller: Option<ByteView>, realm_auth: ByteView) -> IoResult {
+        IoResult::Values(vec![Some(target), caller, Some(realm_auth)])
     }
 
-    fn allowed() -> Event {
-        Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) })
+    fn answer(event: SubOperationEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::SubOperation(event)))
     }
 
-    fn failure(operation: AccountStatusOperation) -> AccountStatusError {
-        assert!(operation.is_complete());
-        operation.finalize().unwrap_err()
+    fn allowed() -> IoResult {
+        answer(SubOperationEvent::AuthorizationResult { allowed: Ok(true) })
     }
 
-    /// Feeds the audit write and returns the row the operation recorded.
-    fn audited(operation: &mut AccountStatusOperation, effects: Effects) -> AdminAuditRecord {
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice()
-        else {
-            panic!("expected the audit write, got {effects:?}");
+    fn revoked() -> IoResult {
+        answer(SubOperationEvent::TokenRevoked { result: Ok(()) })
+    }
+
+    fn updated() -> IoResult {
+        answer(SubOperationEvent::UserUpdated { result: Ok(()) })
+    }
+
+    fn is_child(turn: Turn) -> bool {
+        matches!(turn, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    /// Checks the audit write, finishes it and returns the row the operation recorded.
+    fn audited(operation: &mut AccountStatusOperation, turn: Turn) -> AdminAuditRecord {
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected the audit write, got {turn:?}");
         };
-        assert!(txn_id.is_none());
         let record = AdminAuditRecord::from_bytes(&writes[0].2).unwrap();
-        assert!(!operation.is_complete());
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
         record
     }
 
-    /// Checks that the user update commits the audit row and returns that row.
-    fn committed(operation: &mut AccountStatusOperation, effects: Effects) -> AdminAuditRecord {
-        assert!(
-            effects.is_empty(),
-            "no write follows the update: {effects:?}"
-        );
-        assert!(operation.is_complete());
+    /// Checks that the user update ends the operation and returns the row it committed.
+    fn committed(operation: &mut AccountStatusOperation, turn: Turn) -> AdminAuditRecord {
+        assert_eq!(turn, Ok(Next::Done(())), "no write follows the update");
         operation.audit_record()
     }
 
@@ -533,18 +445,18 @@ mod tests {
     fn service_caller_refused() {
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
-        operation.start();
+        operation.first().unwrap();
         let caller = user_bytes(
             &fixture,
             fixture.actor.user_id,
             &[(SERVICE_GROUP_ATTRIBUTE, &Ulid::generate().to_string())],
         );
-        operation.step(records(
+        let refused = operation.next(records(
             user_bytes(&fixture, fixture.target, &[]),
             Some(caller),
             realm_auth(&fixture, &[fixture.actor.user_id]),
         ));
-        assert_eq!(failure(operation), AccountStatusError::Unauthorized);
+        assert_eq!(refused, Err(AccountStatusError::Unauthorized));
     }
 
     #[test]
@@ -552,46 +464,41 @@ mod tests {
         // A realm administrator is refused before anything is written, cutoff included.
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
-        operation.start();
-        operation.step(records(
-            user_bytes(&fixture, fixture.target, &[]),
-            None,
-            realm_auth(&fixture, &[fixture.target, fixture.other]),
-        ));
-        let effects = operation.step(allowed());
-        assert!(effects.is_empty());
-        assert_eq!(failure(operation), AccountStatusError::Administrator);
+        operation.first().unwrap();
+        operation
+            .next(records(
+                user_bytes(&fixture, fixture.target, &[]),
+                None,
+                realm_auth(&fixture, &[fixture.target, fixture.other]),
+            ))
+            .unwrap();
+        let refused = operation.next(allowed());
+        assert_eq!(refused, Err(AccountStatusError::Administrator));
     }
 
     #[test]
     fn deactivation_writes_cutoff() {
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
-        operation.start();
-        operation.step(records(
-            user_bytes(&fixture, fixture.target, &[]),
-            None,
-            realm_auth(&fixture, &[fixture.other]),
-        ));
-        let effects = operation.step(allowed());
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        operation.first().unwrap();
+        operation
+            .next(records(
+                user_bytes(&fixture, fixture.target, &[]),
+                None,
+                realm_auth(&fixture, &[fixture.other]),
+            ))
+            .unwrap();
+        assert!(is_child(operation.next(allowed())));
         // The cutoff comes first, so a failed status write never leaves old credentials usable.
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        assert!(!operation.is_complete());
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
-            result: Ok(()),
-        }));
-        let record = committed(&mut operation, effects);
+        assert!(is_child(operation.next(revoked())));
+        let turn = operation.next(updated());
+        let record = committed(&mut operation, turn);
         assert_eq!(record.action, AdminAuditAction::AccountDeactivated);
         assert_eq!(
             (record.actor, record.target),
             (fixture.actor.user_id, fixture.target)
         );
         assert_eq!(record.group_id, None);
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]
@@ -599,20 +506,18 @@ mod tests {
         // Reactivation removes only the status; the old cutoff keeps older credentials dead.
         let fixture = fixture();
         let mut operation = operation(&fixture, true);
-        operation.start();
-        operation.step(records(
-            user_bytes(&fixture, fixture.target, &[(DEACTIVATED_ATTRIBUTE, "true")]),
-            None,
-            realm_auth(&fixture, &[fixture.target]),
-        ));
-        let effects = operation.step(allowed());
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
-            result: Ok(()),
-        }));
-        let record = committed(&mut operation, effects);
+        operation.first().unwrap();
+        operation
+            .next(records(
+                user_bytes(&fixture, fixture.target, &[(DEACTIVATED_ATTRIBUTE, "true")]),
+                None,
+                realm_auth(&fixture, &[fixture.target]),
+            ))
+            .unwrap();
+        assert!(is_child(operation.next(allowed())));
+        let turn = operation.next(updated());
+        let record = committed(&mut operation, turn);
         assert_eq!(record.action, AdminAuditAction::AccountReactivated);
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]
@@ -621,42 +526,42 @@ mod tests {
         let fixture = fixture();
         let group = Ulid::from_bytes([9u8; 16]);
         let mut operation = operation(&fixture, false);
-        operation.start();
-        operation.step(records(
-            user_bytes(
-                &fixture,
-                fixture.target,
-                &[(SERVICE_GROUP_ATTRIBUTE, &group.to_string())],
-            ),
-            None,
-            realm_auth(&fixture, &[fixture.other]),
-        ));
-        operation.step(allowed());
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::UserUpdated {
-            result: Ok(()),
-        }));
-        let record = committed(&mut operation, effects);
+        operation.first().unwrap();
+        operation
+            .next(records(
+                user_bytes(
+                    &fixture,
+                    fixture.target,
+                    &[(SERVICE_GROUP_ATTRIBUTE, &group.to_string())],
+                ),
+                None,
+                realm_auth(&fixture, &[fixture.other]),
+            ))
+            .unwrap();
+        operation.next(allowed()).unwrap();
+        operation.next(revoked()).unwrap();
+        let turn = operation.next(updated());
+        let record = committed(&mut operation, turn);
         assert_eq!(record.group_id, Some(group));
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[test]
     fn denied_caller_refused() {
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
-        operation.start();
-        operation.step(records(
-            user_bytes(&fixture, fixture.target, &[]),
-            None,
-            realm_auth(&fixture, &[fixture.other]),
-        ));
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
-        assert_eq!(failure(operation), AccountStatusError::Unauthorized);
+        operation.first().unwrap();
+        operation
+            .next(records(
+                user_bytes(&fixture, fixture.target, &[]),
+                None,
+                realm_auth(&fixture, &[fixture.other]),
+            ))
+            .unwrap();
+        let denied = answer(SubOperationEvent::AuthorizationResult { allowed: Ok(false) });
+        assert_eq!(
+            operation.next(denied),
+            Err(AccountStatusError::Unauthorized)
+        );
     }
 
     #[test]
@@ -665,22 +570,12 @@ mod tests {
         let mut fixture = fixture();
         fixture.target = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId::from_bytes([6u8; 32]));
         let mut operation = operation(&fixture, false);
-        operation.start();
-        let key = ByteView::from(Vec::new());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (key.clone(), None),
-                (key, None),
-                (ByteView::from(Vec::new()), Some(realm_auth(&fixture, &[]))),
-            ],
-        }));
-        let effects = operation.step(allowed());
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let effects = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
-        audited(&mut operation, effects);
-        assert_eq!(operation.finalize(), Ok(()));
+        operation.first().unwrap();
+        let rows = IoResult::Values(vec![None, None, Some(realm_auth(&fixture, &[]))]);
+        operation.next(rows).unwrap();
+        assert!(is_child(operation.next(allowed())));
+        let turn = operation.next(revoked());
+        audited(&mut operation, turn);
     }
 
     #[test]
@@ -690,19 +585,15 @@ mod tests {
         fixture.actor.user_id =
             UserId::new(Ulid::from_bytes([1u8; 16]), RealmId::from_bytes([6u8; 32]));
         let mut operation = operation(&fixture, false);
-        assert!(operation.start().is_empty());
-        assert_eq!(failure(operation), AccountStatusError::Unauthorized);
+        assert_eq!(operation.first(), Err(AccountStatusError::Unauthorized));
     }
 
     #[test]
     fn missing_target_refused() {
         let fixture = fixture();
         let mut operation = operation(&fixture, false);
-        operation.start();
-        let key = ByteView::from(Vec::new());
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(key.clone(), None), (key.clone(), None), (key, None)],
-        }));
-        assert_eq!(failure(operation), AccountStatusError::NotFound);
+        operation.first().unwrap();
+        let missing = operation.next(IoResult::Values(vec![None, None, None]));
+        assert_eq!(missing, Err(AccountStatusError::NotFound));
     }
 }

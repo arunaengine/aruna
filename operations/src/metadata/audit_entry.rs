@@ -6,7 +6,7 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::DriverContext;
-use crate::driver::drive_until;
+use crate::driver::{drive, drive_until};
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::load_config::load_realm_config;
@@ -133,7 +133,9 @@ pub async fn list_audit(
         config_digest,
     );
     partial |= invalid_peer;
-    let mut aggregate = drive_until(operation, context, deadline).await?;
+    // The group deadline marks late nodes missing, so the run itself needs no deadline.
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut aggregate = drive(operation.within(wait), context).await?;
     aggregate.partial |= partial;
     if aggregate.partial {
         aggregate.next_cursor = None;

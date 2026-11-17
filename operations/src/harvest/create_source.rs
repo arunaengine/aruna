@@ -5,22 +5,22 @@
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::keyspaces::{CONNECTOR_INDEX_KEYSPACE, HARVEST_SOURCE_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::structs::execution::harvest::{
     HarvestSelector, HarvestSource, RepositoryConnector, RepositoryConnectorKind,
 };
 use aruna_core::structs::identity::group_delete::GroupWriteError;
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::groups::fence::{group_write_result, write_group_new};
 use crate::harvest::oai_pmh::request::{normalize_metadata_prefix, normalize_set};
-use crate::harvest::repository::{
-    StorageReadError, parse_source_read, read_connector_effect, read_source_effect,
-};
+use crate::harvest::repository::{connector_key, source_key};
 use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,14 +34,13 @@ pub struct CreateSourceInput {
     pub schedule_interval_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum State {
-    Init,
-    ReadConnector,
-    ReadSource,
-    WriteSource,
-    Finish,
-    Error,
+/// The call a source creation waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    /// A concurrent first submission created the source; its row is read again.
+    Reread,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -68,31 +67,21 @@ pub enum CreateSourceError {
     SourceConflict(Ulid),
     #[error("CreateHarvestSource failed")]
     Failed,
-    #[error("state [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: Event,
-    },
+    #[error(transparent)]
+    Io(IoError),
 }
 
-impl From<StorageReadError> for CreateSourceError {
-    fn from(error: StorageReadError) -> Self {
-        match error {
-            StorageReadError::Storage(error) => Self::Storage(error),
-            StorageReadError::Conversion(error) => Self::Conversion(error),
-        }
+impl From<IoError> for CreateSourceError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct CreateSourceOperation {
     input: CreateSourceInput,
-    state: State,
+    stage: Stage,
     source: Option<HarvestSource>,
-    /// Set after a concurrent first submission created the source; its row is read again.
-    reread: bool,
-    output: Option<Result<HarvestSource, CreateSourceError>>,
 }
 
 /// One source per connector and namespace, so a repeated submission keeps its cursor.
@@ -111,27 +100,27 @@ impl CreateSourceOperation {
     pub fn new(input: CreateSourceInput) -> Self {
         Self {
             input,
-            state: State::Init,
+            stage: Stage::Read,
             source: None,
-            reread: false,
-            output: None,
         }
     }
 
-    fn emit_error(&mut self, error: CreateSourceError) -> Effects {
-        self.state = State::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn source_row(&self) -> (String, Key) {
+        let source_id = source_id(self.input.connector_id, &self.input.namespace);
+        (
+            HARVEST_SOURCE_KEYSPACE.to_string(),
+            source_key(self.input.group_id, source_id),
+        )
     }
 
     /// Validate and canonicalize the input, so only values the request builder
     /// and the path encoder can use are ever stored.
-    fn handle_init(&mut self) -> Effects {
+    fn normalize(&mut self) -> Result<(), CreateSourceError> {
         if self.input.namespace.trim().is_empty() {
-            return self.emit_error(CreateSourceError::EmptyNamespace);
+            return Err(CreateSourceError::EmptyNamespace);
         }
         let Some(target_prefix) = normalize_target_prefix(&self.input.target_prefix) else {
-            return self.emit_error(if prefix_is_blank(&self.input.target_prefix) {
+            return Err(if prefix_is_blank(&self.input.target_prefix) {
                 CreateSourceError::EmptyTargetPrefix
             } else {
                 CreateSourceError::LongTargetPrefix(self.input.target_prefix.clone())
@@ -140,75 +129,32 @@ impl CreateSourceOperation {
         // The parser and the RO-Crate mapper are `oai_dc`-typed; any other
         // prefix would silently import identifier-only records.
         let metadata_prefix =
-            match normalize_metadata_prefix(self.input.selector.metadata_prefix.as_deref()) {
-                Ok(prefix) => prefix,
-                Err(prefix) => {
-                    return self.emit_error(CreateSourceError::UnsupportedMetadataPrefix(prefix));
-                }
-            };
+            normalize_metadata_prefix(self.input.selector.metadata_prefix.as_deref())
+                .map_err(CreateSourceError::UnsupportedMetadataPrefix)?;
         self.input.target_prefix = target_prefix;
         self.input.selector.metadata_prefix = Some(metadata_prefix);
         self.input.selector.set = normalize_set(self.input.selector.set.as_deref());
-        self.state = State::ReadConnector;
-        smallvec![read_connector_effect(
-            self.input.group_id,
-            self.input.connector_id,
-            None,
-        )]
+        Ok(())
     }
 
-    fn handle_connector_read(&mut self, event: Event) -> Effects {
-        let connector = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-                Some(bytes) => match RepositoryConnector::from_bytes(bytes.as_ref()) {
-                    Ok(connector) => Some(connector),
-                    Err(error) => return self.emit_error(error.into()),
-                },
-                None => None,
-            },
-            Event::Storage(StorageEvent::Error { error }) => {
-                return self.emit_error(CreateSourceError::Storage(error));
-            }
-            other => {
-                return self.emit_error(CreateSourceError::InvalidStateEvent {
-                    state: format!("{:?}", self.state),
-                    expected: "Event::Storage(StorageEvent::ReadResult)",
-                    received: other,
-                });
-            }
-        };
-        let Some(connector) = connector else {
-            return self.emit_error(CreateSourceError::ConnectorNotFound);
-        };
-        if connector.kind != RepositoryConnectorKind::OaiPmh {
-            return self.emit_error(CreateSourceError::UnsupportedConnector);
-        }
-        self.state = State::ReadSource;
-        smallvec![read_source_effect(
-            self.input.group_id,
-            source_id(self.input.connector_id, &self.input.namespace),
-            None,
-        )]
-    }
-
-    fn handle_source_read(&mut self, event: Event) -> Effects {
-        let existing = match parse_source_read(event) {
-            Ok(existing) => existing,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        if let Some(existing) = existing {
+    /// Returns a stored source of the same definition, or creates it unless it was just taken.
+    fn decide(
+        &mut self,
+        existing: Option<Value>,
+        reread: bool,
+    ) -> Result<Next<HarvestSource>, CreateSourceError> {
+        let existing = existing.map(|bytes| HarvestSource::from_bytes(&bytes));
+        if let Some(existing) = existing.transpose()? {
             if existing.connector_id != self.input.connector_id
                 || existing.target_prefix != self.input.target_prefix
                 || existing.selector != self.input.selector
             {
-                return self.emit_error(CreateSourceError::SourceConflict(existing.source_id));
+                return Err(CreateSourceError::SourceConflict(existing.source_id));
             }
-            self.state = State::Finish;
-            self.output = Some(Ok(existing));
-            return smallvec![];
+            return Ok(Next::Done(existing));
         }
-        if self.reread {
-            return self.emit_error(CreateSourceError::Failed);
+        if reread {
+            return Err(CreateSourceError::Failed);
         }
         let source = HarvestSource::new(
             source_id(self.input.connector_id, &self.input.namespace),
@@ -221,81 +167,50 @@ impl CreateSourceOperation {
             SystemTime::now(),
             self.input.created_by,
         );
-        let value = match source.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let key = crate::harvest::repository::source_key(source.group_id, source.source_id);
-        let keyspace = aruna_core::keyspaces::HARVEST_SOURCE_KEYSPACE.to_string();
-        let write = crate::groups::fence::write_group_new(
-            self.input.group_id,
-            vec![(keyspace.clone(), key.clone(), value.into())],
-            None,
-            (keyspace, key),
-        );
+        let (keyspace, key) = self.source_row();
+        let row = (keyspace.clone(), key.clone(), source.to_bytes()?.into());
+        let write = write_group_new(self.input.group_id, vec![row], None, (keyspace, key));
         self.source = Some(source);
-        self.state = State::WriteSource;
-        smallvec![write]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        match crate::groups::fence::group_write_result(event) {
-            Ok(()) => {}
-            Err(GroupWriteError::Taken) => {
-                self.reread = true;
-                self.state = State::ReadSource;
-                return smallvec![read_source_effect(
-                    self.input.group_id,
-                    source_id(self.input.connector_id, &self.input.namespace),
-                    None,
-                )];
-            }
-            Err(error) => return self.emit_error(error.into()),
-        }
-        let Some(source) = self.source.clone() else {
-            return self.emit_error(CreateSourceError::Failed);
-        };
-        self.state = State::Finish;
-        self.output = Some(Ok(source));
-        smallvec![]
+        self.stage = Stage::Write;
+        Ok(Next::Call(write.into()))
     }
 }
 
-impl EffectOperation for CreateSourceOperation {
+impl Operation for CreateSourceOperation {
     type Output = HarvestSource;
     type Error = CreateSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<Self::Output>, CreateSourceError> {
+        self.normalize()?;
+        let connector = (
+            CONNECTOR_INDEX_KEYSPACE.to_string(),
+            connector_key(self.input.group_id, self.input.connector_id),
+        );
+        Ok(Next::Call(IoCall::Read(vec![connector, self.source_row()])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            State::Init => self.handle_init(),
-            State::ReadConnector => self.handle_connector_read(event),
-            State::ReadSource => self.handle_source_read(event),
-            State::WriteSource => self.handle_written(event),
-            State::Finish => smallvec![],
-            State::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Finish | State::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == State::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CreateSourceError> {
+        match self.stage {
+            Stage::Read => {
+                let [connector, existing] = rows::values::<2>(result)?;
+                let connector = connector.ok_or(CreateSourceError::ConnectorNotFound)?;
+                if RepositoryConnector::from_bytes(&connector)?.kind
+                    != RepositoryConnectorKind::OaiPmh
+                {
+                    return Err(CreateSourceError::UnsupportedConnector);
+                }
+                self.decide(existing, false)
             }
-            return Err(CreateSourceError::Failed);
+            Stage::Write => match group_write_result(rows::event(result)?) {
+                Ok(()) => (self.source.take().map(Next::Done)).ok_or(CreateSourceError::Failed),
+                Err(GroupWriteError::Taken) => {
+                    self.stage = Stage::Reread;
+                    Ok(Next::Call(IoCall::Read(vec![self.source_row()])))
+                }
+                Err(error) => Err(error.into()),
+            },
+            Stage::Reread => self.decide(rows::value(result)?, true),
         }
-        self.output.ok_or(CreateSourceError::Failed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -306,7 +221,7 @@ mod tests {
     use crate::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
     use crate::harvest::repository::{parse_source_read, read_source_effect};
     use crate::harvest::target_path::{DIGEST_SEGMENT_BYTES, HARVEST_PATH_BYTES};
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::handle::Handle;
     use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
     use aruna_storage::storage;
@@ -332,11 +247,7 @@ mod tests {
             namespace: " ".to_string(),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
         });
-        assert!(op.start().is_empty());
-        assert_eq!(
-            op.finalize().unwrap_err(),
-            CreateSourceError::EmptyNamespace
-        );
+        assert_eq!(op.first(), Err(CreateSourceError::EmptyNamespace));
     }
 
     #[test]
@@ -349,10 +260,11 @@ mod tests {
                 },
                 ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
             });
-            assert!(op.start().is_empty());
             assert_eq!(
-                op.finalize().unwrap_err(),
-                CreateSourceError::UnsupportedMetadataPrefix(prefix.to_string())
+                op.first(),
+                Err(CreateSourceError::UnsupportedMetadataPrefix(
+                    prefix.to_string()
+                ))
             );
         }
     }
@@ -375,7 +287,7 @@ mod tests {
                 },
                 ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
             });
-            assert_eq!(op.start().len(), 1);
+            assert!(matches!(op.first(), Ok(Next::Call(_))));
             assert_eq!(op.input.selector.metadata_prefix.as_deref(), Some("oai_dc"));
             assert_eq!(op.input.selector.set, None);
         }
@@ -387,7 +299,7 @@ mod tests {
             target_prefix: "  /imported/zenodo/  ".to_string(),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
         });
-        assert_eq!(op.start().len(), 1);
+        assert!(matches!(op.first(), Ok(Next::Call(_))));
         assert_eq!(op.input.target_prefix, "imported/zenodo");
     }
 
@@ -400,17 +312,16 @@ mod tests {
             target_prefix: "p".repeat(longest),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
         });
-        assert_eq!(accepted.start().len(), 1);
+        assert!(matches!(accepted.first(), Ok(Next::Call(_))));
 
         let too_long = "p".repeat(longest + 1);
         let mut refused = CreateSourceOperation::new(CreateSourceInput {
             target_prefix: too_long.clone(),
             ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
         });
-        assert!(refused.start().is_empty());
         assert_eq!(
-            refused.finalize().unwrap_err(),
-            CreateSourceError::LongTargetPrefix(too_long)
+            refused.first(),
+            Err(CreateSourceError::LongTargetPrefix(too_long))
         );
     }
 
@@ -421,11 +332,7 @@ mod tests {
                 target_prefix: prefix.to_string(),
                 ..input(ulid::Ulid::generate(), ulid::Ulid::generate())
             });
-            assert!(op.start().is_empty());
-            assert_eq!(
-                op.finalize().unwrap_err(),
-                CreateSourceError::EmptyTargetPrefix
-            );
+            assert_eq!(op.first(), Err(CreateSourceError::EmptyTargetPrefix));
         }
     }
 
@@ -434,14 +341,10 @@ mod tests {
     fn missing_connector_errors() {
         let mut op =
             CreateSourceOperation::new(input(ulid::Ulid::generate(), ulid::Ulid::generate()));
-        assert_eq!(op.start().len(), 1);
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: byteview::ByteView::from(Vec::new()),
-            value: None,
-        }));
+        op.first().unwrap();
         assert_eq!(
-            op.finalize().unwrap_err(),
-            CreateSourceError::ConnectorNotFound
+            op.next(IoResult::Values(vec![None, None])),
+            Err(CreateSourceError::ConnectorNotFound)
         );
     }
 
@@ -540,15 +443,11 @@ mod tests {
             Default::default(),
         );
         let mut op = CreateSourceOperation::new(input(group, connector.connector_id));
-        assert_eq!(op.start().len(), 1);
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: byteview::ByteView::from(Vec::new()),
-            value: Some(connector.to_bytes().unwrap().into()),
-        }));
-        assert!(effects.is_empty());
+        op.first().unwrap();
+        let stored = Some(connector.to_bytes().unwrap().into());
         assert_eq!(
-            op.finalize().unwrap_err(),
-            CreateSourceError::UnsupportedConnector
+            op.next(IoResult::Values(vec![stored, None])),
+            Err(CreateSourceError::UnsupportedConnector)
         );
     }
 
@@ -567,30 +466,36 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             Default::default(),
         );
-        let read = |value: Option<Vec<u8>>| {
-            Event::Storage(StorageEvent::ReadResult {
-                key: byteview::ByteView::from(Vec::new()),
-                value: value.map(Into::into),
-            })
-        };
         let taken = || {
-            Event::SubOperation(aruna_core::events::SubOperationEvent::GroupWritten {
-                result: Err(GroupWriteError::Taken),
-            })
+            IoResult::Event(Box::new(Event::SubOperation(
+                SubOperationEvent::GroupWritten {
+                    result: Err(GroupWriteError::Taken),
+                },
+            )))
         };
         for (prefix, reused) in [("imported/zenodo", true), ("imported/other", false)] {
             let mut op = CreateSourceOperation::new(input(group, connector.connector_id));
-            op.start();
-            op.step(read(Some(connector.to_bytes().unwrap())));
-            assert_eq!(op.step(read(None)).len(), 1, "the create is conditional");
+            op.first().unwrap();
+            let stored = Some(connector.to_bytes().unwrap().into());
+            let next = op.next(IoResult::Values(vec![stored, None]));
+            assert!(
+                matches!(next, Ok(Next::Call(IoCall::Child(_)))),
+                "the create is conditional"
+            );
             let mut winner = op.source.clone().unwrap();
             winner.target_prefix = prefix.to_string();
-            assert_eq!(op.step(taken()).len(), 1, "the source is read again");
-            assert!(op.step(read(Some(winner.to_bytes().unwrap()))).is_empty());
+            let next = op.next(taken());
+            assert!(
+                matches!(next, Ok(Next::Call(IoCall::Read(_)))),
+                "the source is read again"
+            );
+            let reread = op.next(IoResult::Values(vec![Some(
+                winner.to_bytes().unwrap().into(),
+            )]));
             match reused {
-                true => assert_eq!(op.finalize(), Ok(winner)),
+                true => assert_eq!(reread, Ok(Next::Done(winner))),
                 false => assert_eq!(
-                    op.finalize(),
+                    reread,
                     Err(CreateSourceError::SourceConflict(winner.source_id))
                 ),
             }

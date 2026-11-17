@@ -4,12 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
 use aruna_core::plugins::{Refusal, ReleaseError, ReleaseRequest, Released};
-use aruna_core::realm_vault::{RealmSealKey, RealmVaultKey};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secrets::{
     Delivery, SecretConsumer, SecretName, SecretScope, UseRequest, check_use,
@@ -19,21 +17,11 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use url::Url;
 
 use super::account::{owned, read_user};
-use super::bound::ReleaseKeys;
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
 use super::rows::write_rows;
 use crate::auth::enforcement::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
-
-/// The realm keys this node releases group and realm secrets with, if it holds them.
-pub fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
-    let keys = ctx.storage_handle.realm_keys();
-    ReleaseKeys {
-        seal: keys.map(|keys| Arc::new(keys.seal.clone())),
-        vault: keys.map(|keys| Arc::new(keys.vault.clone())),
-    }
-}
 
 pub(crate) fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
@@ -61,7 +49,6 @@ pub(crate) fn secret_path(
 /// The release a management node serves to `peer`, decided from `config` and its own storage.
 pub async fn release(
     ctx: &DriverContext,
-    keys: &ReleaseKeys,
     (config, local, peer): (&RealmConfigDocument, NodeId, NodeId),
     request: &ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
@@ -137,7 +124,7 @@ pub async fn release(
     audit.write(None, Some(&selected)).await?;
     let fields = match request.held == Some(selected.value_id) {
         true => None,
-        false => Some(open(ctx, keys, config.realm_id, &selected.sealed).await?),
+        false => Some(open(ctx, config.realm_id, &selected.sealed).await?),
     };
     Ok(Released {
         kind: selected.kind,
@@ -219,19 +206,16 @@ impl Audit<'_> {
     }
 }
 
-/// The management side of a release request from an infrastructure peer, with the realm keys a
-/// management node opens group and realm secrets with.
+/// The management side of a release request from an infrastructure peer.
 pub(crate) async fn serve_release(
     ctx: &DriverContext,
-    (seal, vault): (Option<Arc<RealmSealKey>>, Option<Arc<RealmVaultKey>>),
     peer: NodeId,
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let local = super::artifacts::local_config(ctx).await;
     let local = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
     let (config, local) = local;
-    let keys = ReleaseKeys { seal, vault };
-    release(ctx, &keys, (&config, local, peer), &request).await
+    release(ctx, (&config, local, peer), &request).await
 }
 
 #[cfg(test)]

@@ -2,26 +2,31 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::ShardManifestEntry;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::SHARD_MANIFEST_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{shard_manifest_prefix, sync_revision_key};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::Key;
 use byteview::ByteView;
-use smallvec::smallvec;
 
 const MANIFEST_SCAN_PAGE: usize = 512;
+
+/// Why the manifest entries of a shard could not be read.
+#[derive(Debug, PartialEq, thiserror::Error)]
+pub(crate) enum ManifestScanError {
+    #[error("failed to scan shard manifest: {0}")]
+    Io(#[from] IoError),
+    #[error("failed to decode shard manifest entry: {0}")]
+    Decode(String),
+}
 
 /// Every manifest entry of one shard on this node, read with a prefix scan.
 #[derive(Debug, PartialEq)]
 pub(crate) struct ManifestScanOperation {
     prefix: Key,
     entries: Vec<ShardManifestEntry>,
-    reading: bool,
-    output: Option<Result<Vec<ShardManifestEntry>, String>>,
 }
 
 impl ManifestScanOperation {
@@ -29,82 +34,44 @@ impl ManifestScanOperation {
         Self {
             prefix: ByteView::from(shard_manifest_prefix(placement)),
             entries: Vec::new(),
-            reading: false,
-            output: None,
         }
     }
 
-    fn page(&self, start: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: SHARD_MANIFEST_KEYSPACE.to_string(),
-            prefix: Some(self.prefix.clone()),
-            start: start.map(IterStart::After),
+    fn page(&self, after: Option<Key>) -> Next<Vec<ShardManifestEntry>> {
+        Next::Call(IoCall::Page {
+            space: SHARD_MANIFEST_KEYSPACE.to_string(),
+            prefix: self.prefix.clone(),
+            after,
             limit: MANIFEST_SCAN_PAGE,
-            txn_id: None,
         })
-    }
-
-    fn finish(&mut self, output: Result<Vec<ShardManifestEntry>, String>) -> Effects {
-        self.reading = false;
-        self.output = Some(output);
-        smallvec![]
     }
 }
 
-impl EffectOperation for ManifestScanOperation {
+impl Operation for ManifestScanOperation {
     type Output = Vec<ShardManifestEntry>;
-    type Error = String;
+    type Error = ManifestScanError;
 
-    fn start(&mut self) -> Effects {
-        self.reading = true;
-        smallvec![self.page(None)]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(self.page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let (values, next) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if self.reading => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return self.finish(Err(format!("failed to scan shard manifest: {error}")));
-            }
-            other => {
-                let label = other.label();
-                return self.finish(Err(format!(
-                    "unexpected shard manifest iter result: {label}"
-                )));
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Page { rows, next } = result else {
+            let unexpected = IoError::Unexpected {
+                expected: "a shard manifest page",
+                got: "another result",
+            };
+            return Err(unexpected.into());
         };
-        for (_, value) in &values {
-            match postcard::from_bytes::<ShardManifestEntry>(value.as_ref()) {
-                Ok(entry) => self.entries.push(entry),
-                Err(error) => {
-                    let error = format!("failed to decode shard manifest entry: {error}");
-                    return self.finish(Err(error));
-                }
-            }
+        for (_, value) in &rows {
+            let entry = postcard::from_bytes::<ShardManifestEntry>(value.as_ref())
+                .map_err(|error| ManifestScanError::Decode(error.to_string()))?;
+            self.entries.push(entry);
         }
-        match next {
-            Some(next) => smallvec![self.page(Some(next))],
-            None => {
-                let entries = std::mem::take(&mut self.entries);
-                self.finish(Ok(entries))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .unwrap_or_else(|| Err("the shard manifest scan did not finish".to_string()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match next {
+            Some(next) => self.page(Some(next)),
+            None => Next::Done(std::mem::take(&mut self.entries)),
+        })
     }
 }
 

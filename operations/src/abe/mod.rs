@@ -12,6 +12,7 @@ mod snapshot;
 
 use crate::users::vault_read::{ReadVaultConfig, ReadVaultOperation};
 use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, VaultQuery};
 use aruna_core::errors::{BlobError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -91,6 +92,14 @@ pub enum KeyError {
         "a read policy depends on the session, so ask for this grant while the bucket is unlocked"
     )]
     Session,
+}
+impl From<IoError> for KeyError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Conflict,
+            _ => Self::Storage,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {

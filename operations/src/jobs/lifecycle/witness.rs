@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame};
 use aruna_core::events::{Event, LaunchDecline};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
@@ -647,13 +647,20 @@ async fn offer(context: &DriverContext, offered: Offer) -> RoundOutcome {
     let Ok(launch) = LaunchFrame::new(frame.into_inner()) else {
         return RoundOutcome::Done;
     };
-    let operation = OfferLaunchOperation::new(LaunchOfferEffect {
-        realm_id,
-        target: target.clone(),
-        launch: Box::new(launch),
-        deadline: OFFER_DEADLINE,
-    });
-    match drive(operation, context).await {
+    let target_node = target.node_id;
+    let answered = match context.net_handle.as_ref() {
+        // No transport dials the node it starts from, so a launch planned onto this
+        // node is admitted in process; the decision is the one an inbound offer gets.
+        Some(net) if net.node_id() == target_node => Ok(admit_here(context, launch).await),
+        _ => {
+            drive(
+                OfferLaunchOperation::new(target_node, launch, OFFER_DEADLINE),
+                context,
+            )
+            .await
+        }
+    };
+    match answered {
         Ok(OfferOutcome::Accepted(receipt)) => {
             match append_local(context, realm_id, local, receipt, now_ms).await {
                 true => RoundOutcome::Done,
@@ -678,6 +685,19 @@ async fn offer(context: &DriverContext, offered: Offer) -> RoundOutcome {
         Ok(OfferOutcome::Unavailable) | Err(_) => RoundOutcome::Retry {
             after_ms: retry_after_ms,
         },
+    }
+}
+
+/// Admits a launch planned onto this node, with the answer a remote target would give.
+async fn admit_here(context: &DriverContext, launch: LaunchFrame) -> OfferOutcome {
+    let context = std::sync::Arc::new(context.clone());
+    match super::target::admit_launch(&context, launch).await {
+        Some(Ok(receipt)) => match JobRecordFrame::new(receipt.into_inner()) {
+            Ok(frame) => OfferOutcome::Accepted(frame),
+            Err(_) => OfferOutcome::Unavailable,
+        },
+        Some(Err(reason)) => OfferOutcome::Declined(reason),
+        None => OfferOutcome::Unavailable,
     }
 }
 

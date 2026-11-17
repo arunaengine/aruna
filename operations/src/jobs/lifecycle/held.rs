@@ -2,33 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::JobId;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
+use aruna_core::types::Key;
 
 use super::LifecycleError;
 use super::reservation::MAX_RESERVATION_SCAN;
-use aruna_core::compute::quota::JobReservationRecord;
-use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Reads every held reservation, or only the one of `job_id`, oldest key first.
 #[derive(Debug, PartialEq)]
 pub struct HeldReservations {
     job_id: Option<JobId>,
     held: Vec<JobReservationRecord>,
-    state: HeldState,
-    outcome: Option<Result<Vec<JobReservationRecord>, LifecycleError>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeldState {
-    Init,
-    Page,
-    Done,
 }
 
 impl HeldReservations {
@@ -47,84 +36,46 @@ impl HeldReservations {
         Self {
             job_id,
             held: Vec::new(),
-            state: HeldState::Init,
-            outcome: None,
         }
-    }
-
-    fn page(&mut self, start_after: Option<Key>) -> Effects {
-        self.state = HeldState::Page;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: JOB_RESERVATION_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: MAX_RESERVATION_SCAN,
-            txn_id: None,
-        })]
-    }
-
-    fn finish(&mut self, outcome: Result<Vec<JobReservationRecord>, LifecycleError>) -> Effects {
-        self.outcome = Some(outcome);
-        self.state = HeldState::Done;
-        smallvec![]
     }
 }
 
-impl EffectOperation for HeldReservations {
+/// The page of reservation rows after `after`.
+fn page<T>(after: Option<Key>) -> Next<T> {
+    Next::Call(IoCall::Page {
+        space: JOB_RESERVATION_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
+        limit: MAX_RESERVATION_SCAN,
+    })
+}
+
+impl Operation for HeldReservations {
     type Output = Vec<JobReservationRecord>;
     type Error = LifecycleError;
 
-    fn start(&mut self) -> Effects {
-        self.page(None)
+    fn first(&mut self) -> Result<Next<Self::Output>, LifecycleError> {
+        Ok(page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                HeldState::Page,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                for (_, value) in values {
-                    match from_bytes::<JobReservationRecord>(&value) {
-                        Ok(row) if self.job_id.is_none_or(|job_id| row.job_id == job_id) => {
-                            self.held.push(row);
-                        }
-                        Ok(_) => {}
-                        Err(error) => return self.finish(Err(error.into())),
-                    }
-                }
-                match next_start_after {
-                    Some(next) => self.page(Some(next)),
-                    None => {
-                        let held = std::mem::take(&mut self.held);
-                        self.finish(Ok(held))
-                    }
-                }
-            }
-            (HeldState::Page, Event::Storage(StorageEvent::Error { error })) => {
-                self.finish(Err(error.into()))
-            }
-            (state, event) => self.finish(Err(LifecycleError::UnexpectedEvent {
-                state: format!("{state:?}"),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, LifecycleError> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(IoError::Unexpected {
                 expected: "reservation page",
-                got: event.label(),
-            })),
+                got: "another result",
+            }
+            .into());
+        };
+        for (_, value) in rows {
+            let row = from_bytes::<JobReservationRecord>(&value)?;
+            if self.job_id.is_none_or(|job_id| row.job_id == job_id) {
+                self.held.push(row);
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == HeldState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match next {
+            Some(after) => page(Some(after)),
+            None => Next::Done(std::mem::take(&mut self.held)),
+        })
     }
 }
 

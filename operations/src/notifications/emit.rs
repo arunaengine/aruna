@@ -2,29 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
 use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::notifications::outbox_record::schedule_drain_effect;
+use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmitNotificationsError {
     #[error(transparent)]
     Storage(StorageError),
-    #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
-    #[error("the notification emission did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for EmitNotificationsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            error => Self::Io(error),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,171 +40,60 @@ pub struct EmitNotificationsInput {
     pub records: Vec<NotificationRecord>,
 }
 
+/// Writes the records as outbox rows in one batch, then schedules the outbox drain. A failed
+/// schedule is logged: the drain's own re-arm or the next emission picks the rows up.
 #[derive(Debug, PartialEq)]
 pub struct EmitNotificationsOperation {
-    input: EmitNotificationsInput,
-    state: EmitNotificationsState,
-    error: Option<EmitNotificationsError>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum EmitNotificationsState {
-    Init,
-    StartTransaction,
-    WriteOutbox { txn_id: TxnId },
-    CommitTransaction { txn_id: TxnId },
-    ScheduleDrain,
-    Finish,
-}
-
-impl EmitNotificationsState {
-    fn name(&self) -> &'static str {
-        match self {
-            EmitNotificationsState::Init => "init",
-            EmitNotificationsState::StartTransaction => "start transaction",
-            EmitNotificationsState::WriteOutbox { .. } => "write outbox",
-            EmitNotificationsState::CommitTransaction { .. } => "commit transaction",
-            EmitNotificationsState::ScheduleDrain => "schedule drain",
-            EmitNotificationsState::Finish => "finish",
-        }
-    }
+    writes: Vec<(KeySpace, Key, Value)>,
+    scheduling: bool,
 }
 
 impl EmitNotificationsOperation {
+    /// Builds the outbox rows; each gets a new outbox id here, so `first` and `next` stay
+    /// deterministic.
     pub fn new(input: EmitNotificationsInput) -> Self {
-        Self {
-            input,
-            state: EmitNotificationsState::Init,
-            error: None,
-        }
-    }
-
-    /// Ends the emission with the failure `event` shows, aborting its open transaction.
-    fn drop_emission(&mut self, event: Event, txn_id: Option<TxnId>) -> Effects {
-        let error = match event {
-            Event::Storage(StorageEvent::Error { error }) => EmitNotificationsError::Storage(error),
-            other => EmitNotificationsError::UnexpectedEvent {
-                state: self.state.name(),
-                got: other.label().to_string(),
-            },
-        };
-        warn!(%error, "Dropping notification emission");
-        self.error.get_or_insert(error);
-        self.state = EmitNotificationsState::Finish;
-        match txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let txn_id = match event {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-            other => return self.drop_emission(other, None),
-        };
-
-        let mut writes: Vec<(KeySpace, Key, Value)> = Vec::with_capacity(self.input.records.len());
-        for record in &self.input.records {
-            let outbox_record = NotificationOutboxRecord {
+        let mut writes = Vec::with_capacity(input.records.len());
+        for record in input.records {
+            let outbox = NotificationOutboxRecord {
                 outbox_id: Ulid::generate(),
-                record: record.clone(),
+                record,
             };
-            match outbox_write_entry(&outbox_record) {
+            match outbox_write_entry(&outbox) {
                 Ok(entry) => writes.push(entry),
                 Err(error) => warn!(%error, "Skipping unserializable notification outbox row"),
             }
         }
-
-        if writes.is_empty() {
-            self.state = EmitNotificationsState::Finish;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-
-        self.state = EmitNotificationsState::WriteOutbox { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+        Self {
             writes,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_write_outbox(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
-            return self.drop_emission(event, Some(txn_id));
+            scheduling: false,
         }
-        self.state = EmitNotificationsState::CommitTransaction { txn_id };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_commit_transaction(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        if !matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionCommitted { .. })
-        ) {
-            return self.drop_emission(event, Some(txn_id));
-        }
-        self.state = EmitNotificationsState::ScheduleDrain;
-        smallvec![schedule_drain_effect()]
-    }
-
-    fn handle_schedule_drain(&mut self, event: Event) -> Effects {
-        if let Event::Task(TaskEvent::Error { message, .. }) = event {
-            warn!(message = %message, "Failed to schedule notification outbox drain after emit");
-        }
-        self.state = EmitNotificationsState::Finish;
-        smallvec![]
     }
 }
 
-impl EffectOperation for EmitNotificationsOperation {
+impl Operation for EmitNotificationsOperation {
     type Output = ();
     type Error = EmitNotificationsError;
 
-    fn start(&mut self) -> Effects {
-        if self.input.records.is_empty() {
-            self.state = EmitNotificationsState::Finish;
-            return smallvec![];
+    fn first(&mut self) -> Result<Next<()>, Self::Error> {
+        if self.writes.is_empty() {
+            return Ok(Next::Done(()));
         }
-        self.state = EmitNotificationsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            EmitNotificationsState::StartTransaction => self.handle_start_transaction(event),
-            EmitNotificationsState::WriteOutbox { txn_id } => {
-                self.handle_write_outbox(event, txn_id)
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, Self::Error> {
+        match (self.scheduling, result) {
+            (false, IoResult::Done) => {
+                self.scheduling = true;
+                Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
             }
-            EmitNotificationsState::CommitTransaction { txn_id } => {
-                self.handle_commit_transaction(event, txn_id)
+            (true, IoResult::Event(Event::Task(event))) => {
+                if let TaskEvent::Error { message, .. } = event {
+                    warn!(message = %message, "Failed to schedule notification outbox drain after emit");
+                }
+                Ok(Next::Done(()))
             }
-            EmitNotificationsState::ScheduleDrain => self.handle_schedule_drain(event),
-            EmitNotificationsState::Init | EmitNotificationsState::Finish => {
-                self.drop_emission(event, None)
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == EmitNotificationsState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match (self.state, self.error) {
-            (_, Some(error)) => Err(error),
-            (EmitNotificationsState::Finish, None) => Ok(()),
-            _ => Err(EmitNotificationsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            EmitNotificationsState::WriteOutbox { txn_id }
-            | EmitNotificationsState::CommitTransaction { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
+            (_, other) => Err(unexpected("an outbox write or a drain schedule", &other).into()),
         }
     }
 }
@@ -218,6 +115,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, record, user};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
     use aruna_core::structs::execution::notification::{
         NotificationClass, notification_outbox_key,
@@ -226,7 +125,6 @@ mod tests {
     use aruna_storage::storage;
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
-    use std::convert::Infallible;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -307,198 +205,91 @@ mod tests {
         assert!(read_outbox_rows(&context).await.is_empty());
     }
 
+    /// The rows are written, then the drain is scheduled; a failed schedule still succeeds.
     #[test]
-    fn start_error_finishes() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        let effects = operation.start();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(EmitNotificationsError::Storage(StorageError::WriteError(
-                "boom".to_string()
-            )))
-        );
+    fn write_then_schedule() {
+        for answer in [
+            TaskEvent::TimerScheduled {
+                key: TaskKey::DrainNotificationOutbox,
+                after: Duration::ZERO,
+            },
+            TaskEvent::Error {
+                key: None,
+                message: "scheduler unavailable".to_string(),
+            },
+        ] {
+            let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
+                records: vec![make_record(1, 2)],
+            });
+            assert!(matches!(
+                operation.first(),
+                Ok(Next::Call(IoCall::Write(writes))) if writes.len() == 1
+            ));
+            match operation.next(IoResult::Done) {
+                Ok(Next::Call(IoCall::Effect(Effect::Task(TaskEffect::ResetTimer {
+                    key,
+                    after,
+                })))) => {
+                    assert_eq!(key, TaskKey::DrainNotificationOutbox);
+                    assert_eq!(after, Duration::ZERO);
+                }
+                other => panic!("expected a drain schedule, got {other:?}"),
+            }
+            let answer = IoResult::Event(Event::Task(answer));
+            assert_eq!(operation.next(answer), Ok(Next::Done(())));
+        }
     }
 
     // A storage failure must not reach the parent as a successful emission.
     #[test]
     fn storage_failure_reported() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        assert!(operation.is_complete());
-        assert!(operation.finalize().is_err());
-
-        let Effect::SubOperation(mut emit) = emit_notifications_effect(vec![make_record(1, 2)])
-        else {
-            panic!("emit is a sub-operation");
-        };
-        emit.start();
-        emit.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        assert_ne!(
-            emit.finalize(),
-            Event::SubOperation(SubOperationEvent::NotificationsEmitted)
-        );
-    }
-
-    #[test]
-    fn write_error_aborts() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        operation.start();
-        let txn_id = TxnId::generate();
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { .. })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })] => {
-                assert_eq!(*aborted, txn_id);
-            }
-            other => panic!("expected a single abort effect, got {other:?}"),
-        }
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
+        let boom = StorageError::WriteError("boom".to_string());
         assert_eq!(
-            operation.finalize(),
-            Err(EmitNotificationsError::Storage(StorageError::WriteError(
-                "boom".to_string()
-            )))
+            EmitNotificationsError::from(IoError::Storage(boom.clone())),
+            EmitNotificationsError::Storage(boom)
         );
-    }
-
-    #[test]
-    fn commit_error_finishes() {
         let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
             records: vec![make_record(1, 2)],
         });
-        operation.start();
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
-        }));
+        operation.first().unwrap();
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        match effects.as_slice() {
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })] => {
-                assert_eq!(*aborted, txn_id);
-            }
-            other => panic!("expected a single abort effect, got {other:?}"),
-        }
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(EmitNotificationsError::Storage(StorageError::WriteError(
-                "boom".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn unexpected_event_fails() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        operation.start();
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-
-        let effects = operation.step(Event::Search());
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert!(operation.is_complete());
-        assert!(matches!(
-            operation.finalize(),
-            Err(EmitNotificationsError::UnexpectedEvent { .. })
+            operation.next(IoResult::Woke),
+            Err(EmitNotificationsError::Io(IoError::Unexpected { .. }))
         ));
     }
 
     #[derive(Debug, PartialEq)]
     struct HostOperation {
         record: Option<NotificationRecord>,
-        observed: Option<Event>,
     }
 
-    impl HostOperation {
-        fn new(record: NotificationRecord) -> Self {
-            Self {
-                record: Some(record),
-                observed: None,
-            }
-        }
-    }
-
-    impl EffectOperation for HostOperation {
+    impl Operation for HostOperation {
         type Output = Event;
-        type Error = Infallible;
+        type Error = IoError;
 
-        fn start(&mut self) -> Effects {
-            let record = self.record.take().expect("record present in start");
-            smallvec![emit_notifications_effect(vec![record])]
+        fn first(&mut self) -> Result<Next<Event>, IoError> {
+            let record = self.record.take().expect("record present in first");
+            let Effect::SubOperation(emit) = emit_notifications_effect(vec![record]) else {
+                panic!("emit is a sub-operation");
+            };
+            Ok(Next::Call(IoCall::Child(emit)))
         }
 
-        fn step(&mut self, event: Event) -> Effects {
-            self.observed = Some(event);
-            smallvec![]
-        }
-
-        fn is_complete(&self) -> bool {
-            self.observed.is_some()
-        }
-
-        fn finalize(self) -> Result<Self::Output, Self::Error> {
-            Ok(self
-                .observed
-                .expect("host operation should observe the emit event"))
-        }
-
-        fn abort(&mut self) -> Effects {
-            smallvec![]
+        fn next(&mut self, result: IoResult) -> Result<Next<Event>, IoError> {
+            match result {
+                IoResult::Event(event) => Ok(Next::Done(event)),
+                other => Err(unexpected("the emit event", &other)),
+            }
         }
     }
 
     #[tokio::test]
     async fn wrapper_maps_event() {
         let (_tempdir, context) = context_with_storage();
-        let observed = drive(HostOperation::new(make_record(1, 2)), &context)
-            .await
-            .unwrap();
+        let host = HostOperation {
+            record: Some(make_record(1, 2)),
+        };
+        let observed = drive(host, &context).await.unwrap();
         assert_eq!(
             observed,
             Event::SubOperation(SubOperationEvent::NotificationsEmitted)
@@ -529,62 +320,6 @@ mod tests {
         for (_, row) in &rows {
             assert_eq!(row.record, record);
         }
-    }
-
-    #[test]
-    fn commit_schedules_drain() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        operation.start();
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        match effects.as_slice() {
-            [Effect::Task(TaskEffect::ResetTimer { key, after })] => {
-                assert_eq!(*key, TaskKey::DrainNotificationOutbox);
-                assert_eq!(*after, Duration::ZERO);
-            }
-            other => panic!("expected a drain schedule effect, got {other:?}"),
-        }
-        assert!(!operation.is_complete());
-
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainNotificationOutbox,
-            after: Duration::ZERO,
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
-    }
-
-    #[test]
-    fn drain_error_swallowed() {
-        let mut operation = EmitNotificationsOperation::new(EmitNotificationsInput {
-            records: vec![make_record(1, 2)],
-        });
-        operation.start();
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![],
-        }));
-        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-
-        let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: None,
-            message: "scheduler unavailable".to_string(),
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     #[tokio::test]

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
@@ -12,10 +13,11 @@ use super::*;
 use crate::driver::{DriverContext, drive};
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::jobs::{retire_work, settle_work};
-use crate::plugins::rows::{read_rows, write_rows};
+use crate::plugins::rows::{
+    page_call, page_result, read_call, read_rows, values_result, write_rows,
+};
 use crate::plugins::store::Txn;
 use crate::plugins::worker::tests::installed;
-use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
 const SOURCE: &str = "/realm/g/group/data/node/in/a.txt";
@@ -616,10 +618,10 @@ async fn settles_answer() {
 }
 
 /// A work row's index answer and row answer for `row` under `key`.
-fn found(key: &[u8], row: &WorkRow) -> [Answer; 2] {
+fn found(key: &[u8], row: &WorkRow) -> [IoResult; 2] {
     [
-        Answer::Values(vec![Some(key.to_vec())]),
-        Answer::Values(vec![Some(encode(row).unwrap())]),
+        values_result(vec![Some(key.to_vec())]),
+        values_result(vec![Some(encode(row).unwrap())]),
     ]
 }
 
@@ -630,12 +632,12 @@ fn lookup_follows_index() {
     row.work_id = Ulid::from_parts(2, 2);
     let mut lookup = WorkLookup::new(install_id, row.work_id);
     let index = index_key(install_id, row.work_id);
-    assert_eq!(lookup.ask(), Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, index)]));
+    assert_eq!(lookup.ask(), read_call(vec![(PLUGIN_WORK_KEYSPACE, index)]));
     let [by_index, by_key] = found(b"key", &row);
     let next = lookup.take(by_index).unwrap();
     assert_eq!(
         next,
-        Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, b"key".to_vec())]))
+        Found::Ask(read_call(vec![(PLUGIN_WORK_KEYSPACE, b"key".to_vec())]))
     );
     assert_eq!(
         lookup.take(by_key).unwrap(),
@@ -644,14 +646,14 @@ fn lookup_follows_index() {
     // A missing index, and a row of another work under the key, find nothing.
     let mut gone = WorkLookup::new(install_id, row.work_id);
     assert_eq!(
-        gone.take(Answer::Values(vec![None])).unwrap(),
+        gone.take(values_result(vec![None])).unwrap(),
         Found::Row(None)
     );
     let mut other = WorkLookup::new(install_id, Ulid::from_parts(3, 3));
     let [by_index, by_key] = found(b"key", &row);
     other.take(by_index).unwrap();
     assert_eq!(other.take(by_key).unwrap(), Found::Row(None));
-    assert!(other.take(Answer::Done).is_err());
+    assert!(other.take(IoResult::Done).is_err());
 }
 
 #[test]
@@ -676,7 +678,7 @@ fn send_boundary_decides() {
     once.next(by_index).unwrap();
     assert_eq!(
         once.next(by_key).unwrap(),
-        Turn::Finish(Some(Send::Undecided))
+        Next::Done(Some(Send::Undecided))
     );
     // One that may go twice moves the boundary to the next attempt first.
     let mut again = BeginSend {
@@ -686,14 +688,14 @@ fn send_boundary_decides() {
     };
     let [by_index, by_key] = found(b"key", &row);
     again.next(by_index).unwrap();
-    let Turn::Ask(Ask::Write(rows)) = again.next(by_key).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = again.next(by_key).unwrap() else {
         panic!("the boundary is written before sending");
     };
     let written: WorkRow = decode(&rows[0].2).unwrap();
     assert_eq!(written.boundary, Some(SendBoundary::Sending { attempt: 2 }));
     assert_eq!(
-        again.next(Answer::Done).unwrap(),
-        Turn::Finish(Some(Send::Now))
+        again.next(IoResult::Done).unwrap(),
+        Next::Done(Some(Send::Now))
     );
 }
 
@@ -704,8 +706,10 @@ fn reserve_decisions() {
     let reserve_with = |row: WorkRow| reserve((&install, &call(0)), row, None).unwrap();
     // A row of the same account and digest is adopted without a write.
     let mut adopt = reserve_with(row.clone());
-    let effects = adopt.start();
-    assert_eq!(effects.len(), 1);
+    assert!(matches!(
+        adopt.first().unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
     let mut plan = ReserveWork {
         key: row_key(install.install_id, &call(0)).unwrap(),
         install_id: install.install_id,
@@ -714,17 +718,17 @@ fn reserve_decisions() {
         mark: None,
         phase: ReservePhase::Reading,
     };
-    let stored = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    let stored = values_result(vec![Some(encode(&row).unwrap())]);
     assert_eq!(
         plan.next(stored).unwrap(),
-        Turn::Finish((row.clone(), Reserve::Earlier))
+        Next::Done((row.clone(), Reserve::Earlier))
     );
     let mut conflict = ReserveWork {
         proposed: Some(Box::new(proposed(&install, 2))),
         phase: ReservePhase::Reading,
         ..plan
     };
-    let stored = Answer::Values(vec![Some(encode(&row).unwrap())]);
+    let stored = values_result(vec![Some(encode(&row).unwrap())]);
     assert_eq!(conflict.next(stored), Err(WorkError::Conflict));
     // A new row writes its index and itself.
     let mut fresh = ReserveWork {
@@ -732,13 +736,13 @@ fn reserve_decisions() {
         phase: ReservePhase::Reading,
         ..conflict
     };
-    let Turn::Ask(Ask::Write(rows)) = fresh.next(Answer::Values(vec![None])).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = fresh.next(values_result(vec![None])).unwrap() else {
         panic!("a new row is written");
     };
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        fresh.next(Answer::Done).unwrap(),
-        Turn::Finish((row, Reserve::Fresh))
+        fresh.next(IoResult::Done).unwrap(),
+        Next::Done((row, Reserve::Fresh))
     );
 }
 
@@ -782,7 +786,7 @@ fn change_applies_once() {
     plan.first().unwrap();
     let [by_index, by_key] = found(b"key", &row);
     plan.next(by_index).unwrap();
-    let Turn::Ask(Ask::Write(rows)) = plan.next(by_key).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = plan.next(by_key).unwrap() else {
         panic!("the changed row is written");
     };
     let written: WorkRow = decode(&rows[0].2).unwrap();
@@ -791,8 +795,8 @@ fn change_applies_once() {
         (WorkState::Dispatched, Some(job(1)))
     );
     assert_eq!(
-        plan.next(Answer::Done).unwrap(),
-        Turn::Finish(Some(written))
+        plan.next(IoResult::Done).unwrap(),
+        Next::Done(Some(written))
     );
     // A gone row is not changed.
     let mut gone = UpdateWork {
@@ -801,8 +805,8 @@ fn change_applies_once() {
         written: None,
     };
     assert_eq!(
-        gone.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Finish(None)
+        gone.next(values_result(vec![None])).unwrap(),
+        Next::Done(None)
     );
     // A later state keeps its job.
     let mut settled = row.clone();
@@ -816,12 +820,7 @@ fn listed_by_index() {
     let install_id = Ulid::from_parts(1, 1);
     let row = WorkRow::reserved(&sample_install(install_id), WorkKind::Copy, Ulid::nil(), 1);
     let mut plan = ListWork {
-        page: Some(Ask::Page {
-            space: PLUGIN_WORK_KEYSPACE,
-            prefix: Vec::new(),
-            after: None,
-            limit: 2,
-        }),
+        page: Some(page_call(PLUGIN_WORK_KEYSPACE, Vec::new(), None, 2)),
         indexes: Vec::new(),
         next: None,
     };
@@ -829,14 +828,14 @@ fn listed_by_index() {
     let index = index_key(install_id, row.work_id);
     let other = index_key(install_id, Ulid::from_parts(9, 9));
     let page = vec![(index.clone(), b"k1".to_vec()), (other, b"k2".to_vec())];
-    let Turn::Ask(Ask::Read(reads)) = plan.next(Answer::Page(page, Some(Vec::new()))).unwrap()
+    let Next::Call(IoCall::Read(reads)) = plan.next(page_result(page, Some(Vec::new()))).unwrap()
     else {
         panic!("the rows of the index page are read");
     };
     assert_eq!(reads.len(), 2);
     // A row another work replaced under the key, and a gone one, are left out.
     let values = vec![Some(encode(&row).unwrap()), Some(encode(&row).unwrap())];
-    let Turn::Finish((works, next)) = plan.next(Answer::Values(values)).unwrap() else {
+    let Next::Done((works, next)) = plan.next(values_result(values)).unwrap() else {
         panic!("the page ends the listing");
     };
     assert_eq!(works, [row]);

@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataError};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::graph_lifecycle_key;
 use thiserror::Error;
 
-use crate::metadata::repository::read_lifecycle_effect;
+use crate::metadata::call_results::read_value;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum GraphDeletedError {
@@ -18,13 +18,18 @@ pub enum GraphDeletedError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event while {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("the graph lifecycle read did not finish")]
-    Unfinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for GraphDeletedError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl GraphDeletedError {
@@ -47,100 +52,50 @@ impl From<GraphDeletedError> for MetadataError {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum DeletedState {
-    Init,
-    Reading,
-    Done,
-}
-
 /// Reads the lifecycle row of `graph_iri`; a graph without one is not deleted.
 #[derive(Debug, PartialEq)]
 pub struct GraphDeletedOperation {
     graph_iri: String,
-    state: DeletedState,
-    output: Option<Result<bool, GraphDeletedError>>,
 }
 
 impl GraphDeletedOperation {
     pub fn new(graph_iri: &str) -> Self {
         Self {
             graph_iri: graph_iri.to_string(),
-            state: DeletedState::Init,
-            output: None,
         }
-    }
-
-    fn finish(&mut self, output: Result<bool, GraphDeletedError>) -> Effects {
-        self.state = DeletedState::Done;
-        self.output = Some(output);
-        smallvec![]
     }
 }
 
-impl EffectOperation for GraphDeletedOperation {
+impl Operation for GraphDeletedOperation {
     type Output = bool;
     type Error = GraphDeletedError;
 
-    fn start(&mut self) -> Effects {
-        self.state = DeletedState::Reading;
-        smallvec![read_lifecycle_effect(&self.graph_iri, None)]
+    fn first(&mut self) -> Result<Next<bool>, GraphDeletedError> {
+        let key = graph_lifecycle_key(&self.graph_iri);
+        let read = vec![(GRAPH_LIFECYCLE_KEYSPACE.to_string(), key)];
+        Ok(Next::Call(IoCall::Read(read)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let reading = self.state == DeletedState::Reading;
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) if reading => {
-                let deleted = value
-                    .map(|bytes| postcard::from_bytes::<GraphLifecycleRecord>(&bytes))
-                    .transpose()
-                    .map(|record| record.is_some_and(|record| record.is_deleted()))
-                    .map_err(|error| ConversionError::from(error).into());
-                self.finish(deleted)
-            }
-            Event::Storage(StorageEvent::Error { error }) if reading => {
-                self.finish(Err(error.into()))
-            }
-            event => {
-                let error = GraphDeletedError::UnexpectedEvent {
-                    state: if reading {
-                        "reading the lifecycle"
-                    } else {
-                        "idle"
-                    },
-                    got: event.label(),
-                };
-                self.finish(Err(error))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == DeletedState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GraphDeletedError::Unfinished))
-    }
-
-    // The read runs outside a transaction, so nothing is left to clean up.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, GraphDeletedError> {
+        let deleted = read_value(result)?
+            .map(|bytes| postcard::from_bytes::<GraphLifecycleRecord>(&bytes))
+            .transpose()
+            .map_err(ConversionError::from)?
+            .is_some_and(|record| record.is_deleted());
+        Ok(Next::Done(deleted))
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::types::Value;
     use ulid::Ulid;
 
     const GRAPH: &str = "urn:graph:one";
 
-    fn tombstone() -> Vec<u8> {
+    fn tombstone() -> Value {
         let record = GraphLifecycleRecord::deleted(
             GRAPH.to_string(),
             RealmId([1; 32]),
@@ -148,68 +103,78 @@ mod state_machine_tests {
             Ulid::from_bytes([3; 16]),
             2,
         );
-        postcard::to_allocvec(&record).unwrap()
+        postcard::to_allocvec(&record).unwrap().into()
     }
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: value.map(Into::into),
-        })
-    }
-
-    fn reading() -> GraphDeletedOperation {
-        let mut operation = GraphDeletedOperation::new(GRAPH);
-        operation.start();
-        operation
+    fn read_call() -> Next<bool> {
+        let read = vec![(
+            GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            graph_lifecycle_key(GRAPH),
+        )];
+        Next::Call(IoCall::Read(read))
     }
 
     #[test]
     fn tombstone_reads_deleted() {
         let mut operation = GraphDeletedOperation::new(GRAPH);
-        check_trace(
-            &mut operation,
-            &[read_lifecycle_effect(GRAPH, None)],
-            vec![(read(Some(tombstone())), vec![])],
-        );
-        assert_eq!(operation.finalize(), Ok(true));
+        assert_eq!(operation.first(), Ok(read_call()));
+        let answer = IoResult::Values(vec![Some(tombstone())]);
+        assert_eq!(operation.next(answer), Ok(Next::Done(true)));
     }
 
     #[test]
     fn missing_row_live() {
         let mut operation = GraphDeletedOperation::new(GRAPH);
-        check_trace(
-            &mut operation,
-            &[read_lifecycle_effect(GRAPH, None)],
-            vec![(read(None), vec![])],
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
         );
-        assert_eq!(operation.finalize(), Ok(false));
-    }
-
-    #[test]
-    fn storage_errors_fail() {
-        let mut operation = reading();
-        let error = Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        });
-        assert!(operation.step(error).is_empty());
-        let error = operation.finalize().unwrap_err();
-        assert_eq!(error, GraphDeletedError::Storage(StorageError::Timeout));
-        assert!(matches!(
-            MetadataError::from(error),
-            MetadataError::Storage(StorageError::Timeout)
-        ));
     }
 
     #[test]
     fn broken_row_fails() {
         // A row that does not decode is an error, never a live graph.
-        let mut operation = reading();
-        operation.step(read(Some(vec![0xff])));
-        let error = operation.finalize().unwrap_err();
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        operation.first().unwrap();
+        let error = operation
+            .next(IoResult::Values(vec![Some(vec![0xff].into())]))
+            .unwrap_err();
         assert!(matches!(error, GraphDeletedError::Conversion(_)));
         let folded: StorageOrConversion = error.into_error();
         assert!(matches!(folded, StorageOrConversion::Conversion(_)));
+    }
+
+    #[test]
+    fn wrong_result_fails() {
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        operation.first().unwrap();
+        let error = operation.next(IoResult::Done).unwrap_err();
+        assert!(matches!(
+            error,
+            GraphDeletedError::Io(IoError::Unexpected { .. })
+        ));
+        // Errors outside storage fold into a storage read error for queue callers.
+        let folded: StorageOrConversion = error.into_error();
+        assert!(matches!(folded, StorageOrConversion::Storage(_)));
+    }
+
+    #[test]
+    fn runner_errors_map() {
+        let timeout = GraphDeletedError::from(IoError::Storage(StorageError::Timeout));
+        assert_eq!(timeout, GraphDeletedError::Storage(StorageError::Timeout));
+        assert!(matches!(
+            MetadataError::from(timeout),
+            MetadataError::Storage(StorageError::Timeout)
+        ));
+        assert_eq!(
+            GraphDeletedError::from(IoError::Conflict),
+            GraphDeletedError::Storage(StorageError::TransactionConflict)
+        );
+        assert_eq!(
+            GraphDeletedError::from(IoError::Aborted),
+            GraphDeletedError::Io(IoError::Aborted)
+        );
     }
 
     #[derive(Debug)]
@@ -228,42 +193,5 @@ mod state_machine_tests {
         fn from(error: ConversionError) -> Self {
             Self::Conversion(error)
         }
-    }
-
-    #[test]
-    fn rejects_other_events() {
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, GraphDeletedError::UnexpectedEvent { .. }));
-            // Unexpected events fold into a storage read error for queue callers.
-            let folded: StorageOrConversion = error.into_error();
-            assert!(matches!(folded, StorageOrConversion::Storage(_)));
-        }
-        let mut idle = GraphDeletedOperation::new(GRAPH);
-        idle.step(read(None));
-        assert!(matches!(
-            idle.finalize(),
-            Err(GraphDeletedError::UnexpectedEvent { .. })
-        ));
-    }
-
-    #[test]
-    fn abort_cleans_nothing() {
-        let mut operation = GraphDeletedOperation::new(GRAPH);
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(GraphDeletedOperation::new(GRAPH));
-        rejects_finalize(reading());
     }
 }

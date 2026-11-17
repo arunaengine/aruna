@@ -1,4 +1,4 @@
-//! Tests central provider writes and daily usage charges without I/O.
+//! Tests central provider writes and daily usage charges as calls and results.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,10 +13,6 @@ use ulid::Ulid;
 
 fn user() -> UserId {
     UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32]))
-}
-
-fn txn() -> TxnId {
-    Ulid::from_bytes([6; 16])
 }
 
 fn central(label: &str) -> CentralAssistant {
@@ -44,107 +40,71 @@ fn central(label: &str) -> CentralAssistant {
     }
 }
 
-fn started() -> Event {
-    Event::Storage(StorageEvent::TransactionStarted { txn_id: txn() })
+fn value(bytes: Option<Vec<u8>>) -> IoResult {
+    IoResult::Values(vec![bytes.map(Into::into)])
 }
 
-fn read(value: Option<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: central_key(),
-        value: value.map(Into::into),
-    })
-}
-
-fn committed() -> Event {
-    Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() })
-}
-
-fn aborts(effects: &Effects) -> bool {
-    matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    )
+fn usage_value(usage: Option<AssistantUsage>) -> IoResult {
+    value(usage.map(|usage| usage.to_bytes().unwrap()))
 }
 
 #[test]
 fn sets_when_unchanged() {
     let mut operation = SetCentralOperation::new(Some(central("Realm")), None);
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(read(None));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { .. })]
-    ));
-    let key = central_key();
-    operation.step(Event::Storage(StorageEvent::WriteResult { key }));
-    operation.step(committed());
-    assert!(operation.is_complete());
-    operation.finalize().unwrap();
+    assert!(operation.transaction());
+    assert_eq!(
+        operation.first().unwrap(),
+        Next::Call(IoCall::Read(vec![central_row()]))
+    );
+    let next = operation.next(value(None)).unwrap();
+    assert!(matches!(next, Next::Call(IoCall::Write(rows)) if rows.len() == 1));
+    assert_eq!(operation.next(IoResult::Done).unwrap(), Next::Done(()));
 }
 
 #[test]
 fn concurrent_set_conflicts() {
     let mut operation = SetCentralOperation::new(Some(central("Mine")), None);
-    operation.start();
-    operation.step(started());
+    operation.first().unwrap();
     let other = central("Theirs").to_bytes().unwrap();
-    let effects = operation.step(read(Some(other)));
-    assert!(aborts(&effects));
-    assert!(matches!(
-        operation.finalize(),
+    assert_eq!(
+        operation.next(value(Some(other))),
         Err(CentralStoreError::Stale)
-    ));
+    );
 }
 
 #[test]
 fn removes_provider() {
     let stored = central("Realm");
     let mut operation = SetCentralOperation::new(None, Some(stored.clone()));
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(read(Some(stored.to_bytes().unwrap())));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { .. })]
-    ));
+    operation.first().unwrap();
+    let next = operation.next(value(Some(stored.to_bytes().unwrap())));
+    assert_eq!(next, Ok(Next::Call(IoCall::Delete(vec![central_row()]))));
 }
 
 #[test]
-fn wrong_event_fails() {
+fn wrong_result_fails() {
     let mut operation = SetCentralOperation::new(Some(central("Realm")), None);
-    operation.start();
-    operation.step(started());
-    let key = central_key();
-    let effects = operation.step(Event::Storage(StorageEvent::WriteResult { key }));
-    assert!(aborts(&effects));
+    operation.first().unwrap();
     assert!(matches!(
-        operation.finalize(),
-        Err(CentralStoreError::UnexpectedEvent { .. })
+        operation.next(IoResult::Done),
+        Err(CentralStoreError::Io(IoError::Unexpected { .. }))
     ));
-}
-
-fn usage_read(usage: Option<AssistantUsage>) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: usage_key(user()),
-        value: usage.map(|usage| usage.to_bytes().unwrap().into()),
-    })
 }
 
 #[test]
 fn charge_writes_count() {
     let today = utc_day(86_400 * 3 + 5);
     let mut operation = ChargeUsageOperation::new(user(), today, Some(2));
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(usage_read(Some(AssistantUsage {
+    assert!(operation.transaction());
+    operation.first().unwrap();
+    let next = operation.next(usage_value(Some(AssistantUsage {
         day: today,
         count: 1,
     })));
-    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-        panic!("expected one usage write, got {effects:?}");
+    let Ok(Next::Call(IoCall::Write(rows))) = next else {
+        panic!("expected one usage write, got {next:?}");
     };
-    let written = AssistantUsage::from_bytes(value.as_ref()).unwrap();
+    let written = AssistantUsage::from_bytes(rows[0].2.as_ref()).unwrap();
     assert_eq!(
         written,
         AssistantUsage {
@@ -152,66 +112,52 @@ fn charge_writes_count() {
             count: 2
         }
     );
-    let key = usage_key(user());
-    operation.step(Event::Storage(StorageEvent::WriteResult { key }));
-    operation.step(committed());
-    assert_eq!(operation.finalize().unwrap(), written);
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(written)));
 }
 
 #[test]
-fn refused_charge_aborts() {
+fn refused_charge_fails() {
     let mut operation = ChargeUsageOperation::new(user(), 9, Some(2));
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(usage_read(Some(AssistantUsage { day: 9, count: 2 })));
-    assert!(aborts(&effects));
-    assert!(matches!(
-        operation.finalize(),
+    operation.first().unwrap();
+    let next = operation.next(usage_value(Some(AssistantUsage { day: 9, count: 2 })));
+    assert_eq!(
+        next,
         Err(CentralStoreError::QuotaReached(QuotaReached {
             used: 2,
             limit: 2
         }))
-    ));
+    );
 }
 
 #[test]
 fn charge_resets_daily() {
     // The last second of day 9 is refused; the first second of day 10 counts from zero.
     let last = 86_400 * 10 - 1;
-    let mut operation = ChargeUsageOperation::new(user(), utc_day(last), Some(2));
-    operation.start();
-    operation.step(started());
     let full = Some(AssistantUsage { day: 9, count: 2 });
-    assert!(aborts(&operation.step(usage_read(full))));
+    let mut operation = ChargeUsageOperation::new(user(), utc_day(last), Some(2));
+    operation.first().unwrap();
+    assert!(operation.next(usage_value(full)).is_err());
     let mut operation = ChargeUsageOperation::new(user(), utc_day(last + 1), Some(2));
-    operation.start();
-    operation.step(started());
-    let effects = operation.step(usage_read(full));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Write { .. })]
-    ));
+    operation.first().unwrap();
+    let next = operation.next(usage_value(full));
+    assert!(matches!(next, Ok(Next::Call(IoCall::Write(_)))));
 }
 
 #[test]
 fn reads_central_usage() {
     let mut operation = GetCentralOperation::new(user());
-    let effects = operation.start();
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, txn_id: None })] if reads.len() == 2
-    ));
+    assert_eq!(
+        operation.first().unwrap(),
+        Next::Call(IoCall::Read(vec![central_row(), usage_row(user())]))
+    );
     let usage = AssistantUsage { day: 4, count: 1 };
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                central_key(),
-                Some(central("Realm").to_bytes().unwrap().into()),
-            ),
-            (usage_key(user()), Some(usage.to_bytes().unwrap().into())),
-        ],
-    }));
-    let (stored, read_usage) = operation.finalize().unwrap();
+    let next = operation.next(IoResult::Values(vec![
+        Some(central("Realm").to_bytes().unwrap().into()),
+        Some(usage.to_bytes().unwrap().into()),
+    ]));
+    let Ok(Next::Done((stored, read_usage))) = next else {
+        panic!("expected the central read, got {next:?}");
+    };
     assert_eq!(stored.unwrap().provider.label, "Realm");
     assert_eq!(read_usage, Some(usage));
 }

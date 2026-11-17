@@ -6,6 +6,9 @@
 use super::*;
 use crate::s3::bucket::key::rows::authority_rows;
 use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketKeyRef, EncryptionMode, GrantState, HolderOrigin,
@@ -27,17 +30,17 @@ fn session(seed: u8) -> Option<Ulid> {
     Some(Ulid::from_bytes([seed; 16]))
 }
 
-fn page(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: values
+fn page(values: Vec<(Vec<u8>, Vec<u8>)>, next: Option<Vec<u8>>) -> IoResult {
+    IoResult::Page {
+        rows: values
             .into_iter()
             .map(|(key, value)| (key.into(), value.into()))
             .collect(),
-        next_start_after: next.map(Into::into),
-    })
+        next: next.map(Into::into),
+    }
 }
 
-fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> Event {
+fn rows(values: Vec<(Vec<u8>, Vec<u8>)>) -> IoResult {
     page(values, None)
 }
 
@@ -135,18 +138,30 @@ impl Log {
 }
 
 /// Starts a scan of the bucket settings `buckets` and answers the settings page.
-fn scanned(buckets: Vec<(Vec<u8>, Vec<u8>)>) -> (RestartScanOperation, Effects) {
+fn scanned(buckets: Vec<(Vec<u8>, Vec<u8>)>) -> (RestartScanOperation, Step) {
     let mut operation = RestartScanOperation::new(NOW, RealmId::from_bytes([1; 32]));
-    operation.start();
-    let effects = operation.step(rows(buckets));
-    (operation, effects)
+    let _ = operation.first();
+    let turn = operation.next(rows(buckets));
+    (operation, turn)
 }
 
-fn scans(effects: &Effects, key_space: &str) -> bool {
-    matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { key_space: scanned, .. })] if scanned == key_space
-    )
+fn scans(turn: &Step, key_space: &str) -> bool {
+    matches!(turn, Ok(Next::Call(IoCall::Page { space, .. })) if space == key_space)
+}
+
+fn bucket_row(info: &BucketInfo) -> IoResult {
+    IoResult::Values(vec![Some(info.to_bytes().unwrap().into())])
+}
+
+fn authority(values: Vec<(Key, Option<Value>)>) -> IoResult {
+    IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+}
+
+fn found(turn: Step) -> Vec<RestartedBucket> {
+    match turn {
+        Ok(Next::Done(found)) => found,
+        other => panic!("expected the found buckets, got {other:?}"),
+    }
 }
 
 fn bucket_info() -> BucketInfo {
@@ -182,11 +197,11 @@ fn finds_unlocked_generations() {
         b"locked".to_vec(),
         settings(EncryptionMode::VaultLocked, LOCKED),
     );
-    let (mut operation, effects) = scanned(vec![locked]);
-    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
+    let (mut operation, turn) = scanned(vec![locked]);
+    assert!(scans(&turn, BUCKET_KEY_KEYSPACE));
     let keys = vec![key_row(LOCKED, 1, false), key_row(LOCKED, 2, false)];
-    let effects = operation.step(rows(keys));
-    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    let turn = operation.next(rows(keys));
+    assert!(scans(&turn, BUCKET_AUDIT_KEYSPACE));
     // Generation 2 was locked after its unlock; generation 1 is still unlocked.
     let mut log = Log::default();
     log.applied(AuditAction::Unlock, (1, session(1)), None);
@@ -198,18 +213,15 @@ fn finds_unlocked_generations() {
     // The trail arrives in two storage pages.
     let (first, second) = stored.split_at(2);
     let next = first.last().map(|(key, _)| key.clone());
-    let effects = operation.step(page(first.to_vec(), next));
-    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    let turn = operation.next(page(first.to_vec(), next));
+    assert!(scans(&turn, BUCKET_AUDIT_KEYSPACE));
     let info = bucket_info();
-    operation.step(rows(second.to_vec()));
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(b"locked".to_vec()),
-        value: Some(info.to_bytes().unwrap().into()),
-    }));
+    let _ = operation.next(rows(second.to_vec()));
+    let _ = operation.next(bucket_row(&info));
     // Admin rights come from the current authorization documents: user(4) lost its role.
     let settings = BucketEncryption::from_bytes(&settings(EncryptionMode::VaultLocked, LOCKED));
     let values = authority_rows(&info, Some(&settings.unwrap()), &[user(5)]);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let _ = operation.next(authority(values));
     let grant = BucketHolder {
         bucket_id: LOCKED,
         user_id: user(3),
@@ -218,12 +230,11 @@ fn finds_unlocked_generations() {
         granted_by: user(1),
         granted_at_ms: 1,
     };
-    operation.step(rows(vec![(grant.key(), grant.to_bytes().unwrap())]));
+    let _ = operation.next(rows(vec![(grant.key(), grant.to_bytes().unwrap())]));
     // A former admin keeps an old copy but is no holder any more and is not told.
-    operation.step(rows(vec![copy(user(2), 1), copy(user(4), 1)]));
-    let found = operation.finalize().unwrap();
+    let turn = operation.next(rows(vec![copy(user(2), 1), copy(user(4), 1)]));
     assert_eq!(
-        found,
+        found(turn),
         [RestartedBucket {
             bucket: "locked".to_string(),
             bucket_id: LOCKED,
@@ -239,7 +250,7 @@ fn decrypting_bucket_included() {
     // A bucket in mode off still holds its source key while a decryption runs; a node-managed
     // bucket has only node vault keys, which startup opens itself.
     let managed_id = Ulid::from_bytes([2; 16]);
-    let (mut operation, effects) = scanned(vec![
+    let (mut operation, turn) = scanned(vec![
         (b"locked".to_vec(), settings(EncryptionMode::Off, LOCKED)),
         (
             b"managed".to_vec(),
@@ -247,20 +258,20 @@ fn decrypting_bucket_included() {
         ),
     ]);
     // The last listed bucket is scanned first: its only key has a node copy.
-    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
-    let effects = operation.step(rows(vec![key_row(managed_id, 1, true)]));
-    assert!(scans(&effects, BUCKET_KEY_KEYSPACE));
-    let effects = operation.step(rows(vec![key_row(LOCKED, 1, false)]));
-    assert!(scans(&effects, BUCKET_AUDIT_KEYSPACE));
+    assert!(scans(&turn, BUCKET_KEY_KEYSPACE));
+    let turn = operation.next(rows(vec![key_row(managed_id, 1, true)]));
+    assert!(scans(&turn, BUCKET_KEY_KEYSPACE));
+    let turn = operation.next(rows(vec![key_row(LOCKED, 1, false)]));
+    assert!(scans(&turn, BUCKET_AUDIT_KEYSPACE));
     let mut log = Log::default();
     log.applied(AuditAction::Unlock, (1, session(1)), None);
     let stored = (log.stored().iter())
         .map(|record| (record.key(), record.to_bytes().unwrap()))
         .collect();
-    let effects = operation.step(rows(stored));
+    let turn = operation.next(rows(stored));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+        &turn,
+        Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == S3_BUCKET_KEYSPACE
     ));
 }
 
@@ -294,23 +305,19 @@ fn unresolved_restart_notified() {
             b"locked".to_vec(),
             settings(EncryptionMode::VaultLocked, LOCKED),
         )]);
-        scan.step(rows(vec![key_row(LOCKED, 1, false)]));
+        let _ = scan.next(rows(vec![key_row(LOCKED, 1, false)]));
         let records = log
             .stored()
             .iter()
             .map(|record| (record.key(), record.to_bytes().unwrap()))
             .collect();
-        scan.step(rows(records));
+        let _ = scan.next(rows(records));
         let info = bucket_info();
-        scan.step(Event::Storage(StorageEvent::ReadResult {
-            key: Key::from(b"locked".to_vec()),
-            value: Some(info.to_bytes().unwrap().into()),
-        }));
+        let _ = scan.next(bucket_row(&info));
         let values = authority_rows(&info, None, &[]);
-        scan.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        scan.step(rows(Vec::new()));
-        scan.step(rows(vec![copy(user(1), 1)]));
-        let found = scan.finalize().unwrap();
+        let _ = scan.next(authority(values));
+        let _ = scan.next(rows(Vec::new()));
+        let found = found(scan.next(rows(vec![copy(user(1), 1)])));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].generations, [1]);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();

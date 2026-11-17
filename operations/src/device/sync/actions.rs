@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
 use aruna_core::structs::{
@@ -62,6 +63,12 @@ pub enum ActionError {
     Unavailable,
     #[error(transparent)]
     Folder(#[from] FolderError),
+}
+
+impl From<IoError> for ActionError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
 }
 
 /// Runs one owner action and answers the audit row it wrote.

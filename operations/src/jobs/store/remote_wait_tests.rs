@@ -1,12 +1,9 @@
-//! State and event tests of the remote key wait rows, plus one run against real storage.
+//! Call and result tests of the remote key wait rows, plus one run against real storage.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
@@ -38,14 +35,6 @@ fn auth() -> AuthContext {
         path_restrictions: None,
         session: None,
     }
-}
-
-fn failed(error: StorageError) -> Event {
-    Event::Storage(StorageEvent::Error { error })
-}
-
-fn txn() -> Ulid {
-    Ulid::from_bytes([3; 16])
 }
 
 #[tokio::test]
@@ -101,106 +90,52 @@ async fn wake_until_acknowledged() {
 }
 
 #[test]
-fn row_reports_failure() {
+fn row_deletes_once() {
     let mut row = WaitRowOperation::acknowledge(waiter(), job(), key(1));
+    assert!(matches!(row.first(), Ok(Next::Call(IoCall::Delete(rows))) if rows.len() == 1));
+    assert_eq!(row.next(IoResult::Done), Ok(Next::Done(())));
+    assert!(matches!(row.first(), Err(JobMutationError::Storage(_))));
     assert!(matches!(
-        row.start().as_slice(),
-        [Effect::Storage(StorageEffect::BatchDelete { .. })]
+        row.next(IoResult::Woke),
+        Err(JobMutationError::Storage(_))
     ));
-    assert!(row.step(failed(StorageError::Timeout)).is_empty());
-    assert!(matches!(row.finalize(), Err(JobMutationError::Storage(_))));
 }
 
 #[test]
-fn queue_commits_page() {
+fn queue_rewrites_page() {
     let mut queue = QueueWakesOperation::new(key(1));
+    assert!(queue.transaction());
     assert!(matches!(
-        queue.start().as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-    let effects = queue.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { limit, txn_id: Some(_), .. })] if *limit == WAKE_PAGE
+        queue.first(),
+        Ok(Next::Call(IoCall::Page { limit, after: None, .. })) if limit == WAKE_PAGE
     ));
     let mut row = vec![b'r'];
     row.extend_from_slice(&key(1).key());
     row.extend_from_slice(waiter().as_bytes());
     row.extend_from_slice(&job().to_bytes());
     let value = Value::from(postcard::to_allocvec(&auth()).unwrap().as_slice());
-    let effects = queue.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![(Key::from(row.as_slice()), value)],
-        next_start_after: None,
-    }));
+    let page = IoResult::Page {
+        rows: vec![(Key::from(row.as_slice()), value)],
+        next: None,
+    };
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchWrite {
-            txn_id: Some(_),
-            ..
-        })]
+        queue.next(page),
+        Ok(Next::Call(IoCall::Write(writes))) if writes.len() == 1
     ));
-    let effects = queue.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchDelete {
-            txn_id: Some(_),
-            ..
-        })]
+        queue.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(deletes))) if deletes.len() == 1
     ));
-    let effects = queue.step(Event::Storage(StorageEvent::BatchDeleteResult {
-        entries: Vec::new(),
-    }));
-    assert_eq!(
-        effects.as_slice(),
-        &[Effect::Storage(StorageEffect::CommitTransaction {
-            txn_id: txn()
-        })]
-    );
-    let committed = Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() });
-    assert!(queue.step(committed).is_empty());
-    assert_eq!(queue.finalize().ok(), Some(false));
+    assert_eq!(queue.next(IoResult::Done), Ok(Next::Done(false)));
 }
 
 #[test]
 fn queue_names_conflict() {
-    // A lost commit is a conflict the runner retries; a failed page aborts its transaction.
-    let mut queue = QueueWakesOperation::new(key(1));
-    queue.start();
-    queue.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    let empty = Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    });
-    queue.step(empty);
-    queue.step(failed(StorageError::TransactionConflict));
-    let error = queue.finalize().unwrap_err();
-    assert!(QueueWakesOperation::is_conflict(&error));
-
-    let mut queue = QueueWakesOperation::new(key(1));
-    queue.start();
-    queue.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
-    check_abort(&mut queue, std::slice::from_ref(&abort));
-    assert_eq!(
-        queue.step(failed(StorageError::Timeout)).as_slice(),
-        &[abort]
-    );
-    assert!(!queue.is_complete());
-    queue.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: txn(),
-    }));
-    let error = queue.finalize().unwrap_err();
-    assert!(!QueueWakesOperation::is_conflict(&error));
+    // A lost commit is a conflict the runner retries; any other failure is not.
+    let conflict = JobMutationError::from(IoError::Conflict);
+    assert!(QueueWakesOperation::is_conflict(&conflict));
+    let unfinished = JobMutationError::from(IoError::Unfinished);
+    assert!(!QueueWakesOperation::is_conflict(&unfinished));
 }
 
 #[test]
@@ -209,70 +144,16 @@ fn owed_names_cursor() {
         .map(|seed| (Key::from(vec![b'd', seed]), Value::from(&[0u8; 0][..])))
         .collect();
     let mut owed = OwedWakesOperation::new(None);
-    owed.start();
-    owed.step(Event::Storage(StorageEvent::IterResult {
-        values: rows.clone(),
-        next_start_after: None,
-    }));
-    let (wakes, next) = owed.finalize().unwrap();
+    owed.first().expect("owed page");
+    let page = IoResult::Page {
+        rows: rows.clone(),
+        next: None,
+    };
     // Undecodable rows are skipped, yet a full page still names the next cursor.
-    assert!(wakes.is_empty());
-    assert_eq!(next, rows.last().map(|(row, _)| row.clone()));
-}
-
-#[test]
-fn rejects_unfit_events() {
-    let row = || {
-        let mut row = WaitRowOperation::acknowledge(waiter(), job(), key(1));
-        row.start();
-        row
-    };
-    let fits = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(
-                StorageEvent::BatchWriteResult { .. }
-                    | StorageEvent::BatchDeleteResult { .. }
-                    | StorageEvent::Error { .. }
-            )
-        )
-    };
-    assert!(!rejects_events(row, sample_events, fits).is_empty());
-    let owed = || {
-        let mut owed = OwedWakesOperation::new(None);
-        owed.start();
-        owed
-    };
-    let fits = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-        )
-    };
-    assert!(!rejects_events(owed, sample_events, fits).is_empty());
-    let queue = || {
-        let mut queue = QueueWakesOperation::new(key(1));
-        queue.start();
-        queue
-    };
-    let fits = |event: &Event| {
-        matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionStarted { .. } | StorageEvent::Error { .. })
-        )
-    };
-    assert!(!rejects_events(queue, sample_events, fits).is_empty());
-}
-
-#[test]
-fn aborts_and_finalizes() {
-    check_abort(
-        &mut WaitRowOperation::acknowledge(waiter(), job(), key(1)),
-        &[],
-    );
-    check_abort(&mut OwedWakesOperation::new(None), &[]);
-    check_abort(&mut QueueWakesOperation::new(key(1)), &[]);
-    rejects_finalize(WaitRowOperation::acknowledge(waiter(), job(), key(1)));
-    rejects_finalize(OwedWakesOperation::new(None));
-    rejects_finalize(QueueWakesOperation::new(key(1)));
+    let next = rows.last().map(|(row, _)| row.clone());
+    assert_eq!(owed.next(page), Ok(Next::Done((Vec::new(), next))));
+    assert!(matches!(
+        OwedWakesOperation::new(None).next(IoResult::Done),
+        Err(JobMutationError::Storage(_))
+    ));
 }

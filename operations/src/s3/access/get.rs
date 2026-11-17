@@ -2,23 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum GetAccessState {
-    Init,
-    GetUserAccess,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum GetAccessError {
@@ -26,114 +16,44 @@ pub enum GetAccessError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("Invalid state [{current:?}] - expected [{expected:?}]")]
-    InvalidState {
-        current: GetAccessState,
-        expected: GetAccessState,
-    },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
-    InvalidStateEvent {
-        state: GetAccessState,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error("No user access found")]
     NotFound,
-    #[error("GetUserAccess failed")]
-    GetAccessFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("could not read the user access: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for GetAccessError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct GetAccessOperation {
     access_key_id: String,
-    state: GetAccessState,
-    output: Option<Result<UserAccess, GetAccessError>>,
 }
 
 impl GetAccessOperation {
     pub fn new(access_key_id: String) -> Self {
-        Self {
-            access_key_id,
-            state: GetAccessState::Init,
-            output: None,
-        }
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        if let GetAccessState::Init = self.state {
-            self.state = GetAccessState::GetUserAccess;
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: USER_ACCESS_KEYSPACE.to_string(),
-                key: self.access_key_id.as_bytes().into(),
-                txn_id: None,
-            })]
-        } else {
-            self.abort()
-        }
-    }
-
-    fn access_received(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::ReadResult { value, .. }) = event {
-            self.state = GetAccessState::Finish;
-            self.output = Some(match value {
-                Some(value) => {
-                    UserAccess::from_bytes(&value).map_err(GetAccessError::ConversionError)
-                }
-                None => Err(GetAccessError::NotFound),
-            });
-            smallvec![]
-        } else {
-            self.emit_error(GetAccessError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: (event).label(),
-            })
-        }
-    }
-
-    pub fn emit_error(&mut self, error: GetAccessError) -> Effects {
-        self.state = GetAccessState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+        Self { access_key_id }
     }
 }
 
-impl EffectOperation for GetAccessOperation {
+impl Operation for GetAccessOperation {
     type Output = UserAccess;
     type Error = GetAccessError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<UserAccess>, GetAccessError> {
+        let key = self.access_key_id.as_bytes();
+        Ok(Next::Call(read_row(USER_ACCESS_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
-        match self.state {
-            GetAccessState::Init => self.handle_init(),
-            GetAccessState::GetUserAccess => self.access_received(event),
-            GetAccessState::Finish => smallvec![],
-            GetAccessState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetAccessState::Finish | GetAccessState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(GetAccessError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<UserAccess>, GetAccessError> {
+        let value = result.value()?.ok_or(GetAccessError::NotFound)?;
+        Ok(Next::Done(UserAccess::from_bytes(&value)?))
     }
 }
 
@@ -141,13 +61,23 @@ impl EffectOperation for GetAccessOperation {
 mod test {
     use crate::driver::DriverContext;
     use crate::driver::drive;
-    use crate::s3::access::get::GetAccessOperation;
-    use crate::s3::access::get::UserAccess;
+    use crate::s3::access::get::{GetAccessError, GetAccessOperation, UserAccess};
+    use aruna_core::calls::{IoResult, Next};
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
+    use aruna_core::operation::Operation;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    #[test]
+    fn missing_access_errors() {
+        let mut operation = GetAccessOperation::new("key".to_string());
+        let read = aruna_core::rows::read_row(USER_ACCESS_KEYSPACE, "key".as_bytes());
+        assert_eq!(operation.first(), Ok(Next::Call(read)));
+        let missing = IoResult::Values(vec![None]);
+        assert_eq!(operation.next(missing), Err(GetAccessError::NotFound));
+    }
 
     #[tokio::test]
     pub async fn gets_user_access() {

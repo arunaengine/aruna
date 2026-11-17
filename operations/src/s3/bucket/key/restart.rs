@@ -3,17 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::bucket::key::rows::{SettingsError, authority_read, parse_authority};
+use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
 use crate::s3::restart_notice::RestartedBucket;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
     KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{
@@ -21,8 +21,7 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::holders::resolve_holders;
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use ulid::Ulid;
@@ -31,7 +30,6 @@ const SCAN_LIMIT: usize = 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScanStep {
-    Init,
     ScanSettings,
     ScanKeys,
     ScanAudit,
@@ -39,8 +37,6 @@ enum ScanStep {
     ReadAuthority,
     ScanGrants,
     ScanCopies,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -51,15 +47,22 @@ pub enum RestartScanError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Settings(#[from] SettingsError),
-    #[error("unexpected event in state {state}: expected {expected}, got {received}")]
-    InvalidStateEvent {
-        state: String,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error("the restart scan did not finish")]
     NotFinished,
+    #[error("the restart scan failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for RestartScanError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<Vec<RestartedBucket>>, RestartScanError>;
 
 /// One unlock session as the audit trail describes it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -248,7 +251,6 @@ pub struct RestartScanOperation {
     /// Copies of the unlocked generations.
     copies: Vec<SealedCopy>,
     found: Vec<RestartedBucket>,
-    output: Option<Result<Vec<RestartedBucket>, RestartScanError>>,
 }
 
 impl RestartScanOperation {
@@ -256,7 +258,7 @@ impl RestartScanOperation {
         Self {
             now_ms,
             realm_id,
-            step: ScanStep::Init,
+            step: ScanStep::ScanSettings,
             pending: Vec::new(),
             current: None,
             locked_keys: BTreeSet::new(),
@@ -266,37 +268,24 @@ impl RestartScanOperation {
             grants: Vec::new(),
             copies: Vec::new(),
             found: Vec::new(),
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: impl Into<RestartScanError>) -> Effects {
-        self.output = Some(Err(error.into()));
-        self.step = ScanStep::Error;
-        smallvec![]
-    }
-
-    fn scan(&mut self, step: ScanStep, key_space: &str, prefix: Option<Vec<u8>>) -> Effects {
+    fn scan(&mut self, step: ScanStep, key_space: &str, prefix: Option<Vec<u8>>) -> Step {
         self.step = step;
-        iter(key_space, prefix, None, SCAN_LIMIT)
+        Ok(iter(key_space, prefix, None, SCAN_LIMIT))
     }
 
     /// Grants and copies of one bucket are read whole.
-    fn scan_rows(&mut self, step: ScanStep, key_space: &str, bucket_id: Ulid) -> Effects {
+    fn scan_rows(&mut self, step: ScanStep, key_space: &str, bucket_id: Ulid) -> Step {
         self.step = step;
-        iter(
-            key_space,
-            Some(bucket_id.to_bytes().to_vec()),
-            None,
-            usize::MAX,
-        )
+        let prefix = Some(bucket_id.to_bytes().to_vec());
+        Ok(iter(key_space, prefix, None, usize::MAX))
     }
 
-    fn next_bucket(&mut self) -> Effects {
+    fn next_bucket(&mut self) -> Step {
         let Some((bucket, bucket_id)) = self.pending.pop() else {
-            self.step = ScanStep::Finish;
-            self.output = Some(Ok(std::mem::take(&mut self.found)));
-            return smallvec![];
+            return Ok(Next::Done(std::mem::take(&mut self.found)));
         };
         self.locked_keys.clear();
         self.replay = Replay::default();
@@ -314,7 +303,7 @@ impl RestartScanOperation {
 
     /// A retained generation without a node copy stays locked until a holder unlocks it, also
     /// in mode off while a decryption still needs its source key.
-    fn keys_scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    fn keys_scanned(&mut self, values: Vec<(Key, Value)>) -> Step {
         for (_, value) in values {
             let Ok(record) = BucketKeyRecord::from_bytes(value.as_ref()) else {
                 continue;
@@ -324,7 +313,7 @@ impl RestartScanOperation {
             }
         }
         let Some(current) = self.current.as_ref() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
         if self.locked_keys.is_empty() {
             return self.next_bucket();
@@ -333,7 +322,7 @@ impl RestartScanOperation {
         self.scan(ScanStep::ScanAudit, BUCKET_AUDIT_KEYSPACE, Some(prefix))
     }
 
-    fn settings_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn settings_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
         for (key, value) in values {
             let Ok(settings) = BucketEncryption::from_bytes(value.as_ref()) else {
                 continue;
@@ -344,23 +333,33 @@ impl RestartScanOperation {
             }
         }
         match next {
-            Some(start) => iter(BUCKET_ENCRYPTION_KEYSPACE, None, Some(start), SCAN_LIMIT),
+            Some(start) => Ok(iter(
+                BUCKET_ENCRYPTION_KEYSPACE,
+                None,
+                Some(start),
+                SCAN_LIMIT,
+            )),
             None => self.next_bucket(),
         }
     }
 
-    fn audit_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn audit_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
         for (_, value) in values {
             if let Ok(record) = BucketAuditRecord::from_bytes(value.as_ref()) {
                 self.replay.apply(&record);
             }
         }
         let Some(current) = self.current.as_mut() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
         if let Some(start) = next {
             let prefix = current.bucket_id.to_bytes().to_vec();
-            return iter(BUCKET_AUDIT_KEYSPACE, Some(prefix), Some(start), SCAN_LIMIT);
+            return Ok(iter(
+                BUCKET_AUDIT_KEYSPACE,
+                Some(prefix),
+                Some(start),
+                SCAN_LIMIT,
+            ));
         }
         let locked_keys = &self.locked_keys;
         current.generations = (self.replay.open(self.now_ms).into_iter())
@@ -370,55 +369,40 @@ impl RestartScanOperation {
             return self.next_bucket();
         }
         self.step = ScanStep::ReadBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: current.bucket.as_bytes().into(),
-            txn_id: None,
-        })]
+        let read = read_row(S3_BUCKET_KEYSPACE, current.bucket.as_bytes());
+        Ok(Next::Call(read))
     }
 
-    fn bucket_read(&mut self, value: Option<Value>) -> Effects {
+    fn bucket_read(&mut self, value: Option<Value>) -> Step {
         // A bucket deleted meanwhile has nobody to tell.
         let Some(value) = value else {
             return self.next_bucket();
         };
-        let info = match BucketInfo::from_bytes(value.as_ref()) {
-            Ok(info) => info,
-            Err(error) => return self.fail(error),
-        };
+        let info = BucketInfo::from_bytes(value.as_ref())?;
         let Some(current) = self.current.as_mut() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
         current.group_id = info.group_id;
         self.step = ScanStep::ReadAuthority;
-        let realm_id = self.realm_id;
-        smallvec![authority_read(
-            &current.bucket,
-            realm_id,
-            info.group_id,
-            None
-        )]
+        let reads = authority_keys(&current.bucket, self.realm_id, info.group_id);
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Admin rights come from the current authorization documents, not from stored copies.
-    fn authority_scanned(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn authority_scanned(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
         let Some(current) = self.current.as_ref() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
-        match parse_authority(values, self.realm_id, current.group_id) {
-            Ok(state) => {
-                self.creator = Some(state.info.created_by);
-                self.admins = state.admins;
-            }
-            Err(error) => return self.fail(error),
-        }
+        let state = parse_authority(values, self.realm_id, current.group_id)?;
+        self.creator = Some(state.info.created_by);
+        self.admins = state.admins;
         let bucket_id = current.bucket_id;
         self.scan_rows(ScanStep::ScanGrants, BUCKET_HOLDER_KEYSPACE, bucket_id)
     }
 
-    fn rows_scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    fn rows_scanned(&mut self, values: Vec<(Key, Value)>) -> Step {
         let Some(current) = self.current.as_mut() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
         for (key, value) in values {
             match self.step {
@@ -442,7 +426,7 @@ impl RestartScanOperation {
         }
         // The holders now: creator, current admins and explicit grants; former admins are not.
         let Some(creator) = self.creator.take() else {
-            return self.fail(RestartScanError::NotFinished);
+            return Err(RestartScanError::NotFinished);
         };
         let lookups = BTreeMap::new();
         let report = resolve_holders(creator, &self.admins, &self.grants, &lookups, &self.copies);
@@ -459,73 +443,43 @@ impl RestartScanOperation {
     }
 }
 
-fn iter(key_space: &str, prefix: Option<Vec<u8>>, start: Option<Key>, limit: usize) -> Effects {
-    smallvec![Effect::Storage(StorageEffect::Iter {
-        key_space: key_space.to_string(),
-        prefix: prefix.map(Into::into),
-        start: start.map(IterStart::After),
+fn iter(
+    key_space: &str,
+    prefix: Option<Vec<u8>>,
+    start: Option<Key>,
+    limit: usize,
+) -> Next<Vec<RestartedBucket>> {
+    Next::Call(IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.unwrap_or_default().into(),
+        after: start,
         limit,
-        txn_id: None,
-    })]
+    })
 }
 
-impl EffectOperation for RestartScanOperation {
+impl Operation for RestartScanOperation {
     type Output = Vec<RestartedBucket>;
     type Error = RestartScanError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Step {
         self.scan(ScanStep::ScanSettings, BUCKET_ENCRYPTION_KEYSPACE, None)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.step, event) {
-            (_, Event::Storage(StorageEvent::Error { error })) => self.fail(error),
-            (
-                ScanStep::ScanSettings,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.settings_scanned(values, next_start_after),
-            (ScanStep::ScanKeys, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.keys_scanned(values)
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.step {
+            ScanStep::ScanSettings => {
+                let (values, next) = result.page()?;
+                self.settings_scanned(values, next)
             }
-            (
-                ScanStep::ScanAudit,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.audit_scanned(values, next_start_after),
-            (ScanStep::ReadBucket, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.bucket_read(value)
+            ScanStep::ScanKeys => self.keys_scanned(result.page()?.0),
+            ScanStep::ScanAudit => {
+                let (values, next) = result.page()?;
+                self.audit_scanned(values, next)
             }
-            (ScanStep::ReadAuthority, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                self.authority_scanned(values)
-            }
-            (
-                ScanStep::ScanGrants | ScanStep::ScanCopies,
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.rows_scanned(values),
-            (ScanStep::Finish | ScanStep::Error, _) => smallvec![],
-            (state, received) => self.fail(RestartScanError::InvalidStateEvent {
-                state: format!("{state:?}"),
-                expected: "the event of the current step",
-                received: received.label(),
-            }),
+            ScanStep::ReadBucket => self.bucket_read(result.value()?),
+            ScanStep::ReadAuthority => self.authority_scanned(keyless(result.values()?)),
+            ScanStep::ScanGrants | ScanStep::ScanCopies => self.rows_scanned(result.page()?.0),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.step, ScanStep::Finish | ScanStep::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RestartScanError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 

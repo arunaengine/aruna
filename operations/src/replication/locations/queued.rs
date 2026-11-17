@@ -4,27 +4,17 @@
 
 use super::LocationSummaryError;
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::keyspaces::REPLICATION_JOB_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, ReplicateScopeTarget};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
 use std::collections::BTreeSet;
 use ulid::Ulid;
 
 const JOB_PAGE_SIZE: usize = 256;
 const JOB_MAX_PAGES: usize = 4;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum QueuedState {
-    Init,
-    Scan,
-    Finish,
-    Error,
-}
 
 /// Nodes with a queued replication job, plus what the scan could not see: a
 /// page cap reached before the keyspace ended, and records that would not
@@ -46,9 +36,8 @@ pub struct QueuedNodesOperation {
     version_id: Ulid,
     delete_marker: bool,
     pages: usize,
+    scan: PrefixPages,
     found: QueuedReplicas,
-    state: QueuedState,
-    output: Option<Result<QueuedReplicas, LocationSummaryError>>,
 }
 
 impl QueuedNodesOperation {
@@ -59,22 +48,14 @@ impl QueuedNodesOperation {
             version_id,
             delete_marker,
             pages: 0,
+            scan: PrefixPages::new(REPLICATION_JOB_KEYSPACE, Vec::new(), JOB_PAGE_SIZE),
             found: QueuedReplicas::default(),
-            state: QueuedState::Init,
-            output: None,
         }
     }
 
-    fn scan(&mut self, start_after: Option<Key>) -> Effects {
+    fn read_page(&mut self) -> Next<QueuedReplicas> {
         self.pages = self.pages.saturating_add(1);
-        self.state = QueuedState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: JOB_PAGE_SIZE,
-            txn_id: None,
-        })]
+        Next::Call(self.scan.call())
     }
 
     /// Mirrors `ReplicateScopeOperation::should_enqueue_version`: a job that
@@ -92,86 +73,54 @@ impl QueuedNodesOperation {
             }
         }
     }
-
-    fn finish(&mut self, truncated: bool) -> Effects {
-        self.state = QueuedState::Finish;
-        self.found.truncated = truncated;
-        self.output = Some(Ok(std::mem::take(&mut self.found)));
-        smallvec![]
-    }
 }
 
-impl EffectOperation for QueuedNodesOperation {
+impl Operation for QueuedNodesOperation {
     type Output = QueuedReplicas;
     type Error = LocationSummaryError;
 
-    fn start(&mut self) -> Effects {
-        self.scan(None)
+    fn first(&mut self) -> Result<Next<QueuedReplicas>, LocationSummaryError> {
+        Ok(self.read_page())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            QueuedState::Init => self.start(),
-            QueuedState::Scan => {
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    self.state = QueuedState::Error;
-                    self.output = Some(Err(LocationSummaryError::Unexpected {
-                        state: "queued_scan",
-                        event: event.label().to_string(),
-                    }));
-                    return smallvec![];
-                };
-                for (_, value) in values {
-                    let Ok(record) = BlobJobRecord::from_bytes(value.as_ref()) else {
-                        self.found.skipped = self.found.skipped.saturating_add(1);
-                        continue;
-                    };
-                    if self.covers(&record.input) {
-                        self.found.nodes.insert(record.input.target_node_id);
-                    }
-                }
-                match next_start_after {
-                    Some(start) if self.pages < JOB_MAX_PAGES => self.scan(Some(start)),
-                    Some(_) => self.finish(true),
-                    None => self.finish(false),
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<QueuedReplicas>, LocationSummaryError> {
+        for (_, value) in self.scan.take(result)? {
+            let Ok(record) = BlobJobRecord::from_bytes(value.as_ref()) else {
+                self.found.skipped = self.found.skipped.saturating_add(1);
+                continue;
+            };
+            if self.covers(&record.input) {
+                self.found.nodes.insert(record.input.target_node_id);
             }
-            QueuedState::Finish | QueuedState::Error => smallvec![],
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, QueuedState::Finish | QueuedState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LocationSummaryError::Unexpected {
-            state: "finalize",
-            event: "queued replica scan ended without an answer".to_string(),
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if !self.scan.done() && self.pages < JOB_MAX_PAGES {
+            return Ok(self.read_page());
+        }
+        self.found.truncated = !self.scan.done();
+        Ok(Next::Done(std::mem::take(&mut self.found)))
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::QueuedNodesOperation;
+    use super::QueuedReplicas;
     use crate::tests::locations::{auth, node_id};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::calls::{IoResult, Next};
     use aruna_core::id::NodeId;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::operation::Operation;
     use aruna_core::structs::storage::replication_queue::BlobJobRecord;
     use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,
     };
     use ulid::Ulid;
+
+    fn done(next: Result<Next<QueuedReplicas>, super::LocationSummaryError>) -> QueuedReplicas {
+        match next {
+            Ok(Next::Done(queued)) => queued,
+            other => panic!("expected the queued nodes, got {other:?}"),
+        }
+    }
 
     fn job(target: ReplicateScopeTarget, target_node: NodeId) -> BlobJobRecord {
         marker_job(target, target_node, true)
@@ -206,20 +155,20 @@ mod pure_tests {
             Ulid::from_bytes([3u8; 16]),
             true,
         );
-        operation.start();
+        let _ = operation.first();
 
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
+        let next = operation.next(IoResult::Page {
+            rows: vec![(
                 b"a".to_vec().into(),
                 marker_job(ReplicateScopeTarget::Bucket, node_id(6), false)
                     .to_bytes()
                     .unwrap()
                     .into(),
             )],
-            next_start_after: None,
-        }));
+            next: None,
+        });
 
-        assert!(operation.finalize().unwrap().nodes.is_empty());
+        assert!(done(next).nodes.is_empty());
     }
 
     #[test]
@@ -228,10 +177,10 @@ mod pure_tests {
         let wanted = node_id(6);
         let mut operation =
             QueuedNodesOperation::new("raw".to_string(), "run1.tar".to_string(), version_id, false);
-        operation.start();
+        let _ = operation.first();
 
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
+        let next = operation.next(IoResult::Page {
+            rows: vec![
                 (
                     b"a".to_vec().into(),
                     job(ReplicateScopeTarget::Bucket, wanted)
@@ -252,10 +201,10 @@ mod pure_tests {
                     .into(),
                 ),
             ],
-            next_start_after: None,
-        }));
+            next: None,
+        });
 
-        let queued = operation.finalize().unwrap();
+        let queued = done(next);
         assert_eq!(queued.nodes.len(), 1);
         assert!(queued.nodes.contains(&wanted));
         assert!(!queued.truncated);
@@ -271,14 +220,14 @@ mod pure_tests {
             Ulid::from_bytes([3u8; 16]),
             false,
         );
-        operation.start();
+        let _ = operation.first();
 
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(b"a".to_vec().into(), vec![0xffu8; 8].into())],
-            next_start_after: None,
-        }));
+        let next = operation.next(IoResult::Page {
+            rows: vec![(b"a".to_vec().into(), vec![0xffu8; 8].into())],
+            next: None,
+        });
 
-        let queued = operation.finalize().unwrap();
+        let queued = done(next);
         assert_eq!(queued.skipped, 1);
         assert!(queued.nodes.is_empty());
     }
@@ -294,22 +243,23 @@ mod pure_tests {
             Ulid::from_bytes([3u8; 16]),
             false,
         );
-        operation.start();
+        let _ = operation.first();
 
+        let mut next = Ok(Next::Done(QueuedReplicas::default()));
         for _ in 0..super::JOB_MAX_PAGES {
-            operation.step(Event::Storage(StorageEvent::IterResult {
-                values: vec![(
+            next = operation.next(IoResult::Page {
+                rows: vec![(
                     b"a".to_vec().into(),
                     job(ReplicateScopeTarget::Bucket, wanted)
                         .to_bytes()
                         .unwrap()
                         .into(),
                 )],
-                next_start_after: Some(b"a".to_vec().into()),
-            }));
+                next: Some(b"a".to_vec().into()),
+            });
         }
 
-        let queued = operation.finalize().unwrap();
+        let queued = done(next);
         assert!(queued.truncated);
         assert!(queued.nodes.contains(&wanted));
     }

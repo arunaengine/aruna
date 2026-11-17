@@ -4,14 +4,12 @@
 
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -36,21 +34,11 @@ pub struct SearchUsersOutput {
     pub next_start_after: Option<String>,
 }
 
+/// Scans the realm's users page by page until one more match than the limit or the end.
 #[derive(Debug, PartialEq)]
 pub struct SearchUsersOperation {
     input: SearchUsersInput,
-    state: SearchUsersState,
     matches: Vec<SearchUsersMatch>,
-    storage_start_after: Option<Key>,
-    output: Option<Result<SearchUsersOutput, SearchUsersError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SearchUsersState {
-    Init,
-    SearchUsers,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -69,166 +57,96 @@ pub enum SearchUsersError {
     NotFinished,
 }
 
+impl From<IoError> for SearchUsersError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SearchUsers".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
 impl SearchUsersOperation {
     pub fn new(mut input: SearchUsersInput) -> Self {
         input.limit = input.limit.max(1);
         Self {
             input,
-            state: SearchUsersState::Init,
             matches: Vec::new(),
-            storage_start_after: None,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: SearchUsersError) -> Effects {
-        self.state = SearchUsersState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn fail_storage(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
+    fn page(&self, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: USER_KEYSPACE.to_string(),
+            prefix: UserId::storage_prefix(self.input.realm_id),
+            after,
+            limit: self.input.limit.saturating_add(1).max(64),
         }
-        Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(SearchUsersError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
+    fn finish(&mut self, next_start_after: Option<String>) -> Next<SearchUsersOutput> {
+        Next::Done(SearchUsersOutput {
+            users: std::mem::take(&mut self.matches),
+            next_start_after,
         })
     }
+}
 
-    fn start_after_key(&self) -> Result<Option<Key>, SearchUsersError> {
-        match (&self.storage_start_after, &self.input.start_after) {
-            (Some(key), _) => Ok(Some(key.clone())),
-            (None, Some(user_id)) => {
-                Ok(Some(UserId::from_string(user_id)?.to_storage_key().into()))
-            }
-            (None, None) => Ok(None),
-        }
+impl Operation for SearchUsersOperation {
+    type Output = SearchUsersOutput;
+    type Error = SearchUsersError;
+
+    fn first(&mut self) -> Result<Next<SearchUsersOutput>, SearchUsersError> {
+        let after = (self.input.start_after.as_deref())
+            .map(UserId::from_string)
+            .transpose()?
+            .map(|user_id| Key::from(user_id.to_storage_key()));
+        Ok(Next::Call(self.page(after)))
     }
 
-    fn emit_search_users(&mut self) -> Result<Effects, SearchUsersError> {
-        self.state = SearchUsersState::SearchUsers;
-        Ok(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USER_KEYSPACE.to_string(),
-            prefix: Some(UserId::storage_prefix(self.input.realm_id)),
-            start: self.start_after_key()?.map(IterStart::After),
-            limit: self.input.limit.saturating_add(1).max(64),
-            txn_id: None,
-        })])
-    }
-
-    fn handle_search_users(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
+    fn next(&mut self, result: IoResult) -> Result<Next<SearchUsersOutput>, SearchUsersError> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(SearchUsersError::UnexpectedEvent {
+                state: "SearchUsers".to_string(),
+                expected: "IoResult::Page",
+                got: result.label(),
+            });
         };
-
-        match self.collect_matches(values, next_start_after) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn collect_matches(
-        &mut self,
-        values: Vec<(Key, Value)>,
-        next_start_after: Option<Key>,
-    ) -> Result<Effects, SearchUsersError> {
         let query = self.input.query.to_lowercase();
-        for (key, value) in values {
-            let key_user_id = UserId::from_storage_key(&key)?;
-            if key_user_id.realm_id != self.input.realm_id {
+        for (key, value) in rows {
+            if UserId::from_storage_key(&key)?.realm_id != self.input.realm_id {
                 continue;
             }
-
             let user = User::from_bytes(&value)?;
-            let matched = if self.input.exact_name {
-                user.public_name_is(&query)
-            } else {
-                user.public_matches(&query)
+            let matched = match self.input.exact_name {
+                true => user.public_name_is(&query),
+                false => user.public_matches(&query),
             };
             if user.user_id.realm_id != self.input.realm_id || !matched {
                 continue;
             }
-
             self.matches.push(SearchUsersMatch {
                 user_id: user.user_id,
                 name: user.public_name(),
             });
         }
-
         if self.matches.len() > self.input.limit {
             self.matches.truncate(self.input.limit);
             let next_start_after = self.matches.last().map(|user| user.user_id.to_string());
-            return Ok(self.emit_finish(next_start_after));
+            return Ok(self.finish(next_start_after));
         }
-
-        if let Some(next_start_after) = next_start_after {
-            self.storage_start_after = Some(next_start_after);
-            return self.emit_search_users();
+        match next {
+            Some(after) => Ok(Next::Call(self.page(Some(after)))),
+            None => Ok(self.finish(None)),
         }
-
-        Ok(self.emit_finish(None))
-    }
-
-    fn emit_finish(&mut self, next_start_after: Option<String>) -> Effects {
-        self.state = SearchUsersState::Finish;
-        self.output = Some(Ok(SearchUsersOutput {
-            users: std::mem::take(&mut self.matches),
-            next_start_after,
-        }));
-        smallvec![]
-    }
-}
-
-impl EffectOperation for SearchUsersOperation {
-    type Output = SearchUsersOutput;
-    type Error = SearchUsersError;
-
-    fn start(&mut self) -> Effects {
-        match self.emit_search_users() {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            SearchUsersState::SearchUsers => self.handle_search_users(event),
-            SearchUsersState::Init | SearchUsersState::Finish | SearchUsersState::Error => {
-                smallvec![]
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            SearchUsersState::Finish | SearchUsersState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(SearchUsersError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -236,9 +154,8 @@ impl EffectOperation for SearchUsersOperation {
 mod pure_tests {
     use super::{SearchUsersInput, SearchUsersMatch, SearchUsersOperation, SearchUsersOutput};
     use aruna_core::UserId;
-    use aruna_core::effects::{Effect, IterStart, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::User;
@@ -273,6 +190,10 @@ mod pure_tests {
         )
     }
 
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
+    }
+
     fn matched(user: &User) -> SearchUsersMatch {
         SearchUsersMatch {
             user_id: user.user_id,
@@ -297,37 +218,21 @@ mod pure_tests {
         let bob = user(realm_id, 3, "bob");
         let mut operation = SearchUsersOperation::new(input(realm_id, "ALi", 10));
 
-        let effects = operation.start();
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix,
-                start,
-                limit,
-                txn_id,
-            }) => {
-                assert_eq!(key_space, aruna_core::USER_KEYSPACE);
-                assert_eq!(prefix.as_ref(), Some(&UserId::storage_prefix(realm_id)));
-                assert_eq!(start, &None);
-                assert_eq!(*limit, 64);
-                assert_eq!(txn_id, &None);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
+        let scan = IoCall::Page {
+            space: aruna_core::USER_KEYSPACE.to_string(),
+            prefix: UserId::storage_prefix(realm_id),
+            after: None,
+            limit: 64,
+        };
+        assert_eq!(operation.first(), Ok(Next::Call(scan)));
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&bob)],
+        let output = SearchUsersOutput {
+            users: vec![matched(&alice)],
             next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
-            SearchUsersOutput {
-                users: vec![matched(&alice)],
-                next_start_after: None,
-            }
+            operation.next(page(vec![entry(&alice), entry(&bob)], None)),
+            Ok(Next::Done(output))
         );
     }
 
@@ -341,20 +246,15 @@ mod pure_tests {
         ]);
         let carol = user(realm_id, 3, "carol");
         let mut operation = SearchUsersOperation::new(input(realm_id, "example", 10));
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&bob), entry(&carol)],
+        let output = SearchUsersOutput {
+            users: vec![matched(&bob)],
             next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
-            SearchUsersOutput {
-                users: vec![matched(&bob)],
-                next_start_after: None,
-            }
+            operation.next(page(vec![entry(&bob), entry(&carol)], None)),
+            Ok(Next::Done(output))
         );
     }
 
@@ -364,20 +264,15 @@ mod pure_tests {
         let alice = user(realm_id, 2, "match-alice");
         let bob = user(realm_id, 3, "match-bob");
         let mut operation = SearchUsersOperation::new(input(realm_id, "match", 1));
-        operation.start();
+        operation.first().unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&bob)],
-            next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
+        let output = SearchUsersOutput {
+            users: vec![matched(&alice)],
+            next_start_after: Some(alice.user_id.to_string()),
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
-            SearchUsersOutput {
-                users: vec![matched(&alice)],
-                next_start_after: Some(alice.user_id.to_string()),
-            }
+            operation.next(page(vec![entry(&alice), entry(&bob)], None)),
+            Ok(Next::Done(output))
         );
     }
 
@@ -388,36 +283,25 @@ mod pure_tests {
         let skipped = user(realm_id, 3, "other");
         let bob = user(realm_id, 4, "match-bob");
         let mut operation = SearchUsersOperation::new(input(realm_id, "match", 2));
-        operation.start();
+        operation.first().unwrap();
 
         let continuation_key: Key = skipped.user_id.to_storage_key().into();
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&alice), entry(&skipped)],
-            next_start_after: Some(continuation_key.clone()),
-        }));
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            }) => {
-                assert_eq!(key, &continuation_key);
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-        assert!(!operation.is_complete());
+        let first = page(
+            vec![entry(&alice), entry(&skipped)],
+            Some(continuation_key.clone()),
+        );
+        assert!(matches!(
+            operation.next(first),
+            Ok(Next::Call(IoCall::Page { after: Some(key), .. })) if key == continuation_key
+        ));
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry(&bob)],
+        let output = SearchUsersOutput {
+            users: vec![matched(&alice), matched(&bob)],
             next_start_after: None,
-        }));
-
-        assert!(effects.is_empty());
+        };
         assert_eq!(
-            operation.finalize().unwrap(),
-            SearchUsersOutput {
-                users: vec![matched(&alice), matched(&bob)],
-                next_start_after: None,
-            }
+            operation.next(page(vec![entry(&bob)], None)),
+            Ok(Next::Done(output))
         );
     }
 }

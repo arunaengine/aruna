@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -16,6 +17,23 @@ pub enum StorageReadError {
     Storage(StorageError),
     #[error(transparent)]
     Conversion(ConversionError),
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<IoError> for StorageReadError {
+    fn from(error: IoError) -> Self {
+        let error = (error.into_storage())
+            .unwrap_or_else(|other| StorageError::ReadError(other.to_string()));
+        Self::Storage(error)
+    }
+}
+
+/// Decodes a read row, if any.
+pub(crate) fn decode_row<T>(
+    value: Option<Value>,
+    parse: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
+) -> Result<Option<T>, StorageReadError> {
+    (value.as_deref().map(parse).transpose()).map_err(StorageReadError::Conversion)
 }
 
 pub(crate) type StorageScan = (Vec<(Key, Value)>, Option<Key>);

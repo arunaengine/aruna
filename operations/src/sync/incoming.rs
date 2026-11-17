@@ -189,9 +189,7 @@ async fn peer_request(
             Ok(MetadataTransportMessage::EventsDecided { result })
         }
         MetadataTransportMessage::ReleaseSecret { request } => {
-            let keys = crate::plugins::release::node_keys(context);
-            let keys = (keys.seal, keys.vault);
-            let released = crate::plugins::release::serve_release(context, keys, peer, request);
+            let released = crate::plugins::release::serve_release(context, peer, request);
             let result = Box::pin(released).await;
             Ok(MetadataTransportMessage::SecretReleased { result })
         }

@@ -3,30 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::document_repository::read_effect;
+use crate::document_repository::read_row;
 
 #[derive(Debug, PartialEq)]
 pub struct ReadUserOperation {
     user_id: UserId,
-    state: ReadUserState,
-    output: Option<Result<User, ReadUserError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ReadUserState {
-    Init,
-    ReadUser,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -47,71 +36,66 @@ pub enum ReadUserError {
     NotFinished,
 }
 
-impl ReadUserOperation {
-    pub fn new(user_id: UserId) -> Self {
-        Self {
-            user_id,
-            state: ReadUserState::Init,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: ReadUserError) -> Effects {
-        self.state = ReadUserState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_user_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let result = value
-                    .ok_or(ReadUserError::NotFound)
-                    .and_then(|bytes| User::from_bytes(&bytes).map_err(Into::into));
-                self.state = ReadUserState::Finish;
-                self.output = Some(result);
-                smallvec![]
+impl From<IoError> for ReadUserError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ReadUser".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
             }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.fail(ReadUserError::UnexpectedEvent {
-                state: format!("{:?}", self.state),
-                expected: "storage read result",
-                got: other.label(),
-            }),
         }
     }
 }
 
-impl EffectOperation for ReadUserOperation {
+impl ReadUserOperation {
+    pub fn new(user_id: UserId) -> Self {
+        Self { user_id }
+    }
+}
+
+impl Operation for ReadUserOperation {
     type Output = User;
     type Error = ReadUserError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReadUserState::ReadUser;
-        smallvec![read_effect(
-            &DocumentTarget::User {
-                user_id: self.user_id,
-            },
-            None,
-        )]
+    fn first(&mut self) -> Result<Next<User>, ReadUserError> {
+        let target = DocumentTarget::User {
+            user_id: self.user_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![read_row(&target)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ReadUserState::ReadUser => self.handle_user_read(event),
-            ReadUserState::Init | ReadUserState::Finish | ReadUserState::Error => smallvec![],
-        }
+    fn next(&mut self, result: IoResult) -> Result<Next<User>, ReadUserError> {
+        let [value] = values::<1>(result)?;
+        let bytes = value.ok_or(ReadUserError::NotFound)?;
+        Ok(Next::Done(User::from_bytes(&bytes)?))
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReadUserState::Finish | ReadUserState::Error)
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ReadUserError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn missing_user_fails() {
+        // One read of the user row; a missing row is not found, a wrong answer fails.
+        let user_id = UserId::local(Ulid::from_bytes([2; 16]), RealmId::from_bytes([1; 32]));
+        let mut operation = ReadUserOperation::new(user_id);
+        let target = DocumentTarget::User { user_id };
+        let read = Next::Call(IoCall::Read(vec![read_row(&target)]));
+        assert_eq!(operation.first(), Ok(read));
+        let missing = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(ReadUserError::NotFound));
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(ReadUserError::UnexpectedEvent { .. })
+        ));
     }
 }

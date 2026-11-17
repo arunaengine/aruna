@@ -3,22 +3,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::NOTIFICATION_INBOX_KEYSPACE;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::inbox_update_entry;
 use aruna_core::structs::execution::notification::{
     NotificationRecord, invert_timestamp_ms, notification_inbox_prefix, parse_inbox_key,
 };
-use aruna_core::types::{Effects, Key, KeySpace, Value};
-use byteview::ByteView;
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-pub(crate) const MARK_PAGE_SIZE: usize = 512;
+use crate::notifications::unexpected;
+
+const MARK_PAGE_SIZE: usize = 512;
 pub const MARK_MAX_IDS: usize = 512;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -34,24 +33,15 @@ pub struct MarkReadOutput {
     pub marked: usize,
 }
 
+/// Pages a recipient's inbox and marks the unread records it names by id or up to a time.
 #[derive(Debug, PartialEq)]
 pub struct MarkReadOperation {
     input: MarkReadInput,
-    state: MarkReadState,
     marked: usize,
     ids_remaining: usize,
+    /// The key to page after once the pending write is done; `None` ends the scan.
     pending_next: Option<Key>,
     too_many_ids: bool,
-    output: Option<Result<MarkReadOutput, MarkReadError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum MarkReadState {
-    Init,
-    Scan,
-    Write,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -62,15 +52,20 @@ pub enum MarkReadError {
     ConversionError(#[from] ConversionError),
     #[error("mark read id count exceeds cap {max}")]
     TooManyIds { max: usize },
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("mark read did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
 }
+
+impl From<IoError> for MarkReadError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            error => Self::Io(error),
+        }
+    }
+}
+
+type Turn = Result<Next<MarkReadOutput>, MarkReadError>;
 
 impl MarkReadOperation {
     pub fn new(mut input: MarkReadInput) -> Self {
@@ -82,74 +77,33 @@ impl MarkReadOperation {
         let ids_remaining = input.ids.len();
         Self {
             input,
-            state: MarkReadState::Init,
             marked: 0,
             ids_remaining,
             pending_next: None,
             too_many_ids,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: MarkReadError) -> Effects {
-        self.state = MarkReadState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn storage_error_fails(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-        Ok(event)
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(MarkReadError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        })
-    }
-
-    fn scan_effect(&self, start: Option<IterStart>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
-            prefix: Some(notification_inbox_prefix(self.input.recipient)),
-            start,
+    fn scan(&self, after: Option<Key>) -> Turn {
+        Ok(Next::Call(IoCall::Page {
+            space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            prefix: notification_inbox_prefix(self.input.recipient),
+            after,
             limit: MARK_PAGE_SIZE,
-            txn_id: None,
-        })
+        }))
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = MarkReadState::Finish;
-        self.output = Some(Ok(MarkReadOutput {
+    fn finish(&self) -> Turn {
+        Ok(Next::Done(MarkReadOutput {
             marked: self.marked,
-        }));
-        smallvec![]
+        }))
     }
 
-    fn handle_scan(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected_event("Event::Storage(StorageEvent::IterResult)", got);
-        };
-
+    fn mark_page(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
         let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
-        for (key, value) in values {
-            let (recipient, created_at_ms, notification_id) = match parse_inbox_key(&key) {
-                Ok(identity) => identity,
-                Err(error) => return self.fail(error.into()),
-            };
-            let mut record = match NotificationRecord::from_bytes(&value) {
-                Ok(record) => record,
-                Err(error) => return self.fail(error.into()),
-            };
+        for (key, value) in rows {
+            let (recipient, created_at_ms, notification_id) = parse_inbox_key(&key)?;
+            let mut record = NotificationRecord::from_bytes(&value)?;
             if recipient != self.input.recipient
                 || (recipient, created_at_ms, notification_id)
                     != (
@@ -158,12 +112,10 @@ impl MarkReadOperation {
                         record.notification_id,
                     )
             {
-                return self.fail(
-                    ConversionError::FromStrError(
-                        "notification inbox key does not match payload identity".to_string(),
-                    )
-                    .into(),
-                );
+                return Err(ConversionError::FromStrError(
+                    "notification inbox key does not match payload identity".to_string(),
+                )
+                .into());
             }
             let by_id = self
                 .input
@@ -179,99 +131,59 @@ impl MarkReadOperation {
                 .is_some_and(|up_to_ms| record.created_at_ms <= up_to_ms);
             if record.read_at_ms.is_none() && (by_id || by_time) {
                 record.read_at_ms = Some(self.input.now_ms);
-                match inbox_update_entry(&record) {
-                    Ok(entry) => writes.push(entry),
-                    Err(error) => return self.fail(error.into()),
-                }
+                writes.push(inbox_update_entry(&record)?);
                 self.marked += 1;
             }
         }
 
         let all_ids_found = self.input.up_to_ms.is_none() && self.ids_remaining == 0;
-        let next = if all_ids_found {
-            None
-        } else {
-            next_start_after
-        };
-
+        let next = next.filter(|_| !all_ids_found);
         if !writes.is_empty() {
             self.pending_next = next;
-            self.state = MarkReadState::Write;
-            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })];
+            return Ok(Next::Call(IoCall::Write(writes)));
         }
-
         match next {
-            Some(next) => smallvec![self.scan_effect(Some(IterStart::After(next)))],
-            None => self.finish(),
-        }
-    }
-
-    fn handle_write(&mut self, event: Event) -> Effects {
-        let got = event.label();
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
-        };
-        match self.pending_next.take() {
-            Some(next) => {
-                self.state = MarkReadState::Scan;
-                smallvec![self.scan_effect(Some(IterStart::After(next)))]
-            }
+            Some(next) => self.scan(Some(next)),
             None => self.finish(),
         }
     }
 }
 
-impl EffectOperation for MarkReadOperation {
+impl Operation for MarkReadOperation {
     type Output = MarkReadOutput;
     type Error = MarkReadError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Turn {
         if self.too_many_ids {
-            return self.fail(MarkReadError::TooManyIds { max: MARK_MAX_IDS });
+            return Err(MarkReadError::TooManyIds { max: MARK_MAX_IDS });
         }
         if self.input.ids.is_empty() && self.input.up_to_ms.is_none() {
             return self.finish();
         }
-        self.state = MarkReadState::Scan;
-        let start = match (self.input.up_to_ms, self.input.ids.is_empty()) {
+        let after = match (self.input.up_to_ms, self.input.ids.is_empty()) {
+            // No key lies between this one and itself with one more zero byte, so paging after
+            // it starts at the first record created at or before `up_to_ms`.
             (Some(up_to_ms), true) => {
-                let mut seek = Vec::with_capacity(72);
+                let mut seek = Vec::with_capacity(71);
                 seek.extend_from_slice(&self.input.recipient.to_storage_key());
                 seek.extend_from_slice(&invert_timestamp_ms(up_to_ms).to_be_bytes());
-                seek.extend_from_slice(&[0u8; 16]);
-                Some(IterStart::At(ByteView::from(seek)))
+                seek.extend_from_slice(&[0u8; 15]);
+                Some(Key::from(seek))
             }
             _ => None,
         };
-        smallvec![self.scan_effect(start)]
+        self.scan(after)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.storage_error_fails(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-
-        match self.state {
-            MarkReadState::Scan => self.handle_scan(event),
-            MarkReadState::Write => self.handle_write(event),
-            MarkReadState::Init | MarkReadState::Finish | MarkReadState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Turn {
+        match result {
+            IoResult::Page { rows, next } => self.mark_page(rows, next),
+            IoResult::Done => match self.pending_next.take() {
+                Some(next) => self.scan(Some(next)),
+                None => self.finish(),
+            },
+            other => Err(unexpected("an inbox page or write", &other).into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, MarkReadState::Finish | MarkReadState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(MarkReadError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -280,6 +192,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::tests::notifications::{context_with_storage, seed, user};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::PRUNE_INDEX_KEYSPACE;
     use aruna_core::structs::execution::notification::{NotificationClass, notification_inbox_key};
     use aruna_storage::storage::StorageHandle;
@@ -489,12 +403,63 @@ mod tests {
             up_to_ms: None,
             now_ms: 1,
         });
-
-        assert!(operation.start().is_empty());
         assert_eq!(
-            operation.finalize(),
+            operation.first(),
             Err(MarkReadError::TooManyIds { max: MARK_MAX_IDS })
         );
+    }
+
+    /// A page with marks writes them before it asks for the next page.
+    #[test]
+    fn writes_before_paging() {
+        let recipient = user(1, 1);
+        let records = [record(recipient, 20), record(recipient, 10)];
+        let mut operation = MarkReadOperation::new(MarkReadInput {
+            recipient,
+            ids: Vec::new(),
+            up_to_ms: Some(20),
+            now_ms: 9,
+        });
+        let Ok(Next::Call(IoCall::Page {
+            after: Some(seek), ..
+        })) = operation.first()
+        else {
+            panic!("a page after the seek key");
+        };
+        assert_eq!(seek.len(), 71);
+        let rows = records
+            .iter()
+            .map(|record| {
+                let key = notification_inbox_key(
+                    record.recipient,
+                    record.created_at_ms,
+                    record.notification_id,
+                );
+                (key, Value::from(record.to_bytes().unwrap()))
+            })
+            .collect();
+        let last = Key::from(vec![9u8]);
+        let page = IoResult::Page {
+            rows,
+            next: Some(last.clone()),
+        };
+        let Ok(Next::Call(IoCall::Write(writes))) = operation.next(page) else {
+            panic!("a write of the marks");
+        };
+        assert_eq!(writes.len(), 2);
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Page { after: Some(after), .. })) if after == last
+        ));
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(
+            operation.next(empty),
+            Ok(Next::Done(MarkReadOutput { marked: 2 }))
+        );
+        assert!(operation.next(IoResult::Woke).is_err());
     }
 
     #[tokio::test]

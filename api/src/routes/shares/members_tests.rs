@@ -465,8 +465,8 @@ async fn ticket_error(shared: &Shared, visit: &str, name: &str) -> ServerError {
 // a ticket already handed out and a listing alike.
 #[tokio::test]
 async fn ended_link_refused() {
-    use aruna_core::effects::Effect;
-    use aruna_operations::shares::store::save_effect;
+    use aruna_core::effects::StorageEffect;
+    use aruna_operations::shares::store::save_rows;
     let shared = shared().await;
     put(&shared, 1, "y.txt", "far").await;
     let (link, opened) = visit(&shared, ShareModeBody::Read).await;
@@ -492,8 +492,10 @@ async fn ended_link_refused() {
         .unwrap()
         .unwrap();
     stored.expires_at = Some(unix_timestamp_secs() - 1);
-    let Effect::Storage(write) = save_effect(&stored).unwrap() else {
-        panic!("a link record is one storage write");
+    let writes = save_rows(&stored).unwrap();
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
     };
     context.storage_handle.send_storage_effect(write).await;
     assert_eq!(
