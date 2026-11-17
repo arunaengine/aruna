@@ -10,9 +10,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE, PURGE_FILES_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, IMPORTED_OBJECT_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::{
     BackendImport, ImportedObject, names_version, object_key, version_key,
 };
@@ -20,8 +19,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
-use aruna_core::types::{Effects, GroupId, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use std::collections::HashMap;
 use ulid::Ulid;
 
