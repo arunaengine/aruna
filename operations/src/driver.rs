@@ -1109,7 +1109,7 @@ mod test {
     use crate::driver::{
         DeadlineAbort, DriverContext, GroupEnd, GroupRun, Instant, MAX_TRACKED_TRANSACTIONS,
         MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker, drive,
-        drive_retry, extend_unblocked, run_all, run_window,
+        drive_retry, drive_until, extend_unblocked, run_all, run_window,
     };
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
@@ -1119,7 +1119,7 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{Operation, boxed_suboperation};
+    use aruna_core::operation::{HoldScope, Operation, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -1127,6 +1127,7 @@ mod test {
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
+    use futures_util::FutureExt;
     use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
     use std::convert::Infallible;
@@ -1425,6 +1426,13 @@ mod test {
     }
 
     async fn blob_context() -> (tempfile::TempDir, DriverContext) {
+        let (directory, mut context) = net_context().await;
+        context.net_handle = None;
+        (directory, context)
+    }
+
+    /// Storage, a file system blob backend and a net handle in one temporary folder.
+    async fn net_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
         let root = directory.path().to_str().unwrap().to_string();
         let blob_root = format!("{root}/blobstore");
@@ -1445,7 +1453,7 @@ mod test {
                 timeouts: Default::default(),
             },
             storage_handle.clone(),
-            net_handle,
+            net_handle.clone(),
         )
         .await
         .unwrap();
@@ -1453,7 +1461,7 @@ mod test {
             directory,
             DriverContext {
                 storage_handle,
-                net_handle: None,
+                net_handle: Some(net_handle),
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
                 task_handle: None,
@@ -3021,5 +3029,165 @@ mod test {
             assert_eq!(drive_retry(build, &context, &[7u8; 16]).await, expected);
             assert_eq!(built, attempts);
         }
+    }
+
+    /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a
+    /// gate ends at once when `finish` holds and otherwise stays open until the runner aborts.
+    #[derive(Debug)]
+    struct Holding {
+        name: &'static str,
+        scope: Option<HoldScope>,
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        started: Arc<tokio::sync::Notify>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        finish: bool,
+        done: bool,
+    }
+
+    impl Holding {
+        fn new(name: &'static str, log: &Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                name,
+                scope: Some(HoldScope::DocumentReconcile),
+                log: log.clone(),
+                started: Arc::default(),
+                gate: None,
+                finish: true,
+                done: false,
+            }
+        }
+    }
+
+    impl PartialEq for Holding {
+        fn eq(&self, other: &Self) -> bool {
+            self.name == other.name && self.done == other.done
+        }
+    }
+
+    impl Operation for Holding {
+        type Output = ();
+        type Error = ();
+
+        fn hold_scope(&self) -> Option<HoldScope> {
+            self.scope
+        }
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.log.lock().unwrap().push(self.name);
+            self.started.notify_one();
+            let Some(gate) = self.gate.take() else {
+                self.done = self.finish;
+                return smallvec::smallvec![];
+            };
+            let blob = futures_util::stream::once(async move {
+                let _ = gate.await;
+                Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
+            });
+            smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+                namespace: ulid::Ulid::from_bytes([5u8; 16]),
+                name: self.name.to_string(),
+                created_by: aruna_core::UserId::default(),
+                max_bytes: None,
+                deadline: None,
+                blob: aruna_core::stream::BackendStream::new(blob),
+            })]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.done { Ok(()) } else { Err(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    /// Whether nothing holds the reconcile scope right now.
+    fn reconcile_free(context: &DriverContext) -> bool {
+        let net = context.net_handle.as_ref().expect("net handle");
+        net.hold_reconcile().now_or_never().is_some()
+    }
+
+    #[tokio::test]
+    async fn scope_waits_holder() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let mut first = Holding::new("first", &log);
+        first.gate = Some(gate);
+        let first_started = first.started.clone();
+        let task_context = context.clone();
+        let first_task = tokio::spawn(async move { drive(first, &task_context).await });
+        first_started.notified().await;
+
+        let second = Holding::new("second", &log);
+        let task_context = context.clone();
+        let second_task = tokio::spawn(async move { drive(second, &task_context).await });
+        let mut other = Holding::new("other", &log);
+        other.scope = None;
+        assert_eq!(drive(other, &context).await, Ok(()));
+        let late = Holding::new("late", &log);
+        assert_eq!(drive_until(late, &context, Instant::now()).await, Err(()));
+        // Paused time first runs every ready task, so the second run is parked on the hold
+        // before the clock jumps an hour.
+        tokio::time::pause();
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        tokio::time::resume();
+        assert_eq!(*log.lock().unwrap(), ["first", "other"]);
+
+        open.send(()).unwrap();
+        assert_eq!(first_task.await.unwrap(), Ok(()));
+        assert_eq!(second_task.await.unwrap(), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first", "other", "second"]);
+        assert!(reconcile_free(&context));
+    }
+
+    #[tokio::test]
+    async fn hold_released_finally() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+
+        // Abort: no effects and never complete, so the runner aborts it.
+        let mut aborted = Holding::new("aborted", &log);
+        aborted.finish = false;
+        assert_eq!(drive(aborted, &context).await, Err(()));
+        assert!(reconcile_free(&context));
+
+        // Cancel: the caller drops the run while its spool waits.
+        let (_open, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut cancelled = Holding::new("cancelled", &log);
+        cancelled.gate = Some(gate);
+        let started = cancelled.started.clone();
+        let task_context = context.clone();
+        let task = tokio::spawn(async move { drive(cancelled, &task_context).await });
+        started.notified().await;
+        assert!(!reconcile_free(&context));
+        task.abort();
+        let _ = task.await;
+        assert!(reconcile_free(&context));
+
+        // Expiry: the deadline passes while the spool waits.
+        let (_open, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut expired = Holding::new("expired", &log);
+        expired.gate = Some(gate);
+        let started = expired.started.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move { drive_until(expired, &task_context, deadline).await });
+        started.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(task.await.unwrap(), Err(()));
+        tokio::time::resume();
+        assert!(reconcile_free(&context));
     }
 }
