@@ -128,3 +128,142 @@ impl Operation for GraphDeletedOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    const GRAPH: &str = "urn:graph:one";
+
+    fn tombstone() -> Vec<u8> {
+        let record = GraphLifecycleRecord::deleted(
+            GRAPH.to_string(),
+            RealmId([1; 32]),
+            Ulid::from_bytes([2; 16]),
+            Ulid::from_bytes([3; 16]),
+            2,
+        );
+        postcard::to_allocvec(&record).unwrap()
+    }
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn reading() -> GraphDeletedOperation {
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn tombstone_reads_deleted() {
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        check_trace(
+            &mut operation,
+            &[read_lifecycle_effect(GRAPH, None)],
+            vec![(read(Some(tombstone())), vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(true));
+    }
+
+    #[test]
+    fn missing_row_live() {
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        check_trace(
+            &mut operation,
+            &[read_lifecycle_effect(GRAPH, None)],
+            vec![(read(None), vec![])],
+        );
+        assert_eq!(operation.finalize(), Ok(false));
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let mut operation = reading();
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(error).is_empty());
+        let error = operation.finalize().unwrap_err();
+        assert_eq!(error, GraphDeletedError::Storage(StorageError::Timeout));
+        assert!(matches!(
+            MetadataError::from(error),
+            MetadataError::Storage(StorageError::Timeout)
+        ));
+    }
+
+    #[test]
+    fn broken_row_fails() {
+        // A row that does not decode is an error, never a live graph.
+        let mut operation = reading();
+        operation.step(read(Some(vec![0xff])));
+        let error = operation.finalize().unwrap_err();
+        assert!(matches!(error, GraphDeletedError::Conversion(_)));
+        let folded: StorageOrConversion = error.into_error();
+        assert!(matches!(folded, StorageOrConversion::Conversion(_)));
+    }
+
+    #[derive(Debug)]
+    enum StorageOrConversion {
+        Storage(#[allow(dead_code)] StorageError),
+        Conversion(#[allow(dead_code)] ConversionError),
+    }
+
+    impl From<StorageError> for StorageOrConversion {
+        fn from(error: StorageError) -> Self {
+            Self::Storage(error)
+        }
+    }
+
+    impl From<ConversionError> for StorageOrConversion {
+        fn from(error: ConversionError) -> Self {
+            Self::Conversion(error)
+        }
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, GraphDeletedError::UnexpectedEvent { .. }));
+            // Unexpected events fold into a storage read error for queue callers.
+            let folded: StorageOrConversion = error.into_error();
+            assert!(matches!(folded, StorageOrConversion::Storage(_)));
+        }
+        let mut idle = GraphDeletedOperation::new(GRAPH);
+        idle.step(read(None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(GraphDeletedError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = GraphDeletedOperation::new(GRAPH);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(GraphDeletedOperation::new(GRAPH));
+        rejects_finalize(reading());
+    }
+}
