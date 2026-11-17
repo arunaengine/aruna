@@ -12,9 +12,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::structs::execution::notification_watch::{
-    WATCH_DIRTY_PREFIX, WatchInterestDigest, WatchInterestEntry, WatchInterestTable,
-    dirty_interest_realm, interest_node_id, interest_node_key, interest_node_prefix,
-    interest_pending_key, interest_realm_id, interest_realm_prefix,
+    WATCH_DIRTY_PREFIX, WatchInterestDigest, WatchInterestEntry, dirty_interest_realm,
+    interest_node_id, interest_node_key, interest_pending_key, interest_realm_prefix,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -336,64 +335,6 @@ async fn clear_consumed_markers(
     }
 }
 
-/// Rebuilds the full in-memory watch-interest table from the replicated digests
-/// in local storage. Digests whose embedded node id disagrees with their key are
-/// skipped defensively, and empty digests contribute nothing.
-pub async fn rebuild_interest_table(storage: &StorageHandle) -> WatchInterestTable {
-    let mut table = WatchInterestTable::default();
-    let mut eligible_by_realm: HashMap<RealmId, Option<HashSet<NodeId>>> = HashMap::new();
-    let prefix = Some(Key::from(interest_node_prefix()));
-    let mut pages = pin!(scan_pages(storage, WATCH_INTEREST_KEYSPACE, prefix));
-    loop {
-        let page = match pages.try_next().await {
-            Ok(Some(page)) => page,
-            Ok(None) => break,
-            Err(error) => {
-                warn!(error = %error, "Failed to scan watch interest digests");
-                return WatchInterestTable::default();
-            }
-        };
-        for (key, value) in page {
-            let Some(realm_id) = interest_realm_id(key.as_ref()) else {
-                continue;
-            };
-            let key_node_id = interest_node_id(key.as_ref());
-            let digest = match WatchInterestDigest::from_bytes(value.as_ref()) {
-                Ok(digest) => digest,
-                Err(error) => {
-                    warn!(error = %error, "Failed to decode watch interest digest");
-                    continue;
-                }
-            };
-            // Never trust a digest whose embedded node id disagrees with its key.
-            if key_node_id != Some(digest.node_id) {
-                continue;
-            }
-            if let std::collections::hash_map::Entry::Vacant(entry) =
-                eligible_by_realm.entry(realm_id)
-            {
-                let eligible = match sync_eligible_nodes(storage, realm_id).await {
-                    Ok(eligible) => Some(eligible),
-                    Err(error) => {
-                        warn!(%realm_id, %error, "Ignoring watch interest without a current realm config");
-                        None
-                    }
-                };
-                entry.insert(eligible);
-            }
-            if !eligible_by_realm
-                .get(&realm_id)
-                .and_then(Option::as_ref)
-                .is_some_and(|eligible| eligible.contains(&digest.node_id))
-            {
-                continue;
-            }
-            table.insert(realm_id, digest.node_id, digest.entries);
-        }
-    }
-    table
-}
-
 /// Refreshes the in-memory watch-interest cache for realms whose interest or
 /// membership changed and schedules rebuilds when replicated subscriptions or
 /// placement changed; shared by every reconcile handler.
@@ -509,6 +450,7 @@ async fn sync_eligible_nodes(
 mod tests {
     use super::*;
     use crate::notifications::watch::digest::dirty_marker_write;
+    use crate::notifications::watch::table::RebuildTableOperation;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::{
@@ -1181,7 +1123,9 @@ mod tests {
         )
         .await;
 
-        let table = rebuild_interest_table(&ctx.storage_handle).await;
+        let table = drive(RebuildTableOperation::default(), &ctx)
+            .await
+            .expect("table rebuilds");
         assert_eq!(
             table.matching_nodes(realm_id, "bucket/object", WatchEventKind::MetadataCreated),
             vec![holder]

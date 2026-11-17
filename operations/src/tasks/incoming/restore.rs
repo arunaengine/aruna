@@ -97,6 +97,18 @@ async fn restore_notification_outbox(
     }
 }
 
+/// The watch interest table of the stored digests; empty when they cannot be read.
+async fn interest_table(
+    context: &DriverContext,
+) -> aruna_core::structs::execution::notification_watch::WatchInterestTable {
+    drive(RebuildTableOperation::default(), context)
+        .await
+        .unwrap_or_else(|error| {
+            warn!(%error, "Failed to scan watch interest digests");
+            Default::default()
+        })
+}
+
 /// Requests the watch interest publish when a dirty marker is left over.
 async fn restore_watch_interest(context: &DriverContext, task_handle: &TaskHandle) {
     let context = DriverContext {
@@ -205,8 +217,7 @@ async fn install_task_handler(
     // Prime the origin-side watch interest cache from any digests already in
     // local storage so matching works before the first reconcile.
     if let Some(net_handle) = context.net_handle.as_ref() {
-        let table = rebuild_interest_table(&context.storage_handle).await;
-        net_handle.replace_watch_interest(table);
+        net_handle.replace_watch_interest(interest_table(&context).await);
     }
     TaskQueues {
         context,
@@ -451,11 +462,7 @@ impl OperationsTaskHandler {
             // Fold this node's freshly written digest into the origin-side cache;
             // the local write bypasses the reconcile path that refreshes remotes.
             Ok(true) => {
-                let table = crate::notifications::watch::interest::rebuild_interest_table(
-                    &self.context.storage_handle,
-                )
-                .await;
-                net_handle.replace_watch_interest(table);
+                net_handle.replace_watch_interest(interest_table(&self.context).await);
             }
             Ok(false) => {}
             Err(error) => {
