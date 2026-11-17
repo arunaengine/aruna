@@ -241,7 +241,6 @@ fn located(
 /// a version row this node lacks leaves its terms empty.
 #[derive(Debug, PartialEq)]
 struct Describe {
-    set_id: Ulid,
     changes: Vec<KeyChange>,
     /// Positions in `changes` of the puts that want terms.
     wanted: Vec<usize>,
@@ -259,7 +258,6 @@ impl Describe {
             return Err(changes);
         }
         let describe = Self {
-            set_id,
             changes,
             wanted,
             reading_versions: false,

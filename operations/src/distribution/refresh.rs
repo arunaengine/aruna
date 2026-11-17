@@ -457,9 +457,9 @@ impl Operation for RefreshRangesOperation {
                 let ranges = rows.and_then(|(record, fence)| {
                     coordinated(set.binding.as_ref(), record.as_deref(), fence.as_deref())
                 });
-                match ranges {
+                match ranges.map(|ranges| after_range(ranges, set.after.as_deref())) {
                     Ok(ranges) => {
-                        self.ranges = after_range(ranges, set.after.as_deref()).into();
+                        self.ranges = ranges.into();
                         self.last = None;
                         self.next_range()
                     }

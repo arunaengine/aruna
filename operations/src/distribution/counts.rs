@@ -108,7 +108,10 @@ impl SetCountsOperation {
     pub fn new(group: Option<GroupId>) -> Self {
         Self {
             group,
-            counts: SetCounts::of([]),
+            counts: SetCounts {
+                complete: true,
+                ..SetCounts::default()
+            },
             seen: 0,
             state: State::Init,
             output: None,
