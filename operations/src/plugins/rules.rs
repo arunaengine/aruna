@@ -17,7 +17,7 @@ use aruna_plugins::trigger::TriggerKind;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::entry::ReadEntry;
+use super::entry::{EntryError, ReadEntry};
 use super::grants::covers;
 use super::grants::{InstallScope, parse_grants};
 use super::install::read_config;
@@ -40,6 +40,8 @@ pub enum RuleError {
     Missing,
     #[error(transparent)]
     Secret(#[from] OwnerSecretError),
+    #[error(transparent)]
+    Read(#[from] EntryError),
     #[error("the install record cannot be read: {0}")]
     Unreadable(String),
 }
