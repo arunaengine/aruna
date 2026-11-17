@@ -8,16 +8,13 @@ use std::sync::Arc;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
-use aruna_core::keyspaces::{USER_KEY_KEYSPACE, VAULT_REVISION_KEYSPACE};
 use aruna_core::metadata::AuthToken;
-use aruna_core::structs::identity::user::vault::{
-    MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, VaultRevision,
-    retain_newest_keys, user_record_prefix,
-};
+use aruna_core::structs::identity::user::vault::VaultRecords;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::read::LocalRecordsOperation;
 use super::write::{
     AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended, VaultRefusal,
 };
@@ -25,7 +22,6 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
-use crate::jobs::store::iter_prefix_page;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, WriteAuthError};
 use crate::metadata::transport_message_kind;
@@ -197,7 +193,7 @@ async fn local_records(
         .await
         .ok()
         .ok_or(MetadataReadError::Unavailable)?;
-    let (target, key_space, limit) = match query {
+    let (target, heads) = match query {
         VaultQuery::Heads { auth_token } => {
             if vault_caller(context, peer, auth_token).await? != user_id {
                 return Err(MetadataReadError::Forbidden);
@@ -207,7 +203,7 @@ async fn local_records(
                 user_id,
                 revision_id: Ulid::nil(),
             };
-            (target, VAULT_REVISION_KEYSPACE, MAX_VAULT_HEADS)
+            (target, true)
         }
         VaultQuery::Keys => {
             if !is_sync_eligible(&config, peer) {
@@ -218,7 +214,7 @@ async fn local_records(
                 user_id,
                 record_id: Ulid::nil(),
             };
-            (target, USER_KEY_KEYSPACE, MAX_KEY_RECORDS)
+            (target, false)
         }
     };
     let placement = target_placement_ref(&config, &target, Default::default());
@@ -226,135 +222,5 @@ async fn local_records(
     if !holds_placement(&config, &placement, net_handle.node_id()) {
         return Err(MetadataReadError::Unavailable);
     }
-    read_records(context, user_id, key_space, limit).await
-}
-
-async fn read_records(
-    context: &DriverContext,
-    user_id: UserId,
-    key_space: &str,
-    limit: usize,
-) -> Result<VaultRecords, MetadataReadError> {
-    let mut start = None;
-    let mut keys = Vec::new();
-    loop {
-        let (rows, next) = iter_prefix_page(
-            &context.storage_handle,
-            key_space,
-            Some(user_record_prefix(user_id)),
-            start,
-            limit,
-            None,
-        )
-        .await
-        .map_err(|_| MetadataReadError::Unavailable)?;
-        let values = rows.iter().map(|(_, value)| value.as_ref());
-        if key_space == VAULT_REVISION_KEYSPACE {
-            return Ok(VaultRecords::Heads(
-                values
-                    .map(VaultRevision::from_bytes)
-                    .collect::<Result<_, _>>()
-                    .map_err(|_| MetadataReadError::Unavailable)?,
-            ));
-        }
-        keys.extend(
-            values
-                .map(UserKeyRecord::from_bytes)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| MetadataReadError::Unavailable)?,
-        );
-        retain_newest_keys(&mut keys);
-        if next.is_none() {
-            return Ok(VaultRecords::Keys(keys));
-        }
-        start = next;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::effects::{HolderList, VaultFetchEffect};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
-    use std::time::Duration;
-
-    fn node(seed: u8) -> NodeId {
-        iroh::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    fn fetch_effect() -> VaultFetchEffect {
-        VaultFetchEffect {
-            holders: HolderList::new(vec![node(1), node(2)]).unwrap(),
-            user_id: UserId::local(Ulid::from_bytes([7; 16]), RealmId::from_bytes([3; 32])),
-            query: VaultQuery::Keys,
-            deadline: Duration::from_secs(10),
-        }
-    }
-
-    #[tokio::test]
-    async fn serves_newest_keys() {
-        use aruna_core::effects::StorageEffect;
-        use aruna_core::events::{Event, StorageEvent};
-        use aruna_storage::storage::FjallStorage;
-
-        let dir = tempfile::tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let user_id = fetch_effect().user_id;
-        let writes = (1..=65)
-            .map(|id| {
-                let record = UserKeyRecord {
-                    realm_id: user_id.realm_id,
-                    user_id,
-                    record_id: Ulid::from_bytes([id; 16]),
-                    key_id: format!("key-{id}"),
-                    public_key: [1; 32],
-                    fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
-                    has_recovery: false,
-                    node_id: node(1),
-                    placement: PlacementRef::NIL,
-                    created_at_ms: if id == 1 || id == 65 { 2 } else { 1 },
-                    signature: None,
-                };
-                (
-                    USER_KEY_KEYSPACE.to_string(),
-                    record.target().storage_key(),
-                    record.to_bytes().unwrap().into(),
-                )
-            })
-            .collect();
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await;
-        assert!(matches!(
-            event,
-            Event::Storage(StorageEvent::BatchWriteResult { .. })
-        ));
-        let VaultRecords::Keys(keys) =
-            read_records(&context, user_id, USER_KEY_KEYSPACE, MAX_KEY_RECORDS)
-                .await
-                .unwrap()
-        else {
-            panic!("expected keys");
-        };
-        assert_eq!(keys.len(), MAX_KEY_RECORDS);
-        assert_eq!(keys[0].record_id, Ulid::from_bytes([65; 16]));
-        assert_eq!(keys[1].record_id, Ulid::from_bytes([1; 16]));
-        assert!(
-            !keys
-                .iter()
-                .any(|key| key.record_id == Ulid::from_bytes([2; 16]))
-        );
-    }
+    drive(LocalRecordsOperation::new(user_id, heads), context).await
 }
