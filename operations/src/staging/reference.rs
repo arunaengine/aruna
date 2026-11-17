@@ -703,6 +703,173 @@ async fn guard_expected_bucket(
     ))
 }
 
+/// Heads the staged source and records it as a reference version: the head's connector and
+/// its mirrors are re-checked when the version commits.
+#[derive(Debug, PartialEq)]
+pub struct MaterializeReferenceOperation {
+    input: Option<MaterializeReferenceInput>,
+    now: SystemTime,
+    fresh: Ulid,
+    head: Option<HeadSourceOperation>,
+    write: Option<WriteReferenceOperation>,
+    found: Option<(SourceConnector, SourceMetadata, VersionSourceBinding)>,
+    output: Option<Result<MaterializeReferenceResult, MaterializeReferenceError>>,
+}
+
+impl MaterializeReferenceOperation {
+    /// `now` stamps the version and `fresh` names it unless the bucket's set hints another id.
+    pub fn new(input: MaterializeReferenceInput, now: SystemTime, fresh: Ulid) -> Self {
+        Self {
+            input: Some(input),
+            now,
+            fresh,
+            head: None,
+            write: None,
+            found: None,
+            output: None,
+        }
+    }
+
+    fn fail(&mut self, error: MaterializeReferenceError) -> Effects {
+        self.head = None;
+        self.write = None;
+        self.output = Some(Err(error));
+        smallvec![]
+    }
+
+    /// Builds the reference write from the head, or hands the head error back.
+    fn headed(&mut self, head: HeadSourceResult) -> Effects {
+        let Some(input) = self.input.take() else {
+            return self.fail(StorageError::InvalidEffect.into());
+        };
+        let mut version_source = build_source_binding(
+            StagingStrategy::Reference,
+            &head.connector,
+            &head.metadata,
+            input.source_path,
+            Some(input.node_id),
+            Some(head.connector.connector_id),
+        );
+        for (connector, path) in &input.mirrors {
+            let mut descriptor = build_source_descriptor(
+                connector,
+                &head.metadata,
+                path.clone(),
+                Some(input.node_id),
+            );
+            // A version id names one server's copy, never another's.
+            descriptor.version_selector = None;
+            version_source.mirrors.push(SourceMirror {
+                descriptor,
+                connector_id: Some(connector.connector_id),
+            });
+        }
+        let mirror_guards = (input.mirrors.into_iter()).map(|(connector, _)| connector);
+        let write = ReferenceWrite {
+            preassigned_version_id: None,
+            group_id: input.group_id,
+            user_id: input.user_id,
+            realm_id: input.realm_id,
+            node_id: input.node_id,
+            bucket: input.bucket,
+            key: input.key,
+            expected_bucket: Some(input.expected_bucket),
+            version_source: version_source.clone(),
+            metadata: head.metadata.clone(),
+            inherited_policies: input.inherited_policies,
+            restrictions: input.restrictions,
+            connector_guard: Some((head.connector.clone(), head.secret_fingerprint)),
+            mirror_guards: mirror_guards.collect(),
+            job_id: input.job_id,
+        };
+        self.found = Some((head.connector, head.metadata, version_source));
+        let mut operation = WriteReferenceOperation::new(write, self.now, self.fresh);
+        let effects = operation.start();
+        self.write_step(operation, effects)
+    }
+
+    fn write_step(&mut self, operation: WriteReferenceOperation, effects: Effects) -> Effects {
+        if !operation.is_complete() {
+            self.write = Some(operation);
+            return effects;
+        }
+        match (operation.finalize(), self.found.take()) {
+            (Ok((version_id, _)), Some((connector, source_metadata, version_source))) => {
+                self.output = Some(Ok(MaterializeReferenceResult {
+                    connector,
+                    source_metadata,
+                    version_source,
+                    version_id,
+                }));
+                effects
+            }
+            (Ok(_), None) => self.fail(StorageError::InvalidEffect.into()),
+            (Err(error), _) => self.fail(error),
+        }
+    }
+
+    fn head_step(&mut self, operation: HeadSourceOperation, effects: Effects) -> Effects {
+        if !operation.is_complete() {
+            self.head = Some(operation);
+            return effects;
+        }
+        match operation.finalize() {
+            Ok(head) => self.headed(head),
+            Err(error) => self.fail(error.into()),
+        }
+    }
+}
+
+impl Operation for MaterializeReferenceOperation {
+    type Output = MaterializeReferenceResult;
+    type Error = MaterializeReferenceError;
+
+    fn start(&mut self) -> Effects {
+        let Some(input) = self.input.as_ref() else {
+            return self.fail(StorageError::InvalidEffect.into());
+        };
+        let mut head = HeadSourceOperation::new(HeadSourceInput {
+            group_id: input.group_id,
+            connector_id: input.connector_id,
+            source_path: input.source_path.clone(),
+        });
+        let effects = head.start();
+        self.head_step(head, effects)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Some(mut head) = self.head.take() {
+            let effects = head.step(event);
+            return self.head_step(head, effects);
+        }
+        if let Some(mut write) = self.write.take() {
+            let effects = write.step(event);
+            return self.write_step(write, effects);
+        }
+        let label = event.label();
+        self.fail(StorageError::ReadError(format!("unexpected event {label}")).into())
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some() && self.head.is_none() && self.write.is_none()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(StorageError::ReadError(
+            "the reference was not written".into(),
+        )
+        .into()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match (self.head.as_mut(), self.write.as_mut()) {
+            (Some(head), _) => head.abort(),
+            (_, Some(write)) => write.abort(),
+            _ => smallvec![],
+        }
+    }
+}
+
 /// Where a reference write is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteState {
