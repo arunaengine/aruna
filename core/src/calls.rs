@@ -102,8 +102,8 @@ impl IoCall {
     where
         O: Runnable<K> + 'static,
         K: 'static,
-        O::Output: PartialEq + 'static,
-        O::Error: PartialEq + 'static,
+        O::Output: PartialEq + Sync + 'static,
+        O::Error: PartialEq + Sync + 'static,
     {
         Self::Child(boxed_suboperation(operation, |result| {
             Event::Child(ChildOutcome::new(result))
@@ -114,11 +114,11 @@ impl IoCall {
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types.
 pub struct ChildOutcome(Box<dyn ChildValue>);
 
-trait ChildValue: Any + Send + Debug {
+trait ChildValue: Any + Send + Sync + Debug {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
 }
 
-impl<T: Any + Send + Debug + PartialEq> ChildValue for T {
+impl<T: Any + Send + Sync + Debug + PartialEq> ChildValue for T {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool {
         (other as &dyn Any).downcast_ref::<T>() == Some(self)
     }
@@ -128,8 +128,8 @@ impl ChildOutcome {
     /// Wraps a child's result; a group member child maps its outcome with this.
     pub fn new<T, E>(result: Result<T, E>) -> Self
     where
-        T: Send + Debug + PartialEq + 'static,
-        E: Send + Debug + PartialEq + 'static,
+        T: Send + Sync + Debug + PartialEq + 'static,
+        E: Send + Sync + Debug + PartialEq + 'static,
     {
         Self(Box::new(result))
     }
