@@ -326,8 +326,17 @@ pub struct ReconcileBatch {
     pub cursor_value: ByteView,
     /// Ops whose payload never decoded into an event.
     pub rejections: Vec<crate::structs::SyncRejection>,
-    /// Each event with its publishing actor and that actor's sequence.
-    pub events: Vec<(DocumentEvent, irokle::ActorId, u64)>,
+    pub events: Vec<BatchEvent>,
+}
+
+/// One event of a [`ReconcileBatch`] with its publishing actor and that actor's sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchEvent {
+    pub event: DocumentEvent,
+    pub actor: irokle::ActorId,
+    pub actor_seq: u64,
+    /// Whether the topic's shard publisher policy admits this actor at this sequence.
+    pub publisher_allowed: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

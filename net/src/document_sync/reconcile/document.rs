@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ::irokle::{Event as _, Storage as _};
 use aruna_core::document::{
-    DocumentEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
+    BatchEvent, DocumentEvent, DocumentReconcileResult, DocumentTarget, ReconcileBatch,
 };
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE};
 use aruna_core::metadata::MetadataEventRecord;
@@ -246,13 +246,24 @@ impl DocumentSyncService {
         }
         let cursor_value =
             applied_cursor_value(self.node.storage(), topic_id, genesis, &batch.cursor)?;
+        let policies = self.shard_publishers.read();
+        let policy = policies.get(&topic_id);
+        let events = (batch.events.into_iter())
+            .map(|(event, actor, actor_seq)| BatchEvent {
+                publisher_allowed: !policy.is_some_and(|policy| !policy.allows(&actor, actor_seq)),
+                event,
+                actor,
+                actor_seq,
+            })
+            .collect();
+        drop(policies);
         Ok(Some(ReconcileBatch {
             genesis,
             start: cursor,
             cursor_key,
             cursor_value,
             rejections: batch.rejections,
-            events: batch.events,
+            events,
         }))
     }
 
@@ -262,7 +273,13 @@ impl DocumentSyncService {
         batch: ReconcileBatch,
     ) -> Result<BatchOutcome> {
         let mut state = BatchState::new(batch.rejections);
-        for (event, actor_id, actor_seq) in batch.events {
+        for BatchEvent {
+            event,
+            actor: actor_id,
+            actor_seq,
+            publisher_allowed,
+        } in batch.events
+        {
             let identity = SyncQuarantineIdentity {
                 topic: topic_id,
                 actor: actor_id,
@@ -273,11 +290,6 @@ impl DocumentSyncService {
             if !is_config_candidate(&event) {
                 state.flush_config(&self.storage).await?;
             }
-            let publisher_allowed = !self
-                .shard_publishers
-                .read()
-                .get(&topic_id)
-                .is_some_and(|policy| !policy.allows(&actor_id, actor_seq));
             let target_topic_id = event
                 .target()
                 .sync_topic_id(self.realm_id, &event.placement());
