@@ -12,10 +12,11 @@ use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ulid::Ulid;
 
-use super::upload::{UploadClaimError, claim_upload, upload_key};
+use super::upload::{UploadClaimError, claim_upload};
 use crate::driver::DriverContext;
 use crate::jobs::MUTATE_MAX_ATTEMPTS;
 use crate::jobs::store::query::{CommitStep, commit_write};
+use aruna_core::structs::execution::job::upload_key;
 
 pub async fn read_rocrate_upload(
     storage: &StorageHandle,

@@ -27,7 +27,6 @@ use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
-use crate::jobs::import::upload::upload_stale;
 use crate::jobs::import::upload_store::load_rocrate_upload;
 use crate::jobs::key_wake::read_row;
 use crate::jobs::store::query::find_dedup_plan;
@@ -35,6 +34,7 @@ use crate::jobs::store::state::read_job_record;
 use crate::realm::get_config::GetConfigOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_core::structs::execution::job::dedup_index_key;
+use aruna_core::structs::execution::job::upload_stale;
 
 pub const IMPORT_OPERATION: &str = "federation.import";
 

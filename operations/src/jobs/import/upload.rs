@@ -10,7 +10,7 @@ use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::job::{
-    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
+    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
@@ -462,23 +462,6 @@ pub(crate) fn claim_upload(
             Ok(true)
         }
     }
-}
-
-/// Whether a bound upload can no longer start an import under [`claim_upload`]: it is unclaimed
-/// and expired, or it is gone and no import job holds its import key.
-pub(crate) fn upload_stale(
-    record: Option<&RoCrateUploadRecord>,
-    job_held: bool,
-    now_ms: u64,
-) -> bool {
-    match record {
-        Some(record) => record.claimed_by.is_none() && record.expires_at_ms <= now_ms,
-        None => !job_held,
-    }
-}
-
-pub(crate) fn upload_key(upload_id: Ulid) -> ByteView {
-    ByteView::from(upload_id.to_bytes().to_vec())
 }
 
 #[cfg(test)]

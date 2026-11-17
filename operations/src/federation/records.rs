@@ -22,7 +22,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::export::GrantRecord;
-use crate::jobs::import::upload::{upload_key, upload_stale};
+use aruna_core::structs::execution::job::{upload_key, upload_stale};
 
 const CONFLICT_RETRIES: u8 = 5;
 
