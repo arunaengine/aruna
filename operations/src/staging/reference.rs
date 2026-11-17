@@ -16,7 +16,6 @@ use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::driver::{DriverContext, drive};
-use crate::plugins::journal::journaled;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
@@ -31,6 +30,7 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
 use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{

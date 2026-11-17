@@ -52,7 +52,7 @@ use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
 
 /// Directories the queue holds before the table is read further.
-pub(super) const QUEUE_PAUSE: u64 = 1024;
+const QUEUE_PAUSE: u64 = 1024;
 /// Rows one step maps, so one page and its HEADs stay bounded.
 const STEP_ROWS: usize = 1000;
 /// Table bytes one step of record rows reads; they need no HEAD, so their pages are larger.

@@ -8,9 +8,10 @@ use std::sync::Arc;
 use aruna_core::document::DocumentEvent;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_operations::driver::drive;
 use aruna_operations::sync::sync_quarantine::{
-    QuarantineAdminError, QuarantinePageRequest, acknowledge_quarantine_row,
-    list_quarantine_records, prune_quarantine_records, read_quarantine_record,
+    AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
+    QuarantineAdminError, QuarantinePageRequest, ReadQuarantineOperation,
 };
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -119,7 +120,9 @@ fn map_admin_error(error: QuarantineAdminError) -> ServerError {
     match error {
         QuarantineAdminError::Storage(error) => ServerError::InternalError(error.into()),
         QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.into()),
-        QuarantineAdminError::Unexpected { .. } => ServerError::ServiceUnavailable,
+        QuarantineAdminError::Unexpected { .. } | QuarantineAdminError::Unfinished => {
+            ServerError::ServiceUnavailable
+        }
     }
 }
 
@@ -237,7 +240,8 @@ pub async fn list_quarantine(
     Query(query): Query<QuarantineQuery>,
 ) -> ServerResult<(StatusCode, Json<QuarantinePageResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
-    let page = list_quarantine_records(&state.get_ctx(), page_request(&query)?)
+    let operation = ListQuarantineOperation::new(page_request(&query)?);
+    let page = drive(operation, &state.get_ctx())
         .await
         .map_err(map_admin_error)?;
 
@@ -303,7 +307,7 @@ pub async fn inspect_quarantine(
 ) -> ServerResult<(StatusCode, Json<QuarantineInspectResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
-    let record = read_quarantine_record(&state.get_ctx(), &key)
+    let record = drive(ReadQuarantineOperation::new(key), &state.get_ctx())
         .await
         .map_err(map_admin_error)?
         .ok_or(ServerError::NotFound)?;
@@ -366,7 +370,7 @@ pub async fn acknowledge_quarantine(
 ) -> ServerResult<(StatusCode, Json<QuarantineRecordResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
-    let record = acknowledge_quarantine_row(&state.get_ctx(), &key)
+    let record = drive(AcknowledgeQuarantineOperation::new(key), &state.get_ctx())
         .await
         .map_err(map_admin_error)?
         .ok_or(ServerError::NotFound)?;
@@ -429,7 +433,8 @@ pub async fn prune_quarantine(
     Query(query): Query<QuarantineQuery>,
 ) -> ServerResult<(StatusCode, Json<QuarantinePruneResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
-    let result = prune_quarantine_records(&state.get_ctx(), page_request(&query)?)
+    let operation = PruneQuarantineOperation::new(page_request(&query)?);
+    let result = drive(operation, &state.get_ctx())
         .await
         .map_err(map_admin_error)?;
 

@@ -18,6 +18,7 @@ use aruna_core::keyspaces::{
     RELATIONSHIP_OUT_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::{BackendImport, ImportedObject, object_key};
@@ -37,7 +38,6 @@ use ulid::Ulid;
 
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::validate_folder;
-use crate::jobs::store::decode_job_record;
 use crate::s3::purge_fence::fence_key;
 
 /// Why a rename of a bucket job's page refuses: the job was paused, aborted or replaced.
@@ -722,7 +722,7 @@ impl RenameKeysOperation {
 
     fn runs_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
         for (_, value) in values {
-            match value.as_deref().map(decode_job_record).transpose() {
+            match value.as_deref().map(JobRecord::from_bytes).transpose() {
                 Ok(Some(record)) if is_running(record.state) => {
                     return self.conflict("an import of this bucket is running");
                 }

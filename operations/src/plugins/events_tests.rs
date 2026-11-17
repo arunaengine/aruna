@@ -5,20 +5,22 @@
 
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
+use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::{ForwardRow, RunTrigger, SourceEvent};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
 
 use crate::driver::drive;
-use crate::plugins::decide::decide_batch;
-use crate::plugins::forward::{Backoff, Decisions, EventBatch, Outcome, send_outbox};
+use crate::plugins::forward::Backoff;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::{pause_install, set_grants};
-use crate::plugins::matcher::match_pending;
 use crate::plugins::matcher::tests::{config, forwarded, journal};
-use crate::plugins::replay::plan_replays;
 use crate::plugins::runs::list_runs;
 use crate::plugins::store::Txn;
+use crate::plugins::worker::decide_batch;
+use crate::plugins::worker::match_journal;
+use crate::plugins::worker::plan_replays;
+use crate::plugins::worker::send_outbox;
 use crate::plugins::worker::tests::{
     created, echoed_sync, install_artifact, installed, scoped, synced, worker,
 };
@@ -28,6 +30,7 @@ use crate::sync::sync_relationship::StoreRelationshipOperation;
 use crate::sync::sync_relationship::SyncRelationshipDirection::Outgoing;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::plugin_runs::RunState;
+use aruna_core::plugin_runs::{Decisions, EventBatch, Outcome};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -46,7 +49,7 @@ fn dataset(install: &PluginInstall, resource: &str, at: u64) -> SourceEvent {
 
 /// The resources of the install's runs, sorted.
 async fn ran(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
-    let runs = list_runs(&fixture.ctx, install.install_id, None, 100).await;
+    let runs = drive(list_runs(install.install_id, None, 100), &fixture.ctx).await;
     let mut resources: Vec<String> = (runs.unwrap().0.into_iter())
         .filter_map(|run| match run.trigger {
             RunTrigger::Event(event) => Some(event.resource),
@@ -86,7 +89,7 @@ async fn restart_runs_once() {
     let mut bare = config.clone();
     bare.installs.clear();
     journal(&fixture, &dataset(&install, "replayed", now - 4)).await;
-    match_pending(&fixture.ctx, &bare, local, now)
+    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     let no_clock = |_| async { None };
@@ -94,7 +97,7 @@ async fn restart_runs_once() {
         .await
         .unwrap();
     journal(&fixture, &dataset(&install, "outbox", now - 3)).await;
-    match_pending(&fixture.ctx, &config, local, now)
+    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     journal(&fixture, &dataset(&install, "journal", now - 2)).await;
@@ -129,9 +132,14 @@ async fn narrowed_grant_stops() {
     let install = installed(&fixture).await;
     let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
     journal(&fixture, &dataset(&install, "B/one", now - 1)).await;
-    match_pending(&fixture.ctx, &config(&fixture).await, local, now)
-        .await
-        .unwrap();
+    match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (now, EVENTS_QUEUED),
+    )
+    .await
+    .unwrap();
     let base = created(&install, "").1;
     let narrowed = scoped(vec![format!("{base}/A/**")]);
     let (auth, id) = (fixture.auth(), install.install_id);
@@ -152,9 +160,14 @@ async fn pause_and_removal() {
     for (resource, at) in [("D1", now - 1), ("D2", now)] {
         journal(&fixture, &dataset(&install, resource, at)).await;
     }
-    match_pending(&fixture.ctx, &config(&fixture).await, local, now)
-        .await
-        .unwrap();
+    match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (now, EVENTS_QUEUED),
+    )
+    .await
+    .unwrap();
     let (auth, id) = (fixture.auth(), install.install_id);
     pause_install(&fixture.ctx, &fixture.actor, &auth, id)
         .await
@@ -251,7 +264,7 @@ async fn sync_job_runs() {
         worker.settle().await;
     }
 
-    let runs = list_runs(&fixture.ctx, install.install_id, None, 100).await;
+    let runs = drive(list_runs(install.install_id, None, 100), &fixture.ctx).await;
     let runs = runs.unwrap().0;
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].state, RunState::Succeeded, "{:?}", runs[0].message);
@@ -315,7 +328,7 @@ async fn sync_restart_once() {
     let mut bare = config.clone();
     bare.installs.clear();
     journal(&fixture, &sync_at(&install, 1, now - 4)).await;
-    match_pending(&fixture.ctx, &bare, local, now)
+    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     let no_clock = |_| async { None };
@@ -323,7 +336,7 @@ async fn sync_restart_once() {
         .await
         .unwrap();
     journal(&fixture, &sync_at(&install, 2, now - 3)).await;
-    match_pending(&fixture.ctx, &config, local, now)
+    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     journal(&fixture, &sync_at(&install, 3, now - 2)).await;

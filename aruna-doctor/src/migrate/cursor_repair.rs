@@ -581,10 +581,10 @@ mod tests {
 
     /// Stores the node identity Aruna keeps beside the Craqle and sync stores.
     fn store_identity(path: &Path) {
-        use aruna::identity::{
+        use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
+        use aruna_core::structs::identity::node_state::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
         let realm = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,

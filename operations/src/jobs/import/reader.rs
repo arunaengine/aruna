@@ -152,7 +152,8 @@ fn fetch_range(handle: BlobHandle, location: BackendLocation, range: Range<u64>)
             return match event {
                 Event::Blob(BlobEvent::Error(error)) => Err(io::Error::other(error.to_string())),
                 other => Err(io::Error::other(format!(
-                    "unexpected hidden range event: {other:?}"
+                    "unexpected hidden range event: {}",
+                    other.label()
                 ))),
             };
         };

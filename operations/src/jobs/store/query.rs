@@ -46,7 +46,7 @@ pub async fn list_user_jobs(
             let record = if value.is_empty() {
                 read_job_record(storage, job_id, None).await?
             } else {
-                decode_job_record(value.as_ref()).ok()
+                JobRecord::from_bytes(value.as_ref()).ok()
             };
             if let Some(record) = record
                 && !record.payload.is_internal()
@@ -223,7 +223,7 @@ pub(super) async fn start_write_txn(storage: &StorageHandle) -> Result<TxnId, St
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -243,7 +243,7 @@ pub(super) async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Commit
             error: StorageError::TransactionConflict,
         }) => CommitResult::Conflict,
         Event::Storage(StorageEvent::Error { error }) => CommitResult::Failed(error.to_string()),
-        other => CommitResult::Failed(format!("unexpected storage event: {other:?}")),
+        other => CommitResult::Failed(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -295,7 +295,7 @@ pub(super) async fn read_raw(
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -313,7 +313,7 @@ pub(super) async fn batch_write(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -331,7 +331,7 @@ pub(crate) async fn batch_delete(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -351,6 +351,6 @@ pub(super) async fn delete_raw(
     {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }

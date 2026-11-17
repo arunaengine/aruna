@@ -6,39 +6,25 @@
 use std::time::Duration;
 
 use aruna_core::effects::{Effect, JobRecordFrame};
-use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{
-    ExecutionReceipt, ExecutionUpdate, JobErrorKind, JobFamilyId, JobFamilyRecord, JobId,
-    JobRecord, JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage,
+    ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
-use ulid::Ulid;
 
-use super::reservation::{ReleaseExecutionOperation, held_reservations, job_reservation};
-use super::routing::family_of_alias;
+use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
+use super::held::HeldReservations;
+use super::reservation::ReleaseExecutionOperation;
 use super::witness::arm_family;
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
-};
-use crate::jobs::store::read_job_record;
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::store::state::read_job_record;
 use crate::node::dashboard::notify_dashboard_change;
-
-/// The replicated identity of one physical execution, read back from the
-/// receipt that authorized it. Without it there is no distributed chain to
-/// extend and every publication is skipped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExecutionChain {
-    pub family: JobFamilyId,
-    pub execution_id: Ulid,
-    pub executor_node_id: NodeId,
-    pub spec_digest: [u8; 32],
-    pub receipt_digest: [u8; 32],
-    pub job_id: JobId,
-}
 
 /// Spacing between retries of a terminal publication that stayed pending.
 pub const SETTLE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -48,117 +34,6 @@ pub fn schedule_terminal_settle(after: Duration) -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::SettleJobTerminals,
         after,
-    })
-}
-
-/// Resolves the receipt chain of one local job, if a target admitted it here.
-/// A job with no reservation is purely local and has no chain at all.
-pub async fn execution_chain(context: &DriverContext, job_id: JobId) -> Option<ExecutionChain> {
-    let reservation = local_reservation(context, job_id).await?;
-    chain_for(
-        context,
-        reservation.logical_job_id,
-        reservation.execution_id,
-    )
-    .await
-}
-
-/// The chain of one local job's exact execution. The reservation is what maps
-/// the local physical job row to the logical alias family records are keyed by,
-/// so a caller holding only the physical id must resolve through it.
-pub async fn chain_of_attempt(
-    context: &DriverContext,
-    job_id: JobId,
-    execution_id: Ulid,
-) -> Option<ExecutionChain> {
-    let reservation = local_reservation(context, job_id).await?;
-    if reservation.execution_id != execution_id {
-        warn!(
-            job_id = %job_id,
-            execution_id = %execution_id,
-            reserved = %reservation.execution_id,
-            "Attempt does not hold the reserved execution; the chain stays unresolved"
-        );
-        return None;
-    }
-    chain_for(context, reservation.logical_job_id, execution_id).await
-}
-
-/// The reservation one local job holds. `None` without a warning is the purely
-/// local case; a read that failed is reported instead of read as absence.
-async fn local_reservation(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Option<super::reservation::ExecutionReservation> {
-    match job_reservation(context, job_id).await {
-        Ok(reservation) => reservation,
-        Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Execution reservation read failed");
-            None
-        }
-    }
-}
-
-/// The chain of one exact execution id, used where the attempt control already
-/// names it. `job_id` is the logical alias, never a local physical job id.
-pub async fn chain_for(
-    context: &DriverContext,
-    job_id: JobId,
-    execution_id: Ulid,
-) -> Option<ExecutionChain> {
-    let family = match family_of_alias(context, job_id).await {
-        Ok(Some(family)) => family,
-        Ok(None) => {
-            warn!(
-                job_id = %job_id,
-                execution_id = %execution_id,
-                "No job family alias for this job; the execution chain is unresolvable"
-            );
-            return None;
-        }
-        Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Job family alias read failed");
-            return None;
-        }
-    };
-    let Some(receipt) = receipt_of(context, family, execution_id).await else {
-        warn!(
-            job_id = %job_id,
-            execution_id = %execution_id,
-            "No receipt for this execution in its family"
-        );
-        return None;
-    };
-    let digest = receipt
-        .digest()
-        .inspect_err(|error| warn!(error = %error, "Execution receipt digest failed"))
-        .ok()?;
-    Some(ExecutionChain {
-        family,
-        execution_id,
-        executor_node_id: receipt.executor_node_id,
-        spec_digest: receipt.spec_digest,
-        receipt_digest: digest,
-        job_id: receipt.job_id,
-    })
-}
-
-/// The receipt one execution was admitted under, read from the receipt kind
-/// alone so unrelated family history can never hide it behind the read bound.
-async fn receipt_of(
-    context: &DriverContext,
-    family: JobFamilyId,
-    execution_id: Ulid,
-) -> Option<ExecutionReceipt> {
-    let records = load_kind_complete(context, family, JobRecordKind::Receipt)
-        .await
-        .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
-        .ok()?;
-    records.iter().find_map(|envelope| match &envelope.record {
-        JobFamilyRecord::Receipt(receipt) if receipt.execution_id == execution_id => {
-            Some(receipt.as_ref().clone())
-        }
-        _ => None,
     })
 }
 
@@ -211,7 +86,15 @@ pub async fn publish_state(
     }
     // The chain is extended only from evidence proven complete: the receipt
     // that authorized it, plus every stored update of this execution.
-    let Some(receipt) = receipt_of(context, chain.family, chain.execution_id).await else {
+    let receipts = drive(
+        LoadFamilyOperation::kind(chain.family, JobRecordKind::Receipt),
+        context,
+    )
+    .await
+    .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
+    .ok();
+    let receipt = receipts.and_then(|records| receipt_in(&records, chain.execution_id));
+    let Some(receipt) = receipt else {
         warn!(
             job_id = %chain.job_id,
             execution_id = %chain.execution_id,
@@ -223,7 +106,12 @@ pub async fn publish_state(
         warn!(execution_id = %chain.execution_id, "Execution receipt digest failed");
         return false;
     };
-    let records = match load_kind_complete(context, chain.family, JobRecordKind::Update).await {
+    let records = match drive(
+        LoadFamilyOperation::kind(chain.family, JobRecordKind::Update),
+        context,
+    )
+    .await
+    {
         Ok(records) => records,
         Err(error) => {
             warn!(error = %error, "Execution update read is incomplete; publication deferred");
@@ -306,7 +194,7 @@ pub async fn publish_state(
             if state == PhysicalExecutionState::Error {
                 arm_family(context, chain.family, unix_timestamp_millis()).await;
             }
-            super::outbox::kick(context).await;
+            super::outbox::timers::kick(context).await;
             true
         }
         Ok(outcome) => {
@@ -337,7 +225,7 @@ pub async fn publish_progress(
     job_id: JobId,
     state: PhysicalExecutionState,
 ) {
-    let Some(chain) = execution_chain(context, job_id).await else {
+    let Ok(Some(chain)) = drive(ExecutionChainOperation::of_job(job_id), context).await else {
         return;
     };
     publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
@@ -350,7 +238,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
     let Some(state) = terminal_state(record) else {
         return true;
     };
-    let reservation = match job_reservation(context, record.job_id).await {
+    let held = drive(HeldReservations::of_job(record.job_id), context).await;
+    let reservation = match held.map(|held| held.into_iter().next()) {
         Ok(Some(reservation)) => reservation,
         // No reservation is a purely local execution: it owes nothing here.
         Ok(None) => return true,
@@ -363,13 +252,9 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
             return false;
         }
     };
-    let Some(chain) = chain_for(
-        context,
-        reservation.logical_job_id,
-        reservation.execution_id,
-    )
-    .await
-    else {
+    let chain =
+        ExecutionChainOperation::of_execution(reservation.logical_job_id, reservation.execution_id);
+    let Ok(Some(chain)) = drive(chain, context).await else {
         warn!(
             job_id = %record.job_id,
             execution_id = %reservation.execution_id,
@@ -404,7 +289,8 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
 /// obligation stayed pending, so the caller must run this again.
 pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
     let mut pending = false;
-    for reservation in held_reservations(context).await? {
+    let held = drive(HeldReservations::all(), context).await;
+    for reservation in held.map_err(|error| error.to_string())? {
         let Some(record) =
             read_job_record(&context.storage_handle, reservation.job_id, None).await?
         else {
@@ -470,7 +356,7 @@ fn log_tails(result: Option<&JobResultPayload>) -> (Option<ResultMessage>, Optio
 mod pure_tests {
     use super::*;
     use crate::tests::records::{Family, node, payload, user};
-    use aruna_core::structs::execution::job::{JobError, JobPayload};
+    use aruna_core::structs::execution::job::{ExecutionReceipt, JobError, JobPayload};
 
     fn receipt(family: &Family) -> ExecutionReceipt {
         let spec = family.spec();

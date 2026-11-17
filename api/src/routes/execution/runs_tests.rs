@@ -5,14 +5,14 @@
 use std::sync::Mutex;
 
 use aruna_core::structs::execution::job::{JobId, RunCrateStatus, RunLink};
-use aruna_operations::jobs::store::put_crate_outcome;
+use aruna_operations::jobs::store::attempt::put_crate_outcome;
 use axum::Router;
 use axum::http::StatusCode;
 use ulid::Ulid;
 
 use super::*;
 use crate::auth::RealmAuth;
-use crate::lookup::RELAY_NODE_HEADER;
+use crate::routes::storage::relay::RELAY_NODE_HEADER;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
 
@@ -104,7 +104,11 @@ async fn node_reads_relay() {
     let headers = seen.lock().unwrap().pop().unwrap();
     let named = headers.get(RELAY_NODE_HEADER).unwrap().to_str().unwrap();
     assert_eq!(named, node_id(PEER).to_string());
-    assert!(headers.get(crate::lookup::RELAY_SET_HEADER).is_none());
+    assert!(
+        headers
+            .get(crate::routes::storage::relay::RELAY_SET_HEADER)
+            .is_none()
+    );
     task.abort();
 
     // A node that never answers fails at the deadline, body included.

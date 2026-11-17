@@ -11,12 +11,12 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};

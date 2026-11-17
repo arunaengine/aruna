@@ -690,7 +690,7 @@ mod tests {
     };
     use super::super::version_replication::SourceAuthorizationError;
     use crate::plugins::store::Txn;
-    use crate::sync::mirror_repair::store_sync_status;
+    use crate::sync::mirror_repair::StoreStatusOperation;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
@@ -1252,14 +1252,7 @@ mod tests {
 
     /// The plugin journal rows this node has not matched yet.
     async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
-        let txn = Txn::direct(context);
-        let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
-        page.unwrap()
-            .0
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect()
+        crate::plugins::journal::pending_events(context).await
     }
 
     #[tokio::test]
@@ -1652,7 +1645,11 @@ mod tests {
         relationship.state = SyncState::Failed {
             reason: "access_denied".to_string(),
         };
-        assert!(store_sync_status(&context, &relationship).await.unwrap());
+        assert!(
+            drive(StoreStatusOperation::new(relationship.clone()), &context)
+                .await
+                .unwrap()
+        );
         assert_eq!(journaled(&context).await.len(), 1);
 
         let result = process_blob_batch(&context).await.expect("drain succeeds");

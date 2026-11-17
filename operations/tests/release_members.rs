@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::effects::StorageEffect;
+use aruna_core::jobs::InputResolveRequest;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::metadata::AuthToken;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -27,7 +28,6 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::lifecycle::ingress::InputResolveRequest;
 use aruna_operations::metadata::MetadataReadError;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;

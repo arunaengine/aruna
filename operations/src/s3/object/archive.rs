@@ -25,7 +25,7 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::route_read;
 use crate::driver::drive;
-use crate::jobs::export::{safe_zip_path, zip_entry};
+use crate::jobs::export::archive::zip_entry;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{GetObjectError, GetObjectInput};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -33,6 +33,7 @@ use crate::s3::object::pages::{
     Caller, ListRequest, PageObject, PageScope, RangeRelay, listing_path, object_page,
 };
 use crate::s3::object::read::get_object_routed;
+use aruna_core::archive_path::safe_zip_path;
 
 /// Bucket names never contain `_`, so these paths cannot meet a `bucket/key` path.
 pub const REPORT_PATH: &str = "_report.json";

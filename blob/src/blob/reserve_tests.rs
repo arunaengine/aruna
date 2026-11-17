@@ -639,7 +639,7 @@ async fn upload_late_write() {
         };
         assert_eq!(
             location.hashes,
-            crate::hash::Hasher::new_with_bytes(b"uploaded bytes").to_map()
+            aruna_core::structs::checksum::Hasher::new_with_bytes(b"uploaded bytes").to_map()
         );
     }
 }

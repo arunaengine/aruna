@@ -44,6 +44,8 @@ pub mod staging;
 pub mod storage_read;
 pub mod sync;
 pub mod tasks;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing;
 pub mod users;
 
 #[cfg(test)]

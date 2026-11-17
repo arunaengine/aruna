@@ -47,7 +47,7 @@ use super::version_replication::{
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
+use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
 use aruna_core::structs::storage::replication_queue::MemberTarget;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
@@ -320,11 +320,11 @@ pub(super) async fn store_relationship(
     context: &DriverContext,
     relationship: SyncRelationship,
 ) -> Result<bool, String> {
-    let stored = store_sync_status(context, &relationship)
+    let stored = drive(StoreStatusOperation::new(relationship.clone()), context)
         .await
         .map_err(|error| error.to_string())?;
     if stored {
-        kick_mirror_repair(context).await;
+        let _ = drive(KickRepairOperation::new(), context).await;
     }
     Ok(stored)
 }

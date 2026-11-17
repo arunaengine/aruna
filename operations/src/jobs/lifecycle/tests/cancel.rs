@@ -19,11 +19,11 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::cancel_family;
 use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::transport::serve_job_record;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
-};
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::tests::records::{Family, REALM, user};
 
@@ -315,9 +315,12 @@ async fn late_cancel_flags() {
         .expect("physical row exists");
     assert!(record.cancel_requested);
     assert_eq!(rows(&ctx, JOB_RESERVATION_KEYSPACE, None).await, 0);
-    let updates = load_kind_complete(&ctx, family.family(), JobRecordKind::Update)
-        .await
-        .unwrap();
+    let updates = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Update),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(updates.iter().any(|envelope| matches!(
         &envelope.record,
         JobFamilyRecord::Update(update) if update.state == PhysicalExecutionState::Cancelled
@@ -350,9 +353,9 @@ async fn remote_run_untouched() {
 #[tokio::test]
 async fn deletion_hides_family() {
     // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
-    use crate::jobs::JobRouteError;
     use crate::jobs::lifecycle::cancel::publish_deletion;
     use crate::jobs::lifecycle::report::family_report;
+    use crate::jobs::route::JobRouteError;
     let family = Family::new([43u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.holder).await;
     seed_family(&ctx, &family).await;
@@ -376,7 +379,8 @@ async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
     use crate::jobs::service::delete_owned_run;
-    use crate::jobs::store::{RunDelete, insert_job};
+    use crate::jobs::store::RunDelete;
+    use crate::jobs::store::query::insert_job;
     use crate::tests::records::secret;
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, JobPayload, JobRecord,
@@ -432,6 +436,10 @@ async fn unrecorded_deletion_kept() {
         .await
         .expect("delete runs");
     assert_eq!(deleted, RunDelete::Deleted);
-    let cancels = load_kind_complete(&ctx, family.family(), JobRecordKind::Cancel).await;
+    let cancels = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Cancel),
+        &ctx,
+    )
+    .await;
     assert_eq!(cancels.expect("cancel records load").len(), 1);
 }

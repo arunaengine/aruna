@@ -26,10 +26,14 @@ use super::admit::{
     Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
     relayable,
 };
-use super::keys::{alias_key, conflict_key, family_prefix, kind_prefix, record_key};
-use super::rows::{OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes};
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, conflict_key, family_prefix, kind_prefix, record_key,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// The rows a batch read found, dropping the keys that hold nothing.
 fn stored_rows(values: Vec<(Key, Option<Value>)>) -> impl Iterator<Item = (Key, Value)> {
@@ -445,7 +449,9 @@ impl AppendRecordOperation {
             digest,
             deferred: matches!(
                 admission,
-                Admission::Pending(super::rows::PendingNeed::LocalView)
+                Admission::Pending(
+                    aruna_core::structs::execution::job::record_rows::PendingNeed::LocalView
+                )
             ),
             admission,
             admitted,
@@ -466,13 +472,8 @@ impl AppendRecordOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordStoreError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -497,14 +498,14 @@ impl Operation for AppendRecordOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", format!("{other:?}")),
+                other => self.unexpected("realm config read", other.label()),
             },
             AppendState::Begin => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.read_row(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
+                other => self.unexpected("transaction start", other.label()),
             },
             AppendState::ReadRow { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -533,7 +534,7 @@ impl Operation for AppendRecordOperation {
                     self.scan_pending(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record row read", format!("{other:?}")),
+                other => self.unexpected("record row read", other.label()),
             },
             AppendState::ScanPending { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -541,7 +542,7 @@ impl Operation for AppendRecordOperation {
                     self.read_pending(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending scan", format!("{other:?}")),
+                other => self.unexpected("pending scan", other.label()),
             },
             AppendState::ReadPending { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -551,7 +552,7 @@ impl Operation for AppendRecordOperation {
                     self.read_evidence(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending row read", format!("{other:?}")),
+                other => self.unexpected("pending row read", other.label()),
             },
             AppendState::ReadEvidence { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -561,7 +562,7 @@ impl Operation for AppendRecordOperation {
                     self.scan_kind(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("evidence row read", format!("{other:?}")),
+                other => self.unexpected("evidence row read", other.label()),
             },
             AppendState::ScanKind { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -575,29 +576,31 @@ impl Operation for AppendRecordOperation {
                     self.next_page(txn_id, next_start_after)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("evidence scan", format!("{other:?}")),
+                other => self.unexpected("evidence scan", other.label()),
             },
             AppendState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear_pending(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record write", format!("{other:?}")),
+                other => self.unexpected("record write", other.label()),
             },
             AppendState::Clear { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.commit(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending clear", format!("{other:?}")),
+                other => self.unexpected("pending clear", other.label()),
             },
             AppendState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
+                other => self.unexpected("transaction commit", other.label()),
             },
             AppendState::Cancel { .. } => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", format!("{other:?}")),
+                other => self.unexpected("transaction abort", other.label()),
             },
-            AppendState::Init | AppendState::Finish | AppendState::Error => smallvec![],
+            AppendState::Init | AppendState::Finish | AppendState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 

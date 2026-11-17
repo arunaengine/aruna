@@ -4,9 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
 use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use crate::plugins::account::{read_row, read_user};
+use crate::plugins::account::read_user;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_core::admin_documents::AdminDocumentTarget;
@@ -165,10 +166,8 @@ impl Fixture {
 
     async fn deliver(&self, other: &Fixture, rows: &[(String, Vec<u8>)]) {
         for (key_space, key) in rows {
-            let value = read_row(&self.ctx, key_space, key.clone())
-                .await
-                .unwrap()
-                .unwrap();
+            let txn = crate::plugins::store::Txn::direct(&self.ctx);
+            let value = txn.read(key_space, key).await.unwrap().unwrap();
             other.write_row(key_space, key.clone(), value).await;
         }
     }
@@ -766,4 +765,67 @@ async fn picks_among_holders() {
         next.is_some_and(|next| next != picked && eligible(&config, next)),
         "{next:?}"
     );
+}
+
+fn summary_scope() -> InstallScope {
+    InstallScope {
+        realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
+        group_id: Ulid::from_parts(1, 1),
+        install_id: Ulid::from_parts(2, 2),
+    }
+}
+
+#[test]
+fn summary_warnings() {
+    let warned = |triggers: Value, binding: Option<&str>| {
+        let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
+        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+        let bound = (binding.into_iter())
+            .map(|text| ("key".to_string(), SecretBinding::parse(text).unwrap()))
+            .collect();
+        summary_of(
+            &manifest,
+            "sha256:ab",
+            &summary_scope(),
+            (&BTreeMap::new(), &bound),
+        )
+        .warnings
+    };
+    // Sync triggers are delivered now and warn about nothing; a shared secret still warns.
+    let sync = serde_json::json!({"sync_completed": {}, "sync_failed": {}});
+    assert!(warned(sync.clone(), None).is_empty());
+    assert!(warned(sync.clone(), Some("group:key")).is_empty());
+    assert_eq!(
+        warned(sync, Some("realm:key")),
+        vec!["a realm admin adds the use rule of `realm:key` for `key`".to_string()]
+    );
+}
+
+#[test]
+fn summary_lists_methods() {
+    let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "connections": {
+        "catalog": {"url": "https://c.example.org/", "methods": ["GET", "POST"]}}});
+    let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+    let none = (&BTreeMap::new(), &BTreeMap::new());
+    let lines = summary_of(&manifest, "sha256:ab", &summary_scope(), none).connections;
+    assert_eq!(lines[0].methods, ["GET", "POST"]);
+}
+
+#[test]
+fn summary_stored_answers() {
+    // Only a download through a connection with a secret stores answers the rule screens.
+    let stored = |required: Value| {
+        let manifest = serde_json::json!({"name": "p", "version": "0.1.0",
+            "permissions": {"required": required},
+            "connections": {
+                "files": {"url": "https://f.example.org/", "auth": "token"},
+                "public": {"url": "https://p.example.org/"}}});
+        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
+        let none = (&BTreeMap::new(), &BTreeMap::new());
+        let lines = summary_of(&manifest, "sha256:ab", &summary_scope(), none).connections;
+        lines.iter().map(|line| line.stored).collect::<Vec<_>>()
+    };
+    let download = serde_json::json!(["transfers.download"]);
+    assert_eq!(stored(download), [true, false]);
+    assert_eq!(stored(serde_json::json!([])), [false, false]);
 }

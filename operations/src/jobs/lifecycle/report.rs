@@ -22,13 +22,12 @@ use tracing::debug;
 use super::routing::{family_projection, status_view};
 use super::witness::{WitnessExplain, has_deadline};
 use crate::driver::{DriverContext, drive};
-use crate::jobs::JobRouteError;
-use crate::jobs::records::keys::submission_prefix;
-use crate::jobs::records::rows::from_bytes;
-use crate::jobs::records::{
-    AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation, load_kind_complete,
-};
+use crate::jobs::records::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::route::JobRouteError;
 use crate::storage_read::iter_prefix_page;
+use aruna_core::structs::execution::job::record_keys::submission_prefix;
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Sibling families of one submission a conflict count may scan.
 const MAX_SIBLING_SCAN: usize = 256;
@@ -186,7 +185,11 @@ pub async fn family_report(
 
 /// Whether an authentic cancel record of the family records its deletion.
 async fn deleted(context: &DriverContext, family: JobFamilyId) -> Result<bool, JobRouteError> {
-    let cancels = load_kind_complete(context, family, JobRecordKind::Cancel).await;
+    let cancels = drive(
+        LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
+        context,
+    )
+    .await;
     let cancels = cancels.map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
     Ok(cancels.iter().any(|envelope| {
         matches!(&envelope.record, JobFamilyRecord::Cancel(cancel)
@@ -317,9 +320,12 @@ async fn stored_plan(context: &DriverContext, family: JobFamilyId) -> Option<Pla
 /// The newest launch of the family, read as its placement. It is replicated
 /// evidence, so any responder can answer it even when another node planned.
 async fn launched_plan(context: &DriverContext, family: JobFamilyId) -> Option<PlanEstimate> {
-    let records = load_kind_complete(context, family, JobRecordKind::Launch)
-        .await
-        .ok()?;
+    let records = drive(
+        LoadFamilyOperation::kind(family, JobRecordKind::Launch),
+        context,
+    )
+    .await
+    .ok()?;
     let launch = records
         .iter()
         .filter_map(|envelope| match &envelope.record {

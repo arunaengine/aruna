@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
-use aruna_blob::hash::Hasher;
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::ChecksumAlgorithm;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -707,10 +707,10 @@ mod pure_tests {
         MultipartObjectMetadata, ReferenceAdvance, SyncOrigin, VersionReplicationManifest,
         VersionReplicationMessage,
     };
-    use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::checksum::HASH_SHA256;
+    use aruna_core::structs::checksum::Hasher;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{

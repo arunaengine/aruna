@@ -132,7 +132,7 @@ pub(crate) fn stage_error(bucket: &str, key: &str, error: Option<BaoReadError>) 
         }
         // The holder's key is locked: the job parks on it instead of spending an attempt.
         Some(BaoReadError::Refused(BaoReadRefusal::BucketLocked(_))) => {
-            JobError::retryable(format!("{LOCKED_INPUT}: {message}"))
+            JobError::locked(format!("{LOCKED_INPUT}: {message}"))
         }
         _ => JobError::retryable(message),
     }

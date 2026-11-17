@@ -21,6 +21,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::{KeyLookup, RecoveryState, resolve_holders};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
+use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;

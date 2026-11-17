@@ -748,7 +748,9 @@ mod tests {
 
     #[tokio::test]
     async fn install_wakes_parked() {
-        use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job, read_job_record};
+        use crate::jobs::store::key_wait::park_job;
+        use crate::jobs::store::query::insert_job;
+        use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
         use aruna_core::keyspaces::KEY_COPY_KEYSPACE;
         use aruna_core::node_vault::{VaultEntry, VaultPurpose};
         use aruna_core::structs::execution::job::{

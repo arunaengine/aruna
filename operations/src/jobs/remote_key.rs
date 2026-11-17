@@ -22,22 +22,22 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::Key;
-use aruna_storage::StorageHandle;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::key_wake::{alias_page, alias_wait, find_alias, read_row, version_wait};
 use crate::jobs::route::{JobRouteOperation, JobRouteOutcome};
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::{
-    OwedWake, ack_wake, owed_wakes, queue_remote_wakes, read_job_record, read_key_waits,
-    register_remote_wait, satisfy_key_wait,
+use crate::jobs::store::key_wait::{read_key_waits, satisfy_key_wait};
+use crate::jobs::store::remote_wait::{
+    OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };
+use crate::jobs::store::state::read_job_record;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// Targets one registration may name; more is refused rather than scanned.
-pub const MAX_AWAITED: usize = 1024;
+const MAX_AWAITED: usize = 1024;
 
 /// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
 /// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
@@ -60,7 +60,10 @@ pub(crate) async fn register_waits(
         }
     }
     for wait in &waits {
-        register_remote_wait(&context.storage_handle, wait.key, peer, job_id, auth).await?;
+        let register = WaitRowOperation::register(wait.key, peer, job_id, auth);
+        drive(register, context)
+            .await
+            .map_err(|error| error.to_string())?;
     }
     let mut locked = Vec::new();
     for wait in waits {
@@ -282,7 +285,7 @@ fn owner_auth(record: &JobRecord, realm_id: RealmId) -> AuthContext {
 
 /// Key node: turns the registrations on `key` into owed wakes, in bounded pages.
 pub(crate) async fn queue_wakes(context: &DriverContext, key: BucketKeyRef) -> Result<(), String> {
-    while queue_remote_wakes(&context.storage_handle, key)
+    while drive_retry(|| QueueWakesOperation::new(key), context, &key.key())
         .await
         .map_err(|error| error.to_string())?
     {}
@@ -305,7 +308,7 @@ pub struct Delivery {
 /// Key node: sends one page of owed wakes after `start_after` and drops each acknowledged one.
 pub async fn deliver_owed_wakes(context: &DriverContext, start_after: Option<Key>) -> Delivery {
     let send = |wake: OwedWake| send_wake(context, wake);
-    deliver_with(&context.storage_handle, start_after, send).await
+    deliver_with(context, start_after, send).await
 }
 
 async fn send_wake(context: &DriverContext, wake: OwedWake) -> bool {
@@ -321,8 +324,8 @@ async fn send_wake(context: &DriverContext, wake: OwedWake) -> bool {
 }
 
 /// One delivery pass with `send` as the transport; true from `send` means acknowledged.
-pub(crate) async fn deliver_with<F, Fut>(
-    storage: &StorageHandle,
+async fn deliver_with<F, Fut>(
+    context: &DriverContext,
     start_after: Option<Key>,
     mut send: F,
 ) -> Delivery
@@ -331,7 +334,7 @@ where
     Fut: Future<Output = bool>,
 {
     let resumed = start_after.is_some();
-    let (owed, next) = match owed_wakes(storage, start_after).await {
+    let (owed, next) = match drive(OwedWakesOperation::new(start_after), context).await {
         Ok(page) => page,
         Err(error) => {
             warn!(%error, "Owed key wakes could not be read");
@@ -350,7 +353,7 @@ where
             left = true;
             continue;
         }
-        match ack_wake(storage, waiter, job_id, key).await {
+        match drive(WaitRowOperation::acknowledge(waiter, job_id, key), context).await {
             Ok(()) => acked += 1,
             Err(error) => {
                 warn!(job_id = %job_id, %error, "Acknowledged wake not dropped");
@@ -389,7 +392,9 @@ pub(crate) async fn arm_delivery(context: &DriverContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job};
+    use crate::jobs::store::key_wait::park_job;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job};
     use crate::storage_read::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
@@ -701,8 +706,6 @@ mod tests {
 
     #[tokio::test]
     async fn offline_waiter_recovers() {
-        use crate::jobs::store::queue_remote_wakes;
-
         let (key_dir, waiter_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (key_node, waiter_node) = (empty_context(&key_dir), empty_context(&waiter_dir));
         let node = |seed| iroh::SecretKey::from_bytes(&[seed; 32]).public();
@@ -736,14 +739,14 @@ mod tests {
         park_job(storage, job_id, token, 3_000, vec![wait])
             .await
             .unwrap();
-        let owed_storage = &key_node.storage_handle;
-        register_remote_wait(owed_storage, key, waiter, job_id, &auth)
+        let register = WaitRowOperation::register(key, waiter, job_id, &auth);
+        drive(register, &key_node).await.unwrap();
+        drive(QueueWakesOperation::new(key), &key_node)
             .await
             .unwrap();
-        queue_remote_wakes(owed_storage, key).await.unwrap();
 
         // The waiting node is offline: the wake stays owed and the timer runs again.
-        let offline = deliver_with(owed_storage, None, |_| async { false }).await;
+        let offline = deliver_with(&key_node, None, |_| async { false }).await;
         assert_eq!(
             offline,
             Delivery {
@@ -761,7 +764,7 @@ mod tests {
                 accepted.await == Ok(true)
             }
         };
-        let recovered = deliver_with(owed_storage, None, online).await;
+        let recovered = deliver_with(&key_node, None, online).await;
         assert_eq!(
             recovered,
             Delivery {
@@ -775,17 +778,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(woken.state, JobState::Queued);
-        let left = owed_wakes(owed_storage, None).await.unwrap();
+        let left = drive(OwedWakesOperation::new(None), &key_node)
+            .await
+            .unwrap();
         assert!(left.0.is_empty());
     }
 
     #[tokio::test]
     async fn paging_reaches_later() {
-        use crate::jobs::store::{WAKE_PAGE, queue_remote_wakes};
+        use crate::jobs::store::key_wait::WAKE_PAGE;
 
         let dir = tempfile::tempdir().unwrap();
         let context = empty_context(&dir);
-        let storage = &context.storage_handle;
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let auth = AuthContext {
             user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
@@ -803,21 +807,22 @@ mod tests {
         let last = job(1_000_000);
         for timestamp_ms in 1..=WAKE_PAGE as u64 {
             let job_id = job(timestamp_ms);
-            register_remote_wait(storage, key, waiter, job_id, &auth)
-                .await
-                .unwrap();
+            let register = WaitRowOperation::register(key, waiter, job_id, &auth);
+            drive(register, &context).await.unwrap();
         }
-        register_remote_wait(storage, key, waiter, last, &auth)
+        let register = WaitRowOperation::register(key, waiter, last, &auth);
+        drive(register, &context).await.unwrap();
+        while drive(QueueWakesOperation::new(key), &context)
             .await
-            .unwrap();
-        while queue_remote_wakes(storage, key).await.unwrap() {}
+            .unwrap()
+        {}
 
         // Only the row after a full page of unreachable jobs answers.
         let send = |wake: OwedWake| async move { wake.job_id == last };
-        let first = deliver_with(storage, None, send).await;
+        let first = deliver_with(&context, None, send).await;
         assert_eq!(first.acked, 0);
         assert!(first.owed && first.next.is_some());
-        let second = deliver_with(storage, first.next, send).await;
+        let second = deliver_with(&context, first.next, send).await;
         assert_eq!(second.acked, 1);
         // The pass started mid-way, so it wraps around for the rows still owed.
         assert_eq!(

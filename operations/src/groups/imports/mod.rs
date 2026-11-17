@@ -13,7 +13,7 @@ pub mod shared;
 use crate::driver::DriverContext;
 use crate::groups::backends::{RecordReadError, parse_read};
 use crate::jobs::backend_import::read_checkpoint;
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::storage_read::iter_prefix_page;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};

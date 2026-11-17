@@ -44,14 +44,14 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::kind_prefix;
-use crate::jobs::records::rows::{ProjectionCache, from_bytes};
-use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
+use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
+use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -1817,7 +1817,7 @@ mod tests {
         state: LogicalJobState,
     ) {
         let cache = ProjectionCache {
-            version: crate::jobs::records::rows::PROJECTION_CACHE_VERSION,
+            version: aruna_core::structs::execution::job::record_rows::PROJECTION_CACHE_VERSION,
             revision: 1,
             stale: false,
             projection: Some(aruna_core::structs::execution::job::JobProjection {

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::cursor;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -9,7 +10,6 @@ use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::types::{Effects, GroupId, Key};
-use base64::Engine;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -206,14 +206,11 @@ pub fn bucket_cursor(bucket: &str) -> Result<String, ConversionError> {
 }
 
 fn encode_cursor(key: &Key) -> Result<String, ConversionError> {
-    let bytes = postcard::to_allocvec(&key.to_vec())?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    Ok(cursor::encode_value(&key.to_vec())?)
 }
 
 fn decode_cursor(token: &str) -> Result<Key, ConversionError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)?;
-    let key = postcard::from_bytes::<Vec<u8>>(&bytes)?;
-    Ok(key.into())
+    Ok(cursor::decode_value::<Vec<u8>>(token)?.into())
 }
 
 impl Operation for ListBucketsOperation {

@@ -1,8 +1,7 @@
-//! Opens temporary storage and a plain driver context for the S3 tests, with shared seeds.
+//! Opens temporary storage for the S3 tests, with shared seeds.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
@@ -17,17 +16,6 @@ pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (directory, storage)
-}
-
-pub(crate) fn test_context(storage: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
 }
 
 /// Stores a multipart upload record as a test seed.

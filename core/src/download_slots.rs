@@ -8,14 +8,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::NodeId;
 
 /// Downloads one node serves at once.
-pub const DOWNLOAD_SLOTS: u32 = 256;
+const DOWNLOAD_SLOTS: u32 = 256;
 /// How long a failed holder is skipped.
-pub const AVOID_MS: u64 = 30_000;
+const AVOID_MS: u64 = 30_000;
 /// At most this many holders are skipped at once; the one avoided longest goes first.
 const MAX_AVOIDED: usize = 256;
 
@@ -37,9 +36,21 @@ impl DownloadSlots {
 /// The node-wide download slots and the refusals since the last heartbeat.
 #[derive(Debug)]
 pub struct DownloadGauge {
-    slots: Arc<Semaphore>,
+    active: Arc<AtomicU32>,
     max: u32,
     refused: AtomicU32,
+}
+
+/// One taken download slot; dropping it frees the slot.
+#[derive(Debug)]
+pub struct SlotPermit {
+    active: Arc<AtomicU32>,
+}
+
+impl Drop for SlotPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl Default for DownloadGauge {
@@ -51,26 +62,33 @@ impl Default for DownloadGauge {
 impl DownloadGauge {
     pub fn new(max: u32) -> Self {
         Self {
-            slots: Arc::new(Semaphore::new(max as usize)),
+            active: Arc::new(AtomicU32::new(0)),
             max,
             refused: AtomicU32::new(0),
         }
     }
 
     /// Takes one slot, or counts a refusal when none is free.
-    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
-        let permit = self.slots.clone().try_acquire_owned().ok();
-        if permit.is_none() {
+    pub fn try_acquire(&self) -> Option<SlotPermit> {
+        let taken = self
+            .active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max).then_some(active + 1)
+            })
+            .is_ok();
+        if !taken {
             self.refused.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
-        permit
+        Some(SlotPermit {
+            active: self.active.clone(),
+        })
     }
 
     /// The current use; the refusal count starts again from zero.
     pub fn snapshot(&self) -> DownloadSlots {
-        let free = self.slots.available_permits() as u32;
         DownloadSlots {
-            active: self.max.saturating_sub(free),
+            active: self.active.load(Ordering::Acquire),
             max: self.max,
             refused: self.refused.swap(0, Ordering::Relaxed),
         }
@@ -84,7 +102,7 @@ pub struct AvoidList {
 }
 
 impl AvoidList {
-    /// Skips `node_id` for [`AVOID_MS`] from `now_ms`.
+    /// Skips `node_id` for `AVOID_MS` from `now_ms`.
     pub fn avoid(&self, node_id: NodeId, now_ms: u64) {
         let Ok(mut until) = self.until.lock() else {
             return;

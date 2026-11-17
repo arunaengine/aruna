@@ -37,15 +37,14 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::REPORT_MAX_ROWS;
-use super::protocol::{JobRequest, JobResponse, WireRange, send_job_request};
+use super::protocol::send_job_request;
 use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
-use super::store::{
-    CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
-    list_job_entries, list_user_jobs, read_artifact_tombstone, read_crate_status, read_job_record,
-    read_key_waits, set_cancel_requested,
-};
+use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_requested};
+use super::store::key_wait::read_key_waits;
+use super::store::state::{read_artifact_tombstone, read_job_record};
+use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
     schedule_drain_effect,
@@ -54,16 +53,20 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
+use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::{self, cancel_family};
 use super::lifecycle::ids::session_of;
-use super::lifecycle::routing::{family_of_alias, family_responder, family_status};
+use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
-pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
+use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -667,7 +670,7 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_crate_obligation(
+async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
@@ -1154,7 +1157,10 @@ pub async fn read_report_routed(
     auth_token: Option<crate::metadata::AuthToken>,
 ) -> Result<JobReportLookup, JobRouteError> {
     let user_id = auth.user_id;
-    let job_id = if family_of_alias(context, job_id).await?.is_some() {
+    let job_id = if drive(AliasFamilyOperation::new(job_id), context)
+        .await?
+        .is_some()
+    {
         match super::lifecycle::routing::session_job(context, user_id, job_id).await {
             Ok((_, Some(physical))) => physical,
             Ok((record, None)) => return Ok(JobReportLookup::Pending(record.state)),
@@ -1443,7 +1449,10 @@ pub async fn read_artifact_range(
             Ok(ArtifactRead { blob, stream_size })
         }
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        event => Err(format!("unexpected hidden artifact read event: {event:?}")),
+        event => Err(format!(
+            "unexpected hidden artifact read event: {}",
+            event.label()
+        )),
     }
 }
 
@@ -1559,7 +1568,7 @@ pub async fn cancel_job_routed(
     // call; the local row of a receipted execution is stopped separately.
     if let Some(cancelled) = family_cancel(context, user_id, job_id, auth_token.clone()).await {
         if cancelled.is_ok() {
-            let family = match family_of_alias(context, job_id).await {
+            let family = match drive(AliasFamilyOperation::new(job_id), context).await {
                 Ok(Some(family)) => family,
                 Ok(None) => {
                     return Err(JobRouteError::Unavailable(
@@ -1568,12 +1577,17 @@ pub async fn cancel_job_routed(
                 }
                 Err(error) => return Err(error),
             };
-            for reservation in super::lifecycle::reservation::held_reservations(context)
+            for reservation in drive(HeldReservations::all(), context)
                 .await
-                .map_err(JobRouteError::Unavailable)?
-                .into_iter()
+                .map_err(|error| JobRouteError::Unavailable(error.to_string()))?
             {
-                if family_of_alias(context, reservation.logical_job_id).await? == Some(family) {
+                if drive(
+                    AliasFamilyOperation::new(reservation.logical_job_id),
+                    context,
+                )
+                .await?
+                    == Some(family)
+                {
                     runtime.request_cancel(reservation.job_id);
                 }
             }
@@ -1642,7 +1656,8 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
+    use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
+    use super::crate::jobs::store::query::insert_job;
     use super::*;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,

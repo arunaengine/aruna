@@ -5,18 +5,23 @@
 
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::plugin_runs::{
-    ATTENTION_ROW, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, WAITING_ROW,
-    parse_queue_key, queue_key, run_key, run_prefix,
+    ATTENTION_ROW, MAX_ATTEMPTS, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState,
+    WAITING_ROW, parse_queue_key, queue_key, run_key, run_prefix,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
-use aruna_core::time::unix_timestamp_millis;
+use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
+use aruna_plugins::{FailureKind, InvokeError};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use super::finished::held_runs;
-use super::intents::{drop_intents, open_intent, resolve_intents};
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
+use super::rows::{
+    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, Writes, decode, done,
+    encode, row, unexpected, values, writes,
+};
+use super::work::{WorkRow, work_scan};
 
 /// Serializes admissions on this node, so no install passes its queue bound.
 pub static ADMISSIONS: Mutex<()> = Mutex::const_new(());
@@ -37,152 +42,563 @@ pub enum RunError {
     NotHeld,
 }
 
-/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones.
-pub async fn admit(ctx: &DriverContext, run: &PluginRun) -> Result<(), RunError> {
-    let _admitting = ADMISSIONS.lock().await;
-    transact(ctx, async |txn: &Txn<'_>| admit_in(txn, run).await).await
+/// A sub-plan that admits a run, a new one or one queued again, within its install's bound.
+/// The caller holds `ADMISSIONS` while the transaction runs.
+#[derive(Debug, PartialEq)]
+pub struct Admission {
+    run: Box<PluginRun>,
+    queued: Scan,
 }
 
-/// Admits the run in `txn`, a new one or one queued again; the caller holds `ADMISSIONS`.
-pub async fn admit_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
-    let prefix = run.install_id.to_bytes();
-    let queued = txn.scan(PLUGIN_QUEUE_KEYSPACE, &prefix).await?.len();
-    if queued >= RUNS_QUEUED {
-        return Err(RunError::Full(queued));
+impl Admission {
+    pub fn new(run: PluginRun) -> Self {
+        let prefix = run.install_id.to_bytes().to_vec();
+        Self {
+            run: Box::new(run),
+            queued: Scan::new(PLUGIN_QUEUE_KEYSPACE, prefix),
+        }
     }
-    let queue = vec![(queue_key(run.install_id, run.run_id), Vec::new())];
-    txn.write(PLUGIN_QUEUE_KEYSPACE, queue).await?;
-    let row = vec![(run_key(run.install_id, run.run_id), encode(run)?)];
-    txn.write(PLUGIN_RUNS_KEYSPACE, row).await?;
-    Ok(())
+
+    pub fn ask(&self) -> Ask {
+        self.queued.ask()
+    }
+
+    /// Takes a page of the install's queue; returns the run's rows once the queue is read.
+    pub fn take(&mut self, answer: Answer) -> Result<Option<Vec<Row>>, RunError> {
+        let Some(queued) = self.queued.take(answer)? else {
+            return Ok(None);
+        };
+        if queued.len() >= RUNS_QUEUED {
+            return Err(RunError::Full(queued.len()));
+        }
+        let (install_id, run_id) = (self.run.install_id, self.run.run_id);
+        Ok(Some(vec![
+            row(
+                PLUGIN_QUEUE_KEYSPACE,
+                queue_key(install_id, run_id),
+                Vec::new(),
+            ),
+            row(
+                PLUGIN_RUNS_KEYSPACE,
+                run_key(install_id, run_id),
+                encode(&*self.run)?,
+            ),
+        ]))
+    }
 }
 
-pub async fn read_run(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    run_id: Ulid,
-) -> Result<PluginRun, RunError> {
-    let key = run_key(install_id, run_id);
-    let row = Txn::direct(ctx).read(PLUGIN_RUNS_KEYSPACE, &key).await?;
-    Ok(decode(&row.ok_or(RunError::NotFound)?)?)
+/// Stores a new queued run, unless its install already has `RUNS_QUEUED` unfinished ones. The
+/// caller holds `ADMISSIONS`.
+pub fn admit(run: PluginRun) -> RowsOperation<Admit> {
+    RowsOperation::transaction(Admit {
+        admission: Admission::new(run),
+        written: false,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Admit {
+    admission: Admission,
+    written: bool,
+}
+
+impl Plan for Admit {
+    type Output = ();
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<()>, RunError> {
+        Ok(Turn::Ask(self.admission.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, RunError> {
+        if self.written {
+            return Ok(done(answer).map(|()| Turn::Finish(()))?);
+        }
+        Ok(match self.admission.take(answer)? {
+            None => Turn::Ask(self.admission.ask()),
+            Some(rows) => {
+                self.written = true;
+                Turn::Ask(Ask::Write(rows))
+            }
+        })
+    }
+}
+
+pub fn read_run(install_id: Ulid, run_id: Ulid) -> RowsOperation<ReadRun> {
+    RowsOperation::direct(ReadRun(run_key(install_id, run_id)))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReadRun(Vec<u8>);
+
+impl Plan for ReadRun {
+    type Output = PluginRun;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<PluginRun>, RunError> {
+        let read = vec![(PLUGIN_RUNS_KEYSPACE, self.0.clone())];
+        Ok(Turn::Ask(Ask::Read(read)))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<PluginRun>, RunError> {
+        let [found] = values::<1>(answer)?;
+        Ok(Turn::Finish(decode(&found.ok_or(RunError::NotFound)?)?))
+    }
 }
 
 /// At most `limit` runs of an install after the run `after`, oldest first, and the id of the
 /// last one when more may follow.
-pub async fn list_runs(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    after: Option<Ulid>,
-    limit: usize,
-) -> Result<(Vec<PluginRun>, Option<Ulid>), RunError> {
-    let after = after.map(|run_id| run_key(install_id, run_id));
-    let prefix = run_prefix(install_id);
-    let (rows, next) = (Txn::direct(ctx))
-        .page(PLUGIN_RUNS_KEYSPACE, &prefix, after, limit)
-        .await?;
-    let runs = (rows.iter())
-        .map(|(_, value)| decode::<PluginRun>(value))
-        .collect::<Result<Vec<_>, _>>()?;
-    let next = next.and(runs.last().map(|run| run.run_id));
-    Ok((runs, next))
+pub fn list_runs(install_id: Ulid, after: Option<Ulid>, limit: usize) -> RowsOperation<ListRuns> {
+    RowsOperation::direct(ListRuns(Ask::Page {
+        space: PLUGIN_RUNS_KEYSPACE,
+        prefix: run_prefix(install_id),
+        after: after.map(|run_id| run_key(install_id, run_id)),
+        limit,
+    }))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ListRuns(Ask);
+
+impl Plan for ListRuns {
+    type Output = (Vec<PluginRun>, Option<Ulid>);
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, RunError> {
+        Ok(Turn::Ask(self.0.clone()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, RunError> {
+        let Answer::Page(rows, next) = answer else {
+            return Err(unexpected(answer).into());
+        };
+        let runs = (rows.iter())
+            .map(|(_, value)| decode::<PluginRun>(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next = next.and(runs.last().map(|run| run.run_id));
+        Ok(Turn::Finish((runs, next)))
+    }
 }
 
 /// The install and run ids of every unfinished run on this node; unresolved runs wait for a
 /// person and are left out.
-pub async fn unfinished(ctx: &DriverContext) -> Result<Vec<(Ulid, Ulid)>, RunError> {
-    let rows = Txn::direct(ctx).scan(PLUGIN_QUEUE_KEYSPACE, &[]).await?;
-    Ok((rows.iter())
-        .filter(|(_, value)| ![ATTENTION_ROW, WAITING_ROW].contains(&value.as_slice()))
-        .filter_map(|(key, _)| parse_queue_key(key))
-        .collect())
+pub fn unfinished() -> RowsOperation<Unfinished> {
+    RowsOperation::direct(Unfinished(Scan::new(PLUGIN_QUEUE_KEYSPACE, Vec::new())))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Unfinished(Scan);
+
+impl Plan for Unfinished {
+    type Output = Vec<(Ulid, Ulid)>;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, RunError> {
+        Ok(Turn::Ask(self.0.ask()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, RunError> {
+        let Some(rows) = self.0.take(answer)? else {
+            return Ok(Turn::Ask(self.0.ask()));
+        };
+        Ok(Turn::Finish(
+            (rows.iter())
+                .filter(|(_, value)| ![ATTENTION_ROW, WAITING_ROW].contains(&value.as_slice()))
+                .filter_map(|(key, _)| parse_queue_key(key))
+                .collect(),
+        ))
+    }
+}
+
+/// The rows that save a run: its record, and its queue row marked for attention or, once it
+/// ended, removed.
+pub(crate) fn saved_rows(
+    run: &PluginRun,
+) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u8>)>), RunError> {
+    let mut rows = vec![row(
+        PLUGIN_RUNS_KEYSPACE,
+        run_key(run.install_id, run.run_id),
+        encode(run)?,
+    )];
+    let queued = queue_key(run.install_id, run.run_id);
+    let mut deletes = Vec::new();
+    match run.state {
+        RunState::NeedsAttention => {
+            rows.push(row(PLUGIN_QUEUE_KEYSPACE, queued, ATTENTION_ROW.to_vec()));
+        }
+        state if state.finished() => deletes.push((PLUGIN_QUEUE_KEYSPACE, queued)),
+        _ => {}
+    }
+    Ok((rows, deletes))
 }
 
 /// Writes the run; a run that ended leaves the queue in the same transaction.
-pub async fn save_run(ctx: &DriverContext, run: &PluginRun) -> Result<(), RunError> {
-    transact(ctx, async |txn: &Txn<'_>| save_in(txn, run).await).await
-}
-
-pub async fn save_in(txn: &Txn<'_>, run: &PluginRun) -> Result<(), RunError> {
-    let row = vec![(run_key(run.install_id, run.run_id), encode(run)?)];
-    txn.write(PLUGIN_RUNS_KEYSPACE, row).await?;
-    let queued = queue_key(run.install_id, run.run_id);
-    match run.state {
-        RunState::NeedsAttention => {
-            let waiting = vec![(queued, ATTENTION_ROW.to_vec())];
-            txn.write(PLUGIN_QUEUE_KEYSPACE, waiting).await?;
-        }
-        state if state.finished() => txn.delete(PLUGIN_QUEUE_KEYSPACE, vec![queued]).await?,
-        _ => {}
-    }
-    Ok(())
+pub fn save_run(run: &PluginRun) -> Result<RowsOperation<Writes>, RunError> {
+    let (rows, deletes) = saved_rows(run)?;
+    Ok(writes(rows, deletes))
 }
 
 /// Ends a run that needs attention as a person decided: `done` when its effects happened.
 /// Its open intents record the decision and the audit row is written in the same transaction.
-pub async fn resolve_run(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    run_id: Ulid,
+pub fn resolve_run(
+    (install_id, run_id): (Ulid, Ulid),
     done: bool,
     audit: &AdminAuditRecord,
-) -> Result<PluginRun, RunError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let key = run_key(install_id, run_id);
-        let row = txn.read(PLUGIN_RUNS_KEYSPACE, &key).await?;
-        let mut run = decode::<PluginRun>(&row.ok_or(RunError::NotFound)?)?;
-        if run.state != RunState::NeedsAttention {
-            return Err(RunError::NotWaiting(run.state.as_str()));
-        }
-        let (state, outcome) = match done {
-            true => (RunState::Succeeded, "done"),
-            false => (RunState::Failed, "not done"),
-        };
-        let message = format!("{} resolved it as {outcome}", audit.actor);
-        run.finish(state, Some(message), unix_timestamp_millis());
-        save_in(txn, &run).await?;
-        resolve_intents(txn, run_id, done).await?;
-        let entries = audit
-            .entries()
-            .map_err(|error| StoreError(error.to_string()))?;
-        for (space, key, value) in entries {
-            txn.write(&space, vec![(key.to_vec(), value.to_vec())])
-                .await?;
-        }
-        Ok(run)
-    })
-    .await
+    now_ms: u64,
+) -> Result<RowsOperation<ResolveRun>, RunError> {
+    let outcome = match done {
+        true => "done",
+        false => "not done",
+    };
+    let entries = audit_rows(audit)?;
+    Ok(RowsOperation::transaction(ResolveRun {
+        key: run_key(install_id, run_id),
+        done,
+        message: format!("{} resolved it as {outcome}", audit.actor),
+        now_ms,
+        audit: entries,
+        phase: ResolvePhase::Reading,
+    }))
 }
 
-/// Removes runs that ended longer than `RUN_RETENTION_MS` ago, with their intents and stored
-/// replies. A run that needs attention stays until a person resolves it, and a run whose job's
-/// end is not delivered yet stays for its retry.
-pub async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
-    let rows = Txn::direct(ctx)
-        .scan(PLUGIN_RUNS_KEYSPACE, &[RUN_ROW])
-        .await?;
-    let held = held_runs(ctx).await?;
-    let mut pruned = 0;
-    for (_, value) in rows {
-        let run = decode::<PluginRun>(&value)?;
-        let expired = (run.finished_ms)
-            .is_some_and(|finished| finished.saturating_add(RUN_RETENTION_MS) <= now_ms);
-        if !expired || run.state == RunState::NeedsAttention || held.contains(&run.run_id) {
-            continue;
-        }
-        // A run whose calls may have had effects, or cannot be read, keeps its record.
-        if !matches!(open_intent(ctx, run.run_id).await, Ok(None)) {
-            continue;
-        }
-        transact(ctx, async |txn: &Txn<'_>| {
-            let key = run_key(run.install_id, run.run_id);
-            txn.delete(PLUGIN_RUNS_KEYSPACE, vec![key]).await?;
-            drop_intents(txn, run.run_id).await?;
-            Ok::<_, RunError>(())
-        })
-        .await?;
-        pruned += 1;
+#[derive(Debug, PartialEq)]
+pub struct ResolveRun {
+    key: Vec<u8>,
+    done: bool,
+    message: String,
+    now_ms: u64,
+    audit: Vec<Row>,
+    phase: ResolvePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum ResolvePhase {
+    Reading,
+    Intents(Box<PluginRun>, Scan),
+    Writing(Box<PluginRun>, Vec<(&'static str, Vec<u8>)>),
+    Deleting(Box<PluginRun>),
+}
+
+impl Plan for ResolveRun {
+    type Output = PluginRun;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<PluginRun>, RunError> {
+        let read = vec![(PLUGIN_RUNS_KEYSPACE, self.key.clone())];
+        Ok(Turn::Ask(Ask::Read(read)))
     }
-    Ok(pruned)
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<PluginRun>, RunError> {
+        match std::mem::replace(&mut self.phase, ResolvePhase::Reading) {
+            ResolvePhase::Reading => {
+                let [found] = values::<1>(answer)?;
+                let mut run = decode::<PluginRun>(&found.ok_or(RunError::NotFound)?)?;
+                if run.state != RunState::NeedsAttention {
+                    return Err(RunError::NotWaiting(run.state.as_str()));
+                }
+                let state = match self.done {
+                    true => RunState::Succeeded,
+                    false => RunState::Failed,
+                };
+                run.finish(state, Some(std::mem::take(&mut self.message)), self.now_ms);
+                let scan = intent_scan(run.run_id);
+                let ask = scan.ask();
+                self.phase = ResolvePhase::Intents(Box::new(run), scan);
+                Ok(Turn::Ask(ask))
+            }
+            ResolvePhase::Intents(run, mut scan) => {
+                let Some(intents) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = ResolvePhase::Intents(run, scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let (mut rows, deletes) = saved_rows(&run)?;
+                rows.extend(resolved_rows(intents, self.done)?);
+                rows.append(&mut self.audit);
+                self.phase = ResolvePhase::Writing(run, deletes);
+                Ok(Turn::Ask(Ask::Write(rows)))
+            }
+            ResolvePhase::Writing(run, deletes) => {
+                done(answer)?;
+                self.phase = ResolvePhase::Deleting(run);
+                Ok(Turn::Ask(Ask::Delete(deletes)))
+            }
+            ResolvePhase::Deleting(run) => {
+                done(answer)?;
+                Ok(Turn::Finish(*run))
+            }
+        }
+    }
+}
+
+/// The runs that ended longer than `RUN_RETENTION_MS` ago and may go, as install and run ids.
+/// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
+/// be read stays.
+pub(crate) fn expired_runs(now_ms: u64) -> RowsOperation<ExpiredRuns> {
+    RowsOperation::direct(ExpiredRuns {
+        now_ms,
+        phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
+        prunable: Vec::new(),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ExpiredRuns {
+    now_ms: u64,
+    phase: ExpiredPhase,
+    prunable: Vec<(Ulid, Ulid)>,
+}
+
+#[derive(Debug, PartialEq)]
+enum ExpiredPhase {
+    Runs(Scan),
+    Held(Vec<PluginRun>, Scan),
+    /// Reads the intents of the last expired run; the others follow.
+    Intents(Vec<PluginRun>, Scan),
+    Done,
+}
+
+impl ExpiredRuns {
+    /// The intents of the next expired run, or the outcome when none is left.
+    fn next_run(&mut self, runs: Vec<PluginRun>) -> Turn<Vec<(Ulid, Ulid)>> {
+        let Some(run_id) = runs.last().map(|run| run.run_id) else {
+            return Turn::Finish(std::mem::take(&mut self.prunable));
+        };
+        let scan = intent_scan(run_id);
+        let ask = scan.ask();
+        self.phase = ExpiredPhase::Intents(runs, scan);
+        Turn::Ask(ask)
+    }
+}
+
+impl Plan for ExpiredRuns {
+    type Output = Vec<(Ulid, Ulid)>;
+    type Error = RunError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, RunError> {
+        match &self.phase {
+            ExpiredPhase::Runs(scan) => Ok(Turn::Ask(scan.ask())),
+            _ => Err(StoreError("prune started twice".into()).into()),
+        }
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, RunError> {
+        match std::mem::replace(&mut self.phase, ExpiredPhase::Done) {
+            ExpiredPhase::Runs(mut scan) => {
+                let Some(rows) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = ExpiredPhase::Runs(scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let mut expired = Vec::new();
+                for (_, value) in rows {
+                    let run = decode::<PluginRun>(&value)?;
+                    let ended = (run.finished_ms).is_some_and(|finished| {
+                        finished.saturating_add(RUN_RETENTION_MS) <= self.now_ms
+                    });
+                    if ended && run.state != RunState::NeedsAttention {
+                        expired.push(run);
+                    }
+                }
+                let scan = work_scan();
+                let ask = scan.ask();
+                self.phase = ExpiredPhase::Held(expired, scan);
+                Ok(Turn::Ask(ask))
+            }
+            ExpiredPhase::Held(mut expired, mut scan) => {
+                let Some(rows) = scan.take(answer)? else {
+                    let ask = scan.ask();
+                    self.phase = ExpiredPhase::Held(expired, scan);
+                    return Ok(Turn::Ask(ask));
+                };
+                let held = held_runs(rows)?;
+                expired.retain(|run| !held.contains(&run.run_id));
+                expired.reverse();
+                Ok(self.next_run(expired))
+            }
+            ExpiredPhase::Intents(mut runs, mut scan) => {
+                let intents = match scan.take(answer) {
+                    Ok(None) => {
+                        let ask = scan.ask();
+                        self.phase = ExpiredPhase::Intents(runs, scan);
+                        return Ok(Turn::Ask(ask));
+                    }
+                    Ok(Some(intents)) => Some(intents),
+                    Err(_) => None,
+                };
+                let run = runs.pop().ok_or(RunError::NotFound)?;
+                if intents.is_some_and(|intents| matches!(first_open(&intents), Ok(None))) {
+                    self.prunable.push((run.install_id, run.run_id));
+                }
+                Ok(self.next_run(runs))
+            }
+            ExpiredPhase::Done => Err(unexpected(answer).into()),
+        }
+    }
+}
+
+/// Deletes one run record and every intent and stored reply of the run in one transaction.
+pub(crate) fn drop_run((install_id, run_id): (Ulid, Ulid)) -> RowsOperation<DropRun> {
+    RowsOperation::transaction(DropRun {
+        key: run_key(install_id, run_id),
+        intents: intent_scan(run_id),
+        phase: DropPhase::Run,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DropRun {
+    key: Vec<u8>,
+    intents: Scan,
+    phase: DropPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum DropPhase {
+    Run,
+    Intents,
+    Deleting,
+}
+
+impl Plan for DropRun {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(Ask::Delete(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.key.clone(),
+        )])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        match self.phase {
+            DropPhase::Run => {
+                done(answer)?;
+                self.phase = DropPhase::Intents;
+                Ok(Turn::Ask(self.intents.ask()))
+            }
+            DropPhase::Intents => match self.intents.take(answer)? {
+                None => Ok(Turn::Ask(self.intents.ask())),
+                Some(rows) => {
+                    self.phase = DropPhase::Deleting;
+                    Ok(Turn::Ask(Ask::Delete(intent_keys(rows))))
+                }
+            },
+            DropPhase::Deleting => {
+                done(answer)?;
+                Ok(Turn::Finish(()))
+            }
+        }
+    }
+}
+
+/// The runs a completion still waits on among the work `rows`: those of works not notified yet,
+/// which keep their record until the completion is delivered or dropped.
+pub(crate) fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
+    let mut runs = Vec::new();
+    for (_, value) in rows {
+        let row: WorkRow = decode(&value)?;
+        if !row.notified {
+            runs.push(row.run_id);
+        }
+    }
+    Ok(runs)
+}
+
+/// The rows of an admin audit record.
+pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
+    audit
+        .entries()
+        .map_err(|error| StoreError(error.to_string()))
+}
+
+/// How often the worker looks for due runs.
+pub const TICK: Duration = Duration::from_secs(1);
+/// The longest wait before a failed attempt runs again.
+const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// How one attempt of a run ended, before its intents are inspected.
+#[derive(Debug)]
+pub(crate) enum Ended {
+    Output(Option<String>),
+    Failed(String),
+    /// A host or infrastructure error: the run starts again later.
+    Retry(String),
+    Cancelled(String),
+    /// The runtime had no free slot: the run waits without using an attempt.
+    Busy(String),
+    /// The node stops; the run starts again from the top at the next start.
+    Stopped,
+}
+
+/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
+/// waits without using an attempt.
+pub(crate) fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
+    match invoked {
+        Ok(output) => Ended::Output(output),
+        Err(InvokeError::Guest(failure)) => match failure.kind {
+            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
+            FailureKind::Retryable => Ended::Retry(failure.message),
+        },
+        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
+        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
+        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
+            Ended::Busy(error.to_string())
+        }
+        Err(error) => Ended::Failed(error.to_string()),
+    }
+}
+
+/// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
+/// makes it need attention, and unreadable intents keep it queued without using an attempt.
+pub(crate) fn conclude(
+    run: &mut PluginRun,
+    ended: Ended,
+    changed: bool,
+    open: Result<Option<String>, StoreError>,
+    now_ms: u64,
+) {
+    match open {
+        Ok(Some(reason)) => return run.finish(RunState::NeedsAttention, Some(reason), now_ms),
+        Err(error) => return hold(run, format!("its calls are not readable: {error}"), now_ms),
+        Ok(None) => {}
+    }
+    if changed {
+        let message = "the run made a call that differs from its earlier attempt";
+        return run.finish(RunState::Failed, Some(message.into()), now_ms);
+    }
+    match ended {
+        Ended::Output(output) => {
+            run.output = output;
+            run.finish(RunState::Succeeded, None, now_ms);
+        }
+        Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
+        Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
+        Ended::Retry(message) => retry(run, message, now_ms),
+        Ended::Busy(message) => hold(run, message, now_ms),
+        Ended::Stopped => {}
+    }
+}
+
+/// Queues the run again soon without counting the attempt that just ended.
+fn hold(run: &mut PluginRun, message: String, now_ms: u64) {
+    run.attempts = run.attempts.saturating_sub(1);
+    run.state = RunState::Queued;
+    run.message = Some(message);
+    run.due_ms = now_ms.saturating_add(u64::try_from(TICK.as_millis()).unwrap_or(u64::MAX));
+}
+
+/// Queues the run again after a backoff, or fails it after its last attempt.
+fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
+    if run.attempts >= MAX_ATTEMPTS {
+        run.finish(RunState::Failed, Some(message), now_ms);
+        return;
+    }
+    let backoff = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, run.attempts, 0);
+    run.state = RunState::Queued;
+    run.message = Some(message);
+    run.due_ms = now_ms.saturating_add(u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX));
 }
 
 #[cfg(test)]

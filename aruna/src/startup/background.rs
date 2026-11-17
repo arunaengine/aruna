@@ -6,11 +6,10 @@ use std::sync::Arc;
 
 use aruna_api::monitoring::Readiness;
 use aruna_core::document::DocumentTarget;
-use aruna_core::shutdown::Shutdown;
 use aruna_operations::distribution::index_feed::spawn_index_feed;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::drain::restore_drain_timer;
-use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
+use aruna_operations::jobs::lifecycle::outbox::timers::restore_lifecycle_timers;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::spawn_metadata_warmup;
 use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
@@ -19,6 +18,7 @@ use aruna_operations::plugins::worker::spawn_worker;
 use aruna_operations::s3::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use aruna_operations::tasks::incoming::TaskQueues;
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::application::{Service, ServiceExit};

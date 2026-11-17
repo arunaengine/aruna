@@ -127,7 +127,8 @@ impl Operation for LookupKeysOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::s3::{test_context, test_storage};
+    use crate::testing::test_context;
+    use crate::tests::s3::test_storage;
     use aruna_core::operation_check::{
         check_abort, rejects_events, rejects_finalize, sample_events,
     };

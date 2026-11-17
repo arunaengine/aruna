@@ -5,13 +5,15 @@
 
 use aruna_core::UserId;
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_plugins::broker::{Created, HostError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use super::rows::{
+    Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row, values,
+};
+use super::unavailable;
 use crate::metadata::forward::PinnedCreate;
 
 /// How the key row of a create was found.
@@ -49,7 +51,7 @@ pub enum Step {
 
 /// The next step of a keyed create from how its row was found and what a lookup found. A
 /// missing document is sent again only to the stored node, with the stored arguments.
-pub fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
+pub(crate) fn next_step(claim: Claim, lookup: Option<Lookup>) -> Step {
     match (claim, lookup) {
         (Claim::Fresh, _) => Step::Dispatch,
         (Claim::Earlier, None) => Step::Lookup,
@@ -77,96 +79,138 @@ fn create_key(install_id: Ulid, key: &str) -> Vec<u8> {
 
 /// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
 /// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
-pub async fn claim_key(
-    ctx: &DriverContext,
+pub fn claim_key(
     (install, key): (&PluginInstall, &str),
     minted: PinnedCreate,
-) -> Result<(PinnedCreate, Claim), StoreError> {
-    let row = create_key(install.install_id, key);
-    transact(ctx, async |txn: &Txn<'_>| {
-        let stored = match txn.read(PLUGIN_CREATES_KEYSPACE, &row).await? {
-            Some(bytes) => Some(decode::<KeyRow>(&bytes)?),
-            None => None,
-        };
-        let stored = stored.filter(|stored| stored.account == install.account);
+) -> RowsOperation<ClaimKey> {
+    RowsOperation::transaction(ClaimKey {
+        row: create_key(install.install_id, key),
+        account: install.account,
+        minted: Box::new(minted),
+        claimed: None,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ClaimKey {
+    row: Vec<u8>,
+    account: UserId,
+    minted: Box<PinnedCreate>,
+    claimed: Option<(Box<PinnedCreate>, Claim)>,
+}
+
+impl Plan for ClaimKey {
+    type Output = (PinnedCreate, Claim);
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_CREATES_KEYSPACE,
+            self.row.clone(),
+        )])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        if let Some((create, claim)) = self.claimed.take() {
+            done(answer)?;
+            return Ok(Turn::Finish((*create, claim)));
+        }
+        let [stored] = values::<1>(answer)?;
+        let stored = stored.map(|bytes| decode::<KeyRow>(&bytes)).transpose()?;
+        let stored = stored.filter(|stored| stored.account == self.account);
+        let minted = (*self.minted).clone();
         let (create, claim, open) = match stored {
-            None => (minted.clone(), Claim::Fresh, 1),
+            None => (minted, Claim::Fresh, 1),
             Some(stored) if stored.rejected && stored.open == 0 => {
                 let corrected = PinnedCreate {
                     group_id: stored.create.group_id,
                     document_id: stored.create.document_id,
                     target: stored.create.target,
-                    ..minted.clone()
+                    ..minted
                 };
                 (corrected, Claim::Fresh, 1)
             }
             Some(stored) => (stored.create, Claim::Earlier, stored.open.saturating_add(1)),
         };
         let value = KeyRow {
-            account: install.account,
+            account: self.account,
             create: create.clone(),
             open,
             rejected: false,
         };
-        txn.write(
-            PLUGIN_CREATES_KEYSPACE,
-            vec![(row.clone(), encode(&value)?)],
-        )
-        .await?;
-        Ok((create, claim))
-    })
-    .await
+        self.claimed = Some((Box::new(create), claim));
+        let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&value)?);
+        Ok(Turn::Ask(Ask::Write(vec![write])))
+    }
 }
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub async fn settle_key(
-    ctx: &DriverContext,
+pub(crate) fn settle_key(
     (install, key): (&PluginInstall, &str),
     rejected: bool,
-) -> Result<(), StoreError> {
-    let row = create_key(install.install_id, key);
-    transact(ctx, async |txn: &Txn<'_>| {
-        let Some(bytes) = txn.read(PLUGIN_CREATES_KEYSPACE, &row).await? else {
-            return Ok(());
-        };
-        let mut stored: KeyRow = decode(&bytes)?;
-        if stored.account != install.account {
-            return Ok(());
-        }
-        stored.open = stored.open.saturating_sub(1);
-        stored.rejected = rejected;
-        txn.write(
-            PLUGIN_CREATES_KEYSPACE,
-            vec![(row.clone(), encode(&stored)?)],
-        )
-        .await
+) -> RowsOperation<SettleKey> {
+    RowsOperation::transaction(SettleKey {
+        row: create_key(install.install_id, key),
+        account: install.account,
+        rejected,
+        written: false,
     })
-    .await
 }
 
-/// Deletes the create keys of installs that are being removed or are gone; returns how many.
-/// Keys are written only for installs this receiver ran, so an absent one was removed.
-pub async fn drop_keys(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-) -> Result<usize, StoreError> {
-    let txn = Txn::direct(ctx);
-    let kept = |key: &[u8]| {
-        let install_id = key.get(..16).and_then(|id| <[u8; 16]>::try_from(id).ok());
-        let install_id = install_id.map(Ulid::from_bytes);
-        (config.installs.iter()).any(|install| {
-            Some(install.install_id) == install_id && install.state != InstallState::Removing
-        })
-    };
-    let keys: Vec<_> = (txn.scan(PLUGIN_CREATES_KEYSPACE, &[]).await?)
-        .into_iter()
-        .map(|(key, _)| key)
-        .filter(|key| !kept(key))
-        .collect();
-    let count = keys.len();
-    txn.delete(PLUGIN_CREATES_KEYSPACE, keys).await?;
-    Ok(count)
+#[derive(Debug, PartialEq)]
+pub struct SettleKey {
+    row: Vec<u8>,
+    account: UserId,
+    rejected: bool,
+    written: bool,
+}
+
+impl Plan for SettleKey {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(Ask::Read(vec![(
+            PLUGIN_CREATES_KEYSPACE,
+            self.row.clone(),
+        )])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        if self.written {
+            done(answer)?;
+            return Ok(Turn::Finish(()));
+        }
+        let [stored] = values::<1>(answer)?;
+        let Some(bytes) = stored else {
+            return Ok(Turn::Finish(()));
+        };
+        let mut stored: KeyRow = decode(&bytes)?;
+        if stored.account != self.account {
+            return Ok(Turn::Finish(()));
+        }
+        stored.open = stored.open.saturating_sub(1);
+        stored.rejected = self.rejected;
+        self.written = true;
+        let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&stored)?);
+        Ok(Turn::Ask(Ask::Write(vec![write])))
+    }
+}
+
+/// The intent reply of a create: the document id and its establishing revision.
+pub(crate) fn created_text(document_id: &Ulid, revision: &Ulid) -> String {
+    format!("{document_id} {revision}")
+}
+
+/// A create reply read back from its stored form.
+pub(crate) fn stored_created(reply: &str) -> Result<Created, HostError> {
+    let (resource, revision) = (reply.split_once(' '))
+        .ok_or_else(|| unavailable("the stored create reply is not readable"))?;
+    Ok(Created {
+        resource: resource.to_string(),
+        revision: revision.to_string(),
+    })
 }
 
 #[cfg(test)]

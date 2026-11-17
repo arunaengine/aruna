@@ -228,7 +228,7 @@ async fn plans_until_ended() {
         1,
         None,
     );
-    crate::jobs::store::insert_job(&context.storage_handle, &record)
+    crate::jobs::store::query::insert_job(&context.storage_handle, &record)
         .await
         .unwrap();
     crate::blob::cleanup::process_cleanup_batch(&context)
@@ -271,11 +271,18 @@ async fn plans_until_ended() {
 async fn pauses_purges() {
     let (_directory, context) = setup().await;
     let job = Ulid::from_parts(50, 1);
-    assert!(!is_paused(&context, job).await.unwrap());
-    set_paused(&context, job, true).await.unwrap();
-    assert!(is_paused(&context, job).await.unwrap());
-    set_paused(&context, job, false).await.unwrap();
-    assert!(!is_paused(&context, job).await.unwrap());
+    use crate::blob::pause::{PausePurgeOperation, PausedOperation};
+    use crate::driver::drive;
+    let paused = || drive(PausedOperation::new(job), &context);
+    assert!(!paused().await.unwrap());
+    drive(PausePurgeOperation::new(job, true), &context)
+        .await
+        .unwrap();
+    assert!(paused().await.unwrap());
+    drive(PausePurgeOperation::new(job, false), &context)
+        .await
+        .unwrap();
+    assert!(!paused().await.unwrap());
 }
 
 #[tokio::test]

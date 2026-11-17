@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::jobs::executor::ProgressReporter;
-use crate::jobs::store::find_dedup_plan;
+use crate::jobs::store::query::find_dedup_plan;
 use crate::jobs::submit::mint_job_id;
 use crate::tests::notifications::{CannedPeers, managers, opening, store_setting};
 use crate::tests::staging::setup_driver_context;

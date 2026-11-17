@@ -16,8 +16,8 @@ use serde_json::Value;
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
 use crate::driver::DriverContext;
-use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
 use crate::metadata::get_document::record_materialized_read;
+use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
@@ -232,7 +232,7 @@ pub(crate) fn classify_root_summary(
     collect_conforms_terms(document.get("@context"), &mut conforms_to_keys);
     if root.as_object().is_some_and(|root| {
         root.iter().any(|(key, value)| {
-            conforms_to_keys.contains(key) && jsonld_contains_iri(Some(value), PROCESS_PROFILE)
+            conforms_to_keys.contains(key) && jsonld_contains_iri(Some(value), CRATE_PROFILE_IRI)
         })
     }) {
         return Ok(DocumentPurpose::ProcessRun);
@@ -320,10 +320,10 @@ fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::testing::write_entries;
     use std::sync::Arc;
 
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::Event;
     use aruna_core::metadata::{
         ApplyRoCrateRequest, GraphLifecycleRecord, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
@@ -421,19 +421,6 @@ mod tests {
             updated_at_ms: 1,
             establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
-        }
-    }
-
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
         }
     }
 
@@ -647,14 +634,14 @@ mod tests {
             &fixture,
             &profile,
             serde_json::json!(["Dataset", PROFILE_TYPE_IRI]),
-            Some(PROCESS_PROFILE),
+            Some(CRATE_PROFILE_IRI),
         )
         .await;
         write_rocrate(
             &fixture,
             &process_run,
             serde_json::json!("Dataset"),
-            Some(PROCESS_PROFILE),
+            Some(CRATE_PROFILE_IRI),
         )
         .await;
         write_rocrate(&fixture, &dataset, serde_json::json!("Dataset"), None).await;

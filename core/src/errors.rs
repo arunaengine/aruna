@@ -236,6 +236,11 @@ impl StorageError {
             Self::TransactionConflict | Self::QueueFull | Self::CleanupCapacity
         )
     }
+
+    /// Whether the same work may succeed later: a missing key or a malformed effect never does.
+    pub fn is_transient(&self) -> bool {
+        !matches!(self, Self::KeyNotFound | Self::InvalidEffect)
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]

@@ -5,7 +5,6 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna::identity::PersistedNodeState;
 use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
 use aruna_core::document::DocumentTarget;
@@ -39,6 +38,9 @@ use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
 use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
@@ -46,6 +48,7 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
@@ -56,7 +59,6 @@ use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
-use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_operations::plugins::decide::WaitingRow;
 use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
 use aruna_storage::{SEALED_KEYSPACES, row_aad};
@@ -1077,13 +1079,15 @@ mod tests {
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::structs::execution::job::record_rows::{
+        PendingNeed, PendingRecord, ProjectionCache,
+    };
     use aruna_core::structs::execution::job::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-    use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1356,10 +1360,10 @@ mod tests {
     }
 
     pub(super) fn node_state(path: &Path) {
-        use aruna::identity::{
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+        use aruna_core::structs::identity::node_state::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,

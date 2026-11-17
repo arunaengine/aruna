@@ -26,6 +26,7 @@ pub(crate) enum JobRouteOutcome {
 
 #[derive(Debug, PartialEq)]
 enum RouteState {
+    Init,
     LoadConfig,
     AwaitResponse,
     Done,
@@ -59,7 +60,7 @@ impl JobRouteOperation {
             job_id,
             request,
             responder: None,
-            state: RouteState::LoadConfig,
+            state: RouteState::Init,
             output: None,
         }
     }
@@ -114,6 +115,7 @@ impl Operation for JobRouteOperation {
         if let Some(responder) = self.responder {
             return self.send(responder);
         }
+        self.state = RouteState::LoadConfig;
         smallvec![read_effect(
             &DocumentTarget::RealmConfig {
                 realm_id: self.realm_id,
@@ -140,7 +142,8 @@ impl Operation for JobRouteOperation {
                     self.finish(Err(JobRouteError::Unavailable(error.to_string())))
                 }
                 other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while loading realm config: {other:?}"
+                    "unexpected event while loading realm config: {}",
+                    other.label()
                 )))),
             },
             RouteState::AwaitResponse => match event {
@@ -152,10 +155,13 @@ impl Operation for JobRouteOperation {
                         "job owner unreachable: {message}"
                     )))),
                 other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while awaiting job response: {other:?}"
+                    "unexpected event while awaiting job response: {}",
+                    other.label()
                 )))),
             },
-            RouteState::Done => smallvec![],
+            RouteState::Init | RouteState::Done => self.finish(Err(JobRouteError::Unavailable(
+                format!("unexpected event outside a route: {}", event.label()),
+            ))),
         }
     }
 
@@ -210,6 +216,38 @@ mod pure_tests {
     };
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use ulid::Ulid;
+
+    // An event before `start`, or after the route settled, is refused.
+    #[test]
+    fn rejects_unsent_events() {
+        let route = || {
+            JobRouteOperation::new(
+                RealmId([1u8; 32]),
+                node(1),
+                JobId::from_bytes([1u8; 16]),
+                None,
+            )
+        };
+        let empty = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: None,
+            })
+        };
+        let unexpected = |result: Result<JobRouteOutcome, JobRouteError>| matches!(result, Err(JobRouteError::Unavailable(message)) if message.contains("unexpected"));
+
+        let mut early = route();
+        early.step(empty());
+        assert!(early.is_complete());
+        assert!(unexpected(early.finalize()));
+
+        let mut settled = route();
+        settled.start();
+        settled.step(empty());
+        assert!(settled.is_complete());
+        settled.step(empty());
+        assert!(unexpected(settled.finalize()));
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()

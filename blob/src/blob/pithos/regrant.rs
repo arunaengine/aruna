@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::rewrite::StoredBytes;
+use super::StoredArchive;
 use super::{Share, open_limits, working_set};
 use crate::bao_tree::OpenDalReader;
 use crate::blob::BlobHandler;
@@ -88,7 +88,7 @@ impl BlobHandler {
         let operator = self.operator_from_location(source)?;
         let path = self.object_path(source)?;
         let idle = self.transfer_idle_timeout();
-        let stored = StoredBytes {
+        let stored = StoredArchive {
             operator: operator.clone(),
             path: path.clone(),
             idle,

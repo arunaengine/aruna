@@ -11,6 +11,7 @@ use aruna_core::compute::runtimes::{
     QUICK_RUNTIMES, QuickRuntime, SESSION_RUNTIMES, SESSION_TAG, SESSION_TAG_NOTEBOOK,
     SessionRuntime, quick_runtime,
 };
+use aruna_core::compute::session::{EndReason, SessionAnswer, SessionRequest};
 use aruna_core::structs::execution::job::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
@@ -19,7 +20,7 @@ use aruna_operations::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::family_report;
+use aruna_operations::jobs::lifecycle::report::family_report;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_job_routed,
 };
@@ -440,12 +441,17 @@ impl McpServer {
             tool_extras("run_cell", &input)?,
         )
         .await?;
-        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
+        let submit = SessionRequest::SubmitCell {
+            cell_id: input.cell_id.clone(),
+            code: input.code,
+        };
+        let position = match crate::jobs::caller_session(&self.state, &auth, &input.id, submit)
             .await
-            .map_err(|error| job_error(error.into()))?;
-        let position = session
-            .submit_cell(&input.cell_id, &input.code)
-            .map_err(bad_request)?;
+            .map_err(|error| job_error(error.into()))?
+        {
+            SessionAnswer::Position(position) => position,
+            answer => return Err(session_refusal(answer)),
+        };
         Ok(Json(JsonPayload(json!({
             "cell_id": input.cell_id,
             "position": position,
@@ -473,11 +479,21 @@ impl McpServer {
             tool_extras("read_cell_outputs", &input)?,
         )
         .await?;
-        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
-            .await
-            .map_err(|error| job_error(error.into()))?;
+        let read = SessionRequest::CellOutputs {
+            cell_id: input.cell_id.clone(),
+            after: input.after.unwrap_or_default(),
+        };
         let (last_event_id, outputs) =
-            session.cell_outputs(&input.cell_id, input.after.unwrap_or_default());
+            match crate::jobs::caller_session(&self.state, &auth, &input.id, read)
+                .await
+                .map_err(|error| job_error(error.into()))?
+            {
+                SessionAnswer::Outputs {
+                    last_event_id,
+                    outputs,
+                } => (last_event_id, outputs),
+                answer => return Err(session_refusal(answer)),
+            };
         Ok(Json(JsonPayload(json!({
             "cell_id": input.cell_id,
             "last_event_id": last_event_id,
@@ -502,10 +518,14 @@ impl McpServer {
             tool_extras("interrupt_session", &input)?,
         )
         .await?;
-        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
+        let request = SessionRequest::Interrupt;
+        match crate::jobs::caller_session(&self.state, &auth, &input.id, request)
             .await
-            .map_err(|error| job_error(error.into()))?;
-        session.interrupt().map_err(bad_request)?;
+            .map_err(|error| job_error(error.into()))?
+        {
+            SessionAnswer::Done => {}
+            answer => return Err(session_refusal(answer)),
+        }
         Ok(Json(JsonPayload(json!({ "interrupted": true }))))
     }
 
@@ -530,10 +550,10 @@ impl McpServer {
             tool_extras("end_session", &input)?,
         )
         .await?;
-        let session = crate::jobs::caller_session(&self.state, &auth, &input.id)
+        let request = SessionRequest::End(EndReason::Ended);
+        crate::jobs::caller_session(&self.state, &auth, &input.id, request)
             .await
             .map_err(|error| job_error(error.into()))?;
-        session.end(aruna_compute::session::EndReason::Ended);
         Ok(Json(JsonPayload(json!({ "ended": true }))))
     }
 
@@ -1182,6 +1202,14 @@ fn npm_package_name(spec: &str) -> &str {
         .find('@')
         .map(|version| &spec[..slash + 1 + version])
         .unwrap_or(spec)
+}
+
+/// A session answer other than the one a tool asked for: a refusal keeps its reason.
+fn session_refusal(answer: SessionAnswer) -> CallToolResult {
+    match answer {
+        SessionAnswer::Refused(error) => bad_request(error),
+        _ => internal_error("unexpected session answer"),
+    }
 }
 
 #[cfg(test)]

@@ -169,14 +169,9 @@ async fn serve(
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
         push_key: String::new(),
     };
-    let result = git::transport(
-        &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
-        &auth,
-        request,
-    )
-    .await
-    .map_err(map_error)?;
+    let result = git::transport(&state.get_ctx(), &auth, request)
+        .await
+        .map_err(map_error)?;
     let GitEvent::Response {
         status,
         headers,

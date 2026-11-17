@@ -644,7 +644,7 @@ impl BlobHandler {
             }
         }
         location.blob_size = 0;
-        location.hashes = crate::hash::Hasher::new().to_map();
+        location.hashes = aruna_core::structs::checksum::Hasher::new().to_map();
         match location.is_external() {
             true => BlobEvent::PlainWritten {
                 location,

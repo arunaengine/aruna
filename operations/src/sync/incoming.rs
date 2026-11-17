@@ -8,31 +8,25 @@ use std::time::{Duration, Instant};
 
 use crate::driver::DriverContext;
 use crate::jobs::runtime::JobsRuntime;
-use crate::metadata::MetadataHandle;
-use crate::metadata::projector::{
-    PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
-};
-use crate::metadata::prune_queue::process_graph_tombstones;
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::node::document_sync::{apply_metadata, run_maintenance};
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::replication::catch_up::wake_bootstrap;
-use crate::sync::outbox_record::{
-    new_identified_record, schedule_drain_effect, write_outbox_effect,
-};
+use crate::sync::evicted::ReemitEvictedOperation;
+use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::RoCrateLimits;
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
+use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
@@ -246,7 +240,7 @@ async fn reconcile_inbound_topics(
     };
     let run_started = Instant::now();
     let topic_count = topics.len();
-    let targets = match net_handle.reconcile_sync_topics(topics).await {
+    let targets = match drive(ReconcileTopicsOperation::new(topics), context).await {
         Ok(targets) => targets,
         Err(err) => {
             error!(error = ?err, "Failed to reconcile inbound document sync topics");
@@ -260,7 +254,6 @@ async fn reconcile_inbound_topics(
         return true;
     }
     let dashboard_changed = targets_change_dashboard(&targets.targets);
-    let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
         .targets
         .iter()
@@ -277,18 +270,14 @@ async fn reconcile_inbound_topics(
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
     refresh_target_interest(context, &targets.targets).await;
-    let project_started = Instant::now();
-    project_inbound_events(context, targets).await;
-    let project_elapsed = project_started.elapsed();
-    let prune_started = Instant::now();
-    process_graph_tombstones(context, metadata_graph_tombstones).await;
+    let timings = apply_metadata(context, Some(net_handle.node_id()), targets, true).await;
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,
         applied,
         reconcile_ms = duration_ms(reconcile_elapsed),
-        project_ms = duration_ms(project_elapsed),
-        prune_ms = duration_ms(prune_started.elapsed()),
+        project_ms = duration_ms(timings.project),
+        prune_ms = duration_ms(timings.prune),
         total_ms = duration_ms(run_started.elapsed()),
         "Inbound document sync reconcile summary"
     );
@@ -373,7 +362,7 @@ fn install_inbound_handler(
         warn!("Cannot initialize inbound handling without net handle");
         return None;
     };
-    let metadata_handle = context.metadata_handle.clone();
+    let has_metadata = context.metadata_handle.is_some();
     let inbound_handler = Arc::new(OperationsInboundHandler::new(
         context.clone(),
         rocrate_limits,
@@ -382,11 +371,10 @@ fn install_inbound_handler(
     ));
 
     net_handle.set_inbound_handler(inbound_handler.clone());
-    if let Some(metadata_handle) = metadata_handle {
+    if has_metadata {
         schedule_sync_maintenance(
             context,
             Arc::downgrade(&inbound_handler.document_sync_reconcile),
-            metadata_handle,
             shutdown,
         );
     }
@@ -502,104 +490,29 @@ async fn reemit_evicted_documents(
         warn!(task_id = ?TaskKey::DrainSyncOutbox, "Cannot re-emit evicted documents without net handle");
         return false;
     };
-    let node_id = net_handle.node_id();
-    let mut written = 0usize;
-    let mut complete = true;
-    for document in documents {
-        let record = new_identified_record(
-            document.event_id,
-            node_id,
-            document.target,
-            Vec::new(),
-            document.event,
-            document.placement,
-            document.allow_genesis,
-        );
-        let effect = match write_outbox_effect(&record) {
-            Ok(effect) => effect,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to encode re-emitted eviction outbox record");
-                complete = false;
-                continue;
-            }
-        };
-        match context.storage_handle.send_effect(effect).await {
-            Event::Storage(StorageEvent::WriteResult { .. }) => written += 1,
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to write re-emitted eviction outbox record");
-                complete = false;
-            }
-            other => {
-                warn!(task_id = ?TaskKey::DrainSyncOutbox, event = ?other, "Unexpected event writing re-emitted eviction outbox record");
-                complete = false;
-            }
+    let operation = ReemitEvictedOperation::new(net_handle.node_id(), documents);
+    let outcome = match drive(operation, context).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            warn!(task_id = ?TaskKey::DrainSyncOutbox, error = %error, "Failed to re-emit evicted documents");
+            return false;
         }
-    }
-    if written == 0 {
-        return complete;
-    }
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        warn!(task_id = ?TaskKey::DrainSyncOutbox, "Cannot schedule outbox drain for re-emitted evictions without task handle");
-        return complete;
     };
-    if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(schedule_drain_effect()).await
-    {
+    if let Some(message) = &outcome.drain_error {
         warn!(task_id = ?TaskKey::DrainSyncOutbox, message = %message, "Failed to schedule outbox drain after re-emitting evictions");
     }
-    info!(
-        count = written,
-        "Re-emitted evicted documents to the sync outbox"
-    );
-    complete
-}
-
-async fn project_inbound_events(context: &DriverContext, reconciled: DocumentReconcileResult) {
-    if !reconciled.metadata_create_events.is_empty() {
-        let local_node_id = context.net_handle.as_ref().map(|net| net.node_id());
-        if let Err(error) =
-            project_create_events(context, reconciled.metadata_create_events, local_node_id).await
-        {
-            error!(
-                error = ?error,
-                "Failed to project metadata create event batch after inbound document sync reconciliation"
-            );
-            schedule_projection_retry(context).await;
-        }
-        return;
-    }
-
-    let mut targets = Vec::new();
-    for target in reconciled.targets {
-        let DocumentTarget::MetadataCreateEvent {
-            document_id,
-            event_id,
-            ..
-        } = target
-        else {
-            continue;
-        };
-        targets.push((document_id, event_id));
-    }
-    if let Err(error) = project_logged_events(context, targets).await {
-        error!(
-            error = ?error,
-            "Failed to project metadata create event batch from log after inbound document sync reconciliation"
+    if outcome.written > 0 {
+        info!(
+            count = outcome.written,
+            "Re-emitted evicted documents to the sync outbox"
         );
-        schedule_projection_retry(context).await;
     }
-}
-
-async fn schedule_projection_retry(context: &DriverContext) {
-    if let Err(error) = schedule_projection_drain(context, PROJECTION_RETRY_AFTER).await {
-        warn!(task_id = ?TaskKey::DrainProjectionQueue, error = ?error, "Failed to schedule metadata projection retry");
-    }
+    outcome.complete
 }
 
 fn schedule_sync_maintenance(
     context: Arc<DriverContext>,
     coalescer: Weak<DocumentReconcileCoalescer>,
-    metadata_handle: MetadataHandle,
     shutdown: &Shutdown,
 ) {
     let jitter = Duration::from_secs(
@@ -623,48 +536,22 @@ fn schedule_sync_maintenance(
             };
             coalescer.trigger_all(context.clone());
             cycle = cycle.saturating_add(1);
-            run_sync_maintenance(&metadata_handle, "periodic", cycle).await;
+            run_maintenance(&context, "periodic", cycle).await;
         }
     });
-}
-
-async fn run_sync_maintenance(
-    metadata_handle: &MetadataHandle,
-    source: &'static str,
-    attempt: usize,
-) {
-    if let Err(error) = metadata_handle.reconcile_document_sync().await {
-        warn!(
-            source,
-            attempt,
-            error = ?error,
-            "Metadata document sync reconciliation failed"
-        );
-    }
-    match metadata_handle.prune_deleted_graphs().await {
-        Ok(pruned) if pruned > 0 => {
-            debug!(source, attempt, pruned, "Metadata graph prune completed")
-        }
-        Ok(_) => {}
-        Err(error) => warn!(
-            source,
-            attempt,
-            error = ?error,
-            "Metadata graph prune failed"
-        ),
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::MetadataHandle;
     use crate::replication::protocol::{
         LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::execution::staging::{
@@ -677,10 +564,8 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
-    use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::FjallStorage;
-    use aruna_tasks::TaskHandle;
     use std::collections::HashMap;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
@@ -913,60 +798,6 @@ mod tests {
             drop(fixture);
             net.shutdown().await;
             drop(context);
-        }
-    }
-
-    #[tokio::test]
-    async fn projection_failure_retries() {
-        let temp_dir = tempdir().expect("temp dir");
-        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
-            .expect("storage opens");
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: Some(TaskHandle::new()),
-            compute_handle: None,
-        };
-        let document_id = ulid::Ulid::generate();
-        let event_id = ulid::Ulid::generate();
-
-        project_inbound_events(
-            &context,
-            DocumentReconcileResult {
-                targets: vec![DocumentTarget::MetadataCreateEvent {
-                    document_id,
-                    event_id,
-                }],
-                metadata_create_events: Vec::new(),
-                metadata_graph_tombstones: Vec::new(),
-            },
-        )
-        .await;
-
-        let timer = read_task_timer(&storage, &TaskKey::DrainProjectionQueue)
-            .await
-            .expect("projection retry timer persisted");
-        assert_eq!(timer.key, TaskKey::DrainProjectionQueue);
-    }
-
-    async fn read_task_timer(
-        storage: &aruna_storage::StorageHandle,
-        key: &TaskKey,
-    ) -> Option<PersistedTaskTimer> {
-        let event = storage
-            .send_storage_effect(aruna_core::effects::StorageEffect::Read {
-                key_space: TASK_TIMER_KEYSPACE.to_string(),
-                key: postcard::to_allocvec(key).unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                value.map(|value| postcard::from_bytes(&value).expect("timer decodes"))
-            }
-            other => panic!("unexpected task timer read event: {other:?}"),
         }
     }
 

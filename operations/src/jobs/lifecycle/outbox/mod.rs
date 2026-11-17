@@ -3,6 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod drain;
+pub mod timers;
+
 use std::time::Duration;
 
 use aruna_core::effects::{
@@ -11,34 +14,29 @@ use aruna_core::effects::{
 };
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{FAMILY_OUTBOX_KEYSPACE, FAMILY_RECORD_KEYSPACE, NODE_STATE_KEYSPACE};
+use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{JobRecordEnvelope, JobRecordKey};
+use aruna_core::structs::execution::job::JobRecordKey;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::rows::{OutboxEntry, from_bytes, to_bytes};
-use crate::metadata::api::load_realm_config;
-use crate::placement::resolve_shard_holders;
-use crate::storage_read::iter_prefix_page;
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;
 /// Wall-clock budget of one record publish.
-pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
+const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 /// Spacing between drain passes while entries remain undeliverable.
 pub const OUTBOX_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Definitive refusals one record is offered through before it is dropped.
 /// Unreachable holders never count: only a holder's own refusal does.
-pub const MAX_PUBLISH_REJECTIONS: u32 = 16;
-const OUTBOX_CURSOR_KEY: &[u8] = b"job_family_outbox_cursor";
+const MAX_PUBLISH_REJECTIONS: u32 = 16;
 
 /// Kicks the outbox drain without persisting a timer of its own.
 pub fn schedule_outbox_drain(after: Duration) -> Effect {
@@ -46,16 +44,6 @@ pub fn schedule_outbox_drain(after: Duration) -> Effect {
         key: TaskKey::DrainFamilyOutbox,
         after,
     })
-}
-
-/// Asks the drain to run now, after a record was queued for replication.
-pub async fn kick(context: &DriverContext) {
-    if let Some(task) = context.task_handle.as_ref() {
-        use aruna_core::handle::Handle;
-        let _ = task
-            .send_effect(schedule_outbox_drain(Duration::ZERO))
-            .await;
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +156,27 @@ impl PublishRecordOperation {
         })])
     }
 
+    /// Notes the holders that accepted the record; clears the entry once every holder has it.
+    fn delivered_to(&mut self, holders: Vec<NodeId>) -> Effects {
+        for holder in holders {
+            if self.config.holders.contains(&holder) && !self.delivered.contains(&holder) {
+                self.delivered.push(holder);
+            }
+        }
+        if self
+            .config
+            .holders
+            .iter()
+            .all(|holder| self.delivered.contains(holder))
+        {
+            return self.clear();
+        }
+        match self.store() {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
+        }
+    }
+
     fn settle(&mut self, delivered: bool) -> Effects {
         self.outcome = Some(Ok(delivered));
         self.state = PublishState::Finish;
@@ -219,50 +228,16 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Read".to_string(),
                     expected: "outbox read result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Offer => match event {
                 Event::Net(NetEvent::JobRecord(JobRecordEvent::Published { holder })) => {
                     debug!(peer = %holder, "Job record replicated to a family holder");
-                    if self.config.holders.contains(&holder) && !self.delivered.contains(&holder) {
-                        self.delivered.push(holder);
-                    }
-                    if self
-                        .config
-                        .holders
-                        .iter()
-                        .all(|holder| self.delivered.contains(holder))
-                    {
-                        self.clear()
-                    } else {
-                        match self.store() {
-                            Ok(effects) => effects,
-                            Err(error) => self.fail(error),
-                        }
-                    }
+                    self.delivered_to(vec![holder])
                 }
                 Event::Net(NetEvent::JobRecord(JobRecordEvent::PublishedMany { holders })) => {
-                    for holder in holders {
-                        if self.config.holders.contains(&holder)
-                            && !self.delivered.contains(&holder)
-                        {
-                            self.delivered.push(holder);
-                        }
-                    }
-                    if self
-                        .config
-                        .holders
-                        .iter()
-                        .all(|holder| self.delivered.contains(holder))
-                    {
-                        self.clear()
-                    } else {
-                        match self.store() {
-                            Ok(effects) => effects,
-                            Err(error) => self.fail(error),
-                        }
-                    }
+                    self.delivered_to(holders)
                 }
                 Event::Net(NetEvent::JobRecord(JobRecordEvent::Rejected { holder, reason })) => {
                     warn!(peer = %holder, reason = ?reason, "Family holder refused a record");
@@ -292,7 +267,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Offer".to_string(),
                     expected: "job record publish result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Store => match event {
@@ -301,7 +276,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Store".to_string(),
                     expected: "outbox write result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Clear => match event {
@@ -310,10 +285,16 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Clear".to_string(),
                     expected: "outbox delete result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
-            PublishState::Init | PublishState::Finish | PublishState::Error => smallvec![],
+            PublishState::Init | PublishState::Finish | PublishState::Error => {
+                self.fail(LifecycleError::UnexpectedEvent {
+                    state: format!("{:?}", self.state),
+                    expected: "no event",
+                    got: event.label(),
+                })
+            }
         }
     }
 
@@ -328,178 +309,6 @@ impl Operation for PublishRecordOperation {
     fn abort(&mut self) -> Effects {
         smallvec![]
     }
-}
-
-/// One bounded drain pass. Returns true while entries remain, so the caller
-/// re-arms instead of spinning.
-pub async fn drain_family_outbox(context: &DriverContext) -> bool {
-    let Some(net) = context.net_handle.as_ref() else {
-        return false;
-    };
-    let realm_id = *net.realm_id();
-    let local = net.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        return true;
-    };
-    let start_after = match read_outbox_cursor(context).await {
-        Ok(cursor) => cursor,
-        Err(error) => {
-            warn!(error = %error, "Job family outbox cursor read failed");
-            return true;
-        }
-    };
-    let (entries, next_cursor) = match iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_OUTBOX_KEYSPACE,
-        None,
-        start_after,
-        OUTBOX_DRAIN_BATCH,
-        None,
-    )
-    .await
-    {
-        Ok(page) => page,
-        Err(error) => {
-            warn!(error = %error, "Job family outbox scan failed");
-            return true;
-        }
-    };
-    for (key, _) in entries {
-        let Ok(record_key) = JobRecordKey::from_bytes(&key) else {
-            continue;
-        };
-        let Some(frame) = read_record(context, &key).await else {
-            continue;
-        };
-        let placement = match config.family_placement(record_key.family.submission_id) {
-            Ok(placement) => placement,
-            Err(error) => {
-                warn!(error = %error, "Queued record has no derivable family placement");
-                continue;
-            }
-        };
-        let holders: Vec<NodeId> = resolve_shard_holders(&config, &placement)
-            .into_iter()
-            .filter(|holder| *holder != local)
-            .collect();
-        if holders.is_empty() {
-            if !clear_entry(context, key).await {
-                return true;
-            }
-            continue;
-        }
-        let operation = PublishRecordOperation::new(PublishRecordConfig {
-            realm_id,
-            placement,
-            holders,
-            record: Box::new(frame),
-            key: record_key,
-        });
-        if let Err(error) = drive(operation, context).await {
-            warn!(error = %error, "Job record replication failed");
-        }
-    }
-    if let Err(error) = write_outbox_cursor(context, next_cursor.as_ref()).await {
-        warn!(error = %error, "Job family outbox cursor write failed");
-        return true;
-    }
-    match iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_OUTBOX_KEYSPACE,
-        None,
-        None,
-        1,
-        None,
-    )
-    .await
-    {
-        Ok((entries, _)) => !entries.is_empty(),
-        Err(error) => {
-            warn!(error = %error, "Job family outbox rescan failed");
-            true
-        }
-    }
-}
-
-async fn read_outbox_cursor(context: &DriverContext) -> Result<Option<Key>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: NODE_STATE_KEYSPACE.to_string(),
-            key: Key::from(OUTBOX_CURSOR_KEY.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected outbox cursor read event: {other:?}")),
-    }
-}
-
-async fn write_outbox_cursor(context: &DriverContext, cursor: Option<&Key>) -> Result<(), String> {
-    let event = match cursor {
-        Some(cursor) => {
-            context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: NODE_STATE_KEYSPACE.to_string(),
-                    key: Key::from(OUTBOX_CURSOR_KEY.to_vec()),
-                    value: cursor.clone(),
-                    txn_id: None,
-                })
-                .await
-        }
-        None => {
-            context
-                .storage_handle
-                .send_storage_effect(StorageEffect::Delete {
-                    key_space: NODE_STATE_KEYSPACE.to_string(),
-                    key: Key::from(OUTBOX_CURSOR_KEY.to_vec()),
-                    txn_id: None,
-                })
-                .await
-        }
-    };
-    match event {
-        Event::Storage(StorageEvent::WriteResult { .. })
-        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected outbox cursor write event: {other:?}")),
-    }
-}
-
-async fn clear_entry(context: &DriverContext, key: Key) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::DeleteResult { .. })
-    )
-}
-
-async fn read_record(context: &DriverContext, key: &Key) -> Option<JobRecordFrame> {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: None,
-        })
-        .await;
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = event
-    else {
-        return None;
-    };
-    let envelope = from_bytes::<JobRecordEnvelope>(&bytes).ok()?;
-    JobRecordFrame::new(envelope).ok()
 }
 
 #[cfg(test)]
@@ -626,62 +435,44 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pages_past_blocked() {
-        // A persisted continuation must let the next pass reach later rows.
-        let directory = tempfile::tempdir().expect("temp directory");
-        let storage = aruna_storage::FjallStorage::open(directory.path().to_str().unwrap())
-            .expect("storage opens");
-        let context = DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
+    #[test]
+    fn rejects_terminal_event() {
+        // A publish that settled, or never started, refuses an event instead of ignoring it.
+        let fixture = Family::new([9u8; 32]);
+        let envelope = fixture.sign(
+            &fixture.holder,
+            aruna_core::structs::execution::job::JobFamilyRecord::Spec(Box::new(fixture.spec())),
+        );
+        let key = envelope.key();
+        let config = PublishRecordConfig {
+            realm_id: fixture.config.realm_id,
+            placement: fixture.placement,
+            holders: vec![node(10)],
+            record: Box::new(JobRecordFrame::new(envelope).expect("record frame")),
+            key,
         };
-        let blocked = Key::from(b"blocked".to_vec());
-        let later = Key::from(b"later".to_vec());
-        for key in [&blocked, &later] {
-            assert!(matches!(
-                storage
-                    .send_storage_effect(StorageEffect::Write {
-                        key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-                        key: key.clone(),
-                        value: Value::from(b"queued".to_vec()),
-                        txn_id: None,
-                    })
-                    .await,
-                Event::Storage(StorageEvent::WriteResult { .. })
-            ));
-        }
+        let gone = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: record_key(&key),
+                value: None,
+            })
+        };
 
-        let (page, next) = iter_prefix_page(
-            &context.storage_handle,
-            FAMILY_OUTBOX_KEYSPACE,
-            None,
-            read_outbox_cursor(&context).await.expect("cursor read"),
-            1,
-            None,
-        )
-        .await
-        .expect("first page");
-        assert_eq!(page[0].0, blocked);
-        write_outbox_cursor(&context, next.as_ref())
-            .await
-            .expect("cursor write");
+        let mut early = PublishRecordOperation::new(config.clone());
+        assert!(early.step(gone()).is_empty());
+        assert!(matches!(
+            early.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
 
-        let (page, next) = iter_prefix_page(
-            &context.storage_handle,
-            FAMILY_OUTBOX_KEYSPACE,
-            None,
-            read_outbox_cursor(&context).await.expect("cursor read"),
-            1,
-            None,
-        )
-        .await
-        .expect("second page");
-        assert_eq!(page[0].0, later);
-        assert!(next.is_none());
+        let mut settled = PublishRecordOperation::new(config);
+        let _ = settled.start();
+        assert!(settled.step(gone()).is_empty());
+        assert!(settled.is_complete());
+        assert!(settled.step(gone()).is_empty());
+        assert!(matches!(
+            settled.finalize(),
+            Err(LifecycleError::UnexpectedEvent { .. })
+        ));
     }
 }

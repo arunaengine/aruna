@@ -168,16 +168,13 @@ fn folder_name(root: &str) -> String {
 }
 
 fn encode_cursor(cursor: Option<Key>) -> Option<String> {
-    use base64::Engine;
-    cursor.map(|cursor| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cursor.as_ref()))
+    cursor.map(aruna_core::cursor::encode)
 }
 
 fn decode_cursor(cursor: Option<String>) -> ServerResult<Option<Key>> {
-    use base64::Engine;
     cursor
         .map(|cursor| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(cursor)
+            aruna_core::cursor::decode(cursor)
                 .map(Key::from)
                 .map_err(|_| ServerError::BadRequestReason("malformed cursor".to_string()))
         })

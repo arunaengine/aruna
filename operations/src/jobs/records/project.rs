@@ -15,17 +15,16 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::debug;
 
-use super::keys::{alias_family, alias_prefix, family_prefix, record_key};
 use super::reduce::reduce_family;
-use super::rows::{ProjectionCache, from_bytes, to_bytes};
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
-use crate::jobs::store::{JobDeletes, JobWrites};
+use aruna_core::structs::execution::job::record_keys::{
+    MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix, record_key,
+};
+use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes, to_bytes};
+use aruna_core::structs::execution::job::{JobDeletes, JobWrites};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
-/// Families one alias may resolve to. Two families claiming one id is an
-/// anomaly that stays visible instead of rebinding the first one.
-const MAX_ALIAS_FAMILIES: usize = 8;
 
 /// How a caller names the family to project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,13 +327,8 @@ impl ProjectFamilyOperation {
         }
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordStoreError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
     }
 
     fn txn(&self) -> Option<TxnId> {
@@ -352,6 +346,10 @@ impl ProjectFamilyOperation {
 impl Operation for ProjectFamilyOperation {
     type Output = ProjectedFamily;
     type Error = RecordStoreError;
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        error.is_conflict()
+    }
 
     fn start(&mut self) -> Effects {
         match self.config.family {
@@ -382,7 +380,7 @@ impl Operation for ProjectFamilyOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("alias scan", format!("{other:?}")),
+                other => self.unexpected("alias scan", other.label()),
             },
             ProjectState::ReadCache => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -406,12 +404,12 @@ impl Operation for ProjectFamilyOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", format!("{other:?}")),
+                other => self.unexpected("projection cache read", other.label()),
             },
             ProjectState::Begin => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.page(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
+                other => self.unexpected("transaction start", other.label()),
             },
             ProjectState::Page { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -422,7 +420,7 @@ impl Operation for ProjectFamilyOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record page", format!("{other:?}")),
+                other => self.unexpected("record page", other.label()),
             },
             ProjectState::ReadJobs { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -430,24 +428,26 @@ impl Operation for ProjectFamilyOperation {
                     self.write(txn_id, writes, deletes)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("job row read", format!("{other:?}")),
+                other => self.unexpected("job row read", other.label()),
             },
             ProjectState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection write", format!("{other:?}")),
+                other => self.unexpected("projection write", other.label()),
             },
             ProjectState::Clear { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.commit(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("index clear", format!("{other:?}")),
+                other => self.unexpected("index clear", other.label()),
             },
             ProjectState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.settle(false),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
+                other => self.unexpected("transaction commit", other.label()),
             },
-            ProjectState::Init | ProjectState::Finish | ProjectState::Error => smallvec![],
+            ProjectState::Init | ProjectState::Finish | ProjectState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 
