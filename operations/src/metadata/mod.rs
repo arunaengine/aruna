@@ -35,8 +35,6 @@ mod search_cursor;
 pub mod secondary_ids;
 pub mod stats;
 mod summary_cache;
-#[cfg(test)]
-mod tests;
 pub mod timestamp_index;
 pub mod update_document;
 pub mod visibility_index;

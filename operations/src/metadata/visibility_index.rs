@@ -796,9 +796,6 @@ mod tests {
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::{
-        MetadataAuditOperation, MetadataAuditRecord,
-    };
     use aruna_core::{NodeId, UserId};
     use aruna_storage::storage;
     use std::collections::{HashMap, HashSet};
@@ -852,20 +849,6 @@ mod tests {
             updated_at_ms,
             establishing_event_id: Ulid::from_bytes([8; 16]),
             last_event_id: Ulid::from_bytes([9; 16]),
-        }
-    }
-
-    fn audit(record: &MetadataRegistryRecord) -> MetadataAuditRecord {
-        MetadataAuditRecord {
-            realm_id: record.realm_id,
-            group_id: record.group_id,
-            document_id: record.document_id,
-            graph_iri: record.graph_iri.clone(),
-            user_id: Default::default(),
-            node_id: NodeId::from_bytes(&[1u8; 32]).expect("node id"),
-            operation: MetadataAuditOperation::Create,
-            occurred_at_ms: record.updated_at_ms,
-            details: None,
         }
     }
 
@@ -944,7 +927,13 @@ mod tests {
     }
 
     async fn seed_record(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
+        let writes = create_outbox_entries(
+            record,
+            &crate::tests::metadata::create_audit(record),
+            Ulid::generate(),
+            None,
+        )
+        .unwrap();
         write(context, writes).await;
     }
 

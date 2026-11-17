@@ -243,14 +243,10 @@ pub(crate) async fn delete_index_keys(
 mod tests {
     use super::*;
     use crate::metadata::repository::create_outbox_entries;
-    use aruna_core::NodeId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::{
-        MetadataAuditOperation, MetadataAuditRecord,
-    };
     use aruna_storage::storage;
     use tempfile::tempdir;
 
@@ -275,20 +271,6 @@ mod tests {
         }
     }
 
-    fn audit(record: &MetadataRegistryRecord) -> MetadataAuditRecord {
-        MetadataAuditRecord {
-            realm_id: record.realm_id,
-            group_id: record.group_id,
-            document_id: record.document_id,
-            graph_iri: record.graph_iri.clone(),
-            user_id: Default::default(),
-            node_id: NodeId::from_bytes(&[1u8; 32]).expect("node id"),
-            operation: MetadataAuditOperation::Create,
-            occurred_at_ms: record.updated_at_ms,
-            details: None,
-        }
-    }
-
     fn context() -> (DriverContext, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let context = DriverContext {
@@ -304,7 +286,13 @@ mod tests {
     }
 
     async fn store(context: &DriverContext, record: &MetadataRegistryRecord) {
-        let writes = create_outbox_entries(record, &audit(record), Ulid::generate(), None).unwrap();
+        let writes = create_outbox_entries(
+            record,
+            &crate::tests::metadata::create_audit(record),
+            Ulid::generate(),
+            None,
+        )
+        .unwrap();
         let event = context
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::BatchWrite {
