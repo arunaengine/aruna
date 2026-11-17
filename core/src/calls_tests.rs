@@ -22,6 +22,7 @@ struct Script {
     transaction: bool,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
+    after: Vec<Effect>,
 }
 
 impl Script {
@@ -65,6 +66,10 @@ impl Operation for Script {
     fn abort(&mut self) -> Vec<IoCall> {
         std::mem::take(&mut self.cleanup)
     }
+
+    fn after_commit(&mut self) -> Option<Effect> {
+        (!self.after.is_empty()).then(|| self.after.remove(0))
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -76,6 +81,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         transaction: false,
         then: Vec::new(),
         cleanup: Vec::new(),
+        after: Vec::new(),
     }
 }
 
@@ -103,6 +109,85 @@ fn storage(effect: StorageEffect) -> Effect {
 
 fn read_a() -> IoCall {
     IoCall::Read(vec![("rows".to_string(), key("a"))])
+}
+
+#[test]
+fn effects_join_transaction() {
+    // A passed-through storage effect without a transaction id runs in the operation's one.
+    let entry = crate::node_vault::VaultEntry::new(
+        crate::node_vault::VaultPurpose::NamedSecret,
+        ulid::Ulid::from_parts(1, 1),
+    );
+    let delete = StorageEffect::VaultDelete {
+        entry,
+        txn_id: None,
+    };
+    let mut operation = run(
+        script(vec![IoCall::Effect(Box::new(storage(delete)))]),
+        true,
+    );
+    let start = storage(StorageEffect::StartTransaction { read: false });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let joined = StorageEffect::VaultDelete {
+        entry,
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(joined)]);
+}
+
+#[test]
+fn sends_after_commit() {
+    // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut script = script(vec![IoCall::Write(write)]);
+    let wake = || {
+        Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        })
+    };
+    let sync = || Effect::Storage(StorageEffect::SyncAll);
+    script.after = vec![wake(), sync()];
+    let mut operation = run(script, true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(committed)).as_slice(),
+        &[wake()]
+    );
+    assert!(!operation.is_complete());
+    let refused = TaskEvent::Error {
+        key: None,
+        message: "timer refused".to_string(),
+    };
+    assert_eq!(operation.step(Event::Task(refused)).as_slice(), &[sync()]);
+    let synced = Event::Storage(StorageEvent::SyncAllFinished);
+    assert!(operation.step(synced).is_empty());
+    assert!(operation.is_complete());
+    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
+}
+
+#[test]
+fn storage_refusal_fails() {
+    // A storage effect answered with a storage error fails the operation like a storage call.
+    let read = StorageEffect::Read {
+        key_space: "rows".to_string(),
+        key: key("a"),
+        txn_id: None,
+    };
+    let mut operation = run(script(vec![IoCall::Effect(Box::new(storage(read)))]), false);
+    operation.start();
+    let error = StorageError::ReadError("disk".to_string());
+    let refused = Event::Storage(StorageEvent::Error {
+        error: error.clone(),
+    });
+    assert!(operation.step(refused).is_empty());
+    assert_eq!(operation.finalize(), Err(IoError::Storage(error)));
 }
 
 #[test]

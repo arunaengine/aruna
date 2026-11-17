@@ -696,6 +696,27 @@ pub enum StorageEffect {
     RealmOpen(Box<crate::realm_vault::RealmSealed>),
 }
 
+impl StorageEffect {
+    /// The transaction id of an effect that can run in a caller's transaction.
+    pub fn txn_slot(&mut self) -> Option<&mut Option<TxnId>> {
+        match self {
+            Self::Read { txn_id, .. }
+            | Self::BatchRead { txn_id, .. }
+            | Self::Write { txn_id, .. }
+            | Self::BatchWrite { txn_id, .. }
+            | Self::Delete { txn_id, .. }
+            | Self::BatchDelete { txn_id, .. }
+            | Self::Iter { txn_id, .. }
+            | Self::IterRange { txn_id, .. }
+            | Self::Last { txn_id, .. }
+            | Self::VaultWrite { txn_id, .. }
+            | Self::VaultRead { txn_id, .. }
+            | Self::VaultDelete { txn_id, .. } => Some(txn_id),
+            _ => None,
+        }
+    }
+}
+
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,
 /// so sync traffic is never starved by background materialization work.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

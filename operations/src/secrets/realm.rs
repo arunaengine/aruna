@@ -4,26 +4,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::realm_vault::{RealmSecretRef, RealmVaultError, RealmVaultKey, RealmVaultRecord};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows;
 use aruna_core::secrets::{SecretRecord, SecretScope, UseRule};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use std::collections::BTreeSet;
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 use super::{Applied, ChangeError, Managers, SecretChange, apply_change, widening_notices};
@@ -60,13 +58,14 @@ pub enum RealmSecretError {
     ConfigMissing,
     #[error("this node is not a realm management node")]
     NotManagementNode,
-    #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for RealmSecretError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
+    }
 }
 
 impl From<aruna_core::secrets::SecretError> for RealmSecretError {
@@ -75,39 +74,34 @@ impl From<aruna_core::secrets::SecretError> for RealmSecretError {
     }
 }
 
+/// The call the operation waits for.
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    StartTransaction,
-    ReadCurrent,
-    Write { deletes: Vec<(KeySpace, Key)> },
-    DeleteConflicts,
-    Commit,
-    ScheduleDrain,
-    ScheduleNotices,
-    Done,
+enum Stage {
+    Read,
+    /// The write, then the deletes of the lost conflicts it settles.
+    Write(Vec<(KeySpace, Key)>),
+    Delete,
 }
 
 /// Creates, replaces, rotates or deletes one realm secret.
 #[derive(Debug, PartialEq)]
 pub struct RealmSecretOperation {
     input: RealmChange,
-    state: State,
-    txn_id: Option<TxnId>,
+    stage: Stage,
+    /// Whether the outbox drain and the notice drain still wait for the commit.
+    drain: bool,
     notices: bool,
     result: Option<Option<SecretRecord>>,
-    output: Option<Result<Option<SecretRecord>, RealmSecretError>>,
 }
 
 impl RealmSecretOperation {
     pub fn new(input: RealmChange) -> Self {
         Self {
             input,
-            state: State::Init,
-            txn_id: None,
+            stage: Stage::Read,
+            drain: false,
             notices: false,
             result: None,
-            output: None,
         }
     }
 
@@ -121,17 +115,6 @@ impl RealmSecretOperation {
         AdminDocumentTarget::RealmConfig {
             realm_id: self.input.actor.realm_id,
         }
-    }
-
-    fn fail(&mut self, error: RealmSecretError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Done;
-        self.abort()
-    }
-
-    fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        let got = event.label();
-        self.fail(RealmSecretError::UnexpectedEvent { state, got })
     }
 
     /// The vault write first, then the record, then retirements, so a receiver sees the value
@@ -188,8 +171,7 @@ impl RealmSecretOperation {
         document: Option<Value>,
         reducer: Option<Value>,
         auth: Option<Value>,
-    ) -> Result<Effects, RealmSecretError> {
-        let txn_id = self.txn_id.ok_or(RealmSecretError::NotFinished)?;
+    ) -> Result<Next<Option<SecretRecord>>, RealmSecretError> {
         let mut config =
             RealmConfigDocument::from_bytes(&document.ok_or(RealmSecretError::ConfigMissing)?)?;
         if !is_management(&config, self.input.actor.node_id) {
@@ -274,141 +256,61 @@ impl RealmSecretOperation {
             writes.extend(notices);
         }
         self.result = Some(applied.info);
-        self.state = State::Write { deletes };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn notices_or_done(&mut self) -> Effects {
-        if self.notices {
-            self.state = State::ScheduleNotices;
-            return smallvec![notice_drain_effect()];
-        }
-        self.state = State::Done;
-        self.output = Some(Ok(self.result.take().flatten()));
-        smallvec![]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RealmSecretError::NotFinished);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.drain = true;
+        self.stage = Stage::Write(deletes);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for RealmSecretOperation {
+impl Operation for RealmSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = RealmSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if self.state == State::Commit {
-                self.txn_id = None;
-            }
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
+    fn first(&mut self) -> Result<Next<Self::Output>, RealmSecretError> {
+        let document = self.document();
+        Ok(Next::Call(IoCall::Read(vec![
             (
-                State::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::ReadCurrent;
-                let document = self.document();
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            document.storage_keyspace().to_string(),
-                            document.storage_key()
-                        ),
-                        (
-                            DOCUMENT_STATE_KEYSPACE.to_string(),
-                            reducer_state_key(&self.admin_target()),
-                        ),
-                        (
-                            AUTH_KEYSPACE.to_string(),
-                            self.input.actor.realm_id.as_bytes().to_vec().into(),
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::ReadCurrent, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let [(_, document), (_, reducer), (_, auth)] = values.as_slice() else {
-                    return self.fail(RealmSecretError::UnexpectedEvent {
-                        state: "ReadCurrent",
-                        got: "a batch of another length",
-                    });
-                };
-                match self.write(document.clone(), reducer.clone(), auth.clone()) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                }
-            }
-            (State::Write { deletes }, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                if deletes.is_empty() {
-                    return self.commit();
-                }
-                let deletes = deletes.clone();
-                self.state = State::DeleteConflicts;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: self.txn_id,
-                })]
-            }
-            (State::DeleteConflicts, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.commit()
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = State::ScheduleDrain;
-                smallvec![schedule_drain_effect()]
-            }
-            (State::ScheduleDrain, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.notices_or_done()
-            }
-            (State::ScheduleDrain, Event::Task(TaskEvent::Error { message, .. })) => {
-                warn!(error = %message, "Outbox drain not scheduled; the durable outbox retries");
-                self.notices_or_done()
-            }
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
             (
-                State::ScheduleNotices,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                // The notice rows are committed; a missed timer leaves them to the next drain.
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.admin_target()),
+            ),
+            (
+                AUTH_KEYSPACE.to_string(),
+                self.input.actor.realm_id.as_bytes().to_vec().into(),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RealmSecretError> {
+        match std::mem::replace(&mut self.stage, Stage::Delete) {
+            Stage::Read => {
+                let [document, reducer, auth] = rows::values::<3>(result)?;
+                self.write(document, reducer, auth)
             }
-            (State::Init | State::Done, _) => smallvec![],
-            (_, event) => self.unexpected("RealmSecret", event),
+            Stage::Write(deletes) => {
+                rows::done(result)?;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            Stage::Delete => {
+                rows::done(result)?;
+                Ok(Next::Done(self.result.take().flatten()))
+            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(RealmSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    /// The outbox drain, then the notice drain; a missed timer leaves the rows to the next drain.
+    fn after_commit(&mut self) -> Option<Effect> {
+        if std::mem::take(&mut self.drain) {
+            return Some(schedule_drain_effect());
         }
+        std::mem::take(&mut self.notices).then(notice_drain_effect)
     }
 }
 

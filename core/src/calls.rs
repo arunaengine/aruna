@@ -63,6 +63,18 @@ pub enum IoCall {
     },
 }
 
+/// A sub-operation, group or delay effect becomes its own call; any other effect passes through.
+impl From<Effect> for IoCall {
+    fn from(effect: Effect) -> Self {
+        match effect {
+            Effect::SubOperation(child) => Self::Child(child),
+            Effect::Group(group) => Self::Group(group),
+            Effect::Delay(after) => Self::Delay(after),
+            other => Self::Effect(Box::new(other)),
+        }
+    }
+}
+
 /// The answer to an [`IoCall`].
 #[derive(Debug, PartialEq)]
 pub enum IoResult {
@@ -203,6 +215,18 @@ pub enum IoError {
     Codec(String),
 }
 
+impl IoError {
+    /// The storage failure this error is, a lost conflict as `TransactionConflict`; any other
+    /// error as it is.
+    pub fn into_storage(self) -> Result<StorageError, IoError> {
+        match self {
+            Self::Conflict => Ok(StorageError::TransactionConflict),
+            Self::Storage(error) => Ok(error),
+            other => Err(other),
+        }
+    }
+}
+
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
 /// storage calls in one write transaction when the operation asks for one, commits its outcome
 /// and aborts on an error.
@@ -308,7 +332,7 @@ impl<P: Operation> CallRun<P> {
 
     fn advance(&mut self, mut turn: Result<Next<P::Output>, P::Error>) -> Effects {
         loop {
-            let call = match turn {
+            let mut call = match turn {
                 Err(error) => return self.fail(error),
                 Ok(Next::Done(output)) => return self.finish(output, Vec::new()),
                 Ok(Next::Then { output, calls }) => return self.finish(output, calls),
@@ -322,7 +346,7 @@ impl<P: Operation> CallRun<P> {
                 turn = self.operation.next(result);
                 continue;
             }
-            if self.transaction && self.txn_id.is_none() && in_storage(&call) {
+            if self.transaction && self.txn_id.is_none() && in_storage(&mut call) {
                 self.state = State::Starting(call);
                 let start = StorageEffect::StartTransaction { read: false };
                 return smallvec![Effect::Storage(start)];
@@ -360,8 +384,20 @@ impl<P: Operation> CallRun<P> {
                 self.state = State::Committing(output, calls);
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            None => self.after(output, calls.into()),
+            None => {
+                let calls = self.drain_after_commit(calls);
+                self.after(output, calls)
+            }
         }
+    }
+
+    /// Appends the effects of the operation's `after_commit` to its calls after the commit.
+    fn drain_after_commit(&mut self, calls: Vec<IoCall>) -> VecDeque<IoCall> {
+        let mut calls: VecDeque<IoCall> = calls.into();
+        while let Some(effect) = self.operation.after_commit() {
+            calls.push_back(IoCall::Effect(Box::new(effect)));
+        }
+        calls
     }
 
     /// Makes the next call after the commit; a refused call is logged and skipped.
@@ -434,7 +470,10 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
-                    self.after(output, calls.into())
+                    {
+                        let calls = self.drain_after_commit(calls);
+                        self.after(output, calls)
+                    }
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
@@ -571,6 +610,10 @@ fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
         (Wait::Written, Event::Storage(StorageEvent::BatchWriteResult { .. }))
         | (Wait::Deleted, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
         | (Wait::Synced, Event::Storage(StorageEvent::SyncAllFinished)) => Ok(IoResult::Done),
+        // A refused storage effect fails like a storage call, a lost conflict as a conflict.
+        (Wait::Family(Family::Storage), event @ Event::Storage(StorageEvent::Error { .. })) => {
+            Err(failure("a storage event", event))
+        }
         (Wait::Family(family), event) if event_family(&event) == Some(family) => {
             Ok(IoResult::Event(Box::new(event)))
         }
@@ -595,17 +638,22 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the operation's transaction.
-fn in_storage(call: &IoCall) -> bool {
-    matches!(
-        call,
+/// Whether the call runs in the operation's transaction: a storage call, or a storage effect
+/// that takes a transaction id and names none.
+fn in_storage(call: &mut IoCall) -> bool {
+    match call {
         IoCall::Read(_)
-            | IoCall::Page { .. }
-            | IoCall::Write(_)
-            | IoCall::Delete(_)
-            | IoCall::AddUsage { .. }
-            | IoCall::AddCounters { .. }
-    )
+        | IoCall::Page { .. }
+        | IoCall::Write(_)
+        | IoCall::Delete(_)
+        | IoCall::AddUsage { .. }
+        | IoCall::AddCounters { .. } => true,
+        IoCall::Effect(effect) => match effect.as_mut() {
+            Effect::Storage(storage) => storage.txn_slot().is_some_and(|slot| slot.is_none()),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), IoError> {
@@ -635,7 +683,15 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
             StorageEffect::BatchDelete { deletes, txn_id },
         ),
         IoCall::Sync => (Wait::Synced, StorageEffect::SyncAll),
-        IoCall::Effect(effect) => return Ok((Wait::Family(effect_family(&effect)?), *effect)),
+        IoCall::Effect(mut effect) => {
+            if let Effect::Storage(storage) = effect.as_mut()
+                && let Some(slot) = storage.txn_slot()
+                && slot.is_none()
+            {
+                *slot = txn_id;
+            }
+            return Ok((Wait::Family(effect_family(&effect)?), *effect));
+        }
         IoCall::Child(child) => return Ok((Wait::Child, Effect::SubOperation(child))),
         IoCall::Group(group) => {
             let wait = match group.form {

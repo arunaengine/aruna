@@ -114,7 +114,6 @@ pub(crate) async fn secret_with(
         readable: false,
         now_ms: 1,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(77, part)),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
@@ -338,7 +337,6 @@ pub(crate) async fn hook_secret(
         readable: false,
         now_ms: 1 + round,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(88 + round, part)),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await

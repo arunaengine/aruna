@@ -220,7 +220,6 @@ async fn change_secret(
         readable: false,
         now_ms: 10 + seed as u64,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(80 + seed as u64, part)),
-        txn_id: None,
     };
     crate::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
