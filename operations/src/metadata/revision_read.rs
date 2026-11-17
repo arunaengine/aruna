@@ -227,3 +227,209 @@ impl Operation for RawViewOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::metadata::raw_events::state_machine_tests::{event, page, page_effect, row};
+    use aruna_core::errors::StorageError;
+    use aruna_core::metadata::{MetadataDeleteRecord, MetadataEventRecord};
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    fn document() -> Ulid {
+        event(10).record.document_id
+    }
+
+    fn read_effect(key_space: &str, key: Key) -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+    }
+
+    fn document_effect() -> Effect {
+        read_effect(
+            DOCUMENT_LIFECYCLE_KEYSPACE,
+            document_lifecycle_key(document()),
+        )
+    }
+
+    fn graph_effect() -> Effect {
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document());
+        read_effect(GRAPH_LIFECYCLE_KEYSPACE, graph_lifecycle_key(&graph_iri))
+    }
+
+    fn raw_effect() -> Effect {
+        read_effect(RAW_REVISION_KEYSPACE, raw_revision_key(document()))
+    }
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn bytes<T: serde::Serialize>(value: &T) -> Option<Vec<u8>> {
+        Some(postcard::to_allocvec(value).unwrap())
+    }
+
+    fn revision(event: &MetadataEventRecord) -> MetadataRawRevision {
+        MetadataRawRevision {
+            jsonld: "{}".to_string(),
+            winning_event_id: event.event_id,
+            context_digest: [0; 32],
+            dataset_digest: None,
+            merged: None,
+        }
+    }
+
+    fn reading(with_status: bool) -> RawViewOperation {
+        let mut operation = RawViewOperation::new(document(), None, with_status);
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn merged_state_answers() {
+        // A merged document answers with its stored revision, without the event log.
+        let merged = RawRevisionState {
+            base: None,
+            last_event_id: event(10).event_id,
+            revision: Some(revision(&event(10))),
+            merged: true,
+        };
+        let mut operation = RawViewOperation::new(document(), None, false);
+        check_trace(
+            &mut operation,
+            &[document_effect()],
+            vec![
+                (read(None), vec![graph_effect()]),
+                (read(None), vec![raw_effect()]),
+                (read(bytes(&merged)), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok((None, Some(revision(&event(10))))));
+    }
+
+    #[test]
+    fn replays_event_log() {
+        let first = event(10);
+        let status = MaterializationStatusRecord::pending(&first, 1);
+        let mut operation = RawViewOperation::new(document(), None, true);
+        check_trace(
+            &mut operation,
+            &[read_status_effect(document(), None)],
+            vec![
+                (read(bytes(&status)), vec![document_effect()]),
+                (read(None), vec![graph_effect()]),
+                (read(None), vec![raw_effect()]),
+                (read(None), vec![page_effect(None)]),
+                (page(vec![row(&first)], None), vec![]),
+            ],
+        );
+        let expected = resolve_raw_revision(std::slice::from_ref(&first)).unwrap();
+        assert_eq!(operation.finalize(), Ok((Some(status), expected)));
+    }
+
+    #[test]
+    fn deleted_has_none() {
+        let first = event(10);
+        let tombstone = GraphLifecycleRecord::deleted(
+            first.record.graph_iri.clone(),
+            first.record.realm_id,
+            first.record.group_id,
+            first.record.document_id,
+            2,
+        );
+        let removed = MetadataLifecycleRecord::Delete {
+            event: MetadataDeleteRecord {
+                event_id: Ulid::from_parts(1, 20),
+                tombstone: tombstone.clone(),
+                deleted_after_id: first.event_id,
+            },
+        };
+        let mut by_document = reading(false);
+        by_document.step(read(bytes(&removed)));
+        assert_eq!(by_document.finalize(), Ok((None, None)));
+
+        let mut by_graph = reading(false);
+        by_graph.step(read(None));
+        by_graph.step(read(bytes(&tombstone)));
+        assert_eq!(by_graph.finalize(), Ok((None, None)));
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let error = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        // Steps already taken before the error: status, document, graph, raw, event page.
+        for answered in 0..5 {
+            let mut operation = reading(true);
+            for _ in 0..answered {
+                operation.step(read(None));
+            }
+            assert!(operation.step(error()).is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(RawReadError::Storage(StorageError::Timeout)),
+                "after {answered} answers"
+            );
+        }
+    }
+
+    #[test]
+    fn broken_rows_fail() {
+        for answered in 0..4 {
+            let mut operation = reading(true);
+            for _ in 0..answered {
+                operation.step(read(None));
+            }
+            operation.step(read(Some(vec![0xff, 0xff])));
+            assert!(
+                matches!(operation.finalize(), Err(RawReadError::Conversion(_))),
+                "after {answered} answers"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(|| reading(false), sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, RawReadError::UnexpectedEvent(_)));
+        }
+        let mut idle = RawViewOperation::new(document(), None, false);
+        idle.step(read(None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(RawReadError::UnexpectedEvent(_))
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = RawViewOperation::new(document(), None, true);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(RawViewOperation::new(document(), None, true));
+        rejects_finalize(reading(true));
+    }
+}

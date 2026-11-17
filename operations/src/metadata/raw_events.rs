@@ -271,14 +271,14 @@ impl Operation for RawEventsOperation {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+pub(crate) mod state_machine_tests {
     use super::*;
     use crate::metadata::raw_revision::tests::test_event;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
     };
 
-    fn event(seed: u64) -> MetadataEventRecord {
+    pub(crate) fn event(seed: u64) -> MetadataEventRecord {
         test_event(Ulid::from_parts(1, seed), seed)
     }
 
@@ -290,11 +290,11 @@ mod state_machine_tests {
         event_log_key(event.record.document_id, event.event_id)
     }
 
-    fn row(event: &MetadataEventRecord) -> (Key, Value) {
+    pub(crate) fn row(event: &MetadataEventRecord) -> (Key, Value) {
         (key(event), postcard::to_allocvec(event).unwrap().into())
     }
 
-    fn page_effect(start: Option<Key>) -> Effect {
+    pub(crate) fn page_effect(start: Option<Key>) -> Effect {
         Effect::Storage(StorageEffect::Iter {
             key_space: EVENT_LOG_KEYSPACE.to_string(),
             prefix: Some(event_log_prefix(document())),
@@ -304,7 +304,7 @@ mod state_machine_tests {
         })
     }
 
-    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+    pub(crate) fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
         Event::Storage(StorageEvent::IterResult {
             values: rows,
             next_start_after: next,
