@@ -662,6 +662,8 @@ pub enum StorageEffect {
     FinishUsageRebuild {
         key_space: KeySpace,
     },
+    /// Opens a secret sealed to the realm keys. Only a node that holds them answers with it.
+    RealmOpen(Box<crate::realm_vault::RealmSealed>),
 }
 
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,

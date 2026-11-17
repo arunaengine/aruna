@@ -427,6 +427,10 @@ pub enum StorageEvent {
     Error {
         error: StorageError,
     },
+    /// The opened realm secret, or why this node could not open it.
+    RealmOpened {
+        result: Result<SecretBytes, crate::realm_vault::RealmVaultError>,
+    },
 }
 
 #[derive(Debug, PartialEq)]

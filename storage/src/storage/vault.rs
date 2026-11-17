@@ -266,4 +266,29 @@ mod tests {
             StorageEvent::Error { .. }
         ));
     }
+
+    #[tokio::test]
+    async fn realm_open_needs_keys() {
+        // A handle that was never given the realm keys answers NoKey and opens nothing.
+        use aruna_core::realm_vault::{
+            RealmSealed, RealmVaultEntry, RealmVaultError, RealmVaultPurpose, RealmVaultRecord,
+        };
+        use aruna_core::structs::identity::realm::RealmId;
+        let entry = RealmVaultEntry::new(RealmVaultPurpose::NamedSecret, Ulid::from_bytes([5; 16]));
+        let record = RealmVaultRecord {
+            entry,
+            revision: Ulid::from_bytes([6; 16]),
+            sealed: vec![0; 40],
+        };
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let effect = StorageEffect::RealmOpen(Box::new(RealmSealed::Record { realm_id, record }));
+        let directory = tempfile::tempdir().unwrap();
+        let handle = open(directory.path().to_str().unwrap(), Some(1));
+        assert_eq!(
+            handle.send_storage_effect(effect).await,
+            Event::Storage(StorageEvent::RealmOpened {
+                result: Err(RealmVaultError::NoKey)
+            })
+        );
+    }
 }

@@ -385,11 +385,111 @@ pub enum RealmVaultError {
     Open,
     #[error("unknown realm vault purpose tag {0}")]
     UnknownPurpose(u8),
+    #[error("this node holds no realm key")]
+    NoKey,
+}
+
+/// The realm keys a management node holds; the storage backend opens realm secrets with them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealmKeys {
+    pub vault: RealmVaultKey,
+    pub seal: RealmSealKey,
+}
+
+impl RealmKeys {
+    pub fn derive(realm_key: &SigningKey) -> Self {
+        Self {
+            vault: RealmVaultKey::derive(realm_key),
+            seal: RealmSealKey::derive(realm_key),
+        }
+    }
+}
+
+/// A secret sealed to the realm keys, in one of the forms they open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RealmSealed {
+    /// A realm vault record of the realm config.
+    Record {
+        realm_id: RealmId,
+        record: RealmVaultRecord,
+    },
+    /// The sealed part of a notification setting.
+    Setting {
+        realm_id: RealmId,
+        channel: SettingChannel,
+        owner: UserId,
+        id: Ulid,
+        sealed: Vec<u8>,
+    },
+    /// A named secret value sealed to its owner.
+    Named {
+        realm_id: RealmId,
+        owner: SecretOwner,
+        name: SecretName,
+        incarnation: Ulid,
+        value_id: Ulid,
+        sealed: Vec<u8>,
+    },
+}
+
+impl RealmSealed {
+    pub fn open(&self, keys: &RealmKeys) -> Result<SecretBytes, RealmVaultError> {
+        match self {
+            Self::Record { realm_id, record } => keys.vault.open(realm_id, record),
+            Self::Setting {
+                realm_id,
+                channel,
+                owner,
+                id,
+                sealed,
+            } => keys.seal.open(realm_id, *channel, owner, *id, sealed),
+            Self::Named {
+                realm_id,
+                owner,
+                name,
+                incarnation,
+                value_id,
+                sealed,
+            } => keys
+                .seal
+                .open_named(realm_id, owner, name, *incarnation, *value_id, sealed),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealed_forms_open() {
+        // Each sealed form opens with the realm keys and fails with another realm's keys.
+        let realm_key = SigningKey::from_bytes(&[4u8; 32]);
+        let keys = RealmKeys::derive(&realm_key);
+        let other = RealmKeys::derive(&SigningKey::from_bytes(&[8u8; 32]));
+        let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
+        let entry = RealmVaultEntry::new(RealmVaultPurpose::NamedSecret, Ulid::from_bytes([5; 16]));
+        let revision = Ulid::from_bytes([6; 16]);
+        let secret = SecretBytes::new(CANARY.to_vec());
+        let record = RealmVaultRecord {
+            entry,
+            revision,
+            sealed: keys.vault.seal(&realm_id, entry, revision, &secret).unwrap(),
+        };
+        let owner = UserId::local(Ulid::from_bytes([7; 16]), realm_id);
+        let id = Ulid::from_bytes([9; 16]);
+        let setting = RealmSealed::Setting {
+            realm_id,
+            channel: SettingChannel::Email,
+            owner,
+            id,
+            sealed: seal_setting(&realm_id, SettingChannel::Email, &owner, id, &secret).unwrap(),
+        };
+        for sealed in [RealmSealed::Record { realm_id, record }, setting] {
+            assert_eq!(sealed.open(&keys).unwrap().expose(), CANARY);
+            assert!(sealed.open(&other).is_err());
+        }
+    }
 
     const CANARY: &[u8] = b"canary-7c21";
 

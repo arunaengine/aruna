@@ -15,6 +15,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;
 use crossfire::{TrySendError, mpsc};
@@ -92,6 +93,7 @@ pub struct StorageHandle {
     pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
     pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
+    pub(super) realm_keys: Arc<OnceLock<RealmKeys>>,
     pub(super) database: Arc<OnceLock<OpenDatabase>>,
 }
 
@@ -160,6 +162,7 @@ impl StorageHandle {
                 worker: Arc::new(Mutex::new(None)),
                 secret_key: Arc::new(OnceLock::new()),
                 vault_key: Arc::new(OnceLock::new()),
+                realm_keys: Arc::new(OnceLock::new()),
                 database: Arc::new(OnceLock::new()),
             },
             StorageReceivers { foreground, bulk },
@@ -202,6 +205,12 @@ impl StorageHandle {
     /// at startup; vault effects fail until then, and a later key is ignored.
     pub fn open_vault(&self, key: NodeVaultKey) {
         let _ = self.vault_key.set(key);
+    }
+
+    /// Gives this handle and its clones the realm keys; only management nodes hold them. Set
+    /// once at startup; a later key is ignored.
+    pub fn open_realm(&self, keys: RealmKeys) {
+        let _ = self.realm_keys.set(keys);
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -373,6 +382,11 @@ impl StorageHandle {
     pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        if let StorageEffect::RealmOpen(sealed) = &effect {
+            let keys = self.realm_keys.get();
+            let result = keys.map_or(Err(RealmVaultError::NoKey), |keys| sealed.open(keys));
+            return StorageEvent::RealmOpened { result };
+        }
         let (effect, vault_entry) = match vault_effect(self.vault_key.get(), effect) {
             Ok(translated) => translated,
             Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
@@ -694,7 +708,8 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         | StorageEffect::Last { .. }
         | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
-        | StorageEffect::SyncAll => false,
+        | StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_) => false,
     }
 }
 
@@ -767,7 +782,8 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::VaultRead { txn_id: None, .. }
         | StorageEffect::VaultDelete { txn_id: None, .. }
         | StorageEffect::BeginUsageRebuild { .. }
-        | StorageEffect::FinishUsageRebuild { .. } => None,
+        | StorageEffect::FinishUsageRebuild { .. }
+        | StorageEffect::RealmOpen(_) => None,
     }
 }
 
