@@ -11,8 +11,8 @@ use crate::notifications::checks::{
     verify_node_origin,
 };
 use crate::notifications::client::{
-    create_watch_remote, delete_watch_remote, deliver_events_remote, list_remote,
-    list_watches_remote, mark_read_remote, unread_count_remote,
+    HolderRequestOperation, RemoteError, delivered, events_delivered, listed, marked_read,
+    unread_counted, watch_created, watch_deleted, watches_listed,
 };
 use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
@@ -367,18 +367,112 @@ async fn list_watch_subscriptions(
     Ok(page.subscriptions)
 }
 
-/// Delivers `records` to `holder` and returns the written count or the rejection.
+/// Sends one request to `holder` through the request operation.
+async fn ask(
+    ctx: &DriverContext,
+    holder: NodeId,
+    message: NotificationTransportMessage,
+) -> Result<NotificationTransportMessage, RemoteError> {
+    drive(HolderRequestOperation::new(holder, message), ctx).await
+}
+
 async fn deliver_remote(
-    net: &NetHandle,
+    ctx: &DriverContext,
     holder: NodeId,
     records: Vec<NotificationRecord>,
 ) -> Result<u32, String> {
-    let message = NotificationTransportMessage::DeliverBatch { records };
-    match net.notification_request(holder, &message).await? {
-        NotificationTransportMessage::DeliverAck { written } => Ok(written),
-        NotificationTransportMessage::Reject(reason) => Err(reason),
-        _ => Err("unexpected notification response".to_string()),
-    }
+    delivered(
+        ask(
+            ctx,
+            holder,
+            NotificationTransportMessage::DeliverBatch { records },
+        )
+        .await,
+    )
+}
+
+async fn list_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    recipient: UserId,
+    cursor: Option<Vec<u8>>,
+    limit: u32,
+) -> Result<(Vec<NotificationRecord>, Option<Vec<u8>>), String> {
+    let list = NotificationTransportMessage::List {
+        recipient,
+        cursor,
+        limit,
+    };
+    listed(ask(ctx, holder, list).await)
+}
+
+async fn unread_count_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    recipient: UserId,
+) -> Result<(u32, bool), String> {
+    let count = NotificationTransportMessage::UnreadCount { recipient };
+    unread_counted(ask(ctx, holder, count).await)
+}
+
+async fn mark_read_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    recipient: UserId,
+    ids: Vec<Ulid>,
+    up_to_ms: Option<u64>,
+) -> Result<u32, String> {
+    let mark = NotificationTransportMessage::MarkRead {
+        recipient,
+        ids,
+        up_to_ms,
+    };
+    marked_read(ask(ctx, holder, mark).await)
+}
+
+async fn create_watch_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: WatchEventMask,
+    authorization: WatchAuthorizationBinding,
+) -> Result<aruna_core::structs::execution::notification_watch::WatchSubscription, String> {
+    let create = NotificationTransportMessage::CreateWatch {
+        owner,
+        path_prefix,
+        event_mask,
+        authorization,
+    };
+    watch_created(ask(ctx, holder, create).await)
+}
+
+async fn delete_watch_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), String> {
+    let delete = NotificationTransportMessage::DeleteWatch { owner, watch_id };
+    watch_deleted(ask(ctx, holder, delete).await)
+}
+
+async fn list_watches_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    owner: UserId,
+) -> Result<Vec<aruna_core::structs::execution::notification_watch::WatchSubscription>, String> {
+    let list = NotificationTransportMessage::ListWatches { owner };
+    watches_listed(ask(ctx, holder, list).await)
+}
+
+async fn deliver_events_remote(
+    ctx: &DriverContext,
+    holder: NodeId,
+    events: Vec<WatchEvent>,
+) -> Result<u32, String> {
+    let deliver = NotificationTransportMessage::DeliverWatchEvents { events };
+    events_delivered(ask(ctx, holder, deliver).await)
 }
 
 #[tokio::test]
@@ -392,15 +486,19 @@ async fn dropped_upload_unqueued() {
         group_id: data_group_id(),
     };
     let deletion = NotificationRecord::new(recipient, NotificationClass::Direct, deleted, at);
-    deliver_remote(&a.net, b.net.node_id(), vec![deletion])
+    deliver_remote(&a.context, b.net.node_id(), vec![deletion])
         .await
         .expect("deletion delivered");
 
     let late = share_upload(&a, recipient, "inbox", at - 1);
     let fresh = share_upload(&a, recipient, "other", at + 1);
-    let written = deliver_remote(&a.net, b.net.node_id(), vec![late.clone(), fresh.clone()])
-        .await
-        .expect("batch delivered");
+    let written = deliver_remote(
+        &a.context,
+        b.net.node_id(),
+        vec![late.clone(), fresh.clone()],
+    )
+    .await
+    .expect("batch delivered");
     assert_eq!(written, 1);
     assert!(
         webhook_queued(&b, &fresh).await,
@@ -418,12 +516,12 @@ async fn dropped_upload_unqueued() {
 async fn retry_queues_webhook() {
     let (a, b, recipient, config) = webhook_pair(74).await;
     let upload = share_upload(&a, recipient, "inbox", 1_700_000_000_000);
-    let refused = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()]).await;
+    let refused = deliver_remote(&a.context, b.net.node_id(), vec![upload.clone()]).await;
     assert!(refused.is_err(), "a failed queue refuses the batch");
     assert_eq!(read_inbox(&b).await, vec![upload.clone()]);
 
     grant_jobs(&b, config).await;
-    let written = deliver_remote(&a.net, b.net.node_id(), vec![upload.clone()])
+    let written = deliver_remote(&a.context, b.net.node_id(), vec![upload.clone()])
         .await
         .expect("retry delivered");
     assert_eq!(written, 0);
@@ -451,7 +549,7 @@ async fn remote_upserts_deliver() {
 
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     let mut records = vec![record(recipient, 1), record(recipient, 2)];
-    let written = deliver_remote(&a.net, b.net.node_id(), records.clone())
+    let written = deliver_remote(&a.context, b.net.node_id(), records.clone())
         .await
         .expect("delivery succeeds");
     assert_eq!(written, records.len() as u32);
@@ -481,11 +579,11 @@ async fn remote_delivery_idempotent() {
     let recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     let records = vec![record(recipient, 1), record(recipient, 2)];
 
-    let first = deliver_remote(&a.net, b.net.node_id(), records.clone())
+    let first = deliver_remote(&a.context, b.net.node_id(), records.clone())
         .await
         .expect("first delivery succeeds");
     assert_eq!(first, records.len() as u32);
-    let second = deliver_remote(&a.net, b.net.node_id(), records.clone())
+    let second = deliver_remote(&a.context, b.net.node_id(), records.clone())
         .await
         .expect("second delivery succeeds");
     assert_eq!(second, 0);
@@ -511,7 +609,7 @@ async fn unknown_peer_rejected() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
+    let error = deliver_remote(&c.context, b.net.node_id(), vec![record(recipient, 1)])
         .await
         .expect_err("unknown peer must be rejected");
     assert!(
@@ -542,7 +640,7 @@ async fn mixed_realm_rejected() {
         record(UserId::new(Ulid::generate(), realm_id), 1),
         record(UserId::new(Ulid::generate(), other_realm), 2),
     ];
-    let error = deliver_remote(&a.net, b.net.node_id(), records)
+    let error = deliver_remote(&a.context, b.net.node_id(), records)
         .await
         .expect_err("mixed-realm batch must be rejected");
     assert!(
@@ -571,7 +669,7 @@ async fn nonholder_batch_rejected() {
     let local_recipient = recipient_for_holder(&config, b.net.node_id(), realm_id);
     let remote_recipient = recipient_for_holder(&config, a.net.node_id(), realm_id);
     let error = deliver_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         vec![record(local_recipient, 1), record(remote_recipient, 2)],
     )
@@ -591,7 +689,7 @@ async fn read_batch_rejected() {
     let mut read = record(recipient, 2);
     read.read_at_ms = Some(1_700_000_000_999);
 
-    let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, read])
+    let error = deliver_remote(&a.context, b.net.node_id(), vec![valid, read])
         .await
         .expect_err("batch containing read record must be rejected");
     assert!(
@@ -610,7 +708,7 @@ async fn future_batch_rejected() {
         .saturating_add(MAX_FUTURE_SKEW)
         .saturating_add(60_000);
 
-    let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, future])
+    let error = deliver_remote(&a.context, b.net.node_id(), vec![valid, future])
         .await
         .expect_err("batch containing future record must be rejected");
     assert!(
@@ -630,7 +728,7 @@ async fn invalid_user_rejected() {
         actor_user_id: UserId::nil(recipient.realm_id),
     };
 
-    let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
+    let error = deliver_remote(&a.context, b.net.node_id(), vec![valid, invalid])
         .await
         .expect_err("batch containing invalid kind user must be rejected");
     assert!(
@@ -657,7 +755,7 @@ async fn watch_batch_rejected() {
         actor_user_id: recipient,
     };
 
-    let error = deliver_remote(&a.net, b.net.node_id(), vec![valid, invalid])
+    let error = deliver_remote(&a.context, b.net.node_id(), vec![valid, invalid])
         .await
         .expect_err("generic batch containing watch data must be rejected");
     assert!(
@@ -674,7 +772,7 @@ async fn direct_cap_rejected() {
         .map(|index| record(recipient, (index % 255 + 1) as u8))
         .collect();
 
-    let error = deliver_remote(&a.net, b.net.node_id(), records)
+    let error = deliver_remote(&a.context, b.net.node_id(), records)
         .await
         .expect_err("batch exceeding direct cap must be rejected");
     assert!(
@@ -755,14 +853,13 @@ async fn empty_batch_rejected() {
     )
     .await;
 
-    let response = a
-        .net
-        .notification_request(
-            b.net.node_id(),
-            &NotificationTransportMessage::DeliverBatch { records: vec![] },
-        )
-        .await
-        .expect("request completes");
+    let response = ask(
+        &a.context,
+        b.net.node_id(),
+        NotificationTransportMessage::DeliverBatch { records: vec![] },
+    )
+    .await
+    .expect("request completes");
     assert!(
         matches!(&response, NotificationTransportMessage::Reject(reason) if reason.contains("empty batch")),
         "unexpected response: {response:?}"
@@ -792,7 +889,7 @@ async fn user_peer_rejected() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let deliver_error = deliver_remote(&c.net, b.net.node_id(), vec![record(recipient, 1)])
+    let deliver_error = deliver_remote(&c.context, b.net.node_id(), vec![record(recipient, 1)])
         .await
         .expect_err("user-kind peer must be rejected");
     assert!(
@@ -800,14 +897,13 @@ async fn user_peer_rejected() {
         "unexpected reject reason: {deliver_error}"
     );
 
-    let list = c
-        .net
-        .notification_request(
-            b.net.node_id(),
-            &NotificationTransportMessage::UnreadCount { recipient },
-        )
-        .await
-        .expect("request completes");
+    let list = ask(
+        &c.context,
+        b.net.node_id(),
+        NotificationTransportMessage::UnreadCount { recipient },
+    )
+    .await
+    .expect("request completes");
     assert!(
         matches!(&list, NotificationTransportMessage::Reject(reason) if reason.contains("not a sync-eligible node")),
         "unexpected response: {list:?}"
@@ -845,11 +941,11 @@ async fn rpc_list_roundtrip() {
     ];
     seed_inbox(&b, &records).await;
 
-    let (page1, cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 2)
+    let (page1, cursor) = list_remote(&a.context, b.net.node_id(), recipient, None, 2)
         .await
         .expect("first page");
     let cursor = cursor.expect("cursor for second page");
-    let (page2, next) = list_remote(&a.net, b.net.node_id(), recipient, Some(cursor), 2)
+    let (page2, next) = list_remote(&a.context, b.net.node_id(), recipient, Some(cursor), 2)
         .await
         .expect("second page");
     assert_eq!(next, None);
@@ -897,7 +993,7 @@ async fn list_skips_revoked() {
     .await;
 
     assert_eq!(
-        list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+        list_remote(&a.context, b.net.node_id(), recipient, None, 10)
             .await
             .expect("authorized list")
             .0
@@ -905,25 +1001,25 @@ async fn list_skips_revoked() {
         3
     );
     assert_eq!(
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect("authorized unread count"),
         (3, false)
     );
-    let (first_page, retry_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+    let (first_page, retry_cursor) = list_remote(&a.context, b.net.node_id(), recipient, None, 1)
         .await
         .expect("first authorized page");
     assert_eq!(first_page, vec![watch_three]);
     let retry_cursor = retry_cursor.expect("cursor after first authorized page");
     install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[]).await;
 
-    let (listed, next_cursor) = list_remote(&a.net, b.net.node_id(), recipient, None, 1)
+    let (listed, next_cursor) = list_remote(&a.context, b.net.node_id(), recipient, None, 1)
         .await
         .expect("list after revocation");
     assert_eq!(listed, vec![direct]);
     assert_eq!(next_cursor, None);
     assert_eq!(
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect("unread count after revocation"),
         (1, false)
@@ -942,7 +1038,7 @@ async fn list_skips_revoked() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     list_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         recipient,
         Some(retry_cursor.clone()),
@@ -952,10 +1048,16 @@ async fn list_skips_revoked() {
     .expect_err("authorization decode failure must reject the page");
     install_watch_authorization(&b, realm_id, recipient, &[]).await;
     assert_eq!(
-        list_remote(&a.net, b.net.node_id(), recipient, Some(retry_cursor), 1,)
-            .await
-            .expect("same cursor retries after authorization recovers")
-            .0,
+        list_remote(
+            &a.context,
+            b.net.node_id(),
+            recipient,
+            Some(retry_cursor),
+            1,
+        )
+        .await
+        .expect("same cursor retries after authorization recovers")
+        .0,
         vec![watch_two]
     );
 }
@@ -984,20 +1086,20 @@ async fn revoked_token_ignored() {
 
     revoke_watch_token(&b, &config, &watch).await;
 
-    let listed = list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+    let listed = list_remote(&a.context, b.net.node_id(), recipient, None, 10)
         .await
         .expect("list after token revocation")
         .0;
     assert_eq!(listed, vec![watch.clone(), direct]);
     assert_eq!(
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect("unread count after token revocation"),
         (2, false)
     );
     assert_eq!(
         mark_read_remote(
-            &a.net,
+            &a.context,
             b.net.node_id(),
             recipient,
             vec![watch.notification_id],
@@ -1040,7 +1142,7 @@ async fn restricted_binding_hidden() {
     seed_inbox(&b, &[watch.clone()]).await;
 
     assert!(
-        list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+        list_remote(&a.context, b.net.node_id(), recipient, None, 10)
             .await
             .expect("list with restricted binding")
             .0
@@ -1073,7 +1175,7 @@ async fn unread_mark_roundtrip() {
     seed_inbox(&b, &records).await;
 
     assert_eq!(
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect("unread count"),
         (3, false)
@@ -1084,19 +1186,19 @@ async fn unread_mark_roundtrip() {
         .map(|record| record.notification_id)
         .collect();
     assert_eq!(
-        mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
+        mark_read_remote(&a.context, b.net.node_id(), recipient, ids.clone(), None)
             .await
             .expect("mark read"),
         3
     );
     assert_eq!(
-        mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+        mark_read_remote(&a.context, b.net.node_id(), recipient, ids, None)
             .await
             .expect("mark read again"),
         0
     );
     assert_eq!(
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect("unread count after"),
         (0, false)
@@ -1108,7 +1210,7 @@ async fn mark_limit_rejected() {
     let (a, b, recipient) = delivery_pair(75).await;
     let ids = (0..=MARK_MAX_IDS).map(|_| Ulid::generate()).collect();
 
-    let error = mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+    let error = mark_read_remote(&a.context, b.net.node_id(), recipient, ids, None)
         .await
         .expect_err("too many ids must be rejected");
     assert!(
@@ -1135,7 +1237,7 @@ async fn read_path_gated() {
     .await;
 
     let recipient = UserId::new(Ulid::generate(), realm_id);
-    let error = list_remote(&c.net, b.net.node_id(), recipient, None, 10)
+    let error = list_remote(&c.context, b.net.node_id(), recipient, None, 10)
         .await
         .expect_err("unknown peer must be rejected on the read path");
     assert!(
@@ -1165,14 +1267,14 @@ async fn inbox_nonholder_rejected() {
     seed_inbox(&b, std::slice::from_ref(&seeded)).await;
 
     for error in [
-        list_remote(&a.net, b.net.node_id(), recipient, None, 10)
+        list_remote(&a.context, b.net.node_id(), recipient, None, 10)
             .await
             .expect_err("list on non-holder must be rejected"),
-        unread_count_remote(&a.net, b.net.node_id(), recipient)
+        unread_count_remote(&a.context, b.net.node_id(), recipient)
             .await
             .expect_err("unread count on non-holder must be rejected"),
         mark_read_remote(
-            &a.net,
+            &a.context,
             b.net.node_id(),
             recipient,
             vec![seeded.notification_id],
@@ -1225,7 +1327,7 @@ async fn oversized_message_refused() {
         + 1_000;
     let records = vec![sample; count];
 
-    let error = deliver_remote(&a.net, b.net.node_id(), records)
+    let error = deliver_remote(&a.context, b.net.node_id(), records)
         .await
         .expect_err("oversized message must be refused");
     assert!(
@@ -1256,7 +1358,7 @@ async fn watch_operations_roundtrip() {
     let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
     let prefix = data_path("prefix");
     let created = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         prefix.clone(),
@@ -1272,16 +1374,16 @@ async fn watch_operations_roundtrip() {
     assert_eq!(created.path_prefix, prefix);
     assert_eq!(created.event_mask, mask);
 
-    let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
+    let listed = list_watches_remote(&a.context, b.net.node_id(), owner)
         .await
         .expect("list succeeds");
     assert_eq!(listed, vec![created.clone()]);
 
-    delete_watch_remote(&a.net, b.net.node_id(), owner, created.watch_id)
+    delete_watch_remote(&a.context, b.net.node_id(), owner, created.watch_id)
         .await
         .expect("delete succeeds");
     assert!(
-        list_watches_remote(&a.net, b.net.node_id(), owner)
+        list_watches_remote(&a.context, b.net.node_id(), owner)
             .await
             .expect("list after delete succeeds")
             .is_empty()
@@ -1306,7 +1408,7 @@ async fn watch_nonholder_rejected() {
 
     let owner = recipient_for_holder(&config, a.net.node_id(), realm_id);
     let create_error = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         data_path(""),
@@ -1320,7 +1422,7 @@ async fn watch_nonholder_rejected() {
         "unexpected reject reason: {create_error}"
     );
 
-    let list_error = list_watches_remote(&a.net, b.net.node_id(), owner)
+    let list_error = list_watches_remote(&a.context, b.net.node_id(), owner)
         .await
         .expect_err("list on non-holder must be rejected");
     assert!(
@@ -1328,7 +1430,7 @@ async fn watch_nonholder_rejected() {
         "unexpected reject reason: {list_error}"
     );
 
-    let delete_error = delete_watch_remote(&a.net, b.net.node_id(), owner, Ulid::generate())
+    let delete_error = delete_watch_remote(&a.context, b.net.node_id(), owner, Ulid::generate())
         .await
         .expect_err("delete on non-holder must be rejected");
     assert!(
@@ -1367,7 +1469,7 @@ async fn create_requires_read() {
     admit_peers(&b, &config).await;
 
     let error = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         data_path("prefix"),
@@ -1409,7 +1511,7 @@ async fn policy_denies_watch() {
     admit_peers(&b, &config).await;
     let existing_prefix = data_path("existing");
     let existing = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         existing_prefix.clone(),
@@ -1435,7 +1537,7 @@ async fn policy_denies_watch() {
 
     let prefix = data_path("policy");
     let error = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         prefix.clone(),
@@ -1452,12 +1554,12 @@ async fn policy_denies_watch() {
         format!("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: permission_denied")
     );
     assert_eq!(
-        list_watches_remote(&a.net, b.net.node_id(), owner)
+        list_watches_remote(&a.context, b.net.node_id(), owner)
             .await
             .expect("list remains available"),
         vec![existing.clone()]
     );
-    delete_watch_remote(&a.net, b.net.node_id(), owner, existing.watch_id)
+    delete_watch_remote(&a.context, b.net.node_id(), owner, existing.watch_id)
         .await
         .expect("delete remains available");
     assert!(
@@ -1488,7 +1590,7 @@ async fn binding_path_rejected() {
 
     let prefix = data_path("requested");
     let error = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         prefix,
@@ -1534,7 +1636,7 @@ async fn revoked_watch_unlisted() {
     install_watch_authorization(&b, realm_id, owner, &[]).await;
     admit_peers(&b, &config).await;
     let created = create_watch_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         owner,
         data_path("prefix"),
@@ -1547,7 +1649,7 @@ async fn revoked_watch_unlisted() {
     .await
     .expect("authorized create succeeds");
     assert_eq!(
-        list_watches_remote(&a.net, b.net.node_id(), owner)
+        list_watches_remote(&a.context, b.net.node_id(), owner)
             .await
             .expect("list succeeds"),
         vec![created.clone()]
@@ -1556,7 +1658,7 @@ async fn revoked_watch_unlisted() {
     // Re-owning the group drops the original owner's READ.
     install_watch_authorization(&b, realm_id, UserId::new(Ulid::generate(), realm_id), &[]).await;
 
-    let listed = list_watches_remote(&a.net, b.net.node_id(), owner)
+    let listed = list_watches_remote(&a.context, b.net.node_id(), owner)
         .await
         .expect("list after revocation succeeds");
     assert_eq!(listed.len(), 1);
@@ -1573,7 +1675,7 @@ async fn revoked_watch_unlisted() {
         1,
         "the row is filtered at the surface, not silently deleted"
     );
-    delete_watch_remote(&a.net, b.net.node_id(), owner, listed[0].watch_id)
+    delete_watch_remote(&a.context, b.net.node_id(), owner, listed[0].watch_id)
         .await
         .expect("redacted watch remains deletable");
     assert!(
@@ -1739,11 +1841,11 @@ async fn events_expand_idempotently() {
     .expect("holder subscription");
 
     let events = vec![upload_event(realm_id, actor, "bucket/object")];
-    let first = deliver_events_remote(&a.net, b.net.node_id(), events.clone())
+    let first = deliver_events_remote(&a.context, b.net.node_id(), events.clone())
         .await
         .expect("first delivery succeeds");
     assert_eq!(first, 1);
-    let second = deliver_events_remote(&a.net, b.net.node_id(), events)
+    let second = deliver_events_remote(&a.context, b.net.node_id(), events)
         .await
         .expect("redelivery succeeds");
     assert_eq!(second, 0);
@@ -1824,7 +1926,7 @@ async fn stale_subscription_skipped() {
 
     let actor = UserId::new(Ulid::generate(), realm_id);
     let written = deliver_events_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         vec![upload_event(realm_id, actor, "bucket/object")],
     )
@@ -1879,7 +1981,7 @@ async fn kind_mismatch_rejected() {
     let actor = UserId::new(Ulid::generate(), realm_id);
     let mut event = upload_event(realm_id, actor, "bucket/object");
     event.kind = WatchEventKind::MetadataCreated;
-    let error = deliver_events_remote(&a.net, b.net.node_id(), vec![event])
+    let error = deliver_events_remote(&a.context, b.net.node_id(), vec![event])
         .await
         .expect_err("kind/detail mismatch must be rejected");
     assert!(
@@ -1923,7 +2025,7 @@ async fn delivery_trust_gated() {
 
     let actor = UserId::new(Ulid::generate(), realm_id);
     let error = deliver_events_remote(
-        &c.net,
+        &c.context,
         b.net.node_id(),
         vec![upload_event(realm_id, actor, "bucket/object")],
     )
@@ -1953,14 +2055,13 @@ async fn invalid_events_rejected() {
     )
     .await;
 
-    let empty = a
-        .net
-        .notification_request(
-            b.net.node_id(),
-            &NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
-        )
-        .await
-        .expect("request completes");
+    let empty = ask(
+        &a.context,
+        b.net.node_id(),
+        NotificationTransportMessage::DeliverWatchEvents { events: vec![] },
+    )
+    .await
+    .expect("request completes");
     assert!(
         matches!(&empty, NotificationTransportMessage::Reject(reason) if reason.contains("empty batch")),
         "unexpected response: {empty:?}"
@@ -1968,7 +2069,7 @@ async fn invalid_events_rejected() {
 
     let actor = UserId::new(Ulid::generate(), realm_id);
     let mixed = deliver_events_remote(
-        &a.net,
+        &a.context,
         b.net.node_id(),
         vec![
             upload_event(realm_id, actor, "bucket/object"),
@@ -2006,7 +2107,7 @@ async fn path_trust_gated() {
 
     let owner = UserId::new(Ulid::generate(), realm_id);
     let error = create_watch_remote(
-        &c.net,
+        &c.context,
         b.net.node_id(),
         owner,
         "bucket".to_string(),
@@ -2047,7 +2148,7 @@ async fn fresh_delivery_wakes() {
     let batch = vec![record(recipient, 1)];
     let mut wakes = b.net.subscribe_notification_wakes();
 
-    deliver_remote(&a.net, b.net.node_id(), batch.clone())
+    deliver_remote(&a.context, b.net.node_id(), batch.clone())
         .await
         .expect("first delivery succeeds");
     let woken = timeout(Duration::from_secs(1), wakes.recv())
@@ -2056,7 +2157,7 @@ async fn fresh_delivery_wakes() {
         .expect("channel open");
     assert_eq!(woken, recipient);
 
-    deliver_remote(&a.net, b.net.node_id(), batch.clone())
+    deliver_remote(&a.context, b.net.node_id(), batch.clone())
         .await
         .expect("redelivery succeeds");
     // The holder wakes before writing the ack, so the awaited reply orders
@@ -2090,7 +2191,7 @@ async fn changed_count_wakes() {
     let mut wakes = b.net.subscribe_notification_wakes();
 
     assert_eq!(
-        mark_read_remote(&a.net, b.net.node_id(), recipient, ids.clone(), None)
+        mark_read_remote(&a.context, b.net.node_id(), recipient, ids.clone(), None)
             .await
             .expect("mark read"),
         2
@@ -2102,7 +2203,7 @@ async fn changed_count_wakes() {
     assert_eq!(woken, recipient);
 
     assert_eq!(
-        mark_read_remote(&a.net, b.net.node_id(), recipient, ids, None)
+        mark_read_remote(&a.context, b.net.node_id(), recipient, ids, None)
             .await
             .expect("mark read again"),
         0
