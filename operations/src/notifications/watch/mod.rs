@@ -13,3 +13,4 @@ pub mod records;
 pub mod remove;
 pub mod store;
 pub mod subscriptions;
+pub mod table;
