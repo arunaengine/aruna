@@ -241,3 +241,66 @@ async fn retry_redoes_undone() {
         Begun::Settled("7".into())
     );
 }
+
+/// A settled work row of a fixed install, and its two lookup answers.
+fn settled_work() -> (WorkRow, [Answer; 2]) {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let mut row = WorkRow::reserved(&install, WorkKind::Copy, Ulid::nil(), 1);
+    row.state = WorkState::Settled;
+    let answers = [
+        Answer::Values(vec![Some(b"key".to_vec())]),
+        Answer::Values(vec![Some(encode(&row).unwrap())]),
+    ];
+    (row, answers)
+}
+
+#[test]
+fn notify_marks_once() {
+    let (row, [by_index, by_key]) = settled_work();
+    let mut plan = NotifyWork::new(Ulid::from_parts(1, 1), row.work_id, None);
+    plan.first().unwrap();
+    plan.next(by_index).unwrap();
+    let Turn::Ask(Ask::Write(rows)) = plan.next(by_key).unwrap() else {
+        panic!("a manifest without the trigger marks the work notified");
+    };
+    let written: WorkRow = decode(&rows[0].2).unwrap();
+    assert!(written.notified);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(true));
+    // A notified work is left alone.
+    let (mut done, _) = settled_work();
+    done.notified = true;
+    let mut again = NotifyWork::new(Ulid::from_parts(1, 1), done.work_id, None);
+    again
+        .next(Answer::Values(vec![Some(b"key".to_vec())]))
+        .unwrap();
+    let stored = Answer::Values(vec![Some(encode(&done).unwrap())]);
+    assert_eq!(again.next(stored).unwrap(), Turn::Finish(false));
+}
+
+#[test]
+fn drop_needs_held() {
+    let (row, [by_index, by_key]) = settled_work();
+    let mut plan = DropCompletion {
+        lookup: WorkLookup::new(Ulid::from_parts(1, 1), row.work_id),
+        audit: Vec::new(),
+        dropped: None,
+    };
+    plan.next(by_index).unwrap();
+    assert!(matches!(
+        plan.next(by_key).unwrap(),
+        Turn::Ask(Ask::Write(_))
+    ));
+    let Turn::Finish(dropped) = plan.next(Answer::Done).unwrap() else {
+        panic!("the drop answers the row");
+    };
+    assert!(dropped.notified);
+    let mut gone = DropCompletion {
+        lookup: WorkLookup::new(Ulid::from_parts(1, 1), row.work_id),
+        audit: Vec::new(),
+        dropped: None,
+    };
+    assert_eq!(
+        gone.next(Answer::Values(vec![None])),
+        Err(RunError::NotFound)
+    );
+}

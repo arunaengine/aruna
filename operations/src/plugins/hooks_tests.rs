@@ -221,3 +221,31 @@ async fn node_checks_relay() {
     let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
     assert_eq!(relay(elsewhere).await, None);
 }
+
+#[test]
+fn hook_once_per_delivery() {
+    let run = crate::plugins::runs::tests::queued(Ulid::from_parts(1, 1), 1);
+    let ids = (run.install_id, Some("d1".to_string()));
+    let mut plan = AdmitHook::new(run.clone(), ids.clone(), 9).unwrap();
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    // A delivery id the receiver admitted before starts nothing.
+    let seen = Answer::Values(vec![Some(encode(&9u64).unwrap())]);
+    assert_eq!(plan.next(seen).unwrap(), Turn::Finish(false));
+    let mut fresh = AdmitHook::new(run.clone(), ids, 9).unwrap();
+    fresh.first().unwrap();
+    assert!(matches!(
+        fresh.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let Turn::Ask(Ask::Write(rows)) = fresh.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the delivery and the run are written");
+    };
+    assert_eq!(rows.len(), 4);
+    assert_eq!(fresh.next(Answer::Done).unwrap(), Turn::Finish(true));
+    // Without a delivery id the run is admitted at once.
+    let mut plain = AdmitHook::new(run.clone(), (run.install_id, None), 9).unwrap();
+    assert!(matches!(
+        plain.first().unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+}
