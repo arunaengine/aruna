@@ -11,6 +11,7 @@ mod commit_retry;
 pub mod create_realm;
 pub mod ensure_config;
 pub mod get_nodes;
+pub mod load_config;
 pub mod mutate_placement;
 pub mod node_name;
 pub mod peer_trust;

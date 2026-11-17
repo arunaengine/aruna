@@ -217,21 +217,27 @@ mod tests {
         // The accepting node journals a creation in its batch; its projection adds nothing.
         use crate::metadata::create_document::{
             CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
-            create_metadata_document,
         };
+        use crate::metadata::create_entry::create_metadata_document;
         let fixture = crate::plugins::install::tests::Fixture::new().await;
         let mut ctx = fixture.ctx.clone();
         let dir = tempfile::tempdir().unwrap();
         let storage = fixture.ctx.storage_handle.clone();
-        let metadata = crate::metadata::MetadataHandle::new(
+        let graph = aruna_graph::GraphHandle::open(
             dir.path().join("meta"),
             fixture.actor.node_id,
+            None,
+            None,
+            aruna_graph::GraphOptions::default(),
+        );
+        let metadata = crate::metadata::MetadataHandle::new(
+            dir.path().join("meta"),
             storage,
             None,
-            None,
-            None,
+            Default::default(),
         );
-        ctx.metadata_handle = Some(metadata.unwrap());
+        ctx.metadata_handle = Some(metadata);
+        ctx.graph_handle = Some(graph.unwrap());
         let ctx = std::sync::Arc::new(ctx);
         let create = CreateDocumentOperation::new(CreateDocumentConfig {
             actor: fixture.actor.clone(),

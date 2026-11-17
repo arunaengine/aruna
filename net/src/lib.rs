@@ -19,6 +19,7 @@ pub mod error;
 mod eviction;
 mod heartbeat;
 pub mod job_control;
+pub mod notification;
 mod signing;
 pub mod streams;
 mod tasks;
@@ -201,6 +202,14 @@ impl NetHandle {
         self.inner.endpoint.secret_key().sign(message)
     }
 
+    /// Signs a member statement when it names this node; see the `StatementSign` effect.
+    pub fn sign_statement(
+        &self,
+        claim: aruna_core::structs::storage::distribution::StatementClaim,
+    ) -> aruna_core::events::StatementSignEvent {
+        effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
+    }
+
     /// Issuer-local key that encrypts S3 credential secrets at rest. Derived
     /// from this node's secret, so only this node can decrypt what it wrote.
     pub fn credential_encryption_key(
@@ -252,6 +261,12 @@ impl NetHandle {
 
     pub fn document_sync_database(&self) -> fjall::OptimisticTxDatabase {
         self.inner.document_sync.database()
+    }
+
+    /// Waits until no document reconcile, shard membership change or eviction runs, and keeps
+    /// them out while the guard lives.
+    pub async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.document_sync.hold_reconcile().await
     }
 
     pub async fn sync_topic_peers(
@@ -1098,6 +1113,9 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::Release(_)) => "release",
         Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::Notification(_)) => "notification",
+        Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
+        Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",
@@ -1107,8 +1125,11 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

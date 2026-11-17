@@ -38,7 +38,6 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::jobs::executor::JobContext;
-use crate::node::usage_stats::QuotaGateError;
 use crate::placement::policy::GateOperation;
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
@@ -50,6 +49,7 @@ use crate::s3::object::get::{
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::s3::purge_fence::PurgeFenceError;
+use crate::s3::usage::QuotaGateError;
 use crate::staging::head_source::{HeadSourceInput, HeadSourceOperation};
 use crate::staging::page::rows::MAX_PAGE_ENTRIES;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};

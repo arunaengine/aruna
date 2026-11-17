@@ -1399,21 +1399,23 @@ async fn build_fixture(gated: bool) -> Result<Fixture, Box<dyn std::error::Error
         EgressPolicy::loopback(),
     )
     .await?;
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         &metadata_path,
         actor.node_id,
-        storage.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )?;
+    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     create_bucket(&context, &actor, group_id).await?;
     Ok(Fixture {
@@ -1866,7 +1868,6 @@ async fn claim_context(
         shutdown: CancellationToken::new(),
         progress: ProgressReporter::from_progress(&running.progress),
         range_turns: Default::default(),
-        mail: Default::default(),
     })
 }
 

@@ -28,7 +28,8 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::visible::SCAN_BUDGET;
-use crate::staging::native_source::{body_stream, granted_read};
+use crate::staging::native_source::granted_read;
+use aruna_blob::native::body_stream;
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Keys one listing page returns at most, as S3 does.
@@ -692,8 +693,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let locked = BucketEncryption {
             mode: EncryptionMode::NodeManaged,

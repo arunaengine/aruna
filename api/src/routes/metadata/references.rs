@@ -13,11 +13,13 @@ use crate::metadata::{
     map_references_response,
 };
 use crate::server::state::ServerState;
-use aruna_operations::metadata::api::{
-    MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
-    ReferenceTarget, references_metadata as run_references_metadata,
-    references_preflight as run_references_preflight,
+use aruna_operations::metadata::api::preflight::references_preflight as run_references_preflight;
+use aruna_operations::metadata::api::preflight_types::{
+    MetadataIndexState, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
+    ReferenceTarget,
 };
+use aruna_operations::metadata::api::read::references_metadata as run_references_metadata;
+use aruna_operations::metadata::api::read_types::MetadataReferencesRequest;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -346,10 +348,10 @@ fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
                 .map(|freshness| PreflightFreshnessResponse {
                     node_id: freshness.node_id.to_string(),
                     index_state: match freshness.index_state {
-                        aruna_operations::metadata::api::MetadataIndexState::Current => "current",
-                        aruna_operations::metadata::api::MetadataIndexState::Pending => "pending",
-                        aruna_operations::metadata::api::MetadataIndexState::Failed => "failed",
-                        aruna_operations::metadata::api::MetadataIndexState::Mixed => "mixed",
+                        MetadataIndexState::Current => "current",
+                        MetadataIndexState::Pending => "pending",
+                        MetadataIndexState::Failed => "failed",
+                        MetadataIndexState::Mixed => "mixed",
                     }
                     .to_string(),
                     oldest_status_updated: freshness.oldest_status_updated,

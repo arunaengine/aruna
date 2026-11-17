@@ -9,6 +9,7 @@ use aruna_core::document::{DocumentSyncPublish, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::{build_view, resolve_holders, resolve_shard_holders};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::structs::identity::auth::Actor;
@@ -24,7 +25,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::node::node_info::{read_info_document, seed_info_document};
+use aruna_operations::node::node_info::seed_info_document;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
@@ -173,18 +174,25 @@ async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
         "node info document did not propagate over the shared topic",
         || async {
             Ok(usize::from(
-                read_info_document(&peer.context.storage_handle, publisher_id)
-                    .await
-                    .map_err(std::io::Error::other)?
-                    .is_none(),
+                drive(
+                    ReadInfoOperation::new(vec![publisher_id]),
+                    peer.context.as_ref(),
+                )
+                .await
+                .map_err(std::io::Error::other)?
+                .is_empty(),
             ))
         },
     )
     .await?;
-    let received = read_info_document(&peer.context.storage_handle, publisher_id)
-        .await
-        .map_err(std::io::Error::other)?
-        .expect("node info document present after convergence");
+    let received = drive(
+        ReadInfoOperation::new(vec![publisher_id]),
+        peer.context.as_ref(),
+    )
+    .await
+    .map_err(std::io::Error::other)?
+    .remove(&publisher_id)
+    .expect("node info document present after convergence");
 
     assert_eq!(received.node_id, publisher_id);
     assert!(received.executors.is_empty());

@@ -1,155 +1,82 @@
-//! Defines the notification transport messages and reads and writes them framed.
+//! Bounds the watch event batches, scans, expansions and retries of the notification transport.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::structs::execution::notification::NotificationRecord;
-pub use aruna_core::structs::execution::notification_watch::{
-    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP,
-};
-use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
-};
-use aruna_net::streams::BiStream;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use ulid::Ulid;
+use aruna_core::structs::execution::notification_watch::{WatchEventRetry, watch_retry_key};
+use aruna_core::structs::identity::realm::RealmId;
 
-pub const MAX_NOTIFICATION_SIZE: usize = 4 * 1024 * 1024;
-pub const EVENT_BATCH_SIZE: usize = 128;
-pub const SUBSCRIPTION_SCAN_CAP: usize = 1024;
-pub const DIRTY_REALM_CAP: usize = 4;
-pub const RETRY_BATCH_CAP: usize = 4;
-pub const RETRY_BYTES_CAP: usize = 1024 * 1024;
-pub const EXPANSION_WORK_CAP: usize = 4096;
-pub const EXPANSION_CANDIDATE_CAP: usize = 1024;
-pub const EXPANSION_RECORD_CAP: usize = 1024;
+pub(crate) const EVENT_BATCH_SIZE: usize = 128;
+pub(crate) const SUBSCRIPTION_SCAN_CAP: usize = 1024;
+pub(crate) const DIRTY_REALM_CAP: usize = 4;
+pub(crate) const RETRY_BATCH_CAP: usize = 4;
+pub(crate) const RETRY_BYTES_CAP: usize = 1024 * 1024;
+pub(crate) const EXPANSION_WORK_CAP: usize = 4096;
+pub(crate) const EXPANSION_CANDIDATE_CAP: usize = 1024;
+pub(crate) const EXPANSION_RECORD_CAP: usize = 1024;
+/// Subscription rows read per expansion page.
+pub(crate) const WATCH_PAGE_LIMIT: usize = 256;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum NotificationTransportMessage {
-    DeliverBatch {
-        records: Vec<NotificationRecord>,
-    },
-    DeliverAck {
-        written: u32,
-    },
-    List {
-        recipient: UserId,
-        cursor: Option<Vec<u8>>,
-        limit: u32,
-    },
-    ListResult {
-        records: Vec<NotificationRecord>,
-        next_cursor: Option<Vec<u8>>,
-    },
-    UnreadCount {
-        recipient: UserId,
-    },
-    UnreadCountResult {
-        count: u32,
-        capped: bool,
-    },
-    MarkRead {
-        recipient: UserId,
-        ids: Vec<Ulid>,
-        up_to_ms: Option<u64>,
-    },
-    MarkReadResult {
-        marked: u32,
-    },
-    Reject(String),
-    CreateWatch {
-        owner: UserId,
-        path_prefix: String,
-        event_mask: WatchEventMask,
-        authorization: WatchAuthorizationBinding,
-    },
-    WatchCreated {
-        subscription: WatchSubscription,
-    },
-    DeleteWatch {
-        owner: UserId,
-        watch_id: Ulid,
-    },
-    WatchDeleted,
-    ListWatches {
-        owner: UserId,
-    },
-    WatchList {
-        subscriptions: Vec<WatchSubscription>,
-    },
-    DeliverWatchEvents {
-        events: Vec<WatchEvent>,
-    },
-    WatchEventsAck {
-        written: u32,
-    },
+pub(crate) fn valid_retry(retry: &WatchEventRetry, realm_id: RealmId, key: &[u8]) -> bool {
+    let Some(first) = retry.events.first() else {
+        return false;
+    };
+    let Some(cursor) = retry.cursor.as_ref() else {
+        return false;
+    };
+    retry.events.len() <= EVENT_BATCH_SIZE
+        && retry
+            .events
+            .iter()
+            .all(|event| event.realm_id == realm_id && !event.event_id.is_nil())
+        && cursor.len() == 64
+        && cursor.starts_with(UserId::storage_prefix(realm_id).as_ref())
+        && key == watch_retry_key(realm_id, first.event_id).as_slice()
 }
 
-pub(crate) fn notification_message_kind(message: &NotificationTransportMessage) -> &'static str {
-    match message {
-        NotificationTransportMessage::DeliverBatch { .. } => "deliver_batch",
-        NotificationTransportMessage::DeliverAck { .. } => "deliver_ack",
-        NotificationTransportMessage::List { .. } => "list",
-        NotificationTransportMessage::ListResult { .. } => "list_result",
-        NotificationTransportMessage::UnreadCount { .. } => "unread_count",
-        NotificationTransportMessage::UnreadCountResult { .. } => "unread_count_result",
-        NotificationTransportMessage::MarkRead { .. } => "mark_read",
-        NotificationTransportMessage::MarkReadResult { .. } => "mark_read_result",
-        NotificationTransportMessage::Reject(_) => "reject",
-        NotificationTransportMessage::CreateWatch { .. } => "create_watch",
-        NotificationTransportMessage::WatchCreated { .. } => "watch_created",
-        NotificationTransportMessage::DeleteWatch { .. } => "delete_watch",
-        NotificationTransportMessage::WatchDeleted => "watch_deleted",
-        NotificationTransportMessage::ListWatches { .. } => "list_watches",
-        NotificationTransportMessage::WatchList { .. } => "watch_list",
-        NotificationTransportMessage::DeliverWatchEvents { .. } => "deliver_watch_events",
-        NotificationTransportMessage::WatchEventsAck { .. } => "watch_events_ack",
+pub(crate) fn page_limit(events: usize) -> Result<usize, String> {
+    if events == 0 {
+        return Err("watch event batch is empty".to_string());
     }
+    let mut limit = WATCH_PAGE_LIMIT;
+    for cap in [
+        EXPANSION_WORK_CAP,
+        EXPANSION_CANDIDATE_CAP,
+        EXPANSION_RECORD_CAP,
+    ] {
+        limit = limit.min(cap / events);
+    }
+    (limit > 0)
+        .then_some(limit)
+        .ok_or_else(|| "watch event batch exceeds expansion caps".to_string())
 }
 
-pub async fn write_notification_message(
-    stream: &mut BiStream,
-    message: &NotificationTransportMessage,
-) -> Result<(), String> {
-    let bytes = postcard::to_allocvec(message).map_err(|err| err.to_string())?;
-    if bytes.len() > MAX_NOTIFICATION_SIZE {
-        return Err("notification message exceeds maximum size".to_string());
+pub(crate) fn expansion_budget(events: usize, subscriptions: usize) -> Result<usize, String> {
+    let work = events
+        .checked_mul(subscriptions)
+        .ok_or_else(|| "watch expansion work budget overflow".to_string())?;
+    if work > EXPANSION_WORK_CAP {
+        return Err(format!(
+            "watch expansion work {} exceeds cap {}",
+            work, EXPANSION_WORK_CAP
+        ));
     }
-
-    stream
-        .0
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|err| err.to_string())?;
-    stream
-        .0
-        .write_all(&bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-    stream.0.flush().await.map_err(|err| err.to_string())?;
-    Ok(())
+    Ok(work)
 }
 
-pub async fn read_notification_message(
-    stream: &mut BiStream,
-) -> Result<NotificationTransportMessage, String> {
-    let mut len_buf = [0u8; 4];
-    stream
-        .1
-        .read_exact(&mut len_buf)
-        .await
-        .map_err(|err| err.to_string())?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_NOTIFICATION_SIZE {
-        return Err("notification frame exceeds maximum size".to_string());
+pub(crate) fn add_limit(
+    total: usize,
+    added: usize,
+    limit: usize,
+    label: &str,
+) -> Result<usize, String> {
+    let next = total
+        .checked_add(added)
+        .ok_or_else(|| format!("watch expansion {label} budget overflow"))?;
+    if next > limit {
+        return Err(format!(
+            "watch expansion {label} count {next} exceeds cap {limit}"
+        ));
     }
-
-    let mut bytes = vec![0u8; len];
-    stream
-        .1
-        .read_exact(&mut bytes)
-        .await
-        .map_err(|err| err.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|err| err.to_string())
+    Ok(next)
 }

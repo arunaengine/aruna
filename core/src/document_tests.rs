@@ -722,3 +722,48 @@ fn setting_targets_shared() {
         crate::storage_entries::sync_revision_key(&webhook)
     );
 }
+
+#[test]
+fn dashboard_targets() {
+    let realm_id = RealmId::from_bytes([1; 32]);
+    let node_id = iroh::SecretKey::from_bytes(&[2; 32]).public();
+    let group_id = Ulid::from_parts(3, 1);
+    let user_id = UserId::new(Ulid::from_parts(4, 1), realm_id);
+    let document_id = Ulid::from_parts(5, 1);
+    let relevant = [
+        DocumentTarget::Group { group_id },
+        DocumentTarget::GroupAuthorization { group_id },
+        DocumentTarget::RealmAuthorization { realm_id },
+        DocumentTarget::RealmConfig { realm_id },
+        DocumentTarget::User { user_id },
+        DocumentTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        },
+        DocumentTarget::MetadataCreateEvent {
+            document_id,
+            event_id: Ulid::from_parts(6, 1),
+        },
+        DocumentTarget::MetadataDocumentLifecycle { document_id },
+        DocumentTarget::MetadataGraphLifecycle {
+            graph_iri: "https://example.test/graph".to_string(),
+        },
+    ];
+    assert!(relevant.iter().all(DocumentTarget::changes_dashboard));
+
+    let ignored = [
+        DocumentTarget::WatchInterest { realm_id, node_id },
+        DocumentTarget::WatchSubscription {
+            owner: user_id,
+            watch_id: Ulid::from_parts(7, 1),
+        },
+        DocumentTarget::NodeInfo { realm_id, node_id },
+        // Usage snapshots republish often; the dashboard polls usage on its own.
+        DocumentTarget::NodeUsage {
+            realm_id,
+            node_id,
+            group_id: None,
+        },
+    ];
+    assert!(!ignored.iter().any(DocumentTarget::changes_dashboard));
+}

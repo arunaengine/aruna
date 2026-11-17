@@ -19,11 +19,11 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai_pmh::request::format_from;
-use aruna_operations::metadata::api::{
+use aruna_operations::metadata::api::export_types::{
     ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use aruna_operations::metadata::forward::export_rocrate_routed;
-use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::forward::read::export_rocrate_routed;
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::visibility_index::{
     VisibilityError, earliest_visible, effective_datestamp, visible_page,
 };

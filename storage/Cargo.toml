@@ -22,6 +22,11 @@ hex = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tantivy = { workspace = true }
+
+[features]
+# Smaller key index limits for tests of crates that use the storage handle.
+test-hooks = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

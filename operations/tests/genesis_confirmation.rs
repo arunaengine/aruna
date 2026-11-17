@@ -15,7 +15,8 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_net::NetHandle;
-use aruna_operations::node::startup::{ShardRestoreCursor, ShardRestorePass, restore_shard_pass};
+use aruna_operations::node::restore_plan::{ShardRestoreCursor, ShardRestorePass};
+use aruna_operations::node::startup::restore_shard_pass;
 use aruna_operations::placement::process_placements::process_shard_placements;
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;

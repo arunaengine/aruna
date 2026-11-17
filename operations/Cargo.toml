@@ -20,9 +20,11 @@ test-hooks = []
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
+aruna-graph = { workspace = true }
 aruna-plugins = { workspace = true, features = ["runtime"] }
 aruna-storage = { workspace = true }
 aruna-net = { workspace = true }
+aruna-outbound = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-compression = { workspace = true }
@@ -45,7 +47,6 @@ http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
-lettre = { workspace = true }
 lru = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }
@@ -58,7 +59,6 @@ smallvec = { workspace = true }
 spareval = { workspace = true }
 spargebra = { workspace = true }
 sysinfo = { workspace = true }
-tantivy = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -76,6 +76,7 @@ url = { workspace = true }
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
 axum = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

@@ -13,12 +13,11 @@ use aruna_core::federation::{FederationError, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff, check_handoff};
 use aruna_core::keyspaces::USER_KEYSPACE;
 use aruna_core::link::{
-    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, link_secret,
+    LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, fresh_local,
+    link_secret,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::identity::auth::{
-    Actor, AuthContext, NodeCapabilities, Permission, SessionKind,
-};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::types::Effects;
@@ -36,7 +35,6 @@ use crate::users::update_user::{
 };
 
 /// Commit conflicts a link or unlink rereads ownership for before it gives up.
-const LINK_RETRIES: u8 = 3;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LinkLoginError {
@@ -86,17 +84,6 @@ fn config_read(auth: &AuthContext) -> (String, ByteView) {
     (target.storage_keyspace().to_string(), target.storage_key())
 }
 
-/// An unrestricted portal session of a local account whose primary login was at most
-/// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
-pub fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
-    let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
-    portal
-        && auth.path_restrictions.is_none()
-        && auth.user_id.realm_id == auth.realm_id
-        && !auth.user_id.is_nil()
-        && auth_time.is_some_and(|login| login.saturating_add(MAX_LINK_SECS) >= now)
-}
-
 /// An active account that is not a service account.
 fn usable_account(value: Option<&ByteView>) -> Result<User, LinkLoginError> {
     let user = value
@@ -138,6 +125,8 @@ pub struct ConfirmLinkConfig {
     pub secret: Vec<u8>,
     pub node_capabilities: NodeCapabilities,
     pub now: u64,
+    /// The id of the confirmation, minted by the caller.
+    pub confirmation_id: Ulid,
 }
 
 /// Signs a short-lived confirmation for linking the foreign login to the caller's account.
@@ -185,7 +174,7 @@ impl ConfirmLinkOperation {
             foreign_issued_at: handoff.issued_at,
             issued_at: config.now,
             expires_at: config.now.saturating_add(MAX_LINK_SECS),
-            confirmation_id: Ulid::generate(),
+            confirmation_id: config.confirmation_id,
         };
         Ok(Signed::sign(confirmation, &config.node_capabilities)?)
     }
@@ -242,46 +231,14 @@ fn link_error(error: UpdateUserError) -> LinkLoginError {
     }
 }
 
-/// Runs the replicated alias change, restarting it on a commit conflict so ownership is reread.
-#[derive(Debug, PartialEq)]
-struct AliasUpdate {
-    input: UpdateUserInput,
-    update: UpdateUserOperation,
-    retries: u8,
-}
-
-impl AliasUpdate {
-    fn new(input: UpdateUserInput) -> Self {
-        let update = UpdateUserOperation::new(input.clone());
-        Self {
-            input,
-            update,
-            retries: 0,
-        }
-    }
-
-    /// The effects of this event, and the result once the update finished.
-    fn step(&mut self, event: Event) -> (Effects, Option<Result<User, LinkLoginError>>) {
-        let effects = self.update.step(event);
-        if !self.update.is_complete() {
-            return (effects, None);
-        }
-        let update = std::mem::replace(
-            &mut self.update,
-            UpdateUserOperation::new(self.input.clone()),
-        );
-        match update.finalize() {
-            Err(UpdateUserError::StorageError(StorageError::TransactionConflict))
-                if self.retries < LINK_RETRIES =>
-            {
-                self.retries += 1;
-                // The conflicted commit already ended its transaction; its abort would fail
-                // the restarted update with an unknown transaction.
-                (self.update.start(), None)
-            }
-            result => (effects, Some(result.map_err(link_error))),
-        }
-    }
+/// Whether a link change lost a transaction conflict that a fresh run may avoid.
+fn lost_conflict(error: &LinkLoginError) -> bool {
+    matches!(
+        error,
+        LinkLoginError::Update(UpdateUserError::StorageError(
+            StorageError::TransactionConflict
+        )) | LinkLoginError::Storage(StorageError::TransactionConflict)
+    )
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -296,7 +253,7 @@ pub struct LinkLoginConfig {
 
 #[derive(Debug, PartialEq)]
 enum LinkState {
-    Update(Box<AliasUpdate>),
+    Update(Box<UpdateUserOperation>),
     Done,
 }
 
@@ -366,24 +323,24 @@ impl Operation for LinkLoginOperation {
         if let Err(error) = checked {
             return self.finish(Err(error.into()));
         }
-        let mut update = Box::new(AliasUpdate::new(self.input()));
-        let effects = update.update.start();
+        let mut update = Box::new(UpdateUserOperation::new(self.input()));
+        let effects = update.start();
         self.state = LinkState::Update(update);
         effects
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match std::mem::replace(&mut self.state, LinkState::Done) {
-            LinkState::Update(mut update) => match update.step(event) {
-                (effects, None) => {
+            LinkState::Update(mut update) => {
+                let effects = update.step(event);
+                if !update.is_complete() {
                     self.state = LinkState::Update(update);
-                    effects
+                    return effects;
                 }
-                (effects, Some(result)) => {
-                    self.finish(result);
-                    effects
-                }
-            },
+                // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
+                self.finish((*update).finalize().map_err(link_error));
+                effects
+            }
             LinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
@@ -396,9 +353,13 @@ impl Operation for LinkLoginOperation {
         self.output.unwrap_or(Err(LinkLoginError::NotFinished))
     }
 
+    fn is_conflict(error: &Self::Error) -> bool {
+        lost_conflict(error)
+    }
+
     fn abort(&mut self) -> Effects {
         match &mut self.state {
-            LinkState::Update(update) => update.update.abort(),
+            LinkState::Update(update) => update.abort(),
             LinkState::Done => smallvec![],
         }
     }
@@ -418,7 +379,7 @@ enum UnlinkState {
     Read,
     Authorize,
     Cutoff(Box<RevokeTokenOperation>),
-    Update(Box<AliasUpdate>),
+    Update(Box<UpdateUserOperation>),
     Done,
 }
 
@@ -481,7 +442,7 @@ impl UnlinkLoginOperation {
 
     fn update(&mut self) -> Effects {
         let config = &self.config;
-        let mut update = Box::new(AliasUpdate::new(UpdateUserInput {
+        let mut update = Box::new(UpdateUserOperation::new(UpdateUserInput {
             actor: config.actor.clone(),
             auth_context: config.auth_context.clone(),
             self_realm_id: config.actor.realm_id,
@@ -493,7 +454,7 @@ impl UnlinkLoginOperation {
             alias: Some(AliasChange::Remove(config.alias)),
             subject: None,
         }));
-        let effects = update.update.start();
+        let effects = update.start();
         self.state = UnlinkState::Update(update);
         effects
     }
@@ -570,16 +531,16 @@ impl Operation for UnlinkLoginOperation {
                     }
                 }
             }
-            UnlinkState::Update(mut update) => match update.step(event) {
-                (effects, None) => {
+            UnlinkState::Update(mut update) => {
+                let effects = update.step(event);
+                if !update.is_complete() {
                     self.state = UnlinkState::Update(update);
-                    effects
+                    return effects;
                 }
-                (effects, Some(result)) => {
-                    self.finish(result);
-                    effects
-                }
-            },
+                // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
+                self.finish((*update).finalize().map_err(link_error));
+                effects
+            }
             UnlinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
@@ -592,10 +553,14 @@ impl Operation for UnlinkLoginOperation {
         self.output.unwrap_or(Err(LinkLoginError::NotFinished))
     }
 
+    fn is_conflict(error: &Self::Error) -> bool {
+        lost_conflict(error)
+    }
+
     fn abort(&mut self) -> Effects {
         match &mut self.state {
             UnlinkState::Cutoff(revoke) => revoke.abort(),
-            UnlinkState::Update(update) => update.update.abort(),
+            UnlinkState::Update(update) => update.abort(),
             _ => smallvec![],
         }
     }
@@ -609,7 +574,7 @@ mod tests {
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
     use aruna_core::handoff::secret_nonce;
-    use aruna_core::structs::identity::auth::SessionRef;
+    use aruna_core::structs::identity::auth::{SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::time::unix_timestamp_secs;
     use ed25519_dalek::SigningKey;
@@ -717,8 +682,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         for seed in [2, 3] {
             let user = User {
@@ -765,6 +732,7 @@ mod tests {
             secret: SECRET.to_vec(),
             node_capabilities: capabilities(),
             now,
+            confirmation_id: Ulid::from_parts(now, 1),
         })
     }
 

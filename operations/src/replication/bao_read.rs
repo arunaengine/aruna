@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{HeldElsewhere, kept_location, kept_reads};
+use crate::distribution::held::{HeldElsewhere, kept_location, kept_reads};
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

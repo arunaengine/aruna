@@ -3,30 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{
-    ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot, DemandFamily,
-    DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
-    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability, bound_demand,
+    ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot,
+    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
 };
 use aruna_core::document::{DocumentChange, DocumentTarget};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
+use aruna_core::heartbeat::{INFO_PUBLISH_INTERVAL, NodeHeartbeat, RunningJobs};
 use aruna_core::keyspaces::{
-    COMPUTE_DEPARTURE_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    JOB_RESERVATION_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
+    COMPUTE_DEPARTURE_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
 };
 use aruna_core::storage_entries::sync_revision_key;
-use aruna_core::structs::execution::job::{
-    JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState, SubmissionId,
-};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -37,39 +30,28 @@ use aruna_core::structs::storage::node_info::{
 use aruna_core::structs::storage::routing::BackendCatalog;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::jobs::demand::{demand_snapshot, read_reservations};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
+use crate::node::heartbeat::SendHeartbeatOperation;
+use crate::node::info_publish::PublishInfoOperation;
+use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::policy::{
     SubjectScanError, SubjectScanMode, SubjectScanResult, SubjectSyncOperation, SubjectTrigger,
 };
 use crate::realm::mutate_placement::node_kind;
-use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use crate::s3::usage::LoadCountersOperation;
+use aruna_core::node_state::ReadInfoOperation;
+use aruna_core::node_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
 use aruna_core::placement::{build_view, held_buckets};
-use aruna_core::structs::execution::job::record_keys::kind_prefix;
-use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
-
-/// Rows one snapshot scan reads per page.
-const SNAPSHOT_PAGE_SIZE: usize = 128;
-
-/// Interval between two heartbeats. Peers treat a heartbeat older than three
-/// intervals as stale telemetry.
-pub const INFO_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Arms (or shortens toward) the periodic node-info heartbeat publish task.
-pub fn schedule_info_publish(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::PublishNodeInfo,
-        after,
-    })
-}
+use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
@@ -82,13 +64,13 @@ pub async fn seed_info_document(
 ) -> Result<(), String> {
     let now = unix_timestamp_millis();
     let config = load_realm_config(ctx, realm_id).await?;
-    let stored = read_info_document(&ctx.storage_handle, node_id).await?;
+    let stored = node_info_row(&ctx.storage_handle, node_id).await?;
     let epoch = next_epoch(ctx, realm_id, stored.as_ref(), now).await?;
     let reservation = reservation_snapshot(ctx, epoch).await?;
     // The published drain is the operator's durable flag or a departure, never
     // a value carried forward from the previous document.
     let leaving = stored.as_ref().is_some_and(|old| old.leaving);
-    let compute_draining = leaving || read_operator_drain(ctx).await?;
+    let compute_draining = leaving || operator_drain(ctx).await?;
     let document = NodeInfoDocument {
         node_id,
         executors: advertised_executors(ctx, &config, node_id, &reservation.reserved, now).await?,
@@ -109,19 +91,10 @@ pub async fn seed_info_document(
         demand: demand_snapshot(ctx, epoch).await?,
         reservation,
     };
-    let txn_id = begin_write(&ctx.storage_handle).await?;
-    let written = match write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await {
-        Ok(()) => write_owed(ctx, epoch.publisher_generation, txn_id).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = written {
-        abort_txn(&ctx.storage_handle, txn_id).await;
-        return Err(error);
-    }
-    match commit_txn(&ctx.storage_handle, txn_id).await? {
-        true => Ok(()),
-        false => Err("node info seed conflicted with another revision".to_string()),
-    }
+    drive(InfoWriteOperation::seed(realm_id, document), ctx)
+        .await
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
 /// Seeds this node's current info document and replicates it over the shared
@@ -134,7 +107,7 @@ pub async fn publish_node_info(
     urls: NodeUrls,
 ) -> Result<(), String> {
     seed_info_document(ctx, node_id, realm_id, urls).await?;
-    replicate_node_info(ctx, node_id, realm_id).await
+    publish_info(ctx, node_id, realm_id, false).await
 }
 
 /// This node's advertised execution targets: every enabled backend at the current
@@ -190,198 +163,6 @@ async fn reservation_snapshot(
     Ok(ComputeReservationSnapshot { epoch, reserved })
 }
 
-async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationRecord>, String> {
-    let mut records = Vec::new();
-    let mut start: Option<Key> = None;
-    loop {
-        let (page, next) = iter_page(ctx, JOB_RESERVATION_KEYSPACE, None, start).await?;
-        for (_, value) in &page {
-            records.push(
-                postcard::from_bytes::<JobReservationRecord>(value.as_ref())
-                    .map_err(|error| error.to_string())?,
-            );
-        }
-        match next {
-            Some(cursor) => start = Some(cursor),
-            None => return Ok(records),
-        }
-    }
-}
-
-/// Bounded logical admission demand this node observes: admitted, nonterminal request
-/// families with their group and resources (replicas dedupe by family). Truncation is
-/// per group, so one busy group never understates another group's view.
-async fn demand_snapshot(
-    ctx: &DriverContext,
-    epoch: AdvertisementEpoch,
-) -> Result<ComputeDemandSnapshot, String> {
-    let mut collected: BTreeMap<aruna_core::types::GroupId, (Vec<DemandFamily>, bool)> =
-        BTreeMap::new();
-    let mut unnamed = false;
-    let mut start: Option<Key> = None;
-    loop {
-        let (page, next) = iter_page(ctx, FAMILY_PROJECTION_KEYSPACE, None, start).await?;
-        for (key, value) in &page {
-            let Some(family) = nonterminal_family(ctx, key, value).await? else {
-                continue;
-            };
-            let Some(spec) = read_family_spec(ctx, &family).await? else {
-                continue;
-            };
-            let demand = DemandFamily {
-                submission_id: family.submission_id,
-                request_digest: family.request_digest,
-                resources: spec.1,
-            };
-            let full = collected.len() >= MAX_DEMAND_GROUPS;
-            match collected.get_mut(&spec.0) {
-                Some((families, truncated)) => match families.len() >= MAX_DEMAND_FAMILIES {
-                    true => *truncated = true,
-                    false => families.push(demand),
-                },
-                None if full => unnamed = true,
-                None => {
-                    collected.insert(spec.0, (vec![demand], false));
-                }
-            }
-        }
-        match next {
-            Some(cursor) => start = Some(cursor),
-            None => break,
-        }
-    }
-    let mut groups: Vec<DemandGroup> = collected
-        .into_iter()
-        .map(|(group_id, (mut families, truncated))| {
-            families.sort_unstable_by_key(|family| (family.submission_id.0, family.request_digest));
-            DemandGroup {
-                group_id,
-                families,
-                truncated,
-            }
-        })
-        .collect();
-    let truncated = bound_demand(&mut groups) || unnamed;
-    Ok(ComputeDemandSnapshot {
-        epoch,
-        groups,
-        truncated,
-    })
-}
-
-/// The family of one projection row that still holds logical demand. Succeeded
-/// and cancelled families released theirs; `Indeterminate` has not.
-async fn nonterminal_family(
-    ctx: &DriverContext,
-    key: &Key,
-    value: &Value,
-) -> Result<Option<JobFamilyId>, String> {
-    let family = projection_family(key)?;
-    let cache = ProjectionCache::decode(value.as_ref());
-    let projection = match cache {
-        Some(cache) if !cache.stale => cache.projection,
-        _ => {
-            let projected = drive(
-                ProjectFamilyOperation::new(ProjectFamilyConfig {
-                    family: FamilyRef::Family(family),
-                    now_ms: unix_timestamp_millis(),
-                    rebuild: false,
-                }),
-                ctx,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            // A truncated projection proves nothing about the terminal state, so
-            // the family keeps counting as demand (overshoot is the safe side).
-            if projected.truncated {
-                return Ok(Some(family));
-            }
-            projected.projection
-        }
-    };
-    let Some(projection) = projection else {
-        return Ok(None);
-    };
-    match projection.state {
-        LogicalJobState::Queued | LogicalJobState::Running | LogicalJobState::Indeterminate => {
-            Ok(Some(JobFamilyId {
-                submission_id: projection.submission_id,
-                request_digest: projection.request_digest,
-            }))
-        }
-        LogicalJobState::Succeeded | LogicalJobState::Cancelled | LogicalJobState::Failed => {
-            Ok(None)
-        }
-    }
-}
-
-fn projection_family(key: &Key) -> Result<JobFamilyId, String> {
-    let bytes: &[u8] = key.as_ref();
-    let submission_id = bytes
-        .get(..32)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| "malformed family projection key".to_string())?;
-    let request_digest = bytes
-        .get(32..64)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| "malformed family projection key".to_string())?;
-    Ok(JobFamilyId {
-        submission_id: SubmissionId(submission_id),
-        request_digest,
-    })
-}
-
-/// The group and stored ceilings of one family, read from its immutable spec.
-async fn read_family_spec(
-    ctx: &DriverContext,
-    family: &JobFamilyId,
-) -> Result<
-    Option<(
-        aruna_core::types::GroupId,
-        aruna_core::structs::execution::job::EffectiveResources,
-    )>,
-    String,
-> {
-    let prefix = kind_prefix(family, JobRecordKind::Spec);
-    let (page, _) = iter_page(ctx, FAMILY_RECORD_KEYSPACE, Some(prefix), None).await?;
-    for (_, value) in &page {
-        if let Ok(envelope) = from_bytes::<JobRecordEnvelope>(value.as_ref())
-            && let JobFamilyRecord::Spec(spec) = &envelope.record
-        {
-            return Ok(Some((spec.group_id, spec.resources)));
-        }
-    }
-    Ok(None)
-}
-
-async fn iter_page(
-    ctx: &DriverContext,
-    key_space: &str,
-    prefix: Option<Key>,
-    start: Option<Key>,
-) -> Result<(Vec<(Key, Value)>, Option<Key>), String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix,
-            start: start.map(IterStart::After),
-            limit: SNAPSHOT_PAGE_SIZE,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let next = (values.len() >= SNAPSHOT_PAGE_SIZE)
-                .then(|| values.last().map(|(key, _)| key.clone()))
-                .flatten();
-            Ok((values, next))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("{key_space} iteration failed: {other:?}")),
-    }
-}
-
 async fn read_subject_record(storage: &StorageHandle) -> Result<Option<NodeSubjectRecord>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
@@ -397,7 +178,7 @@ async fn read_subject_record(storage: &StorageHandle) -> Result<Option<NodeSubje
             })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node subject read failed: {other:?}")),
+        other => Err(format!("node subject read failed: {}", other.label())),
     }
 }
 
@@ -435,21 +216,24 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
             .map(|change| change.current.generation)
             .unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("realm config revision read failed: {other:?}")),
+        other => Err(format!(
+            "realm config revision read failed: {}",
+            other.label()
+        )),
     }
 }
 
 /// Heartbeat: revises the persisted node-info document, publishes it while a committed revision
 /// is still owed to replication, then pushes live telemetry to the sync peers. Scans run
 /// outside the revision, so [`revise_node_info`] never carries stale drain backwards.
-pub async fn refresh_info_heartbeat(
+pub(crate) async fn refresh_info_heartbeat(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
     sequence: u64,
     jobs: Option<RunningJobs>,
 ) -> Result<(), String> {
-    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         return Ok(());
     };
     let now = unix_timestamp_millis();
@@ -471,20 +255,18 @@ pub async fn refresh_info_heartbeat(
             .map(|net| net.download_gauge().snapshot()),
         storage_capacity_bytes: storage_capacity(ctx),
     };
-    revise_node_info(ctx, node_id, realm_id, |document| {
-        document.executors = executors.clone();
-        document.labels = labels.clone();
-        document.reservation = reservation;
-        document.demand = demand.clone();
-        document.utilization = utilization;
-    })
-    .await?;
-    if read_owed(ctx, None).await?.is_some() {
-        replicate_node_info(ctx, node_id, realm_id).await?;
-    }
-    let (Some(net_handle), Some(stored)) = (
+    let change = InfoChange::Telemetry {
+        executors: executors.clone(),
+        labels,
+        reservation,
+        demand: demand.clone(),
+        utilization,
+    };
+    revise_node_info(ctx, node_id, realm_id, change).await?;
+    publish_info(ctx, node_id, realm_id, true).await?;
+    let (Some(_), Some(stored)) = (
         ctx.net_handle.as_ref(),
-        read_info_document(&ctx.storage_handle, node_id).await?,
+        node_info_row(&ctx.storage_handle, node_id).await?,
     ) else {
         return Ok(());
     };
@@ -514,180 +296,25 @@ pub async fn refresh_info_heartbeat(
         demand: ComputeDemandSnapshot { epoch, ..demand },
         jobs,
     };
-    crate::node::heartbeat::send_heartbeat(net_handle, heartbeat).await;
-    Ok(())
+    drive(SendHeartbeatOperation::new(heartbeat), ctx)
+        .await
+        .map_err(|error| error.to_string())
 }
 
-/// The advertisement without telemetry and publication stamps; only a change here publishes.
-fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
-    let mut view = document.clone();
-    for executor in &mut view.executors {
-        executor.availability = None;
-    }
-    view.utilization = NodeUtilization {
-        storage_bytes_used: 0,
-        documents_held: None,
-        load_permille: None,
-        heartbeat_at_ms: 0,
-        download_slots: None,
-        storage_capacity_bytes: None,
-    };
-    view.demand = ComputeDemandSnapshot::default();
-    view.reservation = ComputeReservationSnapshot::default();
-    view.updated_at_ms = 0;
-    view.epoch.publisher_generation = 0;
-    view.epoch.observed_at_ms = 0;
-    view
-}
-
-/// Node-info revisions one publisher retries after another committed first.
-const NODE_INFO_ATTEMPTS: usize = 3;
-
-/// Applies `revise` to the current node-info row inside one write transaction,
-/// also stamping the next epoch and re-reading published drain/departure state. All publishers
-/// use it, so concurrent rounds cannot overwrite; `Ok(false)` means no row or no durable change.
+/// Applies `change` to the stored node-info row in one write transaction, retried after a lost
+/// conflict; it stamps the next epoch and re-reads the drain. `Ok(false)`: no row or no change.
 async fn revise_node_info(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
-    mut revise: impl FnMut(&mut NodeInfoDocument),
+    change: InfoChange,
 ) -> Result<bool, String> {
-    let generation = membership_generation(ctx, realm_id).await?;
-    for attempt in 0..NODE_INFO_ATTEMPTS {
-        let txn_id = begin_write(&ctx.storage_handle).await?;
-        match write_revision(ctx, node_id, txn_id, generation, &mut revise).await {
-            Ok(false) => {
-                abort_txn(&ctx.storage_handle, txn_id).await;
-                return Ok(false);
-            }
-            Ok(true) => match commit_txn(&ctx.storage_handle, txn_id).await? {
-                true => return Ok(true),
-                false if attempt + 1 < NODE_INFO_ATTEMPTS => continue,
-                false => break,
-            },
-            Err(error) => {
-                abort_txn(&ctx.storage_handle, txn_id).await;
-                return Err(error);
-            }
-        }
-    }
-    Err("node info revision exhausted conflict retries".to_string())
-}
-
-/// Reads, revises, and writes the node-info row inside `txn_id`.
-async fn write_revision(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    txn_id: TxnId,
-    generation: u64,
-    revise: &mut impl FnMut(&mut NodeInfoDocument),
-) -> Result<bool, String> {
-    let Some(mut document) = node_info_row(&ctx.storage_handle, node_id, Some(txn_id)).await?
-    else {
-        return Ok(false);
-    };
-    let stored = durable_view(&document);
-    revise(&mut document);
-    // The published drain is exactly the operator's durable flag or a departure,
-    // both read here, so no publisher carries a stale copy of them forward.
-    document.compute_draining = operator_drain(ctx, Some(txn_id)).await? || document.leaving;
-    document.epoch.membership_generation = generation;
-    if durable_view(&document) == stored {
-        return Ok(false);
-    }
     let now = unix_timestamp_millis();
-    document.epoch = AdvertisementEpoch {
-        membership_generation: generation,
-        publisher_generation: document.epoch.publisher_generation.saturating_add(1),
-        observed_at_ms: now,
-    };
-    document.demand.epoch = document.epoch;
-    document.reservation.epoch = document.epoch;
-    document.updated_at_ms = now;
-    write_info_row(&ctx.storage_handle, &document, Some(txn_id)).await?;
-    write_owed(ctx, document.epoch.publisher_generation, txn_id).await?;
-    Ok(true)
-}
-
-async fn begin_write(storage: &StorageHandle) -> Result<TxnId, String> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+    let revise = || InfoWriteOperation::revise(realm_id, node_id, change.clone(), now);
+    drive_retry(revise, ctx, node_id.as_bytes())
         .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info transaction start failed: {other:?}")),
-    }
+        .map_err(|error| error.to_string())
 }
-
-/// `Ok(false)` reports a commit conflict, which the caller retries.
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<bool, String> {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info commit failed: {other:?}")),
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    if let Event::Storage(StorageEvent::Error { error }) = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        warn!(%error, "Failed to abort a node info revision");
-    }
-}
-
-/// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
-/// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
-pub async fn group_demand(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    group_id: &aruna_core::types::GroupId,
-) -> Result<(ResourceTotals, bool), String> {
-    let config = load_realm_config(ctx, realm_id).await?;
-    let members = config
-        .sync_eligible_nodes()
-        .map_err(|error| error.to_string())?;
-    let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
-    let fresh = crate::node::heartbeat::fresh_heartbeats(ctx.net_handle.as_ref());
-    Ok(merge_view(local, &members, node_id, &fresh, group_id))
-}
-
-fn merge_view(
-    local: ComputeDemandSnapshot,
-    members: &[NodeId],
-    node_id: NodeId,
-    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
-    group_id: &aruna_core::types::GroupId,
-) -> (ResourceTotals, bool) {
-    let mut missing = false;
-    let mut snapshots = vec![local];
-    for member in members.iter().filter(|member| **member != node_id) {
-        match fresh.get(member) {
-            Some(held) => snapshots.push(held.heartbeat.demand.clone()),
-            None => missing = true,
-        }
-    }
-    let (totals, truncated) = aruna_core::compute::quota::merge_demand(snapshots.iter(), group_id);
-    (totals, truncated || missing)
-}
-
-/// The single durable departure-report row of this node.
-const DEPARTURE_KEY: &[u8] = b"departure";
-/// The operator's own compute drain, kept apart from an observed departure so
-/// returning to placement can never silently undrain a node an operator drained.
-const OPERATOR_DRAIN_KEY: &[u8] = b"operator_drain";
-/// The newest advertisement revision not yet handed to replication. It is written in the same
-/// transaction as that revision, so a failure after the commit only delays the publish.
-const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 
 /// Reacts to an observed placement change for this node. A node the realm still
 /// places revalidates its inventory under the observed subject; one draining or
@@ -713,18 +340,18 @@ pub async fn observe_placement(
 /// Applies an observed departure, or a return, to this node's compute plane. Departing
 /// stops offers/admissions, records reserved executions as unresolved without blocking
 /// removal; returning clears the flags. `Ok(false)` means the state already matched.
-pub async fn set_departure_state(
+pub(crate) async fn set_departure_state(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
     departing: bool,
 ) -> Result<bool, String> {
-    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         return Ok(false);
     };
     // An operator drain outlives a placement observation: returning to the
     // placement map must not undrain a node somebody drained deliberately.
-    let draining = departing || read_operator_drain(ctx).await?;
+    let draining = departing || operator_drain(ctx).await?;
     if document.leaving == departing && document.compute_draining == draining {
         return Ok(false);
     }
@@ -735,12 +362,12 @@ pub async fn set_departure_state(
     if departing {
         write_departure_report(ctx, epoch.membership_generation, now).await?;
     }
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
-        document.leaving = departing;
-        document.reservation = reservation;
-        document.demand = demand.clone();
-    })
-    .await?;
+    let change = InfoChange::Leaving {
+        leaving: departing,
+        reservation,
+        demand,
+    };
+    let revised = revise_node_info(ctx, node_id, realm_id, change).await?;
     info!(
         leaving = departing,
         compute_draining = draining,
@@ -751,7 +378,7 @@ pub async fn set_departure_state(
     if !revised {
         return Ok(false);
     }
-    replicate_node_info(ctx, node_id, realm_id).await?;
+    publish_info(ctx, node_id, realm_id, false).await?;
     Ok(true)
 }
 
@@ -764,11 +391,11 @@ pub async fn set_operator_drain(
     realm_id: RealmId,
     draining: bool,
 ) -> Result<bool, String> {
-    if read_operator_drain(ctx).await? == draining {
+    if operator_drain(ctx).await? == draining {
         return Ok(false);
     }
     write_operator_drain(ctx, draining).await?;
-    let Some(document) = read_info_document(&ctx.storage_handle, node_id).await? else {
+    let Some(document) = node_info_row(&ctx.storage_handle, node_id).await? else {
         warn!(
             operator_draining = draining,
             "Operator compute drain recorded before this node advertises"
@@ -781,11 +408,11 @@ pub async fn set_operator_drain(
     let demand = demand_snapshot(ctx, epoch).await?;
     // The revision derives the published drain from the flag written above; a
     // departing node stays draining whatever that flag says.
-    let revised = revise_node_info(ctx, node_id, realm_id, |document| {
-        document.reservation = reservation;
-        document.demand = demand.clone();
-    })
-    .await?;
+    let change = InfoChange::Snapshots {
+        reservation,
+        demand,
+    };
+    let revised = revise_node_info(ctx, node_id, realm_id, change).await?;
     info!(
         operator_draining = draining,
         leaving = document.leaving,
@@ -794,29 +421,24 @@ pub async fn set_operator_drain(
         "Operator compute drain published"
     );
     if revised {
-        replicate_node_info(ctx, node_id, realm_id).await?;
+        publish_info(ctx, node_id, realm_id, false).await?;
     }
     Ok(true)
 }
 
-/// Whether an operator currently drains this node's compute plane.
-pub async fn read_operator_drain(ctx: &DriverContext) -> Result<bool, String> {
-    operator_drain(ctx, None).await
-}
-
-async fn operator_drain(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<bool, String> {
+async fn operator_drain(ctx: &DriverContext) -> Result<bool, String> {
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
             key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
             key: Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-            txn_id,
+            txn_id: None,
         })
         .await
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain read failed: {other:?}")),
+        other => Err(format!("operator drain read failed: {}", other.label())),
     }
 }
 
@@ -839,7 +461,7 @@ async fn write_operator_drain(ctx: &DriverContext, draining: bool) -> Result<(),
         Event::Storage(StorageEvent::WriteResult { .. })
         | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain write failed: {other:?}")),
+        other => Err(format!("operator drain write failed: {}", other.label())),
     }
 }
 
@@ -877,37 +499,7 @@ async fn write_departure_report(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("departure report write failed: {other:?}")),
-    }
-}
-
-/// The durable departure report of this node, read through its context.
-pub async fn departure_report(
-    ctx: &DriverContext,
-) -> Result<Option<ComputeDepartureReport>, String> {
-    read_departure_report(&ctx.storage_handle).await
-}
-
-/// The durable departure report, if this node ever departed.
-pub async fn read_departure_report(
-    storage: &StorageHandle,
-) -> Result<Option<ComputeDepartureReport>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(DEPARTURE_KEY.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes::<ComputeDepartureReport>(bytes.as_ref())
-                    .map_err(|error| error.to_string())
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("departure report read failed: {other:?}")),
+        other => Err(format!("departure report write failed: {}", other.label())),
     }
 }
 
@@ -956,11 +548,11 @@ fn node_labels(
 }
 
 async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
-    Ok(
-        crate::node::usage_stats::read_local_global(&ctx.storage_handle, None)
-            .await?
-            .stored_bytes,
-    )
+    let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+    let counters = drive(global, ctx)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(counters.stored_bytes)
 }
 
 /// The bytes this node's backends may store, from their quotas.
@@ -1060,152 +652,27 @@ fn permille_of(load1: f64, cores: u64) -> u32 {
     (load1 / cores as f64 * 1000.0).round().clamp(0.0, 1000.0) as u32
 }
 
-async fn replicate_node_info(
+/// Replicates the info document, or only an owed revision of it, and clears what it owed.
+async fn publish_info(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
+    only_owed: bool,
 ) -> Result<(), String> {
-    let owed = read_owed(ctx, None).await?;
-    // A device belongs to no sync topic, so its info document stays local:
-    // an outbox row for it could never be published, only retried forever.
-    let config = load_realm_config(ctx, realm_id).await?;
-    if node_kind(&config, node_id).is_none_or(|kind| kind.is_sync_eligible()) {
-        drive(
-            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-                realm_id,
-                local_node_id: node_id,
-                excluded_peers: Vec::new(),
-                documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
-                // Shared-topic genesis is bootstrapped by publish_core_documents;
-                // explicit publishes and periodic heartbeats only publish into it.
-                allow_genesis: false,
-            })
-            .strict(),
-            ctx,
-        )
+    drive(PublishInfoOperation::new(realm_id, node_id, only_owed), ctx)
         .await
-        .map_err(|error| format!("node info replication failed: {error}"))?;
-    }
-    match owed {
-        Some(owed) => settle_owed(ctx, owed).await,
-        None => Ok(()),
-    }
-}
-
-/// The owed advertisement revision; an unreadable value counts as owed.
-async fn read_owed(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<Option<u64>, String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
-            value.map(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).map_or(0, u64::from_be_bytes))
-        ),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("owed publish read failed: {other:?}")),
-    }
-}
-
-async fn write_owed(ctx: &DriverContext, generation: u64, txn_id: TxnId) -> Result<(), String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-            value: Value::from(generation.to_be_bytes().to_vec()),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("owed publish write failed: {other:?}")),
-    }
-}
-
-/// Clears the owed revision once replication took it; a revision committed meanwhile stays owed.
-async fn settle_owed(ctx: &DriverContext, published: u64) -> Result<(), String> {
-    let txn_id = begin_write(&ctx.storage_handle).await?;
-    let cleared = match read_owed(ctx, Some(txn_id)).await {
-        Ok(Some(owed)) if owed <= published => {
-            match ctx
-                .storage_handle
-                .send_storage_effect(StorageEffect::Delete {
-                    key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-                    key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-                    txn_id: Some(txn_id),
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-                other => Err(format!("owed publish delete failed: {other:?}")),
-            }
-        }
-        Ok(_) => Ok(()),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = cleared {
-        abort_txn(&ctx.storage_handle, txn_id).await;
-        return Err(error);
-    }
-    // A conflict means another revision was committed; it stays owed for the next tick.
-    commit_txn(&ctx.storage_handle, txn_id).await.map(|_| ())
-}
-
-pub(crate) async fn write_info_document(
-    storage: &StorageHandle,
-    document: &NodeInfoDocument,
-) -> Result<(), String> {
-    write_info_row(storage, document, None).await
-}
-
-async fn write_info_row(
-    storage: &StorageHandle,
-    document: &NodeInfoDocument,
-    txn_id: Option<TxnId>,
-) -> Result<(), String> {
-    // `to_bytes` validates, so a locally built advertisement that broke its own
-    // bounds never reaches storage or the shared realm topic.
-    let value = Value::from(document.to_bytes().map_err(|error| error.to_string())?);
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: NODE_INFO_KEYSPACE.to_string(),
-            key: Key::from(node_info_key(document.node_id)),
-            value,
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info write failed: {other:?}")),
-    }
-}
-
-/// Reads a single node's persisted info document, if present.
-pub async fn read_info_document(
-    storage: &StorageHandle,
-    node_id: NodeId,
-) -> Result<Option<NodeInfoDocument>, String> {
-    node_info_row(storage, node_id, None).await
+        .map_err(|error| error.to_string())
 }
 
 async fn node_info_row(
     storage: &StorageHandle,
     node_id: NodeId,
-    txn_id: Option<TxnId>,
 ) -> Result<Option<NodeInfoDocument>, String> {
     match storage
         .send_storage_effect(StorageEffect::Read {
             key_space: NODE_INFO_KEYSPACE.to_string(),
             key: Key::from(node_info_key(node_id)),
-            txn_id,
+            txn_id: None,
         })
         .await
     {
@@ -1216,30 +683,23 @@ async fn node_info_row(
             })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info read failed: {other:?}")),
+        other => Err(format!("node info read failed: {}", other.label())),
     }
 }
 
-/// Reads the persisted info documents for the given nodes, skipping missing ones,
-/// keyed by node id. Takes the driver context so API routes stay in the operations
-/// layer rather than touching the storage handle directly.
-pub async fn read_info_documents(
-    ctx: &DriverContext,
-    node_ids: &[NodeId],
-) -> Result<BTreeMap<NodeId, NodeInfoDocument>, String> {
-    let mut documents = BTreeMap::new();
-    for node_id in node_ids {
-        if let Some(document) = read_info_document(&ctx.storage_handle, *node_id).await? {
-            documents.insert(*node_id, document);
-        }
-    }
-    Ok(documents)
+/// The published endpoints of a node, from its info document.
+pub async fn node_urls(ctx: &DriverContext, node_id: NodeId) -> Option<NodeUrls> {
+    drive(ReadInfoOperation::new(vec![node_id]), ctx)
+        .await
+        .ok()?
+        .remove(&node_id)
+        .map(|document| document.urls)
 }
 
 /// Arms the periodic node-info heartbeat at startup. `ShortenTimer` (never
 /// `ResetTimer`) so the durable-queue re-arm loop cannot push the deadline
 /// forward past the handler's own post-run re-arm.
-pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHandle) {
     if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = task_handle
         .send_effect(Effect::Task(TaskEffect::ShortenTimer {
             key: TaskKey::PublishNodeInfo,
@@ -1254,9 +714,25 @@ pub async fn restore_info_timer(_storage: &StorageHandle, task_handle: &TaskHand
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::demand::{group_demand, merge_view};
+    use crate::node::info_write::PUBLISH_OWED_KEY;
+    use aruna_core::compute::quota::{
+        DemandFamily, DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES,
+    };
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
+    use aruna_core::heartbeat::HeldHeartbeat;
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::{
+        FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+    };
+    use aruna_core::node_state::DrainStateOperation;
     use aruna_core::storage_entries::metadata_registry_key;
+    use aruna_core::structs::execution::job::record_keys::kind_prefix;
+    use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
+    use aruna_core::structs::execution::job::{
+        JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LogicalJobState,
+        SubmissionId,
+    };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::record::{
         NodePlacementEntry, PlacementRef, PlacementStrategy,
@@ -1276,9 +752,11 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             // Node info replication is strict, so its drain scheduling must succeed.
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
@@ -1319,6 +797,18 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    async fn owed_row(ctx: &DriverContext) -> Option<Vec<u8>> {
+        let read = StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
+            other => panic!("owed row read failed: {other:?}"),
+        }
     }
 
     async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentOutboxRecord> {
@@ -1405,7 +895,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1446,7 +936,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            read_info_document(&ctx.storage_handle, local)
+            node_info_row(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_some()
@@ -1483,7 +973,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("seeded node info document");
@@ -1529,7 +1019,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("node info document persisted");
@@ -1586,7 +1076,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let first = read_info_document(&ctx.storage_handle, local)
+        let first = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1601,7 +1091,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let second = read_info_document(&ctx.storage_handle, local)
+        let second = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -1644,7 +1134,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            read_info_document(&ctx.storage_handle, local)
+            node_info_row(&ctx.storage_handle, local)
                 .await
                 .unwrap()
                 .is_none()
@@ -1956,7 +1446,7 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -2106,7 +1596,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let before = read_info_document(&ctx.storage_handle, local)
+        let before = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2117,7 +1607,7 @@ mod tests {
                 .unwrap()
         );
 
-        let after = read_info_document(&ctx.storage_handle, local)
+        let after = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2126,9 +1616,10 @@ mod tests {
         assert!(after.supersedes(&before));
         assert_eq!(after.reservation.reserved.count, 1);
 
-        let report = read_departure_report(&ctx.storage_handle)
+        let report = drive(DrainStateOperation::new(), &ctx)
             .await
             .unwrap()
+            .departure
             .expect("departure report");
         assert_eq!(report.unresolved, vec![execution_id]);
         assert!(!report.truncated);
@@ -2192,7 +1683,7 @@ mod tests {
             .await
             .expect("observation completes");
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .expect("document");
@@ -2224,7 +1715,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, true)
             .await
             .unwrap();
-        let departed = read_info_document(&ctx.storage_handle, local)
+        let departed = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2235,7 +1726,7 @@ mod tests {
                 .unwrap()
         );
 
-        let rejoined = read_info_document(&ctx.storage_handle, local)
+        let rejoined = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2270,7 +1761,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let drained = read_info_document(&ctx.storage_handle, local)
+        let drained = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2283,7 +1774,7 @@ mod tests {
         set_departure_state(&ctx, local, realm_id, false)
             .await
             .unwrap();
-        let observed = read_info_document(&ctx.storage_handle, local)
+        let observed = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2295,7 +1786,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let released = read_info_document(&ctx.storage_handle, local)
+        let released = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2371,7 +1862,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let drained = read_info_document(&ctx.storage_handle, local)
+        let drained = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2381,7 +1872,7 @@ mod tests {
         refresh_info_heartbeat(&ctx, local, realm_id, 1, None)
             .await
             .unwrap();
-        let released = read_info_document(&ctx.storage_handle, local)
+        let released = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2415,7 +1906,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2446,7 +1937,7 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2474,19 +1965,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let seeded = read_info_document(&ctx.storage_handle, local)
+        let seeded = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
         let queued = read_outbox(&ctx).await.len();
 
-        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
+        assert_eq!(owed_row(&ctx).await, None);
         for sequence in 1..=3 {
             refresh_info_heartbeat(&ctx, local, realm_id, sequence, None)
                 .await
                 .unwrap();
         }
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
@@ -2494,20 +1985,24 @@ mod tests {
         assert_eq!(read_outbox(&ctx).await.len(), queued);
 
         // A publish that failed after its revision committed leaves the revision owed.
-        let txn_id = begin_write(&ctx.storage_handle).await.unwrap();
-        write_owed(&ctx, seeded.epoch.publisher_generation, txn_id)
-            .await
-            .unwrap();
-        assert!(commit_txn(&ctx.storage_handle, txn_id).await.unwrap());
+        let owed = seeded.epoch.publisher_generation.to_be_bytes().to_vec();
+        ctx.storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+                value: Value::from(owed),
+                txn_id: None,
+            })
+            .await;
         refresh_info_heartbeat(&ctx, local, realm_id, 4, None)
             .await
             .unwrap();
-        let stored = read_info_document(&ctx.storage_handle, local)
+        let stored = node_info_row(&ctx.storage_handle, local)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
-        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
+        assert_eq!(owed_row(&ctx).await, None);
     }
 }

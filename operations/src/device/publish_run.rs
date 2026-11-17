@@ -223,7 +223,7 @@ async fn read_frozen(
         }) => postcard::from_bytes(&bytes)
             .map(Some)
             .map_err(|error| unavailable(error.to_string())),
-        other => Err(unavailable(format!("{other:?}"))),
+        other => Err(unavailable(other.label().to_string())),
     }
 }
 
@@ -245,7 +245,7 @@ async fn store_frozen(
         .await
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(PublishRunError::Unavailable(format!("{other:?}"))),
+        other => Err(PublishRunError::Unavailable(other.label().to_string())),
     }
 }
 

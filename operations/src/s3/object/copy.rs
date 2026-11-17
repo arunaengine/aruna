@@ -4,7 +4,7 @@
 
 pub mod sealed;
 
-use crate::distribution::pull::record_only;
+use crate::distribution::held::record_only;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContextError, GateOperation};
@@ -19,7 +19,7 @@ use crate::s3::object::head::{
 };
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::reference::{
-    MaterializeReferenceError, ReferenceWrite, write_reference_version,
+    MaterializeReferenceError, ReferenceWrite, WriteReferenceOperation,
 };
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -647,28 +647,32 @@ async fn preserve_reference(
     let (Some(binding), Some(metadata)) = (head.source_binding, head.source_metadata) else {
         return Err(CopyObjectError::Get(GetObjectError::GetObjectFailed));
     };
-    let (version_id, _changed) = write_reference_version(
-        context,
-        ReferenceWrite {
-            preassigned_version_id: version,
-            group_id: input.group_id,
-            user_id: input.user_id,
-            realm_id: input.realm_id,
-            node_id: input.node_id,
-            bucket: input.dest_bucket,
-            key: input.dest_key,
-            expected_bucket: None,
-            version_source: VersionSourceBinding {
-                strategy: StagingStrategy::Reference,
-                ..binding
+    let (version_id, _changed) = drive(
+        WriteReferenceOperation::new(
+            ReferenceWrite {
+                preassigned_version_id: version,
+                group_id: input.group_id,
+                user_id: input.user_id,
+                realm_id: input.realm_id,
+                node_id: input.node_id,
+                bucket: input.dest_bucket,
+                key: input.dest_key,
+                expected_bucket: None,
+                version_source: VersionSourceBinding {
+                    strategy: StagingStrategy::Reference,
+                    ..binding
+                },
+                metadata: metadata.clone(),
+                inherited_policies: head.source_policies,
+                connector_guard: None,
+                mirror_guards: Vec::new(),
+                restrictions: input.restrictions,
+                job_id: input.job_id,
             },
-            metadata: metadata.clone(),
-            inherited_policies: head.source_policies,
-            connector_guard: None,
-            mirror_guards: Vec::new(),
-            restrictions: input.restrictions,
-            job_id: input.job_id,
-        },
+            std::time::SystemTime::now(),
+            ulid::Ulid::generate(),
+        ),
+        context,
     )
     .await?;
     Ok(CopyResultData {
@@ -753,8 +757,10 @@ pub(crate) mod test {
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (temp_handle, context)
     }

@@ -13,7 +13,8 @@ use aruna_core::structs::storage::distribution::{DistributionBinding, Distributi
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
 use aruna_operations::distribution::status::read_view;
 use aruna_operations::distribution::usage::{HeldRange, RangeUsage, held_ranges, sum_held};
-use aruna_operations::node::usage_stats::usage_complete;
+use aruna_operations::driver::drive;
+use aruna_operations::s3::usage::UsageCompleteOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
@@ -539,7 +540,7 @@ pub async fn get_bucket_usage(
         }
         None => {
             let counters = bucket_counters(&state, &bucket).await?;
-            let complete = usage_complete(&state.get_ctx())
+            let complete = drive(UsageCompleteOperation::new(), state.get_ctx().as_ref())
                 .await
                 .map_err(|error| ServerError::InternalError(error.into()))?;
             Ok(Json(BucketUsageResponse::new(bucket, counters, complete)))

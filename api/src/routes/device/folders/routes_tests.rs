@@ -68,8 +68,10 @@ async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
     serve(dir, context, capabilities).await
 }
@@ -168,8 +170,10 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
         net_handle: None,
         blob_handle: Some(blob),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle),
         compute_handle: None,
+        outbound_handle: None,
     };
     let capabilities = NodeCapabilities::user_node(realm_id()).unwrap();
     (serve(dir, context, capabilities).await, fired)

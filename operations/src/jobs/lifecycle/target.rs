@@ -49,10 +49,11 @@ use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::mint_local_job;
-use crate::metadata::api::load_realm_config;
-use crate::node::node_info::{read_info_document, read_operator_drain};
 use crate::placement::policy::GateOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
+use crate::realm::load_config::load_realm_config;
+use aruna_core::node_state::DrainStateOperation;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::resolve_shard_holders;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
@@ -248,10 +249,10 @@ async fn store_receipt(
         round.local,
         now,
     )?;
-    let membership_generation = read_info_document(&context.storage_handle, round.local)
+    let membership_generation = drive(ReadInfoOperation::new(vec![round.local]), context)
         .await
         .ok()
-        .flatten()
+        .and_then(|mut documents| documents.remove(&round.local))
         .map(|document| document.epoch.membership_generation)
         .unwrap_or_default();
     let launch_digest =
@@ -580,9 +581,10 @@ pub(crate) async fn local_capability(
     intent: &LaunchIntent,
     spec: &LogicalJobSpec,
 ) -> Result<ExecutorCapability, LaunchDecline> {
-    let document = read_info_document(&context.storage_handle, local)
+    let document = drive(ReadInfoOperation::new(vec![local]), context)
         .await
         .map_err(|_| LaunchDecline::Draining)?
+        .remove(&local)
         .ok_or(LaunchDecline::Draining)?;
     if !config
         .sync_eligible_nodes()
@@ -603,7 +605,9 @@ pub(crate) async fn local_capability(
     // must never re-enable offers this node was drained out of.
     if document.leaving
         || document.compute_draining
-        || read_operator_drain(context).await.unwrap_or(true)
+        || drive(DrainStateOperation::new(), context)
+            .await
+            .map_or(true, |drain| drain.operator_draining)
         || config
             .placement_entry(local)
             .is_some_and(|entry| entry.draining)

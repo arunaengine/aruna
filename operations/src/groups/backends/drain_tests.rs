@@ -32,6 +32,8 @@ fn context(root: &str) -> DriverContext {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
+        outbound_handle: None,
         task_handle: None,
         compute_handle: None,
     }

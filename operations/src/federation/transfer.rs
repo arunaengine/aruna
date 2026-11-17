@@ -90,6 +90,8 @@ pub struct IssueIntentConfig {
     pub nonce: String,
     pub node_capabilities: NodeCapabilities,
     pub now: u64,
+    /// The id of the intent, minted by the caller.
+    pub intent_id: Ulid,
 }
 
 /// Signs an import intent for this realm's current descriptor. Authorization comes first.
@@ -127,7 +129,7 @@ impl Operation for IssueIntentOperation {
                 nonce: config.nonce.clone(),
                 issued_at: config.now,
                 expires_at: config.now.saturating_add(MAX_TRANSFER_SECS),
-                intent_id: Ulid::generate(),
+                intent_id: config.intent_id,
             };
             Ok(Signed::sign(intent, &config.node_capabilities)?)
         })
@@ -240,6 +242,7 @@ mod tests {
             nonce: "aa".repeat(32),
             node_capabilities: signer(2),
             now: NOW,
+            intent_id: Ulid::from_parts(NOW, 1),
         };
         let issued = drive(IssueIntentOperation::new(config.clone()), &context).await;
         assert!(issued.is_err());

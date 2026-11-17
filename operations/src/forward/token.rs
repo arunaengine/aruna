@@ -15,12 +15,12 @@ use crate::forward::authorize::forward_auth_error;
 use crate::forward::transport::reject;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::handle::MetadataRequestError;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
 use aruna_core::NodeId;
 use aruna_core::auth::bearer_token_hash;
 use aruna_core::auth::valid_revocation_expiry;
+use aruna_core::metadata::AuthToken;
 use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -245,10 +245,10 @@ mod tests {
     use super::run_revoke;
     use crate::metadata::api::MetadataApiError;
     use crate::metadata::handle::MetadataRequestError;
-    use crate::metadata::protocol::AuthToken;
     use crate::metadata::protocol::MetadataTransportMessage;
     use aruna_core::NodeId;
     use aruna_core::auth::bearer_token_hash;
+    use aruna_core::metadata::AuthToken;
     use aruna_core::metadata::MetadataError;
     use tokio::time::Instant;
 

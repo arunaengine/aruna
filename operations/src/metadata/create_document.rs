@@ -2,14 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::CREATE_ACCEPTANCE_KEYSPACE;
 use aruna_core::metadata::{
     MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
@@ -40,16 +39,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::metadata::persistent_id::{mapping_revision, mapping_route_for, transition_entries};
-use crate::metadata::profile::validation::{
+use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
+use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
-    validate_submission,
 };
-use crate::metadata::projector::schedule_projection_drain;
 use crate::metadata::repository::{create_projection_entries, read_document_registry};
 use crate::sync::shard_placement::sort_node_ids;
-use aruna_core::backoff::conflict_backoff;
 use aruna_core::placement::{
     PlacementResolutionContext, choose_origin_bucket, holds_placement, meta_bucket_subject,
     resolve_shard_holders, strategy_for_target,
@@ -95,17 +90,17 @@ pub struct CreateDocumentResult {
 /// Success means pipeline acceptance, not materialization or replication.
 #[derive(Debug, PartialEq)]
 pub struct CreateDocumentOperation {
-    config: CreateDocumentConfig,
+    pub(super) config: CreateDocumentConfig,
     skip_existing_check: bool,
     /// Set when a non-holder forwarded this create; the id was already minted at
     /// the origin with the blind-hash bucket, so this node keeps it unchanged.
-    forwarded: bool,
+    pub(super) forwarded: bool,
     conflict_recheck: bool,
     txn_id: Option<TxnId>,
     state: CreateDocumentState,
     record: Option<MetadataRegistryRecord>,
     create_event: Option<MetadataEventRecord>,
-    route_profile_status: Option<ProfileValidationStatus>,
+    pub(super) route_profile_status: Option<ProfileValidationStatus>,
     pending_realm_config: Option<RealmConfigDocument>,
     pending_placement: Option<PlacementRef>,
     pending_holders: Vec<NodeId>,
@@ -223,7 +218,7 @@ impl CreateDocumentOperation {
     /// A create a non-holder forwarded here. The document's bucket is its blind
     /// hash rather than this node's pick, so every holder the forwarder may try
     /// stamps the same bucket.
-    pub fn new_forwarded(config: CreateDocumentConfig) -> Self {
+    pub(crate) fn new_forwarded(config: CreateDocumentConfig) -> Self {
         let mut operation = Self::new(config);
         operation.forwarded = true;
         operation
@@ -244,7 +239,7 @@ impl CreateDocumentOperation {
     }
 
     /// A pristine operation with the same inputs, for a conflict retry.
-    fn fresh_copy(&self) -> Self {
+    pub(super) fn fresh_copy(&self) -> Self {
         Self {
             config: self.config.clone(),
             skip_existing_check: self.skip_existing_check,
@@ -616,7 +611,7 @@ impl CreateDocumentOperation {
             let profile = match &self.config.payload {
                 CreateDocumentPayload::Scaffold { .. } => false,
                 CreateDocumentPayload::RoCrate { jsonld } => {
-                    crate::metadata::stats::rocrate_is_profile(
+                    crate::metadata::profile::rules::rocrate_is_profile(
                         jsonld,
                         &create_event.record.graph_iri,
                     )
@@ -624,7 +619,7 @@ impl CreateDocumentOperation {
                 }
             };
             let dedup_key = pid_dedup_key(create_event.record.document_id);
-            let job_id = crate::jobs::service::mint_configured_job(
+            let job_id = crate::jobs::submit::mint_configured_job(
                 realm_config,
                 create_event.node_id,
                 &dedup_key,
@@ -772,84 +767,6 @@ pub fn resolve_metadata_id(
     })
 }
 
-const CREATE_CONFLICT_RETRIES: usize = 3;
-
-pub async fn create_metadata_document(
-    mut template: CreateDocumentOperation,
-    context: Arc<DriverContext>,
-) -> Result<CreateDocumentResult, CreateDocumentError> {
-    // Only local nil-sentinel creates mint here; supplied and forwarded ids persist.
-    if !template.forwarded && template.config.document_id.is_nil() {
-        let document_id = mint_local_id(context.as_ref(), &template.config).await?;
-        template.config.document_id = document_id.as_ulid();
-    }
-    template.route_profile_status = Some(match &template.config.payload {
-        CreateDocumentPayload::RoCrate { jsonld } => {
-            validate_submission(
-                context.as_ref(),
-                template.config.document_id,
-                template.config.group_id,
-                jsonld,
-            )
-            .await?
-        }
-        CreateDocumentPayload::Scaffold { .. } => not_profiled_status(template.config.document_id),
-    });
-    let mut attempt = 0usize;
-    let created = loop {
-        match drive(template.fresh_copy(), context.as_ref()).await {
-            Ok(created) => break created,
-            Err(CreateDocumentError::StorageError(StorageError::TransactionConflict))
-                if attempt < CREATE_CONFLICT_RETRIES =>
-            {
-                tokio::time::sleep(conflict_backoff(
-                    attempt,
-                    &template.config.document_id.to_bytes(),
-                ))
-                .await;
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    };
-    schedule_projection_drain(context.as_ref(), std::time::Duration::ZERO)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    if let Some(task_handle) = context.task_handle.as_ref() {
-        task_handle
-            .send_effect(crate::metadata::materialization_queue::schedule_materialization())
-            .await;
-    }
-    Ok(created)
-}
-
-/// Mints from a local held bucket and a pre-provisioned binding.
-/// Missing holdership or bindings fail closed for routed handling.
-pub async fn mint_local_id(
-    context: &DriverContext,
-    config: &CreateDocumentConfig,
-) -> Result<MetaResourceId, CreateDocumentError> {
-    let realm_config = load_create_config(context, config.actor.realm_id).await?;
-    mint_document_for(
-        &realm_config,
-        &config.actor,
-        config.group_id,
-        &config.document_path,
-        false,
-    )
-}
-
-/// Mints a job-produced metadata document id with the blind placement.
-pub async fn mint_job_document(
-    context: &DriverContext,
-    actor: &Actor,
-    group_id: GroupId,
-    document_path: &str,
-) -> Result<MetaResourceId, CreateDocumentError> {
-    let realm_config = load_create_config(context, actor.realm_id).await?;
-    mint_document_for(&realm_config, actor, group_id, document_path, true)
-}
-
 /// Mints a local held-bucket id from an already-loaded config.
 pub fn mint_local_document(
     config: &RealmConfigDocument,
@@ -870,7 +787,7 @@ pub fn mint_forward_document(
     mint_document_for(config, actor, group_id, document_path, true)
 }
 
-fn mint_document_for(
+pub(super) fn mint_document_for(
     config: &RealmConfigDocument,
     actor: &Actor,
     group_id: GroupId,
@@ -978,36 +895,14 @@ fn id_generator() -> &'static Mutex<StructuredIdGenerator> {
     GENERATOR.get_or_init(|| Mutex::new(StructuredIdGenerator::new()))
 }
 
-async fn load_create_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<RealmConfigDocument, CreateDocumentError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Err(CreateDocumentError::PlacementBindingUnavailable(
-                "realm config document missing".to_string(),
-            ))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(CreateDocumentError::PlacementBindingUnavailable(format!(
-            "unexpected storage event reading realm config: {other:?}"
-        ))),
-    }
-}
-
 impl Operation for CreateDocumentOperation {
+    fn is_conflict(error: &CreateDocumentError) -> bool {
+        matches!(
+            error,
+            CreateDocumentError::StorageError(StorageError::TransactionConflict)
+        )
+    }
+
     type Output = CreateDocumentResult;
     type Error = CreateDocumentError;
 
@@ -1034,7 +929,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("metadata validation result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("metadata validation result", other.label().to_string())
+                }
             },
             CreateDocumentState::CheckExisting => {
                 match crate::metadata::repository::parse_registry_read(event) {
@@ -1057,7 +954,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("transaction start result", other.label().to_string())
+                }
             },
             CreateDocumentState::ReadCreateFence => match event {
                 Event::Storage(StorageEvent::BatchReadResult { values }) => {
@@ -1084,7 +983,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("create fence read result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("create fence read result", other.label().to_string())
+                }
             },
             CreateDocumentState::ReadPidFence => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -1111,7 +1012,9 @@ impl Operation for CreateDocumentOperation {
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("persistent id fence read", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("persistent id fence read", other.label().to_string())
+                }
             },
             CreateDocumentState::AppendCreateEvent => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -1121,7 +1024,7 @@ impl Operation for CreateDocumentOperation {
                     self.fail_without_cleanup(error.into())
                 }
                 other => {
-                    self.unexpected_event("metadata create event append", format!("{other:?}"))
+                    self.unexpected_event("metadata create event append", other.label().to_string())
                 }
             },
             CreateDocumentState::CommitTransaction => match event {
@@ -1156,7 +1059,9 @@ impl Operation for CreateDocumentOperation {
                     self.txn_id = None;
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("transaction commit result", other.label().to_string())
+                }
             },
             CreateDocumentState::Finish
             | CreateDocumentState::Error
@@ -1187,8 +1092,9 @@ impl Operation for CreateDocumentOperation {
 mod tests {
     use super::{
         CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
-        accepted_create_matches, create_metadata_document,
+        accepted_create_matches,
     };
+    use crate::metadata::create_entry::create_metadata_document;
 
     use std::sync::Arc;
 
@@ -2087,22 +1993,29 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let metadata_storage =
             FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             temp.join("meta"),
             node_id,
-            metadata_storage,
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            temp.join("meta"),
+            metadata_storage,
+            None,
+            Default::default(),
+        );
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         })
     }
 

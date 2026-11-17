@@ -4,12 +4,12 @@
 
 use super::*;
 use crate::auth::ValidatedBearer;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_operations::metadata::AuthToken;
-use aruna_operations::metadata::api::{
-    MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    query_select_limit,
+use aruna_operations::metadata::api::distributed_types::{
+    MetadataQueryForm as QueryForm, aggregate_query_results, query_select_limit,
 };
+use aruna_operations::metadata::api::path_types::deduplicate_fanout_nodes;
 use serde_json::json;
 use std::collections::BTreeMap;
 

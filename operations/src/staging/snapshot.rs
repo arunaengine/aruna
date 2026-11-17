@@ -2,30 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::connectors::descriptor::build_source_binding;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContextError, GateOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use crate::staging::snapshot_reuse::{SnapshotReuseError, SnapshotReuseOperation};
 use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
 use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
-};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::types::GroupId;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -58,7 +54,7 @@ pub struct MaterializeSnapshotResult {
     pub version_id: Ulid,
 }
 
-use aruna_core::structs::storage::blob::{BackendLocation, BlobLocationKey};
+use aruna_core::structs::storage::blob::BackendLocation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeSnapshotError {
@@ -106,15 +102,14 @@ pub async fn stage_snapshot_blob(
             .capabilities
             .push(format!("staging_retry:{retry_key}"));
     }
+    let reuse = SnapshotReuseOperation::new(
+        input.bucket.clone(),
+        input.key.clone(),
+        version_source.clone(),
+        read_result.metadata.content_length,
+    );
     if input.retry_key.is_some()
-        && let Some((location, version_id)) = find_snapshot(
-            context,
-            &input.bucket,
-            &input.key,
-            &version_source,
-            read_result.metadata.content_length,
-        )
-        .await?
+        && let Some((location, version_id)) = drive(reuse, context).await?
     {
         return Ok(MaterializeSnapshotResult {
             connector: read_result.connector,
@@ -178,73 +173,12 @@ pub async fn stage_snapshot_blob(
     })
 }
 
-async fn find_snapshot(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_source: &VersionSourceBinding,
-    content_length: u64,
-) -> Result<Option<(BackendLocation, Ulid)>, MaterializeSnapshotError> {
-    let head_key = BlobHeadKey::new(bucket, key).to_bytes()?.into();
-    let Some(pointer) = read_value(context, BLOB_HEAD_KEYSPACE, head_key)
-        .await?
-        .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-        .transpose()?
-    else {
-        return Ok(None);
-    };
-    let version_key = VersionKey::new(bucket, key, pointer.version_id)
-        .to_bytes()?
-        .into();
-    let Some(version) = read_value(context, BLOB_VERSIONS_KEYSPACE, version_key)
-        .await?
-        .map(|value| BlobVersion::from_bytes(value.as_ref()))
-        .transpose()?
-    else {
-        return Ok(None);
-    };
-    let BlobVersionState::Materialized {
-        blob_hash,
-        backend,
-        encoding,
-        source: Some(source),
-    } = version.state
-    else {
-        return Ok(None);
-    };
-    if &source != version_source {
-        return Ok(None);
-    }
-    let location_key = BlobLocationKey::new(blob_hash, encoding, backend)
-        .to_bytes()
-        .into();
-    let Some(location) = read_value(context, BLOB_LOCATIONS_KEYSPACE, location_key)
-        .await?
-        .map(|value| BackendLocation::from_bytes(value.as_ref()))
-        .transpose()?
-    else {
-        return Ok(None);
-    };
-    Ok((location.blob_size == content_length).then_some((location, pointer.version_id)))
-}
-
-async fn read_value(
-    context: &DriverContext,
-    key_space: &str,
-    key: Key,
-) -> Result<Option<Value>, MaterializeSnapshotError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError("unexpected event".to_string()).into()),
+impl From<SnapshotReuseError> for MaterializeSnapshotError {
+    fn from(error: SnapshotReuseError) -> Self {
+        match error {
+            SnapshotReuseError::Storage(error) => MaterializeSnapshotError::Storage(error),
+            SnapshotReuseError::Conversion(error) => MaterializeSnapshotError::Conversion(error),
+        }
     }
 }
 

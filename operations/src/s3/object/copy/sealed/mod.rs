@@ -10,9 +10,6 @@ use crate::distribution::guard::{GuardError, WriteAuthority, record_authority, r
 use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
-};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
@@ -21,6 +18,9 @@ use crate::s3::abe_copies::{copy_row, still_active};
 use crate::s3::abe_rekey::RekeyProgress;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_publication, publication_read};
+use crate::s3::usage::{
+    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
+};
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

@@ -171,8 +171,10 @@ mod tests {
             net_handle: Some(net),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         (dir, context)
     }

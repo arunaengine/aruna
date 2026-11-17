@@ -47,17 +47,18 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
-use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::route_metadata_create;
-use crate::metadata::get_document::load_document_record;
+use crate::metadata::create_entry::mint_job_document;
+use crate::metadata::forward::write::route_metadata_create;
+use crate::metadata::record_reads::load_document_record;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use crate::replication::protocol::LocationSummaryRequest;
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::metadata::AuthToken;
 
 /// Run the follow-on run-crate obligation for a finished execution job. A failure
 /// records a durable status and never fails the parent; this internal job succeeds
@@ -2071,7 +2072,8 @@ mod tests {
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-        use crate::metadata::profile::shacl::{ProfileShaclEngine, ProfileShapes};
+        use aruna_core::profile_shapes::ProfileShapes;
+        use aruna_graph::ProfileShaclEngine;
 
         let (record, spec) = execution_record();
         // An input from a device carries its provenance entity, which the shapes must accept.

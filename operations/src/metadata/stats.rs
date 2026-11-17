@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
 use aruna_core::effects::{IterStart, StorageEffect};
@@ -15,14 +16,16 @@ use serde_json::Value;
 
 use super::api::MetadataApiError;
 use super::repository::StorageReadError;
-use crate::driver::DriverContext;
-use crate::metadata::get_document::record_materialized_read;
+use crate::driver::{DriverContext, drive};
+use crate::metadata::live_records::LiveRecordsOperation;
+use crate::metadata::profile::rules::{
+    PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
+};
+use crate::metadata::record_reads::record_materialized_read;
 use aruna_core::metadata::CRATE_PROFILE_IRI;
 
 const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
-const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
-const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupDocumentCounts {
@@ -38,15 +41,13 @@ pub async fn count_realm_documents(
     context: &DriverContext,
     realm_id: RealmId,
 ) -> Result<Option<u64>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return Ok(None);
-    };
-    let records = metadata_handle
-        .list_cached_records()
+    }
+    let records = crate::metadata::list_cached_records(context)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records =
-        super::api::filter_live_records(&context.storage_handle, records.as_ref()).await?;
+    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context).await?;
     Ok(Some(
         records
             .iter()
@@ -71,7 +72,7 @@ pub async fn count_realm_groups(
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(MetadataApiError::Internal(error.to_string()));
         }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
+        other => return Err(MetadataApiError::Internal(other.label().to_string())),
     };
 
     let mut count = 0_u64;
@@ -118,7 +119,7 @@ pub async fn count_realm_groups(
             Event::Storage(StorageEvent::Error { error }) => {
                 break Err(MetadataApiError::Internal(error.to_string()));
             }
-            other => break Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => break Err(MetadataApiError::Internal(other.label().to_string())),
         }
     };
 
@@ -135,7 +136,7 @@ pub async fn count_realm_groups(
             Event::Storage(StorageEvent::Error { error }) => {
                 Err(MetadataApiError::Internal(error.to_string()))
             }
-            other => Err(MetadataApiError::Internal(format!("{other:?}"))),
+            other => Err(MetadataApiError::Internal(other.label().to_string())),
         },
     }
 }
@@ -148,41 +149,34 @@ pub async fn count_group_purpose(
     realm_id: RealmId,
     group_id: GroupId,
 ) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.clone() else {
+    if context.metadata_handle.is_none() {
         return Ok(None);
-    };
-    let records = metadata_handle
-        .list_cached_group(group_id)
+    }
+    let records = crate::metadata::list_cached_group(context, group_id)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records = super::api::filter_live_records(&context.storage_handle, records.as_ref())
+    let records = drive(LiveRecordsOperation::new(records.to_vec(), None), context)
         .await?
         .into_iter()
         .filter(|record| record.realm_id == realm_id && record.group_id == group_id)
         .collect::<Vec<_>>();
 
-    let classifications = stream::iter(records.into_iter().map(|record| {
-        let metadata_handle = metadata_handle.clone();
-        async move {
-            if !record_materialized_read(context, &record)
-                .await
-                .map_err(|error| match error {
-                    StorageReadError::Storage(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                    StorageReadError::Conversion(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                })?
-            {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            let summary = metadata_handle
-                .export_summary_jsonld(record.graph_iri.clone())
-                .await
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            classify_root_summary(&summary, &record.graph_iri)
+    let classifications = stream::iter(records.into_iter().map(|record| async move {
+        if !record_materialized_read(context, &record)
+            .await
+            .map_err(|error| match error {
+                StorageReadError::Storage(error) => MetadataApiError::Internal(error.to_string()),
+                StorageReadError::Conversion(error) => {
+                    MetadataApiError::Internal(error.to_string())
+                }
+            })?
+        {
+            return Err(MetadataApiError::ServiceUnavailable);
         }
+        let summary = crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
+            .await
+            .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
+        classify_root_summary(&summary, &record.graph_iri)
     }))
     .buffered(SUMMARY_FANOUT_LIMIT)
     .collect::<Vec<_>>()
@@ -241,83 +235,6 @@ pub(crate) fn classify_root_summary(
     Ok(DocumentPurpose::Dataset)
 }
 
-/// Classifies the validated create payload before projection. Imported crates
-/// may still name their root as `./`, so fall back to the descriptor's `about`
-/// target when the final graph IRI is not present yet.
-pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, String> {
-    let document: Value = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
-    let graph = document
-        .get("@graph")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "RO-Crate has no @graph".to_string())?;
-    let descriptor_root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some("ro-crate-metadata.json"))
-        .and_then(|descriptor| {
-            [
-                "about",
-                "http://schema.org/about",
-                "https://schema.org/about",
-            ]
-            .into_iter()
-            .find_map(|key| descriptor.get(key))
-        })
-        .and_then(|about| about.get("@id"))
-        .and_then(Value::as_str);
-    let root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(graph_iri))
-        .or_else(|| {
-            descriptor_root.and_then(|root_id| {
-                graph
-                    .iter()
-                    .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(root_id))
-            })
-        })
-        .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
-    Ok(jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI))
-}
-
-fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
-    match value {
-        Some(Value::Array(values)) => {
-            for value in values {
-                collect_conforms_terms(Some(value), terms);
-            }
-        }
-        Some(Value::Object(entries)) => {
-            for (term, definition) in entries {
-                let iri = match definition {
-                    Value::String(iri) => Some(iri.as_str()),
-                    Value::Object(definition) => definition.get("@id").and_then(Value::as_str),
-                    _ => None,
-                };
-                if iri == Some(DCTERMS_CONFORMS_IRI) {
-                    terms.insert(term.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
-    match value {
-        Some(Value::String(value)) => value == expected,
-        Some(Value::Array(values)) => values
-            .iter()
-            .any(|value| jsonld_contains_iri(Some(value), expected)),
-        Some(Value::Object(value)) => {
-            value
-                .get("@id")
-                .or_else(|| value.get("id"))
-                .and_then(Value::as_str)
-                == Some(expected)
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::testing::write_entries;
@@ -358,22 +275,29 @@ mod tests {
         let storage = FjallStorage::open(storage_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             metadata_dir.path(),
             node_id,
-            storage.clone(),
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         Fixture {
             _storage_dir: storage_dir,
@@ -467,9 +391,9 @@ mod tests {
                 root
             ]
         });
-        let handle = fixture.context.metadata_handle.as_ref().unwrap();
-        match handle
-            .send_metadata_effect(MetadataEffect::ApplyRoCrate {
+        match crate::metadata::send_metadata_effect(
+            &fixture.context,
+            MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
                     graph_iri: record.graph_iri.clone(),
                     jsonld: jsonld.to_string(),
@@ -480,8 +404,9 @@ mod tests {
                     durability: MetadataRequestDurability::Durable,
                     deterministic_actor: None,
                 },
-            })
-            .await
+            },
+        )
+        .await
         {
             Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {}
             other => panic!("unexpected metadata event: {other:?}"),
@@ -668,8 +593,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert_eq!(

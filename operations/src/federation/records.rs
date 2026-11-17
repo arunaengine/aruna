@@ -21,16 +21,14 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::export::GrantRecord;
 use aruna_core::structs::execution::job::{upload_key, upload_stale};
-
-const CONFLICT_RETRIES: u8 = 5;
+use aruna_core::transfer::GrantRecord;
 
 type Writes = Vec<(String, Key, Value)>;
 
 /// One conditional change of a transfer record.
 #[derive(Clone, Debug, PartialEq)]
-pub enum RecordChange {
+pub(crate) enum RecordChange {
     /// Stores a grant record unless one exists; the stored one wins.
     StoreGrant { key: Vec<u8>, record: GrantRecord },
     /// Sets the revoked flag of a grant record; nothing clears it.
@@ -49,9 +47,21 @@ pub enum RecordChange {
     ConsumeConfirmation { record_key: Vec<u8> },
 }
 
+impl RecordChange {
+    /// The record key the change reads and writes; it also seeds the runner's retry backoff.
+    pub(crate) fn key(&self) -> &[u8] {
+        match self {
+            RecordChange::StoreGrant { key, .. }
+            | RecordChange::RevokeGrant { key }
+            | RecordChange::BindImport { key, .. }
+            | RecordChange::ConsumeConfirmation { record_key: key } => key,
+        }
+    }
+}
+
 /// A bound upload the caller found stale, checked again inside the binding transaction.
 #[derive(Clone, Debug, PartialEq)]
-pub struct StaleUpload {
+pub(crate) struct StaleUpload {
     pub upload_id: Ulid,
     /// The job dedup index key of the import key; its job keeps a gone upload bound.
     pub dedup_key: Vec<u8>,
@@ -59,7 +69,7 @@ pub struct StaleUpload {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum RecordOutcome {
+pub(crate) enum RecordOutcome {
     /// The stored grant record: the new one or an earlier winner.
     Grant(GrantRecord),
     /// Whether a grant record existed to revoke.
@@ -78,6 +88,8 @@ pub enum RecordError {
     Invalid(String),
     #[error("unexpected transfer record event")]
     Unexpected,
+    #[error("transfer record change lost a transaction conflict")]
+    Conflict,
 }
 
 #[derive(Debug, PartialEq)]
@@ -91,11 +103,10 @@ enum State {
 }
 
 #[derive(Debug, PartialEq)]
-pub struct RecordOperation {
+pub(crate) struct RecordOperation {
     change: RecordChange,
     state: State,
     txn_id: Option<TxnId>,
-    conflicts: u8,
     /// The bound upload this attempt confirmed stale, with the writes that retire it.
     confirmed: Option<(Ulid, Writes)>,
     pending: Option<RecordOutcome>,
@@ -118,7 +129,6 @@ impl RecordOperation {
             change,
             state: State::Start,
             txn_id: None,
-            conflicts: 0,
             confirmed: None,
             pending: None,
             output: None,
@@ -129,15 +139,6 @@ impl RecordOperation {
         self.output = Some(Err(error));
         self.state = State::Finish;
         self.abort()
-    }
-
-    fn key(&self) -> &[u8] {
-        match &self.change {
-            RecordChange::StoreGrant { key, .. }
-            | RecordChange::RevokeGrant { key }
-            | RecordChange::BindImport { key, .. }
-            | RecordChange::ConsumeConfirmation { record_key: key } => key,
-        }
     }
 
     /// The writes and outcome for the stored value of the key.
@@ -316,7 +317,7 @@ impl Operation for RecordOperation {
             (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
                 self.txn_id = Some(txn_id);
                 self.state = State::Read;
-                let key: Key = self.key().to_vec().into();
+                let key: Key = self.change.key().to_vec().into();
                 // A stale upload is read in this transaction, so a racing claim conflicts.
                 if let Some(stale) = self.stale() {
                     let reads = vec![
@@ -359,16 +360,15 @@ impl Operation for RecordOperation {
                 self.output = Some(self.pending.take().ok_or(RecordError::Unexpected));
                 smallvec![]
             }
-            // A racing writer committed first: reread and decide again.
+            // A racing writer committed first: the runner reruns the change, which rereads.
             (
                 State::Commit,
                 Event::Storage(StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 }),
-            ) if self.conflicts < CONFLICT_RETRIES => {
+            ) => {
                 self.txn_id = None;
-                self.conflicts += 1;
-                self.start()
+                self.fail(RecordError::Conflict)
             }
             (_, Event::Storage(StorageEvent::Error { error })) => {
                 if self.state == State::Commit {
@@ -386,6 +386,10 @@ impl Operation for RecordOperation {
 
     fn finalize(self) -> Result<RecordOutcome, RecordError> {
         self.output.unwrap_or(Err(RecordError::Unexpected))
+    }
+
+    fn is_conflict(error: &RecordError) -> bool {
+        *error == RecordError::Conflict
     }
 
     fn abort(&mut self) -> Effects {
@@ -472,7 +476,7 @@ mod tests {
             key: b"grant".to_vec(),
             record: record.clone(),
         };
-        let mut operation = RecordOperation::new(change);
+        let mut operation = RecordOperation::new(change.clone());
         operation.start();
         operation.step(started(1));
         let effects = operation.step(read(None));
@@ -484,11 +488,16 @@ mod tests {
             entries: Vec::new(),
         }));
         let conflict = StorageError::TransactionConflict;
-        let effects = operation.step(Event::Storage(StorageEvent::Error { error: conflict }));
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::StartTransaction { .. })
-        ));
+        assert!(
+            operation
+                .step(Event::Storage(StorageEvent::Error { error: conflict }))
+                .is_empty()
+        );
+        let error = operation.finalize().unwrap_err();
+        assert!(RecordOperation::is_conflict(&error));
+        // The runner's retry runs a fresh change, which rereads the record.
+        let mut operation = RecordOperation::new(change);
+        operation.start();
         operation.step(started(2));
         let revoked = GrantRecord {
             revoked: true,
@@ -625,6 +634,9 @@ mod tests {
         }));
         let conflict = StorageError::TransactionConflict;
         operation.step(Event::Storage(StorageEvent::Error { error: conflict }));
+        assert_eq!(operation.finalize(), Err(RecordError::Conflict));
+        let mut operation = RecordOperation::new(binding(stale(old)));
+        operation.start();
         operation.step(started(2));
         upload.claimed_by = Some(aruna_core::structs::execution::job::JobId::from_bytes(
             [7; 16],

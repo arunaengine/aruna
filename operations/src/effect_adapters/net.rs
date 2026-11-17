@@ -2,17 +2,78 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
+use aruna_core::alpn::Alpn;
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{
-    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, VaultSignEvent,
+    Event, JobControlEvent, NetError, NetEvent, PolicySignEvent, SnapshotSignEvent,
+    StatementSignEvent, VaultSignEvent,
 };
 use aruna_core::handle::Handle;
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, HeartbeatEffect, HeartbeatEvent, HolderFacts};
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
+use aruna_net::NetHandle;
+use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 
 use crate::driver::DriverContext;
 
-const NO_TRANSPORT: &str = "net transport unavailable";
+/// Why signing fails on a node without a net handle, which holds the node key.
+const UNAVAILABLE: &str = "net transport unavailable";
+/// Records, sends or keeps one heartbeat with the net handle; a send is cut off after
+/// [`HEARTBEAT_IO_TIMEOUT`].
+pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &DriverContext) -> Event {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return Event::Net(NetEvent::Error(NetError::ChannelClosed));
+    };
+    let event = match effect {
+        HeartbeatEffect::Record(heartbeat) => {
+            net_handle.record_own_heartbeat(heartbeat);
+            HeartbeatEvent::Peers(net_handle.realm_peers().await)
+        }
+        HeartbeatEffect::Push { peer, frame } => {
+            match timeout(HEARTBEAT_IO_TIMEOUT, push_frame(net_handle, peer, &frame)).await {
+                Ok(Ok(())) => HeartbeatEvent::Pushed,
+                Ok(Err(error)) => HeartbeatEvent::PushFailed(error),
+                Err(_) => HeartbeatEvent::PushFailed("timed out".to_string()),
+            }
+        }
+        HeartbeatEffect::Store { peer, heartbeat } => {
+            HeartbeatEvent::Stored(net_handle.record_heartbeat(peer, *heartbeat))
+        }
+        HeartbeatEffect::Holders { holders, now_ms } => {
+            let avoid_list = net_handle.avoided_holders();
+            let avoided = (holders.iter())
+                .filter(|holder| avoid_list.avoided(holder, now_ms))
+                .copied()
+                .collect();
+            let held = (net_handle.held_heartbeats().into_iter())
+                .filter(|held| holders.contains(&held.node_id))
+                .collect();
+            HeartbeatEvent::Holders(Box::new(HolderFacts {
+                local: net_handle.node_id(),
+                realm_id: *net_handle.realm_id(),
+                held,
+                avoided,
+            }))
+        }
+    };
+    Event::Net(NetEvent::Heartbeat(event))
+}
+
+async fn push_frame(net_handle: &NetHandle, peer: NodeId, frame: &[u8]) -> Result<(), String> {
+    let mut stream = net_handle
+        .open_stream(peer, Alpn::Heartbeat)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream
+        .0
+        .write_all(frame)
+        .await
+        .map_err(|error| error.to_string())?;
+    stream.0.finish().map_err(|error| error.to_string())
+}
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     if let NetEffect::DocumentSync(DocumentEffect::ReconcileTopics { topics }) = effect {
@@ -33,10 +94,16 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             }
             // Sign effects keep their own unavailable answer, as when the runner signed them.
             NetEffect::PolicySign(_) => Event::Net(NetEvent::PolicySign(
-                PolicySignEvent::Unavailable(NO_TRANSPORT.to_string()),
+                PolicySignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
-                VaultSignEvent::Unavailable(NO_TRANSPORT.to_string()),
+                VaultSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
+                SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::StatementSign(_) => Event::Net(NetEvent::StatementSign(
+                StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
             )),
             NetEffect::JobControl(_) => {
                 Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(

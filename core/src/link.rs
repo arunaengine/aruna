@@ -11,6 +11,7 @@ use ulid::Ulid;
 
 use crate::UserId;
 use crate::federation::{FederationError, Signable, Signed};
+use crate::structs::identity::auth::{AuthContext, SessionKind};
 use crate::structs::identity::realm::RealmId;
 
 pub const LINK_DOMAIN: &str = "aruna-link-confirmation-v1";
@@ -99,6 +100,17 @@ pub fn check_confirmation(
         return Err(LinkError::BadLifetime);
     }
     Ok(())
+}
+
+/// An unrestricted portal session of a local account whose primary login was at most
+/// `MAX_LINK_SECS` ago; renewals keep that time and child sessions have none.
+pub fn fresh_local(auth: &AuthContext, auth_time: Option<u64>, now: u64) -> bool {
+    let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
+    portal
+        && auth.path_restrictions.is_none()
+        && auth.user_id.realm_id == auth.realm_id
+        && !auth.user_id.is_nil()
+        && auth_time.is_some_and(|login| login.saturating_add(MAX_LINK_SECS) >= now)
 }
 
 #[cfg(test)]

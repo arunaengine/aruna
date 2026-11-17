@@ -4,10 +4,13 @@
 
 pub mod api;
 pub mod audit;
+pub mod audit_entry;
 pub(crate) mod builtin;
-pub mod checkpoint;
+pub(crate) mod checkpoint;
+pub(crate) mod checkpoint_window;
 pub mod contact;
 pub mod create_document;
+pub mod create_entry;
 pub(crate) mod data_links;
 pub mod delete_document;
 pub mod device_pull;
@@ -16,11 +19,17 @@ pub mod forward;
 pub(crate) mod frames;
 pub mod get_document;
 pub mod global_entries;
+pub(crate) mod graph_deleted;
 pub(crate) mod handle;
+pub mod id_mapping;
+pub mod identifier_lookup;
 mod iri_index;
 pub mod list_documents;
+pub(crate) mod live_records;
 pub mod materialization_queue;
+pub(crate) mod object_version;
 pub mod persistent_id;
+pub(crate) mod pid_transition;
 pub mod profile;
 pub mod projector;
 pub(crate) mod protocol;
@@ -29,25 +38,22 @@ pub mod prune_queue;
 pub mod public_preview;
 mod query_cache;
 mod queue_storage;
+pub(crate) mod raw_events;
 pub mod raw_revision;
+pub mod record_reads;
 pub mod repository;
+pub(crate) mod revision_read;
 mod search_cursor;
-mod search_enrichment;
 pub mod secondary_ids;
 pub mod stats;
 mod summary_cache;
-#[cfg(test)]
-mod tests;
 pub mod timestamp_index;
+pub(crate) mod timestamp_sweep;
 pub mod update_document;
+pub mod update_entry;
+pub(crate) mod updated_page;
 pub mod visibility_index;
-
-use std::sync::Arc;
-
-use aruna_tasks::shutdown::Shutdown;
-use tracing::warn;
-
-use crate::driver::DriverContext;
+pub mod warmup;
 
 /// The phase-time and identity samples a metadata operation stamps records
 /// with. Production keeps the defaults and samples per phase; tests replace the
@@ -96,27 +102,13 @@ impl MetadataPhaseSource {
 
 pub use builtin::builtin_shapes;
 pub use contact::{PEER_CONTACT_WINDOW, PeerContacts};
-pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
-pub(crate) use handle::{WritePeerError, transport_message_kind};
-pub use protocol::{
-    AuthToken, AuthTokenError, MetadataPathWinner, MetadataReadError, PersistentIdResolution,
+pub use handle::{
+    MetadataHandle, MetadataHandleOptions, export_rocrate_jsonld, list_cached_group,
+    list_cached_records, query_authorized_local, search_authorized_local, send_metadata_effect,
+    warm_caches,
 };
-
-/// Primes the metadata caches off the boot path so the first user query
-/// finds them warm. Never blocks startup.
-pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
-    timestamp_index::spawn_index_sweep(Arc::clone(&context), shutdown);
-    visibility_index::spawn_visibility_index(Arc::clone(&context), shutdown);
-    shutdown.spawn(async move {
-        let Some(handle) = context.metadata_handle.clone() else {
-            return;
-        };
-        if let Err(error) = handle.warm_caches().await {
-            warn!(error = %error, "Metadata visibility cache warmup failed");
-            return;
-        }
-        if let Err(error) = iri_index::rebuild_index(&context).await {
-            warn!(error = %error, "Metadata IRI reference index rebuild failed");
-        }
-    });
-}
+pub(crate) use handle::{
+    WritePeerError, export_rocrate_page, export_summary_jsonld, list_group_records,
+    prune_if_deleted, search_local_filtered, transport_message_kind,
+};
+pub use protocol::{MetadataPathWinner, MetadataReadError, PersistentIdResolution};

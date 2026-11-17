@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::materialization_queue::metadata_graph_deleted;
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::repository::schedule_prune_drain;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,7 @@ use thiserror::Error;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::repository::link_queue::queue_deleted;
 
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -79,31 +80,7 @@ impl From<MetadataQueueError> for MetadataGraphError {
     }
 }
 
-pub fn new_prune_job(graph_iri: String, due_at_ms: u64) -> GraphPruneRecord {
-    GraphPruneRecord::new(graph_iri, due_at_ms)
-}
-
-pub fn write_prune_effect(
-    record: &GraphPruneRecord,
-    txn_id: Option<Ulid>,
-) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = graph_prune_entry(record)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id,
-    }))
-}
-
-pub fn schedule_prune_drain() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainPruneQueue,
-        after: Duration::ZERO,
-    })
-}
-
-pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     match next_prune_timer(storage).await {
         Ok(None) => {}
         Ok(Some(after)) => {
@@ -121,7 +98,7 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
     }
 }
 
-pub async fn next_prune_timer(
+pub(crate) async fn next_prune_timer(
     storage: &StorageHandle,
 ) -> Result<Option<Duration>, MetadataGraphError> {
     let now_ms = unix_timestamp_millis();
@@ -182,7 +159,9 @@ pub async fn prune_jobs_exist(storage: &StorageHandle) -> Result<bool, MetadataG
             }
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
     }
@@ -241,11 +220,11 @@ pub async fn process_prune_batch(
     })
 }
 
-pub async fn enqueue_prune_job(
+pub(crate) async fn enqueue_prune_job(
     context: &DriverContext,
     graph_iri: String,
 ) -> Result<(), MetadataGraphError> {
-    let job = new_prune_job(graph_iri, unix_timestamp_millis());
+    let job = GraphPruneRecord::new(graph_iri, unix_timestamp_millis());
     write_prune_job(&context.storage_handle, &job).await?;
     if let Some(task_handle) = context.task_handle.as_ref() {
         match task_handle.send_effect(schedule_prune_drain()).await {
@@ -254,7 +233,9 @@ pub async fn enqueue_prune_job(
                 return Err(MetadataGraphError::UnexpectedEvent(message));
             }
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
     }
@@ -285,13 +266,10 @@ pub async fn process_graph_tombstones(
         }
         result.enqueued = result.enqueued.saturating_add(1);
 
-        let Some(metadata_handle) = metadata_handle.as_ref() else {
+        if metadata_handle.is_none() {
             continue;
-        };
-        match metadata_handle
-            .prune_if_deleted(tombstone.graph_iri.clone())
-            .await
-        {
+        }
+        match crate::metadata::prune_if_deleted(context, tombstone.graph_iri.clone()).await {
             Ok(true) => result.pruned = result.pruned.saturating_add(1),
             Ok(false) => {}
             Err(error) => {
@@ -340,14 +318,17 @@ async fn process_prune_job(
 ) -> Result<ProcessedJobGroup, MetadataGraphError> {
     let job_keys = jobs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>();
     let job = representative_job(&graph_iri, &jobs);
-    if !metadata_graph_deleted::<MetadataGraphError>(&context.storage_handle, &graph_iri).await? {
+    let deleted = drive(GraphDeletedOperation::new(&graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataGraphError>)?;
+    if !deleted {
         return Ok(ProcessedJobGroup {
             completed_keys: job_keys,
             processed: 0,
         });
     }
 
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         reschedule_prune_job(
             &context.storage_handle,
             &job_keys,
@@ -359,10 +340,10 @@ async fn process_prune_job(
             completed_keys: Vec::new(),
             processed: 1,
         });
-    };
+    }
 
     // A retry after a failed link queueing finds the graph already pruned, so it queues again.
-    let pruned = match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
+    let pruned = match crate::metadata::prune_if_deleted(context, graph_iri.clone()).await {
         Ok(_) => queue_deleted(context, &graph_iri)
             .await
             .map_err(|error| format!("queueing the repository links failed: {error}")),
@@ -388,7 +369,7 @@ fn representative_job(graph_iri: &str, jobs: &[(Vec<u8>, GraphPruneRecord)]) -> 
         .map(|(_, job)| job)
         .max_by_key(|job| (job.attempts, job.due_at_ms))
         .cloned()
-        .unwrap_or_else(|| new_prune_job(graph_iri.to_string(), unix_timestamp_millis()))
+        .unwrap_or_else(|| GraphPruneRecord::new(graph_iri.to_string(), unix_timestamp_millis()))
 }
 
 async fn scan_due_prune(
@@ -416,7 +397,9 @@ async fn scan_due_prune(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -505,7 +488,9 @@ async fn write_prune_job(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -580,7 +565,9 @@ async fn find_decoded_prune(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}")));
+                return Err(MetadataGraphError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -701,7 +688,9 @@ async fn transactional_batch_write(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -722,7 +711,9 @@ async fn transactional_batch_delete(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -742,7 +733,9 @@ async fn delete_batch_entries(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataGraphError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataGraphError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -852,22 +845,29 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             metadata_dir.path(),
             node_id,
-            storage.clone(),
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle.clone()),
+            graph_handle: Some(graph_handle.clone()),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let record = registry_record(Ulid::from_parts(8, 1), "docs/tombstoned");
         write_entries(
@@ -876,8 +876,7 @@ mod tests {
         )
         .await;
         metadata_handle.expire_visibility_caches();
-        let stale = metadata_handle
-            .list_cached_group(record.group_id)
+        let stale = crate::metadata::list_cached_group(&context, record.group_id)
             .await
             .expect("registry cache fills");
         assert_eq!(stale.as_ref(), &vec![record.clone()]);
@@ -897,8 +896,7 @@ mod tests {
         let processed = process_graph_tombstones(&context, vec![tombstone.clone()]).await;
 
         assert_eq!(processed.enqueued, 1);
-        let listed = metadata_handle
-            .list_cached_group(record.group_id)
+        let listed = crate::metadata::list_cached_group(&context, record.group_id)
             .await
             .expect("registry cache reads");
         assert!(listed.is_empty());
@@ -915,22 +913,29 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             metadata_dir.path(),
             node_id,
-            storage.clone(),
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            storage.clone(),
+            None,
+            Default::default(),
+        );
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let record = registry_record(Ulid::from_parts(9, 1), "docs/deleted");
         let index_key = aruna_core::storage_entries::iri_reference_key(
@@ -974,15 +979,17 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
-        let job = new_prune_job("urn:graph:not-deleted".to_string(), 1);
+        let job = GraphPruneRecord::new("urn:graph:not-deleted".to_string(), 1);
         write_entries(&storage, vec![graph_prune_entry(&job).expect("job entry")]).await;
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_prune_batch(&context).await.expect("queue drains");
@@ -1011,8 +1018,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_prune_batch(&context)
@@ -1030,7 +1039,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let corrupt_key = vec![0];
-        let valid_job = new_prune_job("urn:graph:valid".to_string(), 1);
+        let valid_job = GraphPruneRecord::new("urn:graph:valid".to_string(), 1);
         write_entries(
             &storage,
             vec![
@@ -1226,7 +1235,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let graph_iri = "urn:graph:deleted";
-        let job = new_prune_job(graph_iri.to_string(), 1);
+        let job = GraphPruneRecord::new(graph_iri.to_string(), 1);
         write_entries(
             &storage,
             vec![
@@ -1240,8 +1249,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_prune_batch(&context)
@@ -1267,7 +1278,7 @@ mod tests {
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
 
         assert!(!prune_jobs_exist(&storage).await.unwrap());
-        let job = new_prune_job("urn:graph:queued".to_string(), 1);
+        let job = GraphPruneRecord::new("urn:graph:queued".to_string(), 1);
         write_entries(&storage, vec![graph_prune_entry(&job).expect("job entry")]).await;
 
         assert!(prune_jobs_exist(&storage).await.unwrap());

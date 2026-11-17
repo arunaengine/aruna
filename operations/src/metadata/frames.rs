@@ -13,7 +13,7 @@ use super::protocol::{
     decode_message, encode_message, frame_class, is_audit_variant, parse_variant,
 };
 
-pub async fn write_message(
+pub(crate) async fn write_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
 ) -> Result<(), String> {

@@ -28,8 +28,9 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_write};
 use crate::forward::fetch::FanoutOperation;
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::realm::peer_trust::is_sync_eligible;
+use aruna_core::metadata::AuthToken;
 
 use super::check::CheckOperation;
 use super::commit::CommitOperation;

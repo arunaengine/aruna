@@ -21,11 +21,12 @@ use ulid::Ulid;
 
 use super::create::submit;
 use super::sign_statement;
-use crate::driver::DriverContext;
-use crate::node::heartbeat::fresh_heartbeats;
+use crate::driver::{DriverContext, drive};
+use crate::s3::usage::LoadCountersOperation;
+use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
 
 /// How long a node waits after proposing a transfer before it proposes the next one.
-pub const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
+const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
 /// A node balances only once it holds this many permille more than the set's average.
 const MARGIN_PERMILLE: u64 = 1100;
 
@@ -102,7 +103,8 @@ pub async fn balance_set(
     if cooling {
         return;
     }
-    let mut fill: BTreeMap<NodeId, u64> = fresh_heartbeats(context.net_handle.as_ref())
+    let mut fill: BTreeMap<NodeId, u64> = context
+        .fresh_heartbeats()
         .into_iter()
         .filter_map(|(node_id, held)| {
             let utilization = held.heartbeat.utilization;
@@ -111,7 +113,8 @@ pub async fn balance_set(
         })
         .collect();
     let capacity = crate::driver::node_routing(context).catalog.capacity();
-    match crate::node::usage_stats::read_local_global(&context.storage_handle, None).await {
+    let global = LoadCountersOperation::new(USAGE_GLOBAL_KEY.to_vec());
+    match drive(global, context).await {
         Ok(usage) => match permille(usage.stored_bytes, capacity) {
             Some(own) => fill.insert(local, own),
             None => return,
@@ -139,7 +142,10 @@ pub async fn balance_set(
         signer: local,
         statement,
     };
-    let signed = match sign_statement(context, claim) {
+    let signed = match context.net_handle.as_ref().map_or_else(
+        || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+        |net| net.sign_statement(claim),
+    ) {
         StatementSignEvent::Signed(signed) => *signed,
         StatementSignEvent::Unavailable(reason) => {
             warn!(%reason, "A balancing transfer could not be signed");

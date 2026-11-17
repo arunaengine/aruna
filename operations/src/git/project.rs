@@ -8,7 +8,7 @@ use crate::driver::DriverContext;
 use aruna_blob::git::GitStore;
 use aruna_core::NodeId;
 use aruna_core::UserId;
-use aruna_core::git::{DocumentLocks, GitChange, GitEffect, GitEvent, GitRecord, record_writes};
+use aruna_core::git::{GitChange, GitEffect, GitEvent, GitRecord, record_writes};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::telemetry::time_stage;
@@ -16,20 +16,7 @@ use lru::LruCache;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::sync::{LazyLock, Mutex};
-use tokio::sync::OwnedMutexGuard;
 use ulid::Ulid;
-
-static LOCKS: LazyLock<DocumentLocks> = LazyLock::new(DocumentLocks::default);
-
-/// Serializes projection, snapshots and pushes of one document on this node.
-pub async fn lock(document_id: Ulid) -> OwnedMutexGuard<()> {
-    aruna_core::telemetry::time_stage("git_document_lock", LOCKS.lock(document_id)).await
-}
-
-/// The lock when it is free; reads use it to avoid waiting for a running snapshot.
-pub fn try_lock(document_id: Ulid) -> Option<OwnedMutexGuard<()>> {
-    LOCKS.try_lock(document_id)
-}
 
 /// The last completed projection of the document on this node, whatever changed since.
 pub fn last(document_id: Ulid) -> Option<Projection> {

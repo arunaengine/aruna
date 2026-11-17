@@ -27,7 +27,9 @@ pub(super) async fn start_write_transaction(
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataQueueError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -41,7 +43,9 @@ pub(super) async fn commit_storage_transaction(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataQueueError::UnexpectedEvent(format!("{other:?}"))),
+        other => Err(MetadataQueueError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 

@@ -7,6 +7,7 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::resolve_scope;
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -16,7 +17,6 @@ use aruna_operations::auth::request_authorization::authorize;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::metadata::AuthToken;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::sync::mirror_repair::{

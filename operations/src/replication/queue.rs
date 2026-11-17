@@ -3681,8 +3681,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         process_live_obligations(&context)
             .await
@@ -3699,8 +3701,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -3724,8 +3728,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -3753,8 +3759,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let queue = || drive(QueueBlobOperation::new(on_demand_input(), None), &context);
         queue().await.expect("first queue succeeds");
@@ -3777,8 +3785,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let retired = BlobJobRecord::new(on_demand_input(), None, 7);
         let replaced = BlobJobRecord::new(on_demand_input(), None, 7);
@@ -3811,8 +3821,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
@@ -4012,8 +4024,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let relationship_id = Ulid::from(77u128);
         let mut relationship = relationship(77, 2, None, true);
@@ -4082,8 +4096,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(
             QueueBlobOperation::new_relationship(on_demand_input(), None, Ulid::from(78u128)),
@@ -4112,8 +4128,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut job = BlobJobRecord::new(on_demand_input(), None, 0).with_member(MemberTarget {
             set_id: Ulid::from_parts(3, 3),
@@ -4156,8 +4174,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(
             QueueBlobOperation::new_relationship(on_demand_input(), None, relationship.id),
@@ -4250,8 +4270,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(
             QueueBlobOperation::new_relationship(
@@ -4325,8 +4347,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let relationship = relationship(83, 2, None, true);
@@ -4361,8 +4385,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let stored = store_relationship(&context, relationship(84, 2, None, true))
@@ -4435,8 +4461,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -4802,8 +4830,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -4854,8 +4884,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -4904,8 +4936,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let advance = reference_advance();
 
@@ -4984,8 +5018,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -5098,8 +5134,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_blob_batch(&context)
@@ -5130,8 +5168,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         for _ in 0..2 {
@@ -5337,8 +5377,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_blob_batch(&context)
@@ -5361,8 +5403,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         write_corrupt_job(&storage, "000-corrupt-blob-job").await;
         drive(QueueBlobOperation::new(on_demand_input(), None), &context)
@@ -5391,8 +5435,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = process_blob_batch(&context)
@@ -5425,8 +5471,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let first = process_blob_batch(&context)
@@ -5796,8 +5844,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(QueueBlobOperation::new(on_demand_input(), None), &context)
             .await
@@ -5842,8 +5892,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(QueueBlobOperation::new(on_demand_input(), None), &context)
             .await
@@ -5885,8 +5937,10 @@ mod tests {
             net_handle: Some(net_handle),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         drive(
             QueueBlobOperation::new(

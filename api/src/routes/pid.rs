@@ -32,11 +32,11 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;
-use aruna_operations::metadata::api::lookup_identifier_distributed;
-use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::api::fanout::lookup_identifier_distributed;
 use aruna_operations::metadata::persistent_id::forward::{
     read_pid_routed, resolve_pid_routed, withdraw_pid_routed,
 };
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_operations::metadata::secondary_ids::IdentifierMatch;
 
 use crate::auth::UnrestrictedAuth;

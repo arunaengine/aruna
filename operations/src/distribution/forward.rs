@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aruna_core::NodeId;
-use aruna_core::errors::StorageError;
 use aruna_core::structs::SyncRefusal;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
@@ -26,11 +25,12 @@ use ulid::Ulid;
 
 use super::admit::{AdmitConfig, AdmitError, AdmitOperation};
 use super::publish::{PublishConfig, PublishError, PublishOperation};
+use crate::driver::drive_retry;
 use crate::driver::node_routing;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
-use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::bootstrap::wake_bootstrap;
@@ -38,9 +38,7 @@ use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::bucket::metadata::{DescriptionError, dataset_description};
-
-/// A publish attempt retries a storage conflict this often before it gives up.
-const PUBLISH_ATTEMPTS: usize = 3;
+use aruna_core::metadata::AuthToken;
 
 /// Why the publisher refused or could not take a request.
 #[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,20 +89,10 @@ pub(crate) async fn publish_local(
         request,
         auth_context,
     };
-    let mut last = PublishRefusal::Unavailable("no attempt was made".to_string());
-    for _ in 0..PUBLISH_ATTEMPTS {
-        match drive(PublishOperation::new(config.clone()), context.as_ref()).await {
-            Ok(revision) => {
-                wake_bootstrap(context).await;
-                return Ok(revision);
-            }
-            Err(PublishError::Storage(StorageError::TransactionConflict)) => {
-                last = PublishRefusal::Unavailable("the record changed concurrently".to_string());
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(last)
+    let build = || PublishOperation::new(config.clone());
+    let revision = drive_retry(build, context.as_ref(), &request_id.to_bytes()).await?;
+    wake_bootstrap(context).await;
+    Ok(revision)
 }
 
 /// The caller of a forwarded configuration request. Only the caller's own bearer token

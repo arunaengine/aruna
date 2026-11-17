@@ -8,23 +8,21 @@ use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::ensure_record_readable;
-use crate::metadata::api::load_live_record;
-use crate::metadata::get_document::record_materialized_read;
+use crate::metadata::api::read::ensure_record_readable;
+use crate::metadata::api::read::load_live_record;
 use crate::metadata::handle::WritePeerError;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::DeviceGroupDocuments;
 use crate::metadata::protocol::GraphState;
 use crate::metadata::protocol::MAX_DEVICE_GROUPS;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::RealmDocuments;
 use crate::metadata::raw_revision::load_raw_view;
+use crate::metadata::record_reads::record_materialized_read;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_document::update_metadata_document;
-use crate::node::node_info::read_info_documents;
+use crate::metadata::update_entry::update_metadata_document;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::node_name::ReadNamesOperation;
 use aruna_core::NodeId;
@@ -36,10 +34,12 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::Event;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataEffect;
 use aruna_core::metadata::MetadataError;
 use aruna_core::metadata::MetadataEvent;
 use aruna_core::metadata::graph_version;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::structs::SyncRefusal;
@@ -132,7 +132,7 @@ pub(super) async fn read_realm_documents(
     let node_ids = config
         .sync_eligible_nodes()
         .map_err(|_| SyncRefusal::Unavailable)?;
-    let node_infos = read_info_documents(context, &node_ids)
+    let node_infos = drive(ReadInfoOperation::new(node_ids), context)
         .await
         .map_err(|error| {
             warn!(%error, "Failed to read the node info documents for a device");
@@ -172,7 +172,7 @@ pub(super) async fn management_urls(
         .filter(|node| matches!(node.kind, RealmNodeKind::Management))
         .filter_map(|node| NodeId::from_str(&node.node_id).ok())
         .collect();
-    let documents = match read_info_documents(context, &node_ids).await {
+    let documents = match drive(ReadInfoOperation::new(node_ids), context).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(%error, "Failed to read the management urls for a device");
@@ -194,7 +194,7 @@ pub(super) async fn management_urls(
 /// The caller's own groups, as the documents this node stores. A read that
 /// fails yields an empty list: one unreadable group must not cost the device
 /// the realm configuration it is judged by.
-pub(super) async fn device_group_documents(
+async fn device_group_documents(
     context: &Arc<DriverContext>,
     user_id: UserId,
 ) -> Vec<DeviceGroupDocuments> {
@@ -244,7 +244,7 @@ pub(super) async fn device_group_documents(
 
 /// Whether the owner holds a role in this group. A device caches its owner's
 /// groups only; a realm-scale group list is not theirs to hold.
-pub(super) fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
+fn holds_any_role(authorization: &GroupAuthorizationDocument, user_id: UserId) -> bool {
     authorization
         .roles
         .values()
@@ -361,7 +361,7 @@ pub(super) async fn read_graph_state(
         .map_err(sync_refusal)?;
     let graph_iri = record.graph_iri.clone();
     let snapshot = match metadata
-        .send_metadata_effect(MetadataEffect::GraphSnapshot { graph_iri })
+        .run_effect(context, MetadataEffect::GraphSnapshot { graph_iri })
         .await
     {
         Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
@@ -417,9 +417,12 @@ async fn scaffold_display(
     let Event::Metadata(MetadataEvent::VersionedExport {
         jsonld, version, ..
     }) = metadata
-        .send_metadata_effect(MetadataEffect::ExportVersioned {
-            graph_iri: record.graph_iri.clone(),
-        })
+        .run_effect(
+            context,
+            MetadataEffect::ExportVersioned {
+                graph_iri: record.graph_iri.clone(),
+            },
+        )
         .await
     else {
         return Err(SyncRefusal::Unavailable);
@@ -524,11 +527,14 @@ pub(super) async fn run_device_batch(
         .ok_or(SyncRefusal::Unavailable)?;
     for (actor, counter) in &batch.base_clock.0 {
         let known = metadata
-            .send_metadata_effect(MetadataEffect::ContainsDot {
-                graph_iri: record.graph_iri.clone(),
-                actor: actor.0,
-                counter: *counter,
-            })
+            .run_effect(
+                context,
+                MetadataEffect::ContainsDot {
+                    graph_iri: record.graph_iri.clone(),
+                    actor: actor.0,
+                    counter: *counter,
+                },
+            )
             .await;
         if !matches!(
             known,
@@ -594,8 +600,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let realm_id = RealmId::from_bytes([7u8; 32]);
         let member = UserId::local(Ulid::from_bytes([8u8; 16]), realm_id);

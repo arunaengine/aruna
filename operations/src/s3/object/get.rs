@@ -10,13 +10,13 @@ use crate::blob::promote::{
 use crate::blob::records::blob_location_read;
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{
+use crate::distribution::held::{
     HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
-    pinned_blob, pull_through,
 };
-use crate::distribution::source_keep::{SourceKeep, keep_first};
+use crate::distribution::pull::{pinned_blob, pull_through};
+use crate::distribution::source_keep::keep_first;
+use crate::distribution::source_plan::SourceKeep;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
@@ -31,6 +31,7 @@ use crate::s3::object::lookup::{
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
 use crate::s3::object::source::choice::{Candidate, choose_source};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{

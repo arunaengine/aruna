@@ -15,10 +15,10 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_operations::device::replica::{DEFAULT_CACHE_BYTES, set_cache_budget};
-use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_tasks::shutdown::Shutdown;
+use aruna_tasks::wipe::DeviceWipe;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -287,11 +287,11 @@ async fn bind_all(
         }
         false => None,
     };
-    if let Some(metadata) = &driver_ctx.metadata_handle {
-        metadata.install_git(aruna_blob::git::GitStore::new(
+    if let Some(blob) = &driver_ctx.blob_handle {
+        blob.install_git(Arc::new(aruna_blob::git::GitStore::new(
             std::path::Path::new(&config.storage_path).join("git"),
             std::env::current_exe()?,
-        ));
+        )));
     }
     let mut state = ServerState::new(
         driver_ctx.clone(),
@@ -563,8 +563,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x46; 32]);
         let shutdown = Shutdown::new();
@@ -678,8 +680,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
 
         let error = match bind(
@@ -772,8 +776,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         match bind(
             config,
@@ -836,8 +842,10 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             CorsConfig::default(),
             std::sync::Arc::new(aruna_core::metrics::NodeMetrics::new()),
@@ -866,8 +874,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x44; 32]);
         let session = SessionS3 {
@@ -915,8 +925,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x45; 32]);
         let session = SessionS3 {

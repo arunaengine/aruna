@@ -202,8 +202,7 @@ pub(super) async fn seed_registry_cache(test: &MetadataTest, record: &MetadataRe
         .metadata_handle
         .as_ref()
         .expect("metadata handle");
-    handle
-        .list_cached_group(record.group_id)
+    crate::metadata::list_cached_group(&test.context, record.group_id)
         .await
         .expect("registry cache fills");
     handle.cache_registry_record(record.clone());

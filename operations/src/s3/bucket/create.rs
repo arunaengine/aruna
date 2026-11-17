@@ -5,11 +5,11 @@
 
 use crate::groups::backends::backend_key;
 use crate::groups::storage_routing::routing_key;
-use crate::node::usage_stats::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
 use crate::s3::imports::ImportRuleError;
 use crate::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use crate::s3::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -811,8 +811,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket_info = BucketInfo {
@@ -847,8 +849,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let bucket_info = BucketInfo {
@@ -892,8 +896,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         // A replicated recreation carries the same record, creation time included.
         let bucket_info = BucketInfo {
@@ -947,8 +953,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let binding = aruna_core::structs::storage::distribution::DistributionBinding {
             set_id: Ulid::generate(),

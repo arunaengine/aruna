@@ -34,11 +34,11 @@ use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
 use crate::jobs::store::state::read_job_record;
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::get_document::load_document_record;
 use crate::metadata::raw_revision::load_raw_revision;
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
+use crate::realm::load_config::load_realm_config;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 use aruna_core::placement::holds_placement;
 
@@ -388,10 +388,7 @@ async fn push_revision(
 }
 
 /// Whether the dataset was deleted, which removes its registry record.
-async fn document_gone(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<bool, LinkError> {
+async fn document_gone(storage: &StorageHandle, document_id: Ulid) -> Result<bool, LinkError> {
     let event = storage
         .send_effect(read_document_registry(document_id, None))
         .await;

@@ -32,16 +32,17 @@ use aruna_core::structs::storage::distribution::on_use::{
 use aruna_core::types::{GroupId, Key, Value};
 use ulid::Ulid;
 
-use super::feed_store::split_key;
+use super::feed_walks::split_key;
 use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{dirty_rows, mark_dirty, wake_publish};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use crate::s3::usage::MarkDirtyOperation;
+use crate::s3::usage::dirty_rows;
 use aruna_core::time::unix_timestamp_millis;
 
 /// Inventory rows one page purges at most.
@@ -97,7 +98,10 @@ pub async fn purge_range(
                 (None, true) => {
                     clear_range_rows(context, set_id, target.range_id).await?;
                     // The range leaves this node's replica share with its counter rows.
-                    mark_dirty(context, [target.group_id]).await?;
+                    let mark = MarkDirtyOperation::new([target.group_id], Ulid::generate());
+                    drive(mark, context)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     cursor.done = true;
                 }
                 (Some(last), false) => {
@@ -117,7 +121,7 @@ pub async fn purge_range(
 }
 
 /// Whether `bucket` is still the member bucket of `binding`: same set, member and incarnation.
-pub async fn still_bound(
+async fn still_bound(
     context: &DriverContext,
     bucket: &str,
     binding: &DistributionBinding,
@@ -176,7 +180,7 @@ async fn page(
             .map(|(key, value)| (key.to_vec(), value))
             .collect()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected purge page answer {other:?}")),
+        other => Err(format!("unexpected purge page answer {}", other.label())),
     }
 }
 
@@ -336,7 +340,7 @@ async fn clear_page(
     match context.storage_handle.send_storage_effect(iter).await {
         Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {other:?}")),
+        other => Err(format!("unexpected scan answer {}", other.label())),
     }
 }
 
@@ -411,7 +415,7 @@ async fn debit_rows(
     let start = StorageEffect::StartTransaction { read: false };
     let txn_id = match storage.send_storage_effect(start).await {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction answer {other:?}")),
+        other => return Err(format!("unexpected transaction answer {}", other.label())),
     };
     let debited = match stage_debit(context, target, deletes, left, txn_id).await {
         Ok(debited) => debited,
@@ -426,10 +430,11 @@ async fn debit_rows(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {}
-        other => return Err(format!("a purge page did not commit: {other:?}")),
+        other => return Err(format!("a purge page did not commit: {}", other.label())),
     }
     if debited {
-        wake_publish(context).await;
+        // Scheduling the publish is best effort; the committed markers wait for it.
+        let _ = drive(MarkDirtyOperation::wake(), context).await;
     }
     Ok(())
 }
@@ -454,7 +459,7 @@ async fn stage_debit(
     };
     let mut values = match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values.into_iter(),
-        other => return Err(format!("unexpected read answer {other:?}")),
+        other => return Err(format!("unexpected read answer {}", other.label())),
     }
     .map(|(_, value)| value);
     let account = (values
@@ -500,7 +505,7 @@ async fn stage_debit(
         });
         // The share moves without the group counters, so the group is published again.
         effects.push(StorageEffect::BatchWrite {
-            writes: dirty_rows([target.group_id]),
+            writes: dirty_rows([target.group_id], Ulid::generate()),
             txn_id: Some(txn_id),
         });
     }
@@ -509,7 +514,7 @@ async fn stage_debit(
             Event::Storage(
                 StorageEvent::BatchDeleteResult { .. } | StorageEvent::BatchWriteResult { .. },
             ) => {}
-            other => return Err(format!("unexpected purge answer {other:?}")),
+            other => return Err(format!("unexpected purge answer {}", other.label())),
         }
     }
     Ok(debited)
@@ -567,7 +572,10 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("a cache entry was not dropped: {started:?}"));
+        return Err(format!(
+            "a cache entry was not dropped: {}",
+            started.label()
+        ));
     };
     let abort = || StorageEffect::AbortTransaction { txn_id };
     let read = StorageEffect::BatchRead {
@@ -584,7 +592,7 @@ async fn drop_cached(context: &DriverContext, identity: [u8; 32]) -> Result<(), 
         Event::Storage(StorageEvent::BatchReadResult { values }) if values.len() == 2 => values,
         other => {
             storage.send_storage_effect(abort()).await;
-            return Err(format!("a cache entry was not read: {other:?}"));
+            return Err(format!("a cache entry was not read: {}", other.label()));
         }
     };
     let mut values = values.into_iter().map(|(_, value)| value);
@@ -684,11 +692,10 @@ async fn clear_range_rows(
 
 /// Removes every generation of the range's search index from disk.
 async fn drop_index(context: &DriverContext, set_id: Ulid, range_id: Ulid) -> Result<(), String> {
-    let Some(metadata) = &context.metadata_handle else {
+    let Some(indexes) = context.storage_handle.range_indexes() else {
         return Ok(());
     };
-    (metadata.range_indexes().prune(set_id, range_id, None).await)
-        .map_err(|error| error.to_string())
+    (indexes.prune(set_id, range_id, None).await).map_err(|error| error.to_string())
 }
 
 /// Deletes every row under `prefix` in bounded batches.
@@ -710,7 +717,7 @@ pub(super) async fn clear_prefix(
                 values.into_iter().map(|(key, _)| key).collect()
             }
             Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected scan answer {other:?}")),
+            other => return Err(format!("unexpected scan answer {}", other.label())),
         };
         if keys.is_empty() {
             return Ok(());
@@ -736,7 +743,7 @@ pub(super) async fn read(
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected read answer {other:?}")),
+        other => Err(format!("unexpected read answer {}", other.label())),
     }
 }
 
@@ -755,7 +762,7 @@ async fn write(
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected write answer {other:?}")),
+        other => Err(format!("unexpected write answer {}", other.label())),
     }
 }
 
@@ -773,25 +780,14 @@ pub(super) async fn batch_delete(
     match context.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected delete answer {other:?}")),
+        other => Err(format!("unexpected delete answer {}", other.label())),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::distribution::test_store::open;
-
-    fn context(storage_handle: aruna_storage::storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
+    use crate::distribution::test_store::{context, open};
 
     fn row(set_id: Ulid, seed: u8) -> Vec<u8> {
         let mut key = set_id.to_bytes().to_vec();
@@ -806,7 +802,7 @@ mod tests {
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
         use aruna_core::structs::storage::distribution::fence::RangeFence;
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let (set_id, other) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
         for seed in 0..4 {
             for id in [set_id, other] {
@@ -906,7 +902,7 @@ mod tests {
         use crate::distribution::split::{SplitConfig, SplitOperation};
         use crate::distribution::test_store::{apply, install, range, write as update};
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([5; 16]);
         let ids = [1, 2, 3].map(|seed| Ulid::from_bytes([seed; 16]));
         install(&handle, set_id, &[range(1, "", None)]).await;
@@ -967,7 +963,7 @@ mod tests {
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
         use aruna_core::structs::storage::blob::BucketInfo;
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([1; 16]);
         write(&context, INVENTORY_KEYSPACE, row(set_id, 1), vec![1])
             .await
@@ -1065,7 +1061,7 @@ mod tests {
         // A page takes the rows no version delete took off the range's counters, so what is
         // left of a range being purged stays counted exactly.
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let (target, charged) = purged_spire(&handle, &context).await;
 
         let rows = page(&context, INVENTORY_KEYSPACE, &target, None)
@@ -1094,7 +1090,7 @@ mod tests {
         };
         use aruna_core::structs::storage::usage::dirty_group_key;
         let (_dir, handle) = open();
-        let context = context(handle.clone());
+        let context = context(&handle);
         let (target, charged) = purged_spire(&handle, &context).await;
         let version_id = Ulid::from_bytes([1; 16]);
         let version = BlobVersion::deleted(
@@ -1153,7 +1149,7 @@ mod tests {
     async fn clears_search_rows() {
         // Content index, search feed and search index rows leave with the set.
         let (_dir, handle) = open();
-        let context = context(handle);
+        let context = context(&handle);
         let set_id = Ulid::from_bytes([1; 16]);
         let key = account_key(set_id, Ulid::from_bytes([3; 16]));
         let spaces = [

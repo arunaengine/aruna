@@ -4,10 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::node::usage_stats::{RowChange, StoredDelta};
 use crate::s3::abe_copies::copy_row;
 use crate::s3::bucket::key::rows::Row;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
+use crate::s3::usage::RowChange;
+use crate::s3::usage::StoredDelta;
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     S3_BUCKET_KEYSPACE,

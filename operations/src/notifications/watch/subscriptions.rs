@@ -1,110 +1,28 @@
-//! Creates, deletes and lists the durable watch subscriptions on the holder node.
+//! Creates and deletes the durable watch subscriptions on the holder node after the owner's
+//! READ check.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
-    DocumentSyncRevision, DocumentTarget,
-};
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::WATCH_SUBSCRIPTIONS_KEYSPACE;
-use aruna_core::metrics::WatchMetricReason;
-use aruna_core::storage_entries::{sync_revision_entry, watch_delete_entry, watch_write_entry};
 use aruna_core::structs::execution::notification_watch::{
-    MAX_PREFIX_LEN, WATCH_USER_CAP, WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-    parse_watch_key, watch_subscription_prefix,
+    WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::TxnId;
-use aruna_storage::StorageHandle;
-use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
-use crate::notifications::watch::authorization::{WatchAuthorization, evaluate_watch_creation};
-use crate::notifications::watch::interest::dirty_marker_write;
-use crate::sync::outbox_record::{
-    new_identified_record, outbox_write_entry, schedule_drain_effect,
+use crate::driver::{DriverContext, drive};
+use crate::notifications::watch::authorization::evaluate_watch_creation;
+use crate::notifications::watch::paths::WatchAuthorization;
+use crate::notifications::watch::records::{
+    WatchSubscriptionError, validated_subscription, watch_delete_replication,
+    watch_upsert_replication,
 };
-
-/// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
-/// always covers a subscription set with a wide safety margin.
-const WATCH_LIST_LIMIT: usize = 256;
-const SUBSCRIPTION_PAGE_LIMIT: usize = 256;
-
-/// Stable reject reason for a cap-exceeded create; matched verbatim by the
-/// holder proxy to surface a 409 to the API layer.
-pub const WATCH_CAP_REACHED: &str = "notification watch subscription cap reached";
-
-/// Stable reject reason for an unauthorized create; matched verbatim by the
-/// holder proxy to surface a 403 to the API layer.
-pub const WATCH_SUBSCRIPTION_UNAUTHORIZED: &str =
-    "watch subscription owner lacks READ on the watched path";
-pub const WATCH_SUBSCRIPTION_UNAVAILABLE: &str =
-    "watch subscription authorization is temporarily unavailable";
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum WatchSubscriptionError {
-    #[error("{WATCH_SUBSCRIPTION_UNAUTHORIZED}: {}", .0.as_str())]
-    Unauthorized(WatchMetricReason),
-    #[error("{WATCH_SUBSCRIPTION_UNAVAILABLE}: {0}")]
-    AuthorizationUnavailable(String),
-    #[error("watch path prefix must not be empty")]
-    EmptyPrefix,
-    #[error("watch path prefix must not start with a slash")]
-    LeadingSlash,
-    #[error("watch path prefix exceeds maximum length")]
-    PrefixTooLong,
-    #[error("watch event mask must select at least one event")]
-    EmptyMask,
-    #[error("watch event mask contains an unknown event")]
-    InvalidMask,
-    #[error("notification watch subscription cap reached")]
-    CapExceeded,
-    #[error("{0}")]
-    Storage(String),
-}
-
-enum CreateFailure {
-    Cap,
-    Conflict,
-    Fatal(String),
-}
-
-#[derive(Clone)]
-struct WatchReplication {
-    revision: DocumentChange,
-    outbox: DocumentOutboxRecord,
-}
-
-pub async fn create_local_watch(
-    storage: &StorageHandle,
-    owner: UserId,
-    path_prefix: String,
-    event_mask: WatchEventMask,
-    now_ms: u64,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let subscription = validated_subscription(
-        owner,
-        path_prefix,
-        event_mask,
-        now_ms,
-        WatchAuthorizationBinding::default(),
-    )?;
-    create_subscription(storage, subscription, None).await
-}
+use crate::notifications::watch::store::StoreWatchOperation;
 
 /// The one holder-side create path, used by both the local API arm and the holder
 /// RPC. A proxying peer's assertion is not authority, so the holder re-derives
 /// the permission path and checks READ before any durable write.
-pub async fn create_holder_watch(
+pub(crate) async fn create_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -139,202 +57,12 @@ pub async fn create_holder_watch(
         }
     }
     let replication = watch_upsert_replication(local_node_id, &subscription)?;
-    let subscription =
-        create_subscription(&context.storage_handle, subscription, Some(replication)).await?;
-    schedule_replication(context).await;
+    let store = StoreWatchOperation::create(subscription.clone(), Some(replication));
+    drive(store, context).await?;
     Ok(subscription)
 }
 
-fn validated_subscription(
-    owner: UserId,
-    path_prefix: String,
-    event_mask: WatchEventMask,
-    now_ms: u64,
-    authorization: WatchAuthorizationBinding,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    validate_subscription_fields(&path_prefix, event_mask)?;
-    if !authorization.is_valid() {
-        return Err(WatchSubscriptionError::Unauthorized(
-            WatchMetricReason::InvalidState,
-        ));
-    }
-
-    Ok(WatchSubscription::new_with_authorization(
-        owner,
-        path_prefix,
-        event_mask,
-        now_ms,
-        authorization,
-    ))
-}
-
-fn validate_subscription_fields(
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-) -> Result<(), WatchSubscriptionError> {
-    if path_prefix.is_empty() {
-        return Err(WatchSubscriptionError::EmptyPrefix);
-    }
-    // Event paths have no leading slash, so such a prefix can never match.
-    // Reject it behind the API validation.
-    if path_prefix.starts_with('/') {
-        return Err(WatchSubscriptionError::LeadingSlash);
-    }
-    if path_prefix.len() > MAX_PREFIX_LEN {
-        return Err(WatchSubscriptionError::PrefixTooLong);
-    }
-    if event_mask.is_empty() {
-        return Err(WatchSubscriptionError::EmptyMask);
-    }
-    if event_mask.bits()
-        & !(WatchEventMask::METADATA_CREATED
-            | WatchEventMask::DATA_UPLOADED
-            | WatchEventMask::SYNC_COMPLETED
-            | WatchEventMask::SYNC_FAILED)
-        != 0
-    {
-        return Err(WatchSubscriptionError::InvalidMask);
-    }
-
-    Ok(())
-}
-
-async fn create_subscription(
-    storage: &StorageHandle,
-    subscription: WatchSubscription,
-    replication: Option<WatchReplication>,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    match create_once(storage, &subscription, replication.as_ref()).await {
-        Ok(()) => Ok(subscription),
-        Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
-        Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-        Err(CreateFailure::Conflict) => {
-            match create_once(storage, &subscription, replication.as_ref()).await {
-                Ok(()) => Ok(subscription),
-                Err(CreateFailure::Cap) => Err(WatchSubscriptionError::CapExceeded),
-                Err(CreateFailure::Fatal(error)) => Err(WatchSubscriptionError::Storage(error)),
-                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                    "watch subscription create conflicted twice".to_string(),
-                )),
-            }
-        }
-    }
-}
-
-async fn create_once(
-    storage: &StorageHandle,
-    subscription: &WatchSubscription,
-    replication: Option<&WatchReplication>,
-) -> Result<(), CreateFailure> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let existing = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(watch_subscription_prefix(subscription.owner)),
-            start: None,
-            limit: WATCH_USER_CAP.saturating_add(1),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-    if existing.len() >= WATCH_USER_CAP {
-        abort_txn(storage, txn_id).await;
-        return Err(CreateFailure::Cap);
-    }
-
-    let subscription_write = match watch_write_entry(subscription) {
-        Ok(entry) => entry,
-        Err(error) => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(error.to_string()));
-        }
-    };
-    let mut writes = vec![subscription_write];
-    writes.push(dirty_marker_write(subscription.owner.realm_id));
-    if let Some(replication) = replication {
-        let target = watch_subscription_target(subscription.owner, subscription.watch_id);
-        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        let outbox_entry = match outbox_write_entry(&replication.outbox) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        writes.push(revision_entry);
-        writes.push(outbox_entry);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(CreateFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-pub async fn delete_local_watch(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-) -> Result<(), WatchSubscriptionError> {
-    delete_subscription(storage, owner, watch_id, None)
-        .await
-        .map(|_| ())
-}
-
-pub async fn delete_holder_watch(
+pub(crate) async fn delete_holder_watch(
     context: &DriverContext,
     local_node_id: aruna_core::NodeId,
     owner: UserId,
@@ -342,448 +70,68 @@ pub async fn delete_holder_watch(
     now_ms: u64,
 ) -> Result<(), WatchSubscriptionError> {
     let replication = watch_delete_replication(local_node_id, owner, watch_id, now_ms);
-    let deleted =
-        delete_subscription(&context.storage_handle, owner, watch_id, Some(replication)).await?;
-    if deleted {
-        schedule_replication(context).await;
-    }
-    Ok(())
-}
-
-async fn delete_subscription(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-    replication: Option<WatchReplication>,
-) -> Result<bool, WatchSubscriptionError> {
-    match delete_once(storage, owner, watch_id, replication.as_ref()).await {
-        Ok(deleted) => Ok(deleted),
-        Err(CreateFailure::Conflict) => {
-            match delete_once(storage, owner, watch_id, replication.as_ref()).await {
-                Ok(deleted) => Ok(deleted),
-                Err(CreateFailure::Conflict) => Err(WatchSubscriptionError::Storage(
-                    "watch subscription delete conflicted twice".to_string(),
-                )),
-                Err(other) => Err(delete_failure(other)),
-            }
-        }
-        Err(other) => Err(delete_failure(other)),
-    }
-}
-
-fn delete_failure(failure: CreateFailure) -> WatchSubscriptionError {
-    match failure {
-        CreateFailure::Fatal(error) => WatchSubscriptionError::Storage(error),
-        // A delete never checks the per-user cap, so this is unreachable; map it
-        // defensively rather than panicking.
-        CreateFailure::Cap => {
-            WatchSubscriptionError::Storage("unexpected cap failure on delete".to_string())
-        }
-        CreateFailure::Conflict => WatchSubscriptionError::Storage(
-            "watch subscription delete conflicted twice".to_string(),
-        ),
-    }
-}
-
-async fn delete_once(
-    storage: &StorageHandle,
-    owner: UserId,
-    watch_id: Ulid,
-    replication: Option<&WatchReplication>,
-) -> Result<bool, CreateFailure> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let (_, subscription_key) = watch_delete_entry(owner, watch_id);
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            key: subscription_key,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            abort_txn(storage, txn_id).await;
-            return Ok(false);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    let (key_space, key) = watch_delete_entry(owner, watch_id);
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space,
-            key,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    let mut writes = vec![dirty_marker_write(owner.realm_id)];
-    if let Some(replication) = replication {
-        let target = watch_subscription_target(owner, watch_id);
-        let revision_entry = match sync_revision_entry(&target, &replication.revision) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        let outbox_entry = match outbox_write_entry(&replication.outbox) {
-            Ok(entry) => entry,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(CreateFailure::Fatal(error.to_string()));
-            }
-        };
-        writes.push(revision_entry);
-        writes.push(outbox_entry);
-    }
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(abort_and_classify(storage, txn_id, error).await);
-        }
-        other => {
-            abort_txn(storage, txn_id).await;
-            return Err(CreateFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(CreateFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-fn watch_subscription_target(owner: UserId, watch_id: Ulid) -> DocumentTarget {
-    DocumentTarget::WatchSubscription { owner, watch_id }
-}
-
-fn watch_upsert_replication(
-    local_node_id: aruna_core::NodeId,
-    subscription: &WatchSubscription,
-) -> Result<WatchReplication, WatchSubscriptionError> {
-    let outbox_id = Ulid::generate();
-    let revision = DocumentChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: 1,
-            event_id: outbox_id,
-            actor: local_node_id,
-            updated_at_ms: subscription.created_at_ms,
-        },
-        kind: DocumentChangeKind::Upsert,
-        placement: PlacementRef::NIL,
-    };
-    let target = watch_subscription_target(subscription.owner, subscription.watch_id);
-    let outbox = new_identified_record(
-        outbox_id,
-        local_node_id,
-        target,
-        Vec::new(),
-        DocumentOutboxEvent::Upsert {
-            bytes: subscription
-                .to_bytes()
-                .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?,
-            change: revision,
-        },
-        PlacementRef::NIL,
-        false,
-    );
-    Ok(WatchReplication { revision, outbox })
-}
-
-fn watch_delete_replication(
-    local_node_id: aruna_core::NodeId,
-    owner: UserId,
-    watch_id: Ulid,
-    now_ms: u64,
-) -> WatchReplication {
-    let outbox_id = Ulid::generate();
-    let revision = DocumentChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: 2,
-            event_id: outbox_id,
-            actor: local_node_id,
-            updated_at_ms: now_ms,
-        },
-        kind: DocumentChangeKind::Delete,
-        placement: PlacementRef::NIL,
-    };
-    let outbox = new_identified_record(
-        outbox_id,
-        local_node_id,
-        watch_subscription_target(owner, watch_id),
-        Vec::new(),
-        DocumentOutboxEvent::Delete { change: revision },
-        PlacementRef::NIL,
-        false,
-    );
-    WatchReplication { revision, outbox }
-}
-
-async fn schedule_replication(context: &DriverContext) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    let _ = task_handle.send_effect(schedule_drain_effect()).await;
-}
-
-fn decode_stored_subscription(
-    key: &[u8],
-    value: &[u8],
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let (key_owner, key_watch_id) =
-        parse_watch_key(key).map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
-    let subscription = WatchSubscription::from_bytes(value)
-        .map_err(|error| WatchSubscriptionError::Storage(error.to_string()))?;
-    if key_owner.is_nil()
-        || key_watch_id.is_nil()
-        || subscription.owner != key_owner
-        || subscription.watch_id != key_watch_id
-    {
-        return Err(WatchSubscriptionError::Storage(
-            "stored watch subscription key does not match payload identity".to_string(),
-        ));
-    }
-    validate_subscription_fields(&subscription.path_prefix, subscription.event_mask).map_err(
-        |error| {
-            WatchSubscriptionError::Storage(format!(
-                "stored watch subscription violates invariants: {error}"
-            ))
-        },
-    )?;
-    if !subscription.authorization.is_valid()
-        || subscription.authorization.watch_path_prefix != subscription.path_prefix
-    {
-        return Err(WatchSubscriptionError::Storage(
-            "stored watch subscription has invalid authorization binding".to_string(),
-        ));
-    }
-    Ok(subscription)
-}
-
-pub async fn list_watch_subscriptions(
-    storage: &StorageHandle,
-    owner: UserId,
-) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
-    let values = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(watch_subscription_prefix(owner)),
-            start: None,
-            limit: WATCH_LIST_LIMIT,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(WatchSubscriptionError::Storage(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let mut subscriptions = Vec::with_capacity(values.len());
-    for (key, value) in values {
-        let subscription = decode_stored_subscription(&key, &value)?;
-        if subscription.owner != owner {
-            return Err(WatchSubscriptionError::Storage(
-                "stored watch subscription belongs to a different owner".to_string(),
-            ));
-        }
-        subscriptions.push(subscription);
-    }
-    Ok(subscriptions)
-}
-
-/// Pages every watch subscription this node holds for `realm_id` (all owners),
-/// used by holder-side watch-event expansion. Subscription keys are realm-first,
-/// so one realm's rows form a single contiguous scan range.
-pub async fn list_realm_subscriptions(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
-    let prefix = UserId::storage_prefix(realm_id);
-    let mut subscriptions = Vec::with_capacity(SUBSCRIPTION_SCAN_CAP);
-    let mut start = None;
-    loop {
-        let remaining = SUBSCRIPTION_SCAN_CAP - subscriptions.len();
-        let limit = remaining.saturating_add(1).min(SUBSCRIPTION_PAGE_LIMIT);
-        let (values, next) = match storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start.map(IterStart::After),
-                limit,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(WatchSubscriptionError::Storage(error.to_string()));
-            }
-            other => {
-                return Err(WatchSubscriptionError::Storage(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        };
-        if values.len() > remaining {
-            return Err(WatchSubscriptionError::Storage(
-                "notification watch subscription scan cap reached".to_string(),
-            ));
-        }
-        for (key, value) in values {
-            let subscription = decode_stored_subscription(&key, &value)?;
-            if subscription.owner.realm_id != realm_id {
-                return Err(WatchSubscriptionError::Storage(
-                    "stored watch subscription belongs to a different realm".to_string(),
-                ));
-            }
-            subscriptions.push(subscription);
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => break,
-        }
-    }
-    Ok(subscriptions)
-}
-
-/// Reads one bounded realm page and returns the last key as its continuation.
-pub async fn list_watch_page(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    start: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
-    if limit == 0 || limit > SUBSCRIPTION_SCAN_CAP {
-        return Err(WatchSubscriptionError::Storage(
-            "notification watch subscription page cap exceeded".to_string(),
-        ));
-    }
-    let prefix = UserId::storage_prefix(realm_id);
-    let values = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start: start.map(|key| IterStart::After(key.into())),
-            limit: limit.saturating_add(1),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(WatchSubscriptionError::Storage(format!(
-                "unexpected watch subscription page event: {other:?}"
-            )));
-        }
-    };
-    let has_more = values.len() > limit;
-    let page: Vec<_> = values.into_iter().take(limit).collect();
-    let next = has_more.then(|| page.last().map(|(key, _)| key.to_vec()));
-    let mut subscriptions = Vec::with_capacity(page.len());
-    for (key, value) in page {
-        let subscription = decode_stored_subscription(&key, &value)?;
-        if subscription.owner.realm_id != realm_id {
-            return Err(WatchSubscriptionError::Storage(
-                "stored watch subscription belongs to a different realm".to_string(),
-            ));
-        }
-        subscriptions.push(subscription);
-    }
-    Ok((subscriptions, next.flatten()))
-}
-
-fn classify(error: StorageError) -> CreateFailure {
-    if matches!(error, StorageError::TransactionConflict) {
-        CreateFailure::Conflict
-    } else {
-        CreateFailure::Fatal(error.to_string())
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-}
-
-async fn abort_and_classify(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    error: StorageError,
-) -> CreateFailure {
-    abort_txn(storage, txn_id).await;
-    classify(error)
+    let store = StoreWatchOperation::delete(owner, watch_id, Some(replication));
+    drive(store, context).await.map(|_| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
+    use crate::notifications::watch::listing::{
+        ListWatchesOperation, SUBSCRIPTION_PAGE_LIMIT, WatchScope,
+    };
+    use crate::notifications::watch::records::decode_stored_subscription;
+    use crate::tests::notifications::{create_local_watch, delete_local_watch};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::storage_entries::watch_write_entry;
+    use aruna_core::structs::execution::notification_watch::WATCH_USER_CAP;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_storage::StorageHandle;
+
+    async fn list_scope(
+        storage: &StorageHandle,
+        scope: WatchScope,
+    ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
+        let list = ListWatchesOperation::new(scope);
+        let page = crate::driver::drive(list, &context(storage)).await?;
+        Ok((page.subscriptions, page.next))
+    }
+
+    async fn list_watch_subscriptions(
+        storage: &StorageHandle,
+        owner: UserId,
+    ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
+        Ok(list_scope(storage, WatchScope::Owner(owner)).await?.0)
+    }
+
+    async fn list_realm_subscriptions(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+    ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
+        Ok(list_scope(storage, WatchScope::Realm(realm_id)).await?.0)
+    }
+
+    async fn list_watch_page(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        start: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
+        let scope = WatchScope::Page {
+            realm_id,
+            start,
+            limit,
+        };
+        list_scope(storage, scope).await
+    }
+
+    use crate::notifications::watch::records::WATCH_CAP_REACHED;
     use crate::tests::notifications::{context, temp_storage, user};
     use aruna_core::NodeId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::MAX_PREFIX_LEN;
     use aruna_core::structs::execution::notification_watch::{WatchEventKind, watch_resource_path};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};

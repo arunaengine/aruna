@@ -16,7 +16,7 @@ pub fn new_outbox_record(record: NotificationRecord) -> NotificationOutboxRecord
     }
 }
 
-pub fn schedule_drain_effect() -> Effect {
+pub(crate) fn schedule_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
         key: TaskKey::DrainNotificationOutbox,
         after: Duration::ZERO,

@@ -11,7 +11,7 @@ use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect, abort_effects};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
@@ -86,7 +86,10 @@ pub enum PublishError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +137,7 @@ pub struct AcceptedRequest {
 }
 
 /// The key of an accepted request: set id then request id.
-pub fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
+fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
     let mut key = set_id.to_bytes().to_vec();
     key.extend_from_slice(&request_id.to_bytes());
     key
@@ -219,7 +222,7 @@ impl PublishOperation {
         let [view, accepted, config, reducer] =
             <[Option<Value>; 4]>::try_from(values).map_err(|_| PublishError::UnexpectedEvent {
                 state: "read state",
-                got: "a batch of another length".to_string(),
+                got: "a batch of another length",
             })?;
         if let Some(accepted) = accepted {
             let accepted: AcceptedRequest =
@@ -444,7 +447,7 @@ impl PublishOperation {
         }
         self.fail(PublishError::UnexpectedEvent {
             state,
-            got: format!("{event:?}"),
+            got: event.label(),
         })
     }
 
@@ -553,10 +556,14 @@ impl Operation for PublishOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
+    }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            PublishError::Storage(StorageError::TransactionConflict)
+        )
     }
 }
 

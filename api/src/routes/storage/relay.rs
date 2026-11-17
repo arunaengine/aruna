@@ -11,7 +11,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
-use aruna_operations::distribution::delegate::node_urls;
+use aruna_operations::node::node_info::node_urls;
 use aruna_operations::distribution::resolve::key_holders;
 use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::{route_read, route_write};

@@ -24,6 +24,8 @@ async fn session_realm() -> (
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
+        outbound_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,
     };

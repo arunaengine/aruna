@@ -18,9 +18,7 @@ use aruna_operations::device::realm_documents::fetch_from_peers;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation};
-use aruna_operations::notifications::watch::interest::{
-    ensure_interest_digest, mark_interest_dirty,
-};
+use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
@@ -118,11 +116,12 @@ pub async fn prepare_core_documents(
     allow_genesis: bool,
     include_node_info: bool,
 ) -> Result<Vec<DocumentTarget>, Box<dyn std::error::Error>> {
-    let digest_created = ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+    let ensure = InterestOperation::ensure(realm_id, node_id);
+    let digest_created = drive(ensure, driver_ctx)
         .await
         .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
     if digest_created {
-        mark_interest_dirty(driver_ctx, realm_id)
+        drive(InterestOperation::mark(realm_id), driver_ctx)
             .await
             .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
     }

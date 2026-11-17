@@ -7,38 +7,37 @@ use crate::auth::request_policy::PolicyRequestExtras;
 use crate::device::edit::DeviceEditError;
 use crate::device::edit::accepts_edits;
 use crate::device::edit::apply_local_edit;
-use crate::driver::DriverContext;
-use crate::metadata::api::GetVisibleRequest;
+use crate::driver::{DriverContext, drive_retry};
 use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::ensure_record_readable;
-use crate::metadata::api::get_visible_document;
-use crate::metadata::api::load_live_record;
+use crate::metadata::api::export::get_visible_document;
+use crate::metadata::api::export_types::GetVisibleRequest;
+use crate::metadata::api::read::ensure_record_readable;
+use crate::metadata::api::read::load_live_record;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::create_document::CreateDocumentOperation;
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::create_document::CreateDocumentResult;
-use crate::metadata::create_document::create_metadata_document;
 use crate::metadata::create_document::mint_forward_document;
 use crate::metadata::create_document::mint_local_document;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::delete_document::DeleteDocumentOperation;
-use crate::metadata::delete_document::delete_metadata_document;
+use crate::metadata::create_entry::create_metadata_document;
+use crate::metadata::delete_document::{DeleteDocumentError, DeleteDocumentOperation};
 use crate::metadata::profile::validation::current_validation_status;
 use crate::metadata::profile::validation::revalidate_current;
-use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataReadError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::update_document::UpdateDocumentConfig;
 use crate::metadata::update_document::UpdateDocumentError;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::metadata::update_document::UpdateDocumentOperation;
-use crate::metadata::update_document::update_metadata_document;
+use crate::metadata::update_entry::update_metadata_document;
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::process_placements::load_realm_config;
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::MetadataBatchSource;
 use aruna_core::metadata::MetadataError;
@@ -1024,4 +1023,17 @@ pub(crate) async fn apply_forwarded_write(
             crate::metadata::handle::transport_message_kind(&other)
         )),
     }
+}
+
+/// Deletes a document held here, retrying lost conflicts, and drops it from the registry cache.
+async fn delete_metadata_document(
+    operation: DeleteDocumentOperation,
+    context: &DriverContext,
+    document_id: Ulid,
+) -> Result<(), DeleteDocumentError> {
+    drive_retry(|| operation.fresh_copy(), context, &document_id.to_bytes()).await?;
+    if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+        metadata_handle.remove_cached_record(document_id);
+    }
+    Ok(())
 }

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
 };
@@ -13,13 +14,12 @@ use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::notifications::client::deliver_events_remote;
+use crate::notifications::client::{HolderRequestOperation, events_delivered};
 use crate::notifications::placement::filter_local_subscriptions;
+use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::mark_interest_dirty;
-use crate::notifications::watch::subscriptions::{
-    WatchSubscriptionError, list_realm_subscriptions,
-};
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
+use crate::notifications::watch::records::WatchSubscriptionError;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
 /// in-memory interest table plus local durable subscriptions, then expands for
@@ -73,7 +73,8 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
                         net_handle.notify_inbox_activity(recipient);
                     }
                     if dropped
-                        && let Err(error) = mark_interest_dirty(context, event.realm_id).await
+                        && let Err(error) =
+                            drive(InterestOperation::mark(event.realm_id), context).await
                     {
                         warn!(%error, "Failed to retract dropped local watch interest");
                     }
@@ -82,10 +83,13 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
                     warn!(%error, "Failed to expand watch event for local holder");
                 }
             }
-        } else if let Err(error) =
-            deliver_events_remote(net_handle, holder, vec![event.clone()]).await
-        {
-            warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+        } else {
+            let events = vec![event.clone()];
+            let deliver = NotificationTransportMessage::DeliverWatchEvents { events };
+            let answer = drive(HolderRequestOperation::new(holder, deliver), context).await;
+            if let Err(error) = events_delivered(answer) {
+                warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+            }
         }
     }
 }
@@ -93,7 +97,7 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
 /// Post-commit, best-effort `metadata_created` emission shared by every dataset
 /// creation path, so an import or a job notifies exactly like `POST /metadata`.
 /// `event_id` dates the event, keeping a retried create's inbox key stable.
-pub async fn emit_metadata_created(
+pub(crate) async fn emit_metadata_created(
     context: &DriverContext,
     realm_id: RealmId,
     actor: UserId,
@@ -129,19 +133,19 @@ async fn include_local_holder(
     let realm_config = drive(GetConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
-    let subscriptions =
-        match list_realm_subscriptions(&context.storage_handle, event.realm_id).await {
-            Ok(subscriptions) => subscriptions,
-            Err(WatchSubscriptionError::Storage(error))
-                if error.contains("subscription scan cap reached") =>
-            {
-                if !holders.contains(&local_node_id) {
-                    holders.push(local_node_id);
-                }
-                return Ok(realm_config);
+    let list = ListWatchesOperation::new(WatchScope::Realm(event.realm_id));
+    let subscriptions = match drive(list, context).await {
+        Ok(page) => page.subscriptions,
+        Err(WatchSubscriptionError::Storage(error))
+            if error.contains("subscription scan cap reached") =>
+        {
+            if !holders.contains(&local_node_id) {
+                holders.push(local_node_id);
             }
-            Err(error) => return Err(error.to_string()),
-        };
+            return Ok(realm_config);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let (subscriptions, found_stale) =
         filter_local_subscriptions(subscriptions, &realm_config, local_node_id)
             .map_err(|error| error.to_string())?;
@@ -153,7 +157,8 @@ async fn include_local_holder(
     }) {
         holders.push(local_node_id);
     }
-    if found_stale && let Err(error) = mark_interest_dirty(context, event.realm_id).await {
+    if found_stale && let Err(error) = drive(InterestOperation::mark(event.realm_id), context).await
+    {
         warn!(%error, "Failed to mark stale watch interest dirty while emitting event");
     }
     Ok(realm_config)
@@ -182,7 +187,7 @@ mod tests {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    use crate::notifications::watch::subscriptions::create_local_watch;
+    use crate::tests::notifications::create_local_watch;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -297,8 +302,10 @@ mod tests {
             net_handle: Some(net.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (dir, ctx, net)
     }

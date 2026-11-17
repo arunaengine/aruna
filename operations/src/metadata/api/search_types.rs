@@ -8,7 +8,7 @@ use super::{
     SystemTime,
 };
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::distribution::index_feed::IndexProgress;
+use crate::distribution::feed_walks::IndexProgress;
 
 #[derive(Debug, Clone)]
 pub struct MetadataSearchRequest {

@@ -8,8 +8,9 @@ use aruna_core::StructuredId;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::audit::{
     AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
-    LocalPageOperation, list_audit,
+    LocalPageOperation,
 };
+use aruna_operations::metadata::audit_entry::list_audit;
 use aruna_operations::metadata::create_document::{CreateDocumentPayload, mint_local_document};
 use std::cell::RefCell;
 use ulid::Ulid;

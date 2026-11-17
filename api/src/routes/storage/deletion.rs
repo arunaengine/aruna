@@ -14,7 +14,7 @@ use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurg
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::JOB_RETENTION_MS;
 use aruna_operations::jobs::service::submit_purge_job;
-use aruna_operations::metadata::api::set_preview_distributed;
+use aruna_operations::metadata::api::links::set_preview_distributed;
 use aruna_operations::s3::bucket::release::BucketScope;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};

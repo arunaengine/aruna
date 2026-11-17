@@ -66,11 +66,10 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{drive, node_routing};
 use crate::forward::transport::MetadataWriteError;
 use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
 };
-use crate::metadata::forward::{route_metadata_create, route_metadata_update};
+use crate::metadata::forward::write::{route_metadata_create, route_metadata_update};
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::notifications::watch::emit::emit_metadata_created;
 use crate::placement::policy::{GateContextError, GateOperation};
@@ -83,6 +82,7 @@ use crate::s3::object::delete::pinned::version_pins;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::metadata::AuthToken;
 use aruna_core::time::unix_timestamp_millis;
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
@@ -1221,7 +1221,7 @@ async fn update_document(
             realm_id: spec.auth_context.realm_id,
         };
         let record =
-            crate::metadata::get_document::load_document_record(&ctx.driver, spec.document_id)
+            crate::metadata::record_reads::load_document_record(&ctx.driver, spec.document_id)
                 .await
                 .map_err(|error| ImportFailure::Retryable(format!("{error:?}")))?;
         // The holder refuses the update inside its transaction when an edit landed after `base`.

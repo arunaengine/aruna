@@ -14,6 +14,8 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
+use aruna_core::node_state::ReadInfoOperation;
 use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
@@ -31,9 +33,8 @@ use aruna_operations::federation::totals::data_totals;
 use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
-use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
-use aruna_operations::node::status::load_status;
-use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
+use aruna_operations::node::heartbeat::held_heartbeats;
+use aruna_operations::node::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::HandleAllocationError;
 use aruna_operations::placement::mutation::drive_placement_mutation;
 use aruna_operations::placement::provision::provision_metadata_binding;
@@ -45,6 +46,7 @@ use aruna_operations::realm::mutate_placement::{
 };
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
+use aruna_operations::s3::usage::LoadCountersOperation;
 use aruna_wire::info::{
     AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,
     InfoResponse, InterfaceServicesStatus, InterfaceStatus, NetworkServiceStatus,
@@ -1337,8 +1339,7 @@ pub(crate) async fn load_node_documents(
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
         .collect();
-    match aruna_operations::node::node_info::read_info_documents(&state.get_ctx(), &node_ids).await
-    {
+    match drive(ReadInfoOperation::new(node_ids), state.get_ctx().as_ref()).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(error = %error, "Failed to load node info documents for realm info");
@@ -2053,7 +2054,8 @@ pub(crate) async fn distinct_buckets(
     group: Option<ulid::Ulid>,
     buckets: u64,
 ) -> Option<u64> {
-    match aruna_operations::distribution::counts::set_counts(&state.get_ctx(), group).await {
+    let count = aruna_operations::distribution::counts::SetCountsOperation::new(group);
+    match aruna_operations::driver::drive(count, &state.get_ctx()).await {
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");
@@ -2075,13 +2077,15 @@ pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
 ) -> ServerResult<RealmUsage> {
-    aruna_operations::node::usage_stats::load_realm_usage(
-        &state.get_ctx(),
-        state.get_node_id(),
-        scope,
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.into()))
+    let context = state.get_ctx();
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let operation = RealmUsageOperation::new(state.get_node_id(), realm_id, scope);
+    let mut totals = drive(operation, context.as_ref())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    totals
+        .pop()
+        .ok_or_else(|| ServerError::InternalError("no realm usage total".into()))
 }
 
 #[utoipa::path(
@@ -2175,7 +2179,7 @@ fn map_realm_nodes(
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
-    let heartbeats = held_heartbeats(state.get_ctx().net_handle.as_ref());
+    let heartbeats = state.get_ctx().held_heartbeats();
     config
         .nodes
         .iter()
@@ -2489,7 +2493,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
     }
 
     let ctx = state.get_ctx();
-    let snapshot = load_status(ctx.as_ref()).await;
+    let snapshot = ctx.status().await;
 
     let (network, warnings) = match snapshot.network {
         Some(info) => {

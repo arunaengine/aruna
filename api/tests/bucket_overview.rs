@@ -35,7 +35,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::node::usage_stats::RebuildStatsOperation;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};
@@ -110,8 +110,10 @@ async fn setup() -> Fixture {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,

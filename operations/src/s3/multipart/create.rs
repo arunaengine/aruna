@@ -7,7 +7,6 @@ use crate::distribution::guard::{
 };
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
-use crate::node::usage_stats::count_upload;
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };
@@ -15,6 +14,7 @@ use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, parse_abe};
 use crate::s3::object::put::{owner_read, owns_path, same_name_path};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::count_upload;
 use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};

@@ -14,12 +14,12 @@ use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::groups::storage_routing::routing_key;
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::fenced::{Fenced, FencedWrite};
 use crate::s3::object::put::{
     PlainRecord, intent_deletes, intent_rows, owner_read, owns_path, same_name_path,
 };
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -3052,8 +3052,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut record = CompressionMigration::new(ZSTD, 1);
         record.failed = 2;

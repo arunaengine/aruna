@@ -39,7 +39,7 @@ use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_ef
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
 use crate::jobs::store::query::iter_prefix_page;
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::tasks::task_persistence::persist_task_effect;
 
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -950,8 +950,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

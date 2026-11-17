@@ -14,7 +14,8 @@ use aruna_core::types::GroupId;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::get_document::GetDocumentOperation;
-use aruna_operations::node::startup::{RESTORE_TOPIC_COUNT, restore_shard_subscriptions};
+use aruna_operations::node::restore_plan::RESTORE_TOPIC_COUNT;
+use aruna_operations::node::startup::restore_shard_subscriptions;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
@@ -370,7 +371,7 @@ fn offline_scale_bound() -> Result<(), BoxError> {
 }
 
 async fn offline_bound_body() -> Result<(), BoxError> {
-    use aruna_operations::node::startup::{RecoveryError, RecoveryOutcome};
+    use aruna_operations::node::recovery::{RecoveryError, RecoveryOutcome};
     use aruna_operations::tasks::incoming::OutboxDrainer;
 
     assert_eq!(INCIDENT_LIMIT, 8_192);
@@ -412,7 +413,7 @@ fn offline_recovery_converges() -> Result<(), BoxError> {
 }
 
 async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(), BoxError> {
-    use aruna_operations::node::startup::{RecoveryError, RecoveryOutcome};
+    use aruna_operations::node::recovery::{RecoveryError, RecoveryOutcome};
     use aruna_operations::tasks::incoming::OutboxDrainer;
 
     let realm_id = RealmId([92u8; 32]);
@@ -431,11 +432,12 @@ fn spawn_recovery(
     node: &TestNode,
     realm_id: RealmId,
 ) -> (
-    aruna_operations::node::startup::RecoveryStatus,
+    aruna_operations::node::recovery::RecoveryStatus,
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
-    use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus, run_recovery};
+    use aruna_operations::node::recovery::RecoveryStatus;
+    use aruna_operations::node::startup::{RecoveryConfig, run_recovery};
     use tokio_util::sync::CancellationToken;
 
     let status = RecoveryStatus::new();
@@ -530,11 +532,11 @@ async fn assert_drain_bound(
 async fn finish_outage(
     outage: OutageFixture,
     drainer: &aruna_operations::tasks::incoming::OutboxDrainer,
-    status: &aruna_operations::node::startup::RecoveryStatus,
+    status: &aruna_operations::node::recovery::RecoveryStatus,
     cancelled: tokio_util::sync::CancellationToken,
     driver: tokio::task::JoinHandle<()>,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::startup::{RecoveryOutcome, RecoveryState};
+    use aruna_operations::node::recovery::{RecoveryOutcome, RecoveryState};
 
     let realm_id = outage.config.realm_id;
     let nodes = restore_peers(
@@ -966,9 +968,9 @@ async fn write_registry(
 }
 
 async fn wait_degraded(
-    status: &aruna_operations::node::startup::RecoveryStatus,
+    status: &aruna_operations::node::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::startup::{RecoveryOutcome, RecoveryState};
+    use aruna_operations::node::recovery::{RecoveryOutcome, RecoveryState};
 
     wait_for_convergence("recovery did not report degraded", || async {
         let snapshot = status.snapshot();
@@ -986,8 +988,10 @@ fn drain_context(node: &TestNode) -> Arc<DriverContext> {
         net_handle: node.context.net_handle.clone(),
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     })
 }
 
@@ -1129,9 +1133,9 @@ async fn wait_registry(
 }
 
 async fn wait_recovery(
-    status: &aruna_operations::node::startup::RecoveryStatus,
+    status: &aruna_operations::node::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_operations::node::startup::RecoveryState;
+    use aruna_operations::node::recovery::RecoveryState;
 
     wait_for_convergence("recovery did not converge", || async {
         Ok::<usize, BoxError>(usize::from(

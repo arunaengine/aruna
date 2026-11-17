@@ -68,6 +68,14 @@ pub fn record_elapsed_ms(span: &Span, field: &'static str, started: Instant) -> 
     duration
 }
 
+/// Marks `span` as failed with `error` for logs and OpenTelemetry.
+pub fn record_error(span: &Span, error: &str) {
+    span.record("result", "error");
+    span.record("error", tracing::field::display(error));
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_description", tracing::field::display(error));
+}
+
 #[derive(Default)]
 struct TraceContextCarrier {
     traceparent: Option<String>,

@@ -815,6 +815,8 @@ async fn recovers_interrupted_bind() -> TestResult<()> {
     let root = tempfile::tempdir()?;
     let unanswered = std::sync::Arc::new(DriverContext {
         metadata_handle: None,
+        outbound_handle: None,
+        graph_handle: None,
         task_handle: None,
         ..(*device.context).clone()
     });

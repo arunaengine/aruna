@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -110,10 +110,7 @@ impl SplitOperation {
     fn finish(&mut self, result: Result<(), SplitError>) -> Effects {
         self.state = State::Done;
         self.result = Some(result);
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 
     fn check(&self, parent: &RangeAccount) -> Result<u64, SplitError> {
@@ -385,10 +382,7 @@ impl Operation for SplitOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 }
 

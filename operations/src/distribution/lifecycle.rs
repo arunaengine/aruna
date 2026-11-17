@@ -6,6 +6,7 @@
 // A transfer away drains its uploads before its fence is stated; a deletion purges the member
 // bucket once it commits. Every pass is bounded and resumes from durable state.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,29 +37,30 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::create::submit;
+use super::fence_row::{FenceChange, UpdateFenceOperation};
 use super::imports::{drop_resume, fenced_imports, fetch_imports, keep_resume};
 use super::purge::{
     PurgeTarget, Purged, abort_range_uploads, batch_delete, clear_set_rows, has_uploads,
     purge_range, purge_rest, read,
 };
-use super::roots::roots_checked;
-use super::sign_statement;
+use super::roots::{RootsCheckOperation, RootsOutcome, Sweep};
 use super::status::read_view;
-use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{dirty_rows, wake_publish};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::replication::members::owes_fanout;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::s3::usage::{MarkDirtyOperation, dirty_rows};
 
 /// Sets one pass looks at, and purge pages it spends at most.
 const SET_BATCH: usize = 16;
 const PURGE_PAGES: usize = 32;
 /// How soon the next pass comes while lifecycle work waits.
-pub const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
-const FENCE_ATTEMPTS: usize = 4;
+const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 /// How long uploads opened before a transfer fence may still complete before they are aborted.
 const UPLOAD_GRACE_MS: u64 = 5 * 60 * 1000;
 /// The set marker after which the next pass continues; a restart begins at the first set.
 static MARKER_CURSOR: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+/// Where the open source root sweep of each transfer goes on.
+static SWEEPS: Mutex<BTreeMap<Ulid, Sweep>> = Mutex::new(BTreeMap::new());
 
 /// What a range held when its former coordinator fenced it; the new coordinator completes
 /// once its own counters of the range reach it.
@@ -183,7 +185,7 @@ async fn scan_markers(context: &DriverContext) -> Result<Vec<(Vec<u8>, Vec<u8>)>
             Ok(rows)
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected scan answer {other:?}")),
+        other => Err(format!("unexpected scan answer {}", other.label())),
     }
 }
 
@@ -200,7 +202,10 @@ pub(crate) async fn settle_marker(
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("the marker transaction did not start: {started:?}"));
+        return Err(format!(
+            "the marker transaction did not start: {}",
+            started.label()
+        ));
     };
     let read = StorageEffect::Read {
         key_space: key_space.to_string(),
@@ -213,7 +218,7 @@ pub(crate) async fn settle_marker(
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(format!("the marker was not read: {other:?}"));
+            return Err(format!("the marker was not read: {}", other.label()));
         }
     };
     if current.as_deref() != Some(seen) {
@@ -317,10 +322,7 @@ impl SetWork {
         binding: &DistributionBinding,
         budget: &mut usize,
     ) -> Result<Left, String> {
-        update_fence(context, self.set_id, |fence| {
-            !std::mem::replace(&mut fence.closed, true)
-        })
-        .await?;
+        update_fence(context, self.set_id, FenceChange::Close).await?;
         let clearing = (snapshot.config.bucket.as_str(), true, Some(binding));
         if self.clear_set(context, clearing, budget).await? == Left::Waiting {
             return Ok(Left::Waiting);
@@ -342,13 +344,7 @@ impl SetWork {
             return Ok(Left::Settled);
         };
         let identity = deletion.identity(self.set_id);
-        update_fence(context, self.set_id, |fence| {
-            let changed = fence.deletion != Some(identity) || !fence.closed;
-            fence.deletion = Some(identity);
-            fence.closed = true;
-            changed
-        })
-        .await?;
+        update_fence(context, self.set_id, FenceChange::Delete(identity)).await?;
         let member_id = local.member.member_id;
         let coordinates = snapshot
             .config
@@ -437,10 +433,7 @@ impl SetWork {
         budget: &mut usize,
     ) -> Result<Left, String> {
         if let Some(binding) = &local.binding {
-            update_fence(context, self.set_id, |fence| {
-                !std::mem::replace(&mut fence.closed, true)
-            })
-            .await?;
+            update_fence(context, self.set_id, FenceChange::Close).await?;
             unbind(context, &snapshot.config.bucket, binding, false).await?;
         }
         // The released bucket checks no fence; a later join of this node starts afresh.
@@ -478,15 +471,11 @@ impl SetWork {
         // The byte copies the range has now; this node's copy goes only once it has them again.
         let copies = snapshot.byte_holders(range, None).len();
         let copies = u32::try_from(copies).unwrap_or(u32::MAX);
-        let fenced = update_fence(context, self.set_id, |local| {
-            let fenced = local.fence_range(fence.clone());
-            if fenced {
-                local.copies.retain(|(id, _)| *id != range.range_id);
-                local.copies.push((range.range_id, copies));
-            }
-            fenced
-        })
-        .await?;
+        let change = FenceChange::Range {
+            fence: fence.clone(),
+            copies,
+        };
+        let fenced = update_fence(context, self.set_id, change).await?;
         if open.fenced.is_some() {
             // Keep the set until the range is reclaimed after the activation.
             return Ok(Left::Waiting);
@@ -501,10 +490,8 @@ impl SetWork {
                 return Ok(Left::Waiting);
             }
             // Closing conflicts every completion still in flight, so none commits after it.
-            update_fence(context, self.set_id, |local| {
-                local.close_uploads(range.range_id)
-            })
-            .await?;
+            let change = FenceChange::Uploads(range.range_id);
+            update_fence(context, self.set_id, change).await?;
         }
         if abort_range_uploads(context, &target).await? {
             return Ok(Left::Waiting);
@@ -599,7 +586,16 @@ impl SetWork {
         }
         // Every source root of what it applied must be readable here before it takes over.
         let group_id = snapshot.config.owner_group;
-        if !roots_checked(context, self.set_id, group_id, open.transfer_id).await? {
+        let sweep = (SWEEPS.lock().ok()).and_then(|sweeps| sweeps.get(&open.transfer_id).cloned());
+        let check = RootsCheckOperation::new(self.set_id, group_id, sweep);
+        let outcome = drive(check, context).await.map_err(|e| e.to_string())?;
+        if let Ok(mut sweeps) = SWEEPS.lock() {
+            match &outcome {
+                RootsOutcome::Continue(sweep) => sweeps.insert(open.transfer_id, sweep.clone()),
+                RootsOutcome::Done(_) => sweeps.remove(&open.transfer_id),
+            };
+        }
+        if outcome != RootsOutcome::Done(true) {
             return Ok(Left::Waiting);
         }
         // The former coordinator's open imports are fetched now, while it still holds them,
@@ -685,7 +681,10 @@ impl SetWork {
             signer: self.local,
             statement,
         };
-        let signed = match sign_statement(context, claim) {
+        let signed = match context.net_handle.as_ref().map_or_else(
+            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+            |net| net.sign_statement(claim),
+        ) {
             StatementSignEvent::Signed(signed) => *signed,
             StatementSignEvent::Unavailable(reason) => return Err(reason),
         };
@@ -791,69 +790,15 @@ pub(super) async fn range_counters(
         .map_err(|error| error.to_string())
 }
 
-/// Changes the set's fence row in one transaction; `change` says whether it changed anything.
-/// A write that read the row before conflicts with this commit.
-pub(super) async fn update_fence(
+/// Changes the set's fence row; see [`UpdateFenceOperation`].
+async fn update_fence(
     context: &DriverContext,
     set_id: Ulid,
-    change: impl Fn(&mut LocalFence) -> bool,
+    change: FenceChange,
 ) -> Result<LocalFence, String> {
-    let storage = &context.storage_handle;
-    let key: Key = LocalFence::key(set_id).into();
-    for _ in 0..FENCE_ATTEMPTS {
-        let started = storage
-            .send_storage_effect(StorageEffect::StartTransaction { read: false })
-            .await;
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-            return Err(format!("the fence transaction did not start: {started:?}"));
-        };
-        let read = StorageEffect::Read {
-            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: Some(txn_id),
-        };
-        let value = match storage.send_storage_effect(read).await {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => {
-                storage
-                    .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                    .await;
-                return Err(format!("the fence row was not read: {other:?}"));
-            }
-        };
-        let mut fence = LocalFence::decode(value.as_deref()).map_err(|error| error.to_string())?;
-        if !change(&mut fence) {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Ok(fence);
-        }
-        let value = fence.to_bytes().map_err(|error| error.to_string())?;
-        let write = StorageEffect::Write {
-            key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
-            key: key.clone(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        };
-        if !matches!(
-            storage.send_storage_effect(write).await,
-            Event::Storage(StorageEvent::WriteResult { .. })
-        ) {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err("the fence row was not written".to_string());
-        }
-        match storage
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => return Ok(fence),
-            Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => continue,
-            other => return Err(format!("the fence row was not committed: {other:?}")),
-        }
-    }
-    Err("the fence row kept changing concurrently".to_string())
+    let build = || UpdateFenceOperation::new(set_id, change.clone());
+    let fence = drive_retry(build, context, &set_id.to_bytes()).await;
+    fence.map_err(|error| error.to_string())
 }
 
 /// Releases the member bucket as an ordinary bucket, only while it carries `binding`; with
@@ -869,7 +814,7 @@ async fn unbind(
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await;
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = started else {
-        return Err(format!("the release did not start: {started:?}"));
+        return Err(format!("the release did not start: {}", started.label()));
     };
     let key: Key = bucket.as_bytes().to_vec().into();
     let read = StorageEffect::Read {
@@ -884,7 +829,7 @@ async fn unbind(
         }
         other => {
             storage.send_storage_effect(abort).await;
-            return Err(format!("the bucket was not read: {other:?}"));
+            return Err(format!("the bucket was not read: {}", other.label()));
         }
     };
     let same = |info: &BucketInfo| {
@@ -908,7 +853,7 @@ async fn unbind(
     storage.send_storage_effect(write).await;
     // The released bucket is ordinary now: its group's published replica share must go.
     let markers = StorageEffect::BatchWrite {
-        writes: dirty_rows([info.group_id]),
+        writes: dirty_rows([info.group_id], Ulid::generate()),
         txn_id: Some(txn_id),
     };
     storage.send_storage_effect(markers).await;
@@ -925,10 +870,11 @@ async fn unbind(
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            wake_publish(context).await;
+            // Scheduling the publish is best effort; the committed markers wait for it.
+            let _ = drive(MarkDirtyOperation::wake(), context).await;
             Ok(())
         }
-        other => Err(format!("the bucket was not released: {other:?}")),
+        other => Err(format!("the bucket was not released: {}", other.label())),
     }
 }
 
@@ -1217,8 +1163,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let space = DISTRIBUTION_LIFECYCLE_KEYSPACE;
         let key = [1u8; 16];

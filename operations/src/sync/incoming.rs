@@ -17,9 +17,11 @@ use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::QuotaOperation;
 use crate::jobs::runtime::JobsRuntime;
-use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
+use crate::metadata::MetadataHandle;
+use crate::metadata::protocol::MetadataTransportMessage;
 use crate::node::document_sync::{apply_metadata, run_maintenance};
-use crate::node::usage_stats::refresh_usage_targets;
+use crate::node::heartbeat::ReceiveHeartbeatOperation;
+use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::policy::GateOperation;
@@ -33,7 +35,8 @@ use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::evicted::ReemitEvictedOperation;
 use crate::sync::reconcile::ReconcileTopicsOperation;
 use crate::tasks::queue_backoff::retry_delay_ms;
@@ -41,7 +44,9 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
+use aruna_core::metadata::MetadataError;
 use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
@@ -53,6 +58,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::task::TaskKey;
+use aruna_core::telemetry::record_elapsed_ms;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_net::InboundEventHandler;
@@ -60,7 +66,7 @@ use aruna_net::streams::BiStream;
 use aruna_tasks::shutdown::Shutdown;
 use async_trait::async_trait;
 use tokio::time::{sleep, timeout};
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{Instrument, Span, debug, error, field, info, info_span, trace, warn};
 use ulid::Ulid;
 
 const SYNC_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
@@ -548,24 +554,159 @@ impl OperationsInboundHandler {
         }
     }
 
-    /// Forwards an inbound metadata stream under the rocrate byte limit held by
-    /// this handler; the metadata handle answers the peer itself.
+    /// Answers one inbound metadata stream under the rocrate byte limit held by
+    /// this handler: jobs and plugins requests here, the rest by the metadata domain.
     async fn handle_metadata_stream(&self, stream: BiStream, node_id: NodeId) {
         let Some(metadata_handle) = self.context.metadata_handle.clone() else {
             warn!(peer = %node_id, "Dropping inbound metadata stream without metadata handle");
             return;
         };
-        if let Err(err) = metadata_handle
-            .handle_inbound_stream(
-                &self.context,
-                stream,
-                node_id,
-                self.rocrate_limits.metadata_bytes,
-            )
-            .await
-        {
+        let served = serve_metadata_stream(
+            &self.context,
+            &metadata_handle,
+            stream,
+            node_id,
+            self.rocrate_limits.metadata_bytes,
+        );
+        if let Err(err) = served.await {
             error!(error = ?err, "Failed to process inbound metadata stream");
         }
+    }
+}
+
+#[tracing::instrument(
+    name = "metadata.remote.inbound",
+    level = "debug",
+    skip(context, metadata, stream),
+    fields(
+        peer = ?peer,
+        request = field::Empty,
+        response = field::Empty,
+        read_ms = field::Empty,
+        process_ms = field::Empty,
+        drain_ms = field::Empty,
+        write_ms = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+async fn serve_metadata_stream(
+    context: &Arc<DriverContext>,
+    metadata: &MetadataHandle,
+    mut stream: BiStream,
+    peer: NodeId,
+    metadata_bytes: u64,
+) -> Result<(), MetadataError> {
+    let total_started = Instant::now();
+    let read_started = Instant::now();
+    let request = metadata.read_request(&mut stream).await?;
+    let span = Span::current();
+    record_elapsed_ms(&span, "read_ms", read_started);
+
+    let process_started = Instant::now();
+    let deadline = request.audit_deadline;
+    let audit = request.audit.then_some(deadline);
+    let (response, response_body) =
+        match peer_request(context, metadata, peer, request.message).await {
+            Ok(response) => (response, None),
+            Err(message) => {
+                metadata
+                    .answer_request(context, peer, metadata_bytes, deadline, message)
+                    .await
+            }
+        };
+    record_elapsed_ms(&span, "process_ms", process_started);
+    MetadataHandle::write_answer(stream, audit, &response, response_body).await?;
+    drop(request.budget);
+    record_elapsed_ms(&span, "elapsed_ms", total_started);
+    Ok(())
+}
+
+/// Answers a metadata transport request of the jobs or plugins domain, or hands the
+/// request back for the metadata domain.
+async fn peer_request(
+    context: &Arc<DriverContext>,
+    _metadata: &MetadataHandle,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataTransportMessage, MetadataTransportMessage> {
+    match message {
+        MetadataTransportMessage::StoreArtifact { chunk } => {
+            let stored = crate::plugins::artifacts::serve_store(context, peer, chunk);
+            let result = Box::pin(stored).await;
+            Ok(MetadataTransportMessage::ArtifactStored { result })
+        }
+        MetadataTransportMessage::FetchArtifact { digest, index } => {
+            let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest, index);
+            let result = Box::pin(fetched).await;
+            Ok(MetadataTransportMessage::FetchedArtifact { result })
+        }
+        MetadataTransportMessage::ProbeClock => {
+            let result = Box::pin(crate::plugins::clock::serve_clock(context, peer)).await;
+            Ok(MetadataTransportMessage::ClockProbed { result })
+        }
+        MetadataTransportMessage::ForwardEvents { batch } => {
+            let decided = crate::plugins::worker::serve_events(context, peer, batch);
+            let result = Box::pin(decided).await;
+            Ok(MetadataTransportMessage::EventsDecided { result })
+        }
+        MetadataTransportMessage::ReleaseSecret { request } => {
+            let keys = crate::plugins::release::node_keys(context);
+            let keys = (keys.seal, keys.vault);
+            let released = crate::plugins::release::serve_release(context, keys, peer, request);
+            let result = Box::pin(released).await;
+            Ok(MetadataTransportMessage::SecretReleased { result })
+        }
+        MetadataTransportMessage::CheckNodeSecret { name, kind } => {
+            let checked = crate::plugins::bound::serve_node_check(context, peer, name, kind);
+            let result = Box::pin(checked).await;
+            Ok(MetadataTransportMessage::NodeSecretChecked { result })
+        }
+        record @ (MetadataTransportMessage::ForwardJobRecord { .. }
+        | MetadataTransportMessage::ForwardRecordPage { .. }) => {
+            let answer = Box::pin(async {
+                crate::jobs::records::transport::serve_job_record(context, peer, record).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardLaunchOffer { launch } => {
+            let answer = Box::pin(async {
+                crate::jobs::records::transport::serve_launch_offer(context, peer, *launch).await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ForwardJobSubmission {
+            auth_token,
+            submission_id,
+            request,
+        } => {
+            let answer = Box::pin(async {
+                crate::jobs::lifecycle::ingress::serve_submission(
+                    context,
+                    peer,
+                    auth_token,
+                    submission_id,
+                    *request,
+                )
+                .await
+            });
+            Ok(answer.await)
+        }
+        MetadataTransportMessage::ResolveJobInputs {
+            auth_token,
+            request,
+        } => {
+            let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
+                context, peer, auth_token, *request,
+            );
+            let result = Box::pin(resolved).await;
+            Ok(MetadataTransportMessage::ResolvedJobInputs { result })
+        }
+        MetadataTransportMessage::JobInputPage { submission, digest } => {
+            let page = crate::jobs::records::pages::serve_page(context, peer, submission, digest);
+            let page = Box::pin(page).await;
+            Ok(MetadataTransportMessage::InputPageResult { page })
+        }
+        message => Err(message),
     }
 }
 
@@ -649,7 +790,10 @@ async fn manifest_policy(
 ) -> Result<(Option<String>, Option<String>), String> {
     // Denied like a missing policy, so the sender stops and no destination is created. An unbound
     // folder stays `Deleting` until its row is gone, so checking before the create suffices.
-    match guard_bucket_write(context, &manifest.bucket).await {
+    match drive(BucketGuardOperation::new(manifest.bucket.as_str()), context)
+        .await
+        .map_err(OfferedDirectoryError::from)
+    {
         Ok(()) => {}
         Err(OfferedDirectoryError::ReadOnly(_)) => return Ok((None, None)),
         Err(error) => return Err(error.to_string()),
@@ -971,7 +1115,10 @@ async fn reconcile_inbound_topics(
     if applied == 0 {
         return true;
     }
-    let dashboard_changed = targets_change_dashboard(&targets.targets);
+    let dashboard_changed = targets
+        .targets
+        .iter()
+        .any(DocumentTarget::changes_dashboard);
     let realm_config_changed = targets
         .targets
         .iter()
@@ -981,9 +1128,16 @@ async fn reconcile_inbound_topics(
         // application; the reconcile arms the SyncPlacements timer instead.
         reconcile_shard_topics(context, *net_handle.realm_id(), net_handle.node_id()).await;
         let (realm_id, node_id) = (*net_handle.realm_id(), net_handle.node_id());
-        crate::federation::publish::publish_soon(context, realm_id, node_id).await;
+        let soon = crate::federation::publish::PublishSoonOperation::new(realm_id, node_id);
+        if let Err(error) = drive(soon, context).await {
+            warn!(%error, "Registry publication was not moved up");
+        }
     }
-    refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
+    let refresh = RefreshUsageOperation::new(node_id, realm_id, &targets.targets, Ulid::generate());
+    if let Err(error) = drive(refresh, context).await {
+        warn!(%error, "Realm usage refresh stopped after a document sync");
+    }
     crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;
@@ -1000,7 +1154,7 @@ async fn reconcile_inbound_topics(
         "Inbound document sync reconcile summary"
     );
     if dashboard_changed {
-        notify_dashboard_change(context);
+        context.notify_dashboard_change();
     }
     true
 }
@@ -1155,12 +1309,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                     .await
                 }
                 Alpn::Heartbeat => {
-                    Box::pin(crate::node::heartbeat::handle_heartbeat_stream(
-                        self.context.as_ref(),
-                        stream,
-                        node_id,
-                    ))
-                    .await
+                    Box::pin(receive_heartbeat(self.context.as_ref(), stream, node_id)).await
                 }
                 Alpn::JobControl => {
                     Box::pin(async {
@@ -1267,6 +1416,57 @@ fn schedule_sync_maintenance(
     });
 }
 
+/// Reads one bounded heartbeat frame of `peer` within the stream limits and keeps it through
+/// the heartbeat operation; every refusal is only logged.
+async fn receive_heartbeat(context: &DriverContext, mut stream: BiStream, peer: NodeId) {
+    let Some(net_handle) = context.net_handle.as_ref() else {
+        return;
+    };
+    let Some(_slot) = net_handle.heartbeat_slot(peer) else {
+        debug!(%peer, "Dropping a heartbeat stream past the stream limits");
+        return;
+    };
+    let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(&mut stream)).await;
+    let _ = stream.0.finish();
+    let frame = match read {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(error)) => {
+            debug!(%peer, %error, "Dropping an invalid heartbeat");
+            return;
+        }
+        Err(_) => {
+            debug!(%peer, "Heartbeat read timed out");
+            return;
+        }
+    };
+    let receive = ReceiveHeartbeatOperation::new(peer, *net_handle.realm_id(), frame);
+    if let Err(error) = drive(receive, context).await {
+        debug!(%peer, %error, "Heartbeat not kept");
+    }
+}
+
+/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
+async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    stream
+        .1
+        .read_exact(&mut length)
+        .await
+        .map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_HEARTBEAT_BYTES {
+        return Err("heartbeat frame exceeds the size limit".to_string());
+    }
+    let mut bytes = vec![0u8; length];
+    stream
+        .1
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1350,8 +1550,10 @@ mod tests {
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let documents = vec![evicted(1), evicted(2)];
         let (failed, receivers) = aruna_storage::StorageHandle::new();
@@ -1435,8 +1637,10 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
@@ -1474,8 +1678,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([4u8; 32]);
         let foreign_realm = RealmId::from_bytes([5u8; 32]);
@@ -1607,7 +1813,7 @@ mod tests {
     // A replica into an offered bucket, delete markers included, is denied, so the sender stops.
     #[tokio::test]
     async fn denies_offered_bucket() {
-        use crate::device::sync::folders::folder_bucket;
+        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
         let fixture = crate::tests::staging::setup_driver_context().await;
@@ -1716,8 +1922,10 @@ mod tests {
                 net_handle: Some(net_b.clone()),
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             RoCrateLimits::default(),
             JobsRuntime::new(),
@@ -1763,22 +1971,29 @@ mod tests {
             )
             .await
             .unwrap();
-            let metadata_handle = MetadataHandle::new(
+            let graph_handle = aruna_graph::GraphHandle::open(
                 dir.path().join("metadata"),
                 net.node_id(),
-                storage.clone(),
-                Some(net.clone()),
                 Some(net.document_sync_node()),
                 Some(net.document_sync_database()),
+                aruna_graph::GraphOptions::default(),
             )
             .unwrap();
+            let metadata_handle = MetadataHandle::new(
+                dir.path().join("metadata"),
+                storage.clone(),
+                Some(net.clone()),
+                Default::default(),
+            );
             let context = Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: Some(net.clone()),
                 blob_handle: None,
                 metadata_handle: Some(metadata_handle),
+                graph_handle: Some(graph_handle),
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             });
 
             let fixture =
@@ -1894,8 +2109,10 @@ mod tests {
                     net_handle: Some(net_b.clone()),
                     blob_handle: Some(blob_handle),
                     metadata_handle: None,
+                    graph_handle: None,
                     task_handle: None,
                     compute_handle: None,
+                    outbound_handle: None,
                 }),
                 RoCrateLimits::default(),
                 JobsRuntime::new(),
@@ -2119,8 +2336,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([9u8; 32]);
         let foreign_realm = RealmId::from_bytes([10u8; 32]);

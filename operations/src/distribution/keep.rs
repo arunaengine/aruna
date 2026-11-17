@@ -5,7 +5,7 @@
 
 // The copy becomes an attachment row, or a cache entry that evicts the oldest entries for room.
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -38,13 +38,16 @@ pub enum KeepError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
 }
 
 fn unexpected(state: &'static str, event: Event) -> KeepError {
     KeepError::UnexpectedEvent {
         state,
-        got: format!("{event:?}"),
+        got: event.label(),
     }
 }
 
@@ -91,10 +94,7 @@ impl ClaimFillOperation {
     fn fail(&mut self, error: KeepError) -> Effects {
         self.output = Some(Err(error));
         self.state = ClaimState::Done;
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 
     fn state_name(&self) -> &'static str {
@@ -275,10 +275,7 @@ impl PublishKeptOperation {
     fn fail(&mut self, error: KeepError) -> Effects {
         self.output = Some(Err(error));
         self.state = PublishState::Done;
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 
     /// Leaves the cache unchanged; the claim is released without a trace.

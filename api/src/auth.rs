@@ -854,8 +854,10 @@ mod test {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
@@ -1094,8 +1096,10 @@ mod test {
             storage_handle,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
         let realm_signing_key = generate_signing_key();
@@ -1518,8 +1522,10 @@ mod test {
             storage_handle,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -1701,8 +1707,10 @@ mod test {
             storage_handle,
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -1806,8 +1814,10 @@ mod test {
             storage_handle,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -2095,8 +2105,10 @@ mod test {
             storage_handle,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 
@@ -2153,8 +2165,10 @@ mod test {
             storage_handle,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         });
 

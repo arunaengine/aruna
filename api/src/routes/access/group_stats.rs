@@ -21,7 +21,7 @@ use aruna_operations::driver::drive;
 use aruna_operations::groups::admin_check::{AdminCheckOperation, realm_groups_path};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::jobs::recent::RecentJobsOperation;
-use aruna_operations::node::usage_stats::RealmUsageScope;
+use aruna_operations::node::realm_usage::RealmUsageScope;
 use aruna_operations::s3::access::tokens::list::{GroupTokensConfig, ListTokensOperation};
 use aruna_operations::s3::access::tokens::{GroupTokensError, TokenStatus};
 use axum::Json;

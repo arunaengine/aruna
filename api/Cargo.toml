@@ -79,6 +79,7 @@ hyper-util = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
+aruna-graph = { workspace = true }
 aruna-operations = { workspace = true, features = ["test-hooks"] }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }

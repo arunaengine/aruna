@@ -9,12 +9,12 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
-};
 use crate::placement::policy::{PolicyGateError, drift_reads, split_drift_reads};
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::{
+    QuotaGate, QuotaGateError, RowChange, UsageCounterUpdate, UsageUpdateError,
+};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::abort_effects;
 use aruna_core::effects::{Effect, StorageEffect};

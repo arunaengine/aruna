@@ -45,7 +45,7 @@ use crate::distribution::status::read_view;
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::metadata::protocol::{AuthToken, MetadataReadError};
+use crate::metadata::protocol::MetadataReadError;
 use crate::placement::policy::GateOperation;
 use crate::realm::peer_trust::is_sync_eligible;
 use crate::replication::queue::complete_put;
@@ -56,6 +56,7 @@ use crate::s3::object::get::{
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use aruna_core::metadata::AuthToken;
 use aruna_core::time::unix_timestamp_millis;
 
 #[derive(Debug, Error, PartialEq)]

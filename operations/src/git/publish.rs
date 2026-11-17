@@ -4,7 +4,7 @@
 
 use super::{GitError, records};
 use crate::driver::DriverContext;
-use crate::metadata::api::load_realm_config;
+use crate::realm::load_config::load_realm_config;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
 use aruna_core::NodeId;
 use aruna_core::UserId;
@@ -98,7 +98,7 @@ async fn stored(context: &DriverContext, pack: &GitPackRecord) -> Result<bool, G
 }
 
 /// The pack row, its sync revision, shard manifest row and outbox publish.
-pub fn pack_writes(
+fn pack_writes(
     pack: &GitPackRecord,
     realm_id: RealmId,
     peers: Vec<NodeId>,

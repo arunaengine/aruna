@@ -11,7 +11,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{UPLOAD_INVENTORY_KEYSPACE, UPLOAD_KEYSPACE, prefix_upper_bound};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::inventory::{
-    Entry, Position, bound_position, head_position, range_interval, upload_position,
+    Entry, Position, bound_position, head_position, prefix_interval, upload_position,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::types::{Effects, Key, Value};
@@ -105,14 +105,8 @@ impl InventoryUploadsOperation {
 
     /// The interval the page may read: the range, narrowed to the prefix.
     fn bounds(&mut self) {
-        let set_id = self.input.set_id;
-        let (lower, end) = range_interval(set_id, &self.input.lower, self.input.upper.as_deref());
-        let prefix = bound_position(set_id, self.prefix());
-        self.start = lower.max(prefix.clone());
-        self.end = match self.prefix().is_empty() {
-            true => end,
-            false => prefix_upper_bound(&prefix).map_or(end.clone(), |upper| upper.min(end)),
-        };
+        let (lower, upper) = (&self.input.lower, self.input.upper.as_deref());
+        (self.start, self.end) = prefix_interval(self.input.set_id, lower, upper, self.prefix());
     }
 
     /// Moves the start past `position` when it lies ahead of the current one.

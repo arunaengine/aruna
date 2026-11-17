@@ -23,15 +23,21 @@ use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::snapshot::unreadable_file;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, ExportMetadataResult, ListVisibleRequest, MetadataApiError, MetadataFanoutStats,
-    MetadataListOrder, MetadataReferenceEntry, MetadataReferencesExecution,
-    RoCrateExportView as OperationMetadataRoCrateExportView, forwarded_bearer,
-    list_visible_documents as run_list_visible_metadata_documents,
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export_types::{
+    ExportMetadataResult, RoCrateExportView as OperationMetadataRoCrateExportView,
+};
+use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
+use aruna_operations::metadata::api::list::list_visible_documents as run_list_visible_metadata_documents;
+use aruna_operations::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
+use aruna_operations::metadata::api::read_types::{
+    ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
 use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use aruna_operations::metadata::forward::{CreateAuthorizedError, create_metadata_authorized};
-use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::forward::write::{
+    CreateAuthorizedError, create_metadata_authorized,
+};
+use aruna_operations::metadata::record_reads::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
@@ -292,7 +298,7 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
 /// so it re-runs the same permission checks under the same authority.
 pub(crate) fn forwarded_auth_token(
     bearer_token: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+) -> ServerResult<Option<aruna_core::metadata::AuthToken>> {
     forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(map_api_error)
 }
 

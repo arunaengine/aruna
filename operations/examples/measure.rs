@@ -19,7 +19,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::EffectOperation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -716,8 +716,10 @@ async fn spawn_single() -> Result<Node, BoxError> {
         net_handle: Some(net.clone()),
         blob_handle: Some(blob_handle),
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Node {
         _dir: dir,
@@ -743,7 +745,7 @@ fn runner_read(index: usize) -> Effect {
     })
 }
 
-impl Operation for ReadRows {
+impl EffectOperation for ReadRows {
     type Output = ();
     type Error = ();
 
@@ -824,8 +826,10 @@ async fn measure_runner() -> Result<(), BoxError> {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     for (detail, reads, grouped) in [
         ("short", 1, false),

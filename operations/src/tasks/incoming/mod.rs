@@ -12,14 +12,12 @@ use aruna_core::backoff::capped_backoff;
 use aruna_core::document::{
     DocumentOutboxEvent, DocumentOutboxRecord, DocumentSyncPublish, DocumentTarget,
 };
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::execution::job::{JobExecutionClass, RoCrateLimits};
-use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::identity::auth::NodeCapabilities;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::time::unix_timestamp_millis;
@@ -28,7 +26,6 @@ use aruna_core::{DocumentEffect, DocumentNetEvent};
 use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
-use byteview::ByteView;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -64,6 +61,7 @@ use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER, restore_sync_timers,
 };
+use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::drain::remove_drained_backends;
@@ -90,20 +88,24 @@ use crate::metadata::prune_queue::{
 };
 use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::node_info::observe_placement;
-use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
+use crate::node::usage_publish::restore_usage_timer;
+use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
+use crate::notifications::outbox::RestoreOutboxOperation;
 use crate::notifications::outbox::{
     DELIVERY_RETRY_AFTER, OUTBOX_BATCH_SIZE, OUTBOX_RETENTION_MS, delete_outbox_records,
     read_outbox_batch, restore_idle_timer, restore_outbox_timer,
 };
 use crate::notifications::placement::resolve_inbox_holder;
+use crate::notifications::prune::RestorePruneOperation;
 use crate::notifications::prune::{
     NOTIFICATION_POLL_AFTER, NOTIFICATION_RETRY_AFTER, process_prune_batch,
 };
-use crate::notifications::watch::interest::{
-    WATCH_PUBLISH_DEBOUNCE, rebuild_interest_table, refresh_target_interest,
-};
+use crate::notifications::watch::digest::InterestOperation;
+use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
+use crate::notifications::watch::interest::{rebuild_interest_table, refresh_target_interest};
+use crate::notifications::watch::table::RebuildTableOperation;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};
 use crate::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation, PRESENCE_REFRESH_AFTER,
@@ -123,6 +125,7 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 use crate::tasks::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_task_timers,
 };
+use crate::triggers::{TimerInput, timer_operation};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
 
 mod outbox;
@@ -704,9 +707,13 @@ impl OperationsTaskHandler {
             REALM_DOCUMENTS_BUDGET,
         )
         .await;
-        match fetched {
-            true => crate::device::sync_status::note_contact(&self.context).await,
-            false => crate::device::sync_status::note_failure(&self.context).await,
+        let note = match fetched {
+            true => SyncNote::Contact,
+            false => SyncNote::Failure,
+        };
+        let note = NoteSyncOperation::new(note, unix_timestamp_millis());
+        if let Err(error) = drive(note, &self.context).await {
+            warn!(%error, "Failed to note the device sync state");
         }
         let mut state = self
             .realm_documents
@@ -727,12 +734,37 @@ impl OperationsTaskHandler {
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
         if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
-            crate::device::sync_status::note_sync(&self.context).await;
+            let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
+            if let Err(error) = drive(note, &self.context).await {
+                warn!(%error, "Failed to note the device sync state");
+            }
         }
     }
 
     /// The timer map. Each arm is boxed here, outside an async body, so only
     /// the selected timer's future stays on the stack while its work runs.
+    /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
+    async fn run_trigger(&self, key: TaskKey) {
+        let input = TimerInput {
+            now_ms: unix_timestamp_millis(),
+            local_node: self.context.net_handle.as_ref().map(|net| net.node_id()),
+        };
+        let Some(operation) = timer_operation(&key, &input) else {
+            error!(task_id = ?key, "The trigger table names no operation for this timer");
+            return;
+        };
+        let after = match drive(operation, self.context.as_ref()).await {
+            Ok(after) => after,
+            Err(failure) => {
+                warn!(task_id = ?key, error = %failure, "Timer run failed");
+                Some(failure.retry_after)
+            }
+        };
+        if let Some(after) = after {
+            self.reschedule_timer(key, after).await;
+        }
+    }
+
     fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         match key {
             TaskKey::RealmPresence { realm_id, node_id } => Box::pin(async move {
@@ -806,12 +838,8 @@ impl OperationsTaskHandler {
             TaskKey::DrainRefreshQueue => Box::pin(async move {
                 self.drain_refresh_queue().await;
             }),
-            TaskKey::DrainNotificationOutbox => Box::pin(async move {
-                self.drain_notification_outbox().await;
-            }),
-            TaskKey::PruneNotifications => Box::pin(async move {
-                self.prune_notifications().await;
-            }),
+            TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
+            TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
             TaskKey::PublishWatchInterest => Box::pin(async move {
                 self.publish_watch_interest().await;
             }),
@@ -923,7 +951,8 @@ impl OperationsTaskHandler {
                 self.publish_registration().await;
             }),
             TaskKey::PruneConnectorReferences => Box::pin(async move {
-                match crate::connectors::reference_prune::prune_references(&self.context).await {
+                let prune = crate::connectors::reference_prune::PruneReferencesOperation::new();
+                match drive(prune, &self.context).await {
                     Ok(true) => {
                         self.reschedule_timer(TaskKey::PruneConnectorReferences, Duration::ZERO)
                             .await;

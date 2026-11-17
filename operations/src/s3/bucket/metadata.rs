@@ -23,11 +23,12 @@ use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::DriverContext;
-use crate::metadata::AuthToken;
-use crate::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use crate::metadata::api::MetadataApiError;
+use crate::metadata::api::export_types::{
+    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
 };
-use crate::metadata::forward::export_rocrate_routed;
+use crate::metadata::forward::read::export_rocrate_routed;
+use aruna_core::metadata::AuthToken;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PutMetadataState {
@@ -472,8 +473,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId::from_bytes([1; 32]);
         let admin = UserId::local(Ulid::from_bytes([2; 16]), realm_id);

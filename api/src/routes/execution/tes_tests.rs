@@ -155,8 +155,10 @@ async fn build_state() -> (TempDir, Arc<ServerState>) {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = ServerState::new(
         ctx,
@@ -1336,8 +1338,10 @@ async fn management_state() -> (TempDir, Arc<ServerState>) {
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let capabilities =
         NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();

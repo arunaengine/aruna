@@ -19,7 +19,6 @@ use aruna_core::structs::execution::notification_watch::{
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::node::dashboard::subscribe_dashboard_changes;
 use aruna_operations::notifications::dispatch;
 use aruna_operations::notifications::dispatch::{
     InboxWakeReceiver, NotificationDispatchError, WatchDispatchError, create_for_user,
@@ -28,9 +27,8 @@ use aruna_operations::notifications::dispatch::{
 };
 use aruna_operations::notifications::list::LIST_MAX_LIMIT;
 use aruna_operations::notifications::mark_read::MARK_MAX_IDS;
-use aruna_operations::notifications::watch::authorization::{
-    WatchAuthorization, evaluate_watch_creation, watch_permission_path,
-};
+use aruna_operations::notifications::watch::authorization::evaluate_watch_creation;
+use aruna_operations::notifications::watch::paths::{WatchAuthorization, watch_permission_path};
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1012,8 +1010,9 @@ pub async fn stream_notifications(
     let context = state.get_ctx();
     let local_node_id = state.get_node_id();
     let recipient = auth.user_id;
-    let (dashboard_epoch, dashboard_revisions) =
-        subscribe_dashboard_changes(context.as_ref()).ok_or(ServerError::ServiceUnavailable)?;
+    let (dashboard_epoch, dashboard_revisions) = context
+        .subscribe_dashboard_changes()
+        .ok_or(ServerError::ServiceUnavailable)?;
 
     let holder = resolve_user_holder(context.as_ref(), recipient)
         .await

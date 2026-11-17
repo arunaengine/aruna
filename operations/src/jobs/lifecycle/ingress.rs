@@ -22,7 +22,9 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::bucket_metadata::{CapturedDatabase, ReleaseRef};
 use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_core::structs::storage::origin::SourcePin;
-use aruna_core::structs::storage::read_grant::{GrantScope, ReadGrant};
+use aruna_core::structs::storage::read_grant::{
+    GrantScope, HEAD_OPERATION, READ_OPERATION, ReadGrant,
+};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::time::unix_timestamp_millis;
 use serde::{Deserialize, Serialize};
@@ -49,18 +51,18 @@ use crate::jobs::records::verify::FamilyView;
 use crate::jobs::service::{mint_local_job, validate_execution};
 use crate::jobs::source_read::{SourceReadError, authorize_read, issue_grant, public_read};
 use crate::jobs::submit::SubmitJobError;
-use crate::metadata::api::load_realm_config;
+use crate::metadata::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::{AuthToken, WritePeerError};
+use crate::realm::load_config::load_realm_config;
 use crate::realm::peer_trust::{is_sync_eligible, peer_acts_for};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
 use aruna_core::structs::execution::job::record_rows::ProjectionCache;
-use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
@@ -1025,7 +1027,8 @@ async fn readable_metadata(
     };
     let described = match metadata.dataset {
         Some(dataset) => {
-            let token = bearer.and_then(|token| crate::metadata::AuthToken::bearer(token).ok());
+            let token =
+                bearer.and_then(|token| aruna_core::metadata::AuthToken::bearer(token).ok());
             let read = dataset_description(context, auth.realm_id, dataset, (Some(auth), token));
             admitted_description(read.await)?
         }
@@ -1765,8 +1768,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

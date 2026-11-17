@@ -206,8 +206,11 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",
+        Effect::Outbound(_) => "outbound",
+        Effect::Delay(_) => "delay",
     }
 }
 

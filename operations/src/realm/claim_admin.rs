@@ -624,8 +624,10 @@ mod tests {
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_config = CreateRealmConfig {
@@ -929,8 +931,10 @@ mod tests {
             blob_handle: None,
             net_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         for user_id in [admin_id, UserId::local(Ulid::generate(), realm_id)] {
             let result = drive(

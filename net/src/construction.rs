@@ -444,6 +444,7 @@ impl BackgroundRuntime {
         let inbound_tasks = TaskTracker::new();
         let effect_context = Arc::new(NetEffectContext {
             dht: services.dht.clone(),
+            secret_key: runtime.endpoint.secret_key().clone(),
             document_sync: services.document_sync.clone(),
             presence: effect_handlers::RealmPresenceCache::default(),
             tasks: inbound_tasks.clone(),

@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -22,6 +22,7 @@ use aruna_core::structs::storage::usage::dirty_share_key;
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::handoff::{
@@ -167,10 +168,7 @@ impl RebuildOperation {
     fn finish(&mut self, outcome: Result<RebuildOutcome, RebuildError>) -> Effects {
         self.state = State::Done;
         self.outcome = Some(outcome);
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+        abort_effects(&mut self.txn_id)
     }
 
     fn fail(&mut self, error: impl Into<RebuildError>) -> Effects {
@@ -546,8 +544,165 @@ impl Operation for RebuildOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+        abort_effects(&mut self.txn_id)
+    }
+}
+
+/// The set, range and account of one range account row; `None` for a malformed row.
+pub(super) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
+    let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
+    let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
+    let account = RangeAccount::from_bytes(value).ok()?;
+    (key.len() == 32).then_some((set_id, range_id, account))
+}
+
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub(super) struct BeginRebuildsError(String);
+
+/// Begins a counter rebuild of every active range account without one, a page at a time, and
+/// outputs how many began. A rebuild that does not begin is logged and skipped.
+#[derive(Debug, PartialEq)]
+pub(super) struct BeginRebuildsOperation {
+    account_page: usize,
+    walk: (usize, usize),
+    started: bool,
+    /// The last account key read, where the next page starts.
+    cursor: Option<Key>,
+    more: bool,
+    /// Accounts of the page still to begin, the next one last.
+    pending: Vec<(Ulid, Ulid)>,
+    current: Option<RebuildOperation>,
+    begun: usize,
+    output: Option<Result<usize, BeginRebuildsError>>,
+}
+
+impl BeginRebuildsOperation {
+    /// Pages of `account_page` accounts; each rebuild records walk pages of `walk` rows and bytes.
+    pub(super) fn new(account_page: usize, walk: (usize, usize)) -> Self {
+        Self {
+            account_page,
+            walk,
+            started: false,
+            cursor: None,
+            more: false,
+            pending: Vec::new(),
+            current: None,
+            begun: 0,
+            output: None,
+        }
+    }
+
+    fn page(&self) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
+            prefix: None,
+            start: self.cursor.clone().map(IterStart::After),
+            limit: self.account_page,
+            txn_id: None,
+        })]
+    }
+
+    fn finish(&mut self, output: Result<usize, BeginRebuildsError>) -> Effects {
+        self.output = Some(output);
+        smallvec![]
+    }
+
+    fn read_page(&mut self, values: Vec<(Key, Value)>, more: bool) -> Effects {
+        // Reversed, so the accounts are popped in key order.
+        for (key, value) in values.into_iter().rev() {
+            let Some((set_id, range_id, account)) = decode(&key, &value) else {
+                continue;
+            };
+            if account.rebuild.is_none() && matches!(account.charge, Charge::Active(_)) {
+                self.pending.push((set_id, range_id));
+            }
+        }
+        self.more = more;
+        self.next_rebuild()
+    }
+
+    fn next_rebuild(&mut self) -> Effects {
+        let Some((set_id, range_id)) = self.pending.pop() else {
+            if self.more {
+                return self.page();
+            }
+            let begun = self.begun;
+            return self.finish(Ok(begun));
+        };
+        // No page budget: the run only records the new generation's rebuild.
+        let config = RebuildConfig {
+            set_id,
+            range_id,
+            page_rows: self.walk.0,
+            page_bytes: self.walk.1,
+            max_pages: 0,
+            group_id: None,
+        };
+        let mut rebuild = RebuildOperation::new(config);
+        let effects = rebuild.start();
+        self.current = Some(rebuild);
+        effects
+    }
+}
+
+impl Operation for BeginRebuildsOperation {
+    type Output = usize;
+    type Error = BeginRebuildsError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        self.page()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        if let Some(mut rebuild) = self.current.take() {
+            let effects = rebuild.step(event);
+            if !rebuild.is_complete() {
+                self.current = Some(rebuild);
+                return effects;
+            }
+            let (set_id, range_id) = (rebuild.config.set_id, rebuild.config.range_id);
+            match rebuild.finalize() {
+                Ok(_) => self.begun += 1,
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
+                }
+            }
+            return self.next_rebuild();
+        }
+        match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) if self.started && self.output.is_none() => {
+                if let Some((key, _)) = values.last() {
+                    self.cursor = Some(key.clone());
+                }
+                self.read_page(values, next_start_after.is_some())
+            }
+            Event::Storage(StorageEvent::Error { error }) if self.started => {
+                self.finish(Err(BeginRebuildsError(error.to_string())))
+            }
+            event => {
+                let unexpected = format!("unexpected answer {}", event.label());
+                self.finish(Err(BeginRebuildsError(unexpected)))
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        let unfinished = BeginRebuildsError("the rebuilds did not begin".to_string());
+        self.output.unwrap_or(Err(unfinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match &mut self.current {
+            Some(rebuild) => rebuild.abort(),
             None => smallvec![],
         }
     }

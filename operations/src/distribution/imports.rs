@@ -69,7 +69,7 @@ struct Kept {
 }
 
 /// The open staging jobs of this node that import into `bucket`, with their specs.
-pub(crate) async fn open_imports(
+async fn open_imports(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Vec<(JobId, StagingJobSpec)>, String> {
@@ -348,7 +348,7 @@ async fn write_row(context: &DriverContext, key: Key, value: Vec<u8>) -> Result<
     };
     match context.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("handed over imports not kept: {other:?}")),
+        other => Err(format!("handed over imports not kept: {}", other.label())),
     }
 }
 
@@ -435,11 +435,14 @@ async fn delete(context: &DriverContext, key: Key) -> Result<(), String> {
     };
     match context.storage_handle.send_storage_effect(delete).await {
         Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        other => Err(format!("handed over imports not dropped: {other:?}")),
+        other => Err(format!(
+            "handed over imports not dropped: {}",
+            other.label()
+        )),
     }
 }
 
-pub(super) async fn read_value(
+async fn read_value(
     context: &DriverContext,
     key_space: &str,
     key: Key,
@@ -451,11 +454,11 @@ pub(super) async fn read_value(
     };
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        other => Err(format!("unexpected read answer {other:?}")),
+        other => Err(format!("unexpected read answer {}", other.label())),
     }
 }
 
-pub(super) async fn page(
+async fn page(
     context: &DriverContext,
     key_space: &str,
     prefix: Option<Vec<u8>>,
@@ -474,7 +477,7 @@ pub(super) async fn page(
             values,
             next_start_after,
         }) => Ok((values, next_start_after)),
-        other => Err(format!("unexpected page answer {other:?}")),
+        other => Err(format!("unexpected page answer {}", other.label())),
     }
 }
 
@@ -741,8 +744,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         assert!(open_imports(&context, "spire").await.unwrap().is_empty());
     }
@@ -773,8 +778,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let open = open_imports(&context, "spire").await.unwrap();
@@ -800,8 +807,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let transfer_id = Ulid::from_bytes([8; 16]);
         keep_resume(&context, "spire", transfer_id).await.unwrap();

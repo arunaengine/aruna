@@ -19,7 +19,7 @@ use super::{
 };
 
 use super::distributed::run_search_distributed;
-use crate::distribution::index_feed::IndexProgress;
+use crate::distribution::feed_walks::IndexProgress;
 use crate::metadata::search_cursor::{SEARCH_MAX_PAGE, SEARCH_PAGE_SIZE};
 use crate::s3::object::search_scan::changed_until;
 

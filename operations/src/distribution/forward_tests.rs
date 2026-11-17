@@ -10,6 +10,7 @@ use aruna_core::structs::storage::distribution::{
 };
 
 use super::*;
+use aruna_core::errors::StorageError;
 
 fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])

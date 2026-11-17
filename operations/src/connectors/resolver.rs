@@ -28,14 +28,13 @@ use crate::connectors::repository::{
     StorageReadError, iter_connectors_effect, parse_connector_iter, parse_connector_read,
     parse_secret_read, read_connector_effect, read_secret_effect,
 };
+use crate::connectors::root_record::{parse_root, read_root};
 use crate::harvest::create_connector::INVENIO_TOKEN;
-use crate::staging::root_record::{parse_root, read_root};
+use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
-pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
 /// Names the distributed bucket whose holders keep the bytes of a record-only version.
 pub(crate) const NATIVE_SET_ID: &str = "set_id";
-pub(crate) const ORIGIN_NODE_ID: &str = "origin_node_id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveConnectorInput {
@@ -748,9 +747,9 @@ pub fn validate_source_path(path: &str, allow_root: bool) -> Result<(), SourceRe
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    use crate::connectors::descriptor::build_source_binding;
     use crate::connectors::repository::delete_connector_effect;
     use crate::driver::{DriverContext, drive};
-    use crate::staging::descriptor::build_source_binding;
     use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_storage::storage;
@@ -767,8 +766,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let group_id = Ulid::generate();
 
@@ -832,8 +833,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let group_id = Ulid::generate();
         let connector = |user: &str| SourceConnectorInput {
@@ -1031,8 +1034,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let group_id = Ulid::generate();
 
@@ -1119,7 +1124,7 @@ mod tests {
     // the record it does not resolve at all.
     #[tokio::test]
     async fn compact_binding_resolves() {
-        use crate::staging::root_record::root_write;
+        use crate::connectors::root_record::root_write;
         use aruna_core::structs::storage::distribution::source_root::RootEntry;
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
@@ -1129,8 +1134,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let created = drive(
             SourceConnectorOperation::new(SourceConnectorInput {

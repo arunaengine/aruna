@@ -7,10 +7,6 @@ use std::time::Duration;
 
 use crate::realm::mutate_placement::node_kind;
 use aruna_core::NodeId;
-use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
-    DocumentSyncRevision, DocumentTarget,
-};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -21,16 +17,15 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataError, MetadataEventPayload,
-    MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataEventRecord, MetadataLifecycleRecord, MetadataMaterializationRecord,
 };
 use aruna_core::plugin_runs::{DEDUP_RETENTION_MS, SourceEvent, journal_entries, source_key};
 use aruna_core::storage_entries::{
     delete_projection_entry, document_job_entry, document_lifecycle_entry, document_lifecycle_key,
-    event_log_key, graph_lifecycle_key, lifecycle_revision_change, materialization_job_entry,
-    pending_projection_key, pending_projection_target, registry_delete_entries,
+    event_log_key, graph_lifecycle_key, materialization_job_entry, pending_projection_key,
+    pending_projection_target, registry_delete_entries,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
@@ -46,13 +41,13 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::materialization_queue::{
-    new_materialization_job, new_pending_status, schedule_materialization,
-};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::driver::{DriverContext, drive};
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::record_reads::load_document_record;
 use crate::metadata::repository::{
-    StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
-    parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
+    StorageReadError, create_materialization_entries, create_outbox_entries, create_outbox_record,
+    parse_status_read, read_status_effect, registry_outbox_record, schedule_materialization,
 };
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
@@ -137,13 +132,13 @@ pub async fn schedule_projection_drain(
         Event::Task(TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
-pub async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
+pub(crate) async fn restore_projection_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
     let event = storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: PENDING_PROJECTION_KEYSPACE.to_string(),
@@ -208,9 +203,9 @@ pub async fn replay_until_stopped(
             }) => (values, next_start_after),
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataProjectionError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         };
 
@@ -248,9 +243,9 @@ pub async fn drain_projection_queue(
         }) => (values, next_start_after),
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
 
@@ -356,9 +351,9 @@ async fn read_create_event(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let Some(value) = value else {
@@ -377,7 +372,7 @@ async fn read_create_event(
     Ok(event)
 }
 
-pub async fn project_create_event(
+pub(crate) async fn project_create_event(
     context: &DriverContext,
     event: MetadataEventRecord,
     local_node_id: Option<NodeId>,
@@ -444,7 +439,7 @@ pub async fn project_create_events(
             let existing_registry = match registry_cache.get(&document_id) {
                 Some(record) => record.clone(),
                 None => {
-                    let record = read_existing_registry(context, document_id).await?;
+                    let record = load_document_record(context, document_id).await?;
                     registry_cache.insert(document_id, None);
                     record
                 }
@@ -462,7 +457,7 @@ pub async fn project_create_events(
         let existing_registry = match registry_cache.get(&document_id) {
             Some(record) => record.clone(),
             None => {
-                let record = read_existing_registry(context, document_id).await?;
+                let record = load_document_record(context, document_id).await?;
                 registry_cache.insert(document_id, record.clone());
                 record
             }
@@ -524,7 +519,10 @@ pub async fn project_create_events(
             && let MetadataEventPayload::ApplyBatch { batch, .. } = &event.payload
             && !dot_applied(context, &event.record.graph_iri, batch).await?
         {
-            let job = new_materialization_job(&event, aruna_core::time::unix_timestamp_millis());
+            let job = MetadataMaterializationRecord::new(
+                &event,
+                aruna_core::time::unix_timestamp_millis(),
+            );
             writes.push(materialization_job_entry(&job)?);
             writes.push(document_job_entry(&job)?);
             late_graphs.insert(event.record.graph_iri.clone());
@@ -593,8 +591,8 @@ pub async fn project_create_events(
         let audit = audit_record(&event, message.as_deref());
         if needs_materialization {
             let now = aruna_core::time::unix_timestamp_millis();
-            let status = new_pending_status(&event, now);
-            let job = new_materialization_job(&event, now);
+            let status = MaterializationStatusRecord::pending(&event, now);
+            let job = MetadataMaterializationRecord::new(&event, now);
             writes.extend(create_materialization_entries(
                 &event.record,
                 &audit,
@@ -647,9 +645,9 @@ pub async fn project_create_events(
             Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
-                return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                    "{other:?}"
-                )));
+                return Err(MetadataProjectionError::UnexpectedEvent(
+                    other.label().to_string(),
+                ));
             }
         }
         if let Some(metadata_handle) = context.metadata_handle.as_ref() {
@@ -714,9 +712,9 @@ async fn pending_projection_marker(
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -740,9 +738,9 @@ async fn author_message(
             .transpose()
             .map_err(ConversionError::from)?),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -761,9 +759,9 @@ async fn source_journaled(
     match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -777,7 +775,9 @@ async fn journals(
         return Ok(false);
     };
     if let std::collections::btree_map::Entry::Vacant(slot) = realm_configs.entry(realm_id) {
-        slot.insert(read_realm_config(context, realm_id).await?);
+        slot.insert(optional_config(
+            drive(GetConfigOperation::new(realm_id), context).await,
+        )?);
     }
     let config = realm_configs.get(&realm_id).and_then(Option::as_ref);
     let kind = config.and_then(|config| node_kind(config, local));
@@ -809,9 +809,9 @@ async fn event_message(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => {
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     let lifecycle =
@@ -890,9 +890,9 @@ async fn transactional_projection_write(
         }
         other => {
             abort_projection_transaction(storage, &mut owner, txn_id).await;
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     };
     if !fence.admits(&values[lifecycle_reads..]) {
@@ -929,9 +929,9 @@ async fn transactional_projection_write(
         }
         other => {
             abort_projection_transaction(storage, &mut owner, txn_id).await;
-            return Err(MetadataProjectionError::UnexpectedEvent(format!(
-                "{other:?}"
-            )));
+            return Err(MetadataProjectionError::UnexpectedEvent(
+                other.label().to_string(),
+            ));
         }
     }
     match storage
@@ -952,9 +952,9 @@ async fn transactional_projection_write(
             }
             Err(error.into())
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -985,9 +985,9 @@ async fn write_pending_markers(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1012,9 +1012,9 @@ async fn delete_pending_markers(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1039,9 +1039,9 @@ async fn delete_marker_keys(
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1056,7 +1056,8 @@ async fn expand_cached_holders(
         match realm_configs.get(&realm_id) {
             Some(config) => config.clone(),
             None => {
-                let config = read_realm_config(context, realm_id).await?;
+                let config =
+                    optional_config(drive(GetConfigOperation::new(realm_id), context).await)?;
                 realm_configs.insert(realm_id, config.clone());
                 config
             }
@@ -1081,107 +1082,16 @@ fn expand_event_holders(
     Ok(event)
 }
 
-async fn read_realm_config(
-    context: &DriverContext,
-    realm_id: aruna_core::structs::identity::realm::RealmId,
+/// A realm config read result where a missing config is `None`.
+fn optional_config(
+    result: Result<RealmConfigDocument, GetConfigError>,
 ) -> Result<Option<RealmConfigDocument>, MetadataProjectionError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    match context
-        .storage_handle
-        .send_effect(crate::document_repository::read_effect(&target, None))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| RealmConfigDocument::from_bytes(&value))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
-/// The document's registry row, published on the registry class's own
-/// everywhere-bound topic rather than the replica-capped bucket topic, so every
-/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
-pub fn registry_outbox_record(
-    event: &MetadataEventRecord,
-    realm_config: Option<&RealmConfigDocument>,
-    allow_genesis: bool,
-) -> Option<DocumentOutboxRecord> {
-    let record = &event.record;
-    let config = realm_config?;
-    let placement = registry_placement(config, record);
-    if placement == PlacementRef::NIL {
-        return None;
-    }
-    let target = DocumentTarget::MetadataRegistry {
-        group_id: record.group_id,
-        document_id: record.document_id,
-    };
-    let peers = resolve_shard_holders(config, &placement);
-    if peers.is_empty() {
-        return None;
-    }
-    let change = DocumentChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: record.updated_at_ms,
-            event_id: event.event_id,
-            actor: event.node_id,
-            updated_at_ms: record.updated_at_ms,
-        },
-        kind: DocumentChangeKind::Upsert,
-        placement,
-    };
-    Some(DocumentOutboxRecord {
-        outbox_id: event.event_id,
-        node_id: event.node_id,
-        target,
-        peers,
-        event: DocumentOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
-            change,
-        },
-        placement,
-        generation: 0,
-        updated_at: event.occurred_at_ms / 1_000,
-        allow_genesis,
-    })
-}
-
-pub fn create_outbox_record(
-    event: &MetadataEventRecord,
-    message: Option<&str>,
-    realm_config: Option<&RealmConfigDocument>,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), message.map(str::to_owned));
-    let target = DocumentTarget::MetadataDocumentLifecycle {
-        document_id: event.record.document_id,
-    };
-    // The bucket is the one the create stamped; peers are its live holders, so a publish after
-    // a rebalance targets the current holder set and not the event-time one.
-    let placement = event.record.placement;
-    let peers = realm_config
-        .map(|config| resolve_shard_holders(config, &placement))
-        .unwrap_or_default();
-    let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
-    DocumentOutboxRecord {
-        outbox_id: event.event_id,
-        node_id: event.node_id,
-        target,
-        peers,
-        event: DocumentOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(&lifecycle)
-                .expect("metadata document lifecycle event serializes"),
-            change,
-        },
-        placement,
-        generation: 0,
-        updated_at: event.occurred_at_ms / 1_000,
-        allow_genesis,
+    match result {
+        Ok(config) => Ok(Some(config)),
+        Err(GetConfigError::DocumentNotFound) => Ok(None),
+        Err(GetConfigError::StorageError(error)) => Err(error.into()),
+        Err(GetConfigError::ConversionError(error)) => Err(error.into()),
+        Err(other) => Err(MetadataProjectionError::UnexpectedEvent(other.to_string())),
     }
 }
 
@@ -1190,16 +1100,18 @@ pub(crate) async fn dot_applied(
     graph_iri: &str,
     batch: &aruna_core::metadata::MetadataBatch,
 ) -> Result<bool, MetadataProjectionError> {
-    let Some(handle) = context.metadata_handle.as_ref() else {
+    if context.metadata_handle.is_none() {
         return Ok(true);
-    };
-    match handle
-        .send_metadata_effect(aruna_core::metadata::MetadataEffect::ContainsDot {
+    }
+    match crate::metadata::send_metadata_effect(
+        context,
+        aruna_core::metadata::MetadataEffect::ContainsDot {
             graph_iri: graph_iri.to_string(),
             actor: batch.actor,
             counter: batch.counter,
-        })
-        .await
+        },
+    )
+    .await
     {
         Event::Metadata(aruna_core::metadata::MetadataEvent::ContainsDotResult {
             contains,
@@ -1208,9 +1120,9 @@ pub(crate) async fn dot_applied(
         Event::Metadata(aruna_core::metadata::MetadataEvent::Error { error, .. }) => {
             Err(error.into())
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1222,25 +1134,11 @@ async fn graph_deleted_cached(
     if let Some(deleted) = lifecycle_cache.get(graph_iri) {
         return Ok(*deleted);
     }
-    let deleted = metadata_graph_deleted(context, graph_iri).await?;
+    let deleted = drive(GraphDeletedOperation::new(graph_iri), context)
+        .await
+        .map_err(GraphDeletedError::into_error::<MetadataProjectionError>)?;
     lifecycle_cache.insert(graph_iri.to_string(), deleted);
     Ok(deleted)
-}
-
-async fn metadata_graph_deleted(
-    context: &DriverContext,
-    graph_iri: &str,
-) -> Result<bool, MetadataProjectionError> {
-    let event = context
-        .storage_handle
-        .send_effect(read_lifecycle_effect(graph_iri, None))
-        .await;
-    parse_lifecycle_read(event)
-        .map(|record| record.is_some_and(|record| record.is_deleted()))
-        .map_err(|error| match error {
-            StorageReadError::Storage(error) => error.into(),
-            StorageReadError::Conversion(error) => error.into(),
-        })
 }
 
 fn audit_record(event: &MetadataEventRecord, message: Option<&str>) -> MetadataAuditRecord {
@@ -1265,26 +1163,6 @@ fn audit_record(event: &MetadataEventRecord, message: Option<&str>) -> MetadataA
     }
 }
 
-async fn read_existing_registry(
-    context: &DriverContext,
-    document_id: ulid::Ulid,
-) -> Result<Option<MetadataRegistryRecord>, MetadataProjectionError> {
-    match context
-        .storage_handle
-        .send_effect(read_document_registry(document_id, None))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| postcard::from_bytes(&value).map_err(ConversionError::from))
-            .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
-    }
-}
-
 async fn read_materialization_status(
     context: &DriverContext,
     document_id: Ulid,
@@ -1293,10 +1171,16 @@ async fn read_materialization_status(
         .storage_handle
         .send_effect(read_status_effect(document_id, None))
         .await;
-    parse_status_read(event).map_err(|error| match error {
-        StorageReadError::Storage(error) => error.into(),
-        StorageReadError::Conversion(error) => error.into(),
-    })
+    Ok(parse_status_read(event)?)
+}
+
+impl From<StorageReadError> for MetadataProjectionError {
+    fn from(error: StorageReadError) -> Self {
+        match error {
+            StorageReadError::Storage(error) => error.into(),
+            StorageReadError::Conversion(error) => error.into(),
+        }
+    }
 }
 
 async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataProjectionError> {
@@ -1308,9 +1192,9 @@ async fn schedule_outbox_drain(context: &DriverContext) -> Result<(), MetadataPr
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1325,9 +1209,9 @@ async fn schedule_materialization_drain(
         Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) => {
             Err(MetadataProjectionError::UnexpectedEvent(message))
         }
-        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
-            "{other:?}"
-        ))),
+        other => Err(MetadataProjectionError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
     }
 }
 
@@ -1336,6 +1220,7 @@ mod tests {
     use super::*;
     use crate::testing::write_entries;
     use aruna_core::UserId;
+    use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
     use aruna_core::storage_entries::{create_event_entry, pending_projection_key};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -1497,8 +1382,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -1536,8 +1423,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = project_create_events(&context, vec![event.clone()], Some(event.node_id))
@@ -1572,8 +1461,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let marker_key = pending_projection_key(event.record.document_id, event.event_id);
 
@@ -1632,8 +1523,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = transactional_projection_write(
@@ -1685,8 +1578,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1729,8 +1624,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1765,8 +1662,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drain_projection_queue(&context)
@@ -1851,8 +1750,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_event(&context, event.clone(), Some(event.node_id))
@@ -2067,8 +1968,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         for _ in 0..2 {
             project_create_event(&context, event.clone(), Some(local))
@@ -2112,8 +2015,10 @@ mod tests {
                 net_handle: None,
                 blob_handle: None,
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             };
             let other = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
             project_create_event(&context, event, Some(other))
@@ -2165,8 +2070,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         project_create_event(&context, event.clone(), Some(event.node_id))
@@ -2406,8 +2313,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = project_create_events(&context, vec![event], None)
@@ -2446,8 +2355,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let error = drain_projection_queue(&context)

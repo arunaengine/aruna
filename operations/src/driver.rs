@@ -4,14 +4,20 @@
 
 use aruna_blob::blob::{BlobHandle, GroupHold};
 use aruna_compute::ExecutorRegistry;
+use aruna_core::NodeId;
 use aruna_core::backoff::conflict_backoff;
 use aruna_core::effects::{BlobEffect, Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
+use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::operation::{EffectOperation, HoldScope, Runnable};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::storage::routing::NodeRouting;
+use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, TxnId};
+use aruna_graph::GraphHandle;
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
@@ -23,11 +29,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span, error, trace, warn};
 
 use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
+use crate::recorder;
 
 /// Node-local routing inputs for a caller assembling an operation config.
 /// Pure in-memory state: operations never fetch this from inside a step.
@@ -48,9 +56,12 @@ pub struct DriverContext {
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub metadata_handle: Option<MetadataHandle>,
+    pub graph_handle: Option<GraphHandle>,
     pub task_handle: Option<TaskHandle>,
     /// Enabled executor backends; `None` on nodes with no compute plane.
     pub compute_handle: Option<std::sync::Arc<ExecutorRegistry>>,
+    /// HTTP and mail clients; `None` where outbound calls answer as unavailable.
+    pub outbound_handle: Option<aruna_outbound::OutboundHandle>,
 }
 
 impl DriverContext {
@@ -76,14 +87,94 @@ impl DriverContext {
             .map(|net| (net.node_id(), *net.realm_id()))
     }
 
-    /// This context with its storage effects and metadata reads on the bulk lane, so
+    /// This context with its storage effects on the bulk lane, so
     /// background work never delays request traffic.
     pub fn bulk(&self) -> Self {
         let mut context = self.clone();
         context.storage_handle = context.storage_handle.bulk();
-        context.metadata_handle = context.metadata_handle.as_ref().map(MetadataHandle::bulk);
         context
     }
+
+    /// The dashboard epoch and a receiver of its change counter; `None` without a net transport.
+    pub fn subscribe_dashboard_changes(&self) -> Option<(String, watch::Receiver<u64>)> {
+        self.net_handle.as_ref().map(|net_handle| {
+            (
+                net_handle.dashboard_epoch().to_string(),
+                net_handle.subscribe_dashboard_changes(),
+            )
+        })
+    }
+
+    /// Heartbeats held for each node, fresh or stale; none without a net transport.
+    pub fn held_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let held = self.net_handle.as_ref().map(NetHandle::held_heartbeats);
+        (held.unwrap_or_default().into_iter())
+            .map(|held| (held.node_id, held))
+            .collect()
+    }
+
+    /// Fresh heartbeats held for each node; none without a net transport.
+    pub fn fresh_heartbeats(&self) -> BTreeMap<NodeId, HeldHeartbeat> {
+        let max_age_ms = MAX_HEARTBEAT_AGE.as_millis() as u64;
+        let mut held = self.held_heartbeats();
+        held.retain(|_, held| held.age_ms <= max_age_ms);
+        held
+    }
+
+    /// Skips holder `node_id` in holder choices for a while after it failed or refused a slot.
+    pub fn avoid_holder(&self, node_id: NodeId, now_ms: u64) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.avoided_holders().avoid(node_id, now_ms);
+        }
+    }
+
+    /// Tells dashboard subscribers that something they show changed.
+    pub fn notify_dashboard_change(&self) {
+        if let Some(net_handle) = self.net_handle.as_ref() {
+            net_handle.notify_dashboard_change();
+        }
+    }
+
+    /// One status snapshot of the net, blob and storage backends this context holds.
+    pub async fn status(&self) -> NodeSnapshot {
+        let network = match &self.net_handle {
+            Some(net) => Some(net.get_status().await),
+            None => None,
+        };
+        let blob = match &self.blob_handle {
+            Some(blob) => Some(blob.get_status().await),
+            None => None,
+        };
+        let metrics = self.storage_handle.snapshot_metrics();
+        NodeSnapshot {
+            network,
+            blob,
+            database: StorageSnapshot {
+                status: if metrics.channel_closed {
+                    Status::Unavailable
+                } else {
+                    Status::Available
+                },
+                requests: RequestSummaryState {
+                    total: metrics.requests_total,
+                    failures: metrics.failed_total,
+                    last_error: metrics.last_error,
+                },
+            },
+        }
+    }
+}
+
+/// The backend status of one node, from [`DriverContext::status`].
+pub struct NodeSnapshot {
+    pub network: Option<NetState>,
+    pub blob: Option<BlobState>,
+    pub database: StorageSnapshot,
+}
+
+pub struct StorageSnapshot {
+    pub status: Status,
+    pub requests: RequestSummaryState,
 }
 
 impl std::fmt::Debug for DriverContext {
@@ -92,8 +183,10 @@ impl std::fmt::Debug for DriverContext {
             .field("net_handle", &self.net_handle)
             .field("blob_handle", &self.blob_handle.is_some())
             .field("metadata_handle", &self.metadata_handle.is_some())
+            .field("graph_handle", &self.graph_handle.is_some())
             .field("task_handle", &self.task_handle.is_some())
             .field("compute_handle", &self.compute_handle.is_some())
+            .field("outbound_handle", &self.outbound_handle.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -101,8 +194,6 @@ impl std::fmt::Debug for DriverContext {
 pub(crate) const MAX_SUBOP_DEPTH: usize = 32;
 const SUBOP_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TRACKED_TRANSACTIONS: usize = 32;
-/// Reruns after a transaction conflict before [`drive_retry`] returns the conflict.
-const CONFLICT_RETRIES: usize = 3;
 
 /// Reserves every tenant backend an effect names for the rest of the operation.
 /// The bytes land inside one effect, but the transaction naming them commits
@@ -461,16 +552,30 @@ trait Drive: Send {
     }
 }
 
-/// Parent adapter: the operation borrows, while typed finalization stays in the
-/// parent entry points.
-struct ParentRun<'a, O: Operation>(&'a mut O);
+/// The runner's clock for one event delivery, recording the event when the run is recorded.
+fn delivery(record: Option<u64>, event: &Event) -> u64 {
+    let now = unix_timestamp_millis();
+    if let Some(run) = record {
+        recorder::event(run, now, event);
+    }
+    now
+}
 
-impl<O: Operation> Drive for ParentRun<'_, O> {
+/// Parent adapter: the operation borrows, while typed finalization stays in the
+/// parent entry points. The second field is the run's record number when recording is on.
+struct ParentRun<'a, O: EffectOperation>(&'a mut O, Option<u64>);
+
+impl<O: EffectOperation> Drive for ParentRun<'_, O> {
     fn start(&mut self) -> Effects {
+        let now = unix_timestamp_millis();
+        self.1 = recorder::begin(type_name::<O>(), now, || format!("{:?}", self.0));
+        self.0.stamp(now);
         self.0.start()
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let now = delivery(self.1, &event);
+        self.0.stamp(now);
         self.0.step(event)
     }
 
@@ -488,15 +593,21 @@ impl<O: Operation> Drive for ParentRun<'_, O> {
 }
 
 /// Suboperation adapter: a boxed child yields an event from `finalize` instead
-/// of a typed result.
-struct SubRun<'a>(&'a mut dyn SubOperation);
+/// of a typed result. The second field is the run's record number when recording is on.
+struct SubRun<'a>(&'a mut dyn SubOperation, Option<u64>);
 
 impl Drive for SubRun<'_> {
     fn start(&mut self) -> Effects {
+        let now = unix_timestamp_millis();
+        let name = type_name_of_val(&*self.0);
+        self.1 = recorder::begin(name, now, || format!("{:?}", self.0));
+        self.0.stamp(now);
         self.0.start()
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let now = delivery(self.1, &event);
+        self.0.stamp(now);
         self.0.step(event)
     }
 
@@ -545,11 +656,97 @@ type Dispatch<'a> = dyn Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Se
 
 /// Dispatches one effect through the adapters, as the effect loop does for a single effect.
 fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> {
-    Box::new(move |effect, until| {
-        Box::pin(effect_adapters::dispatch_effect_until(
+    let limits = hang_limits();
+    Box::new(move |effect, until| Box::pin(dispatch_bounded(effect, context, depth, until, limits)))
+}
+
+/// How long the runner waits for the adapter of each effect kind before it answers
+/// `Event::Hung`; `None` waits without a limit. Blob streams, local files, sub operations,
+/// groups, delays and managed effects have no limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HangLimits {
+    pub storage: Option<Duration>,
+    pub net: Option<Duration>,
+    pub metadata: Option<Duration>,
+    pub task: Option<Duration>,
+    pub staging_source: Option<Duration>,
+}
+
+impl HangLimits {
+    /// Generous bounds far above every adapter's own timeouts; they only catch a hung adapter.
+    pub const DEFAULT: Self = Self {
+        storage: Some(Duration::from_secs(60)),
+        net: Some(Duration::from_secs(30 * 60)),
+        metadata: Some(Duration::from_secs(30 * 60)),
+        task: Some(Duration::from_secs(60)),
+        staging_source: Some(Duration::from_secs(15 * 60)),
+    };
+}
+
+impl Default for HangLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+static HANG_LIMITS: std::sync::RwLock<HangLimits> = std::sync::RwLock::new(HangLimits::DEFAULT);
+
+/// Sets the hang limits every later effect of this process uses.
+pub fn set_hang_limits(limits: HangLimits) {
+    if let Ok(mut current) = HANG_LIMITS.write() {
+        *current = limits;
+    }
+}
+
+fn hang_limits() -> HangLimits {
+    HANG_LIMITS
+        .read()
+        .map_or(HangLimits::DEFAULT, |limits| *limits)
+}
+
+fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
+    if managed_effect(effect) {
+        return None;
+    }
+    match effect {
+        Effect::Storage(_) => limits.storage,
+        Effect::Net(_) => limits.net,
+        Effect::Metadata(_) => limits.metadata,
+        Effect::Task(_) => limits.task,
+        Effect::StagingSource(_) => limits.staging_source,
+        Effect::Blob(_)
+        | Effect::LocalFile(_)
+        | Effect::SubOperation(_)
+        | Effect::Group(_)
+        | Effect::Delay(_)
+        | Effect::Search()
+        | Effect::Stream() => None,
+    }
+}
+
+/// Dispatches one effect; an adapter that outlasts the hang limit of its kind is answered with
+/// `Event::Hung`, which fails the run with a typed error.
+async fn dispatch_bounded(
+    effect: Effect,
+    context: &DriverContext,
+    depth: usize,
+    until: Option<Instant>,
+    limits: HangLimits,
+) -> Event {
+    let limit = hang_limit(&effect, limits);
+    let kind = effect_adapters::effect_kind(&effect);
+    let dispatch: BoxFuture<'_, Event> = match until {
+        Some(_) => Box::pin(effect_adapters::dispatch_effect_until(
             effect, context, depth, until,
-        ))
-    })
+        )),
+        None => Box::pin(effect_adapters::dispatch_effect(effect, context, depth)),
+    };
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, dispatch)
+            .await
+            .unwrap_or(Event::Hung { effect: kind }),
+        None => dispatch.await,
+    }
 }
 
 /// When group members stop: at `at` every member still running ends as unfinished, except a
@@ -854,11 +1051,12 @@ async fn drive_effects(
             } else if let Some(deadline) = deadline {
                 let managed = managed_effect(&effect);
                 // Managed effects own their timeout and must not be canceled here.
-                let dispatch = Box::pin(effect_adapters::dispatch_effect_until(
+                let dispatch = Box::pin(dispatch_bounded(
                     effect,
                     context,
                     depth,
                     Some(deadline),
+                    hang_limits(),
                 ));
                 if managed {
                     dispatch.await
@@ -886,7 +1084,14 @@ async fn drive_effects(
                     }
                 }
             } else {
-                Box::pin(effect_adapters::dispatch_effect(effect, context, depth)).await
+                Box::pin(dispatch_bounded(
+                    effect,
+                    context,
+                    depth,
+                    None,
+                    hang_limits(),
+                ))
+                .await
             };
             state.record_outcome(transaction, &event);
             if !executable.is_complete() {
@@ -927,7 +1132,7 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Starting suboperation"
             );
-            let mut run = SubRun(operation.as_mut());
+            let mut run = SubRun(operation.as_mut(), None);
             let mut state = drive_effects(
                 &mut run,
                 context,
@@ -939,6 +1144,7 @@ pub(crate) fn drive_suboperation<'a>(
             )
             .await;
 
+            let record = run.1;
             abort_leaked_transaction(&mut state.tracker, context, depth, state.cleanup_deadline)
                 .await;
             trace!(
@@ -947,14 +1153,36 @@ pub(crate) fn drive_suboperation<'a>(
                 depth,
                 "Completed suboperation"
             );
-            operation.finalize()
+            let event = operation.finalize();
+            if let Some(run) = record {
+                recorder::end(run, unix_timestamp_millis(), || format!("{event:?}"));
+            }
+            event
         }
         .instrument(span)
         .await
     })
 }
 
-/// Drives an operation under one wall-clock deadline. Cleanup after expiry is
+/// Records the outcome of a recorded run.
+fn record_end<T: std::fmt::Debug, E: std::fmt::Debug>(record: Option<u64>, result: &Result<T, E>) {
+    if let Some(run) = record {
+        recorder::end(run, unix_timestamp_millis(), || format!("{result:?}"));
+    }
+}
+
+/// Waits for the backend hold of `scope`; the run keeps it until it returns or is dropped. A
+/// node without the backend that owns the scope has nothing to exclude.
+async fn take_hold(
+    context: &DriverContext,
+    scope: Option<HoldScope>,
+) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    match scope? {
+        HoldScope::DocumentReconcile => Some(context.net_handle.as_ref()?.hold_reconcile().await),
+    }
+}
+
+/// Drives an operation of either kind under one wall-clock deadline. Cleanup after expiry is
 /// bounded and unresolved transaction ownership is handed to storage.
 #[tracing::instrument(
     name = "operation",
@@ -962,12 +1190,32 @@ pub(crate) fn drive_suboperation<'a>(
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive_until<O: Operation>(
+pub async fn drive_until<O, K>(
+    operation: O,
+    context: &DriverContext,
+    deadline: tokio::time::Instant,
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    machine_until(operation.into_machine(), context, deadline).await
+}
+
+async fn machine_until<O: EffectOperation>(
     mut operation: O,
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    let mut run = ParentRun(&mut operation);
+    let hold = take_hold(context, operation.hold_scope());
+    let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
+        warn!(
+            operation = %type_name::<O>(),
+            "Operation deadline expired while it waited for its backend hold"
+        );
+        let _ = operation.abort();
+        return operation.finalize();
+    };
+    let mut run = ParentRun(&mut operation, None);
     let mut state = drive_effects(
         &mut run,
         context,
@@ -978,6 +1226,7 @@ pub async fn drive_until<O: Operation>(
         Some(type_name::<O>()),
     )
     .await;
+    let record = run.1;
     if !operation.is_complete() {
         // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
         // tracker resolve any transaction they name.
@@ -991,6 +1240,7 @@ pub async fn drive_until<O: Operation>(
     )
     .await;
     let result = operation.finalize();
+    record_end(record, &result);
     if let Err(error) = &result {
         if O::expected_error(error) {
             debug!(
@@ -1011,16 +1261,22 @@ pub async fn drive_until<O: Operation>(
     result
 }
 
-/// Drives an operation without a deadline. Transaction ownership and the effect
-/// loop are the same as [`drive_until`]; only the deadline and its logging
-/// differ.
+/// Drives an operation of either kind without a deadline. Transaction ownership and the effect
+/// loop are the same as [`drive_until`]; only the deadline and its logging differ.
 #[tracing::instrument(
     name = "operation",
     level = "debug",
     skip(operation, context),
     fields(operation = type_name::<O>())
 )]
-pub async fn drive<O: Operation>(
+pub async fn drive<O, K>(operation: O, context: &DriverContext) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    drive_machine(operation.into_machine(), context).await
+}
+
+async fn drive_machine<O: EffectOperation>(
     mut operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
@@ -1032,7 +1288,8 @@ pub async fn drive<O: Operation>(
         "Starting operation"
     );
 
-    let mut run = ParentRun(&mut operation);
+    let _hold = take_hold(context, operation.hold_scope()).await;
+    let mut run = ParentRun(&mut operation, None);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(drive_effects(
@@ -1045,8 +1302,10 @@ pub async fn drive<O: Operation>(
         None,
     ))
     .await;
+    let record = run.1;
     abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
     let result = operation.finalize();
+    record_end(record, &result);
     match &result {
         Ok(_) => trace!(
             event = "operation.completed",
@@ -1069,19 +1328,31 @@ pub async fn drive<O: Operation>(
     result
 }
 
-/// Drives a fresh operation from `build` and, after an error that [`Operation::is_conflict`]
-/// names, waits a backoff seeded by `seed` and drives a new one, at most [`CONFLICT_RETRIES`]
-/// times. The same seed gives the same waits; distinct seeds spread conflicting writers out.
-pub async fn drive_retry<O: Operation>(
+/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it waits a backoff
+/// seeded by `seed` and reruns, at most `conflict_retries` times. The same seed gives the same
+/// waits; distinct seeds spread conflicting writers out.
+pub async fn drive_retry<O, K>(
+    mut build: impl FnMut() -> O,
+    context: &DriverContext,
+    seed: &[u8],
+) -> Result<O::Output, O::Error>
+where
+    O: Runnable<K>,
+{
+    retry_machine(move || build().into_machine(), context, seed).await
+}
+
+async fn retry_machine<O: EffectOperation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
     seed: &[u8],
 ) -> Result<O::Output, O::Error> {
     let mut attempt = 0;
     loop {
-        match drive(build(), context).await {
-            Err(error) if O::is_conflict(&error) && attempt < CONFLICT_RETRIES => {
-                tokio::time::sleep(conflict_backoff(attempt, seed)).await;
+        match drive_machine(build(), context).await {
+            Err(error) if O::is_conflict(&error) && attempt < O::conflict_retries() => {
+                let wait = conflict_backoff(usize::try_from(attempt).unwrap_or(usize::MAX), seed);
+                tokio::time::sleep(wait).await;
                 attempt += 1;
             }
             result => return result,
@@ -1092,9 +1363,10 @@ pub async fn drive_retry<O: Operation>(
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DeadlineAbort, DriverContext, GroupEnd, GroupRun, Instant, MAX_TRACKED_TRANSACTIONS,
-        MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker, drive,
-        drive_retry, extend_unblocked, run_all, run_window,
+        DeadlineAbort, DriverContext, GroupEnd, GroupRun, HangLimits, Instant,
+        MAX_TRACKED_TRANSACTIONS, MemberStop, ParentRun, TransactionEffect, TransactionState,
+        TransactionTracker, dispatch_bounded, drive, drive_retry, drive_until, extend_unblocked,
+        run_all, run_window,
     };
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
@@ -1104,7 +1376,7 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{Operation, boxed_suboperation};
+    use aruna_core::operation::{EffectOperation, HoldScope, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -1112,6 +1384,7 @@ mod test {
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
+    use futures_util::FutureExt;
     use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
     use std::convert::Infallible;
@@ -1135,7 +1408,7 @@ mod test {
         }
     }
 
-    impl Operation for TestOperation {
+    impl EffectOperation for TestOperation {
         type Output = ();
         type Error = ();
 
@@ -1213,7 +1486,7 @@ mod test {
         txn_id: Option<TxnId>,
     }
 
-    impl Operation for MarkerAbortOperation {
+    impl EffectOperation for MarkerAbortOperation {
         type Output = ();
         type Error = ();
 
@@ -1285,7 +1558,7 @@ mod test {
         }
     }
 
-    impl Operation for DeadlineOperation {
+    impl EffectOperation for DeadlineOperation {
         type Output = bool;
         type Error = ();
 
@@ -1403,13 +1676,22 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         (directory, context)
     }
 
     async fn blob_context() -> (tempfile::TempDir, DriverContext) {
+        let (directory, mut context) = net_context().await;
+        context.net_handle = None;
+        (directory, context)
+    }
+
+    /// Storage, a file system blob backend and a net handle in one temporary folder.
+    async fn net_context() -> (tempfile::TempDir, DriverContext) {
         let directory = tempdir().unwrap();
         let root = directory.path().to_str().unwrap().to_string();
         let blob_root = format!("{root}/blobstore");
@@ -1430,7 +1712,7 @@ mod test {
                 timeouts: Default::default(),
             },
             storage_handle.clone(),
-            net_handle,
+            net_handle.clone(),
         )
         .await
         .unwrap();
@@ -1438,11 +1720,13 @@ mod test {
             directory,
             DriverContext {
                 storage_handle,
-                net_handle: None,
+                net_handle: Some(net_handle),
                 blob_handle: Some(blob_handle),
                 metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }
@@ -1596,8 +1880,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -1629,8 +1915,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(
@@ -1731,8 +2019,10 @@ mod test {
             net_handle: None,
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
@@ -1768,7 +2058,7 @@ mod test {
         output: Option<Result<(), u8>>,
     }
 
-    impl Operation for CommitDeadline {
+    impl EffectOperation for CommitDeadline {
         type Output = ();
         type Error = u8;
 
@@ -1850,7 +2140,7 @@ mod test {
         }
     }
 
-    impl Operation for LateOptIn {
+    impl EffectOperation for LateOptIn {
         type Output = ();
         type Error = ();
 
@@ -1935,7 +2225,7 @@ mod test {
         done: bool,
     }
 
-    impl Operation for NestedTransactionOperation {
+    impl EffectOperation for NestedTransactionOperation {
         type Output = ();
         type Error = ();
 
@@ -1997,7 +2287,7 @@ mod test {
         }
     }
 
-    impl Operation for PendingTxn {
+    impl EffectOperation for PendingTxn {
         type Output = bool;
         type Error = ();
 
@@ -2076,7 +2366,7 @@ mod test {
         }
     }
 
-    impl Operation for NestedDeadline {
+    impl EffectOperation for NestedDeadline {
         type Output = ();
         type Error = ();
 
@@ -2232,7 +2522,7 @@ mod test {
         steps: usize,
     }
 
-    impl Operation for StallingOperation {
+    impl EffectOperation for StallingOperation {
         type Output = bool;
         type Error = Infallible;
 
@@ -2282,8 +2572,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let aborted = crate::driver::drive_until(
@@ -2323,8 +2615,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let operation = TestOperation::new();
@@ -2345,7 +2639,7 @@ mod test {
         }
     }
 
-    impl Operation for EffectOrderOperation {
+    impl EffectOperation for EffectOrderOperation {
         type Output = Vec<&'static str>;
         type Error = ();
 
@@ -2395,8 +2689,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
@@ -2419,7 +2715,7 @@ mod test {
         }
     }
 
-    impl Operation for StagingDispatchOperation {
+    impl EffectOperation for StagingDispatchOperation {
         type Output = bool;
         type Error = ();
 
@@ -2490,8 +2786,10 @@ mod test {
             net_handle: None,
             blob_handle: Some(blob_handle),
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let observed = drive(StagingDispatchOperation::new(), &context)
@@ -2511,7 +2809,7 @@ mod test {
         }
     }
 
-    impl Operation for RecursiveSubOperation {
+    impl EffectOperation for RecursiveSubOperation {
         type Output = Event;
         type Error = Infallible;
 
@@ -2565,8 +2863,10 @@ mod test {
                         net_handle: None,
                         blob_handle: None,
                         metadata_handle: None,
+                        graph_handle: None,
                         task_handle: None,
                         compute_handle: None,
+                        outbound_handle: None,
                     };
 
                     let event = drive(RecursiveSubOperation::new(), &context)
@@ -2594,8 +2894,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
         .bulk();
         let read = StorageEffect::Read {
@@ -2676,8 +2978,10 @@ mod test {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
@@ -2739,7 +3043,7 @@ mod test {
         closed: bool,
     }
 
-    impl Operation for WindowRows {
+    impl EffectOperation for WindowRows {
         type Output = ();
         type Error = ();
 
@@ -2787,7 +3091,7 @@ mod test {
             closed: false,
         };
         let end = run_window(
-            &mut ParentRun(&mut operation),
+            &mut ParentRun(&mut operation, None),
             &mut run,
             &mut Vec::new(),
             GroupEnd::Expired,
@@ -2807,7 +3111,7 @@ mod test {
         results: Option<Vec<GroupResult>>,
     }
 
-    impl Operation for OneGroup {
+    impl EffectOperation for OneGroup {
         type Output = Vec<GroupResult>;
         type Error = ();
 
@@ -2888,7 +3192,7 @@ mod test {
         }
     }
 
-    impl Operation for HeldGroup {
+    impl EffectOperation for HeldGroup {
         type Output = bool;
         type Error = ();
 
@@ -2949,14 +3253,15 @@ mod test {
         assert!(blob.idle_generation(backend_id).is_some());
     }
 
-    /// Fails with a conflict until attempt `conflicts`, then answers its attempt.
+    /// Fails with a conflict until attempt `conflicts`, then answers its attempt; the runner
+    /// reruns it at most `RETRIES` times.
     #[derive(Debug, PartialEq)]
-    struct Conflicted {
+    struct Conflicted<const RETRIES: u32> {
         attempt: usize,
         conflicts: usize,
     }
 
-    impl Operation for Conflicted {
+    impl<const RETRIES: u32> EffectOperation for Conflicted<RETRIES> {
         type Output = usize;
         type Error = StorageError;
 
@@ -2986,25 +3291,362 @@ mod test {
         fn is_conflict(error: &Self::Error) -> bool {
             matches!(error, StorageError::TransactionConflict)
         }
+
+        fn conflict_retries() -> u32 {
+            RETRIES
+        }
+    }
+
+    /// The result of a conflict retry and how many operations it built.
+    async fn retried<const RETRIES: u32>(
+        context: &DriverContext,
+        conflicts: usize,
+    ) -> (Result<usize, StorageError>, usize) {
+        let mut built = 0;
+        let build = || {
+            built += 1;
+            Conflicted::<RETRIES> {
+                attempt: built - 1,
+                conflicts,
+            }
+        };
+        let result = drive_retry(build, context, &[7u8; 16]).await;
+        (result, built)
     }
 
     #[tokio::test(start_paused = true)]
     async fn retry_reruns_conflict() {
         let context = bare_context();
-        for (conflicts, expected, attempts) in [
-            (2, Ok(2), 3),
-            (usize::MAX, Err(StorageError::TransactionConflict), 4),
-        ] {
-            let mut built = 0;
-            let build = || {
-                built += 1;
-                Conflicted {
-                    attempt: built - 1,
-                    conflicts,
-                }
-            };
-            assert_eq!(drive_retry(build, &context, &[7u8; 16]).await, expected);
-            assert_eq!(built, attempts);
+        let conflict = Err(StorageError::TransactionConflict);
+        assert_eq!(retried::<3>(&context, 2).await, (Ok(2), 3));
+        assert_eq!(
+            retried::<3>(&context, usize::MAX).await,
+            (conflict.clone(), 4)
+        );
+        assert_eq!(
+            retried::<5>(&context, usize::MAX).await,
+            (conflict.clone(), 6)
+        );
+        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 1));
+    }
+
+    /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a
+    /// gate ends at once when `finish` holds and otherwise stays open until the runner aborts.
+    #[derive(Debug)]
+    struct Holding {
+        name: &'static str,
+        scope: Option<HoldScope>,
+        log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+        started: Arc<tokio::sync::Notify>,
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+        finish: bool,
+        done: bool,
+    }
+
+    impl Holding {
+        fn new(name: &'static str, log: &Arc<std::sync::Mutex<Vec<&'static str>>>) -> Self {
+            Self {
+                name,
+                scope: Some(HoldScope::DocumentReconcile),
+                log: log.clone(),
+                started: Arc::default(),
+                gate: None,
+                finish: true,
+                done: false,
+            }
         }
+    }
+
+    impl PartialEq for Holding {
+        fn eq(&self, other: &Self) -> bool {
+            self.name == other.name && self.done == other.done
+        }
+    }
+
+    impl EffectOperation for Holding {
+        type Output = ();
+        type Error = ();
+
+        fn hold_scope(&self) -> Option<HoldScope> {
+            self.scope
+        }
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            self.log.lock().unwrap().push(self.name);
+            self.started.notify_one();
+            let Some(gate) = self.gate.take() else {
+                self.done = self.finish;
+                return smallvec::smallvec![];
+            };
+            let blob = futures_util::stream::once(async move {
+                let _ = gate.await;
+                Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
+            });
+            smallvec::smallvec![Effect::Blob(BlobEffect::SpoolHidden {
+                namespace: ulid::Ulid::from_bytes([5u8; 16]),
+                name: self.name.to_string(),
+                created_by: aruna_core::UserId::default(),
+                max_bytes: None,
+                deadline: None,
+                blob: aruna_core::stream::BackendStream::new(blob),
+            })]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.done = true;
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.done
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.done { Ok(()) } else { Err(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    /// Whether nothing holds the reconcile scope right now.
+    fn reconcile_free(context: &DriverContext) -> bool {
+        let net = context.net_handle.as_ref().expect("net handle");
+        net.hold_reconcile().now_or_never().is_some()
+    }
+
+    #[tokio::test]
+    async fn scope_waits_holder() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+        let (open, gate) = tokio::sync::oneshot::channel();
+        let mut first = Holding::new("first", &log);
+        first.gate = Some(gate);
+        let first_started = first.started.clone();
+        let task_context = context.clone();
+        let first_task = tokio::spawn(async move { drive(first, &task_context).await });
+        first_started.notified().await;
+
+        let second = Holding::new("second", &log);
+        let task_context = context.clone();
+        let second_task = tokio::spawn(async move { drive(second, &task_context).await });
+        let mut other = Holding::new("other", &log);
+        other.scope = None;
+        assert_eq!(drive(other, &context).await, Ok(()));
+        let late = Holding::new("late", &log);
+        assert_eq!(drive_until(late, &context, Instant::now()).await, Err(()));
+        // Paused time first runs every ready task, so the second run is parked on the hold
+        // before the clock jumps an hour.
+        tokio::time::pause();
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        tokio::time::resume();
+        assert_eq!(*log.lock().unwrap(), ["first", "other"]);
+
+        open.send(()).unwrap();
+        assert_eq!(first_task.await.unwrap(), Ok(()));
+        assert_eq!(second_task.await.unwrap(), Ok(()));
+        assert_eq!(*log.lock().unwrap(), ["first", "other", "second"]);
+        assert!(reconcile_free(&context));
+    }
+
+    #[tokio::test]
+    async fn hold_released_finally() {
+        let (_directory, context) = net_context().await;
+        let log = Arc::default();
+
+        // Abort: no effects and never complete, so the runner aborts it.
+        let mut aborted = Holding::new("aborted", &log);
+        aborted.finish = false;
+        assert_eq!(drive(aborted, &context).await, Err(()));
+        assert!(reconcile_free(&context));
+
+        // Cancel: the caller drops the run while its spool waits.
+        let (_open, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut cancelled = Holding::new("cancelled", &log);
+        cancelled.gate = Some(gate);
+        let started = cancelled.started.clone();
+        let task_context = context.clone();
+        let task = tokio::spawn(async move { drive(cancelled, &task_context).await });
+        started.notified().await;
+        assert!(!reconcile_free(&context));
+        task.abort();
+        let _ = task.await;
+        assert!(reconcile_free(&context));
+
+        // Expiry: the deadline passes while the spool waits.
+        let (_open, gate) = tokio::sync::oneshot::channel::<()>();
+        let mut expired = Holding::new("expired", &log);
+        expired.gate = Some(gate);
+        let started = expired.started.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let task_context = context.clone();
+        let task = tokio::spawn(async move { drive_until(expired, &task_context, deadline).await });
+        started.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(task.await.unwrap(), Err(()));
+        tokio::time::resume();
+        assert!(reconcile_free(&context));
+    }
+
+    /// Asks the runner to wake it after `after` and completes on the wake.
+    #[derive(Debug, PartialEq)]
+    struct Sleeper {
+        after: Duration,
+        woke: bool,
+    }
+
+    impl EffectOperation for Sleeper {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Delay(self.after)]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.woke = matches!(event, Event::Delayed);
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.woke
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.woke { Ok(()) } else { Err(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delay_wakes_operation() {
+        let context = bare_context();
+        let after = Duration::from_secs(30);
+        let started = Instant::now();
+        let sleeper = Sleeper { after, woke: false };
+        assert_eq!(drive(sleeper, &context).await, Ok(()));
+        assert_eq!(started.elapsed(), after);
+
+        // A run deadline before the wake cuts the delay off like any other effect.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        let sleeper = Sleeper { after, woke: false };
+        assert_eq!(drive_until(sleeper, &context, deadline).await, Err(()));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    /// Waits one second and reports whether the runner stamped a time on it.
+    #[derive(Debug, Default, PartialEq)]
+    struct Echo {
+        stamped: Option<u64>,
+        woke: bool,
+    }
+
+    impl EffectOperation for Echo {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Delay(Duration::from_secs(1))]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.woke = matches!(event, Event::Delayed);
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.woke
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.stamped.is_some())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn stamp(&mut self, now_ms: u64) {
+            self.stamped = Some(now_ms);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recording_keeps_order() {
+        use crate::recorder::{Entry, RecordLimits};
+        let limits = RecordLimits {
+            total_bytes: 1 << 20,
+            entry_bytes: 4096,
+        };
+        crate::recorder::enable(limits);
+        let result = drive(Echo::default(), &bare_context()).await;
+        crate::recorder::disable();
+        assert_eq!(
+            result,
+            Ok(true),
+            "the runner stamps the time on the operation"
+        );
+        // Other tests may record at the same time, so only this run's records count.
+        let records = crate::recorder::take().records;
+        let run = records
+            .iter()
+            .find_map(|record| match &record.entry {
+                Entry::Started { operation, .. } if operation.ends_with("::Echo") => {
+                    Some(record.run)
+                }
+                _ => None,
+            })
+            .expect("the run was recorded");
+        let entries: Vec<&Entry> = records
+            .iter()
+            .filter(|record| record.run == run)
+            .map(|record| &record.entry)
+            .collect();
+        assert!(matches!(
+            entries.as_slice(),
+            [
+                Entry::Started { .. },
+                Entry::Event {
+                    label: "Event::Delayed",
+                    ..
+                },
+                Entry::Ended { .. },
+            ]
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hang_limit_answers() {
+        // A storage handle without a worker never answers; its own request timeout is longer.
+        let (storage_handle, _receivers) = storage::StorageHandle::new();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            graph_handle: None,
+            outbound_handle: None,
+        };
+        let limits = HangLimits {
+            storage: Some(Duration::from_secs(1)),
+            ..HangLimits::DEFAULT
+        };
+        let read = Effect::Storage(StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from(*b"hung"),
+            txn_id: None,
+        });
+        let started = Instant::now();
+        let event = dispatch_bounded(read, &context, 0, None, limits).await;
+        assert_eq!(event, Event::Hung { effect: "storage" });
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
     }
 }

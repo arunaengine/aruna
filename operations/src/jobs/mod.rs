@@ -8,6 +8,7 @@ pub mod backend_import;
 pub(crate) mod blob_request;
 pub mod command;
 pub mod copy;
+pub mod demand;
 pub mod drain;
 pub mod executor;
 pub mod export;

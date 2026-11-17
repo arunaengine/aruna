@@ -20,6 +20,7 @@ use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
     RoCrateUploadRecord, WorkspaceMode, job_active_prefix, job_record_key, parse_dedup_value,
 };
+use aruna_core::structs::placement::record::shard_for_subject;
 use aruna_core::structs::storage::backend_import::{BackendImport, import_key};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -54,6 +55,36 @@ pub fn mint_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, C
     generator
         .mint::<RoutableJobId>(handle, bucket)
         .map(JobId::from_routable)
+}
+
+/// Synchronous form used by producer transactions that already fenced and read
+/// the realm config. The resulting job id and dedup shard can therefore be
+/// written atomically with the producer's own records.
+pub(crate) fn mint_configured_job(
+    config: &aruna_core::structs::identity::realm::RealmConfigDocument,
+    owner_node_id: NodeId,
+    subject: &[u8],
+) -> Result<JobId, SubmitJobError> {
+    let handle = config.job_control_handle(&owner_node_id).ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable(
+            "serving node has no job-control binding yet".to_string(),
+        )
+    })?;
+    let tuple = config
+        .binding_directory()
+        .resolve(handle)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let strategy = config.strategy(&tuple.strategy_id).ok_or_else(|| {
+        SubmitJobError::PlacementUnavailable("job-control strategy unavailable".to_string())
+    })?;
+    let shard = shard_for_subject(subject, strategy.shard_count);
+    let bucket = u16::try_from(shard)
+        .ok()
+        .and_then(|shard| BucketId::new(shard).ok())
+        .ok_or_else(|| {
+            SubmitJobError::PlacementUnavailable("job bucket is out of range".to_string())
+        })?;
+    Ok(mint_job_id(handle, bucket)?)
 }
 
 fn job_id_generator() -> &'static Mutex<StructuredIdGenerator> {
@@ -920,8 +951,10 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 

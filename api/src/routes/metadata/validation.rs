@@ -12,8 +12,8 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::metadata::api::GetVisibleRequest;
-use aruna_operations::metadata::forward::route_profile_status as run_profile_validation_status;
+use aruna_operations::metadata::api::export_types::GetVisibleRequest;
+use aruna_operations::metadata::forward::read::route_profile_status as run_profile_validation_status;
 use aruna_operations::metadata::profile::validation::{
     SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name, preview_submission as run_preview_submission,
 };

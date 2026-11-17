@@ -15,6 +15,7 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::metadata::AuthToken;
 use aruna_core::structs::execution::harvest::{
     HarvestJobSpec, HarvestProvenance, HarvestRecordState, HarvestSelector, HarvestSource,
     RepositoryConnector, RepositoryConnectorKind,
@@ -36,11 +37,11 @@ use aruna_operations::harvest::repository::{
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::harvest::run_harvest_job;
 use aruna_operations::jobs::submit::mint_job_id;
-use aruna_operations::metadata::forward::route_metadata_delete;
-use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::forward::write::route_metadata_delete;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::{AuthToken, MetadataHandle};
+use aruna_operations::metadata::record_reads::load_document_record;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use axum::Router;
@@ -90,7 +91,6 @@ impl Fixture {
             shutdown: shutdown.clone(),
             progress: ProgressReporter::from_progress(&JobProgress::new("records")),
             range_turns: Default::default(),
-            mail: Default::default(),
         };
         (ctx, cancel, shutdown)
     }
@@ -140,21 +140,23 @@ async fn build_fixture() -> Result<Fixture, BoxError> {
         EgressPolicy::loopback(),
     )
     .await?;
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         &metadata_path,
         actor.node_id,
-        storage.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )?;
+    let metadata = MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     Ok(Fixture {
         _root: root,

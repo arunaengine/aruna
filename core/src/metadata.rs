@@ -339,6 +339,20 @@ pub struct MetadataMergedRevision {
     pub findings: u32,
 }
 
+/// Most registry records one metadata read may take as candidates.
+pub const REGISTRY_CANDIDATE_LIMIT: usize = 1024;
+/// Most solution rows one metadata query returns.
+pub const QUERY_MAX_ROWS: usize = 10_000;
+/// Most serialized bytes of one metadata query result.
+pub const MAX_RESULT_BYTES: usize = 8 * 1024 * 1024;
+/// The prefixes every metadata query is parsed and evaluated with.
+pub const QUERY_PREFIXES: &str = "\
+PREFIX schema: <http://schema.org/>\n\
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n\
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n\
+PREFIX fts: <urn:craqle:fts:>\n";
+
 pub const EVENT_LIMIT: u32 = 1024;
 pub const RAW_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -1347,6 +1361,88 @@ pub enum MetadataEffect {
         graph_iri: String,
         batch: MetadataBatch,
     },
+}
+
+impl MetadataEffect {
+    /// A stable label for logs and traces.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            MetadataEffect::ValidateCreateCrate { .. } => "validate_create_crate",
+            MetadataEffect::ValidateRoCrate { .. } => "validate_rocrate",
+            MetadataEffect::CreateCrate { .. } => "create_crate",
+            MetadataEffect::ApplyRoCrate { .. } => "apply_rocrate",
+            MetadataEffect::UpsertDataEntity { .. } => "upsert_data_entity",
+            MetadataEffect::UpsertContextualEntity { .. } => "upsert_contextual_entity",
+            MetadataEffect::SetGraphPolicy { .. } => "set_graph_policy",
+            MetadataEffect::AddGraphPeer { .. } => "add_graph_peer",
+            MetadataEffect::SyncBestEffort { .. } => "sync_best_effort",
+            MetadataEffect::GetGraphPolicy { .. } => "get_graph_policy",
+            MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
+            MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
+            MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
+            MetadataEffect::SearchGraphs { .. } => "search_graphs",
+            MetadataEffect::QueryGraphs { .. } => "query_graphs",
+            MetadataEffect::DeleteGraph { .. } => "delete_graph",
+            MetadataEffect::ListGraphs => "list_graphs",
+            MetadataEffect::ContainsGraph { .. } => "contains_graph",
+            MetadataEffect::ContainsDot { .. } => "contains_dot",
+            MetadataEffect::PlanBatch { .. } => "plan_batch",
+            MetadataEffect::MergeBatch { .. } => "merge_batch",
+            MetadataEffect::GraphSnapshot { .. } => "graph_snapshot",
+            MetadataEffect::ExportVersioned { .. } => "export_versioned",
+            MetadataEffect::InstallSnapshot { .. } => "install_snapshot",
+        }
+    }
+
+    /// The graph this effect acts on; the first requested graph of a search or query.
+    pub fn graph_iri(&self) -> Option<String> {
+        match self {
+            MetadataEffect::ValidateCreateCrate { request } => Some(request.graph_iri.clone()),
+            MetadataEffect::ValidateRoCrate { request } => Some(request.graph_iri.clone()),
+            MetadataEffect::CreateCrate { request } => Some(request.graph_iri.clone()),
+            MetadataEffect::ApplyRoCrate { request } => Some(request.graph_iri.clone()),
+            MetadataEffect::UpsertDataEntity { request }
+            | MetadataEffect::UpsertContextualEntity { request } => Some(request.graph_iri.clone()),
+            MetadataEffect::SetGraphPolicy { graph_iri, .. }
+            | MetadataEffect::AddGraphPeer { graph_iri, .. }
+            | MetadataEffect::SyncBestEffort { graph_iri, .. }
+            | MetadataEffect::GetGraphPolicy { graph_iri }
+            | MetadataEffect::ExportRoCrate { graph_iri }
+            | MetadataEffect::ExportRoCrateSummary { graph_iri }
+            | MetadataEffect::DeleteGraph { graph_iri }
+            | MetadataEffect::ContainsGraph { graph_iri }
+            | MetadataEffect::ContainsDot { graph_iri, .. }
+            | MetadataEffect::GraphSnapshot { graph_iri }
+            | MetadataEffect::ExportVersioned { graph_iri }
+            | MetadataEffect::InstallSnapshot { graph_iri, .. }
+            | MetadataEffect::PlanBatch { graph_iri, .. }
+            | MetadataEffect::MergeBatch { graph_iri, .. } => Some(graph_iri.clone()),
+            MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
+            MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris
+                .as_ref()
+                .and_then(|graph_iris| graph_iris.first().cloned()),
+            MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris
+                .as_ref()
+                .and_then(|graph_iris| graph_iris.first().cloned()),
+            MetadataEffect::ListGraphs => None,
+        }
+    }
+
+    /// Whether a successful run of this effect changes a graph.
+    pub fn mutates_graph(&self) -> bool {
+        matches!(
+            self,
+            MetadataEffect::CreateCrate { .. }
+                | MetadataEffect::ApplyRoCrate { .. }
+                | MetadataEffect::UpsertDataEntity { .. }
+                | MetadataEffect::UpsertContextualEntity { .. }
+                | MetadataEffect::SetGraphPolicy { .. }
+                | MetadataEffect::AddGraphPeer { .. }
+                | MetadataEffect::DeleteGraph { .. }
+                | MetadataEffect::InstallSnapshot { .. }
+                | MetadataEffect::MergeBatch { .. }
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
