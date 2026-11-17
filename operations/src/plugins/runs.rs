@@ -163,23 +163,24 @@ impl Operation for ReadRun {
 /// At most `limit` runs of an install after the run `after`, oldest first, and the id of the
 /// last one when more may follow.
 pub fn list_runs(install_id: Ulid, after: Option<Ulid>, limit: usize) -> ListRuns {
-    ListRuns(page_call(
+    ListRuns(Some(page_call(
         PLUGIN_RUNS_KEYSPACE,
         run_prefix(install_id),
         after.map(|run_id| run_key(install_id, run_id)),
         limit,
-    ))
+    )))
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ListRuns(IoCall);
+pub struct ListRuns(Option<IoCall>);
 
 impl Operation for ListRuns {
     type Output = (Vec<PluginRun>, Option<Ulid>);
     type Error = RunError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, RunError> {
-        Ok(Next::Call(self.0.clone()))
+        let page = self.0.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(page))
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, RunError> {
@@ -747,7 +748,12 @@ impl Operation for EnqueueTimer {
                 let mut row = row;
                 row.skipped += u64::from(!admitted);
                 let mut rows = rows;
-                rows.push(row(PLUGIN_RUNS_KEYSPACE, self.key.clone(), encode(&row)?));
+                let value = encode(&row)?;
+                rows.push(super::rows::row(
+                    PLUGIN_RUNS_KEYSPACE,
+                    self.key.clone(),
+                    value,
+                ));
                 self.phase = TimerPhase::Writing(admitted);
                 Ok(Next::Call(IoCall::Write(rows)))
             }

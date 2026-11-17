@@ -193,7 +193,7 @@ async fn copy_work(
             })
         }
         Err(error) if source_locked(&error) => key_wait(ctx, install, read).await,
-        Err(error) => JobRunOutcome::Failed(super::copy::copy_error(error)),
+        Err(error) => JobRunOutcome::Failed(crate::jobs::copy::copy_error(error)),
     }
 }
 
