@@ -49,7 +49,8 @@ use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::drain_state::{DEPARTURE_KEY, OPERATOR_DRAIN_KEY};
-use crate::node::info_write::{InfoChange, InfoWriteOperation, PUBLISH_OWED_KEY};
+use crate::node::info_publish::PublishInfoOperation;
+use crate::node::info_write::{InfoChange, InfoWriteOperation};
 use crate::placement::{build_view, held_buckets};
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
@@ -116,7 +117,7 @@ pub async fn publish_node_info(
     urls: NodeUrls,
 ) -> Result<(), String> {
     seed_info_document(ctx, node_id, realm_id, urls).await?;
-    replicate_node_info(ctx, node_id, realm_id).await
+    publish_info(ctx, node_id, realm_id, false).await
 }
 
 /// This node's advertised execution targets: every enabled backend at the current
@@ -461,9 +462,7 @@ pub(crate) async fn refresh_info_heartbeat(
         utilization,
     };
     revise_node_info(ctx, node_id, realm_id, change).await?;
-    if read_owed(ctx, None).await?.is_some() {
-        replicate_node_info(ctx, node_id, realm_id).await?;
-    }
+    publish_info(ctx, node_id, realm_id, true).await?;
     let (Some(net_handle), Some(stored)) = (
         ctx.net_handle.as_ref(),
         node_info_row(&ctx.storage_handle, node_id, None).await?,
@@ -512,41 +511,6 @@ async fn revise_node_info(
     drive(InfoWriteOperation::revise(realm_id, node_id, change, now), ctx)
         .await
         .map_err(|error| error.to_string())
-}
-
-async fn begin_write(storage: &StorageHandle) -> Result<TxnId, String> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info transaction start failed: {other:?}")),
-    }
-}
-
-/// `Ok(false)` reports a commit conflict, which the caller retries.
-async fn commit_txn(storage: &StorageHandle, txn_id: TxnId) -> Result<bool, String> {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(true),
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(false),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info commit failed: {other:?}")),
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    if let Event::Storage(StorageEvent::Error { error }) = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await
-    {
-        warn!(%error, "Failed to abort a node info revision");
-    }
 }
 
 /// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
@@ -627,7 +591,7 @@ pub(crate) async fn set_departure_state(
     if !revised {
         return Ok(false);
     }
-    replicate_node_info(ctx, node_id, realm_id).await?;
+    publish_info(ctx, node_id, realm_id, false).await?;
     Ok(true)
 }
 
@@ -670,7 +634,7 @@ pub async fn set_operator_drain(
         "Operator compute drain published"
     );
     if revised {
-        replicate_node_info(ctx, node_id, realm_id).await?;
+        publish_info(ctx, node_id, realm_id, false).await?;
     }
     Ok(true)
 }
@@ -903,85 +867,16 @@ fn permille_of(load1: f64, cores: u64) -> u32 {
     (load1 / cores as f64 * 1000.0).round().clamp(0.0, 1000.0) as u32
 }
 
-async fn replicate_node_info(
+/// Replicates the info document, or only an owed revision of it, and clears what it owed.
+async fn publish_info(
     ctx: &DriverContext,
     node_id: NodeId,
     realm_id: RealmId,
+    only_owed: bool,
 ) -> Result<(), String> {
-    let owed = read_owed(ctx, None).await?;
-    // A device belongs to no sync topic, so its info document stays local:
-    // an outbox row for it could never be published, only retried forever.
-    let config = load_realm_config(ctx, realm_id).await?;
-    if node_kind(&config, node_id).is_none_or(|kind| kind.is_sync_eligible()) {
-        drive(
-            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-                realm_id,
-                local_node_id: node_id,
-                excluded_peers: Vec::new(),
-                documents: vec![DocumentTarget::NodeInfo { realm_id, node_id }],
-                // Shared-topic genesis is bootstrapped by publish_core_documents;
-                // explicit publishes and periodic heartbeats only publish into it.
-                allow_genesis: false,
-            })
-            .strict(),
-            ctx,
-        )
+    drive(PublishInfoOperation::new(realm_id, node_id, only_owed), ctx)
         .await
-        .map_err(|error| format!("node info replication failed: {error}"))?;
-    }
-    match owed {
-        Some(owed) => settle_owed(ctx, owed).await,
-        None => Ok(()),
-    }
-}
-
-/// The owed advertisement revision; an unreadable value counts as owed.
-async fn read_owed(ctx: &DriverContext, txn_id: Option<TxnId>) -> Result<Option<u64>, String> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(
-            value.map(|bytes| <[u8; 8]>::try_from(bytes.as_ref()).map_or(0, u64::from_be_bytes))
-        ),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("owed publish read failed: {other:?}")),
-    }
-}
-
-/// Clears the owed revision once replication took it; a revision committed meanwhile stays owed.
-async fn settle_owed(ctx: &DriverContext, published: u64) -> Result<(), String> {
-    let txn_id = begin_write(&ctx.storage_handle).await?;
-    let cleared = match read_owed(ctx, Some(txn_id)).await {
-        Ok(Some(owed)) if owed <= published => {
-            match ctx
-                .storage_handle
-                .send_storage_effect(StorageEffect::Delete {
-                    key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-                    key: Key::from(PUBLISH_OWED_KEY.to_vec()),
-                    txn_id: Some(txn_id),
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-                other => Err(format!("owed publish delete failed: {other:?}")),
-            }
-        }
-        Ok(_) => Ok(()),
-        Err(error) => Err(error),
-    };
-    if let Err(error) = cleared {
-        abort_txn(&ctx.storage_handle, txn_id).await;
-        return Err(error);
-    }
-    // A conflict means another revision was committed; it stays owed for the next tick.
-    commit_txn(&ctx.storage_handle, txn_id).await.map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn write_info_document(
@@ -1057,6 +952,7 @@ pub(crate) async fn restore_info_timer(_storage: &StorageHandle, task_handle: &T
 mod tests {
     use super::*;
     use crate::node::drain_state::DrainStateOperation;
+    use crate::node::info_write::PUBLISH_OWED_KEY;
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
     use aruna_core::storage_entries::metadata_registry_key;
@@ -1122,6 +1018,18 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    async fn owed_row(ctx: &DriverContext) -> Option<Vec<u8>> {
+        let read = StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: Key::from(PUBLISH_OWED_KEY.to_vec()),
+            txn_id: None,
+        };
+        match ctx.storage_handle.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value.map(|v| v.to_vec()),
+            other => panic!("owed row read failed: {other:?}"),
+        }
     }
 
     async fn read_outbox(ctx: &DriverContext) -> Vec<DocumentOutboxRecord> {
@@ -2284,7 +2192,7 @@ mod tests {
             .unwrap();
         let queued = read_outbox(&ctx).await.len();
 
-        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
+        assert_eq!(owed_row(&ctx).await, None);
         for sequence in 1..=3 {
             refresh_info_heartbeat(&ctx, local, realm_id, sequence, None)
                 .await
@@ -2316,6 +2224,6 @@ mod tests {
             .unwrap();
         assert_eq!(stored, seeded);
         assert_eq!(read_outbox(&ctx).await.len(), queued + 1);
-        assert_eq!(read_owed(&ctx, None).await.unwrap(), None);
+        assert_eq!(owed_row(&ctx).await, None);
     }
 }
