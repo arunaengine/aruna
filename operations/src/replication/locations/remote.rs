@@ -7,23 +7,13 @@ use crate::replication::protocol::{
     LocationSummary, LocationSummaryRequest, VersionReplicationMessage,
 };
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::operation::EffectOperation;
-use aruna_core::types::Effects;
-use smallvec::smallvec;
+use aruna_core::operation::Operation;
 use ulid::Ulid;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RemoteState {
-    Init,
-    Open,
-    Send,
-    Read,
-    Close,
-    Finish,
-    Error,
-}
+type Step = Result<Next<LocationSummary>, LocationSummaryError>;
 
 /// Asks one peer whether it holds a version and on what storage. Read-only: a
 /// summary never mutates the peer's state.
@@ -31,9 +21,14 @@ enum RemoteState {
 pub struct RemoteLocationOperation {
     node_id: NodeId,
     request: LocationSummaryRequest,
+    /// The open stream, closed on every end; `None` once closed.
     stream_id: Option<Ulid>,
-    state: RemoteState,
-    output: Option<Result<LocationSummary, LocationSummaryError>>,
+    /// The peer's answer, given once the stream is closed.
+    answer: Option<Result<LocationSummary, LocationSummaryError>>,
+}
+
+fn blob_call(effect: BlobEffect) -> Next<LocationSummary> {
+    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
 }
 
 impl RemoteLocationOperation {
@@ -42,238 +37,185 @@ impl RemoteLocationOperation {
             node_id,
             request,
             stream_id: None,
-            state: RemoteState::Init,
-            output: None,
+            answer: None,
         }
     }
 
-    fn fail(&mut self, error: LocationSummaryError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = RemoteState::Error;
-        match self.stream_id.take() {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
-        }
+    fn opened(&mut self, stream_id: Ulid) -> Step {
+        self.stream_id = Some(stream_id);
+        let message = VersionReplicationMessage::LocationSummaryRequest(self.request.clone());
+        let payload = message.to_bytes()?;
+        Ok(blob_call(BlobEffect::SendMessage { stream_id, payload }))
     }
 
-    fn unexpected(&mut self, event: Event) -> Effects {
-        self.fail(LocationSummaryError::Unexpected {
-            state: "remote",
-            event: event.label().to_string(),
-        })
+    fn received(&mut self, stream_id: Ulid, payload: &[u8]) -> Step {
+        let answer = match VersionReplicationMessage::from_bytes(payload)? {
+            VersionReplicationMessage::LocationSummaryResponse(summary) => Ok(summary),
+            VersionReplicationMessage::LocationSummaryDenied => Err(LocationSummaryError::Denied),
+            _ => {
+                return Err(LocationSummaryError::Unexpected {
+                    state: "remote_read",
+                    event: "unexpected location summary response".to_string(),
+                });
+            }
+        };
+        self.answer = Some(answer);
+        Ok(blob_call(BlobEffect::CloseConnection { stream_id }))
+    }
+
+    fn closed(&mut self, stream_id: Ulid) -> Step {
+        if Some(stream_id) != self.stream_id {
+            return Err(unexpected("the close of this stream", "another stream"));
+        }
+        self.stream_id = None;
+        let answer = self.answer.take().ok_or(IoError::Unfinished)?;
+        Ok(Next::Done(answer?))
     }
 }
 
-impl EffectOperation for RemoteLocationOperation {
+fn unexpected(expected: &'static str, got: &'static str) -> LocationSummaryError {
+    IoError::Unexpected { expected, got }.into()
+}
+
+impl Operation for RemoteLocationOperation {
     type Output = LocationSummary;
     type Error = LocationSummaryError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RemoteState::Open;
-        smallvec![Effect::Blob(BlobEffect::OpenConnection {
+    fn first(&mut self) -> Step {
+        Ok(blob_call(BlobEffect::OpenConnection {
             node_id: self.node_id,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Blob(BlobEvent::Error(error)) => return self.fail(error.into()),
-            event => event,
-        };
-        match self.state {
-            RemoteState::Init => self.start(),
-            RemoteState::Open => {
-                let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                self.stream_id = Some(stream_id);
-                let payload =
-                    match VersionReplicationMessage::LocationSummaryRequest(self.request.clone())
-                        .to_bytes()
-                    {
-                        Ok(payload) => payload,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                self.state = RemoteState::Send;
-                smallvec![Effect::Blob(BlobEffect::SendMessage { stream_id, payload })]
-            }
-            RemoteState::Send => {
-                let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                self.state = RemoteState::Read;
-                smallvec![Effect::Blob(BlobEffect::ReadMessage { stream_id })]
-            }
-            RemoteState::Read => {
-                let Event::Blob(BlobEvent::MessageReceived { stream_id, payload }) = event else {
-                    return self.unexpected(event);
-                };
-                match VersionReplicationMessage::from_bytes(&payload) {
-                    Ok(VersionReplicationMessage::LocationSummaryResponse(summary)) => {
-                        self.output = Some(Ok(summary));
-                        self.state = RemoteState::Close;
-                        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-                    }
-                    Ok(VersionReplicationMessage::LocationSummaryDenied) => {
-                        self.output = Some(Err(LocationSummaryError::Denied));
-                        self.state = RemoteState::Close;
-                        smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-                    }
-                    Ok(_) => self.fail(LocationSummaryError::Unexpected {
-                        state: "remote_read",
-                        event: "unexpected location summary response".to_string(),
-                    }),
-                    Err(error) => self.fail(error.into()),
-                }
-            }
-            RemoteState::Close => {
-                let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
-                    return self.unexpected(event);
-                };
-                if Some(stream_id) != self.stream_id {
-                    return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
-                }
-                self.state = RemoteState::Finish;
-                smallvec![]
-            }
-            RemoteState::Finish | RemoteState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RemoteState::Finish | RemoteState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LocationSummaryError::Unexpected {
-            state: "finalize",
-            event: "remote summary ended without an answer".to_string(),
         }))
     }
 
-    fn abort(&mut self) -> Effects {
-        self.state = RemoteState::Error;
-        self.output
-            .get_or_insert(Err(LocationSummaryError::Aborted));
-        match self.stream_id.take() {
-            Some(stream_id) => smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })],
-            None => smallvec![],
+    fn next(&mut self, result: IoResult) -> Step {
+        match result.event()? {
+            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            Event::Blob(BlobEvent::ConnectionEstablished { stream_id })
+                if self.stream_id.is_none() =>
+            {
+                self.opened(stream_id)
+            }
+            Event::Blob(BlobEvent::MessageSent { stream_id })
+                if Some(stream_id) == self.stream_id && self.answer.is_none() =>
+            {
+                Ok(blob_call(BlobEffect::ReadMessage { stream_id }))
+            }
+            Event::Blob(BlobEvent::MessageReceived { stream_id, payload })
+                if Some(stream_id) == self.stream_id && self.answer.is_none() =>
+            {
+                self.received(stream_id, &payload)
+            }
+            Event::Blob(BlobEvent::ConnectionClosed { stream_id }) if self.answer.is_some() => {
+                self.closed(stream_id)
+            }
+            other => Err(unexpected(
+                "the answer of the current stream step",
+                other.label(),
+            )),
         }
+    }
+
+    /// A deadline or a failure must release the stream; only `CloseConnection` unregisters it.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let close = |stream_id| {
+            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            IoCall::Effect(Box::new(close))
+        };
+        self.stream_id.take().map(close).into_iter().collect()
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
+    use super::{LocationSummaryError, RemoteLocationOperation, Step};
+    use crate::replication::protocol::{LocationSummary, VersionReplicationMessage};
     use crate::tests::locations::{node_id, request};
-    use aruna_core::effects::Effect;
-    use aruna_core::events::Event;
-    use aruna_core::operation::EffectOperation;
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+    use aruna_core::effects::{BlobEffect, Effect};
+    use aruna_core::events::{BlobEvent, Event};
+    use aruna_core::operation::Operation;
     use ulid::Ulid;
+
+    fn stream() -> Ulid {
+        Ulid::from_bytes([5u8; 16])
+    }
+
+    fn blob(event: BlobEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(event)))
+    }
+
+    /// Runs up to the peer's answer and returns the step after it.
+    fn answered(message: VersionReplicationMessage) -> (RemoteLocationOperation, Step) {
+        let mut operation = RemoteLocationOperation::new(node_id(4), request(None));
+        let _ = operation.first();
+        let stream_id = stream();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
+        let payload = message.to_bytes().unwrap();
+        let turn = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
+        (operation, turn)
+    }
+
+    fn close_call() -> IoCall {
+        let close = BlobEffect::CloseConnection {
+            stream_id: stream(),
+        };
+        IoCall::Effect(Box::new(Effect::Blob(close)))
+    }
+
+    fn closed() -> IoResult {
+        blob(BlobEvent::ConnectionClosed {
+            stream_id: stream(),
+        })
+    }
 
     #[test]
     fn reports_remote_denial() {
         // The asking side turns the denial back into a Denied error, never a
-        // transport failure.
-        let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
-        operation.start();
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
-        ));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
-            stream_id,
-        }));
-
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::MessageReceived {
-                stream_id,
-                payload:
-                    crate::replication::protocol::VersionReplicationMessage::LocationSummaryDenied
-                        .to_bytes()
-                        .unwrap(),
-            },
-        ));
-
-        assert_eq!(
-            operation.finalize(),
-            Err(super::LocationSummaryError::Denied)
-        );
+        // transport failure, after it closed the stream.
+        let (mut operation, turn) = answered(VersionReplicationMessage::LocationSummaryDenied);
+        assert_eq!(turn, Ok(Next::Call(close_call())));
+        assert_eq!(operation.next(closed()), Err(LocationSummaryError::Denied));
+        assert!(operation.abort().is_empty());
     }
 
     #[test]
     fn carries_peer_verdict() {
         // Provenance and the peer's own compliance verdict survive the wire.
-        let stream_id = Ulid::from_bytes([5u8; 16]);
         let relationship_id = Ulid::from_bytes([6u8; 16]);
-        let answer = crate::replication::protocol::LocationSummary {
+        let answer = LocationSummary {
             held: true,
             origin: aruna_core::structs::storage::blob::CopyOrigin::Sync { relationship_id },
             compliance: crate::replication::protocol::CopyCompliance::Quarantined,
-            ..crate::replication::protocol::LocationSummary::absent()
+            ..LocationSummary::absent()
         };
-        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
-        operation.start();
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
-        ));
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
-            stream_id,
-        }));
-
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::MessageReceived {
-                stream_id,
-                payload:
-                    crate::replication::protocol::VersionReplicationMessage::LocationSummaryResponse(
-                        answer.clone(),
-                    )
-                    .to_bytes()
-                    .unwrap(),
-            },
-        ));
-
-        assert_eq!(operation.finalize(), Ok(answer));
+        let response = VersionReplicationMessage::LocationSummaryResponse(answer.clone());
+        let (mut operation, _) = answered(response);
+        assert_eq!(operation.next(closed()), Ok(Next::Done(answer)));
     }
 
     #[test]
-    fn remote_close_rejects() {
-        let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
-        operation.start();
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
+    fn early_close_rejects() {
+        let mut operation = RemoteLocationOperation::new(node_id(4), request(None));
+        let _ = operation.first();
+        let stream_id = stream();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        assert!(matches!(
+            operation.next(closed()),
+            Err(LocationSummaryError::Io(IoError::Unexpected { .. }))
         ));
-        operation.state = super::RemoteState::Close;
-
-        operation.step(Event::Blob(aruna_core::events::BlobEvent::MessageSent {
-            stream_id,
-        }));
-
-        assert_eq!(operation.state, super::RemoteState::Error);
     }
 
     #[test]
     fn abort_closes_stream() {
         // A deadline must release the stream; only CloseConnection unregisters it.
-        let stream_id = Ulid::from_bytes([5u8; 16]);
-        let mut operation = super::RemoteLocationOperation::new(node_id(4), request(None));
-        operation.start();
-        operation.step(Event::Blob(
-            aruna_core::events::BlobEvent::ConnectionEstablished { stream_id },
-        ));
-
-        let effects = operation.abort();
-
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Blob(
-                aruna_core::effects::BlobEffect::CloseConnection { stream_id }
-            )]
-        );
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(super::LocationSummaryError::Aborted)
-        );
+        let mut operation = RemoteLocationOperation::new(node_id(4), request(None));
+        assert!(operation.abort().is_empty());
+        let _ = operation.first();
+        let stream_id = stream();
+        let _ = operation.next(blob(BlobEvent::ConnectionEstablished { stream_id }));
+        assert_eq!(operation.abort(), vec![close_call()]);
+        let aborted = LocationSummaryError::from(IoError::Aborted);
+        assert_eq!(aborted, LocationSummaryError::Aborted);
     }
 }

@@ -511,6 +511,7 @@ impl HolderFailures {
             | BaoReadError::Conversion(_)
             | BaoReadError::Unexpected { .. }
             | BaoReadError::NotFinished
+            | BaoReadError::Io(_)
             | BaoReadError::ManagedCopy(_) => self.unavailable = true,
         }
     }

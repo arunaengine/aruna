@@ -3080,8 +3080,8 @@ pub(crate) use sharing::{ReaderScan, RuleScan};
 pub(crate) use trail::{Trail, TrailScan, trail_ranges};
 
 pub(crate) use plain::{
-    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_read, owns_path, same_name_path,
-    version_row,
+    PlainRecord, intent_deletes, intent_keys, intent_rows, owner_call, owner_read, owns_path,
+    path_owned, same_name_path, version_row,
 };
 
 #[path = "abe.rs"]

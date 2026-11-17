@@ -4,51 +4,35 @@
 
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::s3::multipart::target::{StatusCheck, UploadTargetError, validate_upload};
-use crate::s3::usage::count_upload;
+use crate::s3::usage::upload_count;
 use crate::s3::write_cleanup::{WriteCleanup, delete_records_effect};
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BlobCleanupWork, BucketInfo};
 use aruna_core::structs::storage::multipart::{
     MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
 };
-use aruna_core::types::{Effects, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum AbortUploadState {
-    Init,
-    StartMarkTransaction,
-    ReadUploadMark,
-    WriteUploadAborting,
-    CommitMarkTransaction,
+    /// Marks the upload aborting in its own transaction.
+    MarkUpload,
     AbortBackendUpload,
     ReadUploadParts,
-    StartDeleteTransaction,
-    /// Reads the record in the delete transaction, so only the delete that finds it counts.
-    ReadUploadRecord,
-    /// Reads the bucket's distribution binding, whose upload inventory the delete closes.
-    ReadBinding,
-    CountUpload,
-    CountInventory,
+    /// Deletes the records and queues the part blobs in one transaction.
     DeleteUploadRecords,
-    WriteCleanupRecords,
-    CommitDeleteTransaction,
-    CleanupPartBlobs,
-    ResetUploadTransaction,
-    ReadUploadReset,
-    WriteUploadReset,
-    CommitResetTransaction,
-    Finish,
-    Error,
+    /// Reopens the upload after a failure, then reports the failure.
+    ResetUpload,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -59,8 +43,6 @@ pub enum AbortUploadError {
     ConversionError(#[from] ConversionError),
     #[error("Invalid operation state")]
     InvalidOperationState,
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("The specified upload does not exist.")]
     NoSuchUpload,
     #[error("The specified multipart upload does not match the target object.")]
@@ -73,8 +55,6 @@ pub enum AbortUploadError {
     AbortUploadFailed,
     #[error(transparent)]
     BlobError(#[from] BlobError),
-    #[error("operation did not finish")]
-    NotFinished,
     #[error(transparent)]
     Inventory(#[from] InventoryError),
 }
@@ -89,7 +69,15 @@ impl From<UploadTargetError> for AbortUploadError {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl From<IoError> for AbortUploadError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type Turn<T> = Result<Next<T>, AbortUploadError>;
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AbortUploadInput {
     pub bucket: String,
     pub key: String,
@@ -98,35 +86,33 @@ pub struct AbortUploadInput {
     pub now_ms: u64,
 }
 
+impl AbortUploadInput {
+    fn upload_key(&self) -> Vec<u8> {
+        self.upload_id.to_bytes().to_vec()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct AbortUploadOperation {
     input: AbortUploadInput,
     state: AbortUploadState,
-    txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
     upload_parts: Vec<MultipartPart>,
-    cleanup_index: usize,
     skip_status_check: bool,
     resume_abort: bool,
     cleanup: WriteCleanup<AbortUploadError>,
-    inventory: Option<InventoryUpdate>,
-    output: Option<Result<(), AbortUploadError>>,
 }
 
 impl AbortUploadOperation {
     pub fn new(input: AbortUploadInput) -> Self {
         Self {
             input,
-            state: AbortUploadState::Init,
-            txn_id: None,
+            state: AbortUploadState::MarkUpload,
             upload_record: None,
             upload_parts: Vec::new(),
-            cleanup_index: 0,
             skip_status_check: false,
             resume_abort: false,
             cleanup: WriteCleanup::default(),
-            inventory: None,
-            output: None,
         }
     }
 
@@ -142,471 +128,129 @@ impl AbortUploadOperation {
         self
     }
 
-    /// The terminal state is complete, so the driver never calls `abort` for us;
-    /// releasing the transaction here is what keeps it from outliving the
-    /// operation. `abort` takes the id, so it cannot run twice.
-    fn emit_error(&mut self, error: AbortUploadError) -> Effects {
-        self.state = AbortUploadState::Error;
-        self.output = Some(Err(error));
-        self.abort()
+    fn check(&self) -> StatusCheck {
+        let now_ms = self.input.now_ms;
+        match (self.skip_status_check, self.resume_abort) {
+            (true, _) => StatusCheck::Skip,
+            (false, true) => StatusCheck::Recover { now_ms },
+            (false, false) => StatusCheck::Takeover { now_ms },
+        }
     }
 
-    fn schedule_error(&mut self, error: AbortUploadError) -> Effects {
+    /// Reopens the upload, then reports `error`.
+    fn reset(&mut self, error: AbortUploadError) -> Turn<()> {
         self.cleanup.set_error(error);
-        if self.upload_record.is_some() {
-            self.state = AbortUploadState::ResetUploadTransaction;
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: false,
-            })]
-        } else {
-            self.emit_pending_error()
-        }
-    }
-
-    fn emit_pending_error(&mut self) -> Effects {
-        let Some(error) = self.cleanup.take_error() else {
-            return self.emit_error(AbortUploadError::AbortUploadFailed);
-        };
-        self.emit_error(error)
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = AbortUploadState::StartMarkTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+        self.state = AbortUploadState::ResetUpload;
+        let reset = ResetUpload {
+            input: self.input.clone(),
             read: false,
-        })]
+        };
+        Ok(Next::Call(IoCall::child(reset)))
     }
 
-    fn mark_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
+    fn marked(&mut self, record: MultipartUpload) -> Turn<()> {
+        // The provider parts go first: a failure reopens the upload for a retry.
+        let backend_upload = record.backend_upload.clone();
+        self.upload_record = Some(record);
+        let Some(backend_upload) = backend_upload else {
+            return self.read_upload_parts();
         };
-        self.txn_id = Some(txn_id);
-        self.state = AbortUploadState::ReadUploadMark;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
+        self.state = AbortUploadState::AbortBackendUpload;
+        let abort = Effect::Blob(BlobEffect::AbortUpload {
+            backend_upload: Box::new(backend_upload),
+        });
+        Ok(Next::Call(abort.into()))
     }
 
-    fn mark_upload_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        let Some(value) = value else {
-            return self.emit_error(AbortUploadError::NoSuchUpload);
-        };
-        let mut record = match MultipartUpload::from_bytes(value.as_ref()) {
-            Ok(record) => record,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        if let Err(err) = validate_upload(
-            &record,
-            &self.input.bucket,
-            &self.input.key,
-            if self.skip_status_check {
-                StatusCheck::Skip
-            } else if self.resume_abort {
-                StatusCheck::Recover {
-                    now_ms: self.input.now_ms,
-                }
-            } else {
-                StatusCheck::Takeover {
-                    now_ms: self.input.now_ms,
-                }
-            },
-        ) {
-            return self.emit_error(err.into());
-        }
-
-        record.status = MultipartUploadStatus::Aborting;
-        self.upload_record = Some(record.clone());
-        let value = match record.to_bytes() {
-            Ok(value) => value,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = AbortUploadState::WriteUploadAborting;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_upload_marked(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(AbortUploadError::NoTransactionFound);
-        };
-
-        self.state = AbortUploadState::CommitMarkTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_mark_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
-                // The provider parts go first: a failure reopens the upload for a retry.
-                let backend_upload = self
-                    .upload_record
-                    .as_ref()
-                    .and_then(|upload| upload.backend_upload.clone());
-                match backend_upload {
-                    Some(backend_upload) => {
-                        self.state = AbortUploadState::AbortBackendUpload;
-                        smallvec![Effect::Blob(BlobEffect::AbortUpload {
-                            backend_upload: Box::new(backend_upload),
-                        })]
-                    }
-                    None => self.read_upload_parts(),
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) if error.proves_no_commit() => {
-                self.emit_error(error.into())
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                self.txn_id = None;
-                self.schedule_error(error.into())
-            }
-            _ => self.emit_error(AbortUploadError::InvalidOperationState),
-        }
-    }
-
-    fn backend_aborted(&mut self, event: Event) -> Effects {
+    fn backend_aborted(&mut self, event: Event) -> Turn<()> {
         match event {
             Event::Blob(BlobEvent::UploadAborted) => self.read_upload_parts(),
-            Event::Blob(BlobEvent::Error(error)) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
+            Event::Blob(BlobEvent::Error(error)) => self.reset(error.into()),
+            _ => self.reset(AbortUploadError::InvalidOperationState),
         }
     }
 
-    fn read_upload_parts(&mut self) -> Effects {
+    fn read_upload_parts(&mut self) -> Turn<()> {
         let prefix = match MultipartPartKey::prefix(self.input.upload_id) {
             Ok(prefix) => prefix,
-            Err(err) => return self.schedule_error(err.into()),
+            Err(err) => return self.reset(err.into()),
         };
         self.state = AbortUploadState::ReadUploadParts;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_PART_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: UPLOAD_PART_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: 10_000,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn upload_parts_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.schedule_error(AbortUploadError::InvalidOperationState);
+    fn upload_parts_read(&mut self, result: IoResult) -> Turn<()> {
+        let rows = match result.page() {
+            Ok((rows, _)) => rows,
+            Err(error) => return self.reset(error.into()),
         };
-
-        self.upload_parts = values
+        self.upload_parts = rows
             .into_iter()
             .filter_map(|(_, value)| MultipartPart::from_bytes(value.as_ref()).ok())
             .collect();
-        self.state = AbortUploadState::StartDeleteTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn delete_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.schedule_error(AbortUploadError::InvalidOperationState);
-        };
-        self.txn_id = Some(txn_id);
-        self.delete_upload_records()
-    }
-
-    fn delete_upload_records(&mut self) -> Effects {
-        self.state = AbortUploadState::ReadUploadRecord;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    /// A concurrent delete of the record conflicts with this read, so a record is counted
-    /// closed once.
-    fn upload_record_read(&mut self, event: Event) -> Effects {
-        let value = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            Event::Storage(StorageEvent::Error { error }) => {
-                return self.schedule_error(error.into());
-            }
-            _ => return self.schedule_error(AbortUploadError::InvalidOperationState),
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(AbortUploadError::NoTransactionFound);
-        };
-        if value.is_none() {
-            return self.delete_records();
-        }
-        self.state = AbortUploadState::ReadBinding;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn binding_read(&mut self, event: Event) -> Effects {
-        let value = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            Event::Storage(StorageEvent::Error { error }) => {
-                return self.schedule_error(error.into());
-            }
-            _ => return self.schedule_error(AbortUploadError::InvalidOperationState),
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(AbortUploadError::NoTransactionFound);
-        };
-        let bucket = match value
-            .map(|value| BucketInfo::from_bytes(&value))
-            .transpose()
-        {
-            Ok(bucket) => bucket,
-            Err(error) => return self.schedule_error(error.into()),
-        };
-        self.inventory = bucket
-            .and_then(|bucket| bucket.distribution)
-            .map(|binding| {
-                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
-                change.upload = Some((self.input.upload_id, false));
-                InventoryUpdate::new(change)
-            });
-        self.state = AbortUploadState::CountUpload;
-        smallvec![count_upload(&self.input.bucket, -1, txn_id)]
-    }
-
-    fn upload_counted(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.schedule_error(AbortUploadError::NoTransactionFound);
-        };
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                match self.inventory.as_mut() {
-                    Some(inventory) => {
-                        self.state = AbortUploadState::CountInventory;
-                        inventory.start(txn_id)
-                    }
-                    None => self.delete_records(),
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
-        }
-    }
-
-    fn inventory_counted(&mut self, event: Event) -> Effects {
-        let (Some(txn_id), Some(inventory)) = (self.txn_id, self.inventory.as_mut()) else {
-            return self.schedule_error(AbortUploadError::InvalidOperationState);
-        };
-        match inventory.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.delete_records(),
-            Err(error) => self.schedule_error(error.into()),
-        }
-    }
-
-    fn delete_records(&mut self) -> Effects {
-        let effect =
-            match delete_records_effect(self.input.upload_id, &self.upload_parts, self.txn_id) {
-                Ok(effect) => effect,
-                Err(err) => return self.schedule_error(err.into()),
-            };
         self.state = AbortUploadState::DeleteUploadRecords;
-        smallvec![effect]
+        let delete = DeleteRecords::new(self.input.clone(), self.upload_parts.clone());
+        Ok(Next::Call(IoCall::child(delete)))
     }
 
-    fn records_deleted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.write_cleanup_records(),
-            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
-        }
-    }
-
-    fn write_cleanup_records(&mut self) -> Effects {
-        let mut writes = Vec::with_capacity(self.upload_parts.len());
-        for part in &self.upload_parts {
-            let work = BlobCleanupWork::DeleteBlob {
-                location: part.location.clone(),
-            };
-            let value = match work.to_bytes() {
-                Ok(value) => value,
-                Err(err) => return self.schedule_error(err.into()),
-            };
-            writes.push((
-                BLOB_CLEANUP_KEYSPACE.to_string(),
-                Ulid::generate().to_bytes().to_vec().into(),
-                value.into(),
-            ));
-        }
-
-        self.state = AbortUploadState::WriteCleanupRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_cleanup_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.schedule_error(AbortUploadError::NoTransactionFound);
-                };
-                self.state = AbortUploadState::CommitDeleteTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.schedule_error(error.into()),
-            _ => self.schedule_error(AbortUploadError::InvalidOperationState),
-        }
-    }
-
-    fn handle_delete_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.schedule_error(AbortUploadError::InvalidOperationState);
-        };
-        self.txn_id = None;
+    /// The part blobs go once their records are gone; a failed delete leaves them to reclaim.
+    fn deleted(&mut self) -> Turn<()> {
         self.upload_record = None;
-        self.cleanup_index = 0;
-        self.state = AbortUploadState::CleanupPartBlobs;
-        self.next_blob()
-    }
-
-    fn next_blob(&mut self) -> Effects {
-        let Some(part) = self.upload_parts.get(self.cleanup_index) else {
-            self.state = AbortUploadState::Finish;
-            self.output = Some(Ok(()));
-            return smallvec![];
-        };
-
-        self.state = AbortUploadState::CleanupPartBlobs;
-        smallvec![Effect::Blob(BlobEffect::Delete {
-            location: part.location.clone(),
-        })]
-    }
-
-    fn blob_cleaned(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.cleanup_index += 1;
-                self.next_blob()
-            }
-            _ => self.emit_error(AbortUploadError::InvalidOperationState),
-        }
-    }
-
-    fn reset_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        self.txn_id = Some(txn_id);
-        self.state = AbortUploadState::ReadUploadReset;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn reset_upload_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        let Some(value) = value else {
-            return self.txn_id.take().map_or_else(
-                || self.emit_pending_error(),
-                |txn_id| smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            );
-        };
-        let mut record = match MultipartUpload::from_bytes(value.as_ref()) {
-            Ok(record) => record,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        record.status = MultipartUploadStatus::Open;
-        self.upload_record = Some(record.clone());
-        let value: Value = match record.to_bytes() {
-            Ok(value) => value.into(),
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.state = AbortUploadState::WriteUploadReset;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            key: self.input.upload_id.to_bytes().to_vec().into(),
-            value,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn upload_reset(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(AbortUploadError::NoTransactionFound);
-        };
-        self.state = AbortUploadState::CommitResetTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_reset_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(AbortUploadError::InvalidOperationState);
-        };
-        self.txn_id = None;
-        self.emit_pending_error()
+        let calls = (self.upload_parts.iter())
+            .map(|part| {
+                let location = part.location.clone();
+                IoCall::from(Effect::Blob(BlobEffect::Delete { location }))
+            })
+            .collect();
+        Ok(Next::Then { output: (), calls })
     }
 }
 
-impl EffectOperation for AbortUploadOperation {
+impl Operation for AbortUploadOperation {
     type Output = ();
     type Error = AbortUploadError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Turn<()> {
+        self.state = AbortUploadState::MarkUpload;
+        let mark = MarkAborting {
+            input: self.input.clone(),
+            check: self.check(),
+            record: None,
+        };
+        Ok(Next::Call(IoCall::child(mark)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Turn<()> {
         match self.state {
-            AbortUploadState::Init => self.handle_init(),
-            AbortUploadState::StartMarkTransaction => self.mark_started(event),
-            AbortUploadState::ReadUploadMark => self.mark_upload_read(event),
-            AbortUploadState::WriteUploadAborting => self.handle_upload_marked(event),
-            AbortUploadState::CommitMarkTransaction => self.handle_mark_committed(event),
-            AbortUploadState::AbortBackendUpload => self.backend_aborted(event),
-            AbortUploadState::ReadUploadParts => self.upload_parts_read(event),
-            AbortUploadState::StartDeleteTransaction => self.delete_started(event),
-            AbortUploadState::ReadUploadRecord => self.upload_record_read(event),
-            AbortUploadState::ReadBinding => self.binding_read(event),
-            AbortUploadState::CountUpload => self.upload_counted(event),
-            AbortUploadState::CountInventory => self.inventory_counted(event),
-            AbortUploadState::DeleteUploadRecords => self.records_deleted(event),
-            AbortUploadState::WriteCleanupRecords => self.handle_cleanup_written(event),
-            AbortUploadState::CommitDeleteTransaction => self.handle_delete_committed(event),
-            AbortUploadState::CleanupPartBlobs => self.blob_cleaned(event),
-            AbortUploadState::ResetUploadTransaction => self.reset_started(event),
-            AbortUploadState::ReadUploadReset => self.reset_upload_read(event),
-            AbortUploadState::WriteUploadReset => self.upload_reset(event),
-            AbortUploadState::CommitResetTransaction => self.handle_reset_committed(event),
-            AbortUploadState::Finish => smallvec![],
-            AbortUploadState::Error => self.abort(),
+            AbortUploadState::MarkUpload => {
+                match result.child::<MultipartUpload, AbortUploadError>()? {
+                    Ok(record) => self.marked(record),
+                    // A commit that may have applied leaves the upload aborting: reopen it.
+                    Err(AbortUploadError::StorageError(error)) if !error.proves_no_commit() => {
+                        self.reset(error.into())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            AbortUploadState::AbortBackendUpload => self.backend_aborted(result.event()?),
+            AbortUploadState::ReadUploadParts => self.upload_parts_read(result),
+            AbortUploadState::DeleteUploadRecords => {
+                match result.child::<(), AbortUploadError>()? {
+                    Ok(()) => self.deleted(),
+                    Err(error) => self.reset(error),
+                }
+            }
+            AbortUploadState::ResetUpload => {
+                result.child::<(), AbortUploadError>()??;
+                let error = self.cleanup.take_error();
+                Err(error.unwrap_or(AbortUploadError::AbortUploadFailed))
+            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            AbortUploadState::Finish | AbortUploadState::Error
-        )
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -618,24 +262,241 @@ impl EffectOperation for AbortUploadOperation {
                 | AbortUploadError::CompletionInProgress
         )
     }
+}
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(AbortUploadError::NotFinished),
+/// Marks the upload aborting in one transaction; its output is the record it wrote. A failure
+/// before the commit is never a storage error, so the caller reopens only after the commit.
+#[derive(Debug, PartialEq)]
+struct MarkAborting {
+    input: AbortUploadInput,
+    check: StatusCheck,
+    record: Option<MultipartUpload>,
+}
+
+impl Operation for MarkAborting {
+    type Output = MultipartUpload;
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<MultipartUpload> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<MultipartUpload> {
+        if let Some(record) = self.record.take() {
+            result
+                .done()
+                .map_err(|_| AbortUploadError::InvalidOperationState)?;
+            return Ok(Next::Done(record));
+        }
+        let value = (result.value()).map_err(|_| AbortUploadError::InvalidOperationState)?;
+        let value = value.ok_or(AbortUploadError::NoSuchUpload)?;
+        let mut record = MultipartUpload::from_bytes(value.as_ref())?;
+        validate_upload(&record, &self.input.bucket, &self.input.key, self.check)?;
+        record.status = MultipartUploadStatus::Aborting;
+        let row = (
+            UPLOAD_KEYSPACE.to_string(),
+            self.input.upload_key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.record = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DeleteStep {
+    /// Reads the record in the delete transaction, so only the delete that finds it counts.
+    ReadRecord,
+    /// Reads the bucket's distribution binding, whose upload inventory the delete closes.
+    ReadBinding,
+    CountUpload,
+    CountInventory,
+    DeleteRecords,
+    WriteCleanup,
+}
+
+/// Deletes the upload's records and queues its part blobs for cleanup in one transaction.
+#[derive(Debug, PartialEq)]
+struct DeleteRecords {
+    input: AbortUploadInput,
+    parts: Vec<MultipartPart>,
+    step: DeleteStep,
+    inventory: Option<InventoryUpdate>,
+}
+
+impl DeleteRecords {
+    fn new(input: AbortUploadInput, parts: Vec<MultipartPart>) -> Self {
+        Self {
+            input,
+            parts,
+            step: DeleteStep::ReadRecord,
+            inventory: None,
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    /// A concurrent delete of the record conflicts with this read, so a record is counted
+    /// closed once.
+    fn record_read(&mut self, value: Option<Value>) -> Turn<()> {
+        if value.is_none() {
+            return self.delete_records();
+        }
+        self.step = DeleteStep::ReadBinding;
+        let bucket = self.input.bucket.as_bytes().to_vec();
+        Ok(Next::Call(read_row(S3_BUCKET_KEYSPACE, bucket)))
+    }
+
+    fn binding_read(&mut self, value: Option<Value>) -> Turn<()> {
+        let bucket = value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()?;
+        self.inventory = bucket
+            .and_then(|bucket| bucket.distribution)
+            .map(|binding| {
+                let mut change = InventoryChange::new(binding.set_id, self.input.key.clone());
+                change.upload = Some((self.input.upload_id, false));
+                InventoryUpdate::new(change)
+            });
+        self.step = DeleteStep::CountUpload;
+        Ok(Next::Call(upload_count(&self.input.bucket, -1)))
+    }
+
+    fn upload_counted(&mut self) -> Turn<()> {
+        let call = self
+            .inventory
+            .as_mut()
+            .and_then(InventoryUpdate::start_calls);
+        match call {
+            Some(call) => {
+                self.step = DeleteStep::CountInventory;
+                Ok(Next::Call(call.into_call()))
+            }
+            None => self.delete_records(),
+        }
+    }
+
+    fn inventory_counted(&mut self, result: IoResult) -> Turn<()> {
+        let inventory = self.inventory.as_mut();
+        let inventory = inventory.ok_or(AbortUploadError::InvalidOperationState)?;
+        match inventory.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.delete_records(),
+        }
+    }
+
+    fn delete_records(&mut self) -> Turn<()> {
+        let delete = delete_records_effect(self.input.upload_id, &self.parts, None)?;
+        self.step = DeleteStep::DeleteRecords;
+        Ok(Next::Call(delete.into()))
+    }
+
+    fn cleanup_records(&mut self) -> Turn<()> {
+        let mut writes = Vec::with_capacity(self.parts.len());
+        for part in &self.parts {
+            let work = BlobCleanupWork::DeleteBlob {
+                location: part.location.clone(),
+            };
+            writes.push((
+                BLOB_CLEANUP_KEYSPACE.to_string(),
+                Ulid::generate().to_bytes().to_vec().into(),
+                work.to_bytes()?.into(),
+            ));
+        }
+        self.step = DeleteStep::WriteCleanup;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for DeleteRecords {
+    type Output = ();
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        match self.step {
+            DeleteStep::ReadRecord => self.record_read(result.value()?),
+            DeleteStep::ReadBinding => self.binding_read(result.value()?),
+            DeleteStep::CountUpload => {
+                result.done()?;
+                self.upload_counted()
+            }
+            DeleteStep::CountInventory => self.inventory_counted(result),
+            DeleteStep::DeleteRecords => {
+                result.event()?;
+                self.cleanup_records()
+            }
+            DeleteStep::WriteCleanup => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// Reopens a marked upload in one transaction; a record already gone stays gone.
+#[derive(Debug, PartialEq)]
+struct ResetUpload {
+    input: AbortUploadInput,
+    read: bool,
+}
+
+impl Operation for ResetUpload {
+    type Output = ();
+    type Error = AbortUploadError;
+
+    fn first(&mut self) -> Turn<()> {
+        Ok(Next::Call(read_row(
+            UPLOAD_KEYSPACE,
+            self.input.upload_key(),
+        )))
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn<()> {
+        if self.read {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let Some(value) = result.value()? else {
+            return Ok(Next::Done(()));
+        };
+        let mut record = MultipartUpload::from_bytes(value.as_ref())?;
+        record.status = MultipartUploadStatus::Open;
+        let row = (
+            UPLOAD_KEYSPACE.to_string(),
+            self.input.upload_key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.read = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::keyspaces::BLOB_CLEANUP_KEYSPACE;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
     use aruna_core::structs::storage::multipart::BackendUpload;
@@ -652,15 +513,14 @@ mod pure_tests {
         }
     }
 
-    fn marked() -> AbortUploadOperation {
+    fn record() -> MultipartUpload {
         let input = input();
-        let mut operation = AbortUploadOperation::new(input);
-        operation.upload_record = Some(MultipartUpload {
-            upload_id: operation.input.upload_id,
+        MultipartUpload {
+            upload_id: input.upload_id,
             backend: BackendRef::node_default(),
             storage_class: None,
-            bucket: operation.input.bucket.clone(),
-            key: operation.input.key.clone(),
+            bucket: input.bucket,
+            key: input.key,
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: Default::default(),
             created_at: SystemTime::UNIX_EPOCH,
@@ -672,35 +532,46 @@ mod pure_tests {
             completing_since_ms: None,
             backend_upload: None,
             encryption: None,
-        });
-        operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-        operation.state = AbortUploadState::CommitMarkTransaction;
-        operation
+        }
+    }
+
+    /// An abort whose mark transaction answers with `marked`.
+    fn marked(
+        marked: Result<MultipartUpload, AbortUploadError>,
+    ) -> (AbortUploadOperation, Turn<()>) {
+        let mut operation = AbortUploadOperation::new(input());
+        operation.first().unwrap();
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(marked)));
+        (operation, turn)
+    }
+
+    fn part() -> MultipartPart {
+        MultipartPart {
+            part_number: 1,
+            location: part_location(),
+            created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
+            piece: None,
+        }
     }
 
     #[test]
     fn resume_spares_completion() {
-        let mut operation = AbortUploadOperation::new(input()).resuming_abort();
-        let mut record = marked().upload_record.unwrap();
+        let mut record = record();
         record.status = MultipartUploadStatus::Completing;
-        record.completing_since_ms = Some(operation.input.now_ms);
-        operation.txn_id = Some(TxnId::from_bytes([3u8; 16]));
-        operation.state = AbortUploadState::ReadUploadMark;
+        record.completing_since_ms = Some(input().now_ms);
+        let operation = AbortUploadOperation::new(input()).resuming_abort();
+        let mut mark = MarkAborting {
+            input: input(),
+            check: operation.check(),
+            record: None,
+        };
+        mark.first().unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: operation.input.upload_id.to_bytes().to_vec().into(),
-            value: Some(record.to_bytes().unwrap().into()),
-        }));
+        let read = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        let turn = mark.next(read);
 
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Storage(StorageEffect::Write { .. })))
-        );
-        assert_eq!(
-            operation.finalize(),
-            Err(AbortUploadError::CompletionInProgress)
-        );
+        assert_eq!(turn.err(), Some(AbortUploadError::CompletionInProgress));
     }
 
     #[test]
@@ -713,54 +584,39 @@ mod pure_tests {
                 false,
             ),
         ] {
-            let mut operation = marked();
-            let location = part_location();
-            if let Some(upload) = operation.upload_record.as_mut() {
-                upload.backend_upload = Some(BackendUpload {
-                    location,
-                    upload_id: "provider".to_string(),
-                    record_id: Ulid::from_bytes([9u8; 16]),
-                });
-            }
-
-            let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: TxnId::from_bytes([3u8; 16]),
-            }));
+            let mut record = record();
+            record.backend_upload = Some(BackendUpload {
+                location: part_location(),
+                upload_id: "provider".to_string(),
+                record_id: Ulid::from_bytes([9u8; 16]),
+            });
+            let (mut operation, turn) = marked(Ok(record));
+            let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+                panic!("expected the provider abort")
+            };
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::AbortUpload { .. })]
+                *effect,
+                Effect::Blob(BlobEffect::AbortUpload { .. })
             ));
 
-            let effects = operation.step(Event::Blob(answer));
+            let turn = operation.next(IoResult::Event(Box::new(Event::Blob(answer))));
             match aborted {
-                true => assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::Iter { .. })]
-                )),
-                false => assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::StartTransaction { .. })]
-                )),
+                true => assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. })))),
+                false => {
+                    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+                    assert_eq!(operation.state, AbortUploadState::ResetUpload);
+                }
             }
         }
     }
 
     #[test]
     fn unknown_mark_resets() {
-        let mut operation = marked();
+        let failed = Err(AbortUploadError::StorageError(StorageError::CommitFailed));
+        let (mut operation, turn) = marked(failed);
 
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::CommitFailed,
-        }));
-
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
-        assert_eq!(operation.state, AbortUploadState::ResetUploadTransaction);
-        assert_eq!(operation.txn_id, None);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, AbortUploadState::ResetUpload);
         assert_eq!(
             operation.cleanup.take_error(),
             Some(AbortUploadError::StorageError(StorageError::CommitFailed))
@@ -769,123 +625,105 @@ mod pure_tests {
 
     #[test]
     fn conflict_mark_aborts() {
-        let mut operation = marked();
-        let txn_id = operation.txn_id.unwrap();
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
+        let conflict = AbortUploadError::StorageError(StorageError::TransactionConflict);
+        let (_, turn) = marked(Err(conflict));
 
         assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            turn.err(),
+            Some(AbortUploadError::StorageError(
+                StorageError::TransactionConflict
+            ))
         );
-        assert_eq!(operation.state, AbortUploadState::Error);
-        assert_eq!(operation.txn_id, None);
     }
 
     #[test]
     fn committed_mark_continues() {
-        let mut operation = marked();
-
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: TxnId::from_bytes([3u8; 16]),
-        }));
+        let (operation, turn) = marked(Ok(record()));
 
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == UPLOAD_PART_KEYSPACE
+            turn,
+            Ok(Next::Call(IoCall::Page { space, .. })) if space == UPLOAD_PART_KEYSPACE
         ));
         assert_eq!(operation.state, AbortUploadState::ReadUploadParts);
-        assert_eq!(operation.txn_id, None);
+    }
+
+    #[test]
+    fn deleted_frees_parts() {
+        // The part blobs go only after the delete transaction committed.
+        let (mut operation, _) = marked(Ok(record()));
+        let rows = vec![(Vec::new().into(), part().to_bytes().unwrap().into())];
+        let turn = operation.next(IoResult::Page { rows, next: None });
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(
+            Ok::<(), AbortUploadError>(()),
+        )));
+
+        let Ok(Next::Then { calls, .. }) = turn else {
+            panic!("expected the blob deletes")
+        };
+        let location = part_location();
+        let delete = IoCall::from(Effect::Blob(BlobEffect::Delete { location }));
+        assert_eq!(calls, [delete]);
     }
 
     #[test]
     fn queues_cleanup_commit() {
         let location = part_location();
-        let mut operation = AbortUploadOperation::new(input());
-        operation.upload_parts.push(MultipartPart {
-            part_number: 1,
-            location: location.clone(),
-            created_at: SystemTime::UNIX_EPOCH,
-            backend_etag: None,
-            piece: None,
-        });
-        let txn_id = TxnId::from_bytes([5u8; 16]);
-        operation.txn_id = Some(txn_id);
-        operation.state = AbortUploadState::DeleteUploadRecords;
+        let mut delete = DeleteRecords::new(input(), vec![part()]);
+        delete.step = DeleteStep::DeleteRecords;
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
+        let deleted = StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id })] =
-            effects.as_slice()
-        else {
-            panic!("expected cleanup records, got {effects:?}")
         };
-        assert_eq!(*id, Some(txn_id));
+        let turn = delete.next(IoResult::Event(Box::new(Event::Storage(deleted))));
+
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected cleanup records")
+        };
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, BLOB_CLEANUP_KEYSPACE);
         assert_eq!(
             BlobCleanupWork::from_bytes(writes[0].2.as_ref()).unwrap(),
             BlobCleanupWork::DeleteBlob { location }
         );
-        assert_eq!(operation.state, AbortUploadState::WriteCleanupRecords);
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        );
-        assert_eq!(operation.state, AbortUploadState::CommitDeleteTransaction);
+        assert!(matches!(delete.next(IoResult::Done), Ok(Next::Done(()))));
     }
 
     #[test]
     fn counts_found_record() {
         // Only a delete that still finds the record in its transaction counts the upload closed.
         for found in [true, false] {
-            let mut operation = AbortUploadOperation::new(input());
-            operation.txn_id = Some(TxnId::from_bytes([5u8; 16]));
-            let effects = operation.delete_upload_records();
-            let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-            else {
-                panic!("expected the record read, got {effects:?}")
-            };
-            assert_eq!(key_space, UPLOAD_KEYSPACE);
+            let mut delete = DeleteRecords::new(input(), Vec::new());
+            let turn = delete.first();
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == UPLOAD_KEYSPACE
+            ));
             let value = found.then(|| vec![1u8].into());
-            let mut effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: Vec::new().into(),
-                value,
-            }));
+            let mut turn = delete.next(IoResult::Values(vec![value]));
             if found {
-                let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice()
-                else {
-                    panic!("expected the binding read, got {effects:?}")
-                };
-                assert_eq!(key_space, S3_BUCKET_KEYSPACE);
-                effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-                    key: Vec::new().into(),
-                    value: None,
-                }));
-                let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice()
-                else {
-                    panic!("expected the upload count, got {effects:?}")
+                assert!(matches!(
+                    &turn,
+                    Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == S3_BUCKET_KEYSPACE
+                ));
+                turn = delete.next(IoResult::Values(vec![None]));
+                let Ok(Next::Call(IoCall::AddUsage { buckets, .. })) = &turn else {
+                    panic!("expected the upload count, got {turn:?}")
                 };
                 let uploads: Vec<_> = buckets
                     .iter()
                     .map(|(_, delta)| delta.open_uploads)
                     .collect();
                 assert_eq!(uploads, [-1]);
-                effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                    entries: Vec::new(),
-                }));
+                turn = delete.next(IoResult::Done);
             }
+            let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+                panic!("expected the record delete")
+            };
             assert!(matches!(
-                effects.as_slice(),
-                [Effect::Storage(StorageEffect::BatchDelete { .. })]
+                *effect,
+                Effect::Storage(StorageEffect::BatchDelete { .. })
             ));
         }
     }
@@ -894,59 +732,30 @@ mod pure_tests {
     fn delete_batches_records() {
         // The abort removes every part row, the upload record and its pending envelope in one
         // batch inside the delete transaction.
-        let mut operation = AbortUploadOperation::new(input());
-        operation.upload_parts.push(MultipartPart {
-            part_number: 1,
-            location: part_location(),
-            created_at: SystemTime::UNIX_EPOCH,
-            backend_etag: None,
-            piece: None,
-        });
-        let txn_id = TxnId::from_bytes([5u8; 16]);
-        operation.txn_id = Some(txn_id);
+        let mut delete = DeleteRecords::new(input(), vec![part()]);
 
-        let effects = operation.delete_records();
+        let turn = delete.delete_records();
 
-        let [
-            Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: observed,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected upload records delete, got {effects:?}")
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("expected upload records delete")
         };
-        assert_eq!(*observed, Some(txn_id));
+        let Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id }) = *effect else {
+            panic!("expected upload records delete")
+        };
+        assert_eq!(txn_id, None);
         assert_eq!(deletes.len(), 3);
-        let upload_key = operation.input.upload_id.to_bytes().to_vec();
+        let upload_key = input().upload_key();
         for keyspace in [UPLOAD_KEYSPACE, aruna_core::keyspaces::ABE_PENDING_KEYSPACE] {
             assert!(deletes.iter().any(|(key_space, key)| {
                 key_space == keyspace && key.as_ref() == upload_key.as_slice()
             }));
         }
-        let part_key = MultipartPartKey::new(operation.input.upload_id, 1)
+        let part_key = MultipartPartKey::new(input().upload_id, 1)
             .to_bytes()
             .unwrap();
         assert!(deletes.iter().any(|(key_space, key)| {
             key_space == UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
         }));
-        assert_eq!(operation.state, AbortUploadState::DeleteUploadRecords);
-    }
-
-    #[test]
-    fn rejects_incomplete() {
-        let operation = AbortUploadOperation::new(input());
-
-        assert_eq!(operation.finalize(), Err(AbortUploadError::NotFinished));
-    }
-
-    #[test]
-    fn finalizes_finished() {
-        let mut operation = AbortUploadOperation::new(input());
-        operation.state = AbortUploadState::Finish;
-        operation.output = Some(Ok(()));
-
-        assert_eq!(operation.finalize(), Ok(()));
     }
 
     fn part_location() -> BackendLocation {
