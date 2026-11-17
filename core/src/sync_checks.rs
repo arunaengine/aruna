@@ -375,17 +375,5 @@ pub fn watch_change_applies(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn watch_changes_fence() {
-        use DocumentChangeKind::{Delete, Upsert};
-        assert!(watch_change_applies(None, Upsert));
-        assert!(watch_change_applies(None, Delete));
-        assert!(watch_change_applies(Some(Upsert), Delete));
-        assert!(!watch_change_applies(Some(Upsert), Upsert));
-        assert!(!watch_change_applies(Some(Delete), Upsert));
-        assert!(!watch_change_applies(Some(Delete), Delete));
-    }
-}
+#[path = "sync_checks_tests.rs"]
+mod tests;
