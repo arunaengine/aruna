@@ -8,18 +8,14 @@ use std::time::Duration;
 use tokio::time::{Instant, sleep_until, timeout_at};
 
 use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
-    METADATA_REPLICATION_FACTOR, RealmConfigDocument, RealmId, RealmNodeKind,
+    METADATA_REPLICATION_FACTOR, RealmConfigDocument, RealmNodeKind,
 };
-use byteview::ByteView;
 use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use thiserror::Error;
 
 use crate::document_repository::GetConfigOperation;
@@ -216,94 +212,13 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
         .min()
 }
 
-/// Stores a handed realm key for the next start of this node.
-pub(crate) async fn serve_realm_key(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    key: RealmKeyPem,
-) -> Result<(), MetadataReadError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let document = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .ok()
-        .ok_or(MetadataReadError::Unavailable)?;
-    check_handoff(&document, peer, net_handle.node_id(), realm_id, &key)?;
-    let write = StorageEffect::Write {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(PROMOTED_KEY_ROW),
-        value: ByteView::from(key.0.as_bytes()),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        _ => Err(MetadataReadError::Unavailable),
-    }
-}
-
-/// Whether this node's own config lists it as management while it holds a handed key.
-pub(crate) async fn serve_promotion_check(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-) -> Result<bool, MetadataReadError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let document = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
-        .await
-        .ok()
-        .ok_or(MetadataReadError::Unavailable)?;
-    if !is_management(&document, peer) {
-        return Err(MetadataReadError::Forbidden);
-    }
-    if !is_management(&document, net_handle.node_id()) {
-        return Ok(false);
-    }
-    let read = StorageEffect::Read {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(PROMOTED_KEY_ROW),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        _ => Err(MetadataReadError::Unavailable),
-    }
-}
-
-/// Only a current management node may hand the key, never to a device, and only the realm's key.
-fn check_handoff(
-    document: &RealmConfigDocument,
-    peer: NodeId,
-    local: NodeId,
-    realm_id: RealmId,
-    key: &RealmKeyPem,
-) -> Result<(), MetadataReadError> {
-    if !is_management(document, peer)
-        || !matches!(
-            node_kind(document, local),
-            Some(RealmNodeKind::Server | RealmNodeKind::Management)
-        )
-    {
-        return Err(MetadataReadError::Forbidden);
-    }
-    let signing_key =
-        SigningKey::from_pkcs8_pem(&key.0).map_err(|_| MetadataReadError::Unauthorized)?;
-    if signing_key.verifying_key().to_bytes() != *realm_id.as_bytes() {
-        return Err(MetadataReadError::Unauthorized);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::metadata::MetadataError;
+    use aruna_core::structs::identity::realm::RealmId;
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
     fn node(rank: u8) -> NodeId {
@@ -371,45 +286,6 @@ mod tests {
         let (_, _, mut document) = realm();
         document.ensure_node(node(2), RealmNodeKind::Management);
         assert!(check_target(&document, node(1), node(2)).is_ok());
-    }
-
-    #[test]
-    fn handoff_checks_sender() {
-        let (key, realm_id, document) = realm();
-        let key = pem(&key);
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &key),
-            Ok(())
-        );
-        assert_eq!(
-            check_handoff(&document, node(2), node(2), realm_id, &key),
-            Err(MetadataReadError::Forbidden),
-            "a server node may not hand a key"
-        );
-        assert_eq!(
-            check_handoff(&document, node(1), node(3), realm_id, &key),
-            Err(MetadataReadError::Forbidden),
-            "a device never stores the realm key"
-        );
-        assert_eq!(
-            check_handoff(&document, node(1), node(9), realm_id, &key),
-            Err(MetadataReadError::Forbidden)
-        );
-    }
-
-    #[test]
-    fn handoff_rejects_foreign() {
-        let (_, realm_id, document) = realm();
-        let foreign = pem(&generate_signing_key());
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &foreign),
-            Err(MetadataReadError::Unauthorized)
-        );
-        let garbage = RealmKeyPem("not a key".to_string());
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &garbage),
-            Err(MetadataReadError::Unauthorized)
-        );
     }
 
     #[test]

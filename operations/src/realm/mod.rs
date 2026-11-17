@@ -15,6 +15,7 @@ pub mod mutate_placement;
 pub mod node_name;
 pub mod peer_trust;
 pub mod promote_node;
+pub mod promotion;
 pub mod read_authorization;
 pub mod set_admin;
 pub mod set_compute;

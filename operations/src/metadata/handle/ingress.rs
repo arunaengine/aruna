@@ -1189,8 +1189,22 @@ impl MetadataHandle {
                 )
             }
             MetadataTransportMessage::HandRealmKey { key } => {
-                let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);
-                let result = Box::pin(stored).await;
+                let request = crate::realm::promotion::PromotionRequest::HandKey(key);
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm::promotion::ServePromotionOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                }
+                .map(|_| ());
                 (MetadataTransportMessage::RealmKeyStored { result }, None)
             }
             MetadataTransportMessage::RealmSecret { entry, revision } => {
@@ -1260,8 +1274,21 @@ impl MetadataHandle {
                 (MetadataTransportMessage::NodeSecretChecked { result }, None)
             }
             MetadataTransportMessage::PromotionCheck => {
-                let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
-                let result = Box::pin(ready).await;
+                let request = crate::realm::promotion::PromotionRequest::Check;
+                let result = match context.net_handle.as_ref() {
+                    Some(net) => {
+                        let serve = crate::realm::promotion::ServePromotionOperation::new(
+                            *net.realm_id(),
+                            net.node_id(),
+                            peer,
+                            request,
+                        );
+                        crate::driver::drive(serve, context.as_ref())
+                            .await
+                            .and_then(|answer| answer)
+                    }
+                    None => Err(MetadataReadError::Unavailable),
+                };
                 (MetadataTransportMessage::PromotionReady { result }, None)
             }
             MetadataTransportMessage::ResolveJobInputs {
