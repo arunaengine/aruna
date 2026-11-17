@@ -28,3 +28,18 @@ mod tests;
 pub mod unread;
 pub mod watch;
 pub mod webhook;
+
+use aruna_core::calls::{IoError, IoResult};
+
+/// The error for a result that does not answer the call it came for.
+pub(crate) fn unexpected(expected: &'static str, result: &IoResult) -> IoError {
+    let got = match result {
+        IoResult::Event(event) => event.label(),
+        IoResult::Values(_) => "IoResult::Values",
+        IoResult::Page { .. } => "IoResult::Page",
+        IoResult::Done => "IoResult::Done",
+        IoResult::Group(_) => "IoResult::Group",
+        IoResult::Woke => "IoResult::Woke",
+    };
+    IoError::Unexpected { expected, got }
+}

@@ -4,19 +4,20 @@
 
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail, SmtpSettings,
 };
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
 };
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::notifications::unexpected;
 
 /// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);
@@ -32,10 +33,8 @@ pub enum SendError {
     /// No mail sender is cached for the profile; send again with its settings.
     #[error("no mail sender is cached for this profile")]
     NoSender,
-    #[error("unexpected event while sending: {0}")]
-    UnexpectedEvent(String),
-    #[error("the send did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 impl From<OutboundError> for SendError {
@@ -48,17 +47,11 @@ impl From<OutboundError> for SendError {
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum SendState {
-    Ready(OutboundEffect),
-    Sending,
-    Done(Result<Option<u16>, SendError>),
-}
-
 /// One outbound call: a webhook POST answers with its status, a mail with `None`.
 #[derive(Debug, PartialEq)]
 pub struct SendOperation {
-    state: SendState,
+    /// The effect to send, or the refusal found while building it.
+    ready: Option<Result<OutboundEffect, SendError>>,
 }
 
 impl SendOperation {
@@ -67,11 +60,11 @@ impl SendOperation {
         let Some(body) = spec.body() else {
             let refused =
                 SendError::Refused("only share upload notifications are delivered".into());
-            return Self::done(Err(refused));
+            return Self::refused(refused);
         };
         let body = match serde_json::to_vec(&body) {
             Ok(body) => body,
-            Err(error) => return Self::done(Err(SendError::Refused(error.to_string()))),
+            Err(error) => return Self::refused(SendError::Refused(error.to_string())),
         };
         let post = HttpPost {
             url: url.to_string(),
@@ -87,7 +80,7 @@ impl SendOperation {
             deadline: DELIVERY_DEADLINE,
         };
         Self {
-            state: SendState::Ready(OutboundEffect::Post(Box::new(post))),
+            ready: Some(Ok(OutboundEffect::Post(Box::new(post)))),
         }
     }
 
@@ -99,13 +92,13 @@ impl SendOperation {
             mail,
         };
         Self {
-            state: SendState::Ready(OutboundEffect::Mail(Box::new(request))),
+            ready: Some(Ok(OutboundEffect::Mail(Box::new(request)))),
         }
     }
 
-    fn done(result: Result<Option<u16>, SendError>) -> Self {
+    fn refused(error: SendError) -> Self {
         Self {
-            state: SendState::Done(result),
+            ready: Some(Err(error)),
         }
     }
 }
@@ -122,57 +115,33 @@ fn posted(status: u16) -> Result<Option<u16>, SendError> {
     }
 }
 
-impl EffectOperation for SendOperation {
+impl Operation for SendOperation {
     type Output = Option<u16>;
     type Error = SendError;
 
-    fn start(&mut self) -> Effects {
-        match std::mem::replace(&mut self.state, SendState::Sending) {
-            SendState::Ready(effect) => smallvec![Effect::Outbound(effect)],
-            other => {
-                self.state = other;
-                smallvec![]
-            }
-        }
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let effect = self.ready.take().ok_or(IoError::Unfinished)??;
+        Ok(Next::Call(IoCall::Effect(Effect::Outbound(effect))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let result = match (&self.state, event) {
-            (SendState::Sending, Event::Outbound(OutboundEvent::Posted { result })) => {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let sent = match result {
+            IoResult::Event(Event::Outbound(OutboundEvent::Posted { result })) => {
                 result.map_err(SendError::from).and_then(posted)
             }
-            (SendState::Sending, Event::Outbound(OutboundEvent::MailSent { result })) => {
+            IoResult::Event(Event::Outbound(OutboundEvent::MailSent { result })) => {
                 result.map(|()| None).map_err(SendError::from)
             }
-            (_, other) => Err(SendError::UnexpectedEvent(format!("{other:?}"))),
+            other => Err(unexpected("an outbound event", &other).into()),
         };
-        self.state = SendState::Done(result);
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SendState::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            SendState::Done(result) => result,
-            _ => Err(SendError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        sent.map(Next::Done)
     }
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::notifications::user;
-    use aruna_core::operation_check::{
-        check_abort, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::execution::notification::{
         NotificationClass, NotificationKind, NotificationRecord,
     };
@@ -193,24 +162,28 @@ mod state_machine_tests {
         }
     }
 
-    fn posted(result: Result<u16, OutboundError>) -> Event {
-        Event::Outbound(OutboundEvent::Posted { result })
+    fn posted(result: Result<u16, OutboundError>) -> IoResult {
+        IoResult::Event(Event::Outbound(OutboundEvent::Posted { result }))
     }
 
-    fn run(event: Event) -> Result<Option<u16>, SendError> {
-        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
-        send.start();
-        send.step(event);
-        send.finalize()
+    fn webhook() -> SendOperation {
+        SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7)
+    }
+
+    fn run(result: IoResult) -> Result<Next<Option<u16>>, SendError> {
+        let mut send = webhook();
+        send.first().unwrap();
+        send.next(result)
     }
 
     #[test]
     fn webhook_post_signed() {
         let spec = spec();
         let mut send = SendOperation::webhook(&spec, "https://hooks.example.org/a", &[9; 32], 7);
-        let effects = send.start();
-        let [Effect::Outbound(OutboundEffect::Post(post))] = effects.as_slice() else {
-            panic!("one post: {effects:?}");
+        let Ok(Next::Call(IoCall::Effect(Effect::Outbound(OutboundEffect::Post(post))))) =
+            send.first()
+        else {
+            panic!("one post");
         };
         let body = serde_json::to_vec(&spec.body().unwrap()).unwrap();
         assert_eq!(post.body.as_ref(), body.as_slice());
@@ -220,8 +193,7 @@ mod state_machine_tests {
             post.headers
                 .contains(&(SIGNATURE_HEADER, sign_delivery(&[9; 32], 7, &body)))
         );
-        assert!(send.step(posted(Ok(204))).is_empty());
-        assert_eq!(send.finalize(), Ok(Some(204)));
+        assert_eq!(send.next(posted(Ok(204))), Ok(Next::Done(Some(204))));
     }
 
     #[test]
@@ -244,8 +216,7 @@ mod state_machine_tests {
             actor_user_id: user(1, 3),
         };
         let mut send = SendOperation::webhook(&other, "https://hooks.example.org/a", &[9; 32], 7);
-        assert!(send.start().is_empty());
-        assert!(matches!(send.finalize(), Err(SendError::Refused(_))));
+        assert!(matches!(send.first(), Err(SendError::Refused(_))));
     }
 
     #[test]
@@ -258,32 +229,22 @@ mod state_machine_tests {
         };
         let mut send = SendOperation::mail(Ulid::from_parts(2, 2), None, mail);
         assert!(matches!(
-            send.start().as_slice(),
-            [Effect::Outbound(OutboundEffect::Mail(_))]
+            send.first(),
+            Ok(Next::Call(IoCall::Effect(Effect::Outbound(
+                OutboundEffect::Mail(_)
+            ))))
         ));
-        send.step(Event::Outbound(OutboundEvent::MailSent {
+        let sent = send.next(IoResult::Event(Event::Outbound(OutboundEvent::MailSent {
             result: Err(OutboundError::NoSender),
-        }));
-        assert_eq!(send.finalize(), Err(SendError::NoSender));
+        })));
+        assert_eq!(sent, Err(SendError::NoSender));
     }
 
     #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut send =
-                SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
-            send.start();
-            send
-        };
-        let refusals = rejects_events(make, sample_events, |_| false);
-        assert_eq!(refusals.len(), sample_events().len());
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        let mut send = SendOperation::webhook(&spec(), "https://hooks.example.org/a", &[9; 32], 7);
-        send.start();
-        check_abort(&mut send, &[]);
-        rejects_finalize(send);
+    fn other_results_fail() {
+        assert!(matches!(run(IoResult::Done), Err(SendError::Io(_))));
+        let mut send = webhook();
+        send.first().unwrap();
+        assert!(send.first().is_err(), "the effect is sent once");
     }
 }
