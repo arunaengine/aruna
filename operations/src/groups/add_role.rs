@@ -1167,7 +1167,7 @@ pub mod test {
             mutated_group.clone(),
             mutated_auth_doc.clone(),
             true,
-            Vec::new(),
+            Vec::<aruna_core::UserId>::new(),
         )));
         let Ok(Next::Then { output, calls }) = checked.next(IoResult::Child(written)) else {
             panic!("expected the change with the drain wake");

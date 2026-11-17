@@ -679,7 +679,7 @@ fn merge_moves_everything() {
 
     let mut turn = operation.next(IoResult::Done);
     // Stale deletes and the fence read come before the epoch marks of the encrypted buckets.
-    loop {
+    let turn = loop {
         turn = match turn {
             Ok(Next::Call(IoCall::Delete(_) | IoCall::Write(_))) => operation.next(IoResult::Done),
             Ok(Next::Call(IoCall::Read(_))) => operation.next(read(Vec::new())),
@@ -689,7 +689,7 @@ fn merge_moves_everything() {
             }),
             other => break other,
         };
-    }
+    };
     // Only the drain timer runs after the commit, and a lost one leaves the outbox retryable.
     let Ok(Next::Then {
         output: outcome,
