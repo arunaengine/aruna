@@ -7,7 +7,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::encoded_row;
 
 use super::*;
@@ -81,7 +81,10 @@ impl WaitRowOperation {
     pub fn acknowledge(waiter: NodeId, job_id: JobId, key: BucketKeyRef) -> Self {
         let row = delivery_key(waiter, job_id, key);
         Self {
-            call: Some(Ok(IoCall::Delete(vec![(KEY_WAIT_KEYSPACE.to_string(), row)]))),
+            call: Some(Ok(IoCall::Delete(vec![(
+                KEY_WAIT_KEYSPACE.to_string(),
+                row,
+            )]))),
         }
     }
 }
@@ -189,8 +192,8 @@ impl Operation for QueueWakesOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn is_conflict(error: &Self::Error) -> bool {

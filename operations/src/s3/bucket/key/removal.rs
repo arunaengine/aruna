@@ -11,7 +11,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{
     BUCKET_AUDIT_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, HolderOrigin, KeyState, SealedCopy,
@@ -293,8 +293,8 @@ impl Operation for RemoveHolderOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

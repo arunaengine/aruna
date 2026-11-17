@@ -4,7 +4,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::done;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key};
 use aruna_core::types::{Key, Value};
@@ -110,8 +110,8 @@ impl Operation for SettleReconcileOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -155,7 +155,10 @@ mod tests {
     #[test]
     fn claims_missing_activation() {
         let mut operation = outgoing_phase();
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let claimed = SyncMirrorRecord {
             rollback: true,
             ..SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Delete, NOW)

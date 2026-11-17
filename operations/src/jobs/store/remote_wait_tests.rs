@@ -104,7 +104,10 @@ fn row_deletes_once() {
 #[test]
 fn queue_rewrites_page() {
     let mut queue = QueueWakesOperation::new(key(1));
-    assert!(queue.transaction());
+    assert_eq!(
+        queue.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(
         queue.first(),
         Ok(Next::Call(IoCall::Page { limit, after: None, .. })) if limit == WAKE_PAGE

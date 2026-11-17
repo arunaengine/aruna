@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
     LogicalJobState, job_record_key, validate_transition,
@@ -17,10 +17,10 @@ use tracing::debug;
 
 use super::reduce::reduce_family;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
+use aruna_core::structs::execution::job::JobWrites;
 use aruna_core::structs::execution::job::record_keys::{
     MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix, record_key,
 };
-use aruna_core::structs::execution::job::JobWrites;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes, to_bytes};
 
 /// Aliases one family may bridge into local job rows.
@@ -293,8 +293,8 @@ impl Operation for ProjectFamilyOperation {
     type Output = ProjectedFamily;
     type Error = RecordStoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn is_conflict(error: &Self::Error) -> bool {

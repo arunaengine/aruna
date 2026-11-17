@@ -29,9 +29,9 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     /// The next call after `result`, or the outcome.
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error>;
 
-    /// Whether the storage calls run in one write transaction; otherwise each runs on its own.
-    fn transaction(&self) -> bool {
-        false
+    /// How the runner groups the storage calls; by default each runs on its own.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 
     /// Cleanup calls the runner sends once when the run ends in an error before its commit is
@@ -77,6 +77,50 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         Self: Sized,
     {
         3
+    }
+
+    /// Decides on the freshly built next attempt after attempt `attempt` (from 1) of
+    /// `drive_retry` lost a conflict; it may set its own state first, such as a recheck flag.
+    /// By default it reruns `conflict_retries()` times, then fails.
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output>
+    where
+        Self: Sized,
+    {
+        AfterConflict::rerun_within(attempt, Self::conflict_retries())
+    }
+}
+
+/// How the runner groups an operation's storage calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransactionMode {
+    /// Each storage call runs on its own.
+    #[default]
+    None,
+    /// Every storage call runs in one write transaction, committed with the outcome and aborted
+    /// on an error.
+    Write,
+    /// Reads and pages run in one read-only snapshot; writes, deletes and syncs run on their own.
+    ReadSnapshot,
+}
+
+/// What the conflict retry does after a run lost a transaction conflict.
+#[derive(Debug, PartialEq)]
+pub enum AfterConflict<T> {
+    /// Runs the fresh attempt after the backoff.
+    Rerun,
+    /// Ends with this output, without a rerun.
+    Finish(T),
+    /// Ends with the conflict error.
+    Fail,
+}
+
+impl<T> AfterConflict<T> {
+    /// The default policy: rerun while `attempt` is at most `retries`, then fail.
+    pub fn rerun_within(attempt: u32, retries: u32) -> Self {
+        match attempt <= retries {
+            true => Self::Rerun,
+            false => Self::Fail,
+        }
     }
 }
 
@@ -135,6 +179,14 @@ pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
         Self: Sized,
     {
         3
+    }
+
+    /// See [`Operation::on_conflict`].
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output>
+    where
+        Self: Sized,
+    {
+        AfterConflict::rerun_within(attempt, Self::conflict_retries())
     }
 
     /// Whether a deadline must still run `abort` after one of the operation's

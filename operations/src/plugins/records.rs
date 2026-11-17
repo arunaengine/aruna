@@ -9,7 +9,7 @@ use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
@@ -244,8 +244,8 @@ impl Operation for InstallEntryOperation {
     type Output = Option<PluginInstall>;
     type Error = RecordError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, RecordError> {

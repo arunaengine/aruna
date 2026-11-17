@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{EVENT_JOURNAL_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     EVENTS_QUEUED, GapReason, JOURNAL_RETENTION_MS, JOURNAL_ROW, PENDING_ROW, SourceEvent,
@@ -324,8 +324,8 @@ impl Operation for ReplayPage {
     type Output = (usize, bool);
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {

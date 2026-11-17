@@ -111,7 +111,10 @@ fn run_by(case: Case, admin: bool) -> (RemoveHolderOperation, Step) {
         lookups: BTreeMap::from(lookups),
         now_ms: 9,
     });
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let _ = operation.first();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),

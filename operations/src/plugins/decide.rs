@@ -5,7 +5,7 @@
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use std::collections::BTreeMap;
 
 use aruna_core::keyspaces::{
@@ -96,8 +96,8 @@ impl Operation for LateEvent {
     type Output = ();
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {
@@ -165,8 +165,8 @@ impl Operation for DecideEvent {
     type Output = Outcome;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Outcome>, StoreError> {
@@ -413,8 +413,8 @@ impl Operation for KeepReports {
     type Output = Vec<(Ulid, SourceKind, GapReason, u64)>;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {

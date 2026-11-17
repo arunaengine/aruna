@@ -9,7 +9,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
@@ -331,8 +331,8 @@ impl Operation for ClaimStateOperation {
         Ok(self.write(current))
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -489,7 +489,10 @@ mod pure_tests {
     fn claims_unchanged_entry() {
         let entry = entry();
         let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
-        assert!(claim.transaction());
+        assert_eq!(
+            claim.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let read = (
             DEVICE_INTAKE_KEYSPACE.to_string(),
             publish_key(entry.draft_id),

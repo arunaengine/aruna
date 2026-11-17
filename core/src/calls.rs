@@ -14,7 +14,8 @@ use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, a
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
 use crate::operation::{
-    EffectOperation, HoldScope, Operation, Runnable, SubOperation, boxed_suboperation,
+    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation, TransactionMode,
+    boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
@@ -50,7 +51,7 @@ pub enum IoCall {
     /// A wake after this long on the runner's clock.
     Delay(Duration),
     /// Adds usage deltas to the latest stored counters when the operation's transaction
-    /// commits; needs `transaction()`. Answered by `Done`.
+    /// commits; needs `TransactionMode::Write`. Answered by `Done`.
     AddUsage {
         space: KeySpace,
         deltas: Vec<(Key, UsageDelta)>,
@@ -101,8 +102,8 @@ impl IoCall {
     where
         O: Runnable<K> + 'static,
         K: 'static,
-        O::Output: PartialEq + 'static,
-        O::Error: PartialEq + 'static,
+        O::Output: PartialEq + Sync + 'static,
+        O::Error: PartialEq + Sync + 'static,
     {
         Self::Child(boxed_suboperation(operation, |result| {
             Event::Child(ChildOutcome::new(result))
@@ -113,11 +114,11 @@ impl IoCall {
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types.
 pub struct ChildOutcome(Box<dyn ChildValue>);
 
-trait ChildValue: Any + Send + Debug {
+trait ChildValue: Any + Send + Sync + Debug {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool;
 }
 
-impl<T: Any + Send + Debug + PartialEq> ChildValue for T {
+impl<T: Any + Send + Sync + Debug + PartialEq> ChildValue for T {
     fn eq_dyn(&self, other: &dyn ChildValue) -> bool {
         (other as &dyn Any).downcast_ref::<T>() == Some(self)
     }
@@ -127,8 +128,8 @@ impl ChildOutcome {
     /// Wraps a child's result; a group member child maps its outcome with this.
     pub fn new<T, E>(result: Result<T, E>) -> Self
     where
-        T: Send + Debug + PartialEq + 'static,
-        E: Send + Debug + PartialEq + 'static,
+        T: Send + Sync + Debug + PartialEq + 'static,
+        E: Send + Sync + Debug + PartialEq + 'static,
     {
         Self(Box::new(result))
     }
@@ -305,12 +306,12 @@ impl From<IoError> for crate::errors::AuthorizationError {
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
-/// storage calls in one write transaction when the operation asks for one, commits its outcome
+/// storage calls in the operation's transaction mode, commits its outcome
 /// and aborts on an error.
 #[derive(Debug)]
 pub(crate) struct CallRun<P: Operation> {
     operation: P,
-    transaction: bool,
+    mode: TransactionMode,
     txn_id: Option<TxnId>,
     state: State<P::Output, P::Error>,
 }
@@ -391,7 +392,7 @@ impl Wait {
 impl<P: Operation> PartialEq for CallRun<P> {
     fn eq(&self, other: &Self) -> bool {
         self.operation == other.operation
-            && self.transaction == other.transaction
+            && self.mode == other.mode
             && self.txn_id == other.txn_id
             && std::mem::discriminant(&self.state) == std::mem::discriminant(&other.state)
     }
@@ -400,7 +401,7 @@ impl<P: Operation> PartialEq for CallRun<P> {
 impl<P: Operation> CallRun<P> {
     pub(crate) fn new(operation: P) -> Self {
         Self {
-            transaction: operation.transaction(),
+            mode: operation.transaction(),
             operation,
             txn_id: None,
             state: State::Created,
@@ -423,17 +424,24 @@ impl<P: Operation> CallRun<P> {
                 turn = self.operation.next(result);
                 continue;
             }
-            if self.transaction && self.txn_id.is_none() && in_storage(&mut call) {
+            if self.txn_id.is_none() && in_mode(&mut call, self.mode) {
                 self.state = State::Starting(call);
-                let start = StorageEffect::StartTransaction { read: false };
+                let read = self.mode == TransactionMode::ReadSnapshot;
+                let start = StorageEffect::StartTransaction { read };
                 return smallvec![Effect::Storage(start)];
             }
             return self.request(call);
         }
     }
 
-    fn request(&mut self, call: IoCall) -> Effects {
-        match call_effect(call, self.txn_id) {
+    /// The transaction a call runs in: the open one when the call joins the mode, else none.
+    fn txn_for(&self, call: &mut IoCall) -> Option<TxnId> {
+        self.txn_id.filter(|_| in_mode(call, self.mode))
+    }
+
+    fn request(&mut self, mut call: IoCall) -> Effects {
+        let txn_id = self.txn_for(&mut call);
+        match call_effect(call, txn_id) {
             Ok((wait, effect)) => {
                 self.state = State::Waiting(wait);
                 smallvec![effect]
@@ -447,10 +455,13 @@ impl<P: Operation> CallRun<P> {
         self.state = State::Waiting(Wait::Window);
         match self.operation.next(IoResult::Group(event)) {
             Ok(Next::Wait) => smallvec![],
-            Ok(Next::Call(call)) => match call_effect(call, self.txn_id) {
-                Ok((_, effect)) => smallvec![effect],
-                Err(error) => self.fail(error),
-            },
+            Ok(Next::Call(mut call)) => {
+                let txn_id = self.txn_for(&mut call);
+                match call_effect(call, txn_id) {
+                    Ok((_, effect)) => smallvec![effect],
+                    Err(error) => self.fail(error),
+                }
+            }
             turn => self.advance(turn),
         }
     }
@@ -634,6 +645,10 @@ impl<P: Operation> EffectOperation for CallRun<P> {
     fn conflict_retries() -> u32 {
         P::conflict_retries()
     }
+
+    fn on_conflict(&mut self, attempt: u32) -> AfterConflict<P::Output> {
+        self.operation.on_conflict(attempt)
+    }
 }
 
 impl<P: Operation> CallRun<P> {
@@ -715,18 +730,33 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the operation's transaction: a storage call, or a storage effect
-/// that takes a transaction id and names none.
-fn in_storage(call: &mut IoCall) -> bool {
+/// Whether the call runs in the operation's transaction of `mode`: a storage call, or a storage
+/// effect that takes a transaction id and names none; a snapshot takes only reads.
+fn in_mode(call: &mut IoCall, mode: TransactionMode) -> bool {
+    let snapshot = match mode {
+        TransactionMode::None => return false,
+        TransactionMode::Write => false,
+        TransactionMode::ReadSnapshot => true,
+    };
     match call {
-        IoCall::Read(_)
-        | IoCall::Page { .. }
-        | IoCall::Write(_)
+        IoCall::Read(_) | IoCall::Page { .. } => true,
+        IoCall::Write(_)
         | IoCall::Delete(_)
         | IoCall::AddUsage { .. }
-        | IoCall::AddCounters { .. } => true,
+        | IoCall::AddCounters { .. } => !snapshot,
         IoCall::Effect(effect) => match effect.as_mut() {
-            Effect::Storage(storage) => storage.txn_slot().is_some_and(|slot| slot.is_none()),
+            Effect::Storage(storage) => {
+                let reads = matches!(
+                    storage,
+                    StorageEffect::Read { .. }
+                        | StorageEffect::BatchRead { .. }
+                        | StorageEffect::Iter { .. }
+                        | StorageEffect::IterRange { .. }
+                        | StorageEffect::Last { .. }
+                        | StorageEffect::VaultRead { .. }
+                );
+                (reads || !snapshot) && storage.txn_slot().is_some_and(|slot| slot.is_none())
+            }
             _ => false,
         },
         _ => false,

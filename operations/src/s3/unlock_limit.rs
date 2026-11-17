@@ -7,7 +7,7 @@ use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketEncryption, BucketKeyError, EncryptionMode};
 use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
@@ -149,8 +149,8 @@ impl Operation for UnlockLimitOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -209,7 +209,10 @@ mod tests {
             expected_generation: expected,
             now_ms: 10,
         });
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let _ = operation.first();
         let settings = BucketEncryption {
             mode,

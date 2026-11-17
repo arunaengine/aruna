@@ -11,7 +11,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
 use aruna_core::structs::identity::realm::RealmId;
@@ -209,8 +209,8 @@ impl Operation for NodeSecretOperation {
         Ok(self.send())
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     /// The notice rows are committed; a missed timer leaves them to the next drain.

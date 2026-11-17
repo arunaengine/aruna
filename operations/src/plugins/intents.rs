@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_INTENTS_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::CallIntent;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -77,8 +77,8 @@ impl Operation for BeginIntent {
     type Output = Begun;
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<Begun>, StoreError> {

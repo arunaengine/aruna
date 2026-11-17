@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
@@ -46,8 +46,8 @@ impl Operation for NotifyWork {
     type Output = bool;
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<bool>, RunError> {
@@ -144,8 +144,8 @@ impl Operation for RetryRun {
     type Output = PluginRun;
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<PluginRun>, RunError> {
@@ -228,8 +228,8 @@ impl Operation for DropCompletion {
     type Output = WorkRow;
     type Error = RunError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<WorkRow>, RunError> {

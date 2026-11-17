@@ -6,7 +6,7 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::GapReason;
 
 use super::decide::{GapCount, Verdict, WaitingRow, seen_row};
@@ -59,8 +59,8 @@ impl Operation for SettleWaiting {
     type Output = ();
     type Error = StoreError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {

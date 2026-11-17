@@ -54,7 +54,10 @@ fn suspends_covered_keys() {
 fn acquires_free_fence() {
     let mut operation = AcquireFenceOperation::new(job(1), scope());
     assert_eq!(operation.first(), Ok(read()));
-    assert!(operation.transaction());
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     let write = IoCall::Write(vec![(
         PURGE_FENCE_KEYSPACE.to_string(),
         fence_key("bucket"),
