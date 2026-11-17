@@ -265,20 +265,22 @@ fn clears_without_holders() {
     let (key, row) = queued(&family);
     let mut drain = scanning(&family, 1, None);
     drain.step(page(vec![key.clone()], None));
-    let clear = Effect::Storage(StorageEffect::Delete {
-        key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
-        key: key.clone(),
-        txn_id: None,
-    });
-    assert_eq!(drain.step(row).as_slice(), &[clear.clone()]);
+    let clear = || {
+        Effect::Storage(StorageEffect::Delete {
+            key_space: FAMILY_OUTBOX_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        })
+    };
+    assert_eq!(drain.step(row).as_slice(), &[clear()]);
     assert_eq!(
         drain.step(deleted(key.clone())).as_slice(),
         &[cursor_write(None)]
     );
 
     let mut drain = scanning(&family, 1, None);
-    drain.step(page(vec![key], None));
-    assert_eq!(drain.step(queued(&family).1).as_slice(), &[clear]);
+    drain.step(page(vec![key.clone()], None));
+    assert_eq!(drain.step(queued(&family).1).as_slice(), &[clear()]);
     assert!(drain.step(failed()).is_empty());
     assert_eq!(drain.finalize(), Ok(true));
 }

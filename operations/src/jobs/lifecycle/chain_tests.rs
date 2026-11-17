@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobId, JobRecordEnvelope,
+    EffectiveResources, ExecutionReceipt, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope,
     PhysicalExecutionState,
 };
 use aruna_core::types::{Key, Value};
