@@ -33,7 +33,7 @@ use url::Url;
 use crate::auth::bearer_token::realm_user_cutoff;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome};
 use crate::jobs::export::{ExportCheckpoint, crate_jsonld, unheld_bucket};
 use crate::jobs::key_wake::read_row;
@@ -231,7 +231,8 @@ async fn change_record(
     context: &DriverContext,
     change: RecordChange,
 ) -> Result<RecordOutcome, GrantError> {
-    drive(RecordOperation::new(change), context)
+    let run = || RecordOperation::new(change.clone());
+    drive_retry(run, context, change.key())
         .await
         .map_err(|error| GrantError::Storage(error.to_string()))
 }

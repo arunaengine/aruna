@@ -25,7 +25,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::federation::records::{RecordChange, RecordOperation, RecordOutcome, StaleUpload};
 use crate::jobs::import::{load_rocrate_upload, upload_stale};
 use crate::jobs::key_wake::read_row;
@@ -121,7 +121,8 @@ pub(crate) async fn confirm_source(
     let change = RecordChange::ConsumeConfirmation {
         record_key: record_key(*upload_id),
     };
-    match drive(RecordOperation::new(change), context).await {
+    let consume = || RecordOperation::new(change.clone());
+    match drive_retry(consume, context, change.key()).await {
         Ok(RecordOutcome::Confirmed(true)) => Ok(()),
         Ok(_) => source_request(context, reqwest::Method::HEAD, &record.grant, timeout)
             .await
@@ -214,7 +215,8 @@ pub async fn write_import(
 
 /// Runs one binding change and returns the upload bound to the import key afterwards.
 async fn drive_binding(context: &DriverContext, change: RecordChange) -> Result<Ulid, ImportError> {
-    match drive(RecordOperation::new(change), context).await {
+    let bind = || RecordOperation::new(change.clone());
+    match drive_retry(bind, context, change.key()).await {
         Ok(RecordOutcome::Bound(bound)) => Ok(bound),
         Ok(other) => Err(ImportError::Storage(format!(
             "unexpected outcome {other:?}"
