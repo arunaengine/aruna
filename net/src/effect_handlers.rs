@@ -682,7 +682,6 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
-            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (handle, context, directory, realm_id)
@@ -751,7 +750,6 @@ mod tests {
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
             shutdown: CancellationToken::new(),
-            secret_key: iroh::SecretKey::from_bytes(&[seed; 32]),
             refresh_probe: None,
         };
         (
