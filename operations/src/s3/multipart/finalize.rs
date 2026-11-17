@@ -214,7 +214,10 @@ impl CompleteUploadOperation {
         self.write_current_lookup(existing.as_ref())
     }
 
-    fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Turn {
+    pub(super) fn write_current_lookup(
+        &mut self,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Turn {
         let set_hint = self.set_hint;
         let version_id = *self
             .version_id

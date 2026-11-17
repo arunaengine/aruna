@@ -158,6 +158,8 @@ pub enum CompleteUploadState {
     UpdateUsage,
     /// Closes the upload in the inventory of a distributed bucket before a registered commit.
     CloseInventory,
+    /// The finalize failed; only the cleanup in `abort` remains.
+    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -1016,6 +1018,7 @@ impl CompleteUploadOperation {
             Ok(result) => return Ok(self.finished(result)),
             Err(error) => error,
         };
+        self.state = CompleteUploadState::Error;
         let sealed = self.sealed();
         match &error {
             CompleteUploadError::StorageError(storage) => {
@@ -1179,6 +1182,7 @@ impl Operation for CompleteUploadOperation {
             CompleteUploadState::EnforceQuota => self.handle_enforce_quota(result),
             CompleteUploadState::UpdateUsage => self.handle_usage_update(result),
             CompleteUploadState::CloseInventory => self.handle_inventory_closed(result),
+            CompleteUploadState::Error => Err(CompleteUploadError::InvalidOperationState),
         }
     }
 
@@ -1548,3 +1552,7 @@ mod dedup;
 mod finalize;
 #[path = "plain.rs"]
 mod plain;
+
+#[cfg(test)]
+#[path = "complete_tests.rs"]
+mod pure_tests;
