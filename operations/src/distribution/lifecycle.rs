@@ -810,7 +810,7 @@ pub(super) async fn range_counters(
 
 /// Changes the set's fence row in one transaction; `change` says whether it changed anything.
 /// A write that read the row before conflicts with this commit.
-pub(super) async fn update_fence(
+async fn update_fence(
     context: &DriverContext,
     set_id: Ulid,
     change: impl Fn(&mut LocalFence) -> bool,

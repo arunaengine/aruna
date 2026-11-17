@@ -41,7 +41,7 @@ const ROUND_PREFIX: &[u8] = b"refresh_round/";
 
 /// One range's refresh round on this coordinator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub(crate) struct RefreshRound {
+struct RefreshRound {
     /// The last key queued in this round; `None` before its first page.
     pub after: Option<String>,
     pub started_ms: u64,

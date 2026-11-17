@@ -357,7 +357,7 @@ struct Batch {
 /// Applies a page of feed rows to their ranges' indexes, then drops the applied rows that no
 /// writer changed meanwhile. Outputs the dropped row count.
 #[derive(Debug, PartialEq)]
-pub(super) struct FeedWalk {
+struct FeedWalk {
     limit: usize,
     cursor: Option<Vec<u8>>,
     state: FeedState,
@@ -375,7 +375,7 @@ pub(super) struct FeedWalk {
 }
 
 impl FeedWalk {
-    pub(super) fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
+    fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
         Self {
             limit,
             cursor,
@@ -394,7 +394,7 @@ impl FeedWalk {
         }
     }
 
-    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+    fn cursor(&self) -> Option<Vec<u8>> {
         self.cursor.clone()
     }
 
@@ -745,7 +745,7 @@ enum OpenState {
 /// Opens a building index for every live range of a page of account rows without one, in sets
 /// that keep a search index. Outputs the opened count.
 #[derive(Debug, PartialEq)]
-pub(super) struct OpenWalk {
+struct OpenWalk {
     limit: usize,
     cursor: Option<Vec<u8>>,
     state: OpenState,
@@ -758,7 +758,7 @@ pub(super) struct OpenWalk {
 }
 
 impl OpenWalk {
-    pub(super) fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
+    fn new(limit: usize, cursor: Option<Vec<u8>>) -> Self {
         Self {
             limit,
             cursor,
@@ -772,7 +772,7 @@ impl OpenWalk {
         }
     }
 
-    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+    fn cursor(&self) -> Option<Vec<u8>> {
         self.cursor.clone()
     }
 
@@ -960,7 +960,7 @@ struct Build {
 /// builds the first building index of the page; the walk stays at that range until its index is
 /// ready. Outputs the count of changed ranges.
 #[derive(Debug, PartialEq)]
-pub(super) struct StateWalk {
+struct StateWalk {
     limits: FeedLimits,
     cursor: Option<Vec<u8>>,
     next: Option<Vec<u8>>,
@@ -977,7 +977,7 @@ pub(super) struct StateWalk {
 }
 
 impl StateWalk {
-    pub(super) fn new(limits: FeedLimits, cursor: Option<Vec<u8>>) -> Self {
+    fn new(limits: FeedLimits, cursor: Option<Vec<u8>>) -> Self {
         Self {
             limits,
             cursor,
@@ -995,7 +995,7 @@ impl StateWalk {
         }
     }
 
-    pub(super) fn cursor(&self) -> Option<Vec<u8>> {
+    fn cursor(&self) -> Option<Vec<u8>> {
         self.cursor.clone()
     }
 

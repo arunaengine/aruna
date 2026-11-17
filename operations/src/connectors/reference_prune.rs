@@ -281,7 +281,7 @@ pub enum PruneState {
 /// ends the pruning, since the next check meets it at once. Outputs whether the connector
 /// stays queued.
 #[derive(Debug, PartialEq)]
-pub(crate) struct PrunePageOperation {
+struct PrunePageOperation {
     queue_key: Key,
     cursor: Value,
     state: PruneState,
@@ -294,7 +294,7 @@ pub(crate) struct PrunePageOperation {
 }
 
 impl PrunePageOperation {
-    pub(crate) fn new(queue_key: Key, cursor: Value) -> Self {
+    fn new(queue_key: Key, cursor: Value) -> Self {
         Self {
             queue_key,
             cursor,
