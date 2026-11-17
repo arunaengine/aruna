@@ -132,6 +132,12 @@ impl BlobError {
     }
 }
 
+impl From<crate::calls::IoError> for BlobError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum StagingSourceError {
     #[error("Channel closed")]
