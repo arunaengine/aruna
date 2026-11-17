@@ -69,13 +69,10 @@ pub async fn repository_status(
     RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
-    let (status, projection, layout, document, pending) = git::snapshot::status(
-        &state.get_ctx(),
-        &auth,
-        id,
-    )
-    .await
-    .map_err(map_error)?;
+    let (status, projection, layout, document, pending) =
+        git::snapshot::status(&state.get_ctx(), &auth, id)
+            .await
+            .map_err(map_error)?;
     let storage_location = git::location::chosen(&document, projection.state.location.clone());
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
@@ -125,14 +122,9 @@ pub async fn export_revision(
     Path(id): Path<Ulid>,
     Query(query): Query<RevisionQuery>,
 ) -> ServerResult<Json<Value>> {
-    let bytes = git::snapshot::export(
-        &state.get_ctx(),
-        &auth,
-        id,
-        query.revision,
-    )
-    .await
-    .map_err(map_error)?;
+    let bytes = git::snapshot::export(&state.get_ctx(), &auth, id, query.revision)
+        .await
+        .map_err(map_error)?;
     let result: Value =
         serde_json::from_slice(&bytes).map_err(|_| ServerError::ServiceUnavailable)?;
     Ok(Json(result))

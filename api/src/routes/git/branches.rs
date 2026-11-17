@@ -107,15 +107,8 @@ pub async fn create_branch(
     Json(request): Json<CreateBranch>,
 ) -> ServerResult<Response> {
     let name = format!("refs/heads/{}", request.name);
-    let result = versions::change_ref(
-        &state.get_ctx(),
-        &auth,
-        id,
-        name,
-        Some(&request.from),
-        None,
-    )
-    .await;
+    let result =
+        versions::change_ref(&state.get_ctx(), &auth, id, name, Some(&request.from), None).await;
     Ok(created(result, &request.name))
 }
 
@@ -348,13 +341,8 @@ pub async fn merge_conflict(
     headers: HeaderMap,
 ) -> ServerResult<Response> {
     let expected = expected(&headers);
-    let result = merge::resolve_conflict(
-        &state.get_ctx(),
-        &auth,
-        (id, conflict),
-        expected.as_deref(),
-    )
-    .await;
+    let result =
+        merge::resolve_conflict(&state.get_ctx(), &auth, (id, conflict), expected.as_deref()).await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),

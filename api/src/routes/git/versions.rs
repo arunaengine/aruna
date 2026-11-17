@@ -419,13 +419,8 @@ pub async fn rocrate(
     RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let result = aruna_operations::git::snapshot::export(
-        &state.get_ctx(),
-        &auth,
-        id,
-        revision,
-    )
-    .await;
+    let result =
+        aruna_operations::git::snapshot::export(&state.get_ctx(), &auth, id, revision).await;
     Ok(match result {
         Ok(bytes) => {
             let value: Value =

@@ -120,7 +120,11 @@ mod tests {
     const RETENTION: Duration = Duration::from_secs(600);
 
     /// Joins the work already running for `key`, or spawns `work` for it.
-    fn join<V, F>(registry: &JoinRegistry<&'static str, V>, key: &'static str, work: F) -> JoinWatch<V>
+    fn join<V, F>(
+        registry: &JoinRegistry<&'static str, V>,
+        key: &'static str,
+        work: F,
+    ) -> JoinWatch<V>
     where
         V: Clone + Send + Sync + 'static,
         F: Future<Output = V> + Send + 'static,

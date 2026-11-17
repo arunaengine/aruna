@@ -4,10 +4,10 @@
 
 use super::{TestContext, failing_close, setup_two_backends, stream_from_bytes, test_user_id};
 use crate::blob::pithos::{OBJECT_PATH, read};
-use aruna_core::structs::checksum::Hasher;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef, ResolvedBackend};
 use aruna_core::structs::storage::encryption::{BlockCipher, BlockKeys, BucketKeyRef, SealPlan};
 use aruna_core::structs::storage::format::{Compression, PithosLayout, StoredFormat, StoredLayout};

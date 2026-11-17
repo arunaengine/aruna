@@ -10,12 +10,12 @@ use super::{
 use crate::blob::BlobHandler;
 use crate::blob::backend::build_part_path;
 use crate::blob::io::compose_chunk;
-use aruna_core::structs::checksum::Hasher;
 use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_core::structs::storage::multipart::{

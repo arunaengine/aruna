@@ -70,9 +70,8 @@ use crate::s3::util::{
     parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
     parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
-use aruna_core::compute::session::{SessionRequest, TouchedObject};
-use aruna_operations::jobs::session::SessionOperation;
 use aruna_core::NodeId;
+use aruna_core::compute::session::{SessionRequest, TouchedObject};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::job::{RoCrateLimits, credential_job_id};
@@ -92,6 +91,7 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{
     DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
 };
+use aruna_operations::jobs::session::SessionOperation;
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
@@ -243,7 +243,11 @@ impl ArunaS3Service {
         };
         let request = SessionRequest::RecordTouched(touched);
         // Without a live session there is nothing to attribute the request to.
-        let _ = drive(SessionOperation::new(job_id.to_string(), request), &self.state).await;
+        let _ = drive(
+            SessionOperation::new(job_id.to_string(), request),
+            &self.state,
+        )
+        .await;
     }
 }
 

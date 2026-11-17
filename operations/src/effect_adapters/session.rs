@@ -10,7 +10,10 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::driver::DriverContext;
 
-pub(super) async fn dispatch_session(effect: SessionEffect, context: &DriverContext) -> SessionAnswer {
+pub(super) async fn dispatch_session(
+    effect: SessionEffect,
+    context: &DriverContext,
+) -> SessionAnswer {
     let session = (context.compute_handle.as_ref())
         .and_then(|registry| registry.sessions().get(&effect.job_id));
     let Some(session) = session else {
@@ -34,10 +37,12 @@ pub(super) async fn dispatch_session(effect: SessionEffect, context: &DriverCont
             let (backlog, receiver) = session.subscribe_all();
             streamed(backlog, receiver)
         }
-        SessionRequest::SubmitCell { cell_id, code } => match session.submit_cell(&cell_id, &code) {
-            Ok(position) => SessionAnswer::Position(position),
-            Err(error) => SessionAnswer::Refused(error),
-        },
+        SessionRequest::SubmitCell { cell_id, code } => {
+            match session.submit_cell(&cell_id, &code) {
+                Ok(position) => SessionAnswer::Position(position),
+                Err(error) => SessionAnswer::Refused(error),
+            }
+        }
         SessionRequest::Interrupt => done(session.interrupt()),
         SessionRequest::End(reason) => {
             session.end(reason);
