@@ -123,3 +123,137 @@ impl Operation for PrefixScanOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const SPACE: &str = "rows";
+
+    fn key(seed: u8) -> Key {
+        vec![7, seed].into()
+    }
+
+    fn row(seed: u8) -> (Key, Value) {
+        (key(seed), vec![seed].into())
+    }
+
+    fn prefix() -> Key {
+        vec![7].into()
+    }
+
+    fn scan_effect(start: Option<IterStart>, limit: usize) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: SPACE.to_string(),
+            prefix: Some(prefix()),
+            start,
+            limit,
+            txn_id: None,
+        })
+    }
+
+    fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: rows,
+            next_start_after: next,
+        })
+    }
+
+    fn scanning(limit: usize) -> PrefixScanOperation {
+        let mut operation = PrefixScanOperation::new(SPACE, (prefix(), None), limit);
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn scans_all_pages() {
+        // The scan starts at `from`, follows the cursor and asks only for what the limit allows.
+        let mut operation = PrefixScanOperation::new(SPACE, (prefix(), Some(key(1))), 5);
+        check_trace(
+            &mut operation,
+            &[scan_effect(Some(IterStart::At(key(1))), 6)],
+            vec![
+                (
+                    page(vec![row(1), row(2)], Some(key(2))),
+                    vec![scan_effect(Some(IterStart::After(key(2))), 4)],
+                ),
+                (page(vec![row(3)], None), vec![]),
+            ],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok((vec![row(1), row(2), row(3)], false))
+        );
+    }
+
+    #[test]
+    fn cut_at_limit() {
+        // One row past the limit marks the scan as cut and is dropped.
+        let mut operation = scanning(2);
+        assert!(
+            operation
+                .step(page(vec![row(1), row(2), row(3)], Some(key(3))))
+                .is_empty()
+        );
+        assert_eq!(operation.finalize(), Ok((vec![row(1), row(2)], true)));
+    }
+
+    #[test]
+    fn large_limit_pages() {
+        let mut operation = PrefixScanOperation::new(SPACE, (prefix(), None), 10_000);
+        assert_eq!(
+            operation.start().as_slice(),
+            [scan_effect(None, PREFLIGHT_PAGE_SIZE)]
+        );
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let mut operation = scanning(2);
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert!(operation.step(error).is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(PrefixScanError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(|| scanning(2), sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, PrefixScanError::UnexpectedEvent(_)));
+        }
+        let mut idle = PrefixScanOperation::new(SPACE, (prefix(), None), 2);
+        idle.step(page(Vec::new(), None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(PrefixScanError::UnexpectedEvent(_))
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = PrefixScanOperation::new(SPACE, (prefix(), None), 2);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(PrefixScanOperation::new(SPACE, (prefix(), None), 2));
+        rejects_finalize(scanning(2));
+    }
+}
