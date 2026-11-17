@@ -680,3 +680,341 @@ impl Operation for RestoreOutboxOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::tests::locations::node_id;
+    use crate::tests::notifications::{record, user};
+    use aruna_core::UserId;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::storage_entries::outbox_write_entry;
+    use aruna_core::structs::execution::notification::NotificationClass;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use ulid::Ulid;
+
+    const NOW_MS: u64 = 1_700_000_000_000;
+    const SNAPSHOT: TxnId = TxnId::from_parts(3, 3);
+
+    fn outbox_row(record: NotificationRecord) -> (Key, Value, NotificationOutboxRecord) {
+        let outbox = NotificationOutboxRecord {
+            outbox_id: Ulid::from_parts(NOW_MS - 1_000, 1),
+            record,
+        };
+        let (_, key, value) = outbox_write_entry(&outbox).expect("row encodes");
+        (key, value, outbox)
+    }
+
+    /// A realm config whose only holder is `holder`.
+    fn config_bytes(holder: NodeId) -> (RealmId, Value) {
+        let realm_id = user(1, 2).realm_id;
+        let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        config.ensure_node(holder, RealmNodeKind::Server);
+        let actor = Actor {
+            node_id: holder,
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        (realm_id, Value::from(config.to_bytes(&actor).expect("config encodes")))
+    }
+
+    fn page_read(start: Option<Key>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+            prefix: None,
+            start: start.map(IterStart::After),
+            limit: OUTBOX_BATCH_SIZE + 1,
+            txn_id: Some(SNAPSHOT),
+        })
+    }
+
+    fn started() -> DrainOutboxOperation {
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: SNAPSHOT,
+        }));
+        operation
+    }
+
+    #[test]
+    fn remote_success_trace() {
+        let holder = node_id(2);
+        let notice = record(user(1, 2), NotificationClass::Direct, NOW_MS);
+        let (key, value, _) = outbox_row(notice.clone());
+        let (realm_id, config) = config_bytes(holder);
+        let config_key = Key::from(realm_id.as_bytes().to_vec());
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        let request = NotificationRequest {
+            node: holder,
+            message: NotificationTransportMessage::DeliverBatch {
+                records: vec![notice],
+            },
+        };
+        check_trace(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::StartTransaction { read: true })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id: SNAPSHOT }),
+                    vec![page_read(None)],
+                ),
+                (
+                    Event::Storage(StorageEvent::IterResult {
+                        values: vec![(key.clone(), value)],
+                        next_start_after: None,
+                    }),
+                    vec![Effect::Storage(StorageEffect::BatchRead {
+                        reads: vec![(REALM_CONFIG_KEYSPACE.to_string(), config_key.clone())],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchReadResult {
+                        values: vec![(config_key, Some(config))],
+                    }),
+                    vec![Effect::Net(NetEffect::Notification(Box::new(request)))],
+                ),
+                (
+                    Event::Net(NetEvent::Notification(Ok(Box::new(
+                        NotificationTransportMessage::DeliverAck { written: 1 },
+                    )))),
+                    vec![Effect::Storage(StorageEffect::BatchDelete {
+                        deletes: vec![(NOTIFICATION_OUTBOX_KEYSPACE.to_string(), key)],
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::BatchDeleteResult {
+                        entries: Vec::new(),
+                    }),
+                    vec![Effect::Storage(StorageEffect::CommitTransaction {
+                        txn_id: SNAPSHOT,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::TransactionCommitted { txn_id: SNAPSHOT }),
+                    vec![Effect::Storage(StorageEffect::Iter {
+                        key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                        prefix: None,
+                        start: None,
+                        limit: 2,
+                        txn_id: None,
+                    })],
+                ),
+                (
+                    Event::Storage(StorageEvent::IterResult {
+                        values: Vec::new(),
+                        next_start_after: None,
+                    }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(None));
+    }
+
+    #[test]
+    fn rejected_holder_retries() {
+        let holder = node_id(2);
+        let (key, value, _) = outbox_row(record(user(1, 2), NotificationClass::Direct, NOW_MS));
+        let (realm_id, config) = config_bytes(holder);
+        let mut operation = started();
+        operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(key, value)],
+            next_start_after: None,
+        }));
+        let config_key = Key::from(realm_id.as_bytes().to_vec());
+        operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![(config_key, Some(config))],
+        }));
+        let effects = operation.step(Event::Net(NetEvent::Notification(Ok(Box::new(
+            NotificationTransportMessage::Reject("not the holder".to_string()),
+        )))));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: SNAPSHOT
+            })]
+        );
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: SNAPSHOT,
+        }));
+        assert_eq!(operation.finalize(), Ok(Some(DELIVERY_RETRY_AFTER)));
+    }
+
+    #[test]
+    fn expired_rows_dropped() {
+        let notice = record(user(1, 2), NotificationClass::Direct, NOW_MS);
+        let (key, value, _) = outbox_row(notice);
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS + OUTBOX_RETENTION_MS + 10_000);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: SNAPSHOT,
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(key.clone(), value)],
+            next_start_after: None,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchDelete {
+                deletes: vec![(NOTIFICATION_OUTBOX_KEYSPACE.to_string(), key)],
+                txn_id: None,
+            })]
+        );
+    }
+
+    #[test]
+    fn malformed_rows_kept() {
+        let mut operation = started();
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(Key::from(vec![1]), Value::from(vec![1, 2, 3]))],
+            next_start_after: None,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: SNAPSHOT
+            })]
+        );
+        operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: SNAPSHOT,
+        }));
+        let rearm = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![
+                (Key::from(vec![1]), Value::from(vec![1, 2, 3])),
+                (Key::from(vec![2]), Value::from(vec![1, 2, 3])),
+            ],
+            next_start_after: None,
+        }));
+        assert!(rearm.is_empty());
+        assert_eq!(operation.finalize(), Ok(Some(DELIVERY_RETRY_AFTER)));
+    }
+
+    #[test]
+    fn storage_errors_retry() {
+        let mut snapshot = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        snapshot.start();
+        snapshot.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(snapshot.finalize(), Ok(Some(DELIVERY_RETRY_AFTER)));
+
+        let mut page = started();
+        let effects = page.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: SNAPSHOT
+            })]
+        );
+        page.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: SNAPSHOT,
+        }));
+        assert_eq!(page.finalize(), Ok(Some(DELIVERY_RETRY_AFTER)));
+    }
+
+    #[test]
+    fn no_transport_retries() {
+        let mut operation = DrainOutboxOperation::new(None, NOW_MS);
+        assert!(operation.start().is_empty());
+        assert_eq!(operation.finalize(), Ok(Some(DELIVERY_RETRY_AFTER)));
+    }
+
+    #[test]
+    fn unexpected_events_fail() {
+        let expected = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        let refusals = rejects_events(started, sample_events, expected);
+        assert!(!refusals.is_empty());
+        for (_, effects, _) in refusals {
+            assert_eq!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::AbortTransaction {
+                    txn_id: SNAPSHOT
+                })]
+            );
+        }
+    }
+
+    #[test]
+    fn abort_per_phase() {
+        let mut fresh = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        fresh.start();
+        check_abort(&mut fresh, &[]);
+        check_abort(
+            &mut started(),
+            &[Effect::Storage(StorageEffect::AbortTransaction {
+                txn_id: SNAPSHOT,
+            })],
+        );
+    }
+
+    #[test]
+    fn unfinished_drain_fails() {
+        rejects_finalize(started());
+        rejects_finalize(RestoreOutboxOperation::probe());
+    }
+
+    #[test]
+    fn restore_arms_pending() {
+        let row = (Key::from(vec![1]), Value::from(vec![1]));
+        let arm = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        });
+        let mut shorten = RestoreOutboxOperation::shorten(Duration::ZERO);
+        check_trace(
+            &mut shorten,
+            &[Effect::Storage(StorageEffect::Iter {
+                key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::IterResult {
+                        values: vec![row],
+                        next_start_after: None,
+                    }),
+                    vec![arm],
+                ),
+                (
+                    Event::Task(TaskEvent::TimerScheduled {
+                        key: TaskKey::DrainNotificationOutbox,
+                        after: Duration::ZERO,
+                    }),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(shorten.finalize(), Ok(true));
+
+        let mut empty = RestoreOutboxOperation::shorten(Duration::ZERO);
+        empty.start();
+        empty.step(Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        }));
+        assert_eq!(empty.finalize(), Ok(false));
+
+        let mut failed = RestoreOutboxOperation::probe();
+        failed.start();
+        failed.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert!(failed.finalize().is_err());
+    }
+}
