@@ -4,17 +4,19 @@
 
 use std::collections::VecDeque;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_INDEX_KEYSPACE, UPDATED_INDEX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::storage_entries::{metadata_document_key, parse_updated_key, updated_index_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::metadata::call_results::{page_rows, read_values};
 
 /// Storage rows read per index page.
 pub(crate) const INDEX_SCAN_BATCH: usize = 256;
@@ -22,6 +24,32 @@ pub(crate) const INDEX_SCAN_BATCH: usize = 256;
 pub const SWEEP_SCAN_LIMIT: usize = 4_096;
 /// Stale keys per delete batch.
 const SWEEP_DELETE_BATCH: usize = 128;
+
+/// One page of the timestamp index from `start`. The scan may start at a key, which a
+/// page call cannot express, so it goes out as an effect.
+pub(crate) fn scan_call(start: IterStart) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
+        key_space: UPDATED_INDEX_KEYSPACE.to_string(),
+        prefix: None,
+        start: Some(start),
+        limit: INDEX_SCAN_BATCH,
+        txn_id: None,
+    })))
+}
+
+/// The registry record reads of `documents`, in order.
+pub(crate) fn records_call(documents: impl IntoIterator<Item = Ulid>) -> IoCall {
+    let reads = documents
+        .into_iter()
+        .map(|document_id| {
+            (
+                DOCUMENT_INDEX_KEYSPACE.to_string(),
+                metadata_document_key(document_id),
+            )
+        })
+        .collect();
+    IoCall::Read(reads)
+}
 
 /// One bounded sweep pass: how many stale keys it deleted and where to resume.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,38 +64,31 @@ pub enum SweepError {
     Storage(#[from] StorageError),
     #[error("a timestamp index key or registry record does not decode: {0}")]
     Decode(String),
-    #[error("unexpected event while {state}: got {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("the timestamp index sweep did not finish")]
-    Unfinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for SweepError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq)]
 enum SweepState {
-    Init,
     /// Reading one index page.
     Scan,
     /// Reading the records of the scanned keys, in scan order.
     Records,
     /// Deleting one batch of stale keys.
     Delete,
-    Done,
 }
 
-impl SweepState {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Init => "starting",
-            Self::Scan => "reading an index page",
-            Self::Records => "reading registry records",
-            Self::Delete => "deleting stale keys",
-            Self::Done => "finished",
-        }
-    }
-}
+type SweepTurn = Result<Next<SweepPass>, SweepError>;
 
 /// Deletes index keys whose record moved to a newer datestamp or was deleted, at most
 /// `scan_limit` keys per pass. Racing a concurrent write is benign: the writer re-adds the
@@ -89,7 +110,6 @@ pub struct TimestampSweepOperation {
     finishing: bool,
     deleted: usize,
     state: SweepState,
-    output: Option<Result<SweepPass, SweepError>>,
 }
 
 impl TimestampSweepOperation {
@@ -110,29 +130,16 @@ impl TimestampSweepOperation {
             batches: VecDeque::new(),
             finishing: false,
             deleted: 0,
-            state: SweepState::Init,
-            output: None,
+            state: SweepState::Scan,
         }
     }
 
-    fn scan(&mut self, start: IterStart) -> Effects {
+    fn scan(&mut self, start: IterStart) -> SweepTurn {
         self.state = SweepState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPDATED_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: Some(start),
-            limit: INDEX_SCAN_BATCH,
-            txn_id: None,
-        })]
+        Ok(Next::Call(scan_call(start)))
     }
 
-    fn fail(&mut self, error: SweepError) -> Effects {
-        self.state = SweepState::Done;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn scanned_page(&mut self, entries: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+    fn scanned_page(&mut self, entries: Vec<(Key, Value)>, next: Option<Key>) -> SweepTurn {
         // An empty page ends the scan and keeps the last scanned key as the resume point.
         if entries.is_empty() {
             return self.end_pass();
@@ -140,10 +147,8 @@ impl TimestampSweepOperation {
         let mut page = Vec::new();
         let mut budget_spent = false;
         for (key, _) in entries {
-            let (updated_at_ms, document_id) = match parse_updated_key(key.as_ref()) {
-                Ok(parsed) => parsed,
-                Err(error) => return self.fail(SweepError::Decode(error.to_string())),
-            };
+            let (updated_at_ms, document_id) = parse_updated_key(key.as_ref())
+                .map_err(|error| SweepError::Decode(error.to_string()))?;
             self.scanned += 1;
             self.resume = Some(key.clone());
             page.push((key, updated_at_ms, document_id));
@@ -160,43 +165,29 @@ impl TimestampSweepOperation {
                 None
             }
         };
-        let reads = page
-            .iter()
-            .map(|(_, _, document_id)| {
-                (
-                    DOCUMENT_INDEX_KEYSPACE.to_string(),
-                    metadata_document_key(*document_id),
-                )
-            })
-            .collect();
+        let call = records_call(page.iter().map(|(_, _, document_id)| *document_id));
         self.page = page
             .into_iter()
             .map(|(key, updated_at_ms, _)| (key, updated_at_ms))
             .collect();
         self.state = SweepState::Records;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+        Ok(Next::Call(call))
     }
 
-    fn read_records(&mut self, values: Vec<(Key, Option<Value>)>) -> Effects {
+    fn read_records(&mut self, values: Vec<Option<Value>>) -> SweepTurn {
         if values.len() != self.page.len() {
-            return self.fail(SweepError::Decode(format!(
+            return Err(SweepError::Decode(format!(
                 "{} records answered for {} index keys",
                 values.len(),
                 self.page.len()
             )));
         }
-        for ((key, updated_at_ms), (_, value)) in
-            std::mem::take(&mut self.page).into_iter().zip(values)
+        for ((key, updated_at_ms), value) in std::mem::take(&mut self.page).into_iter().zip(values)
         {
-            let record =
-                match value.map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes)) {
-                    Some(Ok(record)) => Some(record),
-                    Some(Err(error)) => return self.fail(SweepError::Decode(error.to_string())),
-                    None => None,
-                };
+            let record = value
+                .map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes))
+                .transpose()
+                .map_err(|error| SweepError::Decode(error.to_string()))?;
             if !record.is_some_and(|record| record.updated_at_ms == updated_at_ms) {
                 self.stale.push(key);
                 if self.stale.len() >= SWEEP_DELETE_BATCH {
@@ -214,7 +205,7 @@ impl TimestampSweepOperation {
     }
 
     /// Sends the next full delete batch, or continues the scan at `next`.
-    fn next_batch_or(&mut self, next: IterStart) -> Effects {
+    fn next_batch_or(&mut self, next: IterStart) -> SweepTurn {
         match self.batches.pop_front() {
             Some(batch) => {
                 self.after_page = Some(next);
@@ -224,7 +215,7 @@ impl TimestampSweepOperation {
         }
     }
 
-    fn end_pass(&mut self) -> Effects {
+    fn end_pass(&mut self) -> SweepTurn {
         self.finishing = true;
         let rest = std::mem::take(&mut self.stale);
         if !rest.is_empty() {
@@ -236,20 +227,17 @@ impl TimestampSweepOperation {
         }
     }
 
-    fn delete(&mut self, batch: Vec<Key>) -> Effects {
+    fn delete(&mut self, batch: Vec<Key>) -> SweepTurn {
         self.state = SweepState::Delete;
         self.deleted += batch.len();
         let deletes = batch
             .into_iter()
             .map(|key| (UPDATED_INDEX_KEYSPACE.to_string(), key))
             .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn deleted_batch(&mut self) -> Effects {
+    fn deleted_batch(&mut self) -> SweepTurn {
         if let Some(batch) = self.batches.pop_front() {
             return self.delete(batch);
         }
@@ -259,75 +247,42 @@ impl TimestampSweepOperation {
         }
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = SweepState::Done;
-        self.output = Some(Ok(SweepPass {
+    fn finish(&mut self) -> SweepTurn {
+        Ok(Next::Done(SweepPass {
             deleted: self.deleted,
             next_after: self.resume.take(),
-        }));
-        smallvec![]
+        }))
     }
 }
 
-impl EffectOperation for TimestampSweepOperation {
+impl Operation for TimestampSweepOperation {
     type Output = SweepPass;
     type Error = SweepError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> SweepTurn {
         let start = self.start.clone();
         self.scan(start)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let running = !matches!(self.state, SweepState::Init | SweepState::Done);
-        match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if self.state == SweepState::Scan => self.scanned_page(values, next_start_after),
-            Event::Storage(StorageEvent::BatchReadResult { values })
-                if self.state == SweepState::Records =>
-            {
-                self.read_records(values)
+    fn next(&mut self, result: IoResult) -> SweepTurn {
+        match self.state {
+            SweepState::Scan => {
+                let (rows, next) = page_rows(result)?;
+                self.scanned_page(rows, next)
             }
-            Event::Storage(StorageEvent::BatchDeleteResult { .. })
-                if self.state == SweepState::Delete =>
-            {
+            SweepState::Records => self.read_records(read_values(result)?),
+            SweepState::Delete => {
+                done(result)?;
                 self.deleted_batch()
             }
-            Event::Storage(StorageEvent::Error { error }) if running => {
-                self.fail(SweepError::Storage(error))
-            }
-            event => {
-                let error = SweepError::UnexpectedEvent {
-                    state: self.state.name(),
-                    got: event.label(),
-                };
-                self.fail(error)
-            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == SweepState::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SweepError::Unfinished))
-    }
-
-    // Every read and delete runs outside a transaction, so nothing is left to clean up.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 pub(crate) mod state_machine_tests {
     use super::*;
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
 
@@ -359,68 +314,33 @@ pub(crate) mod state_machine_tests {
             .into()
     }
 
-    pub(crate) fn scan_effect(start: IterStart) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: UPDATED_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: Some(start),
-            limit: INDEX_SCAN_BATCH,
-            txn_id: None,
-        })
+    pub(crate) fn first_start() -> IterStart {
+        IterStart::At(updated_index_key(0, Ulid::nil()))
     }
 
-    pub(crate) fn reads_effect(documents: &[Ulid]) -> Effect {
-        Effect::Storage(StorageEffect::BatchRead {
-            reads: documents
-                .iter()
-                .map(|document_id| {
-                    (
-                        DOCUMENT_INDEX_KEYSPACE.to_string(),
-                        metadata_document_key(*document_id),
-                    )
-                })
-                .collect(),
-            txn_id: None,
-        })
-    }
-
-    fn delete_effect(keys: &[Key]) -> Effect {
-        Effect::Storage(StorageEffect::BatchDelete {
-            deletes: keys
-                .iter()
-                .map(|key| (UPDATED_INDEX_KEYSPACE.to_string(), key.clone()))
-                .collect(),
-            txn_id: None,
-        })
-    }
-
-    pub(crate) fn page(keys: &[Key], next: Option<Key>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
+    /// An index page answer with `keys`, values unused.
+    pub(crate) fn page(keys: &[Key], next: Option<Key>) -> IoResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
             values: keys
                 .iter()
                 .map(|key| (key.clone(), Vec::<u8>::new().into()))
                 .collect(),
             next_start_after: next,
-        })
+        })))
     }
 
-    pub(crate) fn records(values: Vec<Option<Value>>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: values
-                .into_iter()
-                .map(|value| (Vec::<u8>::new().into(), value))
-                .collect(),
-        })
+    fn delete_call(keys: &[Key]) -> SweepTurn {
+        let deletes = keys
+            .iter()
+            .map(|key| (UPDATED_INDEX_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn deleted() -> Event {
-        Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        })
-    }
-
-    pub(crate) fn first_start() -> IterStart {
-        IterStart::At(updated_index_key(0, Ulid::nil()))
+    fn scanning(after: Option<Key>, limit: usize) -> TimestampSweepOperation {
+        let mut operation = TimestampSweepOperation::new(after, limit);
+        operation.first().unwrap();
+        operation
     }
 
     #[test]
@@ -433,31 +353,26 @@ pub(crate) mod state_machine_tests {
             updated_index_key(30, gone),
         ];
         let mut operation = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        check_trace(
-            &mut operation,
-            &[scan_effect(first_start())],
-            vec![
-                (
-                    page(&keys, None),
-                    vec![reads_effect(&[current, moved, gone])],
-                ),
-                (
-                    records(vec![
-                        Some(record_bytes(current, 10)),
-                        Some(record_bytes(moved, 99)),
-                        None,
-                    ]),
-                    vec![delete_effect(&keys[1..])],
-                ),
-                (deleted(), vec![]),
-            ],
+        assert_eq!(operation.first(), Ok(Next::Call(scan_call(first_start()))));
+        assert_eq!(
+            operation.next(page(&keys, None)),
+            Ok(Next::Call(records_call([current, moved, gone])))
+        );
+        let values = vec![
+            Some(record_bytes(current, 10)),
+            Some(record_bytes(moved, 99)),
+            None,
+        ];
+        assert_eq!(
+            operation.next(IoResult::Values(values)),
+            delete_call(&keys[1..])
         );
         assert_eq!(
-            operation.finalize(),
-            Ok(SweepPass {
+            operation.next(IoResult::Done),
+            Ok(Next::Done(SweepPass {
                 deleted: 2,
                 next_after: None,
-            })
+            }))
         );
     }
 
@@ -470,23 +385,20 @@ pub(crate) mod state_machine_tests {
         ];
         let after = Some(keys[1].clone());
         let mut operation = TimestampSweepOperation::new(Some(keys[0].clone()), 1);
-        check_trace(
-            &mut operation,
-            &[scan_effect(IterStart::After(keys[0].clone()))],
-            vec![
-                (
-                    page(&keys[1..], after.clone()),
-                    vec![reads_effect(&[document(2)])],
-                ),
-                (records(vec![Some(record_bytes(document(2), 11))]), vec![]),
-            ],
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(scan_call(IterStart::After(keys[0].clone()))))
         );
         assert_eq!(
-            operation.finalize(),
-            Ok(SweepPass {
+            operation.next(page(&keys[1..], after.clone())),
+            Ok(Next::Call(records_call([document(2)])))
+        );
+        assert_eq!(
+            operation.next(IoResult::Values(vec![Some(record_bytes(document(2), 11))])),
+            Ok(Next::Done(SweepPass {
                 deleted: 0,
                 next_after: after,
-            })
+            }))
         );
     }
 
@@ -501,128 +413,72 @@ pub(crate) mod state_machine_tests {
             .map(|document_id| updated_index_key(5, *document_id))
             .collect::<Vec<_>>();
         let next = keys.last().cloned();
-        let mut operation = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        check_trace(
-            &mut operation,
-            &[scan_effect(first_start())],
-            vec![
-                (page(&keys, next.clone()), vec![reads_effect(&documents)]),
-                (
-                    records(vec![None; documents.len()]),
-                    vec![delete_effect(&keys)],
-                ),
-                (
-                    deleted(),
-                    vec![scan_effect(IterStart::After(next.clone().expect("cursor")))],
-                ),
-                (page(&[], None), vec![]),
-            ],
+        let mut operation = scanning(None, SWEEP_SCAN_LIMIT);
+        assert_eq!(
+            operation.next(page(&keys, next.clone())),
+            Ok(Next::Call(records_call(documents.iter().copied())))
         );
         assert_eq!(
-            operation.finalize(),
-            Ok(SweepPass {
+            operation.next(IoResult::Values(vec![None; documents.len()])),
+            delete_call(&keys)
+        );
+        let after = IterStart::After(next.clone().expect("cursor"));
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Ok(Next::Call(scan_call(after)))
+        );
+        assert_eq!(
+            operation.next(page(&[], None)),
+            Ok(Next::Done(SweepPass {
                 deleted: SWEEP_DELETE_BATCH,
                 next_after: next,
-            })
+            }))
         );
     }
 
     #[test]
     fn storage_errors_fail() {
-        let key = updated_index_key(10, document(1));
-        let error = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        let at_scan = || TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        let at_reads = || {
-            let mut operation = at_scan();
-            operation.start();
-            operation.step(page(std::slice::from_ref(&key), None));
-            operation
-        };
-        let at_delete = || {
-            let mut operation = at_reads();
-            operation.step(records(vec![None]));
-            operation
-        };
-        for mut operation in [
-            {
-                let mut operation = at_scan();
-                operation.start();
-                operation
-            },
-            at_reads(),
-            at_delete(),
-        ] {
-            assert!(operation.step(error()).is_empty());
-            assert_eq!(
-                operation.finalize(),
-                Err(SweepError::Storage(StorageError::Timeout))
-            );
-        }
+        let error = IoResult::Event(Box::new(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        })));
+        assert_eq!(
+            scanning(None, SWEEP_SCAN_LIMIT).next(error),
+            Err(SweepError::Storage(StorageError::Timeout))
+        );
+        assert_eq!(
+            SweepError::from(IoError::Conflict),
+            SweepError::Storage(StorageError::TransactionConflict)
+        );
     }
 
     #[test]
     fn broken_rows_fail() {
-        let mut bad_key = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        bad_key.start();
-        bad_key.step(page(&[vec![1u8].into()], None));
-        assert!(matches!(bad_key.finalize(), Err(SweepError::Decode(_))));
+        let bad_key = scanning(None, SWEEP_SCAN_LIMIT).next(page(&[vec![1u8].into()], None));
+        assert!(matches!(bad_key, Err(SweepError::Decode(_))));
 
         let key = updated_index_key(10, document(1));
-        let mut bad_record = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        bad_record.start();
-        bad_record.step(page(std::slice::from_ref(&key), None));
-        bad_record.step(records(vec![Some(vec![0xff].into())]));
-        assert!(matches!(bad_record.finalize(), Err(SweepError::Decode(_))));
-
-        let mut short = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        short.start();
-        short.step(page(std::slice::from_ref(&key), None));
-        short.step(records(Vec::new()));
-        assert!(matches!(short.finalize(), Err(SweepError::Decode(_))));
-    }
-
-    #[test]
-    fn rejects_other_events() {
-        let scanning = || {
-            let mut operation = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-            operation.start();
-            operation
-        };
-        let accepted = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (_, effects, error) in rejects_events(scanning, sample_events, accepted) {
-            assert!(effects.is_empty());
-            assert!(matches!(error, SweepError::UnexpectedEvent { .. }));
-        }
-        let mut idle = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        idle.step(page(&[], None));
+        let mut bad_record = scanning(None, SWEEP_SCAN_LIMIT);
+        bad_record
+            .next(page(std::slice::from_ref(&key), None))
+            .unwrap();
         assert!(matches!(
-            idle.finalize(),
-            Err(SweepError::UnexpectedEvent { .. })
+            bad_record.next(IoResult::Values(vec![Some(vec![0xff].into())])),
+            Err(SweepError::Decode(_))
+        ));
+
+        let mut short = scanning(None, SWEEP_SCAN_LIMIT);
+        short.next(page(std::slice::from_ref(&key), None)).unwrap();
+        assert!(matches!(
+            short.next(IoResult::Values(Vec::new())),
+            Err(SweepError::Decode(_))
         ));
     }
 
     #[test]
-    fn abort_cleans_nothing() {
-        let mut operation = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-    }
-
-    #[test]
-    fn finalize_needs_result() {
-        rejects_finalize(TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT));
-        let mut scanning = TimestampSweepOperation::new(None, SWEEP_SCAN_LIMIT);
-        scanning.start();
-        rejects_finalize(scanning);
+    fn wrong_result_fails() {
+        assert!(matches!(
+            scanning(None, SWEEP_SCAN_LIMIT).next(IoResult::Done),
+            Err(SweepError::Io(IoError::Unexpected { .. }))
+        ));
     }
 }
