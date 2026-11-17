@@ -46,6 +46,7 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 
 pub mod attempt;
 pub mod key_wait;
+pub mod list_jobs;
 pub mod mutation;
 pub mod query;
 pub mod remote_wait;

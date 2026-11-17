@@ -2469,7 +2469,7 @@ async fn capacity_not_conflict() {
 // A listing reads the record of an index row that carries none, and a short page ends it.
 #[test]
 fn list_reads_bare_rows() {
-    use super::query::ListJobsOperation;
+    use super::list_jobs::ListJobsOperation;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     let record = queued_record(job_id(1_000));
