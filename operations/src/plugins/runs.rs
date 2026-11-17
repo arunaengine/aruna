@@ -330,67 +330,63 @@ impl Plan for ResolveRun {
     }
 }
 
-/// Removes runs that ended longer than `RUN_RETENTION_MS` ago, each with its intents in one batch.
+/// The runs that ended longer than `RUN_RETENTION_MS` ago and may go, as install and run ids.
 /// A run waiting for a person, for its job's end, or whose calls may have had effects or cannot
 /// be read stays.
-pub(crate) fn prune_runs(now_ms: u64) -> RowsOperation<PruneRuns> {
-    RowsOperation::direct(PruneRuns {
+pub(crate) fn expired_runs(now_ms: u64) -> RowsOperation<ExpiredRuns> {
+    RowsOperation::direct(ExpiredRuns {
         now_ms,
-        phase: PrunePhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
-        pruned: 0,
+        phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
+        prunable: Vec::new(),
     })
 }
 
 #[derive(Debug, PartialEq)]
-pub struct PruneRuns {
+pub struct ExpiredRuns {
     now_ms: u64,
-    phase: PrunePhase,
-    pruned: usize,
+    phase: ExpiredPhase,
+    prunable: Vec<(Ulid, Ulid)>,
 }
 
 #[derive(Debug, PartialEq)]
-enum PrunePhase {
+enum ExpiredPhase {
     Runs(Scan),
     Held(Vec<PluginRun>, Scan),
     /// Reads the intents of the last expired run; the others follow.
     Intents(Vec<PluginRun>, Scan),
-    /// Deletes the last run and its intents.
-    Deleting(Vec<PluginRun>),
+    Done,
 }
 
-impl PruneRuns {
+impl ExpiredRuns {
     /// The intents of the next expired run, or the outcome when none is left.
-    fn next_run(&mut self, runs: Vec<PluginRun>) -> Turn<usize> {
-        match runs.last() {
-            None => Turn::Finish(self.pruned),
-            Some(run) => {
-                let scan = intent_scan(run.run_id);
-                let ask = scan.ask();
-                self.phase = PrunePhase::Intents(runs, scan);
-                Turn::Ask(ask)
-            }
-        }
+    fn next_run(&mut self, runs: Vec<PluginRun>) -> Turn<Vec<(Ulid, Ulid)>> {
+        let Some(run_id) = runs.last().map(|run| run.run_id) else {
+            return Turn::Finish(std::mem::take(&mut self.prunable));
+        };
+        let scan = intent_scan(run_id);
+        let ask = scan.ask();
+        self.phase = ExpiredPhase::Intents(runs, scan);
+        Turn::Ask(ask)
     }
 }
 
-impl Plan for PruneRuns {
-    type Output = usize;
+impl Plan for ExpiredRuns {
+    type Output = Vec<(Ulid, Ulid)>;
     type Error = RunError;
 
-    fn first(&mut self) -> Result<Turn<usize>, RunError> {
+    fn first(&mut self) -> Result<Turn<Self::Output>, RunError> {
         match &self.phase {
-            PrunePhase::Runs(scan) => Ok(Turn::Ask(scan.ask())),
+            ExpiredPhase::Runs(scan) => Ok(Turn::Ask(scan.ask())),
             _ => Err(StoreError("prune started twice".into()).into()),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, RunError> {
-        let phase = std::mem::replace(&mut self.phase, PrunePhase::Deleting(Vec::new()));
-        match phase {
-            PrunePhase::Runs(mut scan) => {
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, RunError> {
+        match std::mem::replace(&mut self.phase, ExpiredPhase::Done) {
+            ExpiredPhase::Runs(mut scan) => {
                 let Some(rows) = scan.take(answer)? else {
                     let ask = scan.ask();
-                    self.phase = PrunePhase::Runs(scan);
+                    self.phase = ExpiredPhase::Runs(scan);
                     return Ok(Turn::Ask(ask));
                 };
                 let mut expired = Vec::new();
@@ -405,13 +401,13 @@ impl Plan for PruneRuns {
                 }
                 let scan = work_scan();
                 let ask = scan.ask();
-                self.phase = PrunePhase::Held(expired, scan);
+                self.phase = ExpiredPhase::Held(expired, scan);
                 Ok(Turn::Ask(ask))
             }
-            PrunePhase::Held(mut expired, mut scan) => {
+            ExpiredPhase::Held(mut expired, mut scan) => {
                 let Some(rows) = scan.take(answer)? else {
                     let ask = scan.ask();
-                    self.phase = PrunePhase::Held(expired, scan);
+                    self.phase = ExpiredPhase::Held(expired, scan);
                     return Ok(Turn::Ask(ask));
                 };
                 let held = held_runs(rows)?;
@@ -419,34 +415,78 @@ impl Plan for PruneRuns {
                 expired.reverse();
                 Ok(self.next_run(expired))
             }
-            PrunePhase::Intents(mut runs, mut scan) => {
+            ExpiredPhase::Intents(mut runs, mut scan) => {
                 let intents = match scan.take(answer) {
                     Ok(None) => {
                         let ask = scan.ask();
-                        self.phase = PrunePhase::Intents(runs, scan);
+                        self.phase = ExpiredPhase::Intents(runs, scan);
                         return Ok(Turn::Ask(ask));
                     }
-                    Ok(Some(intents)) => intents,
-                    Err(_) => {
-                        runs.pop();
-                        return Ok(self.next_run(runs));
-                    }
+                    Ok(Some(intents)) => Some(intents),
+                    Err(_) => None,
                 };
-                let run = runs.last().ok_or(RunError::NotFound)?;
-                if !matches!(first_open(&intents), Ok(None)) {
-                    runs.pop();
-                    return Ok(self.next_run(runs));
+                let run = runs.pop().ok_or(RunError::NotFound)?;
+                if intents.is_some_and(|intents| matches!(first_open(&intents), Ok(None))) {
+                    self.prunable.push((run.install_id, run.run_id));
                 }
-                let mut keys = vec![(PLUGIN_RUNS_KEYSPACE, run_key(run.install_id, run.run_id))];
-                keys.extend(intent_keys(intents));
-                self.phase = PrunePhase::Deleting(runs);
-                Ok(Turn::Ask(Ask::Delete(keys)))
-            }
-            PrunePhase::Deleting(mut runs) => {
-                done(answer)?;
-                runs.pop();
-                self.pruned += 1;
                 Ok(self.next_run(runs))
+            }
+            ExpiredPhase::Done => Err(unexpected(answer).into()),
+        }
+    }
+}
+
+/// Deletes one run record and every intent and stored reply of the run in one transaction.
+pub(crate) fn drop_run((install_id, run_id): (Ulid, Ulid)) -> RowsOperation<DropRun> {
+    RowsOperation::transaction(DropRun {
+        key: run_key(install_id, run_id),
+        intents: intent_scan(run_id),
+        phase: DropPhase::Run,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DropRun {
+    key: Vec<u8>,
+    intents: Scan,
+    phase: DropPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum DropPhase {
+    Run,
+    Intents,
+    Deleting,
+}
+
+impl Plan for DropRun {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(Ask::Delete(vec![(
+            PLUGIN_RUNS_KEYSPACE,
+            self.key.clone(),
+        )])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        match self.phase {
+            DropPhase::Run => {
+                done(answer)?;
+                self.phase = DropPhase::Intents;
+                Ok(Turn::Ask(self.intents.ask()))
+            }
+            DropPhase::Intents => match self.intents.take(answer)? {
+                None => Ok(Turn::Ask(self.intents.ask())),
+                Some(rows) => {
+                    self.phase = DropPhase::Deleting;
+                    Ok(Turn::Ask(Ask::Delete(intent_keys(rows))))
+                }
+            },
+            DropPhase::Deleting => {
+                done(answer)?;
+                Ok(Turn::Finish(()))
             }
         }
     }

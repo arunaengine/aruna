@@ -13,8 +13,9 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::runs::tests::queued;
-use crate::plugins::runs::{admit, list_runs, prune_runs, save_run, unfinished};
+use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
+use crate::plugins::worker::prune_runs;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
 
 /// A created dataset journaled now, and its forward row for `install`.
@@ -202,7 +203,7 @@ async fn dedup_retention() {
     let mut run = runs(&fixture, &install).await.remove(0);
     run.finish(RunState::Succeeded, None, anchor + 7 * DAY);
     drive(save_run(&run).unwrap(), &fixture.ctx).await.unwrap();
-    drive(prune_runs(u64::MAX / 2), &fixture.ctx).await.unwrap();
+    prune_runs(&fixture.ctx, u64::MAX / 2).await.unwrap();
     assert_eq!(
         drive(prune_seen(anchor + 10 * DAY), &fixture.ctx).await,
         Ok(0)

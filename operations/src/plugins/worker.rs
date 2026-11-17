@@ -52,7 +52,9 @@ use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, replay_page, replay_scan};
 use super::rows::{StoreError, decode, page_rows, scan_rows};
-use super::runs::{Ended, RunError, TICK, conclude, prune_runs, read_run, save_run, unfinished};
+use super::runs::{
+    Ended, RunError, TICK, conclude, drop_run, expired_runs, read_run, save_run, unfinished,
+};
 use super::waiting::recheck_waiting;
 use super::work::prune_work;
 use crate::driver::{DriverContext, drive};
@@ -527,6 +529,16 @@ pub(crate) async fn match_journal(
     }
 }
 
+/// Removes the runs that ended longer than the retention ago, each with its intents in one
+/// transaction; answers how many went.
+pub(crate) async fn prune_runs(ctx: &DriverContext, now_ms: u64) -> Result<usize, RunError> {
+    let expired = drive(expired_runs(now_ms), ctx).await?;
+    for ids in &expired {
+        drive(drop_run(*ids), ctx).await?;
+    }
+    Ok(expired.len())
+}
+
 /// Deletes the use audit rows past their retention, a page per transaction; answers how many
 /// records went.
 pub(crate) async fn prune_audit(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
@@ -629,7 +641,7 @@ pub fn spawn_worker(
             }
             if now.saturating_sub(pruned_at) >= PRUNE_MS {
                 pruned_at = now;
-                if let Err(error) = drive(prune_runs(now), &worker.ctx).await {
+                if let Err(error) = prune_runs(&worker.ctx, now).await {
                     warn!(%error, "Could not prune finished plugin runs");
                 }
                 if let Err(error) = drive(prune_journal(now), &worker.ctx).await {

@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use crate::plugins::worker::prune_runs;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
@@ -126,7 +127,7 @@ async fn pruned_runs() {
     let waiting = queued(install, 4);
     drive(admit(waiting.clone()), &ctx).await.unwrap();
     let now = 10 + RUN_RETENTION_MS;
-    assert_eq!(drive(prune_runs(now), &ctx).await.unwrap(), 1);
+    assert_eq!(prune_runs(&ctx, now).await.unwrap(), 1);
     assert_eq!(
         drive(read_run(install, ended[0].run_id), &ctx).await,
         Err(RunError::NotFound)
@@ -211,12 +212,7 @@ async fn keeps_open_calls() {
     drive(save_run(&run).unwrap(), &ctx).await.unwrap();
     let unknown = unknown_row(run.run_id, &Intent::new(0, &[b"x"]), "lost").unwrap();
     drive(write_rows(vec![unknown]), &ctx).await.unwrap();
-    assert_eq!(
-        drive(prune_runs(10 + RUN_RETENTION_MS), &ctx)
-            .await
-            .unwrap(),
-        0
-    );
+    assert_eq!(prune_runs(&ctx, 10 + RUN_RETENTION_MS).await.unwrap(), 0);
     assert!(drive(read_run(install, run.run_id), &ctx).await.is_ok());
 }
 
@@ -300,7 +296,7 @@ async fn resolved_expire() {
     .unwrap();
     assert_eq!(drive(open_intent(run.run_id), &ctx).await.unwrap(), None);
     let later = resolved.finished_ms.unwrap() + RUN_RETENTION_MS;
-    assert_eq!(drive(prune_runs(later), &ctx).await.unwrap(), 1);
+    assert_eq!(prune_runs(&ctx, later).await.unwrap(), 1);
     assert_eq!(
         drive(read_run(install, run.run_id), &ctx).await,
         Err(RunError::NotFound)

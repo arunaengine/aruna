@@ -11,11 +11,12 @@ use serde_json::json;
 use super::*;
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::runs::{list_runs, prune_runs, save_run};
+use crate::plugins::runs::{list_runs, save_run};
 use crate::plugins::submit::start_copy;
 use crate::plugins::submit::tests::{path, ready, request, scope};
 use crate::plugins::work::tests::edit_work;
 use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
+use crate::plugins::worker::prune_runs;
 use crate::s3::object::copy::test::seed_bucket;
 
 /// An install whose version copies and has a `job_finished` trigger, with buckets `in` and `out`.
@@ -114,7 +115,7 @@ async fn holds_failed_runs() {
     assert_eq!(notify(&fixture).await, 0);
     assert!(finish_runs(&fixture, &install).await.is_empty());
     let late = RUN_RETENTION_MS * 3;
-    assert_eq!(drive(prune_runs(late), &fixture.ctx).await.unwrap(), 0);
+    assert_eq!(prune_runs(&fixture.ctx, late).await.unwrap(), 0);
     assert_eq!(drive(prune_work(late), &fixture.ctx).await.unwrap(), 0);
     let row = drive(read_work(install.install_id, work_id), &fixture.ctx)
         .await
