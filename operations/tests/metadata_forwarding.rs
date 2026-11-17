@@ -2,11 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::convergence;
-
 use aruna_core::keys::generate_signing_key;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::NodeId;
@@ -16,7 +13,7 @@ use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision, DocumentTarget,
 };
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -32,7 +29,6 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_secs;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -43,11 +39,12 @@ use aruna_operations::device::inspect_draft::InspectDraftOperation;
 use aruna_operations::device::publish_queue::{
     PUBLISH_PAGE_SIZE, PublishEntry, PublishState, publish_entry,
 };
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
 use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::metadata::AuthToken;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_forward_document,
@@ -56,41 +53,28 @@ use aruna_operations::metadata::create_document::{
 use aruna_operations::metadata::forward::{route_metadata_create, route_metadata_update};
 use aruna_operations::metadata::get_document::load_document_record;
 use aruna_operations::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
-use aruna_operations::metadata::{AuthToken, MetadataHandle};
 use aruna_operations::placement::resolve_shard_holders;
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
 use aruna_operations::sync::document_outbox::read_outbox_record;
-use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::sync::outbox_record::outbox_key;
 use aruna_operations::sync::outbox_record::{new_outbox_record, write_outbox_effect};
-use aruna_operations::tasks::incoming::{OutboxDrainer, start_task_queues};
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
+use aruna_operations::tasks::incoming::OutboxDrainer;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-use convergence::wait_for_convergence;
+use crate::convergence::wait_for_convergence;
+use crate::topology::mesh;
+use crate::topology::{TestNode, spawn_replica, write};
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-    sync_eligible: bool,
-    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
-    /// the node's whole lifetime.
-    _shutdown: aruna_core::shutdown::Shutdown,
-}
 
 /// A User-kind node forwards its create because it holds no bucket.
 #[tokio::test]
@@ -277,7 +261,7 @@ async fn first_record(
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
-        for node in nodes.iter().filter(|node| node.sync_eligible) {
+        for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             if let Some(record) = registry_record(node, document_id).await? {
                 return Ok(record);
             }
@@ -307,7 +291,7 @@ async fn user_forwards_revoke() -> Result<(), Box<dyn std::error::Error>> {
     let hash = bearer_token_hash(&target);
     wait_for_convergence("forwarded revocation did not converge", || async {
         let mut pending = 0;
-        for node in nodes.iter().filter(|node| node.sync_eligible) {
+        for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             let config = drive(
                 GetConfigOperation::new(realm.realm_id),
                 node.context.as_ref(),
@@ -370,7 +354,7 @@ async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
     let own = bearer_token_hash(&scoped_string);
     wait_for_convergence("the scoped self revocation did not converge", || async {
         let mut pending = 0;
-        for node in nodes.iter().filter(|node| node.sync_eligible) {
+        for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             let config = drive(
                 GetConfigOperation::new(realm.realm_id),
                 node.context.as_ref(),
@@ -383,7 +367,7 @@ async fn scoped_revokes_itself() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<usize, Box<dyn std::error::Error>>(pending)
     })
     .await?;
-    for node in nodes.iter().filter(|node| node.sync_eligible) {
+    for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
         let config = drive(
             GetConfigOperation::new(realm.realm_id),
             node.context.as_ref(),
@@ -415,7 +399,7 @@ async fn forwards_group_create() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(authorization.group_id, group.group_id);
     wait_for_convergence("the forwarded group create did not converge", || async {
         let mut pending = 0;
-        for node in nodes.iter().filter(|node| node.sync_eligible) {
+        for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             if drive(
                 GetGroupOperation::new(GetGroupConfig {
                     group_id: group.group_id,
@@ -925,7 +909,7 @@ async fn set_write_policy(
     };
     // Only the sync-eligible nodes are management members, and a realm-config
     // write on any other node is refused before it can diverge.
-    for node in nodes.iter().filter(|node| node.sync_eligible) {
+    for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
         // Replication writes the same document, and losing that transaction is the retryable
         // conflict the route reports as 409; the fixture retries it exactly as a caller would.
         let mut attempts = 0;
@@ -981,7 +965,7 @@ async fn wait_for_group(
     let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     loop {
         let mut pending = false;
-        for node in nodes.iter().filter(|node| node.sync_eligible) {
+        for node in nodes.iter().filter(|node| node.is_sync_eligible()) {
             if !owner_can_write(realm, node, path.clone()).await {
                 pending = true;
             }
@@ -1119,79 +1103,19 @@ async fn build_realm(
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(servers + users);
     for index in 0..(servers + users) {
-        nodes.push(spawn_node(realm.realm_id, index < servers).await?);
+        let mut node = spawn_replica(realm.realm_id, true, true).await?;
+        if index >= servers {
+            node.kind = RealmNodeKind::User {
+                owner: realm.user_id,
+            };
+        }
+        nodes.push(node);
     }
 
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
 
     let config = install_realm_config(realm, &nodes).await?;
     Ok((nodes, config))
-}
-
-async fn spawn_node(
-    realm_id: RealmId,
-    sync_eligible: bool,
-) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-
-    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    initialize_net_holder(
-        context.clone(),
-        aruna_core::structs::execution::job::RoCrateLimits::default(),
-        jobs_runtime.clone(),
-        &shutdown,
-    );
-    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
-
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-        sync_eligible,
-        _shutdown: shutdown,
-    })
 }
 
 async fn install_realm_config(
@@ -1202,14 +1126,7 @@ async fn install_realm_config(
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
     config.seed_default_placement();
     for (band, node) in nodes.iter().enumerate() {
-        let kind = if node.sync_eligible {
-            RealmNodeKind::Management
-        } else {
-            RealmNodeKind::User {
-                owner: realm.user_id,
-            }
-        };
-        config.ensure_node(node.net.node_id(), kind);
+        config.ensure_node(node.net.node_id(), node.kind.clone());
         config.seed_job_control(node.net.node_id(), band as u32);
     }
 
@@ -1276,28 +1193,6 @@ async fn install_realm_config(
     }
 
     Ok(config)
-}
-
-async fn write(
-    node: &TestNode,
-    key_space: &str,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    match node
-        .context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        other => Err(format!("unexpected write event in `{key_space}`: {other:?}").into()),
-    }
 }
 
 async fn shutdown(nodes: Vec<TestNode>) {

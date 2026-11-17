@@ -86,3 +86,8 @@ zip = { workspace = true }
 [[test]]
 name = "integration"
 path = "tests/main.rs"
+
+# Prints workload rates on request (cargo run --release --example measure); never a test.
+[[example]]
+name = "measure"
+test = false

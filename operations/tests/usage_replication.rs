@@ -3,44 +3,31 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::structs::storage::format::Compression;
-use std::sync::Arc;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
-use aruna_core::structs::identity::auth::Actor;
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key, usage_global_key,
     usage_group_key,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::drive;
 use aruna_operations::node::usage_stats::{
     RealmUsageScope, load_realm_usage, publish_usage_snapshots,
 };
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
-use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::convergence;
-use convergence::wait_for_convergence;
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-}
+use crate::convergence::wait_for_convergence;
+use crate::topology::store_realm_config;
+use crate::topology::{TestNode, spawn_replicas};
 
 // Node A's usage counters must become visible in node B's realm-wide aggregate via the real
 // document sync apply path.
@@ -399,68 +386,10 @@ async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
-    }
-
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
+    let nodes = spawn_replicas(*realm_id, count, false, false).await?;
 
     install_realm_config(&nodes, realm_id).await?;
     Ok(nodes)
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
-    let task_handle = TaskHandle::new();
-
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-
-    initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    start_task_queues(
-        context.clone(),
-        task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
-        &shutdown,
-    )
-    .await;
-
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-    })
 }
 
 async fn install_realm_config(
@@ -474,27 +403,7 @@ async fn install_realm_config(
     }
 
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: aruna_core::UserId::nil(*realm_id),
-            realm_id: *realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).

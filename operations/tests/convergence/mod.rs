@@ -4,9 +4,15 @@
 
 #![allow(dead_code)]
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::types::GroupId;
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::metadata::get_document::GetDocumentOperation;
+use aruna_operations::metadata::materialization_queue::materialization_jobs_exist;
 use tokio::time::{Instant, sleep, timeout};
+use ulid::Ulid;
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -50,6 +56,67 @@ where
         sleep(poll_interval).await;
         poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
+}
+
+/// Polls every node until each document reads back. Fails only when a whole
+/// lost-progress window passes without one more document becoming visible.
+pub async fn wait_for_visibility(
+    contexts: &[Arc<DriverContext>],
+    pairs: &[(GroupId, Ulid)],
+    poll_interval: Duration,
+) -> Result<(), String> {
+    let mut remaining: Vec<Vec<(GroupId, Ulid)>> =
+        contexts.iter().map(|_| pairs.to_vec()).collect();
+    let mut best = usize::MAX;
+    let mut deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+
+    loop {
+        for (context, missing) in contexts.iter().zip(remaining.iter_mut()) {
+            let mut still_missing = Vec::new();
+            for &(group_id, document_id) in missing.iter() {
+                if drive(
+                    GetDocumentOperation::new(group_id, document_id),
+                    context.as_ref(),
+                )
+                .await
+                .is_err()
+                {
+                    still_missing.push((group_id, document_id));
+                }
+            }
+            *missing = still_missing;
+        }
+        let pending: usize = remaining.iter().map(Vec::len).sum();
+        if pending == 0 {
+            return Ok(());
+        }
+        if pending < best {
+            best = pending;
+            deadline = Instant::now() + NO_PROGRESS_TIMEOUT;
+        }
+        if Instant::now() >= deadline {
+            let counts: Vec<usize> = remaining.iter().map(Vec::len).collect();
+            return Err(format!("visibility stalled; missing per node: {counts:?}"));
+        }
+        sleep(poll_interval).await;
+    }
+}
+
+/// Waits until no node has a metadata materialization job left.
+pub async fn wait_empty_queues(contexts: &[Arc<DriverContext>]) -> Result<(), String> {
+    wait_for_convergence("materialization queues never drained", || async {
+        let mut busy = 0usize;
+        for context in contexts {
+            if materialization_jobs_exist(&context.storage_handle)
+                .await
+                .map_err(|error| format!("materialization probe failed: {error:?}"))?
+            {
+                busy += 1;
+            }
+        }
+        Ok(busy)
+    })
+    .await
 }
 
 /// Bounds a one-shot harness operation that could block forever under starvation.

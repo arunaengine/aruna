@@ -2,56 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
 use aruna_core::StructuredId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::{NodeId, UserId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::realm::announce_presence::{
-    AnnouncePresenceConfig, AnnouncePresenceOperation,
-};
-use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::shard::assemble_shard_manifest;
 use aruna_operations::shard::client::fetch_shard_manifest;
 use aruna_operations::shard::verify::{is_shard_verified, verify_held_shards};
-use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
-use aruna_tasks::TaskHandle;
-use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::convergence;
-use convergence::wait_for_convergence;
-
-struct TestNode {
-    _temp_dir: TempDir,
-    net: NetHandle,
-    context: Arc<DriverContext>,
-    /// Keeps the inbound handler's scheduled tasks tied to a live owner for
-    /// the node's whole lifetime.
-    _shutdown: aruna_core::shutdown::Shutdown,
-}
+use crate::convergence::wait_for_convergence;
+use crate::topology::store_realm_config;
+use crate::topology::{
+    TestNode, announce_nodes, install_default_config, spawn_replica, spawn_replicas,
+};
 
 #[tokio::test]
 async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([121u8; 32]);
     let (nodes, config) = build_realm_nodes(&realm_id, 2).await?;
     // An outsider node that is not in the realm config at all.
-    let outsider = spawn_node(realm_id).await?;
+    let outsider = spawn_replica(realm_id, true, true).await?;
     outsider
         .net
         .add_peer_addr(nodes[0].net.endpoint_addr())
@@ -237,22 +214,7 @@ async fn build_meshed_nodes(
     realm_id: RealmId,
     count: usize,
 ) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
-        nodes.push(spawn_node(realm_id).await?);
-    }
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
+    let nodes = spawn_replicas(realm_id, count, true, true).await?;
     Ok(nodes)
 }
 
@@ -279,27 +241,7 @@ async fn install_unplaced_config(
         config.seed_job_control(node.net.node_id(), band as u32);
     }
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, &config).await?;
     }
     Ok(config)
 }
@@ -371,147 +313,10 @@ async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
 ) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
-    let mut nodes = Vec::with_capacity(count);
-    for _ in 0..count {
-        nodes.push(spawn_node(*realm_id).await?);
-    }
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
-    for node in &nodes {
-        drive(
-            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                realm_id: *realm_id,
-                node_id: node.net.node_id(),
-                schedule_refresh: true,
-            }),
-            node.context.as_ref(),
-        )
-        .await?;
-    }
-    wait_node_convergence(&nodes, realm_id).await?;
-    let config = install_realm_config(&nodes, realm_id).await?;
+    let nodes = spawn_replicas(*realm_id, count, true, true).await?;
+    announce_nodes(&nodes, realm_id).await?;
+    let config = install_default_config(&nodes, realm_id).await?;
     Ok((nodes, config))
-}
-
-async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
-    let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage.clone(),
-    )
-    .await?;
-    let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
-        temp_dir.path().join("metadata"),
-        net.node_id(),
-        storage.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )?;
-    let context = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(task_handle.clone()),
-        compute_handle: None,
-    });
-    let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-    let shutdown = aruna_core::shutdown::Shutdown::new();
-    initialize_net_holder(
-        context.clone(),
-        aruna_core::structs::execution::job::RoCrateLimits::default(),
-        jobs_runtime.clone(),
-        &shutdown,
-    );
-    start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
-    Ok(TestNode {
-        _temp_dir: temp_dir,
-        net,
-        context,
-        _shutdown: shutdown,
-    })
-}
-
-async fn install_realm_config(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
-    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
-    config.seed_default_placement();
-    for (band, node) in nodes.iter().enumerate() {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-        config.seed_job_control(node.net.node_id(), band as u32);
-    }
-    for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(*realm_id),
-            realm_id: *realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(&config).await?;
-    }
-    for node in nodes {
-        aruna_operations::placement::process_placements::process_shard_placements(
-            &node.context,
-            *realm_id,
-            node.net.node_id(),
-        )
-        .await;
-    }
-    Ok(config)
-}
-
-async fn wait_node_convergence(
-    nodes: &[TestNode],
-    realm_id: &RealmId,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let expected: std::collections::HashSet<NodeId> =
-        nodes.iter().map(|node| node.net.node_id()).collect();
-    wait_for_convergence("realm nodes did not converge", || async {
-        let mut pending = 0;
-        for node in nodes {
-            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
-                Ok(realm_nodes) if realm_nodes == expected => {}
-                _ => pending += 1,
-            }
-        }
-        Ok(pending)
-    })
-    .await
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

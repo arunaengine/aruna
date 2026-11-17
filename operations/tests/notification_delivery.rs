@@ -9,14 +9,13 @@ use aruna_core::document::DocumentEffect;
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::realm_vault::RealmSealKey;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationOutboxRecord, NotificationRecord,
 };
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::WebhookSubscription;
-use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
@@ -44,8 +43,10 @@ use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::convergence;
-use convergence::wait_for_convergence;
+use crate::convergence::wait_for_convergence;
+use crate::topology::mesh;
+use crate::topology::store_realm_config;
+use crate::topology::{realm_config_for, user_with_holder};
 
 const LIST_LIMIT: u32 = LIST_MAX_LIMIT as u32;
 
@@ -64,7 +65,7 @@ struct TestNode {
 async fn notification_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([12u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -103,10 +104,10 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     nodes.push(spawn_with_secret(realm_id, secrets[0]).await?);
     nodes.push(spawn_with_secret(realm_id, secrets[1]).await?);
     nodes.push(respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?);
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, realm_id).await?;
 
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -131,7 +132,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     nodes[2] = respawn_with_storage(realm_id, secrets[2], holder_storage.clone()).await?;
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, realm_id).await?;
     drain_notification_outbox(nodes[0].context.clone()).await;
 
@@ -155,7 +156,7 @@ async fn delivery_retries_outage() -> Result<(), Box<dyn std::error::Error>> {
 async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([33u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     let record = added_group_record(recipient, realm_id, unix_timestamp_millis());
@@ -206,7 +207,7 @@ async fn duplicate_delivery_idempotent() -> Result<(), Box<dyn std::error::Error
 async fn unread_crosses_nodes() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([44u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
 
@@ -267,7 +268,7 @@ async fn placement_converges() -> Result<(), Box<dyn std::error::Error>> {
 async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([66u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
-    let config = realm_config_for(&nodes, realm_id);
+    let config = realm_config_for(nodes.iter().map(|node| &node.net), realm_id);
     let holder = nodes[2].net.node_id();
     let recipient = user_with_holder(&config, holder, realm_id);
     // Neither the emitter nor the holder: every op it serves must proxy one hop
@@ -378,30 +379,6 @@ fn added_group_record(
     )
 }
 
-fn realm_config_for(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-    config.seed_default_placement();
-    for node in nodes {
-        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
-    }
-    config
-}
-
-fn user_with_holder(
-    realm_config: &RealmConfigDocument,
-    holder: NodeId,
-    realm_id: RealmId,
-) -> UserId {
-    for _ in 0..10_000 {
-        let candidate = UserId::local(Ulid::generate(), realm_id);
-        if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
-        {
-            return candidate;
-        }
-    }
-    panic!("no user hashed to holder {holder} within the sampling bound");
-}
-
 async fn emit_on(
     node: &TestNode,
     records: Vec<NotificationRecord>,
@@ -468,24 +445,9 @@ async fn build_realm_nodes(
     for _ in 0..count {
         nodes.push(spawn_node(*realm_id).await?);
     }
-    mesh_nodes(&nodes).await;
+    mesh(nodes.iter().map(|node| &node.net)).await;
     install_realm_config(&nodes, *realm_id).await?;
     Ok(nodes)
-}
-
-async fn mesh_nodes(nodes: &[TestNode]) {
-    for i in 0..nodes.len() {
-        for j in (i + 1)..nodes.len() {
-            nodes[i]
-                .net
-                .add_peer_addr(nodes[j].net.endpoint_addr())
-                .await;
-            nodes[j]
-                .net
-                .add_peer_addr(nodes[i].net.endpoint_addr())
-                .await;
-        }
-    }
 }
 
 async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::Error>> {
@@ -584,7 +546,11 @@ async fn install_realm_config(
     nodes: &[TestNode],
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    install_config(nodes, &realm_config_for(nodes, realm_id)).await
+    install_config(
+        nodes,
+        &realm_config_for(nodes.iter().map(|node| &node.net), realm_id),
+    )
+    .await
 }
 
 async fn install_config(
@@ -593,27 +559,7 @@ async fn install_config(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = config.realm_id;
     for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: UserId::nil(realm_id),
-            realm_id,
-        };
-        let bytes = config.to_bytes(&actor)?;
-        match node
-            .context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Write {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: (*realm_id.as_bytes()).into(),
-                value: bytes.into(),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => return Err(format!("unexpected realm config write event: {other:?}").into()),
-        }
-        node.net.refresh_document_peers(config).await?;
+        store_realm_config(&node.net, &node.context, realm_id, config).await?;
     }
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
@@ -671,7 +617,7 @@ impl SettingRealm {
             let node = realm.start(index).await?;
             realm.nodes.push(node);
         }
-        mesh_nodes(&realm.nodes).await;
+        mesh(realm.nodes.iter().map(|node| &node.net)).await;
         install_config(&realm.nodes, &realm.config()).await?;
         // Onboarding admits every infrastructure node to the shared realm topics; here S mints
         // the topic and the managers pull it from S.

@@ -9,14 +9,12 @@ use aruna_core::StructuredId;
 use aruna_core::document::shard_topic_id;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::transition::TransitionLimits;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::placement::transition::preview_transition;
 use aruna_operations::realm::mutate_placement::RealmPlacementMutation;
-use ulid::Ulid;
 
-use topology::{TestNode, TestResult, Topology, wait_until};
+use crate::topology::document_present;
+use topology::{TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 6;
 const USER_NODES: usize = 1;
@@ -127,13 +125,4 @@ async fn turn_over(
         "preview did not equal outcome"
     );
     Ok(holders)
-}
-
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
-    drive(
-        GetDocumentOperation::new(group_id, document_id),
-        node.context.as_ref(),
-    )
-    .await
-    .is_ok()
 }

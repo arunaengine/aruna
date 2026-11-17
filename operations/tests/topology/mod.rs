@@ -8,7 +8,9 @@ use crate::convergence;
 
 use aruna_core::keys::generate_signing_key;
 use std::collections::{BTreeMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aruna_blob::blob::BlobHandler;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
@@ -22,6 +24,8 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::reducer::AdminDocumentState;
+use aruna_core::shutdown::Shutdown;
+use aruna_core::structs::execution::job::RoCrateLimits;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, TokenClaims};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
@@ -32,7 +36,8 @@ use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, group_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::{NodeId, UserId};
+use aruna_core::types::GroupId;
+use aruna_core::{NodeId, StructuredId, UserId};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
@@ -40,11 +45,14 @@ use aruna_operations::auth::check_permissions::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::groups::add_member::{AddUserInput, AddUserOperation};
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload,
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_operations::metadata::projector::replay_event_log;
+use aruna_operations::metadata::get_document::GetDocumentOperation;
+use aruna_operations::metadata::projector::{project_logged_events, replay_event_log};
 use aruna_operations::metadata::{AuthToken, MetadataHandle};
+use aruna_operations::notifications::placement::resolve_inbox_holder;
 use aruna_operations::placement::expand_placement::expand_realm_placement;
 use aruna_operations::placement::transition::{TransitionRequest, plan_transition};
 use aruna_operations::placement::{
@@ -54,10 +62,12 @@ use aruna_operations::placement::{
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
+use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::realm::get_nodes::GetNodesOperation;
 use aruna_operations::realm::mutate_placement::{
     MutatePlacementConfig, RealmPlacementMutation, drive_placement_mutation,
 };
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_operations::sync::incoming::{initialize_incoming_fixture, initialize_net_holder};
 use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -73,7 +83,11 @@ pub use convergence::{hang_cap, wait_for_convergence};
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// Error of helpers whose futures run on spawned tasks or other runtimes.
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 const TOPOLOGY_SHARD_COUNT: u32 = 8;
+const PROJECTION_BATCH: usize = 32;
 
 /// Two stable locations, so `distinct_locations` strategies stay satisfiable
 /// and location ranking is exercised rather than degenerate.
@@ -81,10 +95,13 @@ pub const LOCATIONS: [&str; 2] = ["eu", "us"];
 pub const NODE_WEIGHT: u32 = 100;
 
 pub struct TestNode {
-    _temp_dir: TempDir,
+    /// The folder the node owns; a restart test takes it to keep the folder alive.
+    pub temp_dir: Option<TempDir>,
     pub net: NetHandle,
     pub context: Arc<DriverContext>,
     pub kind: RealmNodeKind,
+    /// Owner of the production net holder and task queues, when the node installed them.
+    pub shutdown: Option<Shutdown>,
 }
 
 impl TestNode {
@@ -156,7 +173,7 @@ impl Topology {
             };
             nodes.push(spawn_node(realm_id, kind).await?);
         }
-        mesh(&nodes).await;
+        mesh(nodes.iter().map(|node| &node.net)).await;
 
         for node in &nodes {
             hang_cap(
@@ -1034,24 +1051,21 @@ pub async fn spawn_node(realm_id: RealmId, kind: RealmNodeKind) -> TestResult<Te
     .await;
 
     Ok(TestNode {
-        _temp_dir: temp_dir,
+        temp_dir: Some(temp_dir),
         net,
         context,
         kind,
+        shutdown: None,
     })
 }
 
-async fn mesh(nodes: &[TestNode]) {
-    for left in 0..nodes.len() {
-        for right in (left + 1)..nodes.len() {
-            nodes[left]
-                .net
-                .add_peer_addr(nodes[right].net.endpoint_addr())
-                .await;
-            nodes[right]
-                .net
-                .add_peer_addr(nodes[left].net.endpoint_addr())
-                .await;
+/// Adds the address of every net to every other net, so the nodes need no discovery.
+pub async fn mesh<'a>(nets: impl IntoIterator<Item = &'a NetHandle>) {
+    let nets: Vec<&NetHandle> = nets.into_iter().collect();
+    for left in 0..nets.len() {
+        for right in (left + 1)..nets.len() {
+            nets[left].add_peer_addr(nets[right].endpoint_addr()).await;
+            nets[right].add_peer_addr(nets[left].endpoint_addr()).await;
         }
     }
 }
@@ -1432,6 +1446,41 @@ pub async fn read_group_record(node: &TestNode, group_id: Ulid) -> TestResult<Op
     }
 }
 
+/// Stores `config` as the realm config row of one node, encoded as that node with
+/// the nil user, and points its document sync at the configured peers.
+pub async fn store_realm_config(
+    net: &NetHandle,
+    context: &DriverContext,
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), String> {
+    let actor = Actor {
+        node_id: net.node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    let bytes = config
+        .to_bytes(&actor)
+        .map_err(|error| format!("realm config encoding failed: {error}"))?;
+    match context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: (*realm_id.as_bytes()).into(),
+            value: bytes.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => return Err(format!("unexpected realm config write event: {other:?}")),
+    }
+    net.refresh_document_peers(config)
+        .await
+        .map_err(|error| format!("document peer refresh failed: {error}"))?;
+    Ok(())
+}
+
 pub async fn read_realm_config(
     node: &TestNode,
     realm_id: RealmId,
@@ -1465,4 +1514,579 @@ where
 {
     let context = format!("{label} did not converge on node {node_id}");
     wait_for_convergence(&context, || async { Ok(usize::from(!predicate().await)) }).await
+}
+
+/// Turns on span logs for the load tests and the measure example when `RUST_LOG` is set.
+pub fn init_logging() {
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .try_init();
+    }
+}
+
+pub fn make_runtime() -> Result<tokio::runtime::Runtime, BoxError> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?)
+}
+
+/// Spawns `count` meshed management nodes with production storage pools, waits until
+/// every node sees all of them, then installs the default realm config on each.
+pub async fn build_realm_nodes(
+    realm_id: &RealmId,
+    count: usize,
+) -> Result<Vec<TestNode>, BoxError> {
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        nodes.push(spawn_load_node(*realm_id, false).await?);
+    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
+    announce_nodes(&nodes, realm_id).await?;
+    install_default_config(&nodes, realm_id).await?;
+    Ok(nodes)
+}
+
+/// A load node in its own temporary folder.
+pub async fn spawn_load_node(realm_id: RealmId, hold_shutdown: bool) -> Result<TestNode, BoxError> {
+    let temp_dir = tempfile::tempdir()?;
+    let dir = temp_dir.path().to_path_buf();
+    let mut node = spawn_node_with(realm_id, None, dir, hold_shutdown).await?;
+    node.temp_dir = Some(temp_dir);
+    Ok(node)
+}
+
+/// A management node on `dir` with production storage pools, a metadata store and running
+/// task queues; a fixed `secret_key` lets a restart keep the node id. With `hold_shutdown`
+/// the node installs the production net holder under a `Shutdown` it keeps for draining.
+pub async fn spawn_node_with(
+    realm_id: RealmId,
+    secret_key: Option<iroh::SecretKey>,
+    dir: PathBuf,
+    hold_shutdown: bool,
+) -> Result<TestNode, BoxError> {
+    let fjall_dir = dir.join("fjall");
+    std::fs::create_dir_all(&fjall_dir)?;
+    let storage = FjallStorage::open(fjall_dir.to_str().ok_or("invalid storage path")?)?;
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            secret_key,
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            sync_storage_path: Some(dir.join("document-sync")),
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await?;
+    let task_handle = TaskHandle::new();
+    let metadata_handle = MetadataHandle::new(
+        dir.join("metadata"),
+        net.node_id(),
+        storage.clone(),
+        Some(net.clone()),
+        Some(net.document_sync_node()),
+        Some(net.document_sync_database()),
+    )?;
+
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle: Some(metadata_handle),
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+
+    let shutdown = Shutdown::new();
+    if hold_shutdown {
+        let limits = RoCrateLimits::default();
+        initialize_net_holder(context.clone(), limits, JobsRuntime::new(), &shutdown);
+    } else {
+        initialize_incoming_fixture(context.clone());
+    }
+    start_task_queues(context.clone(), task_handle, JobsRuntime::new(), &shutdown).await;
+
+    Ok(TestNode {
+        temp_dir: None,
+        net,
+        context,
+        kind: RealmNodeKind::Management,
+        shutdown: hold_shutdown.then_some(shutdown),
+    })
+}
+
+/// Restarts a node on its kept folder and key, retrying while the old storage lock is released.
+pub async fn respawn_with_retry(
+    realm_id: RealmId,
+    secret_key: iroh::SecretKey,
+    dir: &Path,
+    hold_shutdown: bool,
+) -> Result<TestNode, BoxError> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let spawned = spawn_node_with(
+            realm_id,
+            Some(secret_key.clone()),
+            dir.to_path_buf(),
+            hold_shutdown,
+        );
+        match spawned.await {
+            Ok(node) => return Ok(node),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(format!("respawn failed after retries: {error}").into());
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+/// Installs the default realm config with every node as a management node, then repeats
+/// the restore and placement passes of a realm-config apply until none reschedules.
+pub async fn install_replica_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<RealmConfigDocument, String> {
+    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    config.seed_default_placement();
+    for node in nodes {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+    }
+
+    for node in nodes {
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
+    }
+
+    for _ in 0..5 {
+        for node in nodes {
+            aruna_operations::node::startup::restore_shard_subscriptions(
+                &node.context,
+                node.net.node_id(),
+                *realm_id,
+            )
+            .await;
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_operations::placement::process_placements::process_shard_placements(
+                &node.context,
+                *realm_id,
+                node.net.node_id(),
+            )
+            .await
+            .retry_scheduled;
+        }
+        if !retry {
+            break;
+        }
+    }
+
+    Ok(config)
+}
+
+/// Installs the default realm config with every node as a management node in its own job
+/// control band, then runs the shard placement step a realm-config apply runs.
+pub async fn install_default_config(
+    nodes: &[TestNode],
+    realm_id: &RealmId,
+) -> Result<RealmConfigDocument, String> {
+    let mut config = RealmConfigDocument::default_for_realm(*realm_id, Vec::new());
+    config.seed_default_placement();
+    for (band, node) in nodes.iter().enumerate() {
+        config.ensure_node(node.net.node_id(), RealmNodeKind::Management);
+        config.seed_job_control(node.net.node_id(), band as u32);
+    }
+    for node in nodes {
+        store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
+    }
+    for node in nodes {
+        aruna_operations::placement::process_placements::process_shard_placements(
+            &node.context,
+            *realm_id,
+            node.net.node_id(),
+        )
+        .await;
+    }
+    Ok(config)
+}
+
+/// Announces every node's presence, then waits until each node sees all of them.
+pub async fn announce_nodes(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), String> {
+    for node in nodes {
+        let announce = AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+            realm_id: *realm_id,
+            node_id: node.net.node_id(),
+            schedule_refresh: true,
+        });
+        drive(announce, node.context.as_ref())
+            .await
+            .map_err(|error| format!("announce failed: {error:?}"))?;
+    }
+    wait_node_convergence(nodes, realm_id).await
+}
+
+pub async fn wait_node_convergence(nodes: &[TestNode], realm_id: &RealmId) -> Result<(), String> {
+    let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
+    wait_for_convergence("realm nodes did not converge", || async {
+        let mut pending = 0;
+        for node in nodes {
+            match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
+                Ok(realm_nodes) if realm_nodes == expected => {}
+                _ => pending += 1,
+            }
+        }
+        Ok(pending)
+    })
+    .await
+}
+
+/// Stops one node as a restart does: drains its held shutdown owner, removes its inbound
+/// handler, stops its task queues and its net. The caller still holds the storage.
+pub async fn stop_node(node: &TestNode) {
+    if let Some(shutdown) = &node.shutdown {
+        let _ = shutdown.drain(convergence::NO_PROGRESS_TIMEOUT).await;
+    }
+    node.net.clear_inbound_handler();
+    if let Some(task_handle) = &node.context.task_handle {
+        let _ = task_handle.shutdown(convergence::NO_PROGRESS_TIMEOUT).await;
+    }
+    node.net.shutdown().await;
+}
+
+/// Drains a held shutdown owner and the task queues first, then stops the net.
+pub async fn shutdown_nodes(nodes: Vec<TestNode>) {
+    for node in nodes {
+        if let Some(shutdown) = &node.shutdown {
+            let _ = shutdown.drain(convergence::NO_PROGRESS_TIMEOUT).await;
+            if let Some(task_handle) = &node.context.task_handle {
+                let _ = task_handle.shutdown(convergence::NO_PROGRESS_TIMEOUT).await;
+            }
+        }
+        node.net.shutdown().await;
+    }
+}
+
+pub fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
+    nodes
+        .iter()
+        .map(|node| (node.net.node_id(), node.context.clone()))
+        .collect()
+}
+
+/// Builds the payload of one created document from its label, writer, index and id.
+pub type PayloadFn = fn(&str, usize, usize, Ulid) -> CreateDocumentPayload;
+
+/// Runs `writers` writer tasks with `per_writer` creates each and returns every document.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_writers(
+    realm_id: RealmId,
+    group_id: GroupId,
+    label: &str,
+    writers: usize,
+    per_writer: usize,
+    targets: &[(NodeId, Arc<DriverContext>)],
+    period: Option<Duration>,
+    payload: PayloadFn,
+) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
+    let mut handles = Vec::with_capacity(writers);
+    for writer in 0..writers {
+        let targets = targets.to_vec();
+        let label = label.to_string();
+        handles.push(tokio::spawn(async move {
+            run_writer(
+                realm_id, group_id, &label, writer, per_writer, targets, period, payload,
+            )
+            .await
+        }));
+    }
+    let mut created = Vec::with_capacity(writers * per_writer);
+    for handle in handles {
+        created.extend(handle.await??);
+    }
+    Ok(created)
+}
+
+/// Creates `count` documents round robin over `targets` with the given payloads and projects
+/// them in batches as the API create path does. With a `period`, one create starts per period.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_writer(
+    realm_id: RealmId,
+    group_id: GroupId,
+    label: &str,
+    writer: usize,
+    count: usize,
+    targets: Vec<(NodeId, Arc<DriverContext>)>,
+    period: Option<Duration>,
+    payload: PayloadFn,
+) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
+    let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
+    let mut pending = 0usize;
+    let mut created = Vec::with_capacity(count);
+    let mut ticker = period.map(tokio::time::interval);
+    let config = drive(GetConfigOperation::new(realm_id), targets[0].1.as_ref())
+        .await
+        .map_err(|error| format!("realm config load failed: {error:?}"))?;
+
+    for index in 0..count {
+        if let Some(ticker) = ticker.as_mut() {
+            ticker.tick().await;
+        }
+        let slot = (writer + index) % targets.len();
+        let (node_id, context) = &targets[slot];
+        let document_path = format!("datasets/bench-{label}-{writer}-{index}");
+        let actor = Actor {
+            node_id: *node_id,
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+        };
+        let document_id = mint_local_document(&config, &actor, group_id, &document_path)
+            .map_err(|error| format!("mint failed writer={writer} index={index}: {error:?}"))?
+            .as_ulid();
+        let payload = payload(label, writer, index, document_id);
+        let result = drive(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor,
+                group_id,
+                document_id,
+                document_path,
+                public: true,
+                payload,
+            }),
+            context.as_ref(),
+        )
+        .await
+        .map_err(|error| format!("create failed writer={writer} index={index}: {error:?}"))?;
+
+        batches[slot].push((result.record.document_id, result.record.last_event_id));
+        created.push((group_id, result.record.document_id, Instant::now()));
+        pending += 1;
+        if pending >= PROJECTION_BATCH {
+            flush_projection_batches(&targets, &mut batches).await?;
+            pending = 0;
+        }
+    }
+    flush_projection_batches(&targets, &mut batches).await?;
+    Ok(created)
+}
+
+/// Projects the logged events of each target node's batch and empties the batches.
+pub async fn flush_projection_batches(
+    targets: &[(NodeId, Arc<DriverContext>)],
+    batches: &mut [Vec<(Ulid, Ulid)>],
+) -> Result<(), BoxError> {
+    for (slot, batch) in batches.iter_mut().enumerate() {
+        if batch.is_empty() {
+            continue;
+        }
+        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
+        project_logged_events(targets[slot].1.as_ref(), drained)
+            .await
+            .map_err(|error| format!("projection failed: {error:?}"))?;
+    }
+    Ok(())
+}
+
+/// The load test payload: a scaffold for even indexes and an RO-Crate otherwise.
+pub fn mixed_payload(label: &str, writer: usize, index: usize, id: Ulid) -> CreateDocumentPayload {
+    if index.is_multiple_of(2) {
+        scaffold_payload(label, writer, index)
+    } else {
+        rocrate_payload(id)
+    }
+}
+
+pub fn scaffold_payload(label: &str, writer: usize, index: usize) -> CreateDocumentPayload {
+    CreateDocumentPayload::Scaffold {
+        name: format!("Bench Dataset {label}-{writer}-{index}"),
+        description: "Load test document".to_string(),
+        date_published: "2026-06-10".to_string(),
+        license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+    }
+}
+
+pub fn rocrate_payload(document_id: Ulid) -> CreateDocumentPayload {
+    let jsonld = format!(
+        r#"{{
+  "@context": "https://w3id.org/ro/crate/1.2/context",
+  "@graph": [
+    {{
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+      "about": {{"@id": "https://w3id.org/aruna/{document_id}"}}
+    }},
+    {{
+      "@id": "https://w3id.org/aruna/{document_id}",
+      "@type": "Dataset",
+      "name": "Bench Crate {document_id}",
+      "description": "Load test crate",
+      "datePublished": "2026-06-10",
+      "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+    }}
+  ]
+}}"#
+    );
+    CreateDocumentPayload::RoCrate { jsonld }
+}
+
+/// A replica node in its own temporary folder, with storage at the folder root and a
+/// loopback net. `metadata` adds a metadata store; `holder` installs the production net
+/// holder under a kept `Shutdown` in place of the test inbound handler.
+pub async fn spawn_replica(
+    realm_id: RealmId,
+    metadata: bool,
+    holder: bool,
+) -> TestResult<TestNode> {
+    spawn_replica_with(realm_id, None, metadata, holder, true).await
+}
+
+/// [`spawn_replica`] with a fixed node key, and without task queues when `start_tasks` is
+/// false, so a test drives every timer by hand.
+pub async fn spawn_replica_with(
+    realm_id: RealmId,
+    secret_key: Option<iroh::SecretKey>,
+    metadata: bool,
+    holder: bool,
+    start_tasks: bool,
+) -> TestResult<TestNode> {
+    let temp_dir = tempfile::tempdir()?;
+    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
+    let net_config = NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        realm_id,
+        secret_key,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+    let net = NetHandle::new(net_config, storage.clone()).await?;
+    let task_handle = TaskHandle::new();
+    let metadata_handle = match metadata {
+        true => Some(MetadataHandle::new(
+            temp_dir.path().join("metadata"),
+            net.node_id(),
+            storage.clone(),
+            Some(net.clone()),
+            Some(net.document_sync_node()),
+            Some(net.document_sync_database()),
+        )?),
+        false => None,
+    };
+    let context = Arc::new(DriverContext {
+        storage_handle: storage,
+        net_handle: Some(net.clone()),
+        blob_handle: None,
+        metadata_handle,
+        task_handle: Some(task_handle.clone()),
+        compute_handle: None,
+    });
+    let jobs_runtime = JobsRuntime::new();
+    let shutdown = Shutdown::new();
+    if holder {
+        let limits = RoCrateLimits::default();
+        initialize_net_holder(context.clone(), limits, jobs_runtime.clone(), &shutdown);
+    } else {
+        initialize_incoming_fixture(context.clone());
+    }
+    if start_tasks {
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+    }
+    Ok(TestNode {
+        temp_dir: Some(temp_dir),
+        net,
+        context,
+        kind: RealmNodeKind::Management,
+        shutdown: holder.then_some(shutdown),
+    })
+}
+
+/// Spawns `count` meshed replicas; see [`spawn_replica`].
+pub async fn spawn_replicas(
+    realm_id: RealmId,
+    count: usize,
+    metadata: bool,
+    holder: bool,
+) -> TestResult<Vec<TestNode>> {
+    let mut nodes = Vec::with_capacity(count);
+    for _ in 0..count {
+        nodes.push(spawn_replica(realm_id, metadata, holder).await?);
+    }
+    mesh(nodes.iter().map(|node| &node.net)).await;
+    Ok(nodes)
+}
+
+pub async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
+    drive(
+        GetDocumentOperation::new(group_id, document_id),
+        node.context.as_ref(),
+    )
+    .await
+    .is_ok()
+}
+
+pub fn document_config(
+    realm: &Topology,
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+    payload: CreateDocumentPayload,
+) -> CreateDocumentConfig {
+    CreateDocumentConfig {
+        actor: realm.actor(node),
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        public: true,
+        payload,
+    }
+}
+
+/// Creates a document on `node`, replays its event log, and returns the document's placement.
+pub async fn create_document(
+    realm: &Topology,
+    node: &TestNode,
+    group_id: Ulid,
+    document_id: Ulid,
+    document_path: &str,
+    payload: CreateDocumentPayload,
+) -> TestResult<PlacementRef> {
+    let config = document_config(realm, node, group_id, document_id, document_path, payload);
+    let created = drive(CreateDocumentOperation::new(config), node.context.as_ref()).await?;
+    replay_event_log(node.context.as_ref()).await?;
+    Ok(created.record.placement)
+}
+
+/// The default realm config with each of `nets` as a management node.
+pub fn realm_config_for<'a>(
+    nets: impl IntoIterator<Item = &'a NetHandle>,
+    realm_id: RealmId,
+) -> RealmConfigDocument {
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    for net in nets {
+        config.ensure_node(net.node_id(), RealmNodeKind::Management);
+    }
+    config
+}
+
+/// A local user of `realm_id` whose notification inbox `holder` holds under `realm_config`.
+pub fn user_with_holder(
+    realm_config: &RealmConfigDocument,
+    holder: NodeId,
+    realm_id: RealmId,
+) -> UserId {
+    for _ in 0..10_000 {
+        let candidate = UserId::local(Ulid::generate(), realm_id);
+        if matches!(resolve_inbox_holder(&candidate, realm_config), Ok(Some(node)) if node == holder)
+        {
+            return candidate;
+        }
+    }
+    panic!("no user hashed to holder {holder} within the sampling bound");
 }

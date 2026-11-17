@@ -7,15 +7,14 @@ use crate::topology;
 use aruna_core::StructuredId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, create_metadata_document,
     mint_local_document,
 };
-use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::projector::replay_event_log;
 use ulid::Ulid;
 
+use crate::topology::document_present;
 use topology::{TestNode, TestResult, Topology, wait_until};
 
 const MANAGEMENT_NODES: usize = 4;
@@ -203,13 +202,4 @@ async fn create_document(
     .await?;
     replay_event_log(node.context.as_ref()).await?;
     Ok(created.record.placement)
-}
-
-async fn document_present(node: &TestNode, group_id: Ulid, document_id: Ulid) -> bool {
-    drive(
-        GetDocumentOperation::new(group_id, document_id),
-        node.context.as_ref(),
-    )
-    .await
-    .is_ok()
 }

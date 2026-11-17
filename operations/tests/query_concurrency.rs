@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::topology::init_logging;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -33,15 +34,6 @@ use ulid::Ulid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 const REALM: RealmId = RealmId([9u8; 32]);
-
-fn init_logging() {
-    if std::env::var("RUST_LOG").is_ok() {
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .try_init();
-    }
-}
 
 struct TestHarness {
     _storage_dir: TempDir,
