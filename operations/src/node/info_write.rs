@@ -420,3 +420,294 @@ impl Operation for InfoWriteOperation {
     }
 }
 
+#[cfg(test)]
+mod state_machine_tests {
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::storage::node_info::NodeUrls;
+    use ulid::Ulid;
+
+    use super::*;
+
+    const REALM: RealmId = RealmId([3; 32]);
+    const TXN: TxnId = Ulid::from_parts(5, 5);
+    const NOW: u64 = 9_000;
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
+    fn document(publisher_generation: u64) -> NodeInfoDocument {
+        NodeInfoDocument {
+            node_id: node(),
+            executors: Vec::new(),
+            labels: BTreeMap::new(),
+            urls: NodeUrls { api: None, s3: None },
+            utilization: NodeUtilization {
+                storage_bytes_used: 0,
+                documents_held: None,
+                load_permille: None,
+                heartbeat_at_ms: 0,
+                download_slots: None,
+                storage_capacity_bytes: None,
+            },
+            updated_at_ms: 1,
+            epoch: AdvertisementEpoch {
+                membership_generation: 0,
+                publisher_generation,
+                observed_at_ms: 1,
+            },
+            compute_draining: false,
+            leaving: false,
+            demand: ComputeDemandSnapshot::default(),
+            reservation: ComputeReservationSnapshot::default(),
+        }
+    }
+
+    fn storage(event: StorageEvent) -> Event {
+        Event::Storage(event)
+    }
+
+    fn begin() -> Effect {
+        Effect::Storage(StorageEffect::StartTransaction { read: false })
+    }
+
+    fn started() -> Event {
+        storage(StorageEvent::TransactionStarted { txn_id: TXN })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn rollback() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    fn conflict() -> Event {
+        storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        })
+    }
+
+    fn generation_read() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: SYNC_REVISION_KEYSPACE.to_string(),
+            key: sync_revision_key(&DocumentTarget::RealmConfig { realm_id: REALM }),
+            txn_id: None,
+        })
+    }
+
+    fn row_read() -> Effect {
+        Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (NODE_INFO_KEYSPACE.to_string(), Key::from(node_info_key(node()))),
+                (
+                    COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                    Key::from(OPERATOR_DRAIN_KEY.to_vec()),
+                ),
+            ],
+            txn_id: Some(TXN),
+        })
+    }
+
+    fn rows(row: Option<&NodeInfoDocument>, drained: bool) -> Event {
+        let row = row.map(|document| Value::from(document.to_bytes().unwrap()));
+        let drain = drained.then(|| Value::from(vec![1]));
+        storage(StorageEvent::BatchReadResult {
+            values: vec![(Key::from(Vec::new()), row), (Key::from(Vec::new()), drain)],
+        })
+    }
+
+    fn written() -> Event {
+        storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        })
+    }
+
+    fn committed() -> Event {
+        storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    }
+
+    fn leaving() -> InfoChange {
+        InfoChange::Leaving {
+            leaving: true,
+            reservation: ComputeReservationSnapshot::default(),
+            demand: ComputeDemandSnapshot::default(),
+        }
+    }
+
+    fn revise(change: InfoChange) -> InfoWriteOperation {
+        InfoWriteOperation::revise(REALM, node(), change, NOW)
+    }
+
+    /// A revision at the read step, generation zero.
+    fn reading(change: InfoChange) -> InfoWriteOperation {
+        let mut operation = revise(change);
+        operation.start();
+        operation.step(storage(StorageEvent::ReadResult {
+            key: Key::from(Vec::new()),
+            value: None,
+        }));
+        operation.step(started());
+        operation
+    }
+
+    #[test]
+    fn seed_writes_row() {
+        let seeded = document(1);
+        let mut operation = InfoWriteOperation::seed(REALM, seeded.clone());
+        let writes = InfoWriteOperation::writes(&seeded, TXN).unwrap().to_vec();
+        check_trace(
+            &mut operation,
+            &[begin()],
+            vec![
+                (started(), writes),
+                (written(), vec![commit()]),
+                (committed(), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(true));
+
+        let mut racing = InfoWriteOperation::seed(REALM, seeded);
+        racing.start();
+        racing.step(started());
+        racing.step(written());
+        racing.step(conflict());
+        assert_eq!(racing.finalize(), Err(InfoWriteError::SeedConflict));
+    }
+
+    #[test]
+    fn revision_stamps_epoch() {
+        let mut operation = revise(leaving());
+        let mut expected = document(4);
+        expected.leaving = true;
+        expected.compute_draining = true;
+        expected.epoch = AdvertisementEpoch {
+            membership_generation: 0,
+            publisher_generation: 5,
+            observed_at_ms: NOW,
+        };
+        expected.demand.epoch = expected.epoch;
+        expected.reservation.epoch = expected.epoch;
+        expected.updated_at_ms = NOW;
+        let writes = InfoWriteOperation::writes(&expected, TXN).unwrap().to_vec();
+        check_trace(
+            &mut operation,
+            &[generation_read()],
+            vec![
+                (
+                    storage(StorageEvent::ReadResult {
+                        key: Key::from(Vec::new()),
+                        value: None,
+                    }),
+                    vec![begin()],
+                ),
+                (started(), vec![row_read()]),
+                (rows(Some(&document(4)), false), writes),
+                (written(), vec![commit()]),
+                (committed(), vec![]),
+            ],
+        );
+        assert_eq!(operation.finalize(), Ok(true));
+    }
+
+    #[test]
+    fn unchanged_rows_abort() {
+        // No row, or a change that alters nothing durable, writes nothing.
+        let snapshots = InfoChange::Snapshots {
+            reservation: ComputeReservationSnapshot::default(),
+            demand: ComputeDemandSnapshot::default(),
+        };
+        for (row, change) in [(None, leaving()), (Some(document(2)), snapshots)] {
+            let mut operation = reading(change);
+            assert_eq!(operation.step(rows(row.as_ref(), false)).to_vec(), vec![rollback()]);
+            assert_eq!(operation.finalize(), Ok(false));
+        }
+        // The operator's flag drains the advertisement although the change does not.
+        let mut drained = reading(InfoChange::Snapshots {
+            reservation: ComputeReservationSnapshot::default(),
+            demand: ComputeDemandSnapshot::default(),
+        });
+        let effects = drained.step(rows(Some(&document(2)), true));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchWrite { .. })]
+        ));
+    }
+
+    #[test]
+    fn conflicts_retry_bounded() {
+        let mut operation = reading(leaving());
+        operation.step(rows(Some(&document(1)), false));
+        operation.step(written());
+        for _ in 1..ATTEMPTS {
+            assert_eq!(operation.step(conflict()).to_vec(), vec![begin()]);
+            operation.step(started());
+            operation.step(rows(Some(&document(1)), false));
+            operation.step(written());
+        }
+        assert!(operation.step(conflict()).is_empty());
+        assert_eq!(operation.finalize(), Err(InfoWriteError::Exhausted));
+    }
+
+    #[test]
+    fn failures_abort_open() {
+        let failed = || {
+            storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        let mut operation = reading(leaving());
+        assert_eq!(operation.step(failed()).to_vec(), vec![rollback()]);
+        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
+
+        let mut garbled = reading(leaving());
+        let row = storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Key::from(Vec::new()), Some(Value::from(vec![0xff; 3]))),
+                (Key::from(Vec::new()), None),
+            ],
+        });
+        assert_eq!(garbled.step(row).to_vec(), vec![rollback()]);
+        assert!(matches!(garbled.finalize(), Err(InfoWriteError::Document(_))));
+
+        let mut unknown = reading(leaving());
+        unknown.step(rows(Some(&document(1)), false));
+        unknown.step(written());
+        unknown.step(storage(StorageEvent::Error {
+            error: StorageError::CommitFailed,
+        }));
+        assert_eq!(unknown.finalize(), Err(StorageError::CommitFailed.into()));
+    }
+
+    #[test]
+    fn rejects_stray_events() {
+        let open = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::BatchReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(|| reading(leaving()), sample_events, open) {
+            assert_eq!(effects.to_vec(), vec![rollback()], "{label}");
+            assert!(matches!(error, InfoWriteError::UnexpectedEvent(_)), "{label}");
+        }
+        let fresh = || revise(leaving());
+        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+    }
+
+    #[test]
+    fn abort_releases_transaction() {
+        let mut operation = revise(leaving());
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        let mut open = reading(leaving());
+        check_abort(&mut open, &[rollback()]);
+        open.step(rows(Some(&document(1)), false));
+        check_abort(&mut open, &[rollback()]);
+        rejects_finalize(open);
+    }
+}
