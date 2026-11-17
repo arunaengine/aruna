@@ -645,8 +645,8 @@ mod tests {
     use super::{
         AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditPageEntry,
-        AuditPageResponse, Effect, Event, ListAuditError, ListAuditOperation, ListAuditRequest,
-        LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, EffectOperation, StorageEvent,
+        AuditPageResponse, Effect, EffectOperation, Event, ListAuditError, ListAuditOperation,
+        ListAuditRequest, LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, StorageEvent,
         audit_scope, decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;

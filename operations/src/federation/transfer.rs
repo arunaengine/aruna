@@ -54,7 +54,10 @@ impl<T> ConfigStep<T> {
     }
 
     fn start(&mut self) -> Effects {
-        self.read.as_mut().map(EffectOperation::start).unwrap_or_default()
+        self.read
+            .as_mut()
+            .map(EffectOperation::start)
+            .unwrap_or_default()
     }
 
     fn step(
@@ -76,7 +79,10 @@ impl<T> ConfigStep<T> {
     }
 
     fn abort(&mut self) -> Effects {
-        self.read.as_mut().map(EffectOperation::abort).unwrap_or_default()
+        self.read
+            .as_mut()
+            .map(EffectOperation::abort)
+            .unwrap_or_default()
     }
 }
 

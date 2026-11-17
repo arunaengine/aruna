@@ -171,7 +171,9 @@ impl<T: HolderRecord> HolderFetchOperation<T> {
     }
 }
 
-impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation for HolderFetchOperation<T> {
+impl<T: HolderRecord + std::fmt::Debug + PartialEq + Send> EffectOperation
+    for HolderFetchOperation<T>
+{
     type Output = Fetched<T>;
     type Error = FetchError;
 

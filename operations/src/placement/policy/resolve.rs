@@ -130,7 +130,10 @@ impl ResolvePolicyOperation {
             [config, auth] => ([config, auth], None),
             [config, auth, (_, group)] => ([config, auth], Some(group)),
             other => {
-                return self.unexpected_event("realm config and authorization", "a batch of another length");
+                return self.unexpected_event(
+                    "realm config and authorization",
+                    "a batch of another length",
+                );
             }
         };
         let Some(config_value) = config_value else {

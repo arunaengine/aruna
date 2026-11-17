@@ -2,13 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
 use aruna_core::UserId;
 use aruna_core::compute::{AttemptRef, FenceContext};
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::PURGE_FENCE_KEYSPACE;
 use aruna_core::keyspaces::{
     ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE, DEDUP_INDEX_KEYSPACE,
     JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, KEY_WAIT_KEYSPACE,

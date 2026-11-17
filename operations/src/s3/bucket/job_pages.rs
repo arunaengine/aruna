@@ -109,9 +109,9 @@ pub(super) async fn job_access(
     match BucketAccess::load(context, &job.auth, scope, bucket).await {
         Ok(access) if access.allows(None, &Permission::WRITE) => Ok(Some(access)),
         Ok(_) | Err(AuthorizeError::PermissionDenied) => Ok(None),
-        Err(AuthorizeError::Policy(
-            crate::auth::error::PolicyEnforcementError::Denied { .. },
-        )) => Ok(None),
+        Err(AuthorizeError::Policy(crate::auth::error::PolicyEnforcementError::Denied {
+            ..
+        })) => Ok(None),
         Err(error) => Err(error.to_string()),
     }
 }

@@ -138,7 +138,10 @@ impl EffectOperation for IssueHandoffOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.read.as_mut().map(EffectOperation::abort).unwrap_or_default()
+        self.read
+            .as_mut()
+            .map(EffectOperation::abort)
+            .unwrap_or_default()
     }
 }
 

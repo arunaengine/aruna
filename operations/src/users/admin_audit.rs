@@ -99,7 +99,9 @@ impl EffectOperation for AuditPageOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         if self.output.is_some() {
-            self.output = Some(Err(AuditPageError::UnexpectedEvent(event.label().to_string())));
+            self.output = Some(Err(AuditPageError::UnexpectedEvent(
+                event.label().to_string(),
+            )));
             return smallvec![];
         }
         self.output = Some(match event {

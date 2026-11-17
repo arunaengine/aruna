@@ -247,7 +247,10 @@ async fn outgoing(
 }
 
 /// Runs `operation` against storage until it asks to commit, and returns that commit.
-async fn run_to_commit<O: EffectOperation>(context: &DriverContext, operation: &mut O) -> StorageEffect {
+async fn run_to_commit<O: EffectOperation>(
+    context: &DriverContext,
+    operation: &mut O,
+) -> StorageEffect {
     let mut queue: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = queue.pop_front() {
         let Effect::Storage(effect) = effect else {
