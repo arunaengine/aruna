@@ -676,7 +676,9 @@ impl Operation for SubmitJobOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            SubmitState::Init => self.begin(),
+            SubmitState::Init => {
+                self.fail(SubmitJobError::UnexpectedEvent(event.label().to_string()))
+            }
             SubmitState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.read_dedup(txn_id)

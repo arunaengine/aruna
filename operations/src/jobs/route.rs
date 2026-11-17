@@ -26,6 +26,7 @@ pub(crate) enum JobRouteOutcome {
 
 #[derive(Debug, PartialEq)]
 enum RouteState {
+    Init,
     LoadConfig,
     AwaitResponse,
     Done,
@@ -59,7 +60,7 @@ impl JobRouteOperation {
             job_id,
             request,
             responder: None,
-            state: RouteState::LoadConfig,
+            state: RouteState::Init,
             output: None,
         }
     }
@@ -114,6 +115,7 @@ impl Operation for JobRouteOperation {
         if let Some(responder) = self.responder {
             return self.send(responder);
         }
+        self.state = RouteState::LoadConfig;
         smallvec![read_effect(
             &DocumentTarget::RealmConfig {
                 realm_id: self.realm_id,
@@ -157,7 +159,9 @@ impl Operation for JobRouteOperation {
                     other.label()
                 )))),
             },
-            RouteState::Done => smallvec![],
+            RouteState::Init | RouteState::Done => self.finish(Err(JobRouteError::Unavailable(
+                format!("unexpected event outside a route: {}", event.label()),
+            ))),
         }
     }
 
