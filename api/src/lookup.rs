@@ -23,6 +23,8 @@ use aruna_operations::distribution::routing::read_coordinator;
 use aruna_operations::distribution::routing::{route_read, route_write};
 use aruna_operations::distribution::status::node_reach;
 use aruna_operations::driver::drive;
+use aruna_operations::forward::routing::{is_user_origin, origin_holds_document};
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::object::list::ListedObject;
 use axum::body::Body;
@@ -38,6 +40,23 @@ use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::server::state::ServerState;
+
+/// Whether this node is a device, from the current realm config; a node the config does not list
+/// is unavailable.
+pub(crate) async fn user_origin(state: &ServerState) -> ServerResult<bool> {
+    let config = drive(GetConfigOperation::new(state.get_realm_id()), &state.get_ctx())
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)?;
+    is_user_origin(&config, state.get_node_id()).ok_or(ServerError::ServiceUnavailable)
+}
+
+/// Whether this node holds a structured metadata document's bucket; `None` when the realm config
+/// is unreadable or does not place the document here.
+pub(crate) async fn origin_holds(state: &ServerState, document_id: Ulid) -> Option<bool> {
+    let realm_id = state.get_realm_id();
+    let config = drive(GetConfigOperation::new(realm_id), &state.get_ctx()).await.ok()?;
+    origin_holds_document(&config, realm_id, state.get_node_id(), document_id)
+}
 
 const API_PREFIX: &str = "/api/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);

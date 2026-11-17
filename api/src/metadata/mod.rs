@@ -9,6 +9,7 @@ pub use model::*;
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::origin_holds;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::{
@@ -19,7 +20,6 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::snapshot::unreadable_file;
 use aruna_operations::metadata::api::{
@@ -426,14 +426,9 @@ pub(crate) async fn local_write_record(
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
     ensure_device_owner(state, auth).await?;
     let context = state.get_ctx();
-    if !run_origin_holds_document(
-        &context,
-        state.get_realm_id(),
-        state.get_node_id(),
-        document_id,
-    )
-    .await
-    .map_err(map_api_error)?
+    if !origin_holds(state, document_id)
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?
     {
         return Ok(None);
     }

@@ -47,6 +47,7 @@ use aruna_operations::metadata::get_document::{
     GetDocumentError, GetDocumentOperation, load_document_record,
 };
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
+use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;
@@ -841,14 +842,14 @@ async fn bystander_writes_forward() -> TestResult<()> {
         .map_err(|error| format!("registry read failed: {error:?}"))?
         .ok_or("the non-holder must carry the registry row")?;
     assert_eq!(record.placement, placement);
-    assert!(
-        !origin_holds_document(
-            &bystander.context,
-            realm.realm_id,
-            bystander.node_id(),
-            document_id,
-        )
-        .await?
+    let config = drive(
+        GetConfigOperation::new(realm.realm_id),
+        bystander.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(
+        origin_holds_document(&config, realm.realm_id, bystander.node_id(), document_id),
+        Some(false)
     );
 
     update_routed(

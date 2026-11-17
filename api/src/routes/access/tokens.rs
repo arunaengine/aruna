@@ -5,6 +5,7 @@
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::user_origin;
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
@@ -15,7 +16,6 @@ use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
 use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::forwarded_bearer;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -80,9 +80,7 @@ pub async fn revoke_token(
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let ctx = state.get_ctx();
-    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_api_error)?;
+    let user_origin = user_origin(&state).await?;
     // Trusted bearers may revoke only their own subject unless they are realm admins.
     let claims = claims_for_revocation(&state, &request.token)
         .await
