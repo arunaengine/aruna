@@ -12,7 +12,8 @@ use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, ARTIFACT_TOMBSTONE_KEYSPACE, ATTEMPT_CONTROL_KEYSPACE,
     DEDUP_INDEX_KEYSPACE, JOB_CLAIM_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
     JOB_STATE_KEYSPACE, KEY_WAIT_KEYSPACE, LAUNCH_RECORD_KEYSPACE, OUTPUT_RECORD_KEYSPACE,
-    PURGE_CHECKPOINT_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE,
+    PURGE_CHECKPOINT_KEYSPACE, PURGE_FENCE_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
+    STAGING_STATE_KEYSPACE,
 };
 use aruna_core::structs::execution::job::{
     ActiveJobKind, AttemptControl, AttemptIntent, GLOBAL_DEDUP_PREFIX, JobClaim, JobError,
@@ -852,14 +853,17 @@ where
             let settled = !old.is_settled() && record.is_settled();
             let mut terminal_deletes = Vec::new();
             if settled && let Some(spec) = record.payload.purge_spec() {
-                if let Some(delete) = crate::s3::fence_store::delete_owned_terminal(
-                    storage,
-                    txn_id,
+                let bucket = crate::s3::purge_fence::fence_key(spec.scope.bucket());
+                let fence = read_raw(storage, PURGE_FENCE_KEYSPACE, bucket, Some(txn_id))
+                    .await
+                    .map_err(JobMutationError::Storage)?;
+                let owned = crate::s3::fence_store::owned_fence_delete(
+                    fence.as_deref(),
                     record.job_id,
                     &spec.scope,
-                )
-                .await
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?
+                );
+                if let Some(delete) =
+                    owned.map_err(|error| JobMutationError::Storage(error.to_string()))?
                 {
                     terminal_deletes.push(delete);
                 }

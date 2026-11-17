@@ -49,7 +49,7 @@ use aruna_operations::jobs::store::{
 };
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::fence_store::acquire_purge_fence;
+use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::multipart::complete::{
     CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
@@ -252,13 +252,8 @@ async fn scoped_fence_isolates() {
         bucket: "bucket".to_string(),
         prefix: "blocked/".to_string(),
     };
-    acquire_purge_fence(
-        &context.driver.storage_handle,
-        JobId::from_bytes([0xC3; 16]),
-        &scope,
-    )
-    .await
-    .unwrap();
+    let acquire = AcquireFenceOperation::new(JobId::from_bytes([0xC3; 16]), scope.clone());
+    drive(acquire, &context.driver).await.unwrap();
 
     assert!(matches!(
         drive(
@@ -561,9 +556,8 @@ async fn purge_resumes_cleanly() {
     };
     let prefix_job_id = JobId::from_bytes([0xA1; 16]);
     let prefix_job = claimed_job(context.driver.clone(), prefix_job_id, prefix_spec.clone()).await;
-    acquire_purge_fence(&context.driver.storage_handle, prefix_job_id, &prefix_scope)
-        .await
-        .unwrap();
+    let acquire = AcquireFenceOperation::new(prefix_job_id, prefix_scope.clone());
+    drive(acquire, &context.driver).await.unwrap();
     put_purge_checkpoint(
         &context.driver.storage_handle,
         prefix_job_id,

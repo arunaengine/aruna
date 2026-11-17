@@ -52,11 +52,11 @@ use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReport
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, transition_to_running,
 };
-use aruna_operations::storage_read::iter_prefix_page;
 use aruna_operations::jobs::workflow::purge::run_storage_purge;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::fence_store::acquire_purge_fence;
+use aruna_operations::s3::fence_store::AcquireFenceOperation;
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_operations::storage_read::iter_prefix_page;
 use aruna_storage::storage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -680,9 +680,12 @@ async fn s3_fences_copies() {
         prefix: "old/".to_string(),
     };
     let job = JobId::from_bytes([0xA1; 16]);
-    acquire_purge_fence(&context.driver.storage_handle, job, &scope)
-        .await
-        .unwrap();
+    drive(
+        AcquireFenceOperation::new(job, scope.clone()),
+        &context.driver,
+    )
+    .await
+    .unwrap();
     assert_eq!(run_import(&context, 0xD4).await, (0, 2, 0));
     assert_eq!(duplicates(&context).await.keys, 0);
 }

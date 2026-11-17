@@ -30,7 +30,7 @@ use crate::driver::drive;
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::{BucketScope, MembershipQuery};
-use crate::s3::fence_store::acquire_purge_fence;
+use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
 use crate::s3::object::delete::DeleteObjectError;
@@ -49,9 +49,8 @@ pub async fn run_storage_purge(
     spec: &StoragePurgeSpec,
     files: bool,
 ) -> JobRunOutcome {
-    if let Err(error) =
-        acquire_purge_fence(&ctx.driver.storage_handle, ctx.job_id, &spec.scope).await
-    {
+    let acquire = AcquireFenceOperation::new(ctx.job_id, spec.scope.clone());
+    if let Err(error) = drive(acquire, &ctx.driver).await {
         return JobRunOutcome::Failed(fence_error(error));
     }
     // The planned files wait in the cleanup queue until the job has ended.
