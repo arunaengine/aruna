@@ -60,7 +60,7 @@ pub enum EnqueueDraftError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -139,7 +139,7 @@ impl Operation for EnqueueDraftOperation {
 
         match self.state.clone() {
             EnqueueDraftState::StartTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
                     return fail(
                         self,
@@ -160,7 +160,7 @@ impl Operation for EnqueueDraftOperation {
                 })]
             }
             EnqueueDraftState::CountEntries { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
                     return fail(
                         self,
@@ -182,7 +182,7 @@ impl Operation for EnqueueDraftOperation {
                 self.emit_write(txn_id)
             }
             EnqueueDraftState::WriteEntry { txn_id } => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
                     return fail(
                         self,
@@ -197,7 +197,7 @@ impl Operation for EnqueueDraftOperation {
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
             EnqueueDraftState::CommitTransaction => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
                     return fail(
                         self,

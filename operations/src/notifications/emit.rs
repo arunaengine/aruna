@@ -46,7 +46,7 @@ impl EmitNotificationsOperation {
         }
     }
 
-    fn drop_emission(&mut self, event_desc: String, txn_id: Option<TxnId>) -> Effects {
+    fn drop_emission(&mut self, event_desc: &str, txn_id: Option<TxnId>) -> Effects {
         warn!(state = ?self.state, event = %event_desc, "Dropping notification emission");
         self.state = EmitNotificationsState::Finish;
         match txn_id {
@@ -56,7 +56,7 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.drop_emission(got, None);
         };
@@ -86,7 +86,7 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_write_outbox(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.drop_emission(got, Some(txn_id));
         };
@@ -95,7 +95,7 @@ impl EmitNotificationsOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.drop_emission(got, Some(txn_id));
         };

@@ -103,7 +103,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_count_owned", level = "debug", skip(self, event), fields(state = ?self.state))]
     fn handle_owned_count(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CountOwnedGroups,
@@ -306,7 +306,7 @@ impl CreateGroupOperation {
         &mut self,
         state: CreateGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
@@ -348,7 +348,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_start_transaction", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 CreateGroupState::StartTransaction,
@@ -367,7 +367,7 @@ impl CreateGroupOperation {
     }
 
     fn handle_realm_config(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::ReadRealmConfig,
@@ -408,7 +408,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_group_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_create_group(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CreateGroup,
@@ -441,7 +441,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_owner_index_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_owner_index(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::WriteOwnerIndex,
@@ -472,7 +472,7 @@ impl CreateGroupOperation {
     }
 
     fn handle_bucket_fence(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 CreateGroupState::ReadBucketFence,
@@ -496,7 +496,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_auth_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_create_roles(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CreateRoles,
@@ -522,7 +522,7 @@ impl CreateGroupOperation {
 
     #[tracing::instrument(name = "group.create.handle_commit", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_commit_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CommitTransaction,
@@ -551,7 +551,7 @@ impl CreateGroupOperation {
             other => self.unexpected_event(
                 CreateGroupState::ScheduleSyncDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }
@@ -611,7 +611,7 @@ pub enum CreateGroupError {
     UnexpectedEvent {
         state: CreateGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 

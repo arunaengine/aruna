@@ -64,7 +64,7 @@ pub enum GetOidcError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("registration did not finish")]
     NotFinished,
@@ -102,7 +102,7 @@ impl GetOidcOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(GetOidcError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -111,7 +111,7 @@ impl GetOidcOperation {
     }
 
     fn handle_start_txn(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
@@ -136,7 +136,7 @@ impl GetOidcOperation {
     }
 
     fn accept_subject(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::ReadResult { key, value })",
@@ -166,7 +166,7 @@ impl GetOidcOperation {
     }
 
     fn accept_existing(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 "Event::Storage(StorageEvent::ReadResult { key, value })",
@@ -228,7 +228,7 @@ impl GetOidcOperation {
         event: Event,
         (txn_id, start, current, seen): (TxnId, User, User, Vec<UserId>),
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
         };
@@ -243,7 +243,7 @@ impl GetOidcOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event, user: User) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self
                 .unexpected_event("Event::Storage(StorageEvent::TransactionCommitted)", got);

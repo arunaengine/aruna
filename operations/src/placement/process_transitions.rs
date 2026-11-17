@@ -484,7 +484,7 @@ async fn submit_steps(
             Err(MutatePlacementError::StorageError(StorageError::TransactionConflict))
                 if attempts < CONFLICT_ATTEMPTS =>
             {
-                tokio::time::sleep(crate::tasks::queue_backoff::conflict_backoff(
+                tokio::time::sleep(aruna_core::backoff::conflict_backoff(
                     attempts,
                     local_node_id.as_bytes(),
                 ))

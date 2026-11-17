@@ -54,7 +54,7 @@ pub enum UnreadCountError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("unread count did not finish")]
     NotFinished,
@@ -84,7 +84,7 @@ impl UnreadCountOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(UnreadCountError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -113,7 +113,7 @@ impl UnreadCountOperation {
     }
 
     fn handle_scan(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,

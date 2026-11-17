@@ -41,7 +41,7 @@ pub enum ResolvePathsError {
     UnexpectedEvent {
         state: ResolvePathsState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -112,7 +112,7 @@ impl ResolvePathsOperation {
         &mut self,
         state: ResolvePathsState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
@@ -134,7 +134,7 @@ impl ResolvePathsOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 ResolvePathsState::StartTransaction,
@@ -152,7 +152,7 @@ impl ResolvePathsOperation {
     }
 
     fn handle_read_aliases(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -178,7 +178,7 @@ impl ResolvePathsOperation {
     }
 
     fn handle_commit_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 ResolvePathsState::CommitTransaction,

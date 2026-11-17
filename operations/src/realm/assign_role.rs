@@ -120,7 +120,7 @@ pub enum AssignRolesError {
     UnexpectedEvent {
         state: AssignRolesState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -135,7 +135,7 @@ impl AssignRolesOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 AssignRolesState::StartTransaction,
@@ -159,7 +159,7 @@ impl AssignRolesOperation {
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
                 AssignRolesState::Auth,
@@ -207,7 +207,7 @@ impl AssignRolesOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -333,7 +333,7 @@ impl AssignRolesOperation {
         admin_outbox_written: bool,
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -364,7 +364,7 @@ impl AssignRolesOperation {
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -399,7 +399,7 @@ impl AssignRolesOperation {
         auth_doc: RealmAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -430,7 +430,7 @@ impl AssignRolesOperation {
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }
@@ -454,7 +454,7 @@ impl AssignRolesOperation {
         event: Event,
         auth_doc: RealmAuthorizationDocument,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -486,7 +486,7 @@ impl AssignRolesOperation {
         &mut self,
         state: AssignRolesState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(

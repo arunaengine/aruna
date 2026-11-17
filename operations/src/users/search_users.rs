@@ -63,7 +63,7 @@ pub enum SearchUsersError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("search users did not finish")]
     NotFinished,
@@ -94,7 +94,7 @@ impl SearchUsersOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(SearchUsersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -124,7 +124,7 @@ impl SearchUsersOperation {
     }
 
     fn handle_search_users(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,

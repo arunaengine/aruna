@@ -35,6 +35,15 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
         false
     }
 
+    /// Whether an error is a lost transaction conflict that a fresh run of the operation may
+    /// avoid. The runner's conflict retry reruns the operation only after such an error.
+    fn is_conflict(_error: &Self::Error) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Whether a deadline must still run `abort` after one of the operation's
     /// transactions committed. Only an operation whose `abort` protects already
     /// committed work may opt in.
