@@ -11,10 +11,10 @@ use aruna_core::operation::Operation;
 use aruna_core::outbound::{
     HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent, OutgoingMail, SmtpSettings,
 };
+use aruna_core::structs::execution::job::JobError;
 use aruna_core::structs::execution::webhook::{
     DELIVERY_HEADER, SIGNATURE_HEADER, WebhookDeliverySpec, sign_delivery,
 };
-use aruna_core::structs::execution::job::JobError;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -240,9 +240,8 @@ mod call_tests {
         let mut send = SendOperation::mail(Ulid::from_parts(2, 2), None, mail);
         assert!(matches!(
             send.first(),
-            Ok(Next::Call(IoCall::from(Effect::Outbound(
-                OutboundEffect::Mail(_)
-            ))))
+            Ok(Next::Call(IoCall::Effect(effect)))
+                if matches!(*effect, Effect::Outbound(OutboundEffect::Mail(_)))
         ));
         let sent = send.next(IoResult::Event(Box::new(Event::Outbound(
             OutboundEvent::MailSent {

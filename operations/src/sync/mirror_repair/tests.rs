@@ -13,6 +13,7 @@ use crate::sync::sync_relationship::{
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -204,10 +205,14 @@ async fn stage(context: &DriverContext, relationship: &SyncRelationship, intent:
     .unwrap();
 }
 
+/// Writes `record` as it is, so a test can set its due time and error.
 async fn store_record(context: &DriverContext, record: SyncMirrorRecord) {
-    drive(MirrorRecordOperation::store(record), context)
-        .await
-        .unwrap();
+    let row = (
+        MIRROR_REPAIR_KEYSPACE.to_string(),
+        repair_key(&record.relationship),
+        record.to_bytes().unwrap().into(),
+    );
+    crate::testing::write_entries(&context.storage_handle, vec![row]).await;
 }
 
 async fn settle(context: &DriverContext, record: &SyncMirrorRecord) -> RollbackClaim {

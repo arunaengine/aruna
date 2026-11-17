@@ -15,13 +15,12 @@ use aruna_core::keyspaces::JOB_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
-    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord,
-    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
-    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, job_record_key,
+    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobRecord, JobRecordBody,
+    JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState, PhysicalExecutionResult,
+    PhysicalExecutionState, ResultMessage, job_record_key,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
@@ -30,8 +29,7 @@ use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::outbox::schedule_outbox_drain;
 use super::reservation::ReleaseExecutionOperation;
-use super::witness::ArmFamilyOperation;
-use crate::driver::{DriverContext, drive};
+use super::witness_arm::ArmFamilyOperation;
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -71,69 +69,6 @@ fn chain_tip(updates: &[&ExecutionUpdate], root: [u8; 32]) -> Option<(u64, [u8; 
 
 /// This node and the realm it serves, or `None` without a net transport.
 type Serving = Option<(NodeId, RealmId)>;
-
-/// Publishes one state of the local execution; see [`PublishStateOperation`].
-pub async fn publish_state(
-    context: &DriverContext,
-    chain: &ExecutionChain,
-    state: PhysicalExecutionState,
-    result: Option<PhysicalExecutionResult>,
-    observed_at_ms: u64,
-) -> bool {
-    let operation = PublishStateOperation::new(
-        *chain,
-        (state, result, observed_at_ms),
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    published(drive(operation, context).await)
-}
-
-/// Publishes a non-terminal state of a receipted execution. A job with no
-/// receipt here is a purely local execution and publishes nothing.
-pub async fn publish_progress(
-    context: &DriverContext,
-    job_id: JobId,
-    state: PhysicalExecutionState,
-) {
-    let Ok(Some(chain)) = drive(ExecutionChainOperation::of_job(job_id), context).await else {
-        return;
-    };
-    publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
-}
-
-/// Publishes the terminal state of a receipted execution and releases its reservation; see
-/// [`PublishTerminalOperation`].
-pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
-    let operation = PublishTerminalOperation::new(
-        record.clone(),
-        context.node_and_realm(),
-        unix_timestamp_millis(),
-    );
-    published(drive(operation, context).await)
-}
-
-/// Retries terminal publication and capacity release for every durable local
-/// terminal execution that still has a reservation. `true` means at least one
-/// obligation stayed pending, so the caller must run this again.
-pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
-    let operation =
-        SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
-    drive(operation, context)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Whether a publication met its obligation.
-fn published(outcome: Result<bool, LifecycleError>) -> bool {
-    match outcome {
-        Ok(done) => done,
-        Err(error) => {
-            warn!(error = %error, "Execution publication failed");
-            false
-        }
-    }
-}
 
 #[derive(Debug, PartialEq)]
 enum PublishState {
@@ -641,7 +576,7 @@ mod pure_tests {
     use crate::tests::records::{Family, node, payload, user};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, JobError, JobPayload,
+        EffectiveResources, ExecutionReceipt, JobError, JobId, JobPayload,
     };
     use aruna_core::types::Value;
 

@@ -507,7 +507,6 @@ fn shutdown_sequence(
         task_handle: aruna_tasks::TaskHandle::new(),
         jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
         net_handle: None,
-        metadata_handle: None,
         graph_handle: None,
         blob_handle: None,
         storage_handle,

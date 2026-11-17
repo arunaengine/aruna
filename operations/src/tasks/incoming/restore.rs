@@ -449,29 +449,6 @@ impl OperationsTaskHandler {
             .await;
     }
 
-    pub(super) async fn publish_watch_interest(&self) {
-        let Some(net_handle) = self.context.net_handle.as_ref() else {
-            warn!(task_id = ?TaskKey::PublishWatchInterest, "Cannot publish watch interest without net handle");
-            return;
-        };
-        let node_id = net_handle.node_id();
-        match crate::notifications::watch::interest::publish_watch_interest(&self.context, node_id)
-            .await
-        {
-            // Fold this node's freshly written digest into the origin-side cache;
-            // the local write bypasses the reconcile path that refreshes remotes.
-            Ok(true) => {
-                net_handle.replace_watch_interest(interest_table(&self.context).await);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                warn!(task_id = ?TaskKey::PublishWatchInterest, error = %error, "Failed to publish watch interest");
-                self.reschedule_timer(TaskKey::PublishWatchInterest, WATCH_PUBLISH_DEBOUNCE)
-                    .await;
-            }
-        }
-    }
-
     pub(super) async fn drain_materialization_queue(&self) {
         let bulk = self.context.bulk();
         match process_materialization_batch(&bulk).await {

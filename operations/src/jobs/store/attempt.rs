@@ -2,7 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::control_mutation::MutateControlOperation;
+use super::mark_start::MarkStartOperation;
+use super::settle_attempt;
 use super::*;
+use crate::driver::drive;
 use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
 use std::collections::BTreeMap;
 
@@ -56,13 +60,13 @@ pub(super) async fn mutate_attempt_control<F>(
     mutate: F,
 ) -> Result<(JobRecord, AttemptControl), JobMutationError>
 where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
 {
     mutate_control_with(context, job_id, Vec::new(), mutate).await
 }
 
 /// Same transaction as [`mutate_attempt_control`], plus writes that must land
-/// atomically with the control row.
+/// atomically with the control row; see [`MutateControlOperation`].
 pub(super) async fn mutate_control_with<F>(
     context: &DriverContext,
     job_id: JobId,
@@ -70,79 +74,23 @@ pub(super) async fn mutate_control_with<F>(
     mut mutate: F,
 ) -> Result<(JobRecord, AttemptControl), JobMutationError>
 where
-    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord, &mut AttemptControl) -> Result<JobMutation, JobMutationError> + Send,
 {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let Some(mut record) = read_job_record(context, job_id, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?
-            else {
-                return Err(JobMutationError::NotFound);
-            };
-            let epoch = record
-                .attempt_intent
-                .as_ref()
-                .map(|intent| intent.attempt_epoch)
-                .ok_or(JobMutationError::MissingControl)?;
-            let mut control = read_attempt_control(context, job_id, epoch, Some(txn_id))
-                .await?
-                .ok_or(JobMutationError::MissingControl)?;
-            if control.attempt_epoch != epoch {
-                return Err(JobMutationError::EpochMismatch);
-            }
-            let old = record.clone();
-            if matches!(mutate(&mut record, &mut control)?, JobMutation::Skip) {
-                return Ok((old, control));
-            }
-            if old.state != record.state {
-                validate_transition(old.execution_class, old.state, record.state)?;
-            }
-            let (mut writes, deletes) = index_deltas(&old, &record)
-                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-            writes.push((
-                ATTEMPT_CONTROL_KEYSPACE.to_string(),
-                ByteView::from(attempt_control_key(job_id, epoch)),
-                ByteView::from(
-                    control
-                        .to_bytes()
-                        .map_err(|error| JobMutationError::Storage(error.to_string()))?,
-                ),
-            ));
-            writes.extend(extra.iter().cloned());
-            batch_write(context, writes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            batch_delete(context, deletes, Some(txn_id))
-                .await
-                .map_err(JobMutationError::Storage)?;
-            Ok((record, control))
-        }
-        .await;
-        match result {
-            Ok(value) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "attempt mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(value),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+    let mut attempt = 0;
+    loop {
+        let operation = MutateControlOperation::new(job_id, extra.clone(), &mut mutate);
+        let result = drive(operation, context).await;
+        match settle_attempt(
+            result,
+            attempt,
+            "attempt mutation exhausted conflict retries",
+        )
+        .await
+        {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "attempt mutation exhausted conflict retries".to_string(),
-    ))
 }
 
 pub(super) fn bump_generation(control: &mut AttemptControl) -> Result<(), JobMutationError> {
@@ -289,8 +237,7 @@ pub async fn record_attempt_started(
 }
 
 /// `mutate_job`, then in the same transaction marks the launch record of the current attempt
-/// as executed: its guard passed, so the backend accepted this epoch, even when a cancellation
-/// keeps the job from running.
+/// as executed; see [`MarkStartOperation`].
 async fn mutate_marking_start<F>(
     context: &DriverContext,
     job_id: JobId,
@@ -298,79 +245,20 @@ async fn mutate_marking_start<F>(
     mut mutate: F,
 ) -> Result<JobRecord, JobMutationError>
 where
-    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError>,
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Send,
 {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(context)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let result = async {
-            let record =
-                Box::pin(mutate_in_txn(context, txn_id, job_id, &mut mutate, None)).await?;
-            mark_launch_started(context, txn_id, &record, started_at_ms).await?;
-            Ok(record)
-        }
+    let mut attempt = 0;
+    loop {
+        let result = drive(
+            MarkStartOperation::new(job_id, &mut mutate, started_at_ms),
+            context,
+        )
         .await;
-        match result {
-            Ok(record) => match commit_write(
-                context,
-                txn_id,
-                attempt,
-                "job mutation exhausted conflict retries",
-            )
-            .await?
-            {
-                CommitStep::Committed => return Ok(record),
-                CommitStep::Retry => continue,
-            },
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
+        match settle_attempt(result, attempt, "job mutation exhausted conflict retries").await {
+            Some(result) => return result,
+            None => attempt += 1,
         }
     }
-    Err(JobMutationError::Storage(
-        "job mutation exhausted conflict retries".to_string(),
-    ))
-}
-
-async fn mark_launch_started(
-    context: &DriverContext,
-    txn_id: TxnId,
-    record: &JobRecord,
-    started_at_ms: u64,
-) -> Result<(), JobMutationError> {
-    let Some(intent) = &record.attempt_intent else {
-        return Ok(());
-    };
-    let key = ByteView::from(attempt_control_key(record.job_id, intent.attempt_epoch));
-    let storage_error = |error: String| JobMutationError::Storage(error);
-    let Some(value) = read_raw(context, LAUNCH_RECORD_KEYSPACE, key.clone(), Some(txn_id))
-        .await
-        .map_err(storage_error)?
-    else {
-        return Ok(());
-    };
-    let mut launch = LaunchRecord::from_bytes(value.as_ref())
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    if launch.started_at_ms.is_some() {
-        return Ok(());
-    }
-    launch.started_at_ms = Some(started_at_ms);
-    let value = launch
-        .to_bytes()
-        .map_err(|error| JobMutationError::Storage(error.to_string()))?;
-    batch_write(
-        context,
-        vec![(
-            LAUNCH_RECORD_KEYSPACE.to_string(),
-            key,
-            ByteView::from(value),
-        )],
-        Some(txn_id),
-    )
-    .await
-    .map_err(storage_error)
 }
 
 /// The executed launch record of the record's final attempt, if any.

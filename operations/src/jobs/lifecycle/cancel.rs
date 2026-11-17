@@ -16,8 +16,9 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::alias::AliasFamilyOperation;
+use super::publish::publish_terminal;
 use super::routing::family_projection;
-use super::updates::{SETTLE_RETRY_AFTER, publish_terminal, schedule_terminal_settle};
+use super::updates::{SETTLE_RETRY_AFTER, schedule_terminal_settle};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};

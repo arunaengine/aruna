@@ -14,6 +14,7 @@ use crate::notifications::client::{
     unread_counted, watch_created, watch_deleted, watches_listed,
 };
 use crate::notifications::inbox::UpsertInboxOperation;
+use crate::notifications::mark_read::MARK_MAX_IDS;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;

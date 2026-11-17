@@ -86,6 +86,30 @@ pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
 }
 
+/// Creates a watch on this node as its holder, with the owner's READ check and replication.
+pub(crate) async fn create_holder_watch(
+    context: &DriverContext,
+    local_node_id: aruna_core::NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    authorization: aruna_core::structs::execution::notification_watch::WatchAuthorizationBinding,
+    now_ms: u64,
+) -> Result<
+    aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let watch = (path_prefix, event_mask);
+    let create = crate::notifications::watch::store::CreateWatchOperation::new(
+        local_node_id,
+        owner,
+        watch,
+        authorization,
+        now_ms,
+    )?;
+    drive(create, context).await
+}
+
 /// Stores a watch of `owner` on this node without authorization or replication.
 pub(crate) async fn create_local_watch(
     storage: &StorageHandle,

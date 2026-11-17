@@ -32,10 +32,10 @@ use tokio::sync::Mutex;
 use tracing::warn;
 use ulid::Ulid;
 
-use super::limiter::retried;
 use super::manifest::{
     ManifestDigest, lasting_head, lasting_resolution, lasting_source, manifest_digests,
 };
+use super::retried;
 use super::{
     ItemFailure, checkpoint_key, moved_away, persist_slot, pinned_bucket, queue_key, stage_item,
     sync_progress,

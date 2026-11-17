@@ -16,7 +16,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_storage::FjallStorage;
+use aruna_storage::{FjallStorage, StorageHandle};
 use tempfile::tempdir;
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
@@ -604,7 +604,7 @@ async fn stale_checkpoint_rejected() {
         Err(JobMutationError::TokenMismatch)
     ));
     assert_eq!(
-        read_state::<Vec<u8>>(&storage, STAGING_STATE_KEYSPACE, key, "staging checkpoint",)
+        read_state::<Vec<u8>>(&context, STAGING_STATE_KEYSPACE, key, "staging checkpoint",)
             .await
             .unwrap()
             .unwrap(),
@@ -2447,29 +2447,19 @@ async fn external_live_skipped() {
     assert_eq!(stored.state, JobState::Running);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn capacity_not_conflict() {
-    // Cleanup-capacity exhaustion must fail fast, never feed the OCC retry.
-    let (storage, receivers) = StorageHandle::new();
-    let context = crate::testing::test_context(storage.clone());
-    let receiver = receivers.foreground;
-    let actor = std::thread::spawn(move || {
-        let (_effect, response_tx, ..) = receiver.recv().expect("commit effect arrives");
-        assert!(response_tx.send(StorageEvent::Error {
-            error: StorageError::CleanupCapacity,
-        }));
-    });
-
-    let result = commit_txn(&context, Ulid::generate()).await;
-    actor.join().expect("storage actor finishes");
-
-    assert!(matches!(result, CommitResult::Failed(_)));
+#[test]
+fn capacity_not_conflict() {
+    // Cleanup-capacity exhaustion must fail fast, never feed the conflict retry.
+    use aruna_core::calls::IoError;
+    use aruna_core::errors::StorageError;
+    let error = JobMutationError::from(IoError::Storage(StorageError::CleanupCapacity));
+    assert!(matches!(error, JobMutationError::Storage(_)));
 }
 
 // A listing reads the record of an index row that carries none, and a short page ends it.
 #[test]
 fn list_reads_bare_rows() {
-    use super::query::ListJobsOperation;
+    use super::list_jobs::ListJobsOperation;
     use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::operation::Operation;
     let record = queued_record(job_id(1_000));

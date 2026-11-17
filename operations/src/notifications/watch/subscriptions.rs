@@ -1,60 +1,27 @@
-//! Creates and deletes the durable watch subscriptions on the holder node after the owner's
-//! READ check.
+//! Tests the durable watch subscriptions: the store, the per-owner cap and the listings.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
-};
-use ulid::Ulid;
-
-use crate::driver::{DriverContext, drive};
-use crate::notifications::watch::records::{WatchSubscriptionError, watch_delete_replication};
-use crate::notifications::watch::store::{CreateWatchOperation, StoreWatchOperation};
-
-/// The one holder-side create path, used by both the local API arm and the holder RPC.
-pub(crate) async fn create_holder_watch(
-    context: &DriverContext,
-    local_node_id: aruna_core::NodeId,
-    owner: UserId,
-    path_prefix: String,
-    event_mask: WatchEventMask,
-    authorization: WatchAuthorizationBinding,
-    now_ms: u64,
-) -> Result<WatchSubscription, WatchSubscriptionError> {
-    let watch = (path_prefix, event_mask);
-    let create = CreateWatchOperation::new(local_node_id, owner, watch, authorization, now_ms)?;
-    drive(create, context).await
-}
-
-pub(crate) async fn delete_holder_watch(
-    context: &DriverContext,
-    local_node_id: aruna_core::NodeId,
-    owner: UserId,
-    watch_id: Ulid,
-    now_ms: u64,
-) -> Result<(), WatchSubscriptionError> {
-    let replication = watch_delete_replication(local_node_id, owner, watch_id, now_ms);
-    let store = StoreWatchOperation::delete(owner, watch_id, Some(replication));
-    drive(store, context).await.map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
     use crate::notifications::watch::listing::{
         ListWatchesOperation, SUBSCRIPTION_PAGE_LIMIT, WatchScope,
     };
+    use crate::notifications::watch::records::WatchSubscriptionError;
     use crate::notifications::watch::records::decode_stored_subscription;
+    use crate::tests::notifications::create_holder_watch;
     use crate::tests::notifications::{create_local_watch, delete_local_watch};
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::watch_write_entry;
     use aruna_core::structs::execution::notification_watch::WATCH_USER_CAP;
-    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchEventMask, WatchSubscription,
+    };
     use aruna_storage::StorageHandle;
+    use ulid::Ulid;
 
     async fn list_scope(
         storage: &StorageHandle,

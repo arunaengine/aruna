@@ -12,9 +12,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::StagingJobSpec;
 use rand::RngExt;
 
-use crate::driver::drive;
-use crate::jobs::executor::JobContext;
-
 /// Attempts of one request while its answers stay transient.
 const ATTEMPTS: u32 = 5;
 /// The first backoff; each further attempt doubles it.
@@ -32,7 +29,7 @@ fn backoff(attempt: u32, seed: u64) -> Duration {
 
 /// Runs one source request as a child and, for a table import, runs it again after a
 /// transient error until it answers or the attempts run out.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(super) struct Retried<I, O: Operation> {
     input: I,
     build: fn(I) -> O,
@@ -43,8 +40,19 @@ pub(super) struct Retried<I, O: Operation> {
     waiting: bool,
 }
 
+/// Two retries are equal when they stand at the same place; the functions are not compared.
+impl<I: PartialEq, O: Operation> PartialEq for Retried<I, O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.table == other.table
+            && self.attempt == other.attempt
+            && self.seed == other.seed
+            && self.waiting == other.waiting
+    }
+}
+
 impl<I: Clone, O: Operation> Retried<I, O> {
-    fn new(
+    pub(super) fn new(
         spec: &StagingJobSpec,
         input: I,
         build: fn(I) -> O,
@@ -100,32 +108,6 @@ where
             }
             Err(error) => Err(error),
         }
-    }
-}
-
-/// Sends a source request of a table import again after a transient answer; `transient` tells
-/// a retryable failure. Other jobs send once. A cancel or shutdown ends the waiting.
-pub(super) async fn retried<I, O>(
-    ctx: &JobContext,
-    spec: &StagingJobSpec,
-    input: I,
-    build: fn(I) -> O,
-    transient: fn(&O::Error) -> bool,
-) -> Result<O::Output, O::Error>
-where
-    I: Clone + Debug + PartialEq + Send + 'static,
-    O: Operation + 'static,
-    O::Output: PartialEq + 'static,
-    O::Error: 'static,
-{
-    let operation = Retried::new(spec, input, build, transient);
-    if spec.table.is_none() {
-        return drive(operation, &ctx.driver).await;
-    }
-    tokio::select! {
-        result = drive(operation, &ctx.driver) => result,
-        _ = ctx.cancel.cancelled() => Err(IoError::Aborted.into()),
-        _ = ctx.shutdown.cancelled() => Err(IoError::Aborted.into()),
     }
 }
 

@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::jobs::demand::group_demand;
+use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::demand::{DemandSnapshotOperation, merge_view};
 use aruna_core::NodeId;
 use aruna_core::compute::quota::{
     ComputeQuota, QuotaDenied, ResourceTotals, admits, understated_denial,
@@ -13,7 +14,8 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ADMISSION_QUOTA_KEYSPACE;
 use aruna_core::structs::execution::job::EffectiveResources;
 use aruna_core::structs::execution::job::record_rows::from_bytes;
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::storage::node_info::AdvertisementEpoch;
 use aruna_core::types::{GroupId, Key};
 use tracing::{info, warn};
 
@@ -101,6 +103,30 @@ async fn quota_revision(context: &DriverContext, group_id: GroupId) -> Result<u6
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("quota revision read failed: {}", other.label())),
     }
+}
+
+/// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
+/// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
+pub async fn group_demand(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+    node_id: NodeId,
+    group_id: &GroupId,
+) -> Result<(ResourceTotals, bool), String> {
+    let config = drive(GetConfigOperation::new(realm_id), ctx)
+        .await
+        .map_err(|error| format!("failed to read realm config for node info: {error}"))?;
+    let members = config
+        .sync_eligible_nodes()
+        .map_err(|error| error.to_string())?;
+    let local = drive(
+        DemandSnapshotOperation::new(AdvertisementEpoch::default()),
+        ctx,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let fresh = ctx.fresh_heartbeats();
+    Ok(merge_view(local, &members, node_id, &fresh, group_id))
 }
 
 #[cfg(test)]

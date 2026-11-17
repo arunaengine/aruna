@@ -570,24 +570,19 @@ async fn claim_context(
     payload: JobPayload,
 ) -> Result<JobContext, Box<dyn std::error::Error>> {
     let node_id = node.net.node_id();
-    if read_job_record(&node.context.storage_handle, job_id, None)
+    if read_job_record(&node.context, job_id, None)
         .await?
         .is_none()
     {
         let now = unix_timestamp_millis();
         insert_job(
-            &node.context.storage_handle,
+            &node.context,
             &JobRecord::new(job_id, payload, owner, node_id, now, now, None),
         )
         .await?;
     }
-    let ClaimOutcome::Claimed(claimed) = claim_job(
-        &node.context.storage_handle,
-        job_id,
-        node_id,
-        unix_timestamp_millis(),
-    )
-    .await?
+    let ClaimOutcome::Claimed(claimed) =
+        claim_job(&node.context, job_id, node_id, unix_timestamp_millis()).await?
     else {
         return Err("export job was not claimable".into());
     };
@@ -596,13 +591,8 @@ async fn claim_context(
         .as_ref()
         .ok_or("claimed job has no claim")?
         .claim_token;
-    let running = transition_to_running(
-        &node.context.storage_handle,
-        job_id,
-        token,
-        unix_timestamp_millis(),
-    )
-    .await?;
+    let running =
+        transition_to_running(&node.context, job_id, token, unix_timestamp_millis()).await?;
     Ok(JobContext {
         driver: node.context.clone(),
         job_id,
@@ -696,7 +686,7 @@ async fn export_rows(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Vec<ExportReportRow>, Box<dyn std::error::Error>> {
-    let (entries, _next) = list_job_entries(&context.storage_handle, job_id, None, 100).await?;
+    let (entries, _next) = list_job_entries(&context, job_id, None, 100).await?;
     entries
         .into_iter()
         .map(|(_, value)| postcard::from_bytes(value.as_ref()).map_err(Into::into))

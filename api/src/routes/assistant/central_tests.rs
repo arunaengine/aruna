@@ -16,6 +16,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_tasks::TaskHandle;
+use axum::Extension;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::Path;
