@@ -28,10 +28,10 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;

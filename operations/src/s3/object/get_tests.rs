@@ -4,7 +4,6 @@
 
 use crate::connectors::repository::source_connector_key;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate};
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::object::get::{
@@ -12,6 +11,7 @@ use crate::s3::object::get::{
     MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
     get_object_routed, promote_leased, routed_info, slice_blob,
 };
+use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
 use aruna_core::UserId;

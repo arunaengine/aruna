@@ -337,7 +337,7 @@ impl OperationsTaskHandler {
                 warn!(task_id = ?TaskKey::PublishUsageSnapshots, error = %error, "Failed to publish usage snapshots");
                 self.reschedule_timer(
                     TaskKey::PublishUsageSnapshots,
-                    crate::node::usage_stats::SNAPSHOT_PUBLISH_DEBOUNCE,
+                    crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE,
                 )
                 .await;
             }

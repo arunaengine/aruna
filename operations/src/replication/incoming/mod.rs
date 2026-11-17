@@ -12,10 +12,6 @@ use crate::blob::records::{
 use crate::distribution::inventory::{AddedVersion, InventoryChange, version_written};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::storage_routing::load_group_inputs;
-use crate::node::usage_stats::{
-    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
-    schedule_snapshot_publish,
-};
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, drift_reads, gate_decision,
     split_drift_reads, union_refs, write_gate,
@@ -27,6 +23,10 @@ use crate::s3::bucket::create::CreateBucketOperation;
 use crate::s3::bucket::key::rows::settings_read;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::{
+    QuotaGate, QuotaGateError, RowChange, StoredDelta, UsageCounterUpdate, UsageUpdateError,
+    schedule_snapshot_publish,
+};
 use crate::staging::root_record::{compact_version, root_write};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};

@@ -157,7 +157,7 @@ fn existing_fence_decides() {
 }
 
 #[test]
-fn conflict_left_to_runner() {
+fn conflict_retried_outside() {
     // A commit conflict ends the attempt; the runner retries it with a fresh operation.
     let mut operation = acquire_after(vec![started(), read(None), written()]);
     assert!(

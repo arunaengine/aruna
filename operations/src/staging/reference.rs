@@ -13,11 +13,11 @@ use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{
-    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
-};
 use crate::plugins::journal::journaled;
 use crate::s3::purge_fence::{PurgeFenceError, check_write_fence, write_fence_read};
+use crate::s3::usage::{
+    RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
+};
 use crate::staging::descriptor::{build_source_binding, build_source_descriptor};
 use crate::staging::head_source::{HeadSourceError, HeadSourceInput, HeadSourceOperation};
 use crate::tasks::task_persistence::persist_task_effect;

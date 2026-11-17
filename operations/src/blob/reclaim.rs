@@ -38,7 +38,7 @@ use crate::blob::pending_reclaim::ReclaimPendingOperation;
 use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::backends::{RecordReadError, backend_key, parse_read};
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::storage_read::iter_prefix_page;
 use crate::tasks::task_persistence::persist_task_effect;
 
