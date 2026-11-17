@@ -13,7 +13,8 @@ use aruna_core::structs::storage::routing::RoutingError;
 use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::inventory::InventoryError;
-use aruna_operations::driver::{GateContextError, RoutingInputsError};
+use aruna_operations::groups::routing::RoutingInputsError;
+use aruna_operations::placement::policy::GateContextError;
 use aruna_operations::groups::imports::ImportRuleError;
 use aruna_operations::node::usage_stats::UsageUpdateError;
 use aruna_operations::placement::policy::PolicyGateError;
@@ -231,9 +232,8 @@ pub(crate) fn routing_inputs_error(error: RoutingInputsError) -> S3Error {
 /// A destination gate that could not be built at all. An admission stop is not
 /// one: `policy_gate_error` reports that, and only for a write carrying refs.
 pub(crate) fn gate_context_error(error: GateContextError) -> S3Error {
-    match error {
-        GateContextError::Routing(error) => routing_inputs_error(error),
-    }
+    warn!(error = %error, "Refusing write with unreadable routing inputs");
+    s3_error!(InternalError, "Storage routing inputs are unavailable")
 }
 
 fn missing_upload_error() -> S3Error {

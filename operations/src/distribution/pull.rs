@@ -45,7 +45,8 @@ use super::keep::{
     ClaimFillOperation, Claimed, KeepError, KeptCopy, PublishKeptOperation, Published,
 };
 use crate::connectors::resolver::NATIVE_SET_ID;
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
+use aruna_core::time::unix_timestamp_millis;
 use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
@@ -368,7 +369,7 @@ async fn member_of(
         .collect();
     // Replicas share the load by free download slots; the coordinator stays the fallback.
     if replicas > 1 {
-        let chosen = choose_holder(context, &holders[..replicas], now_ms()).await;
+        let chosen = choose_holder(context, &holders[..replicas], unix_timestamp_millis()).await;
         let at = chosen.and_then(|chosen| holders.iter().position(|id| *id == chosen.node_id));
         match at {
             Some(at) => holders[..=at].rotate_right(1),
@@ -379,7 +380,7 @@ async fn member_of(
         }
     }
     // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
-    let fresh: Vec<NodeId> = (candidates(context, &holders, now_ms()).await.into_iter())
+    let fresh: Vec<NodeId> = (candidates(context, &holders, unix_timestamp_millis()).await.into_iter())
         .map(|candidate| candidate.node_id)
         .collect();
     if !fresh.is_empty() {
@@ -434,7 +435,7 @@ async fn from_holders(
             result,
             Err(BaoReadError::Blob(_) | BaoReadError::Refused(BaoReadRefusal::BackendFailure))
         ) {
-            avoid_holder(context, *holder, now_ms());
+            avoid_holder(context, *holder, unix_timestamp_millis());
         }
         if let Some(BaoReadOutput::Stream { blob, .. }) = failures.consider(result) {
             return Ok(blob);
@@ -519,7 +520,7 @@ async fn fill(
     let claim = claim_key(kind, held.set_id, held.version_id, held.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
-        claimed_at_ms: now_ms(),
+        claimed_at_ms: unix_timestamp_millis(),
     };
     match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
         Ok(Claimed::Claimed) => {}

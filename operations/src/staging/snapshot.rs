@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{
-    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
-    routing_snapshot,
-};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use crate::placement::policy::{GateContextError, GateOperation};
+use aruna_core::time::unix_timestamp_millis;
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::descriptor::build_source_binding;
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
@@ -124,10 +124,10 @@ pub async fn stage_snapshot_blob(
             version_id,
         });
     }
-    let routing = routing_snapshot(context, input.group_id, &input.bucket).await?;
+    let routing = drive(SnapshotOperation::new(&node_routing(context), input.group_id, BucketRules::Named(&input.bucket.to_string())), context).await?;
     // The staging source is external, so it carries no refs of its own: only
     // the destination default governs the snapshot.
-    let gate = gate_context(context, input.realm_id, now_ms()).await?;
+    let gate = drive(GateOperation::new(input.realm_id, unix_timestamp_millis()), context).await?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: input.user_id,
         group_id: input.group_id,

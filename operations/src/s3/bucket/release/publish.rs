@@ -41,7 +41,10 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
-use crate::driver::{DriverContext, bucket_snapshot, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::GateOperation;
+use aruna_core::time::unix_timestamp_millis;
 use crate::forward::authorize::is_sync_eligible;
 use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
@@ -546,10 +549,10 @@ async fn put_crate(
     let realm = drive(GetConfigOperation::new(scope.realm_id), context)
         .await
         .map_err(|error| failed(&error))?;
-    let routing = bucket_snapshot(context, scope.info)
+    let routing = drive(SnapshotOperation::new(&node_routing(context), (scope.info).group_id, BucketRules::of(scope.info)), context)
         .await
         .map_err(|error| failed(&error))?;
-    let gate = gate_context(context, scope.realm_id, now_ms())
+    let gate = drive(GateOperation::new(scope.realm_id, unix_timestamp_millis()), context)
         .await
         .map_err(|error| failed(&error))?;
     let size = bytes.len() as u64;

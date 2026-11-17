@@ -38,10 +38,10 @@ use ulid::Ulid;
 use super::DEFAULT_WALLTIME;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::driver::{
-    DriverContext, GateContextError, RoutingInputsError, drive, gate_context, now_ms,
-    quota_marked_routing, routing_snapshot,
-};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::{BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation};
+use crate::placement::policy::{GateContextError, GateOperation};
+use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::source_read::{READ_OPERATION, SourceReadError, authorize_read};
 use crate::jobs::store::reserve_output_commits;
@@ -1035,14 +1035,10 @@ async fn put_file_output(
             std::io::Error::other(error)
         })
     }));
-    let routing = routing_snapshot(context, spec.group_id, &write_bucket)
+    let routing = drive(SnapshotOperation::new(&node_routing(context), spec.group_id, BucketRules::Named(&write_bucket.to_string())), context)
         .await
         .map_err(|error| routing_error("output write", error))?;
-    let gate = gate_context(
-        context,
-        context.serving_realm(record.created_by.realm_id),
-        now_ms(),
-    )
+    let gate = drive(GateOperation::new(context.serving_realm(record.created_by.realm_id), unix_timestamp_millis()), context)
     .await
     .map_err(|error| gate_error("output write", error))?;
     if gate.as_ref().is_some_and(|gate| !gate.admitting) {
@@ -1203,7 +1199,7 @@ async fn replicate_output(
                     JobError::retryable(format!("output staging authorization failed: {error}"))
                 }
             })?;
-    let routing = quota_marked_routing(context)
+    let routing = drive(QuotaOperation::new(node_routing(context)), context)
         .await
         .map_err(|error| routing_error("output copy", error))?;
     let operation = ReplicateScopeOperation::new(ReplicateScopeInput {

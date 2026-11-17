@@ -122,7 +122,7 @@ pub(crate) async fn resume_transitions(
 /// Advances every queued transition by one page. Returns when the task must run again.
 pub async fn process_transitions(context: &DriverContext) -> Result<Option<Duration>, String> {
     let storage = &context.storage_handle;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut next = None::<Duration>;
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     let mut after = None;
@@ -212,7 +212,7 @@ async fn advance(
     bucket: &str,
     mut record: EncryptionTransition,
 ) -> Result<Option<Duration>, String> {
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     record.retry_at_ms = None;
     if record.state == TransitionState::Finished {
         return finish(context, bucket, record).await;
@@ -340,7 +340,7 @@ async fn settle(
         }
     }
     record.cleanup_remaining = left;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     if left > 0 {
         record.retry_at_ms = Some(now.saturating_add(RECHECK.as_millis() as u64));
         store(storage, bucket, &mut record).await?;
@@ -364,7 +364,7 @@ async fn finish(
     bucket: &str,
     mut record: EncryptionTransition,
 ) -> Result<Option<Duration>, String> {
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     if let Some(source) = record.source
         && record.target.plan.map(|plan| plan.key) != Some(source)
     {
@@ -650,7 +650,7 @@ async fn stage(
             };
             record.blocked_reason = (versions == 0).then(|| PENDING_REASON.to_string());
             record.retry_at_ms = Some(
-                crate::effect_adapters::routing::now_ms()
+                aruna_core::time::unix_timestamp_millis()
                     .saturating_add(RECHECK.as_millis() as u64),
             );
         }

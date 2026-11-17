@@ -34,7 +34,10 @@ use super::walk::{
 use super::{ItemFailure, pinned_bucket, queue_key};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
-use crate::driver::{bucket_snapshot, drive, gate_context, now_ms};
+use crate::driver::{drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::GateOperation;
+use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::executor::JobContext;
 use crate::node::usage_stats::QuotaGateError;
 use crate::placement::policy::gate::PolicyGateError;
@@ -773,11 +776,11 @@ async fn write_object(
     (body, metadata): (Bytes, &BTreeMap<String, String>),
 ) -> Result<(), ItemFailure> {
     let system = |error: String| ItemFailure::System(error);
-    let routing = bucket_snapshot(&ctx.driver, bucket)
+    let routing = drive(SnapshotOperation::new(&node_routing(&ctx.driver), (bucket).group_id, BucketRules::of(bucket)), &ctx.driver)
         .await
         .map_err(|error| system(error.to_string()))?;
     let auth = &spec.auth_context;
-    let gate = gate_context(&ctx.driver, auth.realm_id, now_ms())
+    let gate = drive(GateOperation::new(auth.realm_id, unix_timestamp_millis()), &ctx.driver)
         .await
         .map_err(|error| system(error.to_string()))?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), &ctx.driver)

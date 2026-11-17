@@ -12,7 +12,8 @@ use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permissi
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
 use aruna_operations::abe::{KeyAction, KeyResult, drive_key};
 use aruna_operations::driver::drive;
-use aruna_operations::driver::now_ms;
+use aruna_operations::driver::drive;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
@@ -494,7 +495,7 @@ pub async fn create_s3_credentials(
     );
     if !buckets.is_empty() {
         let buckets = buckets.iter().cloned().collect();
-        operation = operation.with_tokens(buckets, (realm_id, node_id), now_ms());
+        operation = operation.with_tokens(buckets, (realm_id, node_id), unix_timestamp_millis());
     }
     let (access_key_id, access_secret, access) = match drive(operation, &state.get_ctx()).await {
         Ok(created) => created,

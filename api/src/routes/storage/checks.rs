@@ -11,7 +11,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
 use aruna_operations::blob::migration::check::{clean_broken, is_current, list_broken, read_check};
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
 use aruna_operations::s3::object::delete::DeleteObjectInput;
 use axum::Json;
@@ -357,7 +358,7 @@ pub async fn start_bucket_check(
 ) -> ServerResult<(StatusCode, Json<CheckProgress>)> {
     let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let operation = StartCheckOperation::new(bucket, group_id, now_ms());
+    let operation = StartCheckOperation::new(bucket, group_id, unix_timestamp_millis());
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(|error| match error {

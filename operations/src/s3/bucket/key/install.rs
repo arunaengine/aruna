@@ -1009,7 +1009,7 @@ mod tests {
             caller: UserId::new(Ulid::from_bytes([5; 16]), realm),
             key,
             duration: Some(duration),
-            now_ms: crate::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         };
         let unlock = UnlockBucketOperation::new(input, enabled.private_key);
         let status = unlock_and_wake(&context, unlock, (realm, node), &RoCrateLimits::default())

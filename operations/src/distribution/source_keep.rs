@@ -27,7 +27,8 @@ use ulid::Ulid;
 use super::keep::{ClaimFillOperation, Claimed, KeptCopy, PublishKeptOperation, Published};
 use super::pull::{HeldElsewhere, admitted, drop_copy, drop_evicted, fill_slot, read_row, release};
 use crate::connectors::{ResolveBindingInput, ResolveBindingOperation};
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
+use aruna_core::time::unix_timestamp_millis;
 use crate::s3::object::get::strong_validator;
 
 /// One reference a read served from its source.
@@ -185,7 +186,7 @@ async fn keep_source(
     let claim = claim_key(plan.kind, plan.set_id, keep.version_id, plan.identity);
     let claimed = FillClaim {
         claim_id: Ulid::generate(),
-        claimed_at_ms: now_ms(),
+        claimed_at_ms: unix_timestamp_millis(),
     };
     match drive(ClaimFillOperation::new(claim.clone(), claimed), context).await {
         Ok(Claimed::Claimed) => {}

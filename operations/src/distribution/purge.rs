@@ -36,7 +36,8 @@ use super::feed_store::split_key;
 use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
-use crate::driver::{DriverContext, drive, now_ms};
+use crate::driver::{DriverContext, drive};
+use aruna_core::time::unix_timestamp_millis;
 use crate::node::usage_stats::{dirty_rows, mark_dirty, wake_publish};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
@@ -353,7 +354,7 @@ async fn abort_uploads(
             bucket: target.bucket.clone(),
             key: position.key,
             upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         };
         let abort = AbortUploadOperation::new(input).including_in_progress();
         match drive(abort, context).await {

@@ -14,7 +14,8 @@ use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTas
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::groups::imports::discovery::bucket_access;
 use aruna_operations::groups::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
@@ -318,7 +319,7 @@ async fn start_job(
 ) -> ServerResult<(StatusCode, Json<OrganizeJob>)> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let grant = token_grant(bearer.as_str()).map_err(|_| ServerError::Unauthorized)?;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
     let job = LinkedJob {
         id: Ulid::generate(),
         task,
@@ -726,7 +727,7 @@ pub async fn control_job(
         "abort" => LinkedAction::Abort,
         _ => return Err(ServerError::BadRequestMessage("unknown action".to_string())),
     };
-    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, now_ms());
+    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, unix_timestamp_millis());
     let context = state.get_ctx();
     let job = drive(operation, &context).await.map_err(job_error)?;
     Ok(Json(shown(&context, &rule.bucket, job).await?))

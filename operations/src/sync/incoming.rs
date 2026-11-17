@@ -12,9 +12,10 @@ use crate::auth::request_policy::{
     PolicyEnforcementError, PolicyEvaluator, PolicyRequestExtras, policy_request_with,
 };
 use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::driver::{
-    DriverContext, drive, gate_context, node_routing, now_ms, quota_marked_routing,
-};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::QuotaOperation;
+use crate::placement::policy::GateOperation;
+use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -171,7 +172,7 @@ impl OperationsInboundHandler {
         let watch_manifest = manifest.clone();
         // Only a materialized item can place a blob, so only it reads the caps.
         let routing = if manifest.kind == ReplicationItemKind::Materialized {
-            match quota_marked_routing(self.context.as_ref()).await {
+            match drive(QuotaOperation::new(node_routing(self.context.as_ref())), self.context.as_ref()).await {
                 Ok(routing) => routing,
                 Err(error) => {
                     error!(
@@ -200,7 +201,7 @@ impl OperationsInboundHandler {
                     return;
                 }
             };
-        let gate = match gate_context(self.context.as_ref(), realm_id, now_ms()).await {
+        let gate = match drive(GateOperation::new(realm_id, unix_timestamp_millis()), self.context.as_ref()).await {
             Ok(gate) => gate,
             Err(error) => {
                 error!(
@@ -262,7 +263,7 @@ impl OperationsInboundHandler {
         let op = IncomingBaoOperation::new(peer, local_node, realm_id, stream_id, request)
             .with_policy_paths(policy_paths)
             .with_policy_candidates(policy_candidates, had_denial)
-            .with_now(now_ms())
+            .with_now(unix_timestamp_millis())
             .with_snapshot();
         if let Err(error) = drive(op, self.context.as_ref()).await {
             error!(

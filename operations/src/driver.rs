@@ -23,14 +23,11 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
 
-pub use effect_adapters::routing::{
-    GateContextError, RoutingInputsError, backend_used_bytes, bucket_snapshot, gate_context,
-    node_routing, now_ms, quota_marked_routing, routing_snapshot,
-};
+pub use effect_adapters::routing::node_routing;
 
 /// Handles and capabilities one operation run may use. Only `storage_handle` is
 /// required; an absent plane keeps its adapter's explicit outcome, and governed
-/// writes fail closed through [`gate_context`] without an advertised subject.
+/// writes fail closed through the gate operation without an advertised subject.
 #[derive(Clone)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,

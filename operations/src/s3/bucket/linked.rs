@@ -452,7 +452,7 @@ pub async fn process_linked(context: &DriverContext) -> Result<Option<Duration>,
                 continue;
             }
             let bucket = String::from_utf8(key.to_vec()).map_err(|error| error.to_string())?;
-            let now = crate::effect_adapters::routing::now_ms();
+            let now = aruna_core::time::unix_timestamp_millis();
             let due = job.updated_at_ms + WAIT.as_millis() as u64;
             let after = match job.waiting.is_some() && now < due {
                 true => Duration::from_millis(due - now),
@@ -645,7 +645,7 @@ async fn store_once(
             return other.map(|_| true).map_err(|error| error.to_string());
         }
     };
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     current.cursor = step.cursor;
     current.done += step.done;
     current.skipped += step.skipped;

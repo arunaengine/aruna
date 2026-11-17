@@ -852,7 +852,7 @@ async fn spawn_seed_at(
             realm_id,
             net.node_id(),
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
-            aruna_operations::driver::now_ms(),
+            aruna_core::time::unix_timestamp_millis(),
         )
         .await
         .map_err(std::io::Error::other)?;

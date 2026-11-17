@@ -2,7 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, GateContextError, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive};
+use crate::placement::policy::{GateContextError, GateOperation};
+use aruna_core::time::unix_timestamp_millis;
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::s3::fence_store::ensure_write_allowed;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
@@ -203,7 +205,7 @@ async fn gate_part(
     refs: &[PlacementPolicyRef],
     group_id: GroupId,
 ) -> Result<(), PartCopyError> {
-    let destination = gate_context(context, realm_id, now_ms()).await?;
+    let destination = drive(GateOperation::new(realm_id, unix_timestamp_millis()), context).await?;
     let Some(gate) =
         write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
     else {
@@ -354,7 +356,9 @@ async fn read_upload(
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::gate_context;
+    use crate::driver::drive;
+    use crate::placement::policy::GateOperation;
+    use aruna_core::time::unix_timestamp_millis;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
@@ -423,7 +427,7 @@ mod test {
         key: &str,
         data: &'static [u8],
     ) {
-        let gate = gate_context(context, realm_id, 1_000)
+        let gate = drive(GateOperation::new(realm_id, 1_000), context)
             .await
             .expect("subject reads");
         let mut operation = PutObjectOperation::new(PutObjectConfig {

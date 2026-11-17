@@ -88,9 +88,10 @@ use aruna_operations::auth::check_permissions::{
 };
 use aruna_operations::auth::request_authorization::{AuthorizeError, BucketAccess, authorize};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{
-    DriverContext, bucket_snapshot, drive, drive_until, gate_context, now_ms, routing_snapshot,
-};
+use aruna_operations::driver::{DriverContext, drive, drive_until, node_routing};
+use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_operations::placement::policy::GateOperation;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
@@ -1108,12 +1109,12 @@ impl S3 for ArunaS3Service {
         let copied = forward::copy_context(&req.extensions, &req.headers)?;
         let create_only = (req.input.if_none_match.as_ref()).is_some_and(|tag| tag.is_any());
         let routing = match bucket_info.as_ref() {
-            Some(info) => bucket_snapshot(&self.state, info).await,
-            None => routing_snapshot(&self.state, group_id, &replication_bucket).await,
+            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
+            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&replication_bucket.to_string())), &self.state).await,
         }
         .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
             .await
             .map_err(gate_context_error)?;
         let mut operation = PutObjectOperation::new(PutObjectConfig {
@@ -1453,11 +1454,11 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let routing = match bucket_info.as_ref() {
-            Some(info) => bucket_snapshot(&self.state, info).await,
-            None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
+            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
+            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&req.input.bucket.to_string())), &self.state).await,
         }
         .map_err(routing_inputs_error)?;
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
             .await
             .map_err(gate_context_error)?;
         let mut operation = CreateMultipartOperation::new(CMPI {
@@ -1878,12 +1879,12 @@ impl S3 for ArunaS3Service {
             .unwrap_or_default();
         validate_part_count(&checksum_request, completed_parts.len())?;
 
-        let gate = gate_context(&self.state, self.realm_id, now_ms())
+        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
             .await
             .map_err(gate_context_error)?;
         let routing = match bucket_info.as_ref() {
-            Some(info) => bucket_snapshot(&self.state, info).await,
-            None => routing_snapshot(&self.state, group_id, &req.input.bucket).await,
+            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
+            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&req.input.bucket.to_string())), &self.state).await,
         }
         .map_err(routing_inputs_error)?;
         let checksum_type = parse_checksum_type(&checksum_request.checksum_type);
@@ -1913,7 +1914,7 @@ impl S3 for ArunaS3Service {
             object_size,
             created_by: user_access.user_identity,
             quota_ceiling,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         })
         .with_rocrate_limits(self.rocrate_limits.clone())
         .with_restrictions(replication_auth.path_restrictions.clone())
@@ -2012,7 +2013,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         });
 
         // A dropped connection must not stop the abort between its transactions.

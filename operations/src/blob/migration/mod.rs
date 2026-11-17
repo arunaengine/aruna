@@ -13,6 +13,7 @@ use crate::blob::cleanup_rows::schedule_cleanup_effect;
 use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::groups::storage_routing::routing_key;
 use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::key::rows::settings_read;
@@ -1749,7 +1750,7 @@ pub async fn process_migrations(
         None,
     )
     .await?;
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let mut next = None::<Duration>;
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     for (key, _) in rows {
@@ -1853,7 +1854,7 @@ async fn migrate_page(
         if !hand_over_moves(context, bucket, record.started_at_ms).await? {
             return Ok(Some(MIGRATION_CONTINUE));
         }
-        record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+        record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
         store_progress(context, bucket, &record, None).await?;
         return Ok(None);
     }
@@ -1866,7 +1867,7 @@ async fn migrate_page(
         true => match move_routing(context, bucket).await? {
             Some(routing) => Some(routing),
             None => {
-                record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+                record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
                 store_progress(context, bucket, &record, None).await?;
                 return Ok(None);
             }
@@ -2036,7 +2037,7 @@ async fn migrate_page(
             "Files the rename's caller may not write keep their name"
         );
     }
-    let now = crate::effect_adapters::routing::now_ms();
+    let now = aruna_core::time::unix_timestamp_millis();
     let after = match (more, record.failed > 0) {
         // This run moved the cursor, so the rows left can go on at once.
         (true, _) => Some(Duration::ZERO),
@@ -2125,7 +2126,7 @@ async fn end_aborted(
         return Ok(Some(MIGRATION_CONTINUE));
     }
     record.retry_at_ms = None;
-    record.finished_at_ms = Some(crate::effect_adapters::routing::now_ms());
+    record.finished_at_ms = Some(aruna_core::time::unix_timestamp_millis());
     store_progress(context, bucket, &record, None).await?;
     Ok(None)
 }
@@ -2523,7 +2524,7 @@ async fn is_broken(context: &crate::driver::DriverContext, key: &Key) -> bool {
     let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
         return false;
     };
-    let now_ms = crate::effect_adapters::routing::now_ms();
+    let now_ms = aruna_core::time::unix_timestamp_millis();
     let operation = check::CheckVersionOperation::new(version_key, now_ms);
     let outcome = crate::driver::drive(operation, context).await;
     matches!(outcome, Ok(check::CheckOutcome::Broken(_)))
@@ -2544,7 +2545,7 @@ pub async fn move_routing(
     let Some(info) = info.map_err(|error| error.to_string())? else {
         return Ok(None);
     };
-    let snapshot = crate::effect_adapters::routing::bucket_snapshot(context, &info).await;
+    let snapshot = crate::driver::drive(SnapshotOperation::new(&crate::driver::node_routing(context), info.group_id, BucketRules::of(&info)), context).await;
     snapshot.map(Some).map_err(|error| error.to_string())
 }
 

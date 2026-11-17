@@ -28,7 +28,9 @@ use ulid::Ulid;
 use super::executor::{JobContext, JobRunOutcome};
 use super::plugin_work::{PROGRESS_TICK, account, key_wait, permanent, refused};
 use crate::driver::drive;
-use crate::effect_adapters::routing::{gate_context, routing_snapshot};
+use crate::driver::{drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::GateOperation;
 use crate::plugins::broker::local_object;
 use crate::plugins::broker::whole_text;
 use crate::plugins::check::{authorize_access, authorize_call, matching};
@@ -128,11 +130,11 @@ pub async fn download_work(
         Arc::new(AtomicBool::new(false)),
     );
     let counted = counted(response, download.max_bytes, &pulled, (&over, &broken));
-    let routing = match routing_snapshot(&ctx.driver, install.group_id, &bucket).await {
+    let routing = match drive(SnapshotOperation::new(&node_routing(&ctx.driver), install.group_id, BucketRules::Named(&bucket.to_string())), &ctx.driver).await {
         Ok(routing) => routing,
         Err(error) => return retryable(error.to_string()),
     };
-    let gate = match gate_context(&ctx.driver, spec.realm_id, unix_timestamp_millis()).await {
+    let gate = match drive(GateOperation::new(spec.realm_id, unix_timestamp_millis()), &ctx.driver).await {
         Ok(gate) => gate,
         Err(error) => return retryable(error.to_string()),
     };

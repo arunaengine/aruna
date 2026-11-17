@@ -33,7 +33,8 @@ use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
-use crate::driver::{DriverContext, drive, routing_snapshot};
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::forward::authorize::peer_acts_for;
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -511,7 +512,7 @@ async fn commit_pull(
             return Err(read_refusal(&error));
         }
     };
-    let routing = routing_snapshot(context, bucket.group_id, &request.target_bucket)
+    let routing = drive(SnapshotOperation::new(&node_routing(context), bucket.group_id, BucketRules::Named(&request.target_bucket.to_string())), context)
         .await
         .map_err(|_| SyncRefusal::Unavailable)?;
     let quota = load_realm_config(context, auth.realm_id)

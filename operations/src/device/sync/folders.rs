@@ -687,7 +687,7 @@ async fn abort_uploads(
                 bucket: upload.bucket,
                 key: upload.key,
                 upload_id: upload.upload_id,
-                now_ms: crate::driver::now_ms(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             });
             if resume {
                 abort = abort.resuming_abort();
@@ -1322,7 +1322,7 @@ mod tests {
         let context = Arc::new(fixture.driver_context);
         let (_root, folder, mut upload) = offered_folder(&context).await;
         upload.status = MultipartUploadStatus::Completing;
-        upload.completing_since_ms = Some(crate::driver::now_ms());
+        upload.completing_since_ms = Some(aruna_core::time::unix_timestamp_millis());
         store_upload(&context, &upload).await;
 
         assert_eq!(

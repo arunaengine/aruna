@@ -1045,7 +1045,8 @@ impl Operation for PolicyBulkOperation {
 #[cfg(test)]
 mod tests {
     use super::{BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, PolicyBulkOperation};
-    use crate::driver::{DriverContext, drive, gate_context};
+    use crate::driver::{DriverContext, drive};
+    use crate::placement::policy::GateOperation;
     use crate::placement::policy::cache::cache_key;
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -1210,7 +1211,7 @@ mod tests {
     }
 
     async fn put_object(context: &DriverContext, fixture: &Fixture, key: &str) -> Ulid {
-        let gate = gate_context(context, fixture.realm_id, 1_000)
+        let gate = drive(GateOperation::new(fixture.realm_id, 1_000), context)
             .await
             .expect("subject reads");
         let mut operation = PutObjectOperation::new(PutObjectConfig {

@@ -14,7 +14,8 @@ use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN}
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
-use aruna_operations::driver::{drive, now_ms};
+use aruna_operations::driver::drive;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
 use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use aruna_operations::groups::imports::cron::next_due;
@@ -977,7 +978,7 @@ pub async fn start_renames(
     }
     // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
+    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis())
         .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
         .with_guards(guards);
     let record = drive(operation, &state.get_ctx())

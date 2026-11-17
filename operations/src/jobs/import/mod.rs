@@ -66,7 +66,10 @@ use super::executor::{JobContext, JobRunOutcome};
 use super::metadata_class::MetadataFailure;
 use super::store::{list_job_entries, put_job_entry, put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{GateContextError, bucket_snapshot, drive, gate_context, now_ms};
+use crate::driver::{drive, node_routing};
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::placement::policy::{GateContextError, GateOperation};
+use aruna_core::time::unix_timestamp_millis;
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
 use crate::metadata::create_document::{
@@ -924,7 +927,7 @@ async fn write_next(
     .map_err(|error| ImportFailure::Retryable(error.to_string()))?
     .quota
     .effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&ctx.driver, &bucket_info)
+    let routing = drive(SnapshotOperation::new(&node_routing(&ctx.driver), bucket_info.group_id, BucketRules::of(&bucket_info)), &ctx.driver)
         .await
         .map_err(|error| match error.storage() {
             Some(_) => ImportFailure::Retryable(error.to_string()),
@@ -932,7 +935,7 @@ async fn write_next(
         })?;
     // The archive entry is external, so it carries no refs of its own: only
     // the destination default governs the imported object.
-    let gate = gate_context(&ctx.driver, spec.auth_context.realm_id, now_ms())
+    let gate = drive(GateOperation::new(spec.auth_context.realm_id, unix_timestamp_millis()), &ctx.driver)
         .await
         .map_err(classify_gate)?;
     // A node that stopped admitting governed data imports nothing until the

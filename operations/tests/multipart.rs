@@ -30,7 +30,8 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::cleanup::{process_cleanup_batch, sweep_stale_uploads};
-use aruna_operations::driver::{DriverContext, drive, now_ms};
+use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 use aruna_operations::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
@@ -227,7 +228,7 @@ async fn complete_upload(
             object_size,
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -341,7 +342,7 @@ async fn completion_persists_parts() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -570,7 +571,7 @@ async fn rejects_missing_checksum() {
             object_size: Some(8),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -752,7 +753,7 @@ async fn completion_retains_path() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1190,7 +1191,7 @@ async fn abort_removes_parts() {
             bucket: "bucket-a".to_string(),
             key: "abort.bin".to_string(),
             upload_id,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1367,7 +1368,7 @@ async fn delete_removes_metadata() {
             object_size: Some((part1.len() + part2.len()) as u64),
             created_by,
             quota_ceiling: None,
-            now_ms: aruna_operations::driver::now_ms(),
+            now_ms: aruna_core::time::unix_timestamp_millis(),
         }),
         &context.driver,
     )
@@ -1529,7 +1530,7 @@ async fn abort_reopens_upload() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     let mut operation = stall_completion(
         &context,
@@ -1567,7 +1568,7 @@ async fn dropped_completion_retries() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     // The first attempt is abandoned mid-compose and never cleans up.
     drop(
@@ -1616,7 +1617,7 @@ async fn abort_refuses_lease() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
     let _stalled = stall_completion(
         &context,
         completion_input(upload.upload_id, &part, realm_id, node_id, created_by, now),
@@ -1688,7 +1689,7 @@ async fn sweep_reclaims_upload() {
         created_by,
     )
     .await;
-    let now = now_ms();
+    let now = unix_timestamp_millis();
 
     let mut stale = read_upload(&context, upload.upload_id).await.unwrap();
     stale.status = MultipartUploadStatus::Completing;
@@ -1736,7 +1737,7 @@ async fn sweep_finishes_abort() {
     halted.status = MultipartUploadStatus::Aborting;
     write_upload(&context, &halted).await;
 
-    let outcome = sweep_stale_uploads(&context.driver, now_ms())
+    let outcome = sweep_stale_uploads(&context.driver, unix_timestamp_millis())
         .await
         .unwrap();
 
@@ -1949,7 +1950,7 @@ async fn s3_provider_flow() {
             bucket: "bucket".to_string(),
             key: "aborted.bin".to_string(),
             upload_id: aborted.upload_id,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &context.driver,
     )

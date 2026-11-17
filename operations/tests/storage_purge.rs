@@ -372,7 +372,7 @@ async fn scoped_fence_isolates() {
                 object_size: None,
                 created_by: context.user_id,
                 quota_ceiling: None,
-                now_ms: aruna_operations::driver::now_ms(),
+                now_ms: aruna_core::time::unix_timestamp_millis(),
             }),
             &context.driver,
         )

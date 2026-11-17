@@ -43,7 +43,9 @@ use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive, gate_context, now_ms};
+use crate::driver::{DriverContext, drive};
+use crate::placement::policy::GateOperation;
+use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
@@ -128,7 +130,7 @@ pub async fn admit_launch(
     };
     // A node that stopped admitting governed data declines every new execution
     // target categorically, whatever the offered work references.
-    match gate_context(context.as_ref(), realm_id, now_ms()).await {
+    match drive(GateOperation::new(realm_id, unix_timestamp_millis()), context.as_ref()).await {
         Ok(Some(gate)) if !gate.admitting => return Some(Err(LaunchDecline::Draining)),
         Err(_) => return None,
         Ok(_) => {}
@@ -763,7 +765,7 @@ async fn placement_verdict(
                 realm_id: spec.realm_id,
                 policy_ref: *policy_ref,
                 local_node_id: subject.node_id,
-                now_ms: now_ms(),
+                now_ms: unix_timestamp_millis(),
             }),
             context,
         )
