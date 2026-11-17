@@ -6,26 +6,30 @@
 use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 
 use super::queue::{BlobQueueError, schedule_blob_drain};
+use std::collections::VecDeque;
 
 use super::drain::REPLICATION_POLL_AFTER;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::key_unlocked;
 use crate::storage_read::iter_prefix_page;
-use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
 };
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
 };
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::task::TaskEvent;
+use aruna_core::types::{Effects, Key, TxnId, Value};
 use aruna_storage::StorageHandle;
+use smallvec::smallvec;
 use std::collections::BTreeSet;
 use tracing::warn;
 use ulid::Ulid;
@@ -98,7 +102,11 @@ pub(crate) async fn park_job(
     for key in keys {
         if !current || key_unlocked(context, *key).await {
             let now_ms = aruna_core::time::unix_timestamp_millis();
-            wake_job(storage, wait_row(*key, &job_key), now_ms).await?;
+            drive(
+                WakeJobOperation::new(wait_row(*key, &job_key), now_ms),
+                context,
+            )
+            .await?;
             return Ok(Some(now_ms));
         }
     }
@@ -219,163 +227,451 @@ async fn wait_current(
     }
 }
 
-/// Makes every job parked for `key` due now and schedules a drain. Returns how many woke.
-pub async fn wake_parked(
-    context: &DriverContext,
-    key: BucketKeyRef,
-    now_ms: u64,
-) -> Result<usize, BlobQueueError> {
-    let storage = &context.storage_handle;
-    let prefix: Key = key.key().into();
-    let mut start_after = None;
-    let mut woken = 0;
-    loop {
-        let page = iter_prefix_page(
-            storage,
-            COPY_WAIT_KEYSPACE,
-            Some(prefix.clone()),
-            start_after.clone(),
-            WAIT_PAGE,
-            None,
-        )
-        .await
-        .map_err(|error| BlobQueueError::Storage(StorageError::ReadError(error)))?;
-        let (rows, _) = page;
-        for (row, _) in &rows {
-            woken += usize::from(wake_job(storage, row.to_vec(), now_ms).await?);
-        }
-        match rows.last() {
-            Some((row, _)) if rows.len() == WAIT_PAGE => start_after = Some(row.clone()),
-            _ => break,
-        }
-    }
-    if woken > 0
-        && let Some(tasks) = context.task_handle.as_ref()
-    {
-        let event = tasks.send_effect(schedule_blob_drain()).await;
-        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
-            warn!(message = %message, "Failed to schedule the drain of woken copy jobs");
-        }
-    }
-    Ok(woken)
-}
-
-/// Copy jobs of a relationship that wait for a source key now.
-pub async fn awaiting_jobs(
-    context: &DriverContext,
-    relationship_id: Ulid,
-) -> Result<usize, BlobQueueError> {
-    let storage = &context.storage_handle;
-    let mut start_after = None;
-    let mut jobs = BTreeSet::new();
-    loop {
-        let page = iter_prefix_page(
-            storage,
-            COPY_WAIT_KEYSPACE,
-            None,
-            start_after.clone(),
-            WAIT_PAGE,
-            None,
-        )
-        .await
-        .map_err(|error| BlobQueueError::Storage(StorageError::ReadError(error)))?;
-        let (rows, _) = page;
-        for (row, value) in &rows {
-            let owner: Option<Ulid> =
-                postcard::from_bytes(value).map_err(aruna_core::errors::ConversionError::from)?;
-            if owner == Some(relationship_id) && row.len() > REF_LEN {
-                jobs.insert(row[REF_LEN..].to_vec());
-            }
-        }
-        match rows.last() {
-            Some((row, _)) if rows.len() == WAIT_PAGE => start_after = Some(row.clone()),
-            _ => break,
-        }
-    }
-    let mut parked = 0;
-    for job_key in jobs {
-        let job = read_job(storage, &job_key, None).await?;
-        parked += usize::from(job.is_some_and(|job| job.due_at_ms == PARKED_DUE));
-    }
-    Ok(parked)
+#[derive(Debug, PartialEq)]
+enum WakeState {
+    Init,
+    StartTransaction,
+    ReadJob,
+    WriteJob,
+    DeleteWait,
+    Commit,
+    Finish,
+    Error,
 }
 
 /// Makes the job of one wait row due at `now_ms` and drops the row, in one transaction. A job
-/// that is gone or already due only loses the row. True when a parked job woke.
-async fn wake_job(
-    storage: &StorageHandle,
+/// that is gone or already due only loses the row. True when a parked job woke; a commit
+/// conflict starts over, at most `WAKE_ATTEMPTS` times in all.
+#[derive(Debug, PartialEq)]
+pub(crate) struct WakeJobOperation {
     wait: Vec<u8>,
+    job_key: Vec<u8>,
     now_ms: u64,
-) -> Result<bool, BlobQueueError> {
-    let Some(job_key) = wait.get(REF_LEN..).map(<[u8]>::to_vec) else {
-        return Ok(false);
-    };
-    let mut attempt = 0;
-    loop {
-        attempt += 1;
-        match wake_once(storage, &wait, &job_key, now_ms).await {
-            Err(BlobQueueError::Storage(StorageError::TransactionConflict))
-                if attempt < WAKE_ATTEMPTS => {}
-            result => return result,
-        }
-    }
-}
-
-async fn wake_once(
-    storage: &StorageHandle,
-    wait: &[u8],
-    job_key: &[u8],
-    now_ms: u64,
-) -> Result<bool, BlobQueueError> {
-    let txn_id = start(storage).await?;
-    let result = async {
-        let job = read_job(storage, job_key, Some(txn_id)).await?;
-        let woke = job.as_ref().is_some_and(|job| job.due_at_ms == PARKED_DUE);
-        if let Some(mut job) = job.filter(|_| woke) {
-            job.due_at_ms = now_ms;
-            let write = StorageEffect::Write {
-                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-                key: job_key.to_vec().into(),
-                value: job.to_bytes()?.into(),
-                txn_id: Some(txn_id),
-            };
-            run(storage, write).await?;
-        }
-        let delete = StorageEffect::Delete {
-            key_space: COPY_WAIT_KEYSPACE.to_string(),
-            key: wait.to_vec().into(),
-            txn_id: Some(txn_id),
-        };
-        run(storage, delete).await?;
-        Ok(woke)
-    }
-    .await;
-    match result {
-        Ok(woke) => commit(storage, txn_id).await.map(|()| woke),
-        Err(error) => {
-            abort(storage, txn_id).await;
-            Err(error)
-        }
-    }
-}
-
-async fn read_job(
-    storage: &StorageHandle,
-    job_key: &[u8],
+    attempt: usize,
     txn_id: Option<TxnId>,
-) -> Result<Option<BlobJobRecord>, BlobQueueError> {
-    let read = StorageEffect::Read {
-        key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-        key: job_key.to_vec().into(),
-        txn_id,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+    woke: bool,
+    state: WakeState,
+    error: Option<BlobQueueError>,
+}
+
+impl WakeJobOperation {
+    pub(crate) fn new(wait: Vec<u8>, now_ms: u64) -> Self {
+        let job_key = wait.get(REF_LEN..).map(<[u8]>::to_vec).unwrap_or_default();
+        Self {
+            wait,
+            job_key,
+            now_ms,
+            attempt: 0,
+            txn_id: None,
+            woke: false,
+            state: WakeState::Init,
+            error: None,
+        }
+    }
+
+    fn begin(&mut self) -> Effects {
+        self.attempt += 1;
+        self.woke = false;
+        self.state = WakeState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn fail(&mut self, error: BlobQueueError) -> Effects {
+        self.state = WakeState::Error;
+        self.error = Some(error);
+        abort_effects(&mut self.txn_id)
+    }
+
+    fn job_read(&mut self, value: Option<Value>) -> Effects {
+        let job = match value
             .map(|value| BlobJobRecord::from_bytes(&value))
             .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        {
+            Ok(job) => job,
+            Err(error) => return self.fail(error.into()),
+        };
+        let Some(mut job) = job.filter(|job| job.due_at_ms == PARKED_DUE) else {
+            return self.delete_wait();
+        };
+        self.woke = true;
+        job.due_at_ms = self.now_ms;
+        let value = match job.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.into()),
+        };
+        self.state = WakeState::WriteJob;
+        smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+            key: self.job_key.clone().into(),
+            value: value.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn delete_wait(&mut self) -> Effects {
+        self.state = WakeState::DeleteWait;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: COPY_WAIT_KEYSPACE.to_string(),
+            key: self.wait.clone().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn commit_failed(&mut self, error: StorageError) -> Effects {
+        // The failed commit closed the transaction.
+        self.txn_id = None;
+        if error == StorageError::TransactionConflict && self.attempt < WAKE_ATTEMPTS {
+            return self.begin();
+        }
+        self.fail(error.into())
+    }
+}
+
+impl Operation for WakeJobOperation {
+    type Output = bool;
+    type Error = BlobQueueError;
+
+    fn start(&mut self) -> Effects {
+        if self.job_key.is_empty() {
+            self.state = WakeState::Finish;
+            return smallvec![];
+        }
+        self.begin()
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (WakeState::Commit, Event::Storage(StorageEvent::Error { error })) => {
+                self.commit_failed(error)
+            }
+            (
+                WakeState::StartTransaction
+                | WakeState::ReadJob
+                | WakeState::WriteJob
+                | WakeState::DeleteWait,
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.fail(error.into()),
+            (
+                WakeState::StartTransaction,
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                self.txn_id = Some(txn_id);
+                self.state = WakeState::ReadJob;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+                    key: self.job_key.clone().into(),
+                    txn_id: Some(txn_id),
+                })]
+            }
+            (WakeState::ReadJob, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+                self.job_read(value)
+            }
+            (WakeState::WriteJob, Event::Storage(StorageEvent::WriteResult { .. })) => {
+                self.delete_wait()
+            }
+            (WakeState::DeleteWait, Event::Storage(StorageEvent::DeleteResult { .. })) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(BlobQueueError::UnexpectedEvent("no transaction".into()));
+                };
+                self.state = WakeState::Commit;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (WakeState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                self.txn_id = None;
+                self.state = WakeState::Finish;
+                smallvec![]
+            }
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, WakeState::Finish | WakeState::Error)
+    }
+
+    fn finalize(self) -> Result<bool, BlobQueueError> {
+        match (self.state, self.error) {
+            (WakeState::Finish, _) => Ok(self.woke),
+            (_, Some(error)) => Err(error),
+            _ => Err(BlobQueueError::UnexpectedEvent(
+                "wake did not finish".into(),
+            )),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ParkedState {
+    Init,
+    ReadWaits,
+    Wake,
+    Schedule,
+    Finish,
+    Error,
+}
+
+/// Makes every job parked for `key` due now and schedules a drain. Answers how many woke.
+#[derive(Debug, PartialEq)]
+pub struct WakeParkedOperation {
+    key: BucketKeyRef,
+    now_ms: u64,
+    rows: VecDeque<Vec<u8>>,
+    after: Option<Key>,
+    woken: usize,
+    state: ParkedState,
+    error: Option<BlobQueueError>,
+}
+
+impl WakeParkedOperation {
+    pub fn new(key: BucketKeyRef, now_ms: u64) -> Self {
+        Self {
+            key,
+            now_ms,
+            rows: VecDeque::new(),
+            after: None,
+            woken: 0,
+            state: ParkedState::Init,
+            error: None,
+        }
+    }
+
+    fn read_waits(&mut self, after: Option<Key>) -> Effects {
+        self.state = ParkedState::ReadWaits;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: COPY_WAIT_KEYSPACE.to_string(),
+            prefix: Some(self.key.key().into()),
+            start: after.map(IterStart::After),
+            limit: WAIT_PAGE,
+            txn_id: None,
+        })]
+    }
+
+    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+        // A full page may have more rows behind it; a short one is the last.
+        self.after = (values.len() == WAIT_PAGE)
+            .then(|| values.last().map(|(row, _)| row.clone()))
+            .flatten();
+        self.rows = values.into_iter().map(|(row, _)| row.to_vec()).collect();
+        self.wake_next()
+    }
+
+    fn wake_next(&mut self) -> Effects {
+        let Some(row) = self.rows.pop_front() else {
+            return match self.after.take() {
+                Some(after) => self.read_waits(Some(after)),
+                None if self.woken > 0 => {
+                    self.state = ParkedState::Schedule;
+                    smallvec![schedule_blob_drain()]
+                }
+                None => self.finish(),
+            };
+        };
+        self.state = ParkedState::Wake;
+        let wake = WakeJobOperation::new(row, self.now_ms);
+        smallvec![Effect::SubOperation(boxed_suboperation(wake, |result| {
+            Event::SubOperation(SubOperationEvent::CopyWoken {
+                result: result.map_err(|error| error.to_string()),
+            })
+        }))]
+    }
+
+    fn finish(&mut self) -> Effects {
+        self.state = ParkedState::Finish;
+        smallvec![]
+    }
+
+    fn fail(&mut self, error: BlobQueueError) -> Effects {
+        self.state = ParkedState::Error;
+        self.error = Some(error);
+        smallvec![]
+    }
+}
+
+impl Operation for WakeParkedOperation {
+    type Output = usize;
+    type Error = BlobQueueError;
+
+    fn start(&mut self) -> Effects {
+        self.read_waits(None)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (ParkedState::ReadWaits, Event::Storage(StorageEvent::Error { error })) => {
+                self.fail(error.into())
+            }
+            (ParkedState::ReadWaits, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.waits_read(values)
+            }
+            (ParkedState::Wake, Event::SubOperation(SubOperationEvent::CopyWoken { result })) => {
+                match result {
+                    Ok(woke) => {
+                        self.woken += usize::from(woke);
+                        self.wake_next()
+                    }
+                    Err(error) => self.fail(BlobQueueError::Wake(error)),
+                }
+            }
+            (ParkedState::Schedule, Event::Task(TaskEvent::Error { message, .. })) => {
+                warn!(message = %message, "Failed to schedule the drain of woken copy jobs");
+                self.finish()
+            }
+            (ParkedState::Schedule, Event::Task(_)) => self.finish(),
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, ParkedState::Finish | ParkedState::Error)
+    }
+
+    fn finalize(self) -> Result<usize, BlobQueueError> {
+        match (self.state, self.error) {
+            (ParkedState::Finish, _) => Ok(self.woken),
+            (_, Some(error)) => Err(error),
+            _ => Err(BlobQueueError::UnexpectedEvent(
+                "wake did not finish".into(),
+            )),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum AwaitingState {
+    Init,
+    ReadWaits,
+    ReadJobs,
+    Finish,
+    Error,
+}
+
+/// Copy jobs of a relationship that wait for a source key now.
+#[derive(Debug, PartialEq)]
+pub struct AwaitingJobsOperation {
+    relationship_id: Ulid,
+    jobs: BTreeSet<Vec<u8>>,
+    parked: usize,
+    state: AwaitingState,
+    error: Option<BlobQueueError>,
+}
+
+impl AwaitingJobsOperation {
+    pub fn new(relationship_id: Ulid) -> Self {
+        Self {
+            relationship_id,
+            jobs: BTreeSet::new(),
+            parked: 0,
+            state: AwaitingState::Init,
+            error: None,
+        }
+    }
+
+    fn read_waits(&mut self, after: Option<Key>) -> Effects {
+        self.state = AwaitingState::ReadWaits;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: COPY_WAIT_KEYSPACE.to_string(),
+            prefix: None,
+            start: after.map(IterStart::After),
+            limit: WAIT_PAGE,
+            txn_id: None,
+        })]
+    }
+
+    fn waits_read(&mut self, values: Vec<(Key, Value)>) -> Result<Effects, BlobQueueError> {
+        let after = (values.len() == WAIT_PAGE)
+            .then(|| values.last().map(|(row, _)| row.clone()))
+            .flatten();
+        for (row, value) in &values {
+            let owner: Option<Ulid> = postcard::from_bytes(value).map_err(ConversionError::from)?;
+            if owner == Some(self.relationship_id) && row.len() > REF_LEN {
+                self.jobs.insert(row[REF_LEN..].to_vec());
+            }
+        }
+        if after.is_some() {
+            return Ok(self.read_waits(after));
+        }
+        if self.jobs.is_empty() {
+            self.state = AwaitingState::Finish;
+            return Ok(smallvec![]);
+        }
+        // All jobs of the relationship are read in one batch instead of one read each.
+        self.state = AwaitingState::ReadJobs;
+        let reads = (self.jobs.iter())
+            .map(|job_key| (REPLICATION_JOB_KEYSPACE.to_string(), job_key.clone().into()))
+            .collect();
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: None,
+        })])
+    }
+
+    fn jobs_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, BlobQueueError> {
+        for (_, value) in values {
+            let job = value
+                .map(|value| BlobJobRecord::from_bytes(&value))
+                .transpose()?;
+            self.parked += usize::from(job.is_some_and(|job| job.due_at_ms == PARKED_DUE));
+        }
+        self.state = AwaitingState::Finish;
+        Ok(smallvec![])
+    }
+}
+
+impl Operation for AwaitingJobsOperation {
+    type Output = usize;
+    type Error = BlobQueueError;
+
+    fn start(&mut self) -> Effects {
+        self.read_waits(None)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let result = match (&self.state, event) {
+            (
+                AwaitingState::ReadWaits | AwaitingState::ReadJobs,
+                Event::Storage(StorageEvent::Error { error }),
+            ) => Err(error.into()),
+            (AwaitingState::ReadWaits, Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.waits_read(values)
+            }
+            (AwaitingState::ReadJobs, Event::Storage(StorageEvent::BatchReadResult { values })) => {
+                self.jobs_read(values)
+            }
+            (_, event) => Err(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+        };
+        result.unwrap_or_else(|error| {
+            self.state = AwaitingState::Error;
+            self.error = Some(error);
+            smallvec![]
+        })
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, AwaitingState::Finish | AwaitingState::Error)
+    }
+
+    fn finalize(self) -> Result<usize, BlobQueueError> {
+        match (self.state, self.error) {
+            (AwaitingState::Finish, _) => Ok(self.parked),
+            (_, Some(error)) => Err(error),
+            _ => Err(BlobQueueError::UnexpectedEvent(
+                "count did not finish".into(),
+            )),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
     }
 }
 
@@ -420,6 +716,7 @@ async fn abort(storage: &StorageHandle, txn_id: TxnId) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
     use crate::replication::drain::next_blob_timer;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
@@ -676,9 +973,12 @@ mod tests {
             assert_eq!(stored.attempts, record.attempts);
             assert_eq!(stored.last_error, record.last_error);
             assert_eq!(
-                awaiting_jobs(&context, Ulid::from_parts(10, 10))
-                    .await
-                    .unwrap(),
+                drive(
+                    AwaitingJobsOperation::new(Ulid::from_parts(10, 10)),
+                    &context
+                )
+                .await
+                .unwrap(),
                 0
             );
             assert!(next_blob_timer(storage).await.unwrap().is_some());
@@ -749,19 +1049,44 @@ mod tests {
         assert_eq!(parked.attempts, 2);
         assert_eq!(parked.last_error, None);
         assert_eq!(parked.job_id, record.job_id);
-        assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 1);
+        assert_eq!(
+            drive(AwaitingJobsOperation::new(relationship), &context)
+                .await
+                .unwrap(),
+            1
+        );
         // The drain neither runs a parked job nor times a wake for it.
         assert_eq!(next_blob_timer(&storage).await.unwrap(), None);
 
         // Another key's unlock leaves it parked.
         let other = BucketKeyRef::new(locked.bucket_id, 2);
-        assert_eq!(wake_parked(&context, other, 5_000).await.unwrap(), 0);
-        assert_eq!(wake_parked(&context, locked, 5_000).await.unwrap(), 1);
+        assert_eq!(
+            drive(WakeParkedOperation::new(other, 5_000), &context)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            drive(WakeParkedOperation::new(locked, 5_000), &context)
+                .await
+                .unwrap(),
+            1
+        );
         let woken = read_job(&storage, &key, None).await.unwrap().unwrap();
         assert_eq!(woken.due_at_ms, 5_000);
         assert_eq!((woken.attempts, woken.job_id), (2, record.job_id));
-        assert_eq!(awaiting_jobs(&context, relationship).await.unwrap(), 0);
-        assert_eq!(wake_parked(&context, locked, 6_000).await.unwrap(), 0);
+        assert_eq!(
+            drive(AwaitingJobsOperation::new(relationship), &context)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            drive(WakeParkedOperation::new(locked, 6_000), &context)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -833,7 +1158,12 @@ mod tests {
         let unlocked = BucketKeyRef::new(Ulid::from_parts(8, 8), 1);
         source(&context, unlocked).await;
         unlock(&context, unlocked).await;
-        assert_eq!(wake_parked(&context, unlocked, 1).await.unwrap(), 0);
+        assert_eq!(
+            drive(WakeParkedOperation::new(unlocked, 1), &context)
+                .await
+                .unwrap(),
+            0
+        );
 
         let due = park_job(&context, key.clone(), &record, &[unlocked])
             .await
@@ -843,7 +1173,7 @@ mod tests {
         assert_eq!(due, Some(woken.due_at_ms));
         assert_ne!(woken.due_at_ms, PARKED_DUE);
         assert_eq!(
-            awaiting_jobs(&context, Ulid::from_parts(7, 7))
+            drive(AwaitingJobsOperation::new(Ulid::from_parts(7, 7)), &context)
                 .await
                 .unwrap(),
             0
@@ -928,28 +1258,42 @@ mod tests {
             Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
         ));
         assert_eq!(
-            awaiting_jobs(&context, record.relationship_id.unwrap())
-                .await
-                .unwrap(),
+            drive(
+                AwaitingJobsOperation::new(record.relationship_id.unwrap()),
+                &context
+            )
+            .await
+            .unwrap(),
             1
         );
         assert_eq!(next_blob_timer(storage).await.unwrap(), None);
         assert_eq!(
-            wake_parked(&context, BucketKeyRef::new(old.bucket_id, 2), 5_000)
-                .await
-                .unwrap(),
+            drive(
+                WakeParkedOperation::new(BucketKeyRef::new(old.bucket_id, 2), 5_000),
+                &context
+            )
+            .await
+            .unwrap(),
             0
         );
         unlock(&context, old).await;
-        assert_eq!(wake_parked(&context, old, 5_000).await.unwrap(), 1);
+        assert_eq!(
+            drive(WakeParkedOperation::new(old, 5_000), &context)
+                .await
+                .unwrap(),
+            1
+        );
         let woken = read_job(storage, &row, None).await.unwrap().unwrap();
         assert_eq!(woken.due_at_ms, 5_000);
         assert_eq!(woken.attempts, record.attempts);
         assert_eq!(woken.last_error, record.last_error);
         assert_eq!(
-            awaiting_jobs(&context, record.relationship_id.unwrap())
-                .await
-                .unwrap(),
+            drive(
+                AwaitingJobsOperation::new(record.relationship_id.unwrap()),
+                &context
+            )
+            .await
+            .unwrap(),
             0
         );
         assert!(next_blob_timer(storage).await.unwrap().is_some());
@@ -979,7 +1323,12 @@ mod tests {
         let old = BucketKeyRef::new(Ulid::from_parts(17, 17), 1);
         source(&context, old).await;
         unlock(&context, old).await;
-        assert_eq!(wake_parked(&context, old, 1).await.unwrap(), 0);
+        assert_eq!(
+            drive(WakeParkedOperation::new(old, 1), &context)
+                .await
+                .unwrap(),
+            0
+        );
         let record = job(Ulid::from_parts(18, 18));
         let row = store(storage, &record).await;
         let (proxy, receivers) = StorageHandle::new();
@@ -1082,9 +1431,12 @@ mod tests {
         assert_eq!(woken.attempts, record.attempts);
         assert_eq!(woken.last_error, record.last_error);
         assert_eq!(
-            awaiting_jobs(&context, record.relationship_id.unwrap())
-                .await
-                .unwrap(),
+            drive(
+                AwaitingJobsOperation::new(record.relationship_id.unwrap()),
+                &context
+            )
+            .await
+            .unwrap(),
             0
         );
         assert!(next_blob_timer(storage).await.unwrap().is_some());
@@ -1366,6 +1718,329 @@ mod tests {
                     .is_some()
             );
             assert!(next_blob_timer(storage).await.unwrap().is_some());
+        }
+    }
+
+    async fn read_job(
+        storage: &StorageHandle,
+        job_key: &[u8],
+        txn_id: Option<TxnId>,
+    ) -> Result<Option<BlobJobRecord>, BlobQueueError> {
+        let read = StorageEffect::Read {
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+            key: job_key.to_vec().into(),
+            txn_id,
+        };
+        match storage.send_storage_effect(read).await {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .map(|value| BlobJobRecord::from_bytes(&value))
+                .transpose()
+                .map_err(Into::into),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+        }
+    }
+
+    mod transitions {
+        use super::*;
+        use aruna_core::operation_check::{
+            check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+        };
+
+        fn key() -> BucketKeyRef {
+            BucketKeyRef::new(Ulid::from_parts(3, 3), 1)
+        }
+
+        fn wait() -> Vec<u8> {
+            wait_row(key(), b"job")
+        }
+
+        fn txn() -> TxnId {
+            Ulid::from_parts(8, 8)
+        }
+
+        fn parked() -> BlobJobRecord {
+            let mut record = job(Ulid::from_parts(1, 1));
+            record.due_at_ms = PARKED_DUE;
+            record
+        }
+
+        fn started() -> Event {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id: txn() })
+        }
+
+        fn job_read(record: Option<&BlobJobRecord>) -> Event {
+            Event::Storage(StorageEvent::ReadResult {
+                key: b"job".to_vec().into(),
+                value: record.map(|record| record.to_bytes().unwrap().into()),
+            })
+        }
+
+        fn deleted() -> Event {
+            Event::Storage(StorageEvent::DeleteResult { key: wait().into() })
+        }
+
+        fn delete_wait() -> Effect {
+            Effect::Storage(StorageEffect::Delete {
+                key_space: COPY_WAIT_KEYSPACE.to_string(),
+                key: wait().into(),
+                txn_id: Some(txn()),
+            })
+        }
+
+        fn commit() -> Effect {
+            Effect::Storage(StorageEffect::CommitTransaction { txn_id: txn() })
+        }
+
+        fn committed() -> Event {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: txn() })
+        }
+
+        #[test]
+        fn wakes_parked_job() {
+            let mut operation = WakeJobOperation::new(wait(), 7);
+            let mut woken = parked();
+            woken.due_at_ms = 7;
+            let read = Effect::Storage(StorageEffect::Read {
+                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+                key: b"job".to_vec().into(),
+                txn_id: Some(txn()),
+            });
+            let write = Effect::Storage(StorageEffect::Write {
+                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+                key: b"job".to_vec().into(),
+                value: woken.to_bytes().unwrap().into(),
+                txn_id: Some(txn()),
+            });
+            let written = Event::Storage(StorageEvent::WriteResult {
+                key: b"job".to_vec().into(),
+            });
+            let begin = [Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })];
+            let steps = vec![
+                (started(), vec![read]),
+                (job_read(Some(&parked())), vec![write]),
+                (written, vec![delete_wait()]),
+                (deleted(), vec![commit()]),
+                (committed(), vec![]),
+            ];
+            check_trace(&mut operation, &begin, steps);
+            assert_eq!(operation.finalize(), Ok(true));
+        }
+
+        #[test]
+        fn due_or_gone_job_drops_row() {
+            let mut due = parked();
+            due.due_at_ms = 3;
+            for record in [None, Some(&due)] {
+                let mut operation = WakeJobOperation::new(wait(), 7);
+                operation.start();
+                operation.step(started());
+                assert_eq!(operation.step(job_read(record)).as_slice(), [delete_wait()]);
+                operation.step(deleted());
+                operation.step(committed());
+                assert_eq!(operation.finalize(), Ok(false));
+            }
+            // A row too short to name a job is done without storage.
+            let mut short = WakeJobOperation::new(vec![1, 2], 7);
+            assert!(short.start().is_empty());
+            assert_eq!(short.finalize(), Ok(false));
+        }
+
+        #[test]
+        fn conflicts_retry_then_fail() {
+            let conflict = || {
+                Event::Storage(StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                })
+            };
+            let mut operation = WakeJobOperation::new(wait(), 7);
+            operation.start();
+            for attempt in 1..=WAKE_ATTEMPTS {
+                operation.step(started());
+                operation.step(job_read(None));
+                operation.step(deleted());
+                let effects = operation.step(conflict());
+                assert_eq!(effects.is_empty(), attempt == WAKE_ATTEMPTS);
+            }
+            assert_eq!(
+                operation.finalize(),
+                Err(BlobQueueError::Storage(StorageError::TransactionConflict))
+            );
+        }
+
+        #[test]
+        fn wake_contract() {
+            let reading = || {
+                let mut operation = WakeJobOperation::new(wait(), 7);
+                operation.start();
+                operation.step(started());
+                operation
+            };
+            let refused = rejects_events(reading, sample_events, |event| {
+                matches!(event, Event::Storage(StorageEvent::ReadResult { .. }))
+            });
+            let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
+            assert!(
+                refused
+                    .iter()
+                    .all(|(_, effects, _)| effects.as_slice() == [abort.clone()])
+            );
+            let mut open = reading();
+            check_abort(&mut open, &[abort]);
+            rejects_finalize(open);
+        }
+
+        fn waits(rows: usize) -> Event {
+            Event::Storage(StorageEvent::IterResult {
+                values: (0..rows)
+                    .map(|index| (wait_row(key(), &[index as u8; 4]).into(), Vec::new().into()))
+                    .collect(),
+                next_start_after: None,
+            })
+        }
+
+        fn woken(result: Result<bool, String>) -> Event {
+            Event::SubOperation(SubOperationEvent::CopyWoken { result })
+        }
+
+        #[test]
+        fn wakes_each_row_then_schedules() {
+            let mut operation = WakeParkedOperation::new(key(), 5);
+            assert_eq!(operation.start().len(), 1);
+            assert!(matches!(
+                operation.step(waits(2)).as_slice(),
+                [Effect::SubOperation(_)]
+            ));
+            assert!(matches!(
+                operation.step(woken(Ok(true))).as_slice(),
+                [Effect::SubOperation(_)]
+            ));
+            assert_eq!(
+                operation.step(woken(Ok(false))).as_slice(),
+                [schedule_blob_drain()]
+            );
+            let scheduled = Event::Task(TaskEvent::Error {
+                key: None,
+                message: "no task runtime".to_string(),
+            });
+            assert!(operation.step(scheduled).is_empty());
+            assert_eq!(operation.finalize(), Ok(1));
+            // Nothing woken schedules nothing.
+            let mut quiet = WakeParkedOperation::new(key(), 5);
+            quiet.start();
+            assert!(quiet.step(waits(0)).is_empty());
+            assert_eq!(quiet.finalize(), Ok(0));
+        }
+
+        #[test]
+        fn full_page_reads_on() {
+            let mut operation = WakeParkedOperation::new(key(), 5);
+            operation.start();
+            let page = waits(WAIT_PAGE);
+            operation.step(page);
+            for _ in 1..WAIT_PAGE {
+                operation.step(woken(Ok(false)));
+            }
+            let effects = operation.step(woken(Ok(false)));
+            assert!(matches!(
+                effects.as_slice(),
+                [Effect::Storage(StorageEffect::Iter { start: Some(_), .. })]
+            ));
+        }
+
+        #[test]
+        fn parked_contract() {
+            let mut failed = WakeParkedOperation::new(key(), 5);
+            failed.start();
+            failed.step(waits(1));
+            failed.step(woken(Err("busy".to_string())));
+            assert_eq!(
+                failed.finalize(),
+                Err(BlobQueueError::Wake("busy".to_string()))
+            );
+            let reading = || {
+                let mut operation = WakeParkedOperation::new(key(), 5);
+                operation.start();
+                operation
+            };
+            assert!(
+                !rejects_events(reading, sample_events, |event| {
+                    matches!(
+                        event,
+                        Event::Storage(
+                            StorageEvent::IterResult { .. } | StorageEvent::Error { .. }
+                        )
+                    )
+                })
+                .is_empty()
+            );
+            let mut open = reading();
+            check_abort(&mut open, &[]);
+            rejects_finalize(open);
+        }
+
+        #[test]
+        fn counts_parked_jobs_in_one_batch() {
+            let relationship = Ulid::from_parts(1, 1);
+            let owner = postcard::to_allocvec(&Some(relationship)).unwrap();
+            let other = postcard::to_allocvec(&Some(Ulid::from_parts(2, 2))).unwrap();
+            let mut operation = AwaitingJobsOperation::new(relationship);
+            operation.start();
+            let page = Event::Storage(StorageEvent::IterResult {
+                values: vec![
+                    (wait_row(key(), b"one").into(), owner.clone().into()),
+                    (wait_row(key(), b"two").into(), owner.into()),
+                    (wait_row(key(), b"three").into(), other.into()),
+                ],
+                next_start_after: None,
+            });
+            let batch = Effect::Storage(StorageEffect::BatchRead {
+                reads: vec![
+                    (REPLICATION_JOB_KEYSPACE.to_string(), b"one".to_vec().into()),
+                    (REPLICATION_JOB_KEYSPACE.to_string(), b"two".to_vec().into()),
+                ],
+                txn_id: None,
+            });
+            assert_eq!(operation.step(page).as_slice(), [batch]);
+            let jobs = Event::Storage(StorageEvent::BatchReadResult {
+                values: vec![
+                    (
+                        b"one".to_vec().into(),
+                        Some(parked().to_bytes().unwrap().into()),
+                    ),
+                    (b"two".to_vec().into(), None),
+                ],
+            });
+            assert!(operation.step(jobs).is_empty());
+            assert_eq!(operation.finalize(), Ok(1));
+        }
+
+        #[test]
+        fn awaiting_contract() {
+            let reading = || {
+                let mut operation = AwaitingJobsOperation::new(Ulid::from_parts(1, 1));
+                operation.start();
+                operation
+            };
+            assert!(
+                !rejects_events(reading, sample_events, |event| {
+                    matches!(
+                        event,
+                        Event::Storage(
+                            StorageEvent::IterResult { .. } | StorageEvent::Error { .. }
+                        )
+                    )
+                })
+                .is_empty()
+            );
+            let mut open = reading();
+            check_abort(&mut open, &[]);
+            rejects_finalize(open);
+            let mut empty = reading();
+            assert!(empty.step(waits(0)).is_empty());
+            assert_eq!(empty.finalize(), Ok(0));
         }
     }
 }

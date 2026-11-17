@@ -23,7 +23,7 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::AuthToken;
 use aruna_operations::replication::drain::relationship_job_stats;
-use aruna_operations::replication::parking::awaiting_jobs;
+use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
     consent_write, relationship_consent,
@@ -1440,7 +1440,7 @@ async fn annotate(
     response.plaintext = consent
         .map_err(|error| ServerError::InternalError(error.into()))?
         .is_some();
-    let awaiting = awaiting_jobs(&context, id).await;
+    let awaiting = drive(AwaitingJobsOperation::new(id), &context).await;
     response.status.awaiting_key =
         awaiting.map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(())

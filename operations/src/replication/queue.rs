@@ -54,6 +54,8 @@ pub enum BlobQueueError {
     UnexpectedEvent(String),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error("a parked copy job could not wake: {0}")]
+    Wake(String),
 }
 
 pub fn schedule_blob_drain() -> Effect {

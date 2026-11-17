@@ -5,7 +5,7 @@
 
 use crate::blob::migration::MIGRATION_CONTINUE;
 use crate::blob::migration::rewrite::{RewriteOutcome, RewriteVersionOperation};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -368,7 +368,8 @@ async fn finish(
     if let Some(source) = record.source
         && record.target.plan.map(|plan| plan.key) != Some(source)
     {
-        crate::replication::parking::wake_parked(context, source, now)
+        let wake = crate::replication::parking::WakeParkedOperation::new(source, now);
+        drive(wake, context)
             .await
             .map_err(|error| error.to_string())?;
         if let Some(tasks) = context.task_handle.as_ref() {

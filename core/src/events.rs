@@ -142,6 +142,10 @@ pub enum SubOperationEvent {
     CopySealed {
         sealed: bool,
     },
+    /// Whether one parked copy job woke; the row of its wait is gone either way.
+    CopyWoken {
+        result: Result<bool, String>,
+    },
 }
 
 /// How the re-key of one version ended.
