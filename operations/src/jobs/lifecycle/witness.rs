@@ -6,23 +6,25 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::compute::ExecutionTargetId;
 use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame};
 use aruna_core::events::{Event, LaunchDecline};
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
     PhysicalExecutionState, WitnessBudgetRecord,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Key, TxnId};
+use aruna_core::types::{Key, TxnId, Value};
 use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -31,10 +33,11 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::build_plan;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::store::query::batch_delete;
@@ -123,81 +126,199 @@ fn jitter_ms(family: &JobFamilyId, node: NodeId, base_delay_ms: u64) -> u64 {
     u64::from(u16::from_be_bytes([key[0], key[1]])) % spread
 }
 
-/// Arms this node's fallback for one family. Rank zero is due immediately; a
-/// later rank waits `base_delay * rank` plus its own jitter. An earlier existing
-/// deadline is kept, so re-arming can only ever bring a round forward.
+/// Arms this node's fallback for one family; see [`ArmFamilyOperation`].
 pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u64) {
-    let Some(net) = context.net_handle.as_ref() else {
+    let Some((local, realm_id)) = context.node_and_realm() else {
         debug!(?family, "No net handle; witness fallback not armed");
         return;
     };
-    let realm_id = *net.realm_id();
-    let local = net.node_id();
-    let Some(config) = load_realm_config(context, realm_id).await else {
-        warn!(
-            ?family,
-            "Realm config unavailable; witness fallback not armed"
-        );
-        return;
-    };
-    let Some(view) = FamilyView::resolve(&config, realm_id, family) else {
-        warn!(
-            ?family,
-            "Family placement unresolved; witness fallback not armed"
-        );
-        return;
-    };
-    let admitting = admitting_node(context, family).await;
-    let Some(rank) = witness_rank(view.holders(), &family, local, admitting) else {
-        debug!(?family, "Node is not a witness for this family");
-        return;
-    };
-    let base = config.compute.witness_delay_ms;
-    let due_at_ms = match rank {
-        0 => now_ms,
-        rank => now_ms + base * u64::from(rank) + jitter_ms(&family, local, base),
-    };
-    let existing = match read_deadline_index(context, &family).await {
-        Ok(existing) => existing,
-        Err(error) => {
-            warn!(?family, error = %error, "Witness deadline read failed");
-            return;
-        }
-    };
-    if existing
-        .as_ref()
-        .is_some_and(|existing| existing.due_at_ms <= due_at_ms)
-    {
-        return;
-    }
-    let deadline = WitnessDeadline { due_at_ms, rank };
-    if !replace_deadline(context, &family, existing, deadline).await {
-        return;
-    }
-    let after = Duration::from_millis(due_at_ms.saturating_sub(now_ms));
-    if let Some(task) = context.task_handle.as_ref() {
-        let _ = task.send_effect(schedule_witness_drain(after)).await;
+    let operation = ArmFamilyOperation::new(family, local, realm_id, now_ms);
+    if let Err(error) = drive(operation, context).await {
+        warn!(?family, error = %error, "Witness deadline was not armed");
     }
 }
 
-/// The node that admitted the family: the committing node of the claim with the
-/// lowest order key, which every holder reduces the same way. An unreadable
-/// claim set leaves the order to the digest alone.
-async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
-    let records = drive(
-        LoadFamilyOperation::kind(family, JobRecordKind::Claim),
-        context,
-    )
-    .await
-    .ok()?;
-    records
-        .iter()
-        .filter_map(|envelope| match &envelope.record {
-            JobFamilyRecord::Claim(claim) => Some(claim),
-            _ => None,
-        })
-        .min_by_key(|claim| claim.order_key())
-        .map(|claim| claim.committing_node_id)
+#[derive(Debug, PartialEq)]
+enum ArmState {
+    Config,
+    Claims,
+    Index,
+    Write,
+    Delete,
+}
+
+/// Arms this node's fallback for one family. Rank zero is due immediately; a
+/// later rank waits `base_delay * rank` plus its own jitter. An earlier existing
+/// deadline is kept, so re-arming can only ever bring a round forward. The deadline is read
+/// and replaced in one write transaction, then the witness drain wakes.
+#[derive(Debug, PartialEq)]
+pub struct ArmFamilyOperation {
+    family: JobFamilyId,
+    local: NodeId,
+    realm_id: RealmId,
+    now_ms: u64,
+    holders: Vec<NodeId>,
+    base_delay_ms: u64,
+    deadline: Option<WitnessDeadline>,
+    deletes: Vec<(String, Key)>,
+    state: ArmState,
+}
+
+type ArmStep = Result<Next<()>, LifecycleError>;
+
+impl ArmFamilyOperation {
+    pub fn new(family: JobFamilyId, local: NodeId, realm_id: RealmId, now_ms: u64) -> Self {
+        Self {
+            family,
+            local,
+            realm_id,
+            now_ms,
+            holders: Vec::new(),
+            base_delay_ms: 0,
+            deadline: None,
+            deletes: Vec::new(),
+            state: ArmState::Config,
+        }
+    }
+
+    /// Ranks this node among the holders; the admitting node goes first.
+    fn rank(&mut self, admitting: Option<NodeId>) -> ArmStep {
+        let family = self.family;
+        let Some(rank) = witness_rank(&self.holders, &family, self.local, admitting) else {
+            debug!(?family, "Node is not a witness for this family");
+            return Ok(Next::Done(()));
+        };
+        let base = self.base_delay_ms;
+        let due_at_ms = match rank {
+            0 => self.now_ms,
+            rank => self.now_ms + base * u64::from(rank) + jitter_ms(&family, self.local, base),
+        };
+        self.deadline = Some(WitnessDeadline { due_at_ms, rank });
+        self.state = ArmState::Index;
+        let row = (
+            DEADLINE_INDEX_KEYSPACE.to_string(),
+            deadline_index_key(&family),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    /// Writes the new deadline unless an earlier one is already armed.
+    fn replace(&mut self, existing: Option<WitnessDeadline>) -> ArmStep {
+        let Some(next) = self.deadline else {
+            return Ok(Next::Done(()));
+        };
+        if existing.is_some_and(|existing| existing.due_at_ms <= next.due_at_ms) {
+            return Ok(Next::Done(()));
+        }
+        let family = &self.family;
+        let key = deadline_key(family, next.due_at_ms);
+        let value = Value::from(to_bytes(&next)?.as_slice());
+        let writes = vec![
+            (
+                WITNESS_DEADLINE_KEYSPACE.to_string(),
+                key.clone(),
+                value.clone(),
+            ),
+            (
+                DEADLINE_INDEX_KEYSPACE.to_string(),
+                deadline_index_key(family),
+                value,
+            ),
+        ];
+        if let Some(previous) = existing.map(|previous| deadline_key(family, previous.due_at_ms))
+            && previous != key
+        {
+            self.deletes
+                .push((WITNESS_DEADLINE_KEYSPACE.to_string(), previous));
+        }
+        self.state = ArmState::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for ArmFamilyOperation {
+    type Output = ();
+    type Error = LifecycleError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> ArmStep {
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(
+            self.realm_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> ArmStep {
+        let family = self.family;
+        match std::mem::replace(&mut self.state, ArmState::Config) {
+            ArmState::Config => {
+                let config = match result.child::<RealmConfigDocument, GetConfigError>()? {
+                    Ok(config) => config,
+                    Err(error) => {
+                        warn!(
+                            ?family,
+                            error = %error,
+                            "Realm config unavailable; witness fallback not armed"
+                        );
+                        return Ok(Next::Done(()));
+                    }
+                };
+                let Some(view) = FamilyView::resolve(&config, self.realm_id, family) else {
+                    warn!(
+                        ?family,
+                        "Family placement unresolved; witness fallback not armed"
+                    );
+                    return Ok(Next::Done(()));
+                };
+                self.holders = view.holders().to_vec();
+                self.base_delay_ms = config.compute.witness_delay_ms;
+                self.state = ArmState::Claims;
+                let claims = LoadFamilyOperation::kind(family, JobRecordKind::Claim);
+                Ok(Next::Call(IoCall::child(claims)))
+            }
+            // The node that admitted the family: the committing node of the claim with the
+            // lowest order key, which every holder reduces the same way. An unreadable
+            // claim set leaves the order to the digest alone.
+            ArmState::Claims => {
+                let records = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
+                let admitting = records.ok().and_then(|records| {
+                    records
+                        .iter()
+                        .filter_map(|envelope| match &envelope.record {
+                            JobFamilyRecord::Claim(claim) => Some(claim),
+                            _ => None,
+                        })
+                        .min_by_key(|claim| claim.order_key())
+                        .map(|claim| claim.committing_node_id)
+                });
+                self.rank(admitting)
+            }
+            ArmState::Index => {
+                let [value] = values::<1>(result)?;
+                let existing = value.and_then(|bytes| from_bytes::<WitnessDeadline>(&bytes).ok());
+                self.replace(existing)
+            }
+            ArmState::Write => {
+                done(result)?;
+                self.state = ArmState::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            ArmState::Delete => {
+                done(result)?;
+                let due_at_ms = self.deadline.map_or(self.now_ms, |next| next.due_at_ms);
+                let after = Duration::from_millis(due_at_ms.saturating_sub(self.now_ms));
+                let drain = IoCall::Effect(Box::new(schedule_witness_drain(after)));
+                Ok(Next::Then {
+                    output: (),
+                    calls: vec![drain],
+                })
+            }
+        }
+    }
 }
 
 /// One bounded pass over the persisted deadlines. Returns true while rows
@@ -269,6 +390,42 @@ pub async fn drain_witness_deadlines(context: &DriverContext, now_ms: u64) -> bo
 mod tests {
     use super::*;
     use crate::tests::records::{Family, context, node};
+
+    fn arming(existing: Option<WitnessDeadline>) -> Result<Next<()>, LifecycleError> {
+        let fixture = Family::new([2u8; 32]);
+        let family = fixture.family();
+        let local = fixture.holder.public();
+        let mut operation = ArmFamilyOperation::new(family, local, fixture.config.realm_id, 1_000);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.holders = vec![local];
+        operation.base_delay_ms = 400;
+        let read = operation.rank(Some(local));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
+        let value = existing.map(|deadline| Value::from(to_bytes(&deadline).unwrap().as_slice()));
+        operation.next(IoResult::Values(vec![value]))
+    }
+
+    // An admitting node arms itself at once; an earlier armed deadline is kept.
+    #[test]
+    fn arms_earliest_deadline() {
+        let Ok(Next::Call(IoCall::Write(rows))) = arming(None) else {
+            panic!("a new deadline is written");
+        };
+        assert_eq!(rows.len(), 2);
+        let armed: WitnessDeadline = from_bytes(&rows[1].2).unwrap();
+        assert_eq!(
+            armed,
+            WitnessDeadline {
+                due_at_ms: 1_000,
+                rank: 0
+            }
+        );
+        let earlier = WitnessDeadline {
+            due_at_ms: 500,
+            rank: 1,
+        };
+        assert_eq!(arming(Some(earlier)), Ok(Next::Done(())));
+    }
 
     #[tokio::test]
     async fn keeps_later_deadlines() {
@@ -935,10 +1092,7 @@ async fn clear_deadline(
             deadline_index_key(family),
         ),
     ];
-    if batch_delete(&context.storage_handle, deletes, Some(txn_id))
-        .await
-        .is_err()
-    {
+    if batch_delete(context, deletes, Some(txn_id)).await.is_err() {
         abort_txn(context, txn_id).await;
         return false;
     }
@@ -967,7 +1121,7 @@ async fn remove_stale(context: &DriverContext, family: &JobFamilyId, key: &Key) 
     }
     if current.is_err()
         || batch_delete(
-            &context.storage_handle,
+            context,
             vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), key.clone())],
             Some(txn_id),
         )
@@ -1030,7 +1184,7 @@ async fn replace_deadline(
         let previous_key = deadline_key(family, previous.due_at_ms);
         if previous_key != deadline_key(family, next.due_at_ms)
             && batch_delete(
-                &context.storage_handle,
+                context,
                 vec![(WITNESS_DEADLINE_KEYSPACE.to_string(), previous_key)],
                 Some(txn_id),
             )

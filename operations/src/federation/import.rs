@@ -244,15 +244,14 @@ async fn stale_upload(
     if upload.is_some() {
         return Ok(upload_stale(upload.as_ref(), false, now));
     }
-    let storage = &context.storage_handle;
     let dedup_key = user_dedup_key(principal, import_key);
-    let job = find_dedup_plan(storage, principal, &dedup_key, None)
+    let job = find_dedup_plan(context, principal, &dedup_key, None)
         .await
         .map_err(ImportError::Storage)?;
     let Some((job_id, _)) = job else {
         return Ok(upload_stale(None, false, now));
     };
-    let record = read_job_record(storage, job_id, None)
+    let record = read_job_record(context, job_id, None)
         .await
         .map_err(ImportError::Storage)?;
     Ok(upload_stale(None, record.is_some(), now))
@@ -265,7 +264,7 @@ pub async fn bound_upload(
     import_key: &str,
 ) -> Result<Option<Ulid>, ImportError> {
     let row = read_row(
-        &context.storage_handle,
+        context,
         FEDERATION_KEYSPACE,
         upload_key(principal, import_key),
     )
@@ -347,7 +346,7 @@ pub async fn read_import(
     upload_id: Ulid,
 ) -> Result<Option<ImportRecord>, ImportError> {
     let row = read_row(
-        &context.storage_handle,
+        context,
         FEDERATION_KEYSPACE,
         record_key(upload_id),
     )
@@ -780,7 +779,7 @@ pub(crate) mod tests {
         let (first, second) = (Ulid::from_bytes([9; 16]), Ulid::from_bytes([10; 16]));
         let live = upload(u64::MAX);
         let storage = &context.storage_handle;
-        crate::jobs::import::upload_store::write_rocrate_upload(storage, &live)
+        crate::jobs::import::upload_store::write_rocrate_upload(&context, &live)
             .await
             .unwrap();
         let mut record = record();

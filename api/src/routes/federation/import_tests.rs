@@ -402,8 +402,7 @@ async fn seed_upload(fixture: &Fixture, upload_id: Ulid) {
         expires_at_ms: unix_timestamp_millis() + 60_000,
         claimed_by: None,
     };
-    let storage = &fixture.state.get_ctx().storage_handle;
-    write_rocrate_upload(storage, &record).await.unwrap();
+    write_rocrate_upload(&fixture.state.get_ctx(), &record).await.unwrap();
 }
 
 async fn import(
@@ -612,13 +611,12 @@ async fn push_after_import() {
     let upload_id = Ulid::from_string(&first.upload_id).unwrap();
     let job = submit(&fixture, upload_id, &key, "first").await.unwrap();
     // The import job claims the upload and deletes it when it ends.
-    let storage = &fixture.state.get_ctx().storage_handle;
     let job_id = JobId::from_str(&job.job_id).unwrap();
     let now = unix_timestamp_millis();
-    claim_rocrate_upload(storage, upload_id, fixture.user, job_id, now)
+    claim_rocrate_upload(&fixture.state.get_ctx(), upload_id, fixture.user, job_id, now)
         .await
         .unwrap();
-    delete_rocrate_upload(storage, upload_id, job_id)
+    delete_rocrate_upload(&fixture.state.get_ctx(), upload_id, job_id)
         .await
         .unwrap();
     let again = push(&fixture, &intent, &grant).await.unwrap();
@@ -645,7 +643,7 @@ async fn push_replaces_expired() {
         .unwrap();
     record.expires_at_ms = 0;
     let storage = &context.storage_handle;
-    write_rocrate_upload(storage, &record).await.unwrap();
+    write_rocrate_upload(&context, &record).await.unwrap();
     let second = push(&fixture, &intent, &grant).await.unwrap();
     let second_id = Ulid::from_string(&second.upload_id).unwrap();
     assert_ne!(second_id, first_id);

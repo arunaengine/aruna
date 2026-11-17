@@ -54,7 +54,7 @@ pub(crate) async fn job_status(
 ) -> Result<JobStatus, HostError> {
     let row = job_row(ctx, install, id).await?;
     let record = match (&row.summary, row.job) {
-        (None, Some(job)) => read_job_record(&ctx.storage_handle, job, None)
+        (None, Some(job)) => read_job_record(ctx, job, None)
             .await
             .map_err(unavailable)?,
         _ => None,
@@ -161,7 +161,7 @@ pub async fn cancel_job(
         },
     };
     // A running job sees the request at its next lease renewal and stops.
-    match set_cancel_requested(&ctx.storage_handle, job, now_ms).await {
+    match set_cancel_requested(ctx, job, now_ms).await {
         Ok(_) | Err(JobMutationError::NotFound) => Ok(()),
         Err(error) => Err(unavailable(error.to_string())),
     }
@@ -184,7 +184,7 @@ pub(crate) async fn settle_work(ctx: &DriverContext, now_ms: u64) -> Result<usiz
             },
             _ => continue,
         };
-        let record = read_job_record(&ctx.storage_handle, job, None).await;
+        let record = read_job_record(ctx, job, None).await;
         let record = record.map_err(StoreError)?;
         let Some(summary) = summary_of(record.as_ref()) else {
             continue;
@@ -221,7 +221,6 @@ pub(crate) async fn retire_work(
     config: &RealmConfigDocument,
     now_ms: u64,
 ) -> Result<usize, StoreError> {
-    let storage = &ctx.storage_handle;
     let mut dropped = Vec::new();
     for (key, value) in drive(scan_rows(work_scan()), ctx).await? {
         let Some(install_id) = install_at(&key) else {
@@ -247,7 +246,7 @@ pub(crate) async fn retire_work(
             dropped.extend([index_key(install_id, row.work_id), key]);
             continue;
         };
-        let record = read_job_record(storage, job, None)
+        let record = read_job_record(ctx, job, None)
             .await
             .map_err(StoreError)?;
         let Some(record) = record else {
@@ -258,7 +257,7 @@ pub(crate) async fn retire_work(
         if row.cancel || record.is_settled() {
             continue;
         }
-        match set_cancel_requested(storage, job, now_ms).await {
+        match set_cancel_requested(ctx, job, now_ms).await {
             Ok(_) => {
                 let change = WorkChange::Cancelling(job);
                 drive(update_work((install_id, row.work_id), change), ctx).await?;

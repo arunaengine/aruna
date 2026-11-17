@@ -661,7 +661,7 @@ async fn work_view(
     row: WorkRow,
 ) -> Result<WorkView, String> {
     let record = match (row.job, &row.summary) {
-        (Some(job), None) => read_job_record(&ctx.storage_handle, job, None).await?,
+        (Some(job), None) => read_job_record(ctx, job, None).await?,
         _ => None,
     };
     let run = match row.notified {
@@ -1397,7 +1397,7 @@ mod tests {
             None,
         );
         record.state = JobState::Running;
-        insert_job(&ctx.storage_handle, &record).await.unwrap();
+        insert_job(&ctx, &record).await.unwrap();
         drive(
             update_work((install_id, work.work_id), WorkChange::Dispatched(job)),
             &ctx,

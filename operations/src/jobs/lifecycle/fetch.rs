@@ -64,12 +64,12 @@ impl FetchFamilyOperation {
         if self.remaining.is_zero() {
             return Next::Done((None, Vec::new()));
         }
-        Next::Call(IoCall::Effect(Effect::Net(NetEffect::MetadataRequest(
-            Box::new(MetadataRequestEffect {
+        Next::Call(IoCall::Effect(Box::new(Effect::Net(
+            NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
                 peer: *peer,
                 frame: frame.clone(),
                 timeout: self.remaining,
-            }),
+            })),
         ))))
     }
 }
@@ -83,12 +83,16 @@ impl Operation for FetchFamilyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<FetchedFamily>, LifecycleError> {
-        let IoResult::Event(Event::Net(NetEvent::MetadataAnswer(answer))) = result else {
-            return Err(LifecycleError::UnexpectedEvent {
-                state: "Fetch".to_string(),
-                expected: "metadata answer",
-                got: "another result",
-            });
+        let unexpected = || LifecycleError::UnexpectedEvent {
+            state: "Fetch".to_string(),
+            expected: "metadata answer",
+            got: "another result",
+        };
+        let IoResult::Event(event) = result else {
+            return Err(unexpected());
+        };
+        let Event::Net(NetEvent::MetadataAnswer(answer)) = *event else {
+            return Err(unexpected());
         };
         let MetadataAnswer {
             peer,

@@ -508,8 +508,7 @@ async fn record_served(
     let Some(token) = prepared.claim.as_ref().map(|claim| claim.claim_token) else {
         return Ok(());
     };
-    let storage = &context.storage_handle;
-    let result = crate::jobs::store::mutate_job(storage, prepared.job_id, |record| {
+    let result = crate::jobs::store::mutate_job(context, prepared.job_id, |record| {
         if record.claim.as_ref().map(|claim| claim.claim_token) != Some(token) {
             return Err(crate::jobs::store::JobMutationError::TokenMismatch);
         }
@@ -727,14 +726,11 @@ pub async fn capture_outputs(
         .map(destination_of)
         .collect::<Result<_, _>>()?;
     let hints = local_hints(context, node_id, &destinations).await?;
-    let control = reserve_output_commits(
-        &context.storage_handle,
-        record.job_id,
-        &destinations,
-        &hints,
-    )
-    .await
-    .map_err(|error| JobError::retryable(format!("output commit reservation failed: {error}")))?;
+    let control = reserve_output_commits(context, record.job_id, &destinations, &hints)
+        .await
+        .map_err(|error| {
+            JobError::retryable(format!("output commit reservation failed: {error}"))
+        })?;
     if control.attempt_epoch != fence.attempt_epoch {
         return Err(JobError::retryable(
             "attempt fence moved during output capture",
@@ -2525,8 +2521,7 @@ mod tests {
             claim_token: Ulid::from_bytes([8; 16]),
             lease_expires_ms: u64::MAX,
         });
-        let storage = &context.storage_handle;
-        crate::jobs::store::query::insert_job(storage, &record)
+        crate::jobs::store::query::insert_job(&context, &record)
             .await
             .unwrap();
         let pin = SourcePin {
@@ -2536,7 +2531,7 @@ mod tests {
         };
         let stored = || async {
             let read =
-                crate::jobs::store::state::read_job_record(storage, record.job_id, None).await;
+                crate::jobs::store::state::read_job_record(&context, record.job_id, None).await;
             read.unwrap().unwrap().captured_inputs[0].served_by.clone()
         };
         let served = BTreeMap::from([("inputs/in.txt".to_string(), pin.clone())]);

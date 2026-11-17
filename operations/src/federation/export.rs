@@ -113,7 +113,7 @@ async fn active_key(
     bucket: &str,
 ) -> Result<Option<BucketKeyRef>, GrantError> {
     let row = bucket.as_bytes().to_vec();
-    let row = read_row(&context.storage_handle, BUCKET_ENCRYPTION_KEYSPACE, row)
+    let row = read_row(context, BUCKET_ENCRYPTION_KEYSPACE, row)
         .await
         .map_err(GrantError::Storage)?;
     let settings = BucketEncryption::from_row(row.as_deref())
@@ -127,7 +127,7 @@ async fn pinned(context: &DriverContext, source: &PinnedSource) -> Result<bool, 
     let key = key
         .to_bytes()
         .map_err(|e| GrantError::Storage(e.to_string()))?;
-    let row = read_row(&context.storage_handle, BLOB_VERSIONS_KEYSPACE, key)
+    let row = read_row(context, BLOB_VERSIONS_KEYSPACE, key)
         .await
         .map_err(GrantError::Storage)?;
     let Some(row) = row else {
@@ -193,7 +193,7 @@ pub async fn read_record(
     job_id: JobId,
 ) -> Result<Option<GrantRecord>, GrantError> {
     let row = read_row(
-        &context.storage_handle,
+        context,
         FEDERATION_KEYSPACE,
         record_key(job_id),
     )

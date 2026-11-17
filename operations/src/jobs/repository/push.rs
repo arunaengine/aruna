@@ -23,9 +23,8 @@ pub(super) async fn prepare(
     target: &LinkTarget,
     checkpoint: &mut ExportCheckpoint,
 ) -> Result<RepositoryDestination, TransferError> {
-    let storage = &ctx.driver.storage_handle;
     let retry = |error: LinkError| TransferError::Retryable(error.to_string());
-    let link = read_link(storage, spec.document_id, target.link_id)
+    let link = read_link(&ctx.driver, spec.document_id, target.link_id)
         .await
         .map_err(retry)?
         .filter(|link| link.status != LinkStatus::Paused)
@@ -39,7 +38,7 @@ pub(super) async fn prepare(
         }
         Some(_) => return Err(permanent("a newer push of this link replaced this job")),
     }
-    let credential = read_secret(storage, target.link_id)
+    let credential = read_secret(&ctx.driver, target.link_id)
         .await
         .map_err(retry)?
         .filter(|secret| secret.link_id == Some(link.link_id) && secret.endpoint == link.endpoint)
@@ -68,8 +67,7 @@ pub(crate) async fn settle(
     target: &LinkTarget,
     outcome: JobRunOutcome,
 ) -> JobRunOutcome {
-    let storage = &ctx.driver.storage_handle;
-    let link = match read_link(storage, spec.document_id, target.link_id).await {
+    let link = match read_link(&ctx.driver, spec.document_id, target.link_id).await {
         Ok(Some(link)) if link.active_job == Some(ctx.job_id) => link,
         Ok(_) => return outcome,
         Err(error) => return retry(error.to_string()),
@@ -122,7 +120,7 @@ pub(super) async fn guard(
     let Some(target) = &destination.link else {
         return Ok(());
     };
-    match read_link(&ctx.driver.storage_handle, spec.document_id, target.link_id).await {
+    match read_link(&ctx.driver, spec.document_id, target.link_id).await {
         Ok(Some(link))
             if link.active_job == Some(ctx.job_id) && link.status != LinkStatus::Paused =>
         {
@@ -140,8 +138,7 @@ pub(super) async fn record_draft(
     target: &LinkTarget,
     record: &RepositoryRecord,
 ) -> Result<(), TransferError> {
-    let storage = &ctx.driver.storage_handle;
-    let link = read_link(storage, spec.document_id, target.link_id)
+    let link = read_link(&ctx.driver, spec.document_id, target.link_id)
         .await
         .map_err(|error| TransferError::Retryable(error.to_string()))?
         .ok_or(TransferError::Cancelled)?;

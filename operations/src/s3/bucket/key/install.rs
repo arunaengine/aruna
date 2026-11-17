@@ -774,8 +774,8 @@ mod tests {
             cleanup_marker: None,
         };
         let job = JobRecord::new(job_id, payload, creator, node, 1_000, 1_000, None);
-        insert_job(storage, &job).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, 2_000).await.unwrap()
+        insert_job(&context, &job).await.unwrap();
+        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -786,7 +786,7 @@ mod tests {
             key: key.key,
         };
         park_job(
-            storage,
+            &context,
             job_id,
             claimed.claim.unwrap().claim_token,
             3_000,
@@ -796,7 +796,7 @@ mod tests {
         .unwrap();
         assert!(!crate::jobs::runtime::key_unlocked(&context, key.key).await);
         assert_eq!(
-            read_job_record(storage, job_id, None)
+            read_job_record(&context, job_id, None)
                 .await
                 .unwrap()
                 .unwrap()
@@ -814,7 +814,7 @@ mod tests {
             .await
             .unwrap();
         assert!(status.active && status.remaining.is_none());
-        let job = read_job_record(storage, job_id, None)
+        let job = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -951,7 +951,7 @@ mod tests {
             .await;
         assert_eq!(process_transitions(&context).await.unwrap(), Some(RECHECK));
         let stored = read_row(
-            &context.storage_handle,
+            &context,
             TRANSITION_KEYSPACE,
             b"sealed".to_vec(),
         )
@@ -1005,7 +1005,7 @@ mod tests {
         );
         while fired.recv().await.unwrap() != TaskKey::MigrateCompression {}
         let resumed = read_row(
-            &context.storage_handle,
+            &context,
             TRANSITION_KEYSPACE,
             b"sealed".to_vec(),
         )
@@ -1022,7 +1022,7 @@ mod tests {
         assert!(duration < RECHECK);
         process_transitions(&context).await.unwrap();
         let stored = read_row(
-            &context.storage_handle,
+            &context,
             TRANSITION_KEYSPACE,
             b"sealed".to_vec(),
         )

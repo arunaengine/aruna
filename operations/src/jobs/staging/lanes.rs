@@ -896,7 +896,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&ctx.driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&ctx.driver, &record)
             .await
             .unwrap();
         JobContext {
@@ -1037,7 +1037,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::query::insert_job(&driver.storage_handle, &record)
+        crate::jobs::store::query::insert_job(&driver, &record)
             .await
             .unwrap();
         let ctx = JobContext {

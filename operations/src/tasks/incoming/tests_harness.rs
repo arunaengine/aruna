@@ -92,9 +92,9 @@ async fn paused_runtime_waits() {
         1,
         None,
     );
-    insert_job(&storage, &record).await.expect("insert job");
+    insert_job(&crate::testing::test_context(storage.clone()), &record).await.expect("insert job");
     assert!(matches!(
-        claim_job(&storage, job_id, node(7), 2).await,
+        claim_job(&crate::testing::test_context(storage.clone()), job_id, node(7), 2).await,
         Ok(ClaimOutcome::Claimed(_))
     ));
     let runtime = JobsRuntime::new_paused();
@@ -102,14 +102,14 @@ async fn paused_runtime_waits() {
     let shutdown = Shutdown::new();
     start_task_queues(context, task_handle, runtime.clone(), &shutdown).await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&crate::testing::test_context(storage.clone()), job_id, None)
         .await
         .expect("read job")
         .expect("job exists");
     assert_eq!(stored.state, JobState::Claimed);
-    assert_eq!(runtime.recover_stale_jobs(&storage).await.unwrap(), 1);
+    assert_eq!(runtime.recover_stale_jobs(&crate::testing::test_context(storage.clone())).await.unwrap(), 1);
     runtime.start();
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&crate::testing::test_context(storage.clone()), job_id, None)
         .await
         .expect("read job")
         .expect("job exists");
@@ -148,9 +148,9 @@ async fn start_keeps_job() {
         1,
         None,
     );
-    insert_job(&storage, &record).await.expect("insert job");
+    insert_job(&crate::testing::test_context(storage.clone()), &record).await.expect("insert job");
     assert!(matches!(
-        claim_job(&storage, job_id, node(7), 2).await,
+        claim_job(&crate::testing::test_context(storage.clone()), job_id, node(7), 2).await,
         Ok(ClaimOutcome::Claimed(_))
     ));
     let runtime = JobsRuntime::new_paused();
@@ -166,7 +166,7 @@ async fn start_keeps_job() {
     let shutdown = Shutdown::new();
     queues.restore_and_start(&shutdown).await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&crate::testing::test_context(storage.clone()), job_id, None)
         .await
         .expect("read job")
         .expect("job exists");

@@ -61,7 +61,7 @@ async fn settle_stale(
     job_id: JobId,
     now: u64,
 ) -> Result<Option<u64>, LinkError> {
-    let record = read_job_record(&context.storage_handle, job_id, None)
+    let record = read_job_record(context, job_id, None)
         .await
         .map_err(LinkError::Unexpected)?;
     let outcome = match record {
@@ -117,7 +117,7 @@ pub async fn start_pull(
     ensure_holder(context, link).await?;
     // A failed link runs again only if no enabled link follows its lineage the other way.
     if matches!(link.status, LinkStatus::Failed { .. }) {
-        Box::pin(ensure_lineage(&context.storage_handle, link)).await?;
+        Box::pin(ensure_lineage(context, link)).await?;
     }
     let document = load_document_record(context, link.document_id)
         .await
@@ -180,7 +180,7 @@ pub(crate) async fn running(
     spec: &ImportRoCrateSpec,
     link_id: Ulid,
 ) -> Result<(), TransferError> {
-    let link = read_link(&ctx.driver.storage_handle, spec.document_id, link_id)
+    let link = read_link(&ctx.driver, spec.document_id, link_id)
         .await
         .map_err(|error| TransferError::Retryable(error.to_string()))?
         .filter(|link| link.status != LinkStatus::Paused && link.pull().is_some())
@@ -271,8 +271,7 @@ pub(crate) async fn settle_import(
             }
         }
         RepositoryPull::Update { link_id } => {
-            let storage = &ctx.driver.storage_handle;
-            let Some(link) = read_link(storage, spec.document_id, *link_id)
+            let Some(link) = read_link(&ctx.driver, spec.document_id, *link_id)
                 .await?
                 .filter(|link| link.active_job == Some(ctx.job_id))
             else {
