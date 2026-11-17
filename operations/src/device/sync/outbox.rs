@@ -29,14 +29,14 @@ use crate::device::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue}
 
 use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 use crate::placement::process_placements::load_realm_config;
 
 use super::folders::FolderError;
 use super::pull::forward_pull;
 use super::repository::{
-    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, base_entry, base_key, folder_key,
-    upload_entry,
+    MAX_UPLOAD_ATTEMPTS, RequeueUploadsOperation, SYNC_PAGE_SIZE, StoreUploadOperation, SyncUpload,
+    UploadState, base_entry, base_key, folder_key, same_version,
 };
 use super::rows::{abort_txn, commit_txn, read_value, start_txn, write_rows};
 
@@ -397,81 +397,20 @@ async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String,
 /// Makes every backed-off upload due now and re-arms retryable failures, for an explicit
 /// owner-requested sync. A running pull keeps its polls.
 pub(crate) async fn requeue_uploads(context: &Arc<DriverContext>, now_ms: u64) {
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((uploads, next)) = read_page(context, cursor).await else {
-            return;
-        };
-        for upload in uploads {
-            if let Some(state) = requeued(&upload.state, now_ms) {
-                store_state(context, &upload, state, true).await;
-            }
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return,
-        }
+    if let Err(error) = drive(RequeueUploadsOperation::new(now_ms), context).await {
+        warn!(error = %error, "Failed to requeue the folder uploads");
     }
 }
 
-/// The state an explicit sync gives one upload: a backed-off one is due now with its
-/// attempts kept, a retryable failure starts over, and anything else stays.
-fn requeued(state: &UploadState, now_ms: u64) -> Option<UploadState> {
-    match state {
-        UploadState::Pending {
-            due_at_ms,
-            attempts,
-            last_error,
-        } if *due_at_ms > now_ms => Some(UploadState::Pending {
-            due_at_ms: now_ms,
-            attempts: *attempts,
-            last_error: last_error.clone(),
-        }),
-        UploadState::Failed {
-            reason,
-            retryable: true,
-        } => Some(UploadState::Pending {
-            due_at_ms: now_ms,
-            attempts: 0,
-            last_error: Some(reason.clone()),
-        }),
-        _ => None,
-    }
-}
-
-/// Writes one upload row under a new state. `guarded` refuses the write when
-/// the stored row no longer carries the state this pass read.
+/// Writes one upload row under a new state; see [`StoreUploadOperation`].
 async fn store_state(
     context: &Arc<DriverContext>,
     upload: &SyncUpload,
     next: UploadState,
     guarded: bool,
 ) -> bool {
-    let Some(txn_id) = start_txn(context).await else {
-        return false;
-    };
-    let updated = SyncUpload {
-        state: next,
-        ..upload.clone()
-    };
-    let stored = match upload_entry(&updated) {
-        Ok(row) => {
-            (!guarded || holds_state(context, upload, txn_id).await)
-                && write_rows(context, vec![row], Some(txn_id)).await
-        }
-        Err(_) => false,
-    };
-    if !stored {
-        abort_txn(context, txn_id).await;
-        return false;
-    }
-    commit_txn(context, txn_id).await
-}
-
-async fn holds_state(context: &Arc<DriverContext>, upload: &SyncUpload, txn_id: TxnId) -> bool {
-    stored_upload(context, upload, txn_id)
-        .await
-        .is_some_and(|stored| stored.state == upload.state && same_version(&stored, upload))
+    let store = StoreUploadOperation::new(upload.clone(), next, guarded);
+    drive(store, context).await.unwrap_or(false)
 }
 
 async fn stored_upload(
@@ -487,11 +426,6 @@ async fn stored_upload(
     )
     .await
     .and_then(|bytes| SyncUpload::from_bytes(&bytes).ok())
-}
-
-/// Whether two rows publish the same local version of one file.
-fn same_version(stored: &SyncUpload, upload: &SyncUpload) -> bool {
-    stored.local_version == upload.local_version && stored.deleted == upload.deleted
 }
 
 async fn read_page(
@@ -576,10 +510,11 @@ mod tests {
 
     use super::{
         ForwardOutcome, QueueDrain, SyncPullAck, SyncUpload, UploadDrain, UploadState,
-        claim_upload, drain_sync_outbox, requeued, settle_upload,
+        claim_upload, drain_sync_outbox, settle_upload,
     };
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
+    use crate::device::sync::repository::requeued;
     use crate::device::sync::repository::{base_key, upload_entry};
     use crate::device::sync::rows::{read_value, write_rows};
     use crate::driver::DriverContext;
