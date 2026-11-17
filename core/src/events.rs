@@ -52,6 +52,28 @@ pub enum Event {
     Task(TaskEvent),
     Search(),
     Stream(),
+    Group(GroupEvent),
+}
+
+/// Results of a [`crate::effects::EffectGroup`]; never persisted.
+#[derive(Debug, PartialEq)]
+pub enum GroupEvent {
+    /// Every member result of an all-at-once group, in emission order.
+    Finished { results: Vec<GroupResult> },
+    /// One finished window member; `index` counts the window's members in emission order.
+    Member { index: usize, result: GroupResult },
+    /// The window has no running or waiting member left.
+    Closed,
+}
+
+/// What one group member returned.
+#[derive(Debug, PartialEq)]
+pub enum GroupResult {
+    Done(Box<Event>),
+    /// The group deadline passed before the member finished.
+    Unfinished,
+    /// The member is a storage transaction effect or a group, which a group cannot run.
+    Refused,
 }
 
 #[derive(Debug, PartialEq)]
@@ -807,6 +829,7 @@ impl Event {
                     TimerScheduled, TimerCancelled, RunningHandlersAborted, Error,
                 }
             ),
+            Event::Group(event) => variant_label!(event, GroupEvent { Finished, Member, Closed }),
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
         }

@@ -11,7 +11,7 @@ mod storage;
 mod task;
 
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent, SubOperationEvent};
 use tracing::{debug, trace, warn};
 
 use crate::driver::{DriverContext, MAX_SUBOP_DEPTH};
@@ -135,6 +135,12 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        // The effect loop runs groups itself; a group never reaches a single dispatch.
+        Effect::Group(group) => {
+            warn!(depth, "Effect group reached a single dispatch");
+            let results = group.members.iter().map(|_| GroupResult::Refused).collect();
+            Event::Group(GroupEvent::Finished { results })
+        }
     };
 
     trace!(
@@ -167,5 +173,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Group(_) => "group",
     }
 }
