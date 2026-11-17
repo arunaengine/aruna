@@ -54,19 +54,6 @@ mod delivery_tests;
 #[path = "events_tests.rs"]
 mod events_tests;
 
-use serde::{Deserialize, Serialize};
-
-/// Artifact bytes in a node message; Debug prints only their length.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ArtifactBytes(pub Vec<u8>);
-
-impl std::fmt::Debug for ArtifactBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ArtifactBytes({} bytes)", self.0.len())
-    }
-}
-
 /// Management nodes that must hold a copy before a publish is answered: a majority, and at
 /// least two once the realm has two. Plain copies with acknowledgements, no vote.
 pub fn copies_needed(managers: usize) -> usize {
@@ -79,6 +66,7 @@ pub fn copies_needed(managers: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::plugins::ArtifactBytes;
 
     #[test]
     fn majority_copies() {

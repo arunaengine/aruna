@@ -682,7 +682,7 @@ pub enum MetadataTransportMessage {
     },
     /// One chunk of a plugin artifact a management node hands another to keep before publishing.
     StoreArtifact {
-        chunk: crate::plugins::copies::Chunk,
+        chunk: aruna_core::plugins::Chunk,
     },
     /// `true` once the receiver holds the whole artifact and it checked out.
     ArtifactStored {
@@ -694,7 +694,7 @@ pub enum MetadataTransportMessage {
         index: u32,
     },
     FetchedArtifact {
-        result: Result<crate::plugins::copies::Chunk, MetadataReadError>,
+        result: Result<aruna_core::plugins::Chunk, MetadataReadError>,
     },
     /// The clock of an infrastructure node, asked to map an install's activation time.
     ProbeClock,

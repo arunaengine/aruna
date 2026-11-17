@@ -788,7 +788,7 @@ impl MetadataHandle {
     pub async fn request_store_artifact(
         &self,
         node_id: NodeId,
-        chunk: crate::plugins::copies::Chunk,
+        chunk: aruna_core::plugins::Chunk,
     ) -> Result<bool, MetadataReadError> {
         let request = MetadataTransportMessage::StoreArtifact { chunk };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
@@ -806,7 +806,7 @@ impl MetadataHandle {
         node_id: NodeId,
         digest: String,
         index: u32,
-    ) -> Result<crate::plugins::copies::Chunk, MetadataReadError> {
+    ) -> Result<aruna_core::plugins::Chunk, MetadataReadError> {
         let request = MetadataTransportMessage::FetchArtifact { digest, index };
         match send_remote_request(&self.inner, &Span::current(), node_id, request)
             .await

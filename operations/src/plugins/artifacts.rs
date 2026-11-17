@@ -17,15 +17,15 @@ use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use super::ArtifactBytes;
 use super::copies::{
-    Assembled, Chunk, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve,
-    store_chunk, store_local, sweep_copies,
+    Assembled, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve, store_chunk,
+    store_local, sweep_copies,
 };
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::realm::get_config::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::plugins::{ArtifactBytes, Chunk};
 
 /// How often a node sweeps its copies, and a management node repairs missing copies and the
 /// accounts and roles of its installs.

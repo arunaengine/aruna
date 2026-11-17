@@ -85,6 +85,33 @@ pub fn valid_version(version: &str) -> bool {
         && (version.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-+.".contains(&b))
 }
 
+/// Artifact bytes in a node message; Debug prints only their length.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArtifactBytes({} bytes)", self.0.len())
+    }
+}
+
+/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub digest: String,
+    pub index: u32,
+    pub total: u64,
+    pub bytes: ArtifactBytes,
+}
+
+/// Sends one artifact chunk to the management node `node_id`, which keeps it toward its copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStore {
+    pub node_id: crate::NodeId,
+    pub chunk: Chunk,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

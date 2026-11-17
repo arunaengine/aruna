@@ -7,12 +7,11 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
-use aruna_core::plugins::MAX_ARTIFACT;
+use aruna_core::plugins::{ArtifactBytes, Chunk, MAX_ARTIFACT};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
-use super::ArtifactBytes;
 use super::artifacts::ArtifactError;
 use super::rows::{self, Row, Scan, StoreError, read_rows, row, sync_all, writes};
 use crate::driver::{DriverContext, drive};
@@ -62,15 +61,6 @@ impl std::fmt::Debug for Assembled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Assembled({} bytes)", self.bytes.len())
     }
-}
-
-/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Chunk {
-    pub digest: String,
-    pub index: u32,
-    pub total: u64,
-    pub bytes: ArtifactBytes,
 }
 
 /// The chunks an artifact of `total` bytes has.
