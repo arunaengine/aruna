@@ -4,29 +4,28 @@
 
 use std::time::SystemTime;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, STORAGE_BACKEND_KEYSPACE,
+    BLOB_RECLAIM_KEYSPACE, BLOB_VERSIONS_KEYSPACE, COPY_OWNER_KEYSPACE, PATHS_INDEX_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::backend_import::version_key;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobCleanupWork, BlobLocationKey, BlobVersion,
-    HashIndex, VersionKey,
+    CopyOwner, HashIndex, VersionKey,
 };
 use aruna_core::structs::storage::cleanup::{ReclaimCandidate, ReclaimCandidateKey};
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::types::{Effects, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::records::{blob_location_read, iter_index_effect, owners_scan_effect};
-use crate::groups::backends::{RecordReadError, backend_key, parse_read};
+use crate::groups::backends::backend_key;
 use crate::s3::usage::{StoredDelta, UsageCounterUpdate, UsageUpdateError};
 
 /// What one candidate resolved to. `Dropped` covers every reason the queue row
@@ -42,8 +41,6 @@ pub enum ReclaimVerdict {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ReclaimState {
-    Init,
-    StartTransaction,
     ReadCandidate,
     FenceBackend,
     ReadLocation,
@@ -53,10 +50,6 @@ enum ReclaimState {
     DeleteRows,
     QueueCleanup,
     UpdateUsage,
-    CommitTransaction,
-    AbortTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -67,29 +60,30 @@ pub enum ReclaimBlobError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Usage(#[from] UsageUpdateError),
-    #[error(transparent)]
-    Read(#[from] RecordReadError),
     #[error("reclaim failed")]
     Failed,
     #[error("indexed blob version is missing")]
     MissingOwner,
-    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received}]")]
-    InvalidStateEvent {
-        state: &'static str,
-        expected: &'static str,
-        received: &'static str,
-    },
     #[error("reclaim storage failed: {0}")]
-    Io(aruna_core::calls::IoError),
+    Io(IoError),
 }
 
-impl From<aruna_core::calls::IoError> for ReclaimBlobError {
-    fn from(error: aruna_core::calls::IoError) -> Self {
+impl From<IoError> for ReclaimBlobError {
+    fn from(error: IoError) -> Self {
         match error {
-            aruna_core::calls::IoError::Storage(error) => Self::Storage(error),
+            IoError::Storage(_) | IoError::Conflict => Self::Storage(error.into()),
             other => Self::Io(other),
         }
     }
+}
+
+type Turn = Result<Next<ReclaimVerdict>, ReclaimBlobError>;
+
+fn parsed<T>(
+    value: Option<Value>,
+    decode: impl FnOnce(&[u8]) -> Result<T, ConversionError>,
+) -> Result<Option<T>, ReclaimBlobError> {
+    Ok(value.map(|value| decode(value.as_ref())).transpose()?)
 }
 
 /// Deletes one unreferenced copy. Everything that decides it happens inside one
@@ -101,11 +95,11 @@ pub struct ReclaimBlobOperation {
     enqueued_at: SystemTime,
     sweep_time: SystemTime,
     state: ReclaimState,
-    txn_id: Option<TxnId>,
     location: Option<BackendLocation>,
     next_alias_page: Option<Key>,
     usage_update: Option<UsageCounterUpdate>,
-    output: Option<Result<ReclaimVerdict, ReclaimBlobError>>,
+    /// The verdict the transaction commits with.
+    verdict: Option<ReclaimVerdict>,
     /// Frees the copy whatever the strategy and without a queued candidate.
     forced: bool,
 }
@@ -123,12 +117,11 @@ impl ReclaimBlobOperation {
             key,
             enqueued_at,
             sweep_time,
-            state: ReclaimState::Init,
-            txn_id: None,
+            state: ReclaimState::ReadCandidate,
             location: None,
             next_alias_page: None,
             usage_update: None,
-            output: None,
+            verdict: None,
             forced: false,
         }
     }
@@ -137,79 +130,36 @@ impl ReclaimBlobOperation {
         BlobLocationKey::new(self.key.blake3, self.key.encoding, self.key.backend.clone())
     }
 
-    fn fail(&mut self, error: ReclaimBlobError) -> Effects {
-        self.output = Some(Err(error));
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = ReclaimState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.state = ReclaimState::Error;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, state: &'static str, expected: &'static str, event: Event) -> Effects {
-        self.fail(ReclaimBlobError::InvalidStateEvent {
-            state,
-            expected,
-            received: (event).label(),
-        })
+    fn call(&mut self, state: ReclaimState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
     /// Ends the candidate without touching the bytes: the queue row goes, the
     /// location row stays.
-    fn drop_candidate(&mut self, verdict: ReclaimVerdict) -> Effects {
-        self.output = Some(Ok(verdict));
-        self.state = ReclaimState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![(
-                BLOB_RECLAIM_KEYSPACE.to_string(),
-                self.key.to_bytes().into()
-            )],
-            txn_id: self.txn_id,
-        })]
+    fn drop_candidate(&mut self, verdict: ReclaimVerdict) -> Turn {
+        self.verdict = Some(verdict);
+        let delete = vec![(
+            BLOB_RECLAIM_KEYSPACE.to_string(),
+            self.key.to_bytes().into(),
+        )];
+        self.call(ReclaimState::DeleteRows, IoCall::Delete(delete))
     }
 
-    fn handle_txn_started(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                self.txn_id = Some(txn_id);
-                self.state = ReclaimState::ReadCandidate;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_RECLAIM_KEYSPACE.to_string(),
-                    key: self.key.to_bytes().into(),
-                    txn_id: self.txn_id,
-                })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.unexpected(
-                "StartTransaction",
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                received,
-            ),
-        }
-    }
-
-    fn handle_candidate(&mut self, event: Event) -> Effects {
-        let candidate = match parse_read(event, ReclaimCandidate::from_bytes) {
-            Ok(candidate) => candidate,
-            Err(error) => return self.fail(error.into()),
-        };
-        match candidate {
+    fn handle_candidate(&mut self, value: Option<Value>) -> Turn {
+        match parsed(value, ReclaimCandidate::from_bytes)? {
             _ if self.forced => {}
             None => return self.drop_candidate(ReclaimVerdict::Dropped),
+            // The candidate changed after the sweep read it: it is simply not due yet.
             Some(candidate) if candidate.enqueued_at != self.enqueued_at => {
-                return self.finish_not_due();
+                return Ok(Next::Done(ReclaimVerdict::NotDue));
             }
             Some(_) => {}
         }
         match self.key.backend {
             BackendRef::Group(backend_id) => {
-                self.state = ReclaimState::FenceBackend;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                    key: backend_key(backend_id),
-                    txn_id: self.txn_id,
-                })]
+                let read = read_row(STORAGE_BACKEND_KEYSPACE, backend_key(backend_id));
+                self.call(ReclaimState::FenceBackend, read)
             }
             BackendRef::Node(_) => self.read_location(),
         }
@@ -218,11 +168,9 @@ impl ReclaimBlobOperation {
     /// Re-checks the tenant's strategy under the transaction, so a flip to
     /// retain conflicts with this sweep instead of racing it. A grace the tenant
     /// lengthened since the sweep read it makes the candidate not due again.
-    fn handle_fence(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorage::from_bytes) {
-            Ok(Some(record)) => record,
-            Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
-            Err(error) => return self.fail(error.into()),
+    fn handle_fence(&mut self, value: Option<Value>) -> Turn {
+        let Some(record) = parsed(value, GroupStorage::from_bytes)? else {
+            return self.drop_candidate(ReclaimVerdict::Dropped);
         };
         if self.forced {
             return self.read_location();
@@ -232,35 +180,18 @@ impl ReclaimBlobOperation {
         };
         match self.enqueued_at.checked_add(after) {
             Some(due) if due <= self.sweep_time => self.read_location(),
-            _ => self.finish_not_due(),
+            _ => Ok(Next::Done(ReclaimVerdict::NotDue)),
         }
     }
 
-    /// Leaves the queue row in place: the candidate is simply not due yet.
-    fn finish_not_due(&mut self) -> Effects {
-        self.output = Some(Ok(ReclaimVerdict::NotDue));
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = ReclaimState::AbortTransaction;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = ReclaimState::Finish;
-                smallvec![]
-            }
-        }
+    fn read_location(&mut self) -> Turn {
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, self.location_key().to_bytes());
+        self.call(ReclaimState::ReadLocation, read)
     }
 
-    fn read_location(&mut self) -> Effects {
-        self.state = ReclaimState::ReadLocation;
-        smallvec![blob_location_read(&self.location_key(), self.txn_id)]
-    }
-
-    fn handle_location(&mut self, event: Event) -> Effects {
-        let location = match parse_read(event, BackendLocation::from_bytes) {
-            Ok(Some(location)) => location,
-            Ok(None) => return self.drop_candidate(ReclaimVerdict::Dropped),
-            Err(error) => return self.fail(error.into()),
+    fn handle_location(&mut self, value: Option<Value>) -> Turn {
+        let Some(location) = parsed(value, BackendLocation::from_bytes)? else {
+            return self.drop_candidate(ReclaimVerdict::Dropped);
         };
         // Staged and partial copies belong to the hidden sweep and never
         // credited the stored counters, so debiting them would underflow.
@@ -271,28 +202,19 @@ impl ReclaimBlobOperation {
         self.scan_aliases(None)
     }
 
-    fn scan_aliases(&mut self, start: Option<Key>) -> Effects {
-        self.state = ReclaimState::ScanAliases;
-        match iter_index_effect(&self.key.blake3, start, self.txn_id) {
-            Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(error.into()),
-        }
+    fn scan_aliases(&mut self, start: Option<Key>) -> Turn {
+        let page = IoCall::Page {
+            space: PATHS_INDEX_KEYSPACE.to_string(),
+            prefix: HashIndex::hash_prefix(&self.key.blake3)?.into(),
+            after: start,
+            limit: usize::MAX,
+        };
+        self.call(ReclaimState::ScanAliases, page)
     }
 
-    fn handle_alias_page(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.unexpected(
-                "ScanAliases",
-                "Event::Storage(StorageEvent::IterResult)",
-                event,
-            );
-        };
-        self.next_alias_page = next_start_after;
-        let reads = match values
+    fn handle_alias_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        self.next_alias_page = next;
+        let reads = values
             .iter()
             .map(|(key, _)| {
                 let alias = HashIndex::from_bytes(key.as_ref())?;
@@ -302,40 +224,20 @@ impl ReclaimBlobOperation {
                     version.to_bytes()?.into(),
                 ))
             })
-            .collect::<Result<Vec<_>, ConversionError>>()
-        {
-            Ok(reads) => reads,
-            Err(error) => return self.fail(error.into()),
-        };
+            .collect::<Result<Vec<_>, ConversionError>>()?;
         if reads.is_empty() {
             return self.continue_scan();
         }
-        self.state = ReclaimState::ReadVersions;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.call(ReclaimState::ReadVersions, IoCall::Read(reads))
     }
 
     /// A version naming this exact copy pins it. Missing or undecodable indexed
     /// versions fail the sweep closed and leave the candidate queued.
-    fn handle_versions(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(
-                "ReadVersions",
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                event,
-            );
-        };
+    fn handle_versions(&mut self, values: Vec<Option<Value>>) -> Turn {
         let wanted = self.location_key();
-        for (_, value) in values {
-            let Some(value) = value else {
-                return self.fail(ReclaimBlobError::MissingOwner);
-            };
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(error) => return self.fail(error.into()),
-            };
+        for value in values {
+            let value = value.ok_or(ReclaimBlobError::MissingOwner)?;
+            let version = BlobVersion::from_bytes(value.as_ref())?;
             if version.location_key() == Some(wanted.clone()) {
                 return self.drop_candidate(ReclaimVerdict::Pinned);
             }
@@ -343,7 +245,7 @@ impl ReclaimBlobOperation {
         self.continue_scan()
     }
 
-    fn continue_scan(&mut self) -> Effects {
+    fn continue_scan(&mut self) -> Turn {
         match self.next_alias_page.take() {
             Some(start) => self.scan_aliases(Some(start)),
             None => self.read_owners(),
@@ -351,42 +253,26 @@ impl ReclaimBlobOperation {
     }
 
     /// Versions still pending or mid-promotion own a Pithos archive without a hash alias.
-    fn read_owners(&mut self) -> Effects {
-        let Some(location) = self.location.as_ref() else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
+    fn read_owners(&mut self) -> Turn {
+        let location = self.location.as_ref().ok_or(ReclaimBlobError::Failed)?;
         let archive = ArchiveKey::of(location);
-        self.state = ReclaimState::ReadOwners;
-        smallvec![owners_scan_effect(&archive, self.txn_id)]
-    }
-
-    fn handle_owners(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::IterResult { values, .. }) if values.is_empty() => {
-                self.free_copy()
-            }
-            Event::Storage(StorageEvent::IterResult { .. }) => {
-                self.drop_candidate(ReclaimVerdict::Pinned)
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            event => self.unexpected(
-                "ReadOwners",
-                "Event::Storage(StorageEvent::IterResult)",
-                event,
-            ),
-        }
+        let page = IoCall::Page {
+            space: COPY_OWNER_KEYSPACE.to_string(),
+            prefix: CopyOwner::prefix(&archive).into(),
+            after: None,
+            limit: 2,
+        };
+        self.call(ReclaimState::ReadOwners, page)
     }
 
     /// The free path: location row, queue row, physical delete and the counter
     /// debit all commit together, so no window shows the copy as unreferenced
     /// while its bytes are neither queued for deletion nor still charged.
-    fn free_copy(&mut self) -> Effects {
-        let Some(location) = self.location.clone() else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
-        self.output = Some(Ok(ReclaimVerdict::Freed {
+    fn free_copy(&mut self) -> Turn {
+        let location = self.location.clone().ok_or(ReclaimBlobError::Failed)?;
+        self.verdict = Some(ReclaimVerdict::Freed {
             bytes: location.stored_size(),
-        }));
+        });
         let mut deletes = vec![
             (
                 BLOB_LOCATIONS_KEYSPACE.to_string(),
@@ -401,60 +287,32 @@ impl ReclaimBlobOperation {
             let key = version_key(location.ulid);
             deletes.push((BACKEND_VERSION_KEYSPACE.to_string(), key));
         }
-        self.state = ReclaimState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: self.txn_id,
-        })]
+        self.call(ReclaimState::DeleteRows, IoCall::Delete(deletes))
     }
 
-    fn handle_rows_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected(
-                "DeleteRows",
-                "Event::Storage(StorageEvent::BatchDeleteResult)",
-                event,
-            );
-        };
-        let Some(location) = self
-            .location
-            .clone()
-            .filter(|_| matches!(self.output, Some(Ok(ReclaimVerdict::Freed { .. }))))
-        else {
+    fn freed(&self) -> bool {
+        matches!(self.verdict, Some(ReclaimVerdict::Freed { .. }))
+    }
+
+    fn handle_rows_deleted(&mut self) -> Turn {
+        let Some(location) = self.location.clone().filter(|_| self.freed()) else {
             return self.commit();
         };
         // Bytes Aruna found on a tenant backend are never deleted; only the row goes.
         if location.is_external() {
             return self.debit_usage();
         }
-        let work = match (BlobCleanupWork::DeleteBlob { location }).to_bytes() {
-            Ok(work) => work,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = ReclaimState::QueueCleanup;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_CLEANUP_KEYSPACE.to_string(),
-            key: Ulid::generate().to_bytes().to_vec().into(),
-            value: work.into(),
-            txn_id: self.txn_id,
-        })]
+        let work = (BlobCleanupWork::DeleteBlob { location }).to_bytes()?;
+        let row = (
+            BLOB_CLEANUP_KEYSPACE.to_string(),
+            Ulid::generate().to_bytes().to_vec().into(),
+            work.into(),
+        );
+        self.call(ReclaimState::QueueCleanup, IoCall::Write(vec![row]))
     }
 
-    fn handle_cleanup_queued(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected(
-                "QueueCleanup",
-                "Event::Storage(StorageEvent::WriteResult)",
-                event,
-            );
-        };
-        self.debit_usage()
-    }
-
-    fn debit_usage(&mut self) -> Effects {
-        let (Some(txn_id), Some(location)) = (self.txn_id, self.location.as_ref()) else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
+    fn debit_usage(&mut self) -> Turn {
+        let location = self.location.as_ref().ok_or(ReclaimBlobError::Failed)?;
         let bytes = -i128::from(location.stored_size());
         let stored = StoredDelta::of_copy(location, -1, bytes).unwrap_or_else(|| {
             StoredDelta::new(self.key.blake3, self.key.backend.clone(), -1, bytes)
@@ -463,124 +321,70 @@ impl ReclaimBlobOperation {
         if update.is_noop() {
             return self.commit();
         }
-        self.state = ReclaimState::UpdateUsage;
-        let effects = update.start(txn_id);
+        let call = update.start_calls().into_call();
         self.usage_update = Some(update);
-        effects
+        self.call(ReclaimState::UpdateUsage, call)
     }
 
-    fn handle_usage(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
-        let Some(update) = self.usage_update.as_mut() else {
-            return self.fail(ReclaimBlobError::Failed);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => self.commit(),
-            Err(error) => self.fail(error.into()),
+    fn handle_usage(&mut self, result: IoResult) -> Turn {
+        let update = self.usage_update.as_mut().ok_or(ReclaimBlobError::Failed)?;
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.commit(),
         }
     }
 
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(ReclaimBlobError::Failed);
+    /// A freed copy wakes the cleanup queue once the transaction commits.
+    fn commit(&mut self) -> Turn {
+        let verdict = self.verdict.ok_or(ReclaimBlobError::Failed)?;
+        let calls = match self.freed() {
+            true => vec![schedule_cleanup_effect().into()],
+            false => Vec::new(),
         };
-        self.state = ReclaimState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        self.txn_id = None;
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.state = ReclaimState::Finish;
-                match self.output {
-                    Some(Ok(ReclaimVerdict::Freed { .. })) => {
-                        smallvec![schedule_cleanup_effect()]
-                    }
-                    _ => smallvec![],
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.unexpected(
-                "CommitTransaction",
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                received,
-            ),
-        }
-    }
-
-    fn handle_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = match self.output {
-                    Some(Ok(_)) => ReclaimState::Finish,
-                    _ => ReclaimState::Error,
-                };
-                smallvec![]
-            }
-            received => self.unexpected(
-                "AbortTransaction",
-                "Event::Storage(StorageEvent::TransactionAborted)",
-                received,
-            ),
-        }
+        Ok(Next::Then {
+            output: verdict,
+            calls,
+        })
     }
 }
 
-impl EffectOperation for ReclaimBlobOperation {
+impl Operation for ReclaimBlobOperation {
     type Output = ReclaimVerdict;
     type Error = ReclaimBlobError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReclaimState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> Turn {
+        let read = read_row(BLOB_RECLAIM_KEYSPACE, self.key.to_bytes());
+        self.call(ReclaimState::ReadCandidate, read)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Turn {
         match self.state {
-            ReclaimState::Init => self.start(),
-            ReclaimState::StartTransaction => self.handle_txn_started(event),
-            ReclaimState::ReadCandidate => self.handle_candidate(event),
-            ReclaimState::FenceBackend => self.handle_fence(event),
-            ReclaimState::ReadLocation => self.handle_location(event),
-            ReclaimState::ScanAliases => self.handle_alias_page(event),
-            ReclaimState::ReadVersions => self.handle_versions(event),
-            ReclaimState::ReadOwners => self.handle_owners(event),
-            ReclaimState::DeleteRows => self.handle_rows_deleted(event),
-            ReclaimState::QueueCleanup => self.handle_cleanup_queued(event),
-            ReclaimState::UpdateUsage => self.handle_usage(event),
-            ReclaimState::CommitTransaction => self.handle_committed(event),
-            ReclaimState::AbortTransaction => self.handle_aborted(event),
-            ReclaimState::Finish | ReclaimState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReclaimState::Finish | ReclaimState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            ReclaimState::Finish => self.output.unwrap_or(Err(ReclaimBlobError::Failed)),
-            _ => match self.output {
-                Some(Err(error)) => Err(error),
-                _ => Err(ReclaimBlobError::Failed),
+            ReclaimState::ReadCandidate => self.handle_candidate(result.value()?),
+            ReclaimState::FenceBackend => self.handle_fence(result.value()?),
+            ReclaimState::ReadLocation => self.handle_location(result.value()?),
+            ReclaimState::ScanAliases => {
+                let (rows, next) = result.page()?;
+                self.handle_alias_page(rows, next)
+            }
+            ReclaimState::ReadVersions => self.handle_versions(result.values()?),
+            ReclaimState::ReadOwners => match result.page()?.0.is_empty() {
+                true => self.free_copy(),
+                false => self.drop_candidate(ReclaimVerdict::Pinned),
             },
+            ReclaimState::DeleteRows => {
+                result.done()?;
+                self.handle_rows_deleted()
+            }
+            ReclaimState::QueueCleanup => {
+                result.done()?;
+                self.debit_usage()
+            }
+            ReclaimState::UpdateUsage => self.handle_usage(result),
         }
     }
 
-    fn abort(&mut self) -> Effects {
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = ReclaimState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        smallvec![]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -594,7 +398,10 @@ mod tests {
     use crate::blob::reclaim_sweep::{RECLAIM_TICK_LIMIT, backend_status, sweep_at};
     use crate::driver::{DriverContext, drive};
     use crate::storage_read::iter_prefix_page;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+    use aruna_core::operation::{EffectOperation, Runnable};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::CopyOwner;
     use aruna_core::structs::storage::format::EncodingClass;
@@ -605,6 +412,18 @@ mod tests {
     use tempfile::tempdir;
 
     const HASH: [u8; 32] = [4u8; 32];
+
+    fn answer(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
+    }
+
+    /// The key space of the first row a step reads.
+    fn space(turn: &Turn) -> &str {
+        match turn {
+            Ok(Next::Call(IoCall::Read(rows))) => &rows[0].0,
+            other => panic!("expected a read, got {other:?}"),
+        }
+    }
 
     /// Long past its grace, so only the case under test decides the verdict.
     fn reclaim_op(key: ReclaimCandidateKey) -> ReclaimBlobOperation {
@@ -1114,7 +933,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let context = context(dir.path().to_str().unwrap());
         seed(&context, 10).await;
-        let mut operation = reclaim_op(candidate_key());
+        let mut operation = reclaim_op(candidate_key()).into_machine();
         let mut effects = std::collections::VecDeque::from_iter(operation.start());
         let mut refreshed = false;
         while !operation.is_complete() {
@@ -1344,30 +1163,21 @@ mod tests {
             EncodingClass::Raw,
             HASH,
         ));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: operation.key.to_bytes().into(),
-            value: Some(
-                ReclaimCandidate {
-                    enqueued_at: SystemTime::UNIX_EPOCH,
-                }
-                .to_bytes()
-                .unwrap()
-                .into(),
-            ),
-        }));
+        operation.first().unwrap();
+        let candidate = ReclaimCandidate {
+            enqueued_at: SystemTime::UNIX_EPOCH,
+        };
+        operation
+            .next(answer(Some(candidate.to_bytes().unwrap())))
+            .unwrap();
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(group_record(backend_id, CleanupStrategy::Retain).into()),
-        }));
+        let turn = operation.next(answer(Some(group_record(
+            backend_id,
+            CleanupStrategy::Retain,
+        ))));
 
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = effects.as_slice()
-        else {
-            panic!("expected the queue row to be dropped, got {effects:?}")
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the queue row to be dropped, got {turn:?}")
         };
         assert_eq!(deletes.len(), 1);
         assert_eq!(deletes[0].0, BLOB_RECLAIM_KEYSPACE);
@@ -1379,29 +1189,15 @@ mod tests {
         let backend_id = Ulid::from_bytes([8u8; 16]);
         let key = ReclaimCandidateKey::new(BackendRef::Group(backend_id), EncodingClass::Raw, HASH);
         let mut operation = reclaim_op(key).forced();
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: operation.key.to_bytes().into(),
-            value: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == STORAGE_BACKEND_KEYSPACE
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(group_record(backend_id, CleanupStrategy::Retain).into()),
-        }));
+        operation.first().unwrap();
+        let turn = operation.next(answer(None));
+        assert_eq!(space(&turn), STORAGE_BACKEND_KEYSPACE);
+        let turn = operation.next(answer(Some(group_record(
+            backend_id,
+            CleanupStrategy::Retain,
+        ))));
         // The location is read next, so the alias scan still decides.
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == BLOB_LOCATIONS_KEYSPACE
-        ));
+        assert_eq!(space(&turn), BLOB_LOCATIONS_KEYSPACE);
     }
 
     #[test]
@@ -1416,36 +1212,18 @@ mod tests {
             enqueued_at,
             sweep_time,
         );
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: operation.key.to_bytes().into(),
-            value: Some(ReclaimCandidate { enqueued_at }.to_bytes().unwrap().into()),
-        }));
+        operation.first().unwrap();
+        let candidate = ReclaimCandidate { enqueued_at };
+        operation
+            .next(answer(Some(candidate.to_bytes().unwrap())))
+            .unwrap();
+        let grace = CleanupStrategy::Reclaim {
+            after: Duration::from_secs(3_600),
+        };
 
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(
-                group_record(
-                    backend_id,
-                    CleanupStrategy::Reclaim {
-                        after: Duration::from_secs(3_600),
-                    },
-                )
-                .into(),
-            ),
-        }));
+        let turn = operation.next(answer(Some(group_record(backend_id, grace))));
 
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        assert_eq!(operation.finalize(), Ok(ReclaimVerdict::NotDue));
+        assert!(matches!(turn, Ok(Next::Done(ReclaimVerdict::NotDue))));
     }
 
     fn group_record(backend_id: Ulid, cleanup: CleanupStrategy) -> Vec<u8> {
@@ -1530,16 +1308,11 @@ mod tests {
     fn rejects_stray_event() {
         // A write acknowledgement is not a transaction start.
         let mut operation = reclaim_op(candidate_key());
-        operation.start();
+        operation.first().unwrap();
 
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        let turn = operation.next(IoResult::Done);
 
-        assert!(matches!(
-            operation.finalize(),
-            Err(ReclaimBlobError::InvalidStateEvent { .. })
-        ));
+        assert!(matches!(turn, Err(ReclaimBlobError::Io(_))));
     }
 
     #[tokio::test]
