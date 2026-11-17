@@ -19,6 +19,7 @@ use aruna_core::effects::{Effect, EffectGroup, GroupForm, StorageEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -28,7 +29,6 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_core::operation::Operation;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Effects, GroupId};
 use aruna_core::{NodeId, StructuredId, UserId};
@@ -796,7 +796,11 @@ async fn measure_runner() -> Result<(), BoxError> {
     let writes = (0..RUNNER_READS)
         .map(|index| {
             let key = format!("runner/{index:04}").into_bytes();
-            (API_STATE_KEYSPACE.to_string(), key.into(), vec![7u8; 64].into())
+            (
+                API_STATE_KEYSPACE.to_string(),
+                key.into(),
+                vec![7u8; 64].into(),
+            )
         })
         .collect();
     let effect = StorageEffect::BatchWrite {
@@ -833,7 +837,12 @@ async fn measure_runner() -> Result<(), BoxError> {
                 .map_err(|()| format!("runner {detail} failed"))?;
         }
         let seconds = started.elapsed().as_secs_f64();
-        report("runner", &format!("{detail} reads={reads}"), RUNNER_RUNS, seconds);
+        report(
+            "runner",
+            &format!("{detail} reads={reads}"),
+            RUNNER_RUNS,
+            seconds,
+        );
     }
     Ok(())
 }

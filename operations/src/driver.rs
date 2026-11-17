@@ -535,10 +535,10 @@ fn refused_member(effect: &Effect) -> bool {
 }
 
 /// Dispatches one effect through the adapters, as the effect loop does for a single effect.
-fn adapter_dispatch(
-    context: &DriverContext,
+fn adapter_dispatch<'a>(
+    context: &'a DriverContext,
     depth: usize,
-) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'_, Event> {
+) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> + Send + 'a {
     move |effect, until| {
         Box::pin(effect_adapters::dispatch_effect_until(
             effect, context, depth, until,
@@ -607,7 +607,10 @@ where
         holds: &mut Vec<GroupHold>,
     ) -> BoxFuture<'a, (usize, GroupResult)> {
         if refused_member(&member) {
-            warn!(index, "Effect group refused a transaction effect or nested group");
+            warn!(
+                index,
+                "Effect group refused a transaction effect or nested group"
+            );
             return Box::pin(std::future::ready((index, GroupResult::Refused)));
         }
         let protected = self.stop.protect_managed && managed_effect(&member);
@@ -676,10 +679,13 @@ where
             protect_managed: false,
         },
         (false, GroupForm::All { deadline: wait }) => MemberStop {
-            at: [deadline, wait.and_then(|wait| Instant::now().checked_add(wait))]
-                .into_iter()
-                .flatten()
-                .min(),
+            at: [
+                deadline,
+                wait.and_then(|wait| Instant::now().checked_add(wait)),
+            ]
+            .into_iter()
+            .flatten()
+            .min(),
             protect_managed: true,
         },
         (false, GroupForm::Window) => MemberStop {
@@ -1098,20 +1104,20 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-    use futures_util::future::BoxFuture;
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-    use std::time::Duration;
     use aruna_core::operation::{Operation, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::task::{TaskEffect, TaskKey};
     use aruna_core::types::TxnId;
     use aruna_storage::storage;
     use byteview::ByteView;
+    use futures_util::future::BoxFuture;
     use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[derive(Debug, PartialEq)]
@@ -2619,9 +2625,9 @@ mod test {
 
     /// Answers a storage read the seconds its first key byte names after it starts, and a
     /// reservation release after three seconds; tests run it on paused time only.
-    fn slow_dispatch(
+    fn slow_dispatch<'a>(
         flight: Arc<Flight>,
-    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'static, Event> {
+    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'a, Event> {
         move |effect, _| {
             let flight = flight.clone();
             Box::pin(async move {
