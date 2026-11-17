@@ -16,7 +16,7 @@ use crate::driver::DriverContext;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve_marked};
+use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve};
 use crate::s3::object::copy::test::{seed_bucket, with_blob};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
 

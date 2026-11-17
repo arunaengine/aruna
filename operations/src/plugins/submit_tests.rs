@@ -312,7 +312,7 @@ async fn marks_once() {
         row
     };
     let marked = Some(("in", "reads.fq"));
-    let reserve = |row| reserve_marked(&fixture.ctx, (&install, &identity), row, marked);
+    let reserve = async |row| drive(reserve((&install, &identity), row, marked).unwrap(), &fixture.ctx).await;
     let (first, second) = tokio::join!(reserve(proposed()), reserve(proposed()));
     let mut found = Vec::new();
     for outcome in [first, second] {
@@ -561,7 +561,7 @@ async fn reply_rechecked() {
     use crate::plugins::bound::tests::{ORIGIN, keys, rule_for, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
-    use crate::plugins::work::{record_sent, reserve};
+    use crate::plugins::work::{WorkChange, reserve, update_work};
     let fixture = Fixture::keyed().await;
     fetcher(&fixture).await;
     let puts = serde_json::json!({

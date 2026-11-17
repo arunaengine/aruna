@@ -11,7 +11,8 @@ use crate::plugins::copies::store_local;
 use crate::plugins::dispatch::event_run;
 use crate::plugins::install::InstallRequest;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::intents::mark_unknown;
+use crate::plugins::intents::unknown_row;
+use crate::plugins::rows::write_rows;
 use crate::plugins::lifecycle::set_grants;
 use crate::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use crate::plugins::runs::admit;
@@ -195,9 +196,8 @@ async fn finishes_runs() {
     let ok = admitted(&fixture, &install, 1, "echo").await;
     let unsure = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    mark_unknown(&fixture.ctx, unsure.run_id, &intent, "timed out")
-        .await
-        .unwrap();
+    let unknown = unknown_row(unsure.run_id, &intent, "timed out").unwrap();
+        drive(write_rows(vec![unknown]), &fixture.ctx).await.unwrap();
     let worker = worker(&fixture);
     assert_eq!(worker.claim(unix_timestamp_millis()).await.unwrap(), 2);
     worker.settle().await;
@@ -517,9 +517,8 @@ async fn removed_with_intents() {
     let open = admitted(&fixture, &install, 1, "echo").await;
     let clean = admitted(&fixture, &install, 2, "echo").await;
     let intent = Intent::new(0, &[b"patch"]);
-    mark_unknown(ctx, open.run_id, &intent, "timed out")
-        .await
-        .unwrap();
+    let unknown = unknown_row(open.run_id, &intent, "timed out").unwrap();
+        drive(write_rows(vec![unknown]), ctx).await.unwrap();
     remove_install(ctx, actor, &auth, install.install_id)
         .await
         .unwrap();
