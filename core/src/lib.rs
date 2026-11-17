@@ -53,7 +53,6 @@ pub mod request_policy;
 pub mod scheduling;
 pub mod secret_registers;
 pub mod secrets;
-pub mod shutdown;
 pub mod storage_entries;
 pub mod stream;
 pub mod structs;

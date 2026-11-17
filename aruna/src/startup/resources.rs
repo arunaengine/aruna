@@ -9,7 +9,6 @@ use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::shutdown::Shutdown;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::jobs::runtime::JobsRuntime;
@@ -18,6 +17,7 @@ use aruna_operations::node::startup::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 

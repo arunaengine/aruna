@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_api::https::certificate::CertificateStore;
 use aruna_api::https::listener::{HttpsHandle, RoutedListener};
 use aruna_api::https::{HostCheck, HostRoute};
-use aruna_core::shutdown::Shutdown;
+use aruna_tasks::shutdown::Shutdown;
 use rustls::pki_types::UnixTime;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;

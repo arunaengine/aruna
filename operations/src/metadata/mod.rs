@@ -43,7 +43,7 @@ pub mod visibility_index;
 
 use std::sync::Arc;
 
-use aruna_core::shutdown::Shutdown;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::driver::DriverContext;

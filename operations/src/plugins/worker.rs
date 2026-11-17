@@ -13,7 +13,6 @@ use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
     MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
 };
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::broker::ErrorKind;
@@ -23,6 +22,7 @@ use aruna_plugins::{
     CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
     WebhookDelivery, WebhookRequest,
 };
+use aruna_tasks::shutdown::Shutdown;
 use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;

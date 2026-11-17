@@ -14,9 +14,9 @@ use crate::metadata::update_document::{
 use aruna_blob::git::GitStore;
 use aruna_core::git::{GitEffect, GitEvent, PENDING, PendingMerge, ZERO_OID};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_tasks::shutdown::Shutdown;
 use std::collections::BTreeSet;
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing::warn;

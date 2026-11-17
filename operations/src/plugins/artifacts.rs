@@ -10,10 +10,10 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::FetchScope;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
+use aruna_tasks::shutdown::Shutdown;
 use thiserror::Error;
 use tracing::{debug, warn};
 
