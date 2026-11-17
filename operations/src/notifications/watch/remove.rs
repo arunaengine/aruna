@@ -11,7 +11,7 @@ use aruna_core::types::Key;
 use ulid::Ulid;
 
 use crate::notifications::checks::{peer_config, verify_recipient_holder};
-use crate::notifications::deliver::{DeliverError, DeliverInput};
+use crate::notifications::deliver::{AnswerTurn, DeliverError, DeliverInput, reject};
 use crate::notifications::unexpected;
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::records::{WatchSubscriptionError, watch_delete_replication};
@@ -36,12 +36,6 @@ pub struct RemoveWatchOperation {
     state: RemoveState,
 }
 
-type Turn = Result<Next<NotificationTransportMessage>, DeliverError>;
-
-fn reject(reason: String) -> Turn {
-    Ok(Next::Done(NotificationTransportMessage::Reject(reason)))
-}
-
 impl RemoveWatchOperation {
     pub fn new(input: DeliverInput, owner: UserId, watch_id: Ulid) -> Self {
         Self {
@@ -52,7 +46,7 @@ impl RemoveWatchOperation {
         }
     }
 
-    fn checked(&mut self, value: Option<&[u8]>) -> Turn {
+    fn checked(&mut self, value: Option<&[u8]>) -> AnswerTurn {
         let input = self.input;
         let checked = peer_config(input.peer, self.owner.realm_id, value)
             .and_then(|config| verify_recipient_holder(&self.owner, &config, input.local));
@@ -71,7 +65,7 @@ impl RemoveWatchOperation {
         &mut self,
         store: StoreWatchOperation,
         turn: Result<Next<bool>, WatchSubscriptionError>,
-    ) -> Turn {
+    ) -> AnswerTurn {
         match turn {
             Ok(Next::Call(call)) => {
                 self.state = RemoveState::Store(Box::new(store));
@@ -91,7 +85,11 @@ impl RemoveWatchOperation {
     }
 
     /// Follows the publish request; the watch is deleted whatever it answers.
-    fn published(&mut self, publish: InterestOperation, turn: Result<Next<bool>, ()>) -> Turn {
+    fn published(
+        &mut self,
+        publish: InterestOperation,
+        turn: Result<Next<bool>, ()>,
+    ) -> AnswerTurn {
         match turn {
             Ok(Next::Call(call)) => {
                 self.state = RemoveState::Publish(Box::new(publish));
@@ -106,7 +104,7 @@ impl Operation for RemoveWatchOperation {
     type Output = NotificationTransportMessage;
     type Error = DeliverError;
 
-    fn first(&mut self) -> Turn {
+    fn first(&mut self) -> AnswerTurn {
         let realm_id = self.owner.realm_id;
         if realm_id != self.input.local_realm {
             let peer = self.input.peer;
@@ -121,7 +119,7 @@ impl Operation for RemoveWatchOperation {
         )])))
     }
 
-    fn next(&mut self, result: IoResult) -> Turn {
+    fn next(&mut self, result: IoResult) -> AnswerTurn {
         match (std::mem::take(&mut self.state), result) {
             (RemoveState::Config, IoResult::Values(values)) => {
                 let value = values.into_iter().flatten().next();
@@ -161,7 +159,7 @@ mod call_tests {
         RemoveWatchOperation::new(input(), user(1, 2), Ulid::from_parts(5, 5))
     }
 
-    fn rejected(turn: Turn) -> String {
+    fn rejected(turn: AnswerTurn) -> String {
         match turn {
             Ok(Next::Done(NotificationTransportMessage::Reject(reason))) => reason,
             other => panic!("expected a rejection, got {other:?}"),

@@ -3,16 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::fmt::Display;
 use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::calls::{IoError, IoResult, Next};
 use aruna_core::events::Event;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use aruna_core::types::Effects;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
@@ -147,9 +150,10 @@ pub struct PeerInput<'a> {
 #[error("{0}")]
 pub struct PeerFailure(pub String);
 
-/// A peer operation produces the answer frame body the shell writes back.
-pub trait PeerRun: EffectOperation + Sized {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
+impl From<IoError> for PeerFailure {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
 }
 
 /// The operation that answers one peer request frame.
@@ -195,60 +199,42 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
     }
 }
 
-impl PeerRun for DeliverBatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
-        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+/// The answer frame body of a finished peer operation, or its failure.
+fn peer_turn<T: Serialize, E: Display>(
+    turn: Result<Next<T>, E>,
+) -> Result<Next<Vec<u8>>, PeerFailure> {
+    match turn {
+        Ok(Next::Call(call)) => Ok(Next::Call(call)),
+        Ok(Next::Wait) => Ok(Next::Wait),
+        Ok(Next::Done(answer)) => postcard::to_allocvec(&answer)
+            .map(Next::Done)
+            .map_err(|error| PeerFailure(error.to_string())),
+        Err(error) => Err(PeerFailure(error.to_string())),
     }
 }
 
-impl PeerRun for RemoveWatchOperation {
-    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
-        let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
-        postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
-    }
-}
-
-impl EffectOperation for PeerOperation {
+impl Operation for PeerOperation {
     type Output = Vec<u8>;
     type Error = PeerFailure;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            PeerOperation::DeliverNotifications(operation) => operation.start(),
-            PeerOperation::RemoveWatch(operation) => operation.start(),
+            PeerOperation::DeliverNotifications(operation) => peer_turn(operation.first()),
+            PeerOperation::RemoveWatch(operation) => peer_turn(operation.first()),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            PeerOperation::DeliverNotifications(operation) => operation.step(event),
-            PeerOperation::RemoveWatch(operation) => operation.step(event),
+            PeerOperation::DeliverNotifications(operation) => peer_turn(operation.next(result)),
+            PeerOperation::RemoveWatch(operation) => peer_turn(operation.next(result)),
         }
     }
 
-    fn is_complete(&self) -> bool {
+    fn transaction(&self) -> bool {
         match self {
-            PeerOperation::DeliverNotifications(operation) => operation.is_complete(),
-            PeerOperation::RemoveWatch(operation) => operation.is_complete(),
-        }
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => {
-                DeliverBatchOperation::answer(operation.finalize())
-            }
-            PeerOperation::RemoveWatch(operation) => {
-                RemoveWatchOperation::answer(operation.finalize())
-            }
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self {
-            PeerOperation::DeliverNotifications(operation) => operation.abort(),
-            PeerOperation::RemoveWatch(operation) => operation.abort(),
+            PeerOperation::DeliverNotifications(operation) => operation.transaction(),
+            PeerOperation::RemoveWatch(operation) => operation.transaction(),
         }
     }
 }
@@ -354,8 +340,9 @@ mod tests {
         };
         let frame = postcard::to_allocvec(&delivery).unwrap();
         let mut operation = peer_operation(peer_input(Alpn::Notification, &frame)).unwrap();
-        assert!(operation.start().is_empty());
-        let answer = operation.finalize().expect("an empty batch is answered");
+        let Ok(Next::Done(answer)) = operation.first() else {
+            panic!("an empty batch is answered");
+        };
         let decoded: NotificationTransportMessage = postcard::from_bytes(&answer).unwrap();
         assert_eq!(
             decoded,
