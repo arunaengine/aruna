@@ -1781,27 +1781,30 @@ pub fn node_targets(nodes: &[TestNode]) -> Vec<(NodeId, Arc<DriverContext>)> {
 /// Builds the payload of one created document from its label, writer, index and id.
 pub type PayloadFn = fn(&str, usize, usize, Ulid) -> CreateDocumentPayload;
 
+/// What every writer of one run shares: realm, group, label, pacing and payload.
+#[derive(Clone)]
+pub struct WriterSettings {
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub label: String,
+    /// With a period, one create starts per period.
+    pub period: Option<Duration>,
+    pub payload: PayloadFn,
+}
+
 /// Runs `writers` writer tasks with `per_writer` creates each and returns every document.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_writers(
-    realm_id: RealmId,
-    group_id: GroupId,
-    label: &str,
+    settings: &WriterSettings,
     writers: usize,
     per_writer: usize,
     targets: &[(NodeId, Arc<DriverContext>)],
-    period: Option<Duration>,
-    payload: PayloadFn,
 ) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
     let mut handles = Vec::with_capacity(writers);
     for writer in 0..writers {
         let targets = targets.to_vec();
-        let label = label.to_string();
+        let settings = settings.clone();
         handles.push(tokio::spawn(async move {
-            run_writer(
-                realm_id, group_id, &label, writer, per_writer, targets, period, payload,
-            )
-            .await
+            run_writer(&settings, writer, per_writer, targets).await
         }));
     }
     let mut created = Vec::with_capacity(writers * per_writer);
@@ -1812,18 +1815,20 @@ pub async fn run_writers(
 }
 
 /// Creates `count` documents round robin over `targets` with the given payloads and projects
-/// them in batches as the API create path does. With a `period`, one create starts per period.
-#[allow(clippy::too_many_arguments)]
+/// them in batches as the API create path does.
 pub async fn run_writer(
-    realm_id: RealmId,
-    group_id: GroupId,
-    label: &str,
+    settings: &WriterSettings,
     writer: usize,
     count: usize,
     targets: Vec<(NodeId, Arc<DriverContext>)>,
-    period: Option<Duration>,
-    payload: PayloadFn,
 ) -> Result<Vec<(GroupId, Ulid, Instant)>, BoxError> {
+    let WriterSettings {
+        realm_id,
+        group_id,
+        ref label,
+        period,
+        payload,
+    } = *settings;
     let mut batches: Vec<Vec<(Ulid, Ulid)>> = targets.iter().map(|_| Vec::new()).collect();
     let mut pending = 0usize;
     let mut created = Vec::with_capacity(count);

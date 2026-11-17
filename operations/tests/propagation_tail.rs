@@ -13,7 +13,7 @@ use ulid::Ulid;
 use crate::convergence::{wait_empty_queues, wait_for_visibility};
 use crate::topology::{
     BoxError, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
-    run_writers, shutdown_nodes,
+    WriterSettings, run_writers, shutdown_nodes,
 };
 
 const WRITERS: usize = 24;
@@ -35,14 +35,16 @@ fn sustained_load_converges() -> Result<(), BoxError> {
         let group_id = Ulid::generate();
 
         let created = run_writers(
-            realm_id,
-            group_id,
-            "tail",
+            &WriterSettings {
+                realm_id,
+                group_id,
+                label: "tail".to_string(),
+                period: Some(WRITER_PERIOD),
+                payload: mixed_payload,
+            },
             WRITERS,
             DOCS_PER_WRITER,
             &targets,
-            Some(WRITER_PERIOD),
-            mixed_payload,
         )
         .await?;
         let pairs: Vec<(GroupId, Ulid)> = created
