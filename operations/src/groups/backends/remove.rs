@@ -2,23 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{RecordReadError, backend_key, index_key, parse_read};
+use super::{backend_key, index_key};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BACKEND_INDEX_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{done, values};
 use aruna_core::structs::storage::blob::{BackendRef, BlobCleanupWork, BlobLocationKey};
 use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETING, GroupStorage, GroupStorageSecret,
 };
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use std::collections::BTreeSet;
 use thiserror::Error;
 use tracing::warn;
@@ -147,17 +146,12 @@ fn scan_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoErr
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// What the removal transaction waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RemoveState {
-    Init,
-    StartTransaction,
     ReadRecord,
     DeleteRecords,
     DeleteSecret,
-    CommitTransaction,
-    AbortTransaction,
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -166,8 +160,6 @@ pub enum RemoveBackendError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Read(#[from] RecordReadError),
     #[error("storage backend is not removable")]
     NotRemovable,
     /// The removal mark still needs the storage's keys to delete the bucket.
@@ -175,12 +167,16 @@ pub enum RemoveBackendError {
     CleanupPending,
     #[error("remove failed")]
     Failed,
-    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: &'static str,
-        expected: &'static str,
-        received: Event,
-    },
+}
+
+impl From<IoError> for RemoveBackendError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            _ => Self::Failed,
+        }
+    }
 }
 
 /// Erases a drained tenant backend. The record is re-read inside the
@@ -191,8 +187,6 @@ pub struct RemoveBackendOperation {
     group_id: Ulid,
     backend_id: Ulid,
     state: RemoveState,
-    txn_id: Option<TxnId>,
-    output: Option<Result<(), RemoveBackendError>>,
 }
 
 impl RemoveBackendOperation {
@@ -200,195 +194,80 @@ impl RemoveBackendOperation {
         Self {
             group_id,
             backend_id,
-            state: RemoveState::Init,
-            txn_id: None,
-            output: None,
+            state: RemoveState::ReadRecord,
         }
     }
 
-    fn fail(&mut self, error: RemoveBackendError) -> Effects {
-        self.output = Some(Err(error));
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = RemoveState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        self.state = RemoveState::Error;
-        smallvec![]
-    }
-
-    fn handle_txn_started(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                self.txn_id = Some(txn_id);
-                self.state = RemoveState::ReadRecord;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-                    key: backend_key(self.backend_id),
-                    txn_id: self.txn_id,
-                })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "StartTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_record(&mut self, event: Event) -> Effects {
-        let record = match parse_read(event, GroupStorage::from_bytes) {
-            Ok(Some(record)) if record.group_id == self.group_id && record.disabled => record,
-            Ok(_) => return self.fail(RemoveBackendError::NotRemovable),
-            Err(error) => return self.fail(error.into()),
-        };
+    fn handle_record(&mut self, value: Option<Value>) -> Result<Next<()>, RemoveBackendError> {
+        let record = value
+            .map(|value| GroupStorage::from_bytes(value.as_ref()))
+            .transpose()?
+            .filter(|record| record.group_id == self.group_id && record.disabled)
+            .ok_or(RemoveBackendError::NotRemovable)?;
         let mut buckets = record.checked_buckets();
         if buckets.any(|bucket| record.bucket_state(bucket) == Some(BUCKET_DELETING)) {
-            return self.fail(RemoveBackendError::CleanupPending);
+            return Err(RemoveBackendError::CleanupPending);
         }
 
         self.state = RemoveState::DeleteRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: vec![
-                (
-                    STORAGE_BACKEND_KEYSPACE.to_string(),
-                    backend_key(record.backend_id),
-                ),
-                (
-                    BACKEND_INDEX_KEYSPACE.to_string(),
-                    index_key(record.group_id, record.backend_id),
-                ),
-            ],
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_deleted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                self.state = RemoveState::DeleteSecret;
-                smallvec![crate::node_vault::delete_secret(
-                    GroupStorageSecret::vault_entry(self.backend_id),
-                    self.txn_id,
-                )]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "DeleteRecords",
-                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_secret_deleted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(RemoveBackendError::Failed);
-                };
-                self.output = Some(Ok(()));
-                self.state = RemoveState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "DeleteSecret",
-                expected: "Event::Storage(StorageEvent::DeleteResult)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        self.txn_id = None;
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.state = RemoveState::Finish;
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "CommitTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received,
-            }),
-        }
-    }
-
-    fn handle_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.state = RemoveState::Error;
-                smallvec![]
-            }
-            received => self.fail(RemoveBackendError::InvalidStateEvent {
-                state: "AbortTransaction",
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received,
-            }),
-        }
+        Ok(Next::Call(IoCall::Delete(vec![
+            (
+                STORAGE_BACKEND_KEYSPACE.to_string(),
+                backend_key(record.backend_id),
+            ),
+            (
+                BACKEND_INDEX_KEYSPACE.to_string(),
+                index_key(record.group_id, record.backend_id),
+            ),
+        ])))
     }
 }
 
-impl EffectOperation for RemoveBackendOperation {
+impl Operation for RemoveBackendOperation {
     type Output = ();
     type Error = RemoveBackendError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RemoveState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn first(&mut self) -> Result<Next<()>, RemoveBackendError> {
+        let row = (
+            STORAGE_BACKEND_KEYSPACE.to_string(),
+            backend_key(self.backend_id),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, RemoveBackendError> {
         match self.state {
-            RemoveState::Init => self.start(),
-            RemoveState::StartTransaction => self.handle_txn_started(event),
-            RemoveState::ReadRecord => self.handle_record(event),
-            RemoveState::DeleteRecords => self.handle_deleted(event),
-            RemoveState::DeleteSecret => self.handle_secret_deleted(event),
-            RemoveState::CommitTransaction => self.handle_committed(event),
-            RemoveState::AbortTransaction => self.handle_aborted(event),
-            RemoveState::Finish | RemoveState::Error => {
-                self.fail(RemoveBackendError::InvalidStateEvent {
-                    state: "terminal",
-                    expected: "no event",
-                    received: event,
-                })
+            RemoveState::ReadRecord => {
+                let [value] = values::<1>(result)?;
+                self.handle_record(value)
             }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RemoveState::Finish | RemoveState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            RemoveState::Finish => self.output.unwrap_or(Err(RemoveBackendError::Failed)),
-            _ => match self.output {
-                Some(Err(error)) => Err(error),
+            RemoveState::DeleteRecords => {
+                done(result)?;
+                self.state = RemoveState::DeleteSecret;
+                // The runner puts the vault delete into this operation's transaction.
+                let entry = GroupStorageSecret::vault_entry(self.backend_id);
+                let delete = crate::node_vault::delete_secret(entry, None);
+                Ok(Next::Call(IoCall::Effect(Box::new(delete))))
+            }
+            RemoveState::DeleteSecret => match result {
+                IoResult::Event(event) => match *event {
+                    Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(Next::Done(())),
+                    Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+                    _ => Err(RemoveBackendError::Failed),
+                },
                 _ => Err(RemoveBackendError::Failed),
             },
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        if let Some(txn_id) = self.txn_id.take() {
-            self.state = RemoveState::AbortTransaction;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        smallvec![]
     }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use aruna_core::operation_check::{rejects_events, sample_events};
     use aruna_core::structs::storage::cleanup::CleanupStrategy;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::group_backend::GroupBackendKind;
@@ -410,84 +289,63 @@ pub(super) mod tests {
         }
     }
 
+    fn read(stored: &GroupStorage) -> IoResult {
+        IoResult::Values(vec![Some(stored.to_bytes().unwrap().into())])
+    }
+
+    fn removal(backend_id: Ulid) -> RemoveBackendOperation {
+        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        operation
+    }
+
     #[test]
     fn refuses_enabled_record() {
         // The in-transaction re-read is the fence against a concurrent enable.
         let backend_id = Ulid::from_bytes([8u8; 16]);
-        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(record(backend_id, false).to_bytes().unwrap().into()),
-        }));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
-        assert_eq!(operation.finalize(), Err(RemoveBackendError::NotRemovable));
+        let enabled = read(&record(backend_id, false));
+        assert_eq!(
+            removal(backend_id).next(enabled),
+            Err(RemoveBackendError::NotRemovable)
+        );
     }
 
     #[test]
     fn pending_cleanup_refuses() {
+        // The secret stays while a removal mark still deletes a provider bucket with it.
         let backend_id = Ulid::from_bytes([8u8; 16]);
-        let mut operation = RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9u8; 16]),
-        }));
         let mut drained = record(backend_id, true);
         let state = ("bucket:team-a-x".to_string(), "deleting".to_string());
         drained.public_config.extend([state]);
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: Some(drained.to_bytes().unwrap().into()),
-        }));
-        // The secret stays while a removal mark still deletes a provider bucket with it.
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
         assert_eq!(
-            operation.finalize(),
+            removal(backend_id).next(read(&drained)),
             Err(RemoveBackendError::CleanupPending)
         );
     }
 
-    // A state that expects no event must reject one instead of ignoring it.
     #[test]
-    fn terminal_rejects_event() {
+    fn removes_records_secret() {
+        // Both records and the vault secret go in the one transaction.
         let backend_id = Ulid::from_bytes([8u8; 16]);
-        let make = || {
-            let mut operation =
-                RemoveBackendOperation::new(Ulid::from_bytes([1u8; 16]), backend_id);
-            operation.start();
-            operation.step(Event::Storage(StorageEvent::TransactionStarted {
-                txn_id: Ulid::from_bytes([9u8; 16]),
-            }));
-            operation.step(Event::Storage(StorageEvent::ReadResult {
-                key: b"x".to_vec().into(),
-                value: Some(record(backend_id, false).to_bytes().unwrap().into()),
-            }));
-            operation.step(Event::Storage(StorageEvent::TransactionAborted {
-                txn_id: Ulid::from_bytes([9u8; 16]),
-            }));
-            operation
+        let mut operation = removal(backend_id);
+        let Ok(Next::Call(IoCall::Delete(rows))) = operation.next(read(&record(backend_id, true)))
+        else {
+            panic!("expected the record deletes");
         };
-        for (_, effects, error) in rejects_events(make, sample_events, |_| false) {
-            assert!(effects.is_empty());
-            assert!(
-                matches!(error, RemoveBackendError::InvalidStateEvent { .. }),
-                "{error:?}"
-            );
-        }
+        assert_eq!(rows.len(), 2);
+        let Ok(Next::Call(IoCall::Effect(delete))) = operation.next(IoResult::Done) else {
+            panic!("expected the vault delete");
+        };
+        let entry = GroupStorageSecret::vault_entry(backend_id);
+        assert_eq!(*delete, crate::node_vault::delete_secret(entry, None));
+        let deleted = Event::Storage(StorageEvent::DeleteResult {
+            key: Key::from(Vec::new()),
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(deleted))),
+            Ok(Next::Done(()))
+        );
     }
 
     fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
