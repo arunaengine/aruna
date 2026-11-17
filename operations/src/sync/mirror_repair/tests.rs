@@ -398,3 +398,406 @@ fn serving_changes_identity() {
 
     assert!(!same_relationship(&left, &right));
 }
+
+#[tokio::test]
+async fn delete_supersedes_reconcile() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let relationship = relationship();
+
+    stage(&context, &relationship, SyncMirrorIntent::Reconcile).await;
+    stage(&context, &relationship, SyncMirrorIntent::Delete).await;
+    stage(&context, &relationship, SyncMirrorIntent::Reconcile).await;
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: relationship.id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing mirror repair record");
+    };
+    let record = SyncMirrorRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
+    assert_eq!(record.intent, SyncMirrorIntent::Delete);
+}
+
+#[tokio::test]
+async fn delete_blocks_status() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let relationship = relationship();
+    drive(
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
+        &context,
+    )
+    .await
+    .unwrap();
+    stage(&context, &relationship, SyncMirrorIntent::Delete).await;
+    let mut updated = relationship.clone();
+    updated.status.last_error = Some("failed".to_string());
+
+    assert!(!store_status(&context, &updated).await.unwrap());
+    assert_eq!(
+        drive(
+            GetRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing,),
+            &context,
+        )
+        .await
+        .unwrap(),
+        relationship
+    );
+}
+
+#[tokio::test]
+async fn status_stages_reconcile() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let mut relationship = relationship();
+    relationship.state = SyncState::Failed {
+        reason: "failed".to_string(),
+    };
+    drive(
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
+        &context,
+    )
+    .await
+    .unwrap();
+    relationship.state = SyncState::Enabled;
+    relationship.status.last_error = None;
+
+    assert!(store_status(&context, &relationship).await.unwrap());
+    assert_eq!(
+        drive(
+            GetRelationshipOperation::new(relationship.id, SyncRelationshipDirection::Outgoing,),
+            &context,
+        )
+        .await
+        .unwrap(),
+        relationship
+    );
+    assert_eq!(
+        repair_record(&context, &relationship)
+            .await
+            .map(|record| record.relationship),
+        Some(relationship)
+    );
+}
+
+/// The plugin journal rows this node has not matched yet.
+async fn journaled(context: &DriverContext) -> Vec<SourceEvent> {
+    let txn = crate::plugins::store::Txn::direct(context);
+    let pending = aruna_core::plugin_runs::PENDING_ROW;
+    let page = crate::plugins::journal::journal_page(&txn, pending, None, 100).await;
+    page.unwrap()
+        .0
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect()
+}
+
+async fn stored(context: &DriverContext, relationship: &SyncRelationship) {
+    let direction = SyncRelationshipDirection::Outgoing;
+    let store = StoreRelationshipOperation::new(relationship.clone(), direction);
+    drive(store, context).await.unwrap();
+}
+
+#[tokio::test]
+async fn failure_journals_once() {
+    // A relationship that stops as failed journals one `sync_failed` row with its status;
+    // storing it failed again writes none, and a failure after a resume writes a second.
+    let (_dir, context) = setup_auth(None).await;
+    let mut relationship = relationship();
+    stored(&context, &relationship).await;
+    let failed = SyncState::Failed {
+        reason: "access_denied".to_string(),
+    };
+    relationship.state = failed.clone();
+    assert!(store_status(&context, &relationship).await.unwrap());
+    relationship.status.counters.failures = 2;
+    assert!(store_status(&context, &relationship).await.unwrap());
+
+    let events = journaled(&context).await;
+    assert_eq!(events.len(), 1);
+    let source = &relationship.source;
+    let group_id = Ulid::from_bytes([6; 16]);
+    let path = object_permission_path(source.realm_id, group_id, source.node_id, "source", "");
+    assert_eq!(
+        (events[0].kind, &events[0].path),
+        (aruna_core::plugin_runs::SourceKind::SyncFailed, &path)
+    );
+    assert_eq!(events[0].resource, relationship.id.to_string());
+    let prefix = format!("sync_failed/{}/{}/", source.node_id, relationship.id);
+    assert!(events[0].source.starts_with(&prefix));
+
+    relationship.state = SyncState::Enabled;
+    assert!(store_status(&context, &relationship).await.unwrap());
+    relationship.state = failed;
+    assert!(store_status(&context, &relationship).await.unwrap());
+    let events = journaled(&context).await;
+    assert_eq!(events.len(), 2);
+    assert_ne!(events[0].source, events[1].source);
+}
+
+#[tokio::test]
+async fn failure_needs_commit() {
+    // An aborted status transaction, a detached stub and a deleted source bucket journal
+    // nothing.
+    let failed = SyncState::Failed {
+        reason: "access_denied".to_string(),
+    };
+    let (_dir, context) = setup_auth(None).await;
+    let relationship = relationship();
+    stored(&context, &relationship).await;
+    let mut changed = relationship.clone();
+    changed.replicate_deletes = false;
+    changed.state = failed.clone();
+    assert!(store_status(&context, &changed).await.is_err());
+    let mut detached = relationship.clone();
+    detached.state = SyncState::Detached;
+    stored(&context, &detached).await;
+    detached.state = failed.clone();
+    assert!(!store_status(&context, &detached).await.unwrap());
+    assert!(journaled(&context).await.is_empty());
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let mut relationship = relationship;
+    stored(&context, &relationship).await;
+    relationship.state = failed;
+    assert!(store_status(&context, &relationship).await.unwrap());
+    assert!(journaled(&context).await.is_empty());
+}
+
+#[tokio::test]
+async fn status_stays_handling() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let context = DriverContext {
+        storage_handle: storage,
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+        compute_handle: None,
+    };
+    let mut current = relationship();
+    let stale = current.clone();
+    current.set_reference_handling(ReferenceHandling::Preserve);
+    drive(
+        StoreRelationshipOperation::new(current.clone(), SyncRelationshipDirection::Outgoing),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        store_status(&context, &stale).await,
+        Err(SyncMirrorError::Mirror(_))
+    ));
+    assert_eq!(
+        drive(
+            GetRelationshipOperation::new(current.id, SyncRelationshipDirection::Outgoing,),
+            &context,
+        )
+        .await
+        .unwrap(),
+        current
+    );
+}
+
+#[tokio::test]
+async fn stale_reconcile_survives() {
+    let (_tempdir, context) = storage_context();
+    let relationship = relationship();
+    let mut stale = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    stale.due_at_ms = 0;
+    store_record(&context, stale.clone()).await;
+
+    let mut current = stale.clone();
+    current.relationship.status.last_error = Some("newer".to_string());
+    current.due_at_ms = 10;
+    store_record(&context, current.clone()).await;
+
+    drive(
+        MirrorRecordOperation::clear_scanned(stale.clone()),
+        &context,
+    )
+    .await
+    .unwrap();
+    let reschedule = MirrorRecordOperation::reschedule(stale, "stale".to_string());
+    drive(reschedule, &context).await.unwrap();
+
+    assert_eq!(repair_record(&context, &relationship).await, Some(current));
+}
+
+#[tokio::test]
+async fn newer_reconcile_survives() {
+    let (_tempdir, context) = storage_context();
+    let stale = relationship();
+    let mut current = stale.clone();
+    current.status.last_error = Some("newer".to_string());
+    stage(&context, &current, SyncMirrorIntent::Reconcile).await;
+
+    let clear = MirrorRecordOperation::clear(stale, SyncMirrorIntent::Reconcile);
+    drive(clear, &context).await.unwrap();
+
+    assert_eq!(
+        repair_record(&context, &current)
+            .await
+            .map(|record| record.relationship),
+        Some(current)
+    );
+}
+
+#[tokio::test]
+async fn delete_clear_preserved() {
+    let (_tempdir, context) = storage_context();
+    let stale = relationship();
+    let mut current = stale.clone();
+    current.status.last_error = Some("newer".to_string());
+    stage(&context, &current, SyncMirrorIntent::Delete).await;
+
+    let clear = MirrorRecordOperation::clear(stale.clone(), SyncMirrorIntent::Delete);
+    drive(clear, &context).await.unwrap();
+
+    assert!(repair_record(&context, &stale).await.is_none());
+}
+
+#[tokio::test]
+async fn repair_backs_off() {
+    // Authorized repair reaches the missing metadata handle and retries.
+    let (_tempdir, context) = setup_auth(None).await;
+    let storage = context.storage_handle.clone();
+    let relationship = relationship();
+    drive(
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
+        &context,
+    )
+    .await
+    .unwrap();
+    stage(&context, &relationship, SyncMirrorIntent::Reconcile).await;
+
+    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    record.due_at_ms = 0;
+    let (key_space, key, value) = repair_entry(record).unwrap();
+    assert!(matches!(
+        storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+
+    let result = process_mirror_repairs(&context, relationship.source.node_id)
+        .await
+        .unwrap();
+    assert_eq!(result.failed, 1);
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(value), ..
+    }) = storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            key: relationship.id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing mirror repair retry");
+    };
+    let record = SyncMirrorRecord::from_bytes(&relationship.id.to_bytes(), &value).unwrap();
+    assert_eq!(record.attempts, 1);
+    assert_eq!(record.last_error.as_deref(), Some("target unreachable"));
+}
+
+#[tokio::test]
+async fn policy_denies_write() {
+    let (_tempdir, context) = setup_auth(Some("operation == 's3.PutBucketReplication'")).await;
+
+    let result = ensure_target_write(&context, &relationship()).await;
+
+    assert!(matches!(
+        result,
+        Err(SyncMirrorError::Mirror(error)) if error == "access_denied"
+    ));
+}
+
+#[tokio::test]
+async fn policy_allows_write() {
+    let (_tempdir, context) = setup_auth(Some("operation == 's3.GetObject'")).await;
+
+    assert!(ensure_target_write(&context, &relationship()).await.is_ok());
+}
+
+#[tokio::test]
+async fn policy_retry_survives() {
+    let (_tempdir, context) = setup_auth(Some("operation == 's3.PutBucketReplication'")).await;
+    let mut relationship = relationship();
+    relationship.target = ArunaArn::s3_bucket(
+        relationship.target.realm_id,
+        relationship.source.node_id,
+        "target",
+    )
+    .unwrap();
+    drive(
+        StoreRelationshipOperation::new(relationship.clone(), SyncRelationshipDirection::Outgoing),
+        &context,
+    )
+    .await
+    .unwrap();
+    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    record.due_at_ms = 0;
+    store_record(&context, record).await;
+
+    let result = process_mirror_repairs(&context, relationship.source.node_id)
+        .await
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    assert_eq!(
+        repair_record(&context, &relationship)
+            .await
+            .and_then(|record| record.last_error),
+        Some("access_denied".to_string())
+    );
+}
