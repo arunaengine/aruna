@@ -13,28 +13,6 @@ use aruna_core::structs::storage::distribution::parking::{Authority, publisher_a
 use aruna_core::structs::storage::distribution::{PublisherCutoff, SignedSnapshot, publisher_key};
 use aruna_core::structs::storage::usage::dirty_share_key;
 
-/// Content rules that need no stored state: the target's set, the publisher as origin, the
-/// publisher's signature and every embedded statement. A failure is invalid input.
-pub(in crate::document_sync) fn validate_distribution_shape(
-    event: &AdminDocumentEvent,
-) -> std::result::Result<(), String> {
-    let AdminDocumentTarget::Distribution { realm_id, set_id } = &event.target else {
-        return Err("distribution snapshot must target a distribution record".to_string());
-    };
-    let AdminDocumentOperation::DistributionPublished { snapshot } = &event.op else {
-        return Err("distribution records change only through published snapshots".to_string());
-    };
-    if snapshot.snapshot.set_id() != *set_id {
-        return Err("distribution snapshot names another set".to_string());
-    }
-    if event.origin_node_id != snapshot.snapshot.root.publisher {
-        return Err("distribution snapshot does not come from the set's publisher".to_string());
-    }
-    snapshot
-        .verify(*realm_id)
-        .map_err(|error| format!("distribution snapshot is invalid: {error}"))
-}
-
 /// Committed revisions carry the publisher's acceptance, so no actor's current role is
 /// rechecked here. A publisher the config does not know yet is parked; a removed one keeps
 /// authority only for the exact cutoff snapshot its removal recorded for the set.

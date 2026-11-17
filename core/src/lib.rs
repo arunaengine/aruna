@@ -4,6 +4,7 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod admin_checks;
 pub mod admin_documents;
 pub mod alpn;
 pub mod audit;
