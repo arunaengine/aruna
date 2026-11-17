@@ -53,8 +53,7 @@ async fn durable_rearm_loop(
             sweep_dead_letters(&context.storage_handle).await;
         }
         restore_materialization_timer(&context.storage_handle.bulk(), &task_handle).await;
-        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
         restore_notification_prune(&context, &task_handle).await;
         restore_drain_timer(&context.storage_handle, &task_handle).await;
         restore_prune_timer(&context.storage_handle, &task_handle).await;
@@ -313,8 +312,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
-            .await;
+        crate::metadata::prune_queue::restore_prune_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -531,7 +529,7 @@ impl OperationsTaskHandler {
                 )
                 .await;
             }
-            Ok(_) => match prune_jobs_exist(&bulk.storage_handle).await {
+            Ok(_) => match prune_jobs_exist(&bulk).await {
                 Ok(false) => {}
                 Ok(true) => {
                     self.reschedule_timer(TaskKey::DrainPruneQueue, GRAPH_POLL_AFTER)
