@@ -33,7 +33,7 @@ pub enum IoCall {
     Sync,
     /// A net, blob, metadata, task, staging source, local file or other storage effect, answered
     /// by the event of the same family. Transaction control effects are refused.
-    Effect(Effect),
+    Effect(Box<Effect>),
     /// A child operation, answered by the event its result maps to.
     Child(Box<dyn SubOperation>),
     /// Independent effects run at the same time. An all-at-once group is answered once; a
@@ -55,10 +55,24 @@ pub enum IoResult {
     /// A write, delete or sync finished.
     Done,
     /// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
-    Event(Event),
+    Event(Box<Event>),
     Group(GroupEvent),
     /// The delay passed.
     Woke,
+}
+
+impl IoResult {
+    /// Names the result kind without its values, for unexpected-result errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Values(_) => "IoResult::Values",
+            Self::Page { .. } => "IoResult::Page",
+            Self::Done => "IoResult::Done",
+            Self::Event(event) => event.label(),
+            Self::Group(_) => "IoResult::Group",
+            Self::Woke => "IoResult::Woke",
+        }
+    }
 }
 
 /// What an operation does next.
@@ -88,6 +102,8 @@ pub enum IoError {
     Hung { effect: &'static str },
     #[error("the operation did not finish")]
     Unfinished,
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
@@ -392,9 +408,9 @@ fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
         | (Wait::Deleted, Event::Storage(StorageEvent::BatchDeleteResult { .. }))
         | (Wait::Synced, Event::Storage(StorageEvent::SyncAllFinished)) => Ok(IoResult::Done),
         (Wait::Family(family), event) if event_family(&event) == Some(family) => {
-            Ok(IoResult::Event(event))
+            Ok(IoResult::Event(Box::new(event)))
         }
-        (Wait::Child, event) => Ok(IoResult::Event(event)),
+        (Wait::Child, event) => Ok(IoResult::Event(Box::new(event))),
         (Wait::Group, Event::Group(finished @ GroupEvent::Finished { .. }))
         | (Wait::Window, Event::Group(finished @ GroupEvent::Closed)) => {
             Ok(IoResult::Group(finished))
@@ -449,7 +465,7 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
             StorageEffect::BatchDelete { deletes, txn_id },
         ),
         IoCall::Sync => (Wait::Synced, StorageEffect::SyncAll),
-        IoCall::Effect(effect) => return Ok((Wait::Family(effect_family(&effect)?), effect)),
+        IoCall::Effect(effect) => return Ok((Wait::Family(effect_family(&effect)?), *effect)),
         IoCall::Child(child) => return Ok((Wait::Child, Effect::SubOperation(child))),
         IoCall::Group(group) => {
             let wait = match group.form {
