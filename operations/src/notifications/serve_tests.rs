@@ -159,7 +159,7 @@ fn watch_event(realm_id: aruna_core::structs::identity::realm::RealmId) -> Watch
 }
 
 #[test]
-fn events_refused_before_reads() {
+fn events_refused_early() {
     let mut empty = WatchEventsOperation::new(peer_input(), Vec::new());
     assert_eq!(rejected(empty.first()), "empty batch");
     let foreign = vec![watch_event(user(9, 2).realm_id)];
@@ -169,7 +169,7 @@ fn events_refused_before_reads() {
 
 /// Dropped watches ask for an interest publish, then the new records' recipients are woken.
 #[test]
-fn events_mark_then_wake() {
+fn events_wake_recipients() {
     let events = vec![watch_event(user(1, 2).realm_id)];
     let mut operation = WatchEventsOperation::new(peer_input(), events);
     operation.state = EventsState::Expand;
