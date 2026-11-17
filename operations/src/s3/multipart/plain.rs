@@ -491,3 +491,825 @@ impl CompleteUploadOperation {
         Ok(writes)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::keyspaces::BACKEND_VERSION_KEYSPACE;
+    use aruna_core::structs::checksum::HASH_BLAKE3;
+    use aruna_core::structs::storage::backend_import::{
+        BackendImport, DEFAULT_PATTERN, ImportedObject,
+    };
+    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::routing::{BackendCatalog, GroupRoutingInputs};
+    use std::collections::BTreeSet;
+
+    fn backend_id() -> Ulid {
+        Ulid::from_bytes([5u8; 16])
+    }
+
+    fn operation(pattern: &str) -> CompleteUploadOperation {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let input = CompleteUploadInput {
+            bucket: "bucket".to_string(),
+            key: "in/object".to_string(),
+            upload_id: Ulid::from_parts(1, 1),
+            realm_id,
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            completed_parts: vec![],
+            expected_checksums: vec![],
+            checksum_algorithm: None,
+            checksum_type: MultipartChecksumType::FullObject,
+            checksum_type_explicit: false,
+            object_size: None,
+            created_by: UserId::local(Ulid::from_parts(2, 2), realm_id),
+            quota_ceiling: None,
+            now_ms: 0,
+        };
+        let record = MultipartUpload {
+            upload_id: input.upload_id,
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            group_id: Ulid::from_parts(3, 3),
+            created_by: input.created_by,
+            created_at: SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Completing,
+            checksum_hint: None,
+            metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+            completing_since_ms: None,
+            backend_upload: None,
+            encryption: None,
+        };
+        let catalog = BackendCatalog::new("default").with_backend("default", None);
+        let routing = RoutingSnapshot::new(Ulid::from_parts(3, 3), catalog).with_group_inputs(
+            GroupRoutingInputs {
+                backend_ids: BTreeSet::from([backend_id()]),
+                imports: vec![rule(Ulid::from_bytes([4u8; 16]), "bucket", "in/", pattern)],
+                ..Default::default()
+            },
+        );
+        let mut operation = CompleteUploadOperation::new(input).with_routing(routing);
+        operation.upload_record = Some(record);
+        operation
+    }
+
+    fn rule(import_id: Ulid, bucket: &str, key_prefix: &str, pattern: &str) -> BackendImport {
+        BackendImport {
+            import_id,
+            group_id: Ulid::from_parts(3, 3),
+            backend_id: backend_id(),
+            backend_prefix: "raw/".to_string(),
+            bucket: bucket.to_string(),
+            key_prefix: key_prefix.to_string(),
+            schedule: None,
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: pattern.to_string(),
+        }
+    }
+
+    fn values(values: Vec<Option<Value>>) -> IoResult {
+        IoResult::Values(values)
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn fenced(result: Result<Fenced, StorageError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn written(turn: &Turn) -> &[(String, Key, Value)] {
+        match turn {
+            Ok(Next::Call(IoCall::Write(rows))) => rows,
+            other => panic!("expected a write, got {other:?}"),
+        }
+    }
+
+    fn asked(turn: &Turn) -> &Effect {
+        match turn {
+            Ok(Next::Call(IoCall::Effect(effect))) => effect,
+            other => panic!("expected an effect, got {other:?}"),
+        }
+    }
+
+    fn record_writes(exists: bool, committed: Option<Ulid>) -> Vec<(String, Key, Value)> {
+        recorded(exists, committed).1
+    }
+
+    fn recorded(
+        exists: bool,
+        committed: Option<Ulid>,
+    ) -> (CompleteUploadOperation, Vec<(String, Key, Value)>) {
+        let mut operation = operation("{dir}{name}");
+        operation.compose_blob().unwrap();
+        operation.plain_version = Some("v1".to_string());
+        let id = operation.version_id.unwrap();
+        operation.composed_location = Some(BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: "raw/object".to_string(),
+            ulid: id,
+            format: StoredFormat::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 3,
+            hashes: HashMap::from([(HASH_BLAKE3.to_string(), vec![7u8; 32])]),
+        });
+        operation.final_location = operation.composed_location.clone();
+        if let (Some(location), Some(ulid)) = (operation.final_location.as_mut(), committed) {
+            location.ulid = ulid;
+        }
+        let writes = finalize_writes(&mut operation, exists);
+        (operation, writes)
+    }
+
+    /// Drives a composed upload through its finalize records, with or without the rule.
+    fn finalize_writes(
+        operation: &mut CompleteUploadOperation,
+        exists: bool,
+    ) -> Vec<(String, Key, Value)> {
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let turn = operation.next(IoResult::Done);
+        let turn = fence_read(operation, turn, exists, None);
+        written(&turn).to_vec()
+    }
+
+    /// Answers the scan of the rules that read the path with `readers`.
+    fn past_readers(
+        operation: &mut CompleteUploadOperation,
+        turn: Turn,
+        readers: &[BackendImport],
+    ) -> Turn {
+        let Ok(Next::Call(IoCall::Page { space, .. })) = &turn else {
+            return turn;
+        };
+        assert_eq!(space, BACKEND_IMPORT_KEYSPACE);
+        let rows = readers
+            .iter()
+            .map(|rule| (rule.key(), rule.to_bytes().unwrap().into()))
+            .collect();
+        operation.next(IoResult::Page { rows, next: None })
+    }
+
+    /// Answers the read of the rule and of the rows other rules keep of the path.
+    fn fence_read(
+        operation: &mut CompleteUploadOperation,
+        turn: Turn,
+        exists: bool,
+        other: Option<Value>,
+    ) -> Turn {
+        let turn = past_readers(operation, turn, &[]);
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the rule read, got {turn:?}")
+        };
+        assert_eq!(reads[0].0, BACKEND_IMPORT_KEYSPACE);
+        let mut answers = vec![exists.then(|| vec![0u8].into())];
+        answers.extend(reads[1..].iter().map(|_| other.clone()));
+        operation.next(values(answers))
+    }
+
+    #[test]
+    fn drops_orphan_record() {
+        // A removed rule gets no record: the fenced write stores nothing and the upload fails.
+        let mut operation = operation(DEFAULT_PATTERN);
+        let turn = operation.compose_blob();
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, CompleteUploadState::WriteIntent);
+
+        let turn = operation.next(fenced(Ok(Fenced::RuleGone)));
+
+        assert!(operation.written_intent.is_empty());
+        assert_eq!(turn.err(), Some(CompleteUploadError::ImportRemoved));
+    }
+
+    #[test]
+    fn keeps_shared_path() {
+        // Another rule of the folder recorded the path, so the upload does not take it.
+        let (mut operation, _) = recorded(true, None);
+        let other = Ulid::from_parts(9, 9);
+        // The rule reads the folder, created after the upload was routed.
+        let reader = rule(other, "other", "", DEFAULT_PATTERN);
+        operation.readers = Default::default();
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let turn = operation.next(IoResult::Done);
+        let turn = past_readers(&mut operation, turn, &[reader]);
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the fence read, got {turn:?}")
+        };
+        assert_eq!(reads[1].1, object_key(other, "raw/object"));
+
+        let turn = fence_read(&mut operation, turn, true, Some(vec![1].into()));
+
+        assert_eq!(turn.err(), Some(BlobError::PathTaken.into()));
+    }
+
+    fn count(writes: &[(String, Key, Value)], keyspace: &str) -> usize {
+        writes
+            .iter()
+            .filter(|(key_space, _, _)| key_space == keyspace)
+            .count()
+    }
+
+    #[test]
+    fn registered_closes_upload() {
+        // Adopting a registered version still closes the upload in a distributed bucket.
+        let commit = |bound: bool| {
+            let (mut operation, _) = recorded(true, None);
+            operation.registered = true;
+            operation.binding =
+                bound.then(
+                    || aruna_core::structs::storage::distribution::DistributionBinding {
+                        set_id: Ulid::from_bytes([5u8; 16]),
+                        member_id: Ulid::from_bytes([6u8; 16]),
+                        incarnation: 1,
+                        revision: Default::default(),
+                    },
+                );
+            let turn = operation.write_obligation();
+            (operation.state, turn)
+        };
+        let (_, turn) = commit(false);
+        assert!(matches!(turn, Ok(Next::Done(_))), "{turn:?}");
+        let (state, turn) = commit(true);
+        assert_eq!(state, CompleteUploadState::CloseInventory);
+        assert!(matches!(
+            turn,
+            Ok(Next::Call(IoCall::Page { ref space, .. }))
+                if space == aruna_core::keyspaces::RANGE_INDEX_KEYSPACE
+        ));
+    }
+
+    #[test]
+    fn adopts_registered_version() {
+        let found = |stored: Option<[u8; 32]>, staged: bool| {
+            let (mut operation, _) = recorded(true, None);
+            operation.new_blob = staged;
+            // The version is read in the finalize transaction before the head moves.
+            let turn = operation.write_current_lookup(None);
+            let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+                panic!("expected the version read, got {turn:?}")
+            };
+            assert_eq!(reads[0].0, BLOB_VERSIONS_KEYSPACE);
+            let version = stored.map(|hash| {
+                let version = BlobVersion::materialized(
+                    hash,
+                    BackendRef::Group(backend_id()),
+                    EncodingClass::Raw,
+                    SystemTime::UNIX_EPOCH,
+                    UserId::default(),
+                    None,
+                );
+                Value::from(version.to_bytes().unwrap())
+            });
+            let turn = operation.next(values(vec![version]));
+            (operation, turn)
+        };
+        let page = |rows| IoResult::Page { rows, next: None };
+        // An unregistered version reads the delete trail before its head moves.
+        let (mut operation, _) = found(None, false);
+        let turn = operation.next(values(vec![None]));
+        assert!(matches!(
+            turn,
+            Ok(Next::Call(IoCall::Page { ref space, .. })) if space == DELETE_TRAIL_KEYSPACE
+        ));
+        operation.next(page(Vec::new())).unwrap();
+        let turn = operation.next(page(Vec::new()));
+        assert_eq!(written(&turn)[0].0, BLOB_HEAD_KEYSPACE);
+        // A user deleted the version an import had registered: it is not published again.
+        let (mut operation, _) = found(None, false);
+        operation.next(values(vec![None])).unwrap();
+        let record = BlobAuditRecord {
+            realm_id: RealmId::from_bytes([3u8; 32]),
+            group_id: Ulid::nil(),
+            node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+            user_id: UserId::default(),
+            kind: aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteVersion,
+            bucket: "bucket".to_string(),
+            key: "in/object".to_string(),
+            version_id: operation.version_id,
+            occurred_at_ms: 1,
+        };
+        let entry = (Vec::new().into(), record.to_bytes().unwrap().into());
+        let turn = operation.next(page(vec![entry]));
+        assert_eq!(turn.err(), Some(CompleteUploadError::HistoryDeleted));
+        // The same bytes registered by an import: only the upload is cleared, then committed.
+        let (mut operation, _) = found(Some([7u8; 32]), false);
+        assert_eq!(operation.state, CompleteUploadState::ReadUploadRecord);
+        // A location the upload staged for that file goes, so the file counts once.
+        let (mut staged, turn) = found(Some([7u8; 32]), true);
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the staged location delete, got {turn:?}")
+        };
+        assert_eq!(deletes[0].0, BLOB_LOCATIONS_KEYSPACE);
+        staged.next(IoResult::Done).unwrap();
+        assert_eq!(staged.state, CompleteUploadState::ReadUploadRecord);
+        assert!(matches!(operation.write_obligation(), Ok(Next::Done(_))));
+        let (_, turn) = found(Some([8u8; 32]), false);
+        assert_eq!(turn.err(), Some(CompleteUploadError::VersionExists));
+    }
+
+    #[test]
+    fn retires_intent() {
+        let (mut operation, _) = recorded(true, None);
+        let id = operation.version_id.unwrap();
+        let keys = intent_keys(Ulid::from_bytes([4u8; 16]), "raw/object", id, true);
+        operation.written_intent = keys.clone();
+        let turn = operation.next(IoResult::Done);
+        // The intent goes in the version transaction, before the replication obligation.
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
+        };
+        // Every intent the compose recorded goes, the tagged path's as well.
+        let found: Vec<_> = deletes.iter().map(|(_, key)| key.clone()).collect();
+        assert_eq!(found, keys);
+        operation.next(IoResult::Done).unwrap();
+        assert_eq!(
+            operation.state,
+            CompleteUploadState::WriteReplicationObligation
+        );
+    }
+
+    #[test]
+    fn fences_import_row() {
+        let rows = |exists: bool| count(&record_writes(exists, None), IMPORTED_OBJECT_KEYSPACE);
+        assert_eq!(rows(true), 1);
+        // A rule removed meanwhile gets no row its removal would miss.
+        assert_eq!(rows(false), 0);
+    }
+
+    #[test]
+    fn drops_deduplicated_version() {
+        let versions = |committed| count(&record_writes(true, committed), BACKEND_VERSION_KEYSPACE);
+        assert_eq!(versions(None), 1);
+        // Dedup keeps an older location at the same path, so the new one gets no version row.
+        assert_eq!(versions(Some(Ulid::from_parts(6, 6))), 0);
+    }
+
+    /// Answers the intent delete that comes after a refused compose, and returns its key.
+    fn past_drop(operation: &mut CompleteUploadOperation, turn: Turn) -> (Key, Turn) {
+        let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
+            panic!("expected the intent delete, got {turn:?}")
+        };
+        assert_eq!(deletes[0].0, IMPORT_INTENT_KEYSPACE);
+        // The compose goes on only once the delete is on disk.
+        let turn = operation.next(IoResult::Done);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        (deletes[0].1.clone(), operation.next(IoResult::Done))
+    }
+
+    /// Answers the stored and synced write intent that comes before a plain compose.
+    fn past_intent(operation: &mut CompleteUploadOperation, turn: Turn) -> Turn {
+        if operation.state != CompleteUploadState::WriteIntent {
+            return turn;
+        }
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))), "{turn:?}");
+        operation.next(IoResult::Done)
+    }
+
+    fn plain_compose(turn: &Turn) -> PlainPath {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::Compose {
+                plain: Some(plain), ..
+            }) => plain.clone(),
+            other => panic!("expected a plain compose, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orders_intent_acks() {
+        // The compose waits for the intent write and then its sync, each answered once.
+        let mut operation = operation(DEFAULT_PATTERN);
+        operation.compose_blob().unwrap();
+        let turn = operation.next(fenced(Ok(Fenced::Written)));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Sync))));
+        assert_eq!(operation.state, CompleteUploadState::SyncIntent);
+        let turn = operation.next(IoResult::Done);
+        plain_compose(&turn);
+        assert_eq!(operation.state, CompleteUploadState::ComposeBlob);
+    }
+
+    #[test]
+    fn composes_plain_path() {
+        let mut operation = operation(DEFAULT_PATTERN);
+        let turn = operation.compose_blob();
+
+        // No byte moves before the identity of the object is stored.
+        assert_eq!(operation.state, CompleteUploadState::WriteIntent);
+        let id = operation.version_id.expect("the path names the version");
+        let path = format!("raw/object~{id}");
+        let import_id = Ulid::from_bytes([4u8; 16]);
+        assert_eq!(
+            operation.written_intent,
+            [intent_key(import_id, &path, id)],
+            "a unique path gets one intent"
+        );
+        let turn = past_intent(&mut operation, turn);
+        let plain = plain_compose(&turn);
+        assert_eq!(plain.path, path);
+        assert_eq!(plain.ulid, id);
+    }
+
+    /// Answers the read of the rule's record at the path with a row for `key`, or none.
+    fn owner_answer(operation: &mut CompleteUploadOperation, key: Option<String>) -> Turn {
+        let row = key.map(|key| {
+            let row = ImportedObject::written(Ulid::from_parts(8, 8), key, 1, None);
+            row.to_bytes().unwrap().into()
+        });
+        operation.next(values(vec![row]))
+    }
+
+    fn stat(exists: bool, version: Option<&str>) -> IoResult {
+        let version = version.map(str::to_string);
+        event(Event::Blob(BlobEvent::PlainStat { exists, version }))
+    }
+
+    fn taken() -> IoResult {
+        event(Event::Blob(BlobEvent::Error(BlobError::PathTaken)))
+    }
+
+    #[test]
+    fn falls_back_tagged() {
+        let mut operation = operation("{dir}{name}");
+        operation.compose_blob().unwrap();
+        let id = operation.version_id.unwrap();
+        let turn = owner_answer(&mut operation, None);
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/object"
+        ));
+        let turn = operation.next(stat(false, None));
+        let plain = plain_compose(&past_intent(&mut operation, turn));
+        assert_eq!(plain.path, "raw/object");
+        assert!(plain.if_not_exists);
+
+        // Another upload took the free path first; the parts still compose next to it.
+        let turn = operation.next(taken());
+        // The refused compose moved no byte, so the intent of the free path goes.
+        let (key, turn) = past_drop(&mut operation, turn);
+        assert_eq!(
+            key,
+            intent_key(Ulid::from_bytes([4u8; 16]), "raw/object", id)
+        );
+        let plain = plain_compose(&past_intent(&mut operation, turn));
+        assert_eq!(plain.path, format!("raw/object~{id}"));
+        assert!(plain.if_not_exists);
+
+        // A taken tagged path is not tried again.
+        let turn = operation.next(taken());
+        let (_, turn) = past_drop(&mut operation, turn);
+        assert_eq!(turn.err(), Some(BlobError::PathTaken.into()));
+    }
+
+    #[test]
+    fn keeps_foreign_file() {
+        // Another key's file with versions is kept; the object composes at its tagged path.
+        let mut operation = operation("{dir}{name}");
+        operation.compose_blob().unwrap();
+        let id = operation.version_id.unwrap();
+        owner_answer(&mut operation, Some("other".to_string())).unwrap();
+        let turn = operation.next(stat(true, Some("v0")));
+        let plain = plain_compose(&past_intent(&mut operation, turn));
+        assert_eq!(plain.path, format!("raw/object~{id}"));
+        assert!(plain.if_not_exists);
+    }
+
+    #[test]
+    fn proves_unlisted_owner() {
+        // The rules may change during an upload, so a path without a record is never replaced.
+        let mut operation = operation("{dir}{name}");
+        let routing = operation.routing.as_mut().expect("the upload's routing");
+        routing.imports[0].write_prefix = Some("out/".to_string());
+        let turn = operation.compose_blob();
+        assert!(
+            matches!(
+                asked(&turn),
+                Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "out/object"
+            ),
+            "expected the path stat, got {turn:?}"
+        );
+        let id = operation.version_id.unwrap();
+        operation.next(stat(true, Some("v0"))).unwrap();
+        let plain = operation.plain_path.as_ref().expect("the compose path");
+        assert_eq!(plain.path, format!("out/object~{id}"));
+    }
+
+    /// An upload whose provider upload opened at `raw/object` as version `id`, a path the
+    /// rule recorded for `owner`.
+    fn in_place_for(id: Ulid, owner: Option<String>) -> CompleteUploadOperation {
+        let mut operation = operation("{dir}{name}");
+        open_at(&mut operation, "raw/object", id, owner);
+        operation
+    }
+
+    /// Opens the provider upload at `path` as version `id`, recorded for `owner`, and starts
+    /// its completion.
+    fn open_at(
+        operation: &mut CompleteUploadOperation,
+        path: &str,
+        id: Ulid,
+        owner: Option<String>,
+    ) {
+        let location = BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: String::new(),
+            backend_path: path.to_string(),
+            ulid: id,
+            format: Default::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        if let Some(upload) = operation.upload_record.as_mut() {
+            upload.backend_upload = Some(BackendUpload {
+                location,
+                upload_id: "provider".to_string(),
+                record_id: Ulid::from_parts(1, 1),
+            });
+        }
+        operation.compose_blob().unwrap();
+        let turn = owner_answer(operation, owner);
+        assert!(
+            matches!(
+                asked(&turn),
+                Effect::Blob(BlobEffect::StatPlain { path: stat, .. }) if stat == path
+            ),
+            "expected the path stat, got {turn:?}"
+        );
+        assert_eq!(operation.version_id, Some(id));
+    }
+
+    fn in_place(id: Ulid) -> CompleteUploadOperation {
+        let key = operation("{dir}{name}").input.key;
+        in_place_for(id, Some(key))
+    }
+
+    fn provider_condition(turn: &Turn) -> bool {
+        match asked(turn) {
+            Effect::Blob(BlobEffect::CompleteUpload { if_not_exists, .. }) => *if_not_exists,
+            other => panic!("expected the provider completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completes_in_place() {
+        // Only a backend with versions keeps a file that appeared meanwhile at the path.
+        let id = Ulid::from_parts(6, 6);
+        for (exists, version, if_not_exists) in [
+            (false, None, true),
+            (true, None, true),
+            (true, Some("v0"), false),
+        ] {
+            let mut operation = in_place(id);
+            let turn = operation.next(stat(exists, version));
+            let turn = past_intent(&mut operation, turn);
+            assert_eq!(provider_condition(&turn), if_not_exists);
+        }
+        // A file the rule recorded for another key, or never, is kept even with versions.
+        for owner in [Some("other".to_string()), None] {
+            let mut operation = in_place_for(id, owner);
+            let turn = operation.next(stat(true, Some("v0")));
+            let turn = past_intent(&mut operation, turn);
+            assert!(provider_condition(&turn));
+        }
+
+        // The object written in place gets the records of a plain write.
+        let mut operation = in_place(id);
+        written_in_place(&mut operation);
+        let writes = finalize_writes(&mut operation, true);
+        assert_eq!(count(&writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn keeps_saved_identity() {
+        // The upload opened under a suffix pattern; the plain pattern cannot name this key.
+        let id = Ulid::from_parts(6, 6);
+        let path = format!("raw/report ~{id}");
+        let routing = operation("{dir}{name}").routing.unwrap();
+        assert_eq!(routing.plain_target("bucket", "in/report ", id), None);
+        let opened = || {
+            let mut operation = operation("{dir}{name}");
+            operation.input.key = "in/report ".to_string();
+            let key = operation.input.key.clone();
+            open_at(&mut operation, &path, id, Some(key));
+            operation
+        };
+        let mut operation = opened();
+        operation.next(stat(false, None)).unwrap();
+        assert_eq!(operation.state, CompleteUploadState::WriteIntent);
+        assert_eq!(
+            operation.written_intent[0],
+            intent_key(Ulid::from_bytes([4u8; 16]), &path, id)
+        );
+        let mut operation = opened();
+        written_in_place(&mut operation);
+        let writes = finalize_writes(&mut operation, true);
+        assert_eq!(count(&writes, IMPORTED_OBJECT_KEYSPACE), 1);
+    }
+
+    #[test]
+    fn keeps_unclaimed_file() {
+        // The rule was removed before completion, so nothing proves the file there is ours.
+        let id = Ulid::from_parts(6, 6);
+        let mut operation = in_place_for(id, None);
+        operation.plain = None;
+        operation
+            .read_owner((BackendRef::Group(backend_id()), "raw/object".to_string()))
+            .unwrap();
+        let turn = operation.next(stat(true, Some("v0")));
+        assert!(provider_condition(&turn));
+    }
+
+    #[test]
+    fn reads_path_owner() {
+        // An upload opened at a tagged path asks who owns that path, not the plain one.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        let turn = operation.read_owner((
+            BackendRef::Group(backend_id()),
+            "raw/object~tag".to_string(),
+        ));
+        let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+            panic!("expected the owner read, got {turn:?}")
+        };
+        let import_id = operation.plain.as_ref().unwrap().import_id;
+        assert_eq!(reads[0].1, object_key(import_id, "raw/object~tag"));
+    }
+
+    #[test]
+    fn checks_ruleless_replay() {
+        // An upload opened at a provider path is checked for a registered or deleted version
+        // also after its rule was removed.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.plain = None;
+        written_in_place(&mut operation);
+        let turn = operation.write_current_lookup(None);
+        assert!(matches!(
+            turn,
+            Ok(Next::Call(IoCall::Read(ref reads))) if reads[0].0 == BLOB_VERSIONS_KEYSPACE
+        ));
+    }
+
+    #[test]
+    fn pins_without_rule() {
+        // The rule was removed before completion: no import row, but the version stays pinned.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        operation.plain = None;
+        written_in_place(&mut operation);
+        operation.state = CompleteUploadState::DeleteUploadRecords;
+        let turn = operation.next(IoResult::Done);
+        let writes = written(&turn);
+        assert_eq!(count(writes, BACKEND_VERSION_KEYSPACE), 1);
+        assert_eq!(count(writes, IMPORTED_OBJECT_KEYSPACE), 0);
+    }
+
+    /// Completes a stat-checked in-place upload with backend version `v1`.
+    fn written_in_place(operation: &mut CompleteUploadOperation) {
+        let turn = operation.next(stat(false, None));
+        past_intent(operation, turn).unwrap();
+        let mut location = operation.plain_upload().unwrap().location.clone();
+        location.blob_size = 3;
+        location.hashes = HashMap::from([(HASH_BLAKE3.to_string(), vec![7u8; 32])]);
+        let composed = BlobEvent::PlainWritten {
+            location: location.clone(),
+            version: Some("v1".to_string()),
+            etag: None,
+        };
+        let mut turn = operation.next(event(Event::Blob(composed)));
+        // A listed object's intent records the hash of the bytes before the finalize.
+        if operation.state == CompleteUploadState::WriteEvidence {
+            turn = operation.next(fenced(Ok(Fenced::Written)));
+        }
+        assert!(
+            matches!(turn, Ok(Next::Call(IoCall::Child(_)))),
+            "expected the finalize, got {turn:?}"
+        );
+        assert_eq!(operation.state, CompleteUploadState::Finalize);
+        assert_eq!(operation.composed_location.as_ref(), Some(&location));
+        // The test goes on as the finalize, which got these from the parent.
+        operation.plain_version = Some("v1".to_string());
+        operation.final_location = operation.composed_location.clone();
+    }
+
+    #[test]
+    fn taken_in_place() {
+        // A file that took the free path first fails the upload; its parts cannot move.
+        let mut operation = in_place(Ulid::from_parts(6, 6));
+        let turn = operation.next(stat(false, None));
+        past_intent(&mut operation, turn).unwrap();
+        let turn = operation.next(taken());
+        let (_, turn) = past_drop(&mut operation, turn);
+        assert_eq!(turn.err(), Some(BlobError::PathTaken.into()));
+    }
+
+    #[test]
+    fn keeps_provider_layout() {
+        // An upload opened before the rule assembles in Aruna's own layout.
+        let mut operation = operation(DEFAULT_PATTERN);
+        let location = BackendLocation {
+            backend: BackendRef::Group(backend_id()),
+            storage_class: None,
+            root: String::new(),
+            storage_bucket: "data".to_string(),
+            backend_path: "bucket/in/object".to_string(),
+            ulid: Ulid::from_parts(6, 6),
+            format: Default::default(),
+            created_by: UserId::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        if let Some(upload) = operation.upload_record.as_mut() {
+            upload.backend_upload = Some(BackendUpload {
+                location,
+                upload_id: "provider".to_string(),
+                record_id: Ulid::from_parts(1, 1),
+            });
+        }
+        let turn = operation.compose_blob();
+        assert!(matches!(
+            asked(&turn),
+            Effect::Blob(BlobEffect::CompleteUpload { .. })
+        ));
+    }
+
+    fn row(value: Option<Vec<u8>>) -> IoResult {
+        values(vec![value.map(Into::into)])
+    }
+
+    #[test]
+    fn reuses_current_file() {
+        use aruna_core::structs::storage::format::StoredLayout;
+        // A completed upload of the current version's bytes reads that version's file.
+        let (mut operation, _) = recorded(false, None);
+        let written = operation.composed_location.clone().unwrap();
+        let mut old = written.clone();
+        (old.ulid, old.backend_path) = (Ulid::from_parts(8, 8), "raw/object~old".to_string());
+        old.format.layout = StoredLayout::Plain(old.ulid);
+        operation.plain_version = Some("v2".to_string());
+        (operation.dedup, operation.dedup_checked) = (None, false);
+        let turn = operation.check_hash_lookup();
+        let Ok(Next::Call(IoCall::Read(reads))) = turn else {
+            panic!("expected the head read, got {turn:?}")
+        };
+        assert_eq!(reads[0].0, BLOB_HEAD_KEYSPACE);
+        let head = CurrentVersionPointer::new(Ulid::from_parts(6, 6));
+        operation.next(row(Some(head.to_bytes().unwrap()))).unwrap();
+        let version = BlobVersion::materialized(
+            [7u8; 32],
+            BackendRef::Group(backend_id()),
+            old.format.encoding(),
+            SystemTime::UNIX_EPOCH,
+            UserId::default(),
+            None,
+        );
+        operation
+            .next(row(Some(version.to_bytes().unwrap())))
+            .unwrap();
+        operation.next(row(Some(old.to_bytes().unwrap()))).unwrap();
+        operation.next(row(Some(b"v1".to_vec()))).unwrap();
+        operation.next(row(None)).unwrap();
+        assert_eq!(operation.final_location.as_ref(), Some(&old));
+        // The assembled file is released after the commit, at its exact backend version.
+        let writes = operation.plain_records(true).unwrap();
+        let release = writes
+            .iter()
+            .find(|(space, ..)| space == BLOB_CLEANUP_KEYSPACE)
+            .map(|(_, _, value)| BlobCleanupWork::from_bytes(value).unwrap());
+        let Some(BlobCleanupWork::ReleaseRenamed {
+            location, version, ..
+        }) = release
+        else {
+            panic!("expected the release of the assembled file, got {writes:?}")
+        };
+        assert_eq!((location, version.as_str()), (written, "v2"));
+        // Without a backend version the assembled file stays the version's own.
+        let (mut operation, _) = recorded(false, None);
+        (operation.plain_version, operation.dedup_checked) = (None, false);
+        operation.check_hash_lookup().unwrap();
+        assert_eq!(operation.state, CompleteUploadState::CheckHashLookup);
+    }
+}
