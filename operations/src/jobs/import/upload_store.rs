@@ -21,7 +21,9 @@ pub async fn read_rocrate_upload(
     context: &DriverContext,
     upload_id: Ulid,
 ) -> Result<Option<RoCrateUploadRecord>, String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Read {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
             key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
             key: upload_key(upload_id),
             txn_id: None,
@@ -51,7 +53,9 @@ pub async fn write_rocrate_upload(
     record: &RoCrateUploadRecord,
 ) -> Result<(), String> {
     let value = postcard::to_allocvec(record).map_err(|error| error.to_string())?;
-    match context.storage_handle.send_storage_effect(StorageEffect::Write {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
             key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
             key: upload_key(record.upload_id),
             value: ByteView::from(value),
@@ -113,7 +117,9 @@ pub async fn delete_rocrate_upload(
     if record.claimed_by != Some(claimed_by) {
         return Err("upload cleanup claim does not match the job".to_string());
     }
-    match context.storage_handle.send_storage_effect(StorageEffect::Delete {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
             key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
             key: upload_key(upload_id),
             txn_id: None,
@@ -134,7 +140,9 @@ async fn claim_in_txn(
     job_id: JobId,
     now_ms: u64,
 ) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    let value = match context.storage_handle.send_storage_effect(StorageEffect::Read {
+    let value = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
             key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
             key: upload_key(upload_id),
             txn_id: Some(txn_id),
@@ -165,7 +173,9 @@ async fn claim_in_txn(
     let value = postcard::to_allocvec(&record)
         .map(ByteView::from)
         .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    match context.storage_handle.send_storage_effect(StorageEffect::Write {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
             key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
             key: upload_key(upload_id),
             value,
@@ -185,7 +195,9 @@ async fn claim_in_txn(
 }
 
 async fn start_txn(context: &DriverContext) -> Result<TxnId, String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::StartTransaction { read: false })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
@@ -198,6 +210,8 @@ async fn start_txn(context: &DriverContext) -> Result<TxnId, String> {
 }
 
 async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
-    let _ = context.storage_handle.send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await;
 }

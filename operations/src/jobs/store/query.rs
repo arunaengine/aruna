@@ -136,8 +136,15 @@ pub(crate) async fn staging_row_deletes(
         if room == 0 {
             return Ok((deletes, true));
         }
-        let (values, next) =
-            iter_prefix_page(&context.storage_handle, key_space, Some(prefix.clone()), None, room, None).await?;
+        let (values, next) = iter_prefix_page(
+            &context.storage_handle,
+            key_space,
+            Some(prefix.clone()),
+            None,
+            room,
+            None,
+        )
+        .await?;
         more |= next.is_some();
         deletes.extend(
             values
@@ -217,7 +224,9 @@ pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(
 }
 
 pub(super) async fn start_write_txn(context: &DriverContext) -> Result<TxnId, String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::StartTransaction { read: false })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
@@ -233,7 +242,9 @@ pub(super) enum CommitResult {
 }
 
 pub(super) async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> CommitResult {
-    match context.storage_handle.send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => CommitResult::Committed,
@@ -269,7 +280,9 @@ pub(crate) async fn commit_write(
 }
 
 pub(super) async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
-    if let Event::Storage(StorageEvent::Error { error }) = context.storage_handle.send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+    if let Event::Storage(StorageEvent::Error { error }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
         .await
     {
         warn!(error = %error, "Failed to abort job mutation transaction");
@@ -282,7 +295,9 @@ pub(super) async fn read_raw(
     key: Key,
     txn_id: Option<TxnId>,
 ) -> Result<Option<Value>, String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Read {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
             key,
             txn_id,
@@ -303,7 +318,9 @@ pub(super) async fn batch_write(
     if writes.is_empty() {
         return Ok(());
     }
-    match context.storage_handle.send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
@@ -320,7 +337,9 @@ pub(crate) async fn batch_delete(
     if deletes.is_empty() {
         return Ok(());
     }
-    match context.storage_handle.send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
         .await
     {
         Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
@@ -335,7 +354,9 @@ pub(super) async fn delete_raw(
     key: Key,
     txn_id: Option<TxnId>,
 ) -> Result<(), String> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Delete {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
             key_space: key_space.to_string(),
             key,
             txn_id,

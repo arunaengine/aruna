@@ -29,8 +29,8 @@ use crate::auth::error::AuthorizeError;
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
 use crate::driver::drive_retry;
+use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::BucketScope;
@@ -137,16 +137,11 @@ async fn run_fenced_purge(
                 initial_multipart_uploads,
                 batches_completed: 0,
             };
-            put_purge_checkpoint(
-                &ctx.driver,
-                ctx.job_id,
-                ctx.claim_token,
-                &checkpoint,
-            )
-            .await
-            .map_err(|error| {
-                JobError::retryable(format!("purge checkpoint write failed: {error}"))
-            })?;
+            put_purge_checkpoint(&ctx.driver, ctx.job_id, ctx.claim_token, &checkpoint)
+                .await
+                .map_err(|error| {
+                    JobError::retryable(format!("purge checkpoint write failed: {error}"))
+                })?;
             checkpoint
         }
         Err(error) => {
@@ -728,14 +723,9 @@ async fn persist_batch(
 ) -> Result<(), PurgeRunError> {
     ctx.progress.advance(completed);
     persist_progress(ctx).await?;
-    put_purge_checkpoint(
-        &ctx.driver,
-        ctx.job_id,
-        ctx.claim_token,
-        checkpoint,
-    )
-    .await
-    .map_err(|error| JobError::retryable(format!("purge checkpoint write failed: {error}")))?;
+    put_purge_checkpoint(&ctx.driver, ctx.job_id, ctx.claim_token, checkpoint)
+        .await
+        .map_err(|error| JobError::retryable(format!("purge checkpoint write failed: {error}")))?;
     Ok(())
 }
 

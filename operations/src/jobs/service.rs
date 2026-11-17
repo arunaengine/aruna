@@ -571,10 +571,9 @@ pub(crate) async fn find_dedup_job(
     created_by: UserId,
     dedup_key: &[u8],
 ) -> Result<Option<(JobId, [u8; 32])>, SubmitJobError> {
-    let Some((job_id, digest)) =
-        find_dedup_plan(&context, created_by, dedup_key, None)
-            .await
-            .map_err(SubmitJobError::UnexpectedEvent)?
+    let Some((job_id, digest)) = find_dedup_plan(&context, created_by, dedup_key, None)
+        .await
+        .map_err(SubmitJobError::UnexpectedEvent)?
     else {
         return Ok(None);
     };
@@ -713,14 +712,12 @@ pub async fn read_owned_job(
     user_id: UserId,
     job_id: JobId,
 ) -> Result<Option<JobRecord>, String> {
-    Ok(
-        match read_job_record(context, job_id, None).await? {
-            Some(record) if record.created_by == user_id && !record.payload.is_internal() => {
-                Some(record)
-            }
-            _ => None,
-        },
-    )
+    Ok(match read_job_record(context, job_id, None).await? {
+        Some(record) if record.created_by == user_id && !record.payload.is_internal() => {
+            Some(record)
+        }
+        _ => None,
+    })
 }
 
 /// Full owner record for API projections that the status view cannot rebuild
@@ -1073,8 +1070,7 @@ async fn report_page(
         return Ok(JobReportLookup::CursorConflict);
     }
     let limit = limit.clamp(1, usize::from(REPORT_MAX_ROWS));
-    let (rows, next_key) =
-        list_job_entries(context, job_id, last_key, limit).await?;
+    let (rows, next_key) = list_job_entries(context, job_id, last_key, limit).await?;
     Ok(JobReportLookup::Ready {
         job: JobReportView {
             job_id: record.job_id,
@@ -1099,14 +1095,9 @@ pub async fn read_session_reason(
     if !record.state.is_terminal() {
         return None;
     }
-    let (rows, _) = list_job_entries(
-        context,
-        job_id,
-        None,
-        crate::jobs::SESSION_REPORT_ROWS,
-    )
-    .await
-    .ok()?;
+    let (rows, _) = list_job_entries(context, job_id, None, crate::jobs::SESSION_REPORT_ROWS)
+        .await
+        .ok()?;
     rows.iter().rev().find_map(|(_, value)| {
         let row: SessionReportRow = postcard::from_bytes(value).ok()?;
         match row.detail {
@@ -1448,13 +1439,7 @@ pub async fn cancel_owned_job(
     }
     // The job may be pruned between the ownership read and here; treat that as a 404
     // rather than a 500.
-    let outcome = match set_cancel_requested(
-        context,
-        job_id,
-        unix_timestamp_millis(),
-    )
-    .await
-    {
+    let outcome = match set_cancel_requested(context, job_id, unix_timestamp_millis()).await {
         Ok(outcome) => outcome,
         Err(JobMutationError::NotFound) => return Ok(CancelJobOutcome::NotFound),
         Err(error) => return Err(error.to_string()),

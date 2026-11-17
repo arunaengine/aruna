@@ -365,8 +365,7 @@ async fn record_written(
     let status = RunCrateStatus::Written {
         resource: resource.clone(),
     };
-    if let Err(error) =
-        put_outcome(driver, for_job, parent, spec, &status, Some(document_id)).await
+    if let Err(error) = put_outcome(driver, for_job, parent, spec, &status, Some(document_id)).await
     {
         return JobRunOutcome::Failed(JobError::retryable(format!(
             "run crate status write failed: {error}"

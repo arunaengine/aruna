@@ -384,7 +384,8 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, node, 1_000, 1_000, None);
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };
@@ -642,7 +643,8 @@ mod tests {
             served_by: None,
         });
         insert_job(&context, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) = claim_job(&context, job_id, node, 2_000).await.unwrap()
+        let ClaimOutcome::Claimed(claimed) =
+            claim_job(&context, job_id, node, 2_000).await.unwrap()
         else {
             panic!("job must be claimed")
         };

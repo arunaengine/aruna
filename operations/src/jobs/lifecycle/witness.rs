@@ -935,10 +935,7 @@ async fn clear_deadline(
             deadline_index_key(family),
         ),
     ];
-    if batch_delete(context, deletes, Some(txn_id))
-        .await
-        .is_err()
-    {
+    if batch_delete(context, deletes, Some(txn_id)).await.is_err() {
         abort_txn(context, txn_id).await;
         return false;
     }

@@ -315,30 +315,18 @@ pub(super) async fn park_attempt(
     token: ulid::Ulid,
     error: JobError,
 ) {
-    match mark_indeterminate(
-        context,
-        job_id,
-        token,
-        error,
-        unix_timestamp_millis(),
-    )
-    .await
-    {
+    match mark_indeterminate(context, job_id, token, error, unix_timestamp_millis()).await {
         Ok(ParkOutcome::Parked(_)) => {}
         Ok(ParkOutcome::Exhausted(record)) => {
             warn!(job_id = %job_id, "Local attempts exhausted; parking job");
             // A cancelled run settles as cancelled, so the family does not run it elsewhere.
             let record = match record.cancel_requested {
-                true => match set_cancel_requested(
-                    context,
-                    job_id,
-                    unix_timestamp_millis(),
-                )
-                .await
-                {
-                    Ok(CancelRequestOutcome::Cancelled(cancelled)) => cancelled,
-                    _ => record,
-                },
+                true => {
+                    match set_cancel_requested(context, job_id, unix_timestamp_millis()).await {
+                        Ok(CancelRequestOutcome::Cancelled(cancelled)) => cancelled,
+                        _ => record,
+                    }
+                }
                 false => record,
             };
             Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
@@ -361,15 +349,7 @@ pub(super) async fn pre_submit_failure(
         Box::pin(fail_and_crate(context, job_id, token, record, error)).await;
         return;
     }
-    match requeue_before_attempt(
-        context,
-        job_id,
-        token,
-        unix_timestamp_millis(),
-        error,
-    )
-    .await
-    {
+    match requeue_before_attempt(context, job_id, token, unix_timestamp_millis(), error).await {
         Ok(record) if record.is_settled() => {
             Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
         }

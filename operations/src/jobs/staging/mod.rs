@@ -543,15 +543,9 @@ pub(super) async fn persist_slot(
         checkpoint_key(ctx.job_id, slot),
         ByteView::from(value),
     ));
-    put_job_rows(
-        &ctx.driver,
-        ctx.job_id,
-        ctx.claim_token,
-        writes,
-        deletes,
-    )
-    .await
-    .map_err(|error| error.to_string())
+    put_job_rows(&ctx.driver, ctx.job_id, ctx.claim_token, writes, deletes)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The checkpoint row of a job, or of its prefix lane `slot`, which extends the job's key.

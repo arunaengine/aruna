@@ -156,17 +156,15 @@ async fn keeps_attempt_state() {
         LogicalJobState::Succeeded
     );
 
-    let stored =
-        crate::jobs::store::state::read_job_record(&context, family.job_id, None)
-            .await
-            .expect("job row read")
-            .expect("job row exists");
+    let stored = crate::jobs::store::state::read_job_record(&context, family.job_id, None)
+        .await
+        .expect("job row read")
+        .expect("job row exists");
     assert_eq!(stored.state, JobState::Succeeded);
-    let physical =
-        crate::jobs::store::state::read_job_record(&context, physical_id, None)
-            .await
-            .expect("physical row read")
-            .expect("physical row exists");
+    let physical = crate::jobs::store::state::read_job_record(&context, physical_id, None)
+        .await
+        .expect("physical row read")
+        .expect("physical row exists");
     assert_eq!(physical.state, JobState::Running);
 }
 

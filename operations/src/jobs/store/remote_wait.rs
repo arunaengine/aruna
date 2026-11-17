@@ -81,7 +81,10 @@ impl WaitRowOperation {
     pub fn acknowledge(waiter: NodeId, job_id: JobId, key: BucketKeyRef) -> Self {
         let row = delivery_key(waiter, job_id, key);
         Self {
-            call: Some(Ok(IoCall::Delete(vec![(KEY_WAIT_KEYSPACE.to_string(), row)]))),
+            call: Some(Ok(IoCall::Delete(vec![(
+                KEY_WAIT_KEYSPACE.to_string(),
+                row,
+            )]))),
         }
     }
 }

@@ -290,9 +290,7 @@ pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
     let mut pending = false;
     let held = drive(HeldReservations::all(), context).await;
     for reservation in held.map_err(|error| error.to_string())? {
-        let Some(record) =
-            read_job_record(context, reservation.job_id, None).await?
-        else {
+        let Some(record) = read_job_record(context, reservation.job_id, None).await? else {
             continue;
         };
         if record.is_settled() && !publish_terminal(context, &record).await {

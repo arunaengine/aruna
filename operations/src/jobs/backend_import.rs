@@ -2168,7 +2168,9 @@ mod tests {
         let mut request = BlobRequest::new(listing());
         assert_eq!(
             request.first(),
-            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(listing())))))
+            Ok(Next::Call(IoCall::Effect(Box::new(
+                Effect::Blob(listing())
+            ))))
         );
         assert!(matches!(
             request.next(listed()),

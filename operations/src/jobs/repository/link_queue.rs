@@ -71,7 +71,8 @@ pub(crate) async fn queue_rows(
         .iter()
         .map(|(link_id, _)| (LINK_QUEUE_KEYSPACE.to_string(), id_key(*link_id)))
         .collect();
-    let queued = match storage.send_storage_effect(StorageEffect::BatchRead {
+    let queued = match storage
+        .send_storage_effect(StorageEffect::BatchRead {
             reads,
             txn_id: None,
         })
@@ -105,7 +106,9 @@ async fn scan_queue(
     context: &DriverContext,
     start: Option<Key>,
 ) -> Result<(Vec<(Key, Value)>, Option<Key>), LinkError> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Iter {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             prefix: None,
             start: start.map(IterStart::After),
@@ -237,10 +240,9 @@ async fn settle_stale(
     queued: &Value,
 ) -> Result<Option<u64>, LinkError> {
     // A push that finished remotely but failed to record it still counts as pushed.
-    let checkpoint =
-        crate::jobs::export::archive::stored_checkpoint(context, job_id)
-            .await
-            .map_err(LinkError::Unexpected)?;
+    let checkpoint = crate::jobs::export::archive::stored_checkpoint(context, job_id)
+        .await
+        .map_err(LinkError::Unexpected)?;
     let pushed = checkpoint
         .as_ref()
         .and_then(|checkpoint| checkpoint.pushed_outcome());
@@ -412,7 +414,9 @@ async fn settle_entry(
     queued: &Value,
     retry_at: Option<u64>,
 ) -> Result<(), LinkError> {
-    let txn_id = match context.storage_handle.send_storage_effect(StorageEffect::StartTransaction { read: false })
+    let txn_id = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
@@ -421,7 +425,9 @@ async fn settle_entry(
     };
     let result = settle_in(context, link_id, queued, retry_at, txn_id).await;
     if result.is_err() {
-        context.storage_handle.send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        context
+            .storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
     }
     match result {
@@ -438,7 +444,9 @@ async fn settle_in(
     retry_at: Option<u64>,
     txn_id: TxnId,
 ) -> Result<(), LinkError> {
-    let current = match context.storage_handle.send_storage_effect(StorageEffect::Read {
+    let current = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             key: id_key(link_id),
             txn_id: Some(txn_id),
@@ -480,7 +488,9 @@ async fn settle_in(
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         other => return Err(LinkError::Unexpected(other.label().to_string())),
     }
-    match context.storage_handle.send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
@@ -490,7 +500,9 @@ async fn settle_in(
 }
 
 async fn delete_entry(context: &DriverContext, key: Key) -> Result<(), LinkError> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Delete {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
             key_space: LINK_QUEUE_KEYSPACE.to_string(),
             key,
             txn_id: None,
@@ -504,7 +516,9 @@ async fn delete_entry(context: &DriverContext, key: Key) -> Result<(), LinkError
 }
 
 async fn write_row(context: &DriverContext, row: (String, Key, Value)) -> Result<(), LinkError> {
-    match context.storage_handle.send_storage_effect(StorageEffect::Write {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
             key_space: row.0,
             key: row.1,
             value: row.2,
@@ -578,7 +592,9 @@ mod tests {
     use aruna_storage::FjallStorage;
 
     async fn stored(context: &DriverContext, link_id: Ulid) -> Option<LinkQueueEntry> {
-        match context.storage_handle.send_storage_effect(StorageEffect::Read {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
                 key_space: LINK_QUEUE_KEYSPACE.to_string(),
                 key: id_key(link_id),
                 txn_id: None,

@@ -387,9 +387,7 @@ mod tests {
         record.state = state;
         record.workspace_mode = mode;
         record.workspace_bucket = Some(bucket.to_string());
-        insert_job(&ctx.driver, &record)
-            .await
-            .unwrap();
+        insert_job(&ctx.driver, &record).await.unwrap();
         drive(
             CreateBucketOperation::new(
                 bucket.to_string(),
@@ -448,7 +446,9 @@ mod tests {
     }
 
     async fn write_access(context: &DriverContext, access: &UserAccess) {
-        let _ = context.storage_handle.send_storage_effect(StorageEffect::Write {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: access.access_key.as_bytes().into(),
                 value: access.to_bytes().unwrap().into(),

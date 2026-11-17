@@ -1087,11 +1087,18 @@ mod tests {
     }
 
     async fn count_keyspace(context: &DriverContext, key_space: &str) -> usize {
-        crate::storage_read::iter_prefix_page(&context.storage_handle, key_space, None, None, 64, None)
-            .await
-            .expect("scan")
-            .0
-            .len()
+        crate::storage_read::iter_prefix_page(
+            &context.storage_handle,
+            key_space,
+            None,
+            None,
+            64,
+            None,
+        )
+        .await
+        .expect("scan")
+        .0
+        .len()
     }
 
     #[tokio::test]
@@ -1155,7 +1162,9 @@ mod tests {
     }
 
     async fn write_raw(context: &DriverContext, key_space: &str, key: ByteView, value: ByteView) {
-        match context.storage_handle.send_storage_effect(StorageEffect::Write {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
                 key_space: key_space.to_string(),
                 key,
                 value,
@@ -1381,8 +1390,7 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&ctx, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored =
-            crate::jobs::import::upload_store::read_rocrate_upload(&ctx, upload_id).await;
+        let stored = crate::jobs::import::upload_store::read_rocrate_upload(&ctx, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
         let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(

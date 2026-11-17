@@ -1822,15 +1822,9 @@ async fn put_report(
     entry_key: &[u8],
     row: &ImportReportRow,
 ) -> Result<(), ImportFailure> {
-    put_job_entry(
-        &ctx.driver,
-        ctx.job_id,
-        ctx.claim_token,
-        entry_key,
-        row,
-    )
-    .await
-    .map_err(|error| ImportFailure::Retryable(error.to_string()))
+    put_job_entry(&ctx.driver, ctx.job_id, ctx.claim_token, entry_key, row)
+        .await
+        .map_err(|error| ImportFailure::Retryable(error.to_string()))
 }
 
 fn system_report_key(entry_key: &str) -> Vec<u8> {

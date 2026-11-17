@@ -726,14 +726,11 @@ pub async fn capture_outputs(
         .map(destination_of)
         .collect::<Result<_, _>>()?;
     let hints = local_hints(context, node_id, &destinations).await?;
-    let control = reserve_output_commits(
-        context,
-        record.job_id,
-        &destinations,
-        &hints,
-    )
-    .await
-    .map_err(|error| JobError::retryable(format!("output commit reservation failed: {error}")))?;
+    let control = reserve_output_commits(context, record.job_id, &destinations, &hints)
+        .await
+        .map_err(|error| {
+            JobError::retryable(format!("output commit reservation failed: {error}"))
+        })?;
     if control.attempt_epoch != fence.attempt_epoch {
         return Err(JobError::retryable(
             "attempt fence moved during output capture",

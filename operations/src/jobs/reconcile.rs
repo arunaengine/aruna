@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::JobRecord;
 use crate::driver::DriverContext;
+use aruna_core::structs::execution::job::JobRecord;
 
 /// Reconciliation seam for lost external attempts. A lost lease or node restart
 /// must never blindly requeue one (that double-runs the container); the sweep and

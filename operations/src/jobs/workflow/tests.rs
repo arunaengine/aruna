@@ -517,10 +517,7 @@ async fn system_error_parks() {
     ))
     .await;
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Indeterminate);
     assert!(!stored.locally_exhausted);
     assert!(stored.finished_at_ms.is_none());
@@ -559,10 +556,7 @@ async fn cancel_lost_evidence() {
     ))
     .await;
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Cancelled);
     assert!(stored.finished_at_ms.is_some());
 }
@@ -605,10 +599,7 @@ async fn capture_failure_caps() {
         .await;
     }
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Indeterminate);
     assert!(stored.locally_exhausted);
     assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
@@ -772,10 +763,7 @@ async fn cancelled_exhaustion_settles() {
     ))
     .await;
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Cancelled);
     assert!(!stored.locally_exhausted);
     assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
@@ -1275,10 +1263,7 @@ async fn walltime_fails_job() {
     )
     .await;
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
     assert_eq!(stored.state, JobState::Failed);
     assert_eq!(
@@ -1314,10 +1299,7 @@ async fn arms_missing_start() {
     )
     .await;
 
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(backend.cancels.load(Ordering::Relaxed), 1);
     assert_eq!(stored.state, JobState::Failed);
     assert_eq!(
@@ -1384,10 +1366,7 @@ async fn reconcile_skips_submit() {
     .await;
 
     assert!(backend.submits.lock().unwrap().is_empty());
-    let stored = read_job_record(&ctx, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored = read_job_record(&ctx, job_id, None).await.unwrap().unwrap();
     assert_eq!(stored.state, JobState::Cancelled);
 }
 
@@ -1688,7 +1667,9 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         subject_generation: generation,
         subject_digest: digest,
     };
-    let _ = context.storage_handle.send_storage_effect(StorageEffect::Write {
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
             key_space: JOB_RESERVATION_KEYSPACE.to_string(),
             key: reservation.execution_id.to_bytes().as_slice().into(),
             value: postcard::to_allocvec(&reservation).unwrap().into(),
@@ -1704,7 +1685,9 @@ async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, dig
         local_to_controller: true,
     })
     .unwrap();
-    let _ = context.storage_handle.send_storage_effect(StorageEffect::Write {
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
             key_space: NODE_SUBJECT_KEYSPACE.to_string(),
             key: NODE_SUBJECT_KEY.to_vec().into(),
             value: record.to_bytes().unwrap().into(),

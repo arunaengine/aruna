@@ -764,14 +764,7 @@ pub(super) async fn fail_and_crate(
     error: JobError,
 ) {
     let result = execution_result(record, None, Vec::new());
-    let terminal = Box::pin(terminal_fail(
-        context,
-        job_id,
-        token,
-        error,
-        result,
-    ))
-    .await;
+    let terminal = Box::pin(terminal_fail(context, job_id, token, error, result)).await;
     Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
 }
 /// Physical execution identity of the fenced attempt. Without it no output can
@@ -782,8 +775,7 @@ async fn control_or_park(
     token: ulid::Ulid,
     fence: &FenceContext,
 ) -> Option<AttemptControl> {
-    let control =
-        read_attempt_control(context, job_id, fence.attempt_epoch, None).await;
+    let control = read_attempt_control(context, job_id, fence.attempt_epoch, None).await;
     let error = match control {
         Ok(Some(control)) if !control.execution_id.is_nil() => return Some(control),
         Ok(_) => JobError::retryable("attempt control carries no execution identity"),
@@ -905,14 +897,7 @@ async fn export_or_park(
     let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
         let error = JobError::permanent("output capture needs a net handle");
         let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
-        let terminal = Box::pin(terminal_fail(
-            context,
-            job_id,
-            token,
-            error,
-            result,
-        ))
-        .await;
+        let terminal = Box::pin(terminal_fail(context, job_id, token, error, result)).await;
         Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
         return None;
     };
@@ -949,14 +934,7 @@ async fn export_or_park(
         }
         Err(error) => {
             let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
-            let terminal = Box::pin(terminal_fail(
-                context,
-                job_id,
-                token,
-                error,
-                result,
-            ))
-            .await;
+            let terminal = Box::pin(terminal_fail(context, job_id, token, error, result)).await;
             Box::pin(cleanup_and_crate(context, job_id, terminal)).await;
             None
         }

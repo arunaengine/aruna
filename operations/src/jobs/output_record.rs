@@ -335,14 +335,10 @@ mod tests {
         .await
         .unwrap();
         let destinations = vec![(net.node_id(), "ws".to_string(), "reports/a.txt".to_string())];
-        let control = reserve_output_commits(
-            &context,
-            record.job_id,
-            &destinations,
-            &Default::default(),
-        )
-        .await
-        .unwrap();
+        let control =
+            reserve_output_commits(&context, record.job_id, &destinations, &Default::default())
+                .await
+                .unwrap();
         let version_id = control.output_commits[0].version_id;
         let outputs = vec![output(control.execution_id, version_id)];
 
@@ -350,25 +346,16 @@ mod tests {
             .await
             .unwrap();
 
-        let stored = read_attempt_control(
-            &context,
-            record.job_id,
-            control.attempt_epoch,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let stored = read_attempt_control(&context, record.job_id, control.attempt_epoch, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(stored.output_record, Some(digest));
 
-        let envelope = read_output_record(
-            &context,
-            record.job_id,
-            control.attempt_epoch,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let envelope = read_output_record(&context, record.job_id, control.attempt_epoch)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.digest().unwrap(), digest);
         assert!(envelope.verify_signature().is_ok());
         let JobFamilyRecord::Output(output_record) = &envelope.record else {

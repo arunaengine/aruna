@@ -88,11 +88,7 @@ async fn target_locks(
             key,
             version_id,
         } => {
-            let row = read_row(
-                context,
-                S3_BUCKET_KEYSPACE,
-                bucket.clone().into(),
-            );
+            let row = read_row(context, S3_BUCKET_KEYSPACE, bucket.clone().into());
             let Some(info) = row.await? else {
                 return Ok(Vec::new());
             };
@@ -725,8 +721,9 @@ mod tests {
         let owner = UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32]));
         let record = JobRecord::new(job_id, payload, owner, waiter, 1_000, 1_000, None);
         insert_job(&waiter_node, &record).await.unwrap();
-        let ClaimOutcome::Claimed(claimed) =
-            claim_job(&waiter_node, job_id, waiter, 2_000).await.unwrap()
+        let ClaimOutcome::Claimed(claimed) = claim_job(&waiter_node, job_id, waiter, 2_000)
+            .await
+            .unwrap()
         else {
             panic!("job must be claimed")
         };
