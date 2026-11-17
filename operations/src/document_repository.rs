@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::EffectOperation;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -30,6 +30,14 @@ pub fn read_effect(document: &DocumentTarget, txn_id: Option<TxnId>) -> Effect {
         key: storage_key(document),
         txn_id,
     })
+}
+
+/// The storage row of `document`, for a read call.
+pub fn read_row(document: &DocumentTarget) -> (KeySpace, Key) {
+    (
+        storage_keyspace(document).to_string(),
+        storage_key(document),
+    )
 }
 
 pub fn write_effect(document: &DocumentTarget, value: Vec<u8>, txn_id: Option<TxnId>) -> Effect {

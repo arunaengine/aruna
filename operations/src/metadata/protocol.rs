@@ -882,6 +882,13 @@ pub enum MetadataReadError {
     TooLarge,
 }
 
+/// A runner failure is no verdict about the request, so the peer may ask again.
+impl From<aruna_core::calls::IoError> for MetadataReadError {
+    fn from(_: aruna_core::calls::IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteAuthError {
     Unauthorized,
