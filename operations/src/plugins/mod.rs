@@ -35,6 +35,7 @@ pub mod receiver;
 pub mod records;
 pub mod release;
 pub mod replay;
+pub mod rows;
 pub mod rules;
 pub mod runs;
 pub mod settings;
