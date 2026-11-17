@@ -79,6 +79,17 @@ pub enum ReclaimBlobError {
         expected: &'static str,
         received: &'static str,
     },
+    #[error("reclaim storage failed: {0}")]
+    Io(aruna_core::calls::IoError),
+}
+
+impl From<aruna_core::calls::IoError> for ReclaimBlobError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 /// Deletes one unreferenced copy. Everything that decides it happens inside one
