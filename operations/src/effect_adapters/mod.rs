@@ -141,13 +141,13 @@ pub(crate) async fn dispatch_effect_until(
         event = "operation.effect.result",
         depth,
         effect = effect_name,
-        result = event_kind(&event),
+        result = event.label(),
         "Received operation event"
     );
     if depth == 0 {
         debug!(
             effect = effect_name,
-            result = event_kind(&event),
+            result = event.label(),
             "Received top-level operation event"
         );
     }
@@ -167,20 +167,5 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
-    }
-}
-
-fn event_kind(event: &Event) -> &'static str {
-    match event {
-        Event::Blob(_) => "blob",
-        Event::StagingSource(_) => "staging_source",
-        Event::LocalFile(_) => "local_file",
-        Event::Storage(_) => "storage",
-        Event::Net(_) => "net",
-        Event::Metadata(_) => "metadata",
-        Event::SubOperation(_) => "suboperation",
-        Event::Task(_) => "task",
-        Event::Search() => "search",
-        Event::Stream() => "stream",
     }
 }

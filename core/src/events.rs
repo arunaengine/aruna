@@ -723,6 +723,96 @@ pub enum NetError {
     ChannelClosed,
 }
 
+/// Expands to the `Kind::Variant` name of a value, matched exhaustively over the listed variants.
+macro_rules! variant_label {
+    ($value:expr, $kind:ident { $($variant:ident),* $(,)? }) => {
+        match $value {
+            $($kind::$variant { .. } => concat!(stringify!($kind), "::", stringify!($variant)),)*
+        }
+    };
+}
+
+impl Event {
+    /// Names the event variant without its values, for logs and unexpected-event errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Event::Blob(event) => variant_label!(
+                event,
+                BlobEvent {
+                    WriteFinished, ReadFinished, DeleteFinished, ReservationReleased,
+                    HiddenSpooled, HiddenRead, LocalSpooled, HiddenDeleted, HiddenListed,
+                    ConnectionEstablished, ConnectionClosed, MessageReceived, MessageSent,
+                    ReplicationFinished, ReadServed, GroupBackendChecked, UploadOpened,
+                    PartWritten, UploadAborted, BucketKeyGenerated, CopiesSealed, KeyPrepared,
+                    KeyActivated, KeyDiscarded, KeyStatus, KeyExtended, KeyLocked, ReadAdmitted,
+                    Error, CopyRewritten, PieceWritten, UnlockedKeyRead, ArchiveHashed,
+                    ComposeReserved, Abe, ExternalListed, ExternalHashed, PlainStat, ExternalStat,
+                    CopyStat, PlainWritten, BucketReady, BucketExists, BucketDeleted,
+                }
+            ),
+            Event::StagingSource(event) => variant_label!(
+                event,
+                StagingSourceEvent {
+                    CheckResult, HeadResult, ListResult, ReadResult, HealthResult, Error,
+                }
+            ),
+            Event::LocalFile(event) => variant_label!(
+                event,
+                LocalFileEvent {
+                    Written, Copied, Moved, Hashed, Refused, Error,
+                }
+            ),
+            Event::Storage(event) => variant_label!(
+                event,
+                StorageEvent {
+                    TransactionStarted, TransactionCommitted, TransactionAborted, ReadResult,
+                    BatchReadResult, WriteResult, BatchWriteResult, DeleteResult,
+                    BatchDeleteResult, SyncAllFinished, IterResult, VaultResult, Error,
+                }
+            ),
+            Event::Net(event) => variant_label!(
+                event,
+                NetEvent {
+                    Dht, DocumentSync, Stream, JobControl, AuditPages, PolicyFetch, JobRecord,
+                    LaunchOffer, PolicySign, VaultFetch, VaultSign, SnapshotSign, StatementSign,
+                    Release, Error,
+                }
+            ),
+            Event::Metadata(event) => variant_label!(
+                event,
+                MetadataEvent {
+                    ValidationResult, CreateCrateResult, ApplyRoCrateResult, EntityUpsertResult,
+                    GraphPolicySet, GraphPeerAdded, GraphSyncScheduled, GraphPolicyResult,
+                    RoCrateExportResult, RoCrateSummaryResult, RoCratePageResult, SearchResult,
+                    QueryResult, GraphDeleted, GraphListResult, ContainsGraphResult,
+                    ContainsDotResult, VersionedExport, GraphSnapshotResult, SnapshotInstalled,
+                    BatchPlanned, BatchMerged, Error,
+                }
+            ),
+            Event::SubOperation(event) => variant_label!(
+                event,
+                SubOperationEvent {
+                    GroupWritten, DepthLimitExceeded, AuthorizationResult, RealmNodesResult,
+                    DocumentSyncResult, SourceConnectorResolved, VersionAccessResolved,
+                    ReplicationItemResult, ReplicationTransferResult, ReplicationApplyResult,
+                    LiveReplicationQueued, RefreshQueued, BucketCreated, GroupRoutingLoaded,
+                    NotificationsEmitted, ShareLogged, TokenRevoked, UserUpdated, VaultHeld,
+                    KeyRequestsOpened, EpochsMarked, KeyRequestsFailed, ReissuePaged,
+                    VersionRekeyed,
+                }
+            ),
+            Event::Task(event) => variant_label!(
+                event,
+                TaskEvent {
+                    TimerScheduled, TimerCancelled, RunningHandlersAborted, Error,
+                }
+            ),
+            Event::Search() => "Event::Search",
+            Event::Stream() => "Event::Stream",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,6 +820,16 @@ mod tests {
 
     fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
         JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")
+    }
+
+    #[test]
+    fn label_omits_values() {
+        let event = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "private detail".to_string(),
+        });
+        assert_eq!(event.label(), "TaskEvent::Error");
+        assert_eq!(Event::Search().label(), "Event::Search");
     }
 
     #[test]

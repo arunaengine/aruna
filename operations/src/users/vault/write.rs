@@ -65,18 +65,6 @@ impl std::fmt::Debug for VaultChange {
     }
 }
 
-/// Names an event without its values, so no error message carries vault bytes.
-pub(super) fn event_label(event: &Event) -> &'static str {
-    match event {
-        Event::Storage(StorageEvent::ReadResult { .. }) => "storage read",
-        Event::Storage(StorageEvent::IterResult { .. }) => "storage scan",
-        Event::Storage(_) => "storage result",
-        Event::Net(_) => "net result",
-        Event::Task(_) => "task result",
-        _ => "other event",
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppendVaultConfig {
     pub node_id: NodeId,
@@ -619,7 +607,7 @@ impl AppendVaultOperation {
             (state, event) => Err(AppendVaultError::UnexpectedEvent {
                 state: state.label().to_string(),
                 expected: "the event of the current step",
-                got: event_label(&event).to_string(),
+                got: event.label().to_string(),
             }),
         }
     }
