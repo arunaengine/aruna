@@ -32,7 +32,6 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::Effect;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::RealmId;
 
 use crate::sync::replicate_documents::replicate_documents_effect;
 
@@ -40,10 +39,9 @@ use crate::sync::replicate_documents::replicate_documents_effect;
 /// document; each attempt rereads, validates and reapplies its change to the newer document.
 const COMMIT_ATTEMPTS: usize = 3;
 
-/// The call that announces the realm authorization document of `realm_id`, for a role change
-/// whose admin events did not reach the outbox.
-pub(crate) fn announce_call(actor: &Actor, realm_id: RealmId) -> Option<IoCall> {
-    let document = DocumentTarget::RealmAuthorization { realm_id };
+/// The call that announces an authorization `document`, for a role change whose admin events did
+/// not reach the outbox.
+pub(crate) fn announce_call(actor: &Actor, document: DocumentTarget) -> Option<IoCall> {
     match replicate_documents_effect(actor.realm_id, actor.node_id, vec![document]) {
         Effect::SubOperation(child) => Some(IoCall::Child(child)),
         _ => None,

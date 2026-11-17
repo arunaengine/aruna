@@ -126,7 +126,12 @@ impl AssignRolesOperation {
                 calls,
             });
         }
-        let announce = super::announce_call(&self.input.actor, document.realm_id);
+        let announce = super::announce_call(
+            &self.input.actor,
+            DocumentTarget::RealmAuthorization {
+                realm_id: document.realm_id,
+            },
+        );
         let announce = announce.ok_or(AssignRolesError::NotFinished)?;
         self.document = Some(document);
         self.step = Step::Announce;
