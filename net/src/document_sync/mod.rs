@@ -23,7 +23,7 @@ use aruna_core::MetaResourceId;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::document::{
@@ -46,17 +46,12 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord,
 };
 use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH,
-    CONFIG_DISCOVERY_PATH, CONFIG_FEDERATION_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH,
-    CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    METADATA_REPLICATION_PATH, REALM_ID_PATH, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-    USER_NAME_PATH, config_node_path, decode_reducer_state, group_role_path, group_user_path,
-    materialize_group_authorization, materialize_realm_authorization, materialize_user_operation,
-    materialized_group, materialized_realm_config, needs_revocation_index, overlay_group_role,
-    overlay_group_state, overlay_placement, overlay_realm_config, overlay_realm_role,
-    parse_config_node, parse_config_oidc, parse_group_assignment, parse_group_role,
-    parse_realm_assignment, realm_role_path, realm_user_path, reduced_admin_target,
-    user_attribute_path, user_subject_path,
+    AdminApplyStatus, AdminDocumentState, REVOCATIONS_PER_ORIGIN, RevocationIndex,
+    config_node_path, decode_reducer_state, group_user_path, materialize_group_authorization,
+    materialize_realm_authorization, materialize_user_operation, materialized_group,
+    materialized_realm_config, needs_revocation_index, overlay_group_role, overlay_group_state,
+    overlay_placement, overlay_realm_config, overlay_realm_role, realm_user_path,
+    reduced_admin_target,
 };
 use aruna_core::storage_entries::{
     conflict_write_entries, create_acceptance_entry, create_acceptance_key,

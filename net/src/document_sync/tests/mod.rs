@@ -18,7 +18,10 @@ use aruna_core::keyspaces::{
     USER_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventPayload;
-use aruna_core::reducer::CONFIG_STRATEGY_PATH;
+use aruna_core::reducer::{
+    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH, USER_NAME_PATH,
+    user_attribute_path,
+};
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
