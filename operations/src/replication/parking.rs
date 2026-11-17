@@ -10,14 +10,14 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, abort_effects};
+use aruna_core::effects::{BlobEffect, Effect, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
 };
-use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
+use aruna_core::operation::{EffectOperation, Operation, TransactionMode};
 use aruna_core::structs::storage::blob::{BackendLocation, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
@@ -42,33 +42,41 @@ fn wait_row(key: BucketKeyRef, job_key: &[u8]) -> Vec<u8> {
     [&key.key()[..], job_key].concat()
 }
 
-/// Checks inside one read view that a job still waits for `keys`: each key is the bucket's active
-/// or retiring key, and every one of them seals a version the job copies.
+/// Checks that a job still waits for `keys`: each key is the bucket's active or retiring key,
+/// and every one of them seals a version the job copies. Inside a transaction it reads one view.
 #[derive(Debug, PartialEq)]
 struct WaitCheck {
     keys: Vec<BucketKeyRef>,
     bucket: String,
     target: ReplicateScopeTarget,
-    txn_id: Option<TxnId>,
+    phase: CheckPhase,
     settings: Option<BucketEncryption>,
     prefix: Vec<u8>,
     after: Option<Key>,
     found: BTreeSet<BucketKeyRef>,
 }
 
+/// The read a wait check waits for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckPhase {
+    Records,
+    Versions,
+    Locations,
+}
+
 /// What one step of a wait check asks for next.
 enum CheckStep {
-    Read(Effect),
+    Read(IoCall),
     Done(bool),
 }
 
 impl WaitCheck {
-    fn new(job: &BlobJobRecord, keys: &[BucketKeyRef], txn_id: Option<TxnId>) -> Self {
+    fn new(job: &BlobJobRecord, keys: &[BucketKeyRef]) -> Self {
         Self {
             keys: keys.to_vec(),
             bucket: job.input.bucket.clone(),
             target: job.input.target.clone(),
-            txn_id,
+            phase: CheckPhase::Records,
             settings: None,
             prefix: Vec::new(),
             after: None,
@@ -76,7 +84,7 @@ impl WaitCheck {
         }
     }
 
-    fn start(&self) -> Effect {
+    fn start(&self) -> IoCall {
         let mut reads = vec![(
             BUCKET_ENCRYPTION_KEYSPACE.to_string(),
             self.bucket.as_bytes().into(),
@@ -84,37 +92,27 @@ impl WaitCheck {
         reads.extend(
             (self.keys.iter()).map(|key| (BUCKET_KEY_KEYSPACE.to_string(), key.key().into())),
         );
-        Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })
+        IoCall::Read(reads)
     }
 
-    fn step(&mut self, event: Event) -> Result<CheckStep, BlobQueueError> {
-        match event {
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            Event::Storage(StorageEvent::BatchReadResult { values }) if self.settings.is_none() => {
-                self.records_read(values)
+    fn step(&mut self, result: IoResult) -> Result<CheckStep, BlobQueueError> {
+        match self.phase {
+            CheckPhase::Records => self.records_read(result.values()?),
+            CheckPhase::Versions => {
+                let (values, next) = result.page()?;
+                self.versions_read(values, next)
             }
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) if self.settings.is_some() => self.versions_read(values, next_start_after),
-            Event::Storage(StorageEvent::BatchReadResult { values }) => self.locations_read(values),
-            other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+            CheckPhase::Locations => self.locations_read(result.values()?),
         }
     }
 
-    fn records_read(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<CheckStep, BlobQueueError> {
+    fn records_read(&mut self, values: Vec<Option<Value>>) -> Result<CheckStep, BlobQueueError> {
         if values.len() != self.keys.len() + 1 {
             return Err(BlobQueueError::UnexpectedEvent(
                 "short key record read".to_string(),
             ));
         }
-        let mut values = values.into_iter().map(|(_, value)| value);
+        let mut values = values.into_iter();
         let settings = BucketEncryption::from_row(values.next().flatten().as_deref())?;
         for (key, value) in self.keys.iter().zip(values) {
             let record = value
@@ -145,14 +143,14 @@ impl WaitCheck {
         Ok(self.read_versions(None))
     }
 
-    fn read_versions(&self, start: Option<Key>) -> CheckStep {
-        CheckStep::Read(Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(self.prefix.clone().into()),
-            start: start.map(IterStart::After),
+    fn read_versions(&mut self, after: Option<Key>) -> CheckStep {
+        self.phase = CheckPhase::Versions;
+        CheckStep::Read(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: self.prefix.clone().into(),
+            after,
             limit: WAIT_PAGE,
-            txn_id: self.txn_id,
-        }))
+        })
     }
 
     /// The location rows of one page are read in one batch, in the same read view.
@@ -185,21 +183,16 @@ impl WaitCheck {
         if reads.is_empty() {
             return Ok(self.page_done());
         }
-        Ok(CheckStep::Read(Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })))
+        self.phase = CheckPhase::Locations;
+        Ok(CheckStep::Read(IoCall::Read(reads)))
     }
 
-    fn locations_read(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<CheckStep, BlobQueueError> {
+    fn locations_read(&mut self, values: Vec<Option<Value>>) -> Result<CheckStep, BlobQueueError> {
         let active = self
             .settings
             .as_ref()
             .and_then(BucketEncryption::active_key);
-        for value in values.into_iter().filter_map(|(_, value)| value) {
+        for value in values.into_iter().flatten() {
             if let Some(key) = BackendLocation::from_bytes(&value)?
                 .format
                 .bucket_key()
@@ -222,19 +215,79 @@ impl WaitCheck {
     }
 }
 
+/// Writes the parked job, and its wait rows while it still waits, in one transaction after a
+/// wait check in the same view. Answers whether it waits and its new due time.
+#[derive(Debug, PartialEq)]
+struct ParkRowsOperation {
+    job_key: Vec<u8>,
+    job: BlobJobRecord,
+    keys: Vec<BucketKeyRef>,
+    now_ms: u64,
+    check: WaitCheck,
+    /// Whether the job still waits and its due time, once the rows were asked to be written.
+    parked: Option<(bool, u64)>,
+}
+
+impl ParkRowsOperation {
+    fn write_job(&mut self, current: bool) -> Result<Next<(bool, u64)>, BlobQueueError> {
+        let mut parked = self.job.clone();
+        parked.due_at_ms = if current {
+            PARKED_DUE
+        } else {
+            (self.now_ms).saturating_add(REPLICATION_POLL_AFTER.as_millis() as u64)
+        };
+        let relationship =
+            postcard::to_allocvec(&self.job.relationship_id).map_err(ConversionError::from)?;
+        let mut writes: Vec<(String, Key, Value)> = vec![(
+            REPLICATION_JOB_KEYSPACE.to_string(),
+            self.job_key.clone().into(),
+            parked.to_bytes()?.into(),
+        )];
+        for key in self.keys.iter().filter(|_| current) {
+            writes.push((
+                COPY_WAIT_KEYSPACE.to_string(),
+                wait_row(*key, &self.job_key).into(),
+                relationship.clone().into(),
+            ));
+        }
+        self.parked = Some((current, parked.due_at_ms));
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for ParkRowsOperation {
+    type Output = (bool, u64);
+    type Error = BlobQueueError;
+
+    fn first(&mut self) -> Result<Next<(bool, u64)>, BlobQueueError> {
+        Ok(Next::Call(self.check.start()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(bool, u64)>, BlobQueueError> {
+        if let Some(parked) = self.parked {
+            result.done()?;
+            return Ok(Next::Done(parked));
+        }
+        match self.check.step(result)? {
+            CheckStep::Read(call) => Ok(Next::Call(call)),
+            CheckStep::Done(current) => self.write_job(current),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum ParkState {
-    Init,
-    StartTransaction,
-    Check(WaitCheck),
-    WriteJob { current: bool },
-    Commit { current: bool },
+    Park,
     Recheck(WaitCheck),
     KeyStatus { index: usize },
     Wake,
-    Finish,
-    Error,
 }
+
+type ParkStep = Result<Next<Option<u64>>, BlobQueueError>;
 
 /// Parks `job` until one of `keys` unlocks: the job and its wait rows commit together, with no
 /// attempt counted and no error recorded. A key unlocked meanwhile makes it due at once, and
@@ -245,10 +298,7 @@ pub(crate) struct ParkJobOperation {
     job: BlobJobRecord,
     keys: Vec<BucketKeyRef>,
     now_ms: u64,
-    txn_id: Option<TxnId>,
-    due: Option<u64>,
     state: ParkState,
-    error: Option<BlobQueueError>,
 }
 
 impl ParkJobOperation {
@@ -263,211 +313,98 @@ impl ParkJobOperation {
             job,
             keys,
             now_ms,
-            txn_id: None,
-            due: None,
-            state: ParkState::Init,
-            error: None,
+            state: ParkState::Park,
         }
     }
 
-    fn fail(&mut self, error: BlobQueueError) -> Effects {
-        self.state = ParkState::Error;
-        self.error = Some(error);
-        abort_effects(&mut self.txn_id)
-    }
-
-    fn finish(&mut self, due: Option<u64>) -> Effects {
-        self.due = due;
-        self.state = ParkState::Finish;
-        smallvec![]
-    }
-
-    fn check_step(&mut self, event: Event) -> Effects {
-        let (mut check, first) = match std::mem::replace(&mut self.state, ParkState::Error) {
-            ParkState::Check(check) => (check, true),
-            ParkState::Recheck(check) => (check, false),
-            _ => return self.fail(BlobQueueError::UnexpectedEvent("no wait check".into())),
-        };
-        match check.step(event) {
-            Err(error) => self.fail(error),
-            Ok(CheckStep::Read(effect)) => {
-                self.state = if first {
-                    ParkState::Check(check)
-                } else {
-                    ParkState::Recheck(check)
-                };
-                smallvec![effect]
-            }
-            Ok(CheckStep::Done(current)) if first => self.write_job(current),
-            Ok(CheckStep::Done(current)) => self.after_recheck(current),
+    /// The rows commit as their own run; the recheck after it reads outside any transaction.
+    fn parked(&mut self, (current, due): (bool, u64)) -> ParkStep {
+        if !current {
+            return Ok(Next::Done(Some(due)));
         }
-    }
-
-    fn write_job(&mut self, current: bool) -> Effects {
-        let mut parked = self.job.clone();
-        parked.due_at_ms = if current {
-            PARKED_DUE
-        } else {
-            (self.now_ms).saturating_add(REPLICATION_POLL_AFTER.as_millis() as u64)
-        };
-        let relationship = match postcard::to_allocvec(&self.job.relationship_id) {
-            Ok(relationship) => relationship,
-            Err(error) => return self.fail(ConversionError::from(error).into()),
-        };
-        let value = match parked.to_bytes() {
-            Ok(value) => value,
-            Err(error) => return self.fail(error.into()),
-        };
-        let mut writes: Vec<(String, Key, Value)> = vec![(
-            REPLICATION_JOB_KEYSPACE.to_string(),
-            self.job_key.clone().into(),
-            value.into(),
-        )];
-        for key in self.keys.iter().filter(|_| current) {
-            writes.push((
-                COPY_WAIT_KEYSPACE.to_string(),
-                wait_row(*key, &self.job_key).into(),
-                relationship.clone().into(),
-            ));
-        }
-        self.due = Some(parked.due_at_ms);
-        self.state = ParkState::WriteJob { current };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
+        let check = WaitCheck::new(&self.job, &self.keys);
+        let read = check.start();
+        self.state = ParkState::Recheck(check);
+        Ok(Next::Call(read))
     }
 
     /// A key unlocked while the job parked wakes it here; no unlock call would.
-    fn after_recheck(&mut self, current: bool) -> Effects {
+    fn after_recheck(&mut self, current: bool) -> Next<Option<u64>> {
         match self.keys.first() {
             Some(key) if !current => self.wake(*key),
             Some(_) => self.key_status(0),
-            None => self.finish(None),
+            None => Next::Done(None),
         }
     }
 
-    fn key_status(&mut self, index: usize) -> Effects {
+    fn key_status(&mut self, index: usize) -> Next<Option<u64>> {
         let Some(key) = self.keys.get(index) else {
-            return self.finish(None);
+            return Next::Done(None);
         };
         self.state = ParkState::KeyStatus { index };
-        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
+        let read = Effect::Blob(BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
-        })]
+        });
+        Next::Call(IoCall::Effect(Box::new(read)))
     }
 
-    fn status_read(&mut self, index: usize, unlocked: bool) -> Effects {
+    fn status_read(&mut self, index: usize, unlocked: bool) -> Next<Option<u64>> {
         match self.keys.get(index) {
             Some(key) if unlocked => self.wake(*key),
             _ => self.key_status(index + 1),
         }
     }
 
-    fn wake(&mut self, key: BucketKeyRef) -> Effects {
+    fn wake(&mut self, key: BucketKeyRef) -> Next<Option<u64>> {
         self.state = ParkState::Wake;
         let wake = WakeJobOperation::new(wait_row(key, &self.job_key), self.now_ms);
-        smallvec![Effect::SubOperation(boxed_suboperation(wake, |result| {
-            Event::SubOperation(SubOperationEvent::CopyWoken {
-                result: result.map_err(|error| error.to_string()),
-            })
-        }))]
+        Next::Call(IoCall::child(wake))
     }
 }
 
-impl EffectOperation for ParkJobOperation {
+impl Operation for ParkJobOperation {
     type Output = Option<u64>;
     type Error = BlobQueueError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ParkState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn first(&mut self) -> ParkStep {
+        let rows = ParkRowsOperation {
+            job_key: self.job_key.clone(),
+            job: self.job.clone(),
+            keys: self.keys.clone(),
+            now_ms: self.now_ms,
+            check: WaitCheck::new(&self.job, &self.keys),
+            parked: None,
+        };
+        Ok(Next::Call(IoCall::child(rows)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (
-                ParkState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                let check = WaitCheck::new(&self.job, &self.keys, Some(txn_id));
-                let read = check.start();
-                self.state = ParkState::Check(check);
-                smallvec![read]
-            }
-            (ParkState::Check(_) | ParkState::Recheck(_), event) => self.check_step(event),
-            (
-                &ParkState::WriteJob { current },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(BlobQueueError::UnexpectedEvent("no transaction".into()));
-                };
-                self.state = ParkState::Commit { current };
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (
-                &ParkState::Commit { current },
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.txn_id = None;
-                if !current {
-                    return self.finish(self.due);
+    fn next(&mut self, result: IoResult) -> ParkStep {
+        match std::mem::replace(&mut self.state, ParkState::Wake) {
+            ParkState::Park => self.parked(result.child::<(bool, u64), BlobQueueError>()??),
+            ParkState::Recheck(mut check) => match check.step(result)? {
+                CheckStep::Read(call) => {
+                    self.state = ParkState::Recheck(check);
+                    Ok(Next::Call(call))
                 }
-                let check = WaitCheck::new(&self.job, &self.keys, None);
-                let read = check.start();
-                self.state = ParkState::Recheck(check);
-                smallvec![read]
-            }
-            (ParkState::Commit { .. }, Event::Storage(StorageEvent::Error { error })) => {
-                // The failed commit closed the transaction.
-                self.txn_id = None;
-                self.fail(error.into())
-            }
-            (
-                ParkState::StartTransaction | ParkState::WriteJob { .. },
-                Event::Storage(StorageEvent::Error { error }),
-            ) => self.fail(error.into()),
-            (
-                &ParkState::KeyStatus { index },
-                Event::Blob(BlobEvent::KeyStatus { generations }),
-            ) => {
-                let key = self.keys.get(index).copied();
-                let unlocked =
-                    (generations.iter()).any(|status| Some(status.key) == key && status.active);
-                self.status_read(index, unlocked)
-            }
-            // Without a blob backend no key counts as unlocked here.
-            (&ParkState::KeyStatus { index }, Event::Blob(_)) => self.status_read(index, false),
-            (ParkState::Wake, Event::SubOperation(SubOperationEvent::CopyWoken { result })) => {
-                match result {
-                    Ok(_) => self.finish(Some(self.now_ms)),
-                    Err(error) => self.fail(BlobQueueError::Wake(error)),
+                CheckStep::Done(current) => Ok(self.after_recheck(current)),
+            },
+            ParkState::KeyStatus { index } => match result.event()? {
+                Event::Blob(BlobEvent::KeyStatus { generations }) => {
+                    let key = self.keys.get(index).copied();
+                    let unlocked =
+                        (generations.iter()).any(|status| Some(status.key) == key && status.active);
+                    Ok(self.status_read(index, unlocked))
                 }
+                // Without a blob backend no key counts as unlocked here.
+                Event::Blob(_) => Ok(self.status_read(index, false)),
+                other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+            },
+            ParkState::Wake => {
+                let woke = result.child::<bool, BlobQueueError>()?;
+                woke.map_err(|error| BlobQueueError::Wake(error.to_string()))?;
+                Ok(Next::Done(Some(self.now_ms)))
             }
-            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(event.label().to_string())),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ParkState::Finish | ParkState::Error)
-    }
-
-    fn finalize(self) -> Result<Option<u64>, BlobQueueError> {
-        match (self.state, self.error) {
-            (ParkState::Finish, _) => Ok(self.due),
-            (_, Some(error)) => Err(error),
-            _ => Err(BlobQueueError::UnexpectedEvent(
-                "park did not finish".into(),
-            )),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
     }
 }
 
@@ -2115,113 +2052,81 @@ mod tests {
             ParkJobOperation::new(b"job".to_vec(), job(Ulid::from_parts(1, 1)), keys, 100)
         }
 
-        fn records_read(settings: &BucketEncryption, record: Option<BucketKeyRecord>) -> Event {
-            Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (
-                        b"bucket".to_vec().into(),
-                        Some(settings.to_bytes().unwrap().into()),
-                    ),
-                    (
-                        key().key().into(),
-                        record.map(|record| record.to_bytes().unwrap().into()),
-                    ),
-                ],
-            })
+        fn records_read(settings: &BucketEncryption, record: Option<BucketKeyRecord>) -> IoResult {
+            IoResult::Values(vec![
+                Some(settings.to_bytes().unwrap().into()),
+                record.map(|record| record.to_bytes().unwrap().into()),
+            ])
+        }
+
+        fn rows(keys: Vec<BucketKeyRef>) -> ParkRowsOperation {
+            let job = job(Ulid::from_parts(1, 1));
+            ParkRowsOperation {
+                job_key: b"job".to_vec(),
+                check: WaitCheck::new(&job, &keys),
+                job,
+                keys,
+                now_ms: 100,
+                parked: None,
+            }
+        }
+
+        fn rows_answer(result: Result<(bool, u64), BlobQueueError>) -> IoResult {
+            IoResult::Child(ChildOutcome::new(result))
         }
 
         #[test]
         fn stale_key_polls() {
             // A key that is no longer the bucket's key leaves the job due after the poll delay.
-            let mut operation = park(vec![key()]);
-            operation.start();
-            let read = operation.step(started());
-            assert!(matches!(
-                read.as_slice(),
-                [Effect::Storage(StorageEffect::BatchRead {
-                    txn_id: Some(_),
-                    ..
-                })]
-            ));
-            let written = operation.step(records_read(&BucketEncryption::default(), None));
-            let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice()
-            else {
+            let mut operation = rows(vec![key()]);
+            assert_eq!(operation.transaction(), TransactionMode::Write);
+            assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+            let written = operation.next(records_read(&BucketEncryption::default(), None));
+            let Ok(Next::Call(IoCall::Write(writes))) = &written else {
                 panic!("expected the job write, got {written:?}");
             };
             assert_eq!(writes.len(), 1, "no wait row for a stale key");
-            let batch = Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            });
-            assert_eq!(operation.step(batch).as_slice(), [commit()]);
-            assert!(operation.step(committed()).is_empty());
             let due = 100 + REPLICATION_POLL_AFTER.as_millis() as u64;
-            assert_eq!(operation.finalize(), Ok(Some(due)));
+            assert_eq!(operation.next(IoResult::Done), Ok(Next::Done((false, due))));
+            // The parent ends with that due time, without a recheck.
+            let mut park = park(vec![key()]);
+            assert!(matches!(park.first(), Ok(Next::Call(IoCall::Child(_)))));
+            assert_eq!(
+                park.next(rows_answer(Ok((false, due)))),
+                Ok(Next::Done(Some(due)))
+            );
         }
 
         #[test]
-        fn park_errors_abort() {
-            let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
-            let timeout = || {
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::Timeout,
-                })
-            };
-            let mut checking = park(vec![key()]);
-            checking.start();
-            checking.step(started());
-            assert_eq!(checking.step(timeout()).as_slice(), [abort.clone()]);
+        fn park_errors_fail() {
+            let mut park = park(vec![key()]);
+            let _ = park.first();
+            let timeout = BlobQueueError::Storage(StorageError::Timeout);
             assert_eq!(
-                checking.finalize(),
+                park.next(rows_answer(Err(timeout))),
                 Err(BlobQueueError::Storage(StorageError::Timeout))
             );
-            let mut starting = park(vec![key()]);
-            starting.start();
-            assert!(starting.step(timeout()).is_empty());
-            assert!(starting.finalize().is_err());
+            // A waiting job is checked again after its commit.
+            let mut waiting = self::park(vec![key()]);
+            let _ = waiting.first();
+            let recheck = waiting.next(rows_answer(Ok((true, PARKED_DUE))));
+            assert!(matches!(recheck, Ok(Next::Call(IoCall::Read(_)))));
         }
 
         #[test]
         fn locked_keys_stay() {
             // After the commit each key's status is read; no unlocked key leaves the job parked.
+            let blob = |event| IoResult::Event(Box::new(Event::Blob(event)));
             let mut operation = park(vec![key()]);
             operation.state = ParkState::KeyStatus { index: 0 };
-            let locked = Event::Blob(BlobEvent::KeyStatus {
+            let locked = BlobEvent::KeyStatus {
                 generations: Vec::new(),
-            });
-            assert!(operation.step(locked).is_empty());
-            assert_eq!(operation.finalize(), Ok(None));
+            };
+            assert_eq!(operation.next(blob(locked)), Ok(Next::Done(None)));
             let mut unlocked = park(vec![key()]);
             unlocked.state = ParkState::KeyStatus { index: 0 };
-            let missing = Event::Blob(BlobEvent::Error(
-                aruna_core::errors::BlobError::HandleMissing,
-            ));
-            assert!(unlocked.step(missing).is_empty());
-            assert_eq!(unlocked.finalize(), Ok(None));
-        }
-
-        #[test]
-        fn park_contract() {
-            let checking = || {
-                let mut operation = park(vec![key()]);
-                operation.start();
-                operation.step(started());
-                operation
-            };
-            let refused = rejects_events(checking, sample_events, |event| {
-                matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }))
-            });
-            let abort = Effect::Storage(StorageEffect::AbortTransaction { txn_id: txn() });
-            assert!(
-                refused
-                    .iter()
-                    .all(|(_, effects, _)| effects.as_slice() == [abort.clone()])
-            );
-            let mut open = checking();
-            check_abort(&mut open, &[abort]);
-            rejects_finalize(open);
-            let mut fresh = park(vec![key()]);
-            check_abort(&mut fresh, &[]);
-            rejects_finalize(fresh);
+            let missing = BlobEvent::Error(aruna_core::errors::BlobError::HandleMissing);
+            assert_eq!(unlocked.next(blob(missing)), Ok(Next::Done(None)));
         }
     }
 }
