@@ -787,7 +787,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let context = empty_context(&dir);
-        let storage = &context.storage_handle;
         let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
         let auth = AuthContext {
             user_id: UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),

@@ -22,7 +22,7 @@ fn waiter() -> NodeId {
     iroh::SecretKey::from_bytes(&[2; 32]).public()
 }
 
-fn key(generation: u32) -> BucketKeyRef {
+fn key(generation: u64) -> BucketKeyRef {
     BucketKeyRef::new(Ulid::from_bytes([8; 16]), generation)
 }
 
