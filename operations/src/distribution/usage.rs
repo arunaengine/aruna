@@ -74,7 +74,7 @@ pub fn charged_rows(set_id: Ulid, accounts: &[(Ulid, RangeAccount)]) -> Vec<Vec<
 }
 
 /// Adds the read counter rows; a missing row counts as zero.
-pub fn sum_rows(values: &[Option<Value>]) -> Result<RangeCounters, UsageError> {
+fn sum_rows(values: &[Option<Value>]) -> Result<RangeCounters, UsageError> {
     let mut total = RangeCounters::default();
     for value in values.iter().flatten() {
         total = total.merge(RangeCounters::from_bytes(value)?)?;
@@ -231,7 +231,8 @@ pub fn sum_held<'a>(
 /// What this member holds of `bucket`'s set as copies: every range with an account here, one
 /// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
 /// Also names the set and the number of the record the share was computed under.
-pub async fn replica_share(
+#[cfg(test)]
+async fn replica_share(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
@@ -407,24 +408,6 @@ pub async fn replica_shares(
 pub struct GroupShare {
     pub replicas: UsageCounters,
     pub revisions: BTreeMap<Ulid, u64>,
-}
-
-/// The usage of a local distributed bucket from the range counters this member holds; `None`
-/// for an ordinary bucket or a member whose record has not arrived.
-pub async fn range_usage(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<Option<RangeUsage>, UsageError> {
-    let Some((_, snapshot, held)) = held_ranges(context, bucket).await? else {
-        return Ok(None);
-    };
-    let ranges = snapshot.config.ranges.len();
-    Ok(Some(RangeUsage {
-        counters: sum_held(&held)?,
-        ranges,
-        counted: held.len(),
-        complete: held.iter().all(|range| range.complete) && held.len() == ranges,
-    }))
 }
 
 #[cfg(test)]

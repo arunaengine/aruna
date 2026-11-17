@@ -69,7 +69,7 @@ struct Kept {
 }
 
 /// The open staging jobs of this node that import into `bucket`, with their specs.
-pub(crate) async fn open_imports(
+async fn open_imports(
     context: &DriverContext,
     bucket: &str,
 ) -> Result<Vec<(JobId, StagingJobSpec)>, String> {

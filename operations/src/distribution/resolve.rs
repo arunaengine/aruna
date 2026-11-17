@@ -194,7 +194,7 @@ async fn scan_sets(
 
 /// The snapshots of the sets whose hint `version_id` carries, from this node's records, and
 /// whether some candidates were left out.
-pub async fn candidate_sets(
+async fn candidate_sets(
     context: &DriverContext,
     version_id: Ulid,
 ) -> Result<(Vec<DistributionSnapshot>, bool), String> {

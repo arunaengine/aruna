@@ -28,7 +28,7 @@ pub const DEFAULT_CACHE_BYTES: u64 = 2_000_000_000;
 static CACHE_BUDGET: OnceLock<u64> = OnceLock::new();
 
 /// Rows one scan reads at a time.
-pub const REPLICA_PAGE_SIZE: usize = 128;
+const REPLICA_PAGE_SIZE: usize = 128;
 
 /// How the document came to be on this device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,11 +179,11 @@ pub fn document_state(replica: &ReplicaRecord, entries: &[&PublishEntry]) -> Doc
     }
 }
 
-pub fn replica_key(document_id: Ulid) -> Key {
+fn replica_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn replica_entry(replica: &ReplicaRecord) -> Result<(String, Key, Value), ConversionError> {
+fn replica_entry(replica: &ReplicaRecord) -> Result<(String, Key, Value), ConversionError> {
     Ok((
         DEVICE_REPLICA_KEYSPACE.to_string(),
         replica_key(replica.document_id),
@@ -191,7 +191,7 @@ pub fn replica_entry(replica: &ReplicaRecord) -> Result<(String, Key, Value), Co
     ))
 }
 
-pub fn scan_replicas(start_after: Option<Key>) -> Effect {
+fn scan_replicas(start_after: Option<Key>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
         key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
         prefix: None,
@@ -266,7 +266,7 @@ pub fn cache_budget() -> u64 {
 }
 
 /// The bytes one replica record takes, its render included.
-pub fn replica_size(replica: &ReplicaRecord) -> u64 {
+fn replica_size(replica: &ReplicaRecord) -> u64 {
     replica
         .to_bytes()
         .map(|bytes| bytes.len() as u64)

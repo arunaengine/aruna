@@ -33,7 +33,7 @@ use super::replica::{
 
 /// Replicas one pass refreshes. The rest follow on the next beat, so a large
 /// working set converges instead of blocking one pass.
-pub const MAX_REFRESH_PASS: usize = 32;
+const MAX_REFRESH_PASS: usize = 32;
 
 /// Bounds one document's exchange with the realm.
 const REFRESH_BUDGET: Duration = Duration::from_secs(10);

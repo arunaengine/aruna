@@ -137,7 +137,7 @@ pub struct AcceptedRequest {
 }
 
 /// The key of an accepted request: set id then request id.
-pub fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
+fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
     let mut key = set_id.to_bytes().to_vec();
     key.extend_from_slice(&request_id.to_bytes());
     key

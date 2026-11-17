@@ -53,7 +53,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 const SET_BATCH: usize = 16;
 const PURGE_PAGES: usize = 32;
 /// How soon the next pass comes while lifecycle work waits.
-pub const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
+const LIFECYCLE_POLL: Duration = Duration::from_secs(5);
 const FENCE_ATTEMPTS: usize = 4;
 /// How long uploads opened before a transfer fence may still complete before they are aborted.
 const UPLOAD_GRACE_MS: u64 = 5 * 60 * 1000;

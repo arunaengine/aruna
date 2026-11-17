@@ -37,7 +37,7 @@ use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::mark_dirty;
 
 /// How long a pass that found nothing to do waits before it looks again.
-pub const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
+const MAINTAIN_AFTER: Duration = Duration::from_secs(60);
 /// Account rows one page reads.
 const ACCOUNT_PAGE: usize = 64;
 /// Account pages one pass reads before it yields to the next timer run.

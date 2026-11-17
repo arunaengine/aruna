@@ -327,16 +327,6 @@ pub fn record_epoch(
     record_authority(binding, key, event).map(|authority| authority.epoch)
 }
 
-/// Checks `authority` from the answer to [`authority_read`] inside a publication transaction.
-pub fn authority_answer(
-    authority: &WriteAuthority,
-    key: &str,
-    event: Event,
-) -> Result<(), GuardError> {
-    let (record, fence) = authority_rows(event)?;
-    check_authority(authority, key, record.as_deref(), fence.as_deref())
-}
-
 #[cfg(test)]
 #[path = "guard_tests.rs"]
 mod tests;

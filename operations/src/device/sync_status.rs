@@ -31,11 +31,11 @@ use super::sync::rows::scan_page;
 
 /// How recently the realm must have answered for the device to call it
 /// reachable. Two folder beats, so one missed pass does not flip the view.
-pub const REALM_CONTACT_WINDOW: Duration = Duration::from_secs(90);
+const REALM_CONTACT_WINDOW: Duration = Duration::from_secs(90);
 
 /// How long a run stays active without finishing. A crashed run must not block
 /// the next one for longer than this.
-pub const SYNC_RUN_LIFETIME: Duration = Duration::from_secs(120);
+const SYNC_RUN_LIFETIME: Duration = Duration::from_secs(120);
 
 /// The one row this device keeps about its exchange with the realm.
 const SYNC_STATE_KEY: [u8; 1] = [0];
@@ -166,11 +166,7 @@ fn entry_error(entries: &[&PublishEntry]) -> Option<String> {
 }
 
 /// One folder's row from the rows the device already holds for it.
-pub fn dataset_row(
-    folder: &SyncedFolder,
-    bases: &[SyncBase],
-    pending_uploads: usize,
-) -> DatasetRow {
+fn dataset_row(folder: &SyncedFolder, bases: &[SyncBase], pending_uploads: usize) -> DatasetRow {
     let mut unsynced_files = 0usize;
     let mut conflicts = 0usize;
     for base in bases {

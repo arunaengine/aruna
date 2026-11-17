@@ -526,10 +526,7 @@ async fn read_page(
     }
 }
 
-pub(crate) async fn load_folder(
-    context: &Arc<DriverContext>,
-    folder_id: ulid::Ulid,
-) -> Option<SyncedFolder> {
+async fn load_folder(context: &Arc<DriverContext>, folder_id: ulid::Ulid) -> Option<SyncedFolder> {
     read_value(
         context,
         aruna_core::keyspaces::SYNCED_FOLDER_KEYSPACE,

@@ -105,7 +105,7 @@ pub fn base_key(folder_id: Ulid, relative: &str) -> Key {
     ByteView::from(key)
 }
 
-pub fn folder_prefix(folder_id: Ulid) -> Key {
+fn folder_prefix(folder_id: Ulid) -> Key {
     ByteView::from(folder_id.to_bytes().to_vec())
 }
 

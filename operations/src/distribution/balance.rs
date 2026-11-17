@@ -24,7 +24,7 @@ use crate::driver::DriverContext;
 use crate::node::heartbeat::fresh_heartbeats;
 
 /// How long a node waits after proposing a transfer before it proposes the next one.
-pub const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
+const COOL_DOWN: Duration = Duration::from_secs(30 * 60);
 /// A node balances only once it holds this many permille more than the set's average.
 const MARGIN_PERMILLE: u64 = 1100;
 

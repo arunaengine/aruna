@@ -24,7 +24,7 @@ use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;
 
 /// How long an issued delegation is valid.
-pub const DELEGATION_SECS: u64 = 15;
+const DELEGATION_SECS: u64 = 15;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DelegateError {

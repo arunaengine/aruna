@@ -116,7 +116,7 @@ pub async fn purge_range(
 }
 
 /// Whether `bucket` is still the member bucket of `binding`: same set, member and incarnation.
-pub async fn still_bound(
+async fn still_bound(
     context: &DriverContext,
     bucket: &str,
     binding: &DistributionBinding,

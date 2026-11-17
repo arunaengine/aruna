@@ -292,7 +292,7 @@ async fn request_persist(context: &Arc<DriverContext>) {
 /// Whether one queued entry's batch must be re-merged after a restart: only an
 /// edit still on its way to the realm, which nothing else restores. A published
 /// entry returns by refresh; a parked one is not this device's state.
-pub fn replays_edit(entry: &PublishEntry) -> bool {
+fn replays_edit(entry: &PublishEntry) -> bool {
     matches!(entry.kind, PublishKind::Edit { .. })
         && matches!(
             entry.state,
