@@ -13,7 +13,6 @@ pub mod default_rule;
 pub mod deletion;
 pub mod fence;
 pub mod forward;
-pub mod get_group;
 pub mod imports;
 pub mod join_request;
 pub mod list_groups;
