@@ -5,18 +5,17 @@
 
 use std::collections::VecDeque;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, NODE_SECRETS_KEYSPACE};
 use aruna_core::node_vault::{VaultEntry, VaultPurpose};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows;
 use aruna_core::secrets::{SecretName, SecretRecord, SecretScope};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, TxnId};
 use aruna_core::{NodeId, UserId};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -44,45 +43,24 @@ pub enum NodeSecretError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent {
-        state: &'static str,
-        got: &'static str,
-    },
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
 }
 
-/// The result a queued write waits for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Pending {
-    BatchWrite,
-    BatchDelete,
-    Write,
-    Delete,
-}
-
-#[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    StartTransaction,
-    ReadRecord,
-    Writing(Pending),
-    Commit,
-    ScheduleNotices,
-    Done,
+impl From<IoError> for NodeSecretError {
+    fn from(error: IoError) -> Self {
+        error.into_storage().map_or_else(Self::Io, Self::Storage)
+    }
 }
 
 /// Creates, replaces, rotates or deletes one node secret.
 #[derive(Debug, PartialEq)]
 pub struct NodeSecretOperation {
     input: Option<NodeChange>,
-    state: State,
-    txn_id: Option<TxnId>,
-    queue: VecDeque<(Effect, Pending)>,
+    /// The writes of the transaction still to send, once the change is decided.
+    queue: VecDeque<IoCall>,
     notices: bool,
     result: Option<Option<SecretRecord>>,
-    output: Option<Result<Option<SecretRecord>, NodeSecretError>>,
 }
 
 pub fn record_key(name: &SecretName) -> Vec<u8> {
@@ -97,41 +75,42 @@ fn decode(bytes: &[u8]) -> Result<SecretRecord, ConversionError> {
     Ok(postcard::from_bytes(bytes)?)
 }
 
+/// The error for an event that does not answer an iteration.
+pub(super) fn unexpected_iter(event: &Event) -> IoError {
+    IoError::Unexpected {
+        expected: "StorageEvent::IterResult",
+        got: event.label(),
+    }
+}
+
+/// Checks the answer to a queued write: a row write or delete, or a vault write or delete.
+pub(super) fn written(result: IoResult) -> Result<(), IoError> {
+    match result {
+        IoResult::Event(Event::Storage(
+            StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
+        )) => Ok(()),
+        other => rows::done(other),
+    }
+}
+
 impl NodeSecretOperation {
     pub fn new(input: NodeChange) -> Self {
         Self {
             input: Some(input),
-            state: State::Init,
-            txn_id: None,
             queue: VecDeque::new(),
             notices: false,
             result: None,
-            output: None,
         }
-    }
-
-    fn fail(&mut self, error: NodeSecretError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = State::Done;
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-
-    fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        let got = event.label();
-        self.fail(NodeSecretError::UnexpectedEvent { state, got })
     }
 
     /// Decides the change from the stored record, then queues every write of the transaction.
     fn plan(
         &mut self,
+        input: NodeChange,
         stored: Option<&[u8]>,
         auth: Option<&[u8]>,
-    ) -> Result<Effects, NodeSecretError> {
+    ) -> Result<(), NodeSecretError> {
         let current = stored.map(decode).transpose()?;
-        let input = self.input.take().ok_or(NodeSecretError::NotFinished)?;
         let key = record_key(input.change.name());
         let name = input.change.name().clone();
         let applied = apply_change(
@@ -163,44 +142,28 @@ impl NodeSecretOperation {
                 let row = postcard::to_allocvec(info).map_err(ConversionError::from)?;
                 audit.push((keyspace, key.into(), row.into()));
             }
-            None => {
-                let deletes = vec![(keyspace, key.into())];
-                let effect = StorageEffect::BatchDelete {
-                    deletes,
-                    txn_id: self.txn_id,
-                };
-                self.queue
-                    .push_back((Effect::Storage(effect), Pending::BatchDelete));
-            }
+            None => self
+                .queue
+                .push_back(IoCall::Delete(vec![(keyspace, key.into())])),
         }
-        let writes = StorageEffect::BatchWrite {
-            writes: audit,
-            txn_id: self.txn_id,
-        };
-        self.queue
-            .push_back((Effect::Storage(writes), Pending::BatchWrite));
+        self.queue.push_back(IoCall::Write(audit));
         if let (Some(info), Some(fields)) = (&applied.info, &applied.value) {
-            let sealed = write_secret(value_entry(info.value_id), fields.encode()?, self.txn_id);
-            self.queue.push_back((sealed, Pending::Write));
+            let sealed = write_secret(value_entry(info.value_id), fields.encode()?, None);
+            self.queue.push_back(IoCall::Effect(sealed));
         }
         if let Some(retired) = applied.retired {
-            let removal = delete_secret(value_entry(retired), self.txn_id);
-            self.queue.push_back((removal, Pending::Delete));
+            let removal = delete_secret(value_entry(retired), None);
+            self.queue.push_back(IoCall::Effect(removal));
         }
         self.result = Some(applied.info);
-        Ok(self.next())
+        Ok(())
     }
 
-    fn next(&mut self) -> Effects {
-        if let Some((effect, pending)) = self.queue.pop_front() {
-            self.state = State::Writing(pending);
-            return smallvec![effect];
+    fn send(&mut self) -> Next<Option<SecretRecord>> {
+        match self.queue.pop_front() {
+            Some(call) => Next::Call(call),
+            None => Next::Done(self.result.take().flatten()),
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(NodeSecretError::NotFinished);
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
 
@@ -210,117 +173,42 @@ impl From<aruna_core::secrets::SecretError> for NodeSecretError {
     }
 }
 
-impl EffectOperation for NodeSecretOperation {
+impl Operation for NodeSecretOperation {
     type Output = Option<SecretRecord>;
     type Error = NodeSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            if matches!(self.state, State::Commit) {
-                self.txn_id = None;
-            }
-            return self.fail(error.into());
-        }
-        match (&self.state, event) {
+    fn first(&mut self) -> Result<Next<Self::Output>, NodeSecretError> {
+        let input = self.input.as_ref().ok_or(IoError::Unfinished)?;
+        Ok(Next::Call(IoCall::Read(vec![
             (
-                State::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                let Some(input) = &self.input else {
-                    return self.fail(NodeSecretError::NotFinished);
-                };
-                self.state = State::ReadRecord;
-                let auth_key = input.realm_id.as_bytes().to_vec();
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            NODE_SECRETS_KEYSPACE.to_string(),
-                            record_key(input.change.name()).into()
-                        ),
-                        (AUTH_KEYSPACE.to_string(), auth_key.into()),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::ReadRecord, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let [(_, stored), (_, auth)] = values.as_slice() else {
-                    return self.fail(NodeSecretError::UnexpectedEvent {
-                        state: "ReadRecord",
-                        got: "a batch of another length",
-                    });
-                };
-                match self.plan(stored.as_deref(), auth.as_deref()) {
-                    Ok(effects) => effects,
-                    Err(error) => self.fail(error),
-                }
-            }
-            (State::Writing(pending), event) => {
-                let done = matches!(
-                    (pending, &event),
-                    (
-                        Pending::BatchWrite,
-                        Event::Storage(StorageEvent::BatchWriteResult { .. })
-                    ) | (
-                        Pending::BatchDelete,
-                        Event::Storage(StorageEvent::BatchDeleteResult { .. })
-                    ) | (
-                        Pending::Write,
-                        Event::Storage(StorageEvent::WriteResult { .. })
-                    ) | (
-                        Pending::Delete,
-                        Event::Storage(StorageEvent::DeleteResult { .. })
-                    )
-                );
-                match done {
-                    true => self.next(),
-                    false => self.unexpected("Writing", event),
-                }
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                if self.notices {
-                    self.state = State::ScheduleNotices;
-                    return smallvec![schedule_drain_effect()];
-                }
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
-            }
+                NODE_SECRETS_KEYSPACE.to_string(),
+                record_key(input.change.name()).into(),
+            ),
             (
-                State::ScheduleNotices,
-                Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }),
-            ) => {
-                // The notice rows are committed; a missed timer leaves them to the next drain.
-                self.state = State::Done;
-                self.output = Some(Ok(self.result.take().flatten()));
-                smallvec![]
+                AUTH_KEYSPACE.to_string(),
+                input.realm_id.as_bytes().to_vec().into(),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeSecretError> {
+        match self.input.take() {
+            Some(input) => {
+                let [stored, auth] = rows::values::<2>(result)?;
+                self.plan(input, stored.as_deref(), auth.as_deref())?;
             }
-            (State::Init | State::Done, _) => smallvec![],
-            (_, event) => self.unexpected("NodeSecret", event),
+            None => written(result)?,
         }
+        Ok(self.send())
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, State::Done)
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(NodeSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    /// The notice rows are committed; a missed timer leaves them to the next drain.
+    fn after_commit(&mut self) -> Option<Effect> {
+        std::mem::take(&mut self.notices).then(schedule_drain_effect)
     }
 }
 
@@ -329,7 +217,6 @@ impl EffectOperation for NodeSecretOperation {
 pub struct NodeSecretsOperation {
     start: Option<IterStart>,
     limit: usize,
-    output: Option<Result<(Vec<SecretRecord>, bool), NodeSecretError>>,
 }
 
 impl NodeSecretsOperation {
@@ -338,7 +225,6 @@ impl NodeSecretsOperation {
         Self {
             start: after.map(|name| IterStart::After(record_key(name).into())),
             limit: limit.clamp(1, 200),
-            output: None,
         }
     }
 
@@ -347,58 +233,37 @@ impl NodeSecretsOperation {
         Self {
             start: Some(IterStart::At(record_key(name).into())),
             limit: 1,
-            output: None,
         }
     }
 }
 
-impl EffectOperation for NodeSecretsOperation {
+impl Operation for NodeSecretsOperation {
     /// The records and whether more follow.
     type Output = (Vec<SecretRecord>, bool);
     type Error = NodeSecretError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NODE_SECRETS_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.start.clone(),
-            limit: self.limit + 1,
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<Self::Output>, NodeSecretError> {
+        Ok(Next::Call(IoCall::Effect(Effect::Storage(
+            StorageEffect::Iter {
+                key_space: NODE_SECRETS_KEYSPACE.to_string(),
+                prefix: None,
+                start: self.start.clone(),
+                limit: self.limit + 1,
+                txn_id: None,
+            },
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.output.is_some() {
-            return smallvec![];
-        }
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                let more = values.len() > self.limit;
-                (values.iter().take(self.limit))
-                    .map(|(_, value)| decode(value))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|records| (records, more))
-                    .map_err(NodeSecretError::from)
-            }
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            other => Err(NodeSecretError::UnexpectedEvent {
-                state: "Iter",
-                got: other.label(),
-            }),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(NodeSecretError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeSecretError> {
+        let values = match rows::event(result)? {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => return Err(unexpected_iter(&other).into()),
+        };
+        let more = values.len() > self.limit;
+        let records = (values.iter().take(self.limit))
+            .map(|(_, value)| decode(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Next::Done((records, more)))
     }
 }
 
