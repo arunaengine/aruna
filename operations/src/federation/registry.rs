@@ -194,6 +194,24 @@ mod tests {
     use aruna_core::effects::StorageEffect;
     use tempfile::tempdir;
 
+    #[test]
+    fn realm_url_joins() {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let url = realm_url(
+            &Url::parse("https://r.example.org/base").unwrap(),
+            &realm_id,
+        );
+        let url = url.unwrap();
+        assert_eq!(
+            url.as_str(),
+            format!("https://r.example.org/base/v1/realms/{realm_id}")
+        );
+        assert_eq!(
+            totals_url(url).unwrap().as_str(),
+            format!("https://r.example.org/base/v1/realms/{realm_id}/totals")
+        );
+    }
+
     #[tokio::test]
     async fn failed_count_unknown() {
         // A count that fails is reported as `null`; a count that works reports zero as zero.
