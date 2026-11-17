@@ -2530,7 +2530,7 @@ mod tests {
         let generation_two = Ulid::generate().to_bytes().to_vec();
         write_node_stat(&ctx, DIRTY_GLOBAL_KEY.to_vec(), generation_two.clone()).await;
 
-        clear_consumed_markers(&ctx.storage_handle, observed)
+        clear_consumed_markers(&ctx, observed)
             .await
             .unwrap();
 
@@ -2546,7 +2546,7 @@ mod tests {
             Key::from(DIRTY_GLOBAL_KEY.to_vec()),
             Value::from(generation_two),
         )];
-        clear_consumed_markers(&ctx.storage_handle, observed)
+        clear_consumed_markers(&ctx, observed)
             .await
             .unwrap();
         assert!(

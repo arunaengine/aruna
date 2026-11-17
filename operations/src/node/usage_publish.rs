@@ -6,12 +6,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::pin::pin;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, DIRTY_PREFIX, NodeUsageSnapshot, USAGE_GROUP_PREFIX, UsageCounters,
@@ -116,7 +118,7 @@ pub async fn publish_usage_snapshots(
 ) -> Result<PublishedUsage, String> {
     let (published, observed_markers) =
         publish_retaining_markers(ctx, node_id, realm_id, full).await?;
-    clear_consumed_markers(&ctx.storage_handle, observed_markers).await?;
+    clear_consumed_markers(ctx, observed_markers).await?;
     Ok(published)
 }
 
@@ -298,7 +300,7 @@ pub async fn publish_refresh_snapshots(
     }
     // Replication and summary refresh both succeeded; only now consume the
     // markers, and only those a concurrent write did not re-dirty meanwhile.
-    clear_consumed_markers(&ctx.storage_handle, observed_markers).await?;
+    clear_consumed_markers(ctx, observed_markers).await?;
     Ok(published)
 }
 
@@ -307,75 +309,83 @@ async fn signal_snapshot_retry(
     published: &PublishedUsage,
     observed_markers: &[(Key, Value)],
 ) -> Result<(), String> {
-    write_retry_markers(&ctx.storage_handle, published, observed_markers).await?;
+    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+    let markers = retry_markers(published, observed_markers, generation);
+    drive(RetrySignalOperation::new(markers), ctx)
+        .await
+        .map_err(|error| format!("retry marker write failed: {error}"))
+}
 
-    let Some(task_handle) = ctx.task_handle.as_ref() else {
-        return Ok(());
-    };
-    match task_handle.send_effect(schedule_snapshot_publish()).await {
-        Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
-        Event::Task(TaskEvent::Error { message, .. }) => {
-            warn!(message = %message, "Failed to schedule usage snapshot retry");
-            Ok(())
+/// Marker rows for the published scopes a concurrent write did not mark already, so the next
+/// publish retries them; none when nothing was published.
+fn retry_markers(
+    published: &PublishedUsage,
+    observed_markers: &[(Key, Value)],
+    generation: Value,
+) -> Vec<(String, Key, Value)> {
+    let observed_keys: HashSet<&[u8]> = (observed_markers.iter())
+        .map(|(key, _)| key.as_ref())
+        .collect();
+    let mut keys = Vec::with_capacity(published.groups.len() + usize::from(published.global));
+    if published.global {
+        keys.push(DIRTY_GLOBAL_KEY.to_vec());
+    }
+    keys.extend(published.groups.iter().map(|group_id| dirty_group_key(*group_id)));
+    (keys.into_iter())
+        .filter(|key| !observed_keys.contains(key.as_slice()))
+        .map(|key| (NODE_STATS_KEYSPACE.to_string(), Key::from(key), generation.clone()))
+        .collect()
+}
+
+/// Writes the retry markers, then moves the debounced publish timer up. A refused timer is only
+/// logged: the markers alone keep the retry for the next run.
+#[derive(Debug, PartialEq)]
+struct RetrySignalOperation {
+    markers: Vec<(String, Key, Value)>,
+    scheduling: bool,
+}
+
+impl RetrySignalOperation {
+    fn new(markers: Vec<(String, Key, Value)>) -> Self {
+        Self {
+            markers,
+            scheduling: false,
         }
-        other => {
-            warn!(
-                event = other.label(),
-                "Unexpected usage snapshot retry schedule result"
-            );
-            Ok(())
-        }
+    }
+
+    fn schedule(&mut self) -> Result<Next<()>, IoError> {
+        self.scheduling = true;
+        Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))))
     }
 }
 
-async fn write_retry_markers(
-    storage: &StorageHandle,
-    published: &PublishedUsage,
-    observed_markers: &[(Key, Value)],
-) -> Result<(), String> {
-    if published.is_empty() {
-        return Ok(());
-    }
+impl Operation for RetrySignalOperation {
+    type Output = ();
+    type Error = IoError;
 
-    let observed_keys: HashSet<Vec<u8>> = observed_markers
-        .iter()
-        .map(|(key, _)| key.as_ref().to_vec())
-        .collect();
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
-    let mut writes: Vec<(String, Key, Value)> =
-        Vec::with_capacity(published.groups.len() + usize::from(published.global));
-    if published.global && !observed_keys.contains(DIRTY_GLOBAL_KEY) {
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(DIRTY_GLOBAL_KEY.to_vec()),
-            generation.clone(),
-        ));
-    }
-    for group_id in &published.groups {
-        let marker_key = dirty_group_key(*group_id);
-        if observed_keys.contains(&marker_key) {
-            continue;
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        if self.markers.is_empty() {
+            return self.schedule();
         }
-        writes.push((
-            NODE_STATS_KEYSPACE.to_string(),
-            Key::from(marker_key),
-            generation.clone(),
-        ));
-    }
-    if writes.is_empty() {
-        return Ok(());
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.markers))))
     }
 
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("retry marker write failed: {}", other.label())),
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if !self.scheduling {
+            done(result)?;
+            return self.schedule();
+        }
+        match result.event()? {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {}
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(message = %message, "Failed to schedule usage snapshot retry");
+            }
+            other => warn!(
+                event = other.label(),
+                "Unexpected usage snapshot retry schedule result"
+            ),
+        }
+        Ok(Next::Done(()))
     }
 }
 
@@ -401,85 +411,67 @@ async fn write_snapshot_documents(
     }
 }
 
-/// Deletes each observed dirty marker only if its stored generation still matches
-/// the one seen at publish start. Re-reading inside the transaction makes a racing
-/// counter update abort the commit, so its retry signal is never lost.
+/// Deletes each observed dirty marker only if its stored generation still matches the one seen
+/// at publish start. The re-read runs in the deleting transaction, so a racing counter update
+/// makes the commit conflict and its retry signal is never lost.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ClearMarkersOperation {
+    observed: Vec<(Key, Value)>,
+    deleting: bool,
+}
+
+impl ClearMarkersOperation {
+    pub(crate) fn new(observed: Vec<(Key, Value)>) -> Self {
+        Self {
+            observed,
+            deleting: false,
+        }
+    }
+}
+
+impl Operation for ClearMarkersOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        if self.observed.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        let reads = (self.observed.iter())
+            .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if self.deleting {
+            return done(result).map(Next::Done);
+        }
+        let current = result.values()?;
+        let deletes: Vec<_> = (self.observed.iter().zip(current))
+            .filter(|((_, seen), stored)| stored.as_ref() == Some(seen))
+            .map(|((key, _), _)| (NODE_STATS_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        if deletes.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        self.deleting = true;
+        Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+
+    fn transaction(&self) -> bool {
+        true
+    }
+}
+
+/// Runs [`ClearMarkersOperation`]; a lost commit conflict keeps every marker for the next run.
 pub(crate) async fn clear_consumed_markers(
-    storage: &StorageHandle,
+    ctx: &DriverContext,
     observed: Vec<(Key, Value)>,
 ) -> Result<(), String> {
-    if observed.is_empty() {
-        return Ok(());
-    }
-
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    else {
-        return Err("failed to start marker cleanup transaction".to_string());
-    };
-
-    let reads = observed
-        .iter()
-        .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key.clone()))
-        .collect();
-    let current = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("marker re-read failed: {}", other.label()));
-        }
-    };
-
-    let mut deletes: Vec<(String, Key)> = Vec::with_capacity(observed.len());
-    for ((key, observed_generation), (_, current_value)) in observed.iter().zip(current) {
-        if current_value.as_ref() == Some(observed_generation) {
-            deletes.push((NODE_STATS_KEYSPACE.to_string(), key.clone()));
-        }
-    }
-
-    if deletes.is_empty() {
-        storage
-            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-            .await;
-        return Ok(());
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-        other => {
-            storage
-                .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-                .await;
-            return Err(format!("marker delete failed: {}", other.label()));
-        }
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        // A concurrent counter update re-dirtied one of the observed markers; the
-        // conflicting commit aborts and every marker survives for the next run.
-        Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }) => Ok(()),
-        other => Err(format!("marker cleanup commit failed: {}", other.label())),
+    match drive(ClearMarkersOperation::new(observed), ctx).await {
+        Ok(()) | Err(IoError::Conflict) => Ok(()),
+        Err(error) => Err(format!("marker cleanup failed: {error}")),
     }
 }
 
@@ -529,4 +521,73 @@ async fn recompute_summary(
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn marker(seed: u8) -> (Key, Value) {
+        (Key::from(vec![b'd', seed]), Value::from(vec![seed]))
+    }
+
+    #[test]
+    fn clears_unchanged_markers() {
+        // Only markers still at their observed generation are deleted, in one transaction.
+        let mut operation = ClearMarkersOperation::new(vec![marker(1), marker(2)]);
+        assert!(operation.transaction());
+        let reads = vec![
+            (NODE_STATS_KEYSPACE.to_string(), marker(1).0),
+            (NODE_STATS_KEYSPACE.to_string(), marker(2).0),
+        ];
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+        let stored = IoResult::Values(vec![Some(marker(1).1), Some(Value::from(vec![9]))]);
+        let deletes = vec![(NODE_STATS_KEYSPACE.to_string(), marker(1).0)];
+        assert_eq!(
+            operation.next(stored),
+            Ok(Next::Call(IoCall::Delete(deletes)))
+        );
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn retry_marks_then_schedules() {
+        // Scopes a concurrent write marked already keep their marker; then the timer moves up.
+        let group = GroupId::from_bytes([3; 16]);
+        let published = PublishedUsage {
+            global: true,
+            groups: vec![group],
+        };
+        let seen = vec![(Key::from(DIRTY_GLOBAL_KEY.to_vec()), Value::from(vec![1]))];
+        let generation = Value::from(vec![2]);
+        let markers = retry_markers(&published, &seen, generation.clone());
+        let marker = (
+            NODE_STATS_KEYSPACE.to_string(),
+            Key::from(dirty_group_key(group)),
+            generation,
+        );
+        assert_eq!(markers, vec![marker.clone()]);
+        let mut operation = RetrySignalOperation::new(markers);
+        let write = Ok(Next::Call(IoCall::Write(vec![marker])));
+        assert_eq!(operation.first(), write);
+        let timer = Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))));
+        assert_eq!(operation.next(IoResult::Done), timer);
+        let refused = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "full".to_string(),
+        });
+        let answer = operation.next(IoResult::Event(Box::new(refused)));
+        assert_eq!(answer, Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn redirtied_markers_kept() {
+        // Nothing observed, or every marker re-dirtied or gone, ends without a delete.
+        let mut empty = ClearMarkersOperation::new(Vec::new());
+        assert_eq!(empty.first(), Ok(Next::Done(())));
+        let mut moved = ClearMarkersOperation::new(vec![marker(1), marker(2)]);
+        moved.first().unwrap();
+        let stored = IoResult::Values(vec![Some(Value::from(vec![7])), None]);
+        assert_eq!(moved.next(stored), Ok(Next::Done(())));
+    }
 }

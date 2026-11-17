@@ -7,9 +7,7 @@ use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::federation::{FederationError, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff, check_handoff};
 use aruna_core::keyspaces::USER_KEYSPACE;
@@ -17,14 +15,12 @@ use aruna_core::link::{
     LinkAction, LinkConfirmation, LinkError, MAX_LINK_SECS, check_confirmation, fresh_local,
     link_secret,
 };
-use aruna_core::operation::{EffectOperation, Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::values;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -112,16 +108,6 @@ fn read_config(value: Option<&ByteView>) -> Result<RealmConfigDocument, LinkLogi
         .map(|bytes| RealmConfigDocument::from_bytes(bytes))
         .transpose()?
         .ok_or(LinkLoginError::ForeignRefused)
-}
-
-fn batch_values(event: Event) -> Result<Vec<Option<ByteView>>, LinkLoginError> {
-    match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            Ok(values.into_iter().map(|(_, value)| value).collect())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(LinkLoginError::UnexpectedEvent),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -230,35 +216,17 @@ pub struct LinkLoginConfig {
     pub now: u64,
 }
 
-#[derive(Debug, PartialEq)]
-enum LinkState {
-    Update(Box<UpdateUserOperation>),
-    Done,
-}
-
 /// Links the confirmed foreign login to the caller's account through the replicated user
 /// document; the account, the realm's admission and the foreign cutoff are rechecked inside
 /// every transaction attempt.
 #[derive(Debug, PartialEq)]
 pub struct LinkLoginOperation {
     config: LinkLoginConfig,
-    state: LinkState,
-    output: Option<Result<User, LinkLoginError>>,
 }
 
 impl LinkLoginOperation {
     pub fn new(config: LinkLoginConfig) -> Self {
-        Self {
-            config,
-            state: LinkState::Done,
-            output: None,
-        }
-    }
-
-    fn finish(&mut self, result: Result<User, LinkLoginError>) -> Effects {
-        self.state = LinkState::Done;
-        self.output = Some(result);
-        smallvec![]
+        Self { config }
     }
 
     fn input(&self) -> UpdateUserInput {
@@ -283,64 +251,36 @@ impl LinkLoginOperation {
     }
 }
 
-impl EffectOperation for LinkLoginOperation {
+type LinkTurn = Result<Next<User>, LinkLoginError>;
+
+impl Operation for LinkLoginOperation {
     type Output = User;
     type Error = LinkLoginError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> LinkTurn {
         let config = &self.config;
         let auth = &config.auth_context;
         if !fresh_local(auth, config.auth_time, config.now) {
-            return self.finish(Err(LinkLoginError::LocalRefused));
+            return Err(LinkLoginError::LocalRefused);
         }
-        let checked = check_confirmation(
+        check_confirmation(
             &config.confirmation,
             &auth.realm_id,
             &auth.user_id,
             config.now,
-        );
-        if let Err(error) = checked {
-            return self.finish(Err(error.into()));
-        }
-        let mut update = Box::new(UpdateUserOperation::new(self.input()));
-        let effects = update.start();
-        self.state = LinkState::Update(update);
-        effects
+        )?;
+        let update = UpdateUserOperation::new(self.input());
+        Ok(Next::Call(IoCall::child(update)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.state, LinkState::Done) {
-            LinkState::Update(mut update) => {
-                let effects = update.step(event);
-                if !update.is_complete() {
-                    self.state = LinkState::Update(update);
-                    return effects;
-                }
-                // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
-                self.finish((*update).finalize().map_err(link_error));
-                effects
-            }
-            LinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
-        }
+    fn next(&mut self, result: IoResult) -> LinkTurn {
+        // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
+        let user = result.child::<User, UpdateUserError>()?.map_err(link_error)?;
+        Ok(Next::Done(user))
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LinkLoginError::NotFinished))
-    }
-
-    fn is_conflict(error: &Self::Error) -> bool {
+    fn is_conflict(error: &LinkLoginError) -> bool {
         lost_conflict(error)
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.state {
-            LinkState::Update(update) => update.abort(),
-            LinkState::Done => smallvec![],
-        }
     }
 }
 
@@ -354,12 +294,11 @@ pub struct UnlinkLoginConfig {
 }
 
 #[derive(Debug, PartialEq)]
-enum UnlinkState {
+enum UnlinkPhase {
     Read,
     Authorize,
-    Cutoff(Box<RevokeTokenOperation>),
-    Update(Box<UpdateUserOperation>),
-    Done,
+    Cutoff,
+    Update,
 }
 
 /// Removes a linked login: the owner or a realm administrator first records the credential
@@ -367,32 +306,20 @@ enum UnlinkState {
 #[derive(Debug, PartialEq)]
 pub struct UnlinkLoginOperation {
     config: UnlinkLoginConfig,
-    state: UnlinkState,
-    output: Option<Result<User, LinkLoginError>>,
+    phase: UnlinkPhase,
 }
 
 impl UnlinkLoginOperation {
     pub fn new(config: UnlinkLoginConfig) -> Self {
         Self {
             config,
-            state: UnlinkState::Read,
-            output: None,
+            phase: UnlinkPhase::Read,
         }
     }
 
-    fn finish(&mut self, result: Result<User, LinkLoginError>) -> Effects {
-        self.state = UnlinkState::Done;
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn linked(&self, event: Event) -> Result<(), LinkLoginError> {
-        let values = batch_values(event)?;
-        let user = values
-            .first()
-            .and_then(Option::as_ref)
-            .map(|bytes| User::from_bytes(bytes))
-            .transpose()?;
+    fn linked(&self, result: IoResult) -> Result<(), LinkLoginError> {
+        let [user] = values::<1>(result)?;
+        let user = user.map(|bytes| User::from_bytes(&bytes)).transpose()?;
         let alias = self.config.alias;
         if !user.is_some_and(|user| user.alias_user_ids.contains(&alias))
             || alias.realm_id == self.config.user_id.realm_id
@@ -402,26 +329,25 @@ impl UnlinkLoginOperation {
         Ok(())
     }
 
-    fn cutoff(&mut self) -> Effects {
+    fn cutoff(&mut self) -> LinkTurn {
         let config = &self.config;
         // The grace also cuts off sessions another node mints before the cutoff reaches it.
         let cutoff = config.now.saturating_add(REVOCATION_GRACE_SECS);
-        let mut revoke = Box::new(RevokeTokenOperation::new(RevokeTokenConfig {
+        let revoke = RevokeTokenOperation::new(RevokeTokenConfig {
             actor: config.actor.clone(),
             token_hash: user_cutoff_hash(&config.alias),
             expires_at: user_cutoff_expiry(cutoff),
             token_owner: config.alias,
             admission: RevokeTokenAdmission::Privileged,
             now: config.now,
-        }));
-        let effects = revoke.start();
-        self.state = UnlinkState::Cutoff(revoke);
-        effects
+        });
+        self.phase = UnlinkPhase::Cutoff;
+        Ok(Next::Call(IoCall::child(revoke)))
     }
 
-    fn update(&mut self) -> Effects {
+    fn update(&mut self) -> LinkTurn {
         let config = &self.config;
-        let mut update = Box::new(UpdateUserOperation::new(UpdateUserInput {
+        let update = UpdateUserOperation::new(UpdateUserInput {
             actor: config.actor.clone(),
             auth_context: config.auth_context.clone(),
             self_realm_id: config.actor.realm_id,
@@ -432,116 +358,63 @@ impl UnlinkLoginOperation {
             system: true,
             alias: Some(AliasChange::Remove(config.alias)),
             subject: None,
-        }));
-        let effects = update.start();
-        self.state = UnlinkState::Update(update);
-        effects
+        });
+        self.phase = UnlinkPhase::Update;
+        Ok(Next::Call(IoCall::child(update)))
     }
 }
 
-impl EffectOperation for UnlinkLoginOperation {
+impl Operation for UnlinkLoginOperation {
     type Output = User;
     type Error = LinkLoginError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> LinkTurn {
         let config = &self.config;
         let caller = config.auth_context.user_id;
         if caller.realm_id != config.actor.realm_id
             || config.user_id.realm_id != config.actor.realm_id
             || config.auth_context.path_restrictions.is_some()
         {
-            return self.finish(Err(LinkLoginError::Unauthorized));
+            return Err(LinkLoginError::Unauthorized);
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![user_read(&config.user_id)],
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Read(vec![user_read(&config.user_id)])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.state, UnlinkState::Done) {
-            UnlinkState::Read => {
-                if let Err(error) = self.linked(event) {
-                    return self.finish(Err(error));
-                }
+    fn next(&mut self, result: IoResult) -> LinkTurn {
+        match self.phase {
+            UnlinkPhase::Read => {
+                self.linked(result)?;
                 if self.config.auth_context.user_id == self.config.user_id {
                     return self.cutoff();
                 }
                 let realm_id = self.config.actor.realm_id;
-                self.state = UnlinkState::Authorize;
-                smallvec![Effect::SubOperation(boxed_suboperation(
-                    CheckPermissionsOperation::new(CheckPermissionsConfig {
-                        auth_context: self.config.auth_context.clone(),
-                        path: format!("/{realm_id}/admin/u/{}", self.config.user_id),
-                        required_permission: Permission::WRITE,
-                    }),
-                    |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                        allowed
-                    }),
-                ))]
+                self.phase = UnlinkPhase::Authorize;
+                let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: self.config.auth_context.clone(),
+                    path: format!("/{realm_id}/admin/u/{}", self.config.user_id),
+                    required_permission: Permission::WRITE,
+                });
+                Ok(Next::Call(IoCall::child(check)))
             }
-            UnlinkState::Authorize => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                    allowed: Ok(true),
-                }) => self.cutoff(),
-                Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                    allowed: Err(error),
-                }) => self.finish(Err(error.into())),
-                Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                    allowed: Ok(false),
-                }) => self.finish(Err(LinkLoginError::Unauthorized)),
-                _ => self.finish(Err(LinkLoginError::UnexpectedEvent)),
+            UnlinkPhase::Authorize => match result.child::<bool, AuthorizationError>()? {
+                Ok(true) => self.cutoff(),
+                Ok(false) => Err(LinkLoginError::Unauthorized),
+                Err(error) => Err(error.into()),
             },
-            UnlinkState::Cutoff(mut revoke) => {
-                let effects = revoke.step(event);
-                if !revoke.is_complete() {
-                    self.state = UnlinkState::Cutoff(revoke);
-                    return effects;
-                }
-                match revoke.finalize() {
-                    Ok(_) => {
-                        let mut next = effects;
-                        next.extend(self.update());
-                        next
-                    }
-                    Err(error) => {
-                        self.finish(Err(error.into()));
-                        effects
-                    }
-                }
+            UnlinkPhase::Cutoff => {
+                result.child::<RealmConfigDocument, RevokeTokenError>()??;
+                self.update()
             }
-            UnlinkState::Update(mut update) => {
-                let effects = update.step(event);
-                if !update.is_complete() {
-                    self.state = UnlinkState::Update(update);
-                    return effects;
-                }
+            UnlinkPhase::Update => {
                 // A lost commit conflict ends the run; the runner reruns it so ownership is reread.
-                self.finish((*update).finalize().map_err(link_error));
-                effects
+                let user = result.child::<User, UpdateUserError>()?.map_err(link_error)?;
+                Ok(Next::Done(user))
             }
-            UnlinkState::Done => self.finish(Err(LinkLoginError::UnexpectedEvent)),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(LinkLoginError::NotFinished))
-    }
-
-    fn is_conflict(error: &Self::Error) -> bool {
+    fn is_conflict(error: &LinkLoginError) -> bool {
         lost_conflict(error)
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.state {
-            UnlinkState::Cutoff(revoke) => revoke.abort(),
-            UnlinkState::Update(update) => update.abort(),
-            _ => smallvec![],
-        }
     }
 }
 
@@ -549,6 +422,12 @@ impl EffectOperation for UnlinkLoginOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::EffectOperation;
+    use aruna_core::types::Effects;
+    use smallvec::smallvec;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
     };
@@ -734,8 +613,7 @@ mod tests {
             assert_eq!(stale.first(), Err(LinkLoginError::LocalRefused));
             let mut linking = link(local(2), confirmation(now), now);
             linking.config.auth_time = auth_time;
-            assert!(linking.start().is_empty());
-            assert_eq!(linking.finalize(), Err(LinkLoginError::LocalRefused));
+            assert_eq!(linking.first(), Err(LinkLoginError::LocalRefused));
         }
         let mut api = confirm(local(2), Some(now), now);
         api.config.auth_context = session(local(2), SessionKind::Api);
@@ -743,19 +621,9 @@ mod tests {
     }
 
     #[test]
-    fn late_events_rejected() {
-        // Decided operations refuse every further event, and so does an unrelated answer.
+    fn unlink_needs_admin() {
+        // Another caller unlinks only with write access to the account; a refusal ends the run.
         let now = 10_000;
-        let event = || {
-            Event::Storage(StorageEvent::TransactionAborted {
-                txn_id: Ulid::nil(),
-            })
-        };
-        let mut linking = link(local(2), confirmation(now), now);
-        linking.config.auth_time = None;
-        linking.start();
-        linking.step(event());
-        assert_eq!(linking.finalize(), Err(LinkLoginError::UnexpectedEvent));
         let unlink = || {
             UnlinkLoginOperation::new(UnlinkLoginConfig {
                 actor: actor(local(3)),
@@ -765,14 +633,23 @@ mod tests {
                 now,
             })
         };
-        let mut authorizing = unlink();
-        authorizing.state = UnlinkState::Authorize;
-        authorizing.step(event());
-        assert_eq!(authorizing.finalize(), Err(LinkLoginError::UnexpectedEvent));
-        let mut done = unlink();
-        done.state = UnlinkState::Done;
-        done.step(event());
-        assert_eq!(done.finalize(), Err(LinkLoginError::UnexpectedEvent));
+        let answer = |allowed: Result<bool, AuthorizationError>| {
+            let mut operation = unlink();
+            operation.phase = UnlinkPhase::Authorize;
+            operation.next(IoResult::Child(ChildOutcome::new(allowed)))
+        };
+        assert_eq!(answer(Ok(false)), Err(LinkLoginError::Unauthorized));
+        let allowed = answer(Ok(true));
+        assert!(matches!(allowed, Ok(Next::Call(IoCall::Child(_)))));
+        let mut unread = unlink();
+        assert_eq!(
+            unread.first(),
+            Ok(Next::Call(IoCall::Read(vec![user_read(&local(2))])))
+        );
+        assert_eq!(
+            unread.next(IoResult::Values(vec![None])),
+            Err(LinkLoginError::NotLinked)
+        );
     }
 
     fn confirmation(now: u64) -> Signed<LinkConfirmation> {
@@ -870,25 +747,25 @@ mod tests {
         assert_eq!(linked, Err(LinkLoginError::CutOff));
     }
 
-    /// Commits `write` outside the link's transaction right after its first read inside it.
+    /// Commits `write` outside the link's user update right after its first read inside it.
     #[derive(Debug, PartialEq)]
     struct Racing {
-        link: LinkLoginOperation,
+        update: UpdateUserOperation,
         write: Option<StorageEffect>,
         held: Option<Event>,
     }
 
     impl EffectOperation for Racing {
         type Output = User;
-        type Error = LinkLoginError;
+        type Error = UpdateUserError;
 
         fn start(&mut self) -> Effects {
-            self.link.start()
+            self.update.start()
         }
 
         fn step(&mut self, event: Event) -> Effects {
             if let Some(held) = self.held.take() {
-                return self.link.step(held);
+                return self.update.step(held);
             }
             if matches!(event, Event::Storage(StorageEvent::BatchReadResult { .. }))
                 && let Some(write) = self.write.take()
@@ -896,19 +773,19 @@ mod tests {
                 self.held = Some(event);
                 return smallvec![Effect::Storage(write)];
             }
-            self.link.step(event)
+            self.update.step(event)
         }
 
         fn is_complete(&self) -> bool {
-            self.link.is_complete()
+            self.update.is_complete()
         }
 
-        fn finalize(self) -> Result<User, LinkLoginError> {
-            self.link.finalize()
+        fn finalize(self) -> Result<User, UpdateUserError> {
+            self.update.finalize()
         }
 
         fn abort(&mut self) -> Effects {
-            self.link.abort()
+            self.update.abort()
         }
     }
 
@@ -922,7 +799,7 @@ mod tests {
             .unwrap();
         let (key_space, key, value) = cutoff_config(&context, now).await;
         let racing = Racing {
-            link: link(local(2), confirmation, now),
+            update: UpdateUserOperation::new(link(local(2), confirmation, now).input()),
             write: Some(StorageEffect::Write {
                 key_space,
                 key: key.into(),
@@ -931,7 +808,8 @@ mod tests {
             }),
             held: None,
         };
-        assert_eq!(drive(racing, &context).await, Err(LinkLoginError::CutOff));
+        let linked = drive(racing, &context).await.map_err(link_error);
+        assert_eq!(linked, Err(LinkLoginError::CutOff));
         let row = crate::jobs::key_wake::read_row(
             &context.storage_handle,
             USER_KEYSPACE,

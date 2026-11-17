@@ -30,7 +30,6 @@ use aruna_core::structs::storage::usage::{
     RebuildProgress, USAGE_PROGRESS_KEY, UsageCounterError, UsageCounters,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
