@@ -59,11 +59,6 @@ pub(crate) async fn dispatch_effect_until(
             blob::dispatch_local_file(local_file_effect, context).await
         }
         Effect::Storage(storage_effect) => storage::dispatch_storage(storage_effect, context).await,
-        // Job-control routing runs its frame I/O here, where the runner holds
-        // the context; the net crate never sees this effect.
-        Effect::Net(NetEffect::JobControl(job_control)) => {
-            Box::pin(net::dispatch_job_control(*job_control, context)).await
-        }
         // Audit fan-out runs its frame I/O here for the same reason.
         Effect::Net(NetEffect::AuditPage(audit)) => {
             Box::pin(audit::dispatch_audit_page(*audit, context, deadline)).await
