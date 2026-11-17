@@ -931,6 +931,15 @@ mod tests {
         SubmitJobOperation::new(spec, job_id)
     }
 
+    // An event before `start` is refused instead of starting the submission.
+    #[test]
+    fn rejects_unstarted_event() {
+        use aruna_core::operation_check::{rejects_events, sample_events};
+        let fresh = || operation(spec(None));
+        let refusals = rejects_events(fresh, sample_events, |_| false);
+        assert_eq!(refusals.len(), sample_events().len());
+    }
+
     fn spec(dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
         SubmitJobSpec {
             payload: JobPayload::Probe {

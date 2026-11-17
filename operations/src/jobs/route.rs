@@ -213,6 +213,38 @@ mod pure_tests {
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use ulid::Ulid;
 
+    // An event before `start`, or after the route settled, is refused.
+    #[test]
+    fn rejects_unsent_events() {
+        let route = || {
+            JobRouteOperation::new(
+                RealmId([1u8; 32]),
+                node(1),
+                JobId::from_bytes([1u8; 16]),
+                None,
+            )
+        };
+        let empty = || {
+            Event::Storage(StorageEvent::ReadResult {
+                key: Vec::<u8>::new().into(),
+                value: None,
+            })
+        };
+        let unexpected = |result: Result<JobRouteOutcome, JobRouteError>| matches!(result, Err(JobRouteError::Unavailable(message)) if message.contains("unexpected"));
+
+        let mut early = route();
+        early.step(empty());
+        assert!(early.is_complete());
+        assert!(unexpected(early.finalize()));
+
+        let mut settled = route();
+        settled.start();
+        settled.step(empty());
+        assert!(settled.is_complete());
+        settled.step(empty());
+        assert!(unexpected(settled.finalize()));
+    }
+
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
