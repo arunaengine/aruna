@@ -473,8 +473,7 @@ async fn fill(
         acquired.metrics.clone(),
         acquired.readiness.clone(),
         acquired.recovery.clone(),
-    )
-    .await;
+    );
     acquired.monitoring = Some(ops_state.clone());
     let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
     let bound = ops_listener.local_addr()?;

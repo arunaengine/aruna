@@ -47,6 +47,7 @@ cel-interpreter = { workspace = true }
 globset = { workspace = true }
 opentelemetry = { workspace = true }
 oxrdf = { workspace = true }
+parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }

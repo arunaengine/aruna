@@ -598,6 +598,7 @@ dependencies = [
  "nix",
  "opentelemetry",
  "oxrdf",
+ "parking_lot",
  "pbkdf2 0.13.0",
  "percent-encoding",
  "postcard",

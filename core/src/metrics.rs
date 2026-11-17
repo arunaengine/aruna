@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use parking_lot::RwLock;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
@@ -12,7 +13,6 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Metric, Registry, Unit};
-use tokio::sync::RwLock;
 
 /// Exponential request-duration buckets in seconds, spanning ~1 ms to 60 s.
 pub const DURATION_BUCKETS_SECONDS: [f64; 15] = [
@@ -121,21 +121,17 @@ impl NotificationWatchMetrics {
             .inc();
     }
 
-    pub async fn register(&self, metrics: &NodeMetrics) {
-        metrics
-            .register(
-                "notification_watch_creation_denials",
-                "Notification watch creation denials",
-                self.creation_denials.clone(),
-            )
-            .await;
-        metrics
-            .register(
-                "notification_watch_delivery_suppressions",
-                "Notification watch delivery suppressions",
-                self.delivery_suppressions.clone(),
-            )
-            .await;
+    pub fn register(&self, metrics: &NodeMetrics) {
+        metrics.register(
+            "notification_watch_creation_denials",
+            "Notification watch creation denials",
+            self.creation_denials.clone(),
+        );
+        metrics.register(
+            "notification_watch_delivery_suppressions",
+            "Notification watch delivery suppressions",
+            self.delivery_suppressions.clone(),
+        );
     }
 }
 
@@ -201,41 +197,30 @@ impl NodeMetrics {
     }
 
     /// Late-register a metric into the node registry (used by feature branches).
-    pub async fn register(&self, name: &str, help: &str, metric: impl Metric) {
+    pub fn register(&self, name: &str, help: &str, metric: impl Metric) {
         self.registry
             .write()
-            .await
             .register(name.to_string(), help.to_string(), metric);
     }
 
     /// Late-register a metric carrying a unit suffix (e.g. `_seconds`).
-    pub async fn register_with_unit(
-        &self,
-        name: &str,
-        help: &str,
-        unit: Unit,
-        metric: impl Metric,
-    ) {
-        self.registry.write().await.register_with_unit(
-            name.to_string(),
-            help.to_string(),
-            unit,
-            metric,
-        );
+    pub fn register_with_unit(&self, name: &str, help: &str, unit: Unit, metric: impl Metric) {
+        self.registry
+            .write()
+            .register_with_unit(name.to_string(), help.to_string(), unit, metric);
     }
 
     /// Register a scrape-time [`Collector`] that emits its metrics synchronously
     /// on each encode (used for const counters read from a live snapshot).
-    pub async fn register_collector(&self, collector: impl Collector) {
+    pub fn register_collector(&self, collector: impl Collector) {
         self.registry
             .write()
-            .await
             .register_collector(Box::new(collector));
     }
 
     /// Encodes the registry as Prometheus text.
-    pub async fn render(&self) -> String {
-        let registry = self.registry.read().await;
+    pub fn render(&self) -> String {
+        let registry = self.registry.read();
         let mut buffer = String::new();
         encode(&mut buffer, &registry)
             .expect("encoding prometheus metrics into a String is infallible");
@@ -259,8 +244,8 @@ impl std::fmt::Debug for NodeMetrics {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn render_includes_metrics() {
+    #[test]
+    fn render_includes_metrics() {
         let metrics = NodeMetrics::new();
         metrics
             .http_requests
@@ -280,7 +265,7 @@ mod tests {
             })
             .observe(0.05);
 
-        let body = metrics.render().await;
+        let body = metrics.render();
         assert!(
             body.contains(
                 "aruna_http_requests_total{interface=\"rest\",method=\"GET\",code=\"200\"} 1"
@@ -302,38 +287,36 @@ mod tests {
         assert_eq!(method_label("get"), "other");
     }
 
-    #[tokio::test]
-    async fn node_started_flag() {
+    #[test]
+    fn node_started_flag() {
         let metrics = NodeMetrics::new();
-        assert!(metrics.render().await.contains("aruna_node_started 0"));
+        assert!(metrics.render().contains("aruna_node_started 0"));
         metrics.set_node_started(true);
-        assert!(metrics.render().await.contains("aruna_node_started 1"));
+        assert!(metrics.render().contains("aruna_node_started 1"));
     }
 
-    #[tokio::test]
-    async fn late_registration_rendered() {
+    #[test]
+    fn late_registration_rendered() {
         let metrics = NodeMetrics::new();
         let gauge: Gauge = Gauge::default();
         gauge.set(7);
-        metrics
-            .register("custom_gauge", "late", gauge.clone())
-            .await;
-        assert!(metrics.render().await.contains("aruna_custom_gauge 7"));
+        metrics.register("custom_gauge", "late", gauge.clone());
+        assert!(metrics.render().contains("aruna_custom_gauge 7"));
     }
 
-    #[tokio::test]
-    async fn notification_watch_labels() {
+    #[test]
+    fn notification_watch_labels() {
         assert_eq!(
             WatchMetricReason::parse("token_revoked"),
             Some(WatchMetricReason::TokenRevoked)
         );
         let metrics = NodeMetrics::new();
         let watch_metrics = NotificationWatchMetrics::default();
-        watch_metrics.register(&metrics).await;
+        watch_metrics.register(&metrics);
         watch_metrics.record_creation_denial(WatchMetricReason::PermissionDenied);
         watch_metrics.record_delivery_suppression(WatchMetricReason::TokenRestricted);
 
-        let body = metrics.render().await;
+        let body = metrics.render();
         assert!(body.contains(
             "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
         ));
