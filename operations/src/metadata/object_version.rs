@@ -182,3 +182,190 @@ impl Operation for ObjectVersionOperation {
         smallvec![]
     }
 }
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use std::time::SystemTime;
+
+    const BUCKET: &str = "bucket";
+    const KEY: &str = "a.txt";
+
+    fn version_id() -> Ulid {
+        Ulid::from_bytes([7; 16])
+    }
+
+    fn version() -> BlobVersion {
+        BlobVersion::deleted(SystemTime::UNIX_EPOCH, Default::default())
+    }
+
+    fn head_effect() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: BlobHeadKey::new(BUCKET, KEY).to_bytes().unwrap().into(),
+            txn_id: None,
+        })
+    }
+
+    fn version_effect() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: VersionKey::new(BUCKET, KEY, version_id())
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        })
+    }
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: value.map(Into::into),
+        })
+    }
+
+    fn head_bytes() -> Vec<u8> {
+        CurrentVersionPointer::new(version_id()).to_bytes().unwrap()
+    }
+
+    fn by_head() -> ObjectVersionOperation {
+        ObjectVersionOperation::new(BUCKET, KEY, None)
+    }
+
+    #[test]
+    fn reads_head_version() {
+        let mut operation = by_head();
+        check_trace(
+            &mut operation,
+            &[head_effect()],
+            vec![
+                (read(Some(head_bytes())), vec![version_effect()]),
+                (read(Some(version().to_bytes().unwrap())), vec![]),
+            ],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok(ObjectVersion {
+                version_id: Some(version_id()),
+                version: Some(version()),
+            })
+        );
+    }
+
+    #[test]
+    fn skips_given_head() {
+        // A named version that is not stored resolves to its id without a record.
+        let mut operation = ObjectVersionOperation::new(BUCKET, KEY, Some(version_id()));
+        check_trace(
+            &mut operation,
+            &[version_effect()],
+            vec![(read(None), vec![])],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok(ObjectVersion {
+                version_id: Some(version_id()),
+                version: None,
+            })
+        );
+    }
+
+    #[test]
+    fn missing_head_empty() {
+        let mut operation = by_head();
+        check_trace(&mut operation, &[head_effect()], vec![(read(None), vec![])]);
+        assert_eq!(
+            operation.finalize(),
+            Ok(ObjectVersion {
+                version_id: None,
+                version: None,
+            })
+        );
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let error = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        let mut at_head = by_head();
+        at_head.start();
+        let mut at_version = by_head();
+        at_version.start();
+        at_version.step(read(Some(head_bytes())));
+        for mut operation in [at_head, at_version] {
+            assert!(operation.step(error()).is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(ObjectVersionError::Storage(StorageError::Timeout))
+            );
+        }
+    }
+
+    #[test]
+    fn broken_rows_fail() {
+        let mut bad_head = by_head();
+        bad_head.start();
+        bad_head.step(read(Some(vec![0xff])));
+        assert!(matches!(
+            bad_head.finalize(),
+            Err(ObjectVersionError::Decode(_))
+        ));
+
+        let mut bad_version = by_head();
+        bad_version.start();
+        bad_version.step(read(Some(head_bytes())));
+        bad_version.step(read(Some(vec![0xff])));
+        assert!(matches!(
+            bad_version.finalize(),
+            Err(ObjectVersionError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let reading = || {
+            let mut operation = by_head();
+            operation.start();
+            operation
+        };
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(reading, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, ObjectVersionError::UnexpectedEvent { .. }));
+        }
+        let mut idle = by_head();
+        idle.step(read(None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(ObjectVersionError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = by_head();
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(by_head());
+        let mut reading = by_head();
+        reading.start();
+        rejects_finalize(reading);
+    }
+}
