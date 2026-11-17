@@ -15,9 +15,21 @@ pub fn capped_backoff(base: Duration, cap: Duration, attempt: u32, seed: u64) ->
     }
 }
 
+/// The wait before rerun `attempt` after a transaction conflict: 25 ms doubled per attempt up
+/// to 250 ms, with jitter from the first 8 bytes of `seed`, so writers that conflict on one
+/// record spread out and the winner can commit.
+pub fn conflict_backoff(attempt: usize, seed: &[u8]) -> Duration {
+    let mut head = [0u8; 8];
+    let used = seed.len().min(head.len());
+    head[..used].copy_from_slice(&seed[..used]);
+    let attempt = u32::try_from(attempt).unwrap_or(u32::MAX);
+    let (base, cap) = (Duration::from_millis(25), Duration::from_millis(250));
+    capped_backoff(base, cap, attempt, u64::from_le_bytes(head))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::capped_backoff;
+    use super::{capped_backoff, conflict_backoff};
     use std::time::Duration;
 
     const BASE: Duration = Duration::from_millis(250);
@@ -51,5 +63,16 @@ mod tests {
             "jitter stays below the delay: {first:?}"
         );
         assert_eq!(capped_backoff(base, cap, 0, 0), base, "seed 0 adds nothing");
+    }
+
+    #[test]
+    fn conflict_backoff_jitters() {
+        // Backoff is deterministic per seed and stays within [base, 2*base).
+        let seed = [7u8; 16];
+        let first = conflict_backoff(0, &seed);
+        assert_eq!(first, conflict_backoff(0, &seed));
+        let millis = first.as_millis();
+        assert!((25..50).contains(&millis), "jittered first wait: {millis}");
+        assert_eq!(conflict_backoff(0, &[]), Duration::from_millis(25));
     }
 }

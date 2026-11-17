@@ -41,7 +41,7 @@ pub enum InspectDraftError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -74,7 +74,7 @@ impl Operation for InspectDraftOperation {
 
         match self.state.clone() {
             InspectDraftState::ReadEntry => {
-                let got = format!("{event:?}");
+                let got = event.label();
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return fail(
                         self,

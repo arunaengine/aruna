@@ -66,7 +66,7 @@ pub enum MarkReadError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("mark read did not finish")]
     NotFinished,
@@ -104,7 +104,7 @@ impl MarkReadOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(MarkReadError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -131,7 +131,7 @@ impl MarkReadOperation {
     }
 
     fn handle_scan(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::IterResult {
             values,
             next_start_after,
@@ -210,7 +210,7 @@ impl MarkReadOperation {
     }
 
     fn handle_write(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchWriteResult)", got);
         };

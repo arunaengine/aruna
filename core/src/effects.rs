@@ -52,6 +52,29 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+    /// Independent effects the runner runs at the same time; never persisted.
+    Group(EffectGroup),
+}
+
+/// Independent effects or sub operations the runner runs at the same time, at most `limit` at
+/// once (0 counts as 1). Storage transaction effects and nested groups are refused as members.
+#[derive(Debug, PartialEq)]
+pub struct EffectGroup {
+    pub members: Vec<Effect>,
+    pub limit: usize,
+    pub form: GroupForm,
+}
+
+/// How the results of an [`EffectGroup`] come back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupForm {
+    /// One `GroupEvent::Finished` with every result in emission order. A member that has not
+    /// finished `deadline` after the group started reports `GroupResult::Unfinished`.
+    All { deadline: Option<Duration> },
+    /// Each result comes back as its own `GroupEvent::Member` as soon as it finishes. Effects
+    /// the operation returns while the window is open join it as new members, and
+    /// `GroupEvent::Closed` follows once no member runs or waits.
+    Window,
 }
 
 #[derive(Debug, PartialEq)]

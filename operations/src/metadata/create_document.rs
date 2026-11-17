@@ -53,7 +53,7 @@ use crate::placement::{
     resolve_shard_holders, strategy_for_target,
 };
 use crate::sync::shard_placement::sort_node_ids;
-use crate::tasks::queue_backoff::conflict_backoff;
+use aruna_core::backoff::conflict_backoff;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
 
 #[derive(Debug, Clone, PartialEq)]
