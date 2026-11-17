@@ -775,6 +775,8 @@ pub enum NetEffect {
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
     StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
+    /// Signs one job record of an execution; only a claim naming this node as publisher.
+    ExecutionSign(Box<crate::structs::execution::job::ExecutionClaim>),
     /// Reads a release crate version or asks a range holder about releases.
     Release(Box<crate::structs::storage::release::ReleaseEffect>),
     /// Sends one plugin artifact chunk to a management node; answers `NetEvent::ArtifactStored`.

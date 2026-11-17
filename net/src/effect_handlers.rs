@@ -11,10 +11,11 @@ use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
-    DhtEntry, DhtEvent, JobControlEvent, MetadataAnswer, NetEvent, PeerRequestError,
-    SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer, NetEvent,
+    PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::structs::execution::job::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
 use aruna_core::structs::storage::distribution::{SignedSnapshot, SignedStatement, StatementClaim};
@@ -237,6 +238,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::StatementSign(claim) => {
             NetEvent::StatementSign(sign_statement(&ctx.secret_key, *claim))
         }
+        NetEffect::ExecutionSign(claim) => {
+            NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
+        }
         NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
         NetEffect::ArtifactStore(_) => NetEvent::ArtifactStored(Err(
             "artifact copies must be dispatched by the operations runner".to_string(),
@@ -291,6 +295,19 @@ pub(crate) fn sign_statement(key: &iroh::SecretKey, claim: StatementClaim) -> St
         signer: claim.signer,
         statement: claim.statement,
     }))
+}
+
+/// Signs a job record with this node's key, only when the claim names this node as publisher.
+pub(crate) fn sign_execution(key: &iroh::SecretKey, claim: ExecutionClaim) -> ExecutionSignEvent {
+    if claim.publisher != key.public() {
+        return ExecutionSignEvent::Unavailable("record names another publisher".to_string());
+    }
+    match JobRecordEnvelope::signed_with(claim.realm_id, claim.record, claim.publisher, |bytes| {
+        key.sign(bytes)
+    }) {
+        Ok(envelope) => ExecutionSignEvent::Signed(Box::new(envelope)),
+        Err(error) => ExecutionSignEvent::Unavailable(error.to_string()),
+    }
 }
 
 fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
@@ -561,6 +578,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
+        NetEffect::ExecutionSign(_) => "execution_sign",
         NetEffect::Release(_) => "release",
         NetEffect::ArtifactStore(_) => "artifact_store",
         NetEffect::MetadataRequest(_) => "metadata_request",
@@ -587,6 +605,39 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Only a record naming this node as publisher is signed, and its signature verifies.
+    #[test]
+    fn signs_own_execution() {
+        use aruna_core::structs::execution::job::{
+            ExecutionUpdate, JobFamilyRecord, PhysicalExecutionState, SubmissionId,
+        };
+        let key = iroh::SecretKey::from_bytes(&[3; 32]);
+        let claim = |publisher| ExecutionClaim {
+            realm_id: RealmId::from_bytes([1; 32]),
+            record: JobFamilyRecord::Update(Box::new(ExecutionUpdate {
+                execution_id: ulid::Ulid::from_bytes([5; 16]),
+                submission_id: SubmissionId([6; 32]),
+                request_digest: [7; 32],
+                executor_node_id: key.public(),
+                sequence: 0,
+                previous_digest: [8; 32],
+                state: PhysicalExecutionState::Running,
+                observed_at_ms: 1,
+                result: None,
+            })),
+            publisher,
+        };
+        let ExecutionSignEvent::Signed(envelope) = sign_execution(&key, claim(key.public())) else {
+            panic!("a record of this node is signed");
+        };
+        assert!(envelope.verify_signature().is_ok());
+        let other = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        assert!(matches!(
+            sign_execution(&key, claim(other)),
+            ExecutionSignEvent::Unavailable(_)
+        ));
+    }
     use crate::test_support::make_repeated_node;
     use aruna_core::audit::MAX_AUDIT_PEERS;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
