@@ -2,17 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::child_call;
 use crate::connectors::{ResolveConnectorInput, resolve_connector_effect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::types::{Effects, GroupId};
+use aruna_core::types::GroupId;
 use bytes::Bytes;
-use smallvec::smallvec;
 use std::ops::Range;
 use thiserror::Error;
 use ulid::Ulid;
@@ -34,157 +35,80 @@ pub struct ReadSourceResult {
     pub stream: BackendStream<Result<Bytes, StreamError>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ReadSourceState {
-    Init,
-    ResolveConnector,
-    ReadSource,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum ReadSourceError {
+    #[error(transparent)]
+    Io(#[from] IoError),
     #[error(transparent)]
     Resolve(#[from] SourceResolutionError),
     #[error(transparent)]
     Staging(#[from] StagingSourceError),
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: ReadSourceState,
-        expected: &'static str,
-        got: &'static str,
-    },
-    #[error("Read staging source failed")]
-    ReadSourceFailed,
+    #[error("unexpected staging answer {0}")]
+    UnexpectedEvent(&'static str),
 }
 
+/// Resolves the connector, then opens the read of the source path.
 #[derive(Debug, PartialEq)]
 pub struct ReadSourceOperation {
     input: ReadSourceInput,
-    state: ReadSourceState,
     connector: Option<SourceConnector>,
-    output: Option<Result<ReadSourceResult, ReadSourceError>>,
 }
 
 impl ReadSourceOperation {
     pub fn new(input: ReadSourceInput) -> Self {
         Self {
             input,
-            state: ReadSourceState::Init,
             connector: None,
-            output: None,
         }
     }
 
-    fn emit_error(&mut self, error: ReadSourceError) -> Effects {
-        self.state = ReadSourceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn emit_unexpected(&mut self, expected: &'static str, event: &Event) -> Effects {
-        self.emit_error(ReadSourceError::UnexpectedEvent {
-            state: self.state.clone(),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = ReadSourceState::ResolveConnector;
-        smallvec![resolve_connector_effect(ResolveConnectorInput {
-            group_id: self.input.group_id,
-            connector_id: self.input.connector_id,
-            source_path: self.input.source_path.clone(),
-            allow_root: false,
-        })]
-    }
-
-    fn handle_resolved_connector(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) => {
-                match *result {
-                    Ok(resolved) => {
-                        self.connector = Some(resolved.connector);
-                        self.state = ReadSourceState::ReadSource;
-                        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
-                            access: resolved.access,
-                            range: self.input.range.clone(),
-                            expected: self.input.expected.clone(),
-                        })]
-                    }
-                    Err(error) => self.emit_error(error.into()),
-                }
-            }
-            other => self.emit_unexpected(
-                "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                &other,
-            ),
-        }
-    }
-
-    fn handle_read_result(&mut self, event: Event) -> Effects {
-        match event {
-            Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
-                let Some(connector) = self.connector.clone() else {
-                    return self.emit_error(ReadSourceError::ReadSourceFailed);
-                };
-
-                self.state = ReadSourceState::Finish;
-                self.output = Some(Ok(ReadSourceResult {
-                    connector,
-                    metadata,
-                    stream,
-                }));
-                smallvec![]
-            }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.emit_error(error.into())
-            }
-            other => self.emit_unexpected(
-                "Event::StagingSource(StagingSourceEvent::ReadResult)",
-                &other,
-            ),
-        }
+    fn read(&mut self, event: Event) -> Result<IoCall, ReadSourceError> {
+        let Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) = event
+        else {
+            return Err(ReadSourceError::UnexpectedEvent(event.label()));
+        };
+        let resolved = (*result)?;
+        self.connector = Some(resolved.connector);
+        let read = StagingSourceEffect::Read {
+            access: resolved.access,
+            range: self.input.range.clone(),
+            expected: self.input.expected.clone(),
+        };
+        Ok(IoCall::Effect(Box::new(Effect::StagingSource(read))))
     }
 }
 
-impl EffectOperation for ReadSourceOperation {
+impl Operation for ReadSourceOperation {
     type Output = ReadSourceResult;
     type Error = ReadSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<ReadSourceResult>, ReadSourceError> {
+        Ok(Next::Call(child_call(resolve_connector_effect(
+            ResolveConnectorInput {
+                group_id: self.input.group_id,
+                connector_id: self.input.connector_id,
+                source_path: self.input.source_path.clone(),
+                allow_root: false,
+            },
+        ))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ReadSourceState::Init => self.handle_init(),
-            ReadSourceState::ResolveConnector => self.handle_resolved_connector(event),
-            ReadSourceState::ReadSource => self.handle_read_result(event),
-            ReadSourceState::Finish => smallvec![],
-            ReadSourceState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReadSourceState::Finish | ReadSourceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReadSourceState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
+    fn next(&mut self, result: IoResult) -> Result<Next<ReadSourceResult>, ReadSourceError> {
+        let event = result.event()?;
+        let Some(connector) = self.connector.take() else {
+            return Ok(Next::Call(self.read(event)?));
+        };
+        match event {
+            Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                Ok(Next::Done(ReadSourceResult {
+                    connector,
+                    metadata,
+                    stream,
+                }))
             }
-            return Err(ReadSourceError::ReadSourceFailed);
+            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
+            other => Err(ReadSourceError::UnexpectedEvent(other.label())),
         }
-
-        self.output.ok_or(ReadSourceError::ReadSourceFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -192,6 +116,7 @@ impl EffectOperation for ReadSourceOperation {
 mod tests {
     use super::*;
     use crate::driver::drive;
+    use aruna_core::structs::execution::source_access::ResolvedSourceConnector;
     use crate::tests::staging::{
         create_http_connector, sample_connector, sample_resolved_connector, setup_driver_context,
     };
@@ -226,51 +151,52 @@ mod tests {
         ]))
     }
 
-    #[test]
-    fn start_emits_resolve() {
+    fn answer(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn resolved(result: Result<ResolvedSourceConnector, SourceResolutionError>) -> IoResult {
+        answer(Event::SubOperation(
+            SubOperationEvent::SourceConnectorResolved {
+                result: Box::new(result),
+            },
+        ))
+    }
+
+    fn opened() -> ReadSourceOperation {
         let mut operation = ReadSourceOperation::new(sample_input());
-
-        let effects = operation.start();
-
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        assert_eq!(operation.state, ReadSourceState::ResolveConnector);
+        operation.first().unwrap();
+        operation
+            .next(resolved(Ok(sample_resolved_connector())))
+            .unwrap();
+        operation
     }
 
     #[test]
     fn resolved_emits_read() {
         let mut operation = ReadSourceOperation::new(sample_input());
-        operation.start();
-        let resolved = sample_resolved_connector();
-        let expected_access = resolved.access.clone();
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(resolved)),
-            },
-        ));
-
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Read { access, range, expected: None })]
-                if access == &expected_access && range == &Some(5..11)
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert_eq!(operation.state, ReadSourceState::ReadSource);
+        let resolved_connector = sample_resolved_connector();
+        let read = StagingSourceEffect::Read {
+            access: resolved_connector.access.clone(),
+            range: Some(5..11),
+            expected: None,
+        };
+        let call = IoCall::Effect(Box::new(Effect::StagingSource(read)));
+        let effect = operation.next(resolved(Ok(resolved_connector)));
+        assert_eq!(effect, Ok(Next::Call(call)));
     }
 
     #[test]
     fn exposes_resolve_error() {
         let mut operation = ReadSourceOperation::new(sample_input());
-        operation.start();
-
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Err(SourceResolutionError::InvalidSourcePath)),
-            },
-        ));
-
-        assert!(effects.is_empty());
+        operation.first().unwrap();
+        let failed = resolved(Err(SourceResolutionError::InvalidSourcePath));
         assert_eq!(
-            operation.finalize(),
+            operation.next(failed),
             Err(ReadSourceError::Resolve(
                 SourceResolutionError::InvalidSourcePath,
             )),
@@ -279,72 +205,47 @@ mod tests {
 
     #[tokio::test]
     async fn read_finishes_operation() {
-        let mut operation = ReadSourceOperation::new(sample_input());
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(sample_resolved_connector())),
-            },
-        ));
-        let metadata = sample_metadata();
-
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-            metadata: metadata.clone(),
+        let mut operation = opened();
+        let read = answer(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: sample_metadata(),
             stream: sample_stream(),
         }));
-
-        assert!(effects.is_empty());
-        let mut result = operation.finalize().unwrap();
+        let Ok(Next::Done(mut result)) = operation.next(read) else {
+            panic!("expected the read");
+        };
         let first = result.stream.next().await.unwrap().unwrap();
         let second = result.stream.next().await.unwrap().unwrap();
-
         assert_eq!(result.connector, sample_connector());
-        assert_eq!(result.metadata, metadata);
+        assert_eq!(result.metadata, sample_metadata());
         assert_eq!(first, Bytes::from_static(b"hello "));
         assert_eq!(second, Bytes::from_static(b"world"));
     }
 
     #[test]
     fn exposes_staging_error() {
-        let mut operation = ReadSourceOperation::new(sample_input());
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::SourceConnectorResolved {
-                result: Box::new(Ok(sample_resolved_connector())),
-            },
-        ));
-
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
+        let mut operation = opened();
+        let failed = answer(Event::StagingSource(StagingSourceEvent::Error {
             error: StagingSourceError::ReadError("boom".to_string()),
         }));
-
-        assert!(effects.is_empty());
         assert_eq!(
-            operation.finalize(),
+            operation.next(failed),
             Err(ReadSourceError::Staging(StagingSourceError::ReadError(
                 "boom".to_string()
-            ),)),
+            ))),
         );
     }
 
     #[test]
     fn unexpected_describes_event() {
         let mut operation = ReadSourceOperation::new(sample_input());
-        operation.start();
-
-        let effects = operation.step(Event::Task(aruna_core::task::TaskEvent::Error {
+        operation.first().unwrap();
+        let task = answer(Event::Task(aruna_core::task::TaskEvent::Error {
             key: None,
             message: "ignored".to_string(),
         }));
-
-        assert!(effects.is_empty());
         assert_eq!(
-            operation.finalize(),
-            Err(ReadSourceError::UnexpectedEvent {
-                state: ReadSourceState::ResolveConnector,
-                expected: "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
-                got: "TaskEvent::Error",
-            })
+            operation.next(task),
+            Err(ReadSourceError::UnexpectedEvent("TaskEvent::Error"))
         );
     }
 

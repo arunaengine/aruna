@@ -1,26 +1,15 @@
-//! Deactivates plugin accounts that their install no longer names, after a grace period. The
-//! write is guarded so it applies only while the install record still does not name them.
+//! Lists the active plugin accounts for the sweep that deactivates the ones their install no
+//! longer names, after a grace period.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
-
-use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_KEYSPACE};
-use aruna_core::plugin_installs::InstallGuard;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::USER_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::user::User;
-use aruna_core::time::unix_timestamp_secs;
-use aruna_core::{NodeId, UserId};
-use tracing::{info, warn};
-
 use ulid::Ulid;
 
-use super::account::read_row;
-use super::rows::{Answer, Ask, Plan, RowsOperation, StoreError, Turn, unexpected};
-use crate::driver::{DriverContext, drive};
-use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
+use super::rows::{StoreError, page_call, page_of};
 
 /// How long an account stays unnamed before it is deactivated, so a record still on its way
 /// to this node does not cut its account off. Measured in this node's clock.
@@ -28,84 +17,12 @@ pub const ORPHAN_GRACE_MS: u64 = 60 * 60 * 1000;
 /// Users one sweep page reads.
 const PAGE: usize = 1_000;
 
-/// When this node first saw each unnamed account; a restart starts the grace again.
-static SEEN: LazyLock<Mutex<HashMap<UserId, u64>>> = LazyLock::new(Default::default);
-
-/// Deactivates the active plugin accounts the canonical records have not named for the grace
-/// period, as a realm administrator. Returns how many it deactivated.
-pub(crate) async fn sweep_orphans(
-    ctx: &DriverContext,
-    node_id: NodeId,
-    config: &RealmConfigDocument,
-    now_ms: u64,
-) -> Result<usize, String> {
-    let accounts = drive(plugin_accounts(), ctx)
-        .await
-        .map_err(|error| error.0)?;
-    let mut due = Vec::new();
-    {
-        let mut seen = SEEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (install_id, user) in accounts {
-            let named = (config.installs.iter())
-                .any(|install| install.install_id == install_id && install.account == user.user_id);
-            if named {
-                seen.remove(&user.user_id);
-                continue;
-            }
-            let first = *seen.entry(user.user_id).or_insert(now_ms);
-            if now_ms.saturating_sub(first) >= ORPHAN_GRACE_MS {
-                due.push((install_id, user.user_id));
-            }
-        }
-    }
-    if due.is_empty() {
-        return Ok(0);
-    }
-    let Some(admin) = realm_admin(ctx, config).await? else {
-        warn!("No realm administrator to deactivate unnamed plugin accounts with");
-        return Ok(0);
-    };
-    let realm_id = config.realm_id;
-    let mut swept = 0;
-    for (install_id, account) in due {
-        let status = AccountStatusOperation::new(AccountStatusConfig {
-            actor: Actor {
-                node_id,
-                user_id: admin,
-                realm_id,
-            },
-            auth_context: AuthContext {
-                user_id: admin,
-                realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            target: account,
-            active: false,
-            now: unix_timestamp_secs(),
-        })
-        .guarded(InstallGuard::Unnamed {
-            install_id,
-            account,
-        })
-        .by_install();
-        match drive(status, ctx).await {
-            Ok(()) => {
-                info!(%account, %install_id, "Deactivated a plugin account its install no longer names");
-                swept += 1;
-            }
-            Err(error) => warn!(%account, %error, "Could not deactivate an unnamed plugin account"),
-        }
-    }
-    Ok(swept)
-}
-
 /// The active plugin accounts with their install, read a page at a time.
-fn plugin_accounts() -> RowsOperation<PluginAccounts> {
-    RowsOperation::direct(PluginAccounts {
+pub(crate) fn plugin_accounts() -> PluginAccounts {
+    PluginAccounts {
         after: None,
         accounts: Vec::new(),
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -115,28 +32,21 @@ pub struct PluginAccounts {
 }
 
 impl PluginAccounts {
-    fn page(&self) -> Ask {
-        Ask::Page {
-            space: USER_KEYSPACE,
-            prefix: Vec::new(),
-            after: self.after.clone(),
-            limit: PAGE,
-        }
+    fn page(&self) -> IoCall {
+        page_call(USER_KEYSPACE, Vec::new(), self.after.clone(), PAGE)
     }
 }
 
-impl Plan for PluginAccounts {
+impl Operation for PluginAccounts {
     type Output = Vec<(Ulid, User)>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(self.page()))
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.page()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
-        let Answer::Page(rows, next) = answer else {
-            return Err(unexpected(answer));
-        };
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let (rows, next) = page_of(answer)?;
         let users = (rows.iter()).filter_map(|(_, value)| User::from_bytes(value).ok());
         self.accounts.extend(
             users
@@ -146,34 +56,21 @@ impl Plan for PluginAccounts {
         Ok(match next {
             Some(key) => {
                 self.after = Some(key);
-                Turn::Ask(self.page())
+                Next::Call(self.page())
             }
-            None => Turn::Finish(std::mem::take(&mut self.accounts)),
+            None => Next::Done(std::mem::take(&mut self.accounts)),
         })
     }
-}
-
-/// The realm administrator with the smallest id, so every node acts as the same one.
-async fn realm_admin(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-) -> Result<Option<UserId>, String> {
-    let key = config.realm_id.as_bytes().to_vec();
-    let realm = read_row(ctx, AUTH_KEYSPACE, key).await?;
-    let realm = (realm.map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes)))
-        .transpose()
-        .map_err(|error| error.to_string())?;
-    let admins = (realm.iter().flat_map(|realm| realm.roles.values()))
-        .filter(|role| role.name == REALM_ADMIN_ROLE)
-        .flat_map(|role| role.assigned_users.iter().copied());
-    Ok(admins.min())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plugins::install::sweep_orphans;
     use crate::plugins::install::tests::Fixture;
     use crate::plugins::install::{read_config, write_record};
+    use crate::plugins::rows::page_result;
+    use aruna_core::UserId;
 
     #[tokio::test]
     async fn unnamed_accounts() {
@@ -228,19 +125,19 @@ mod tests {
         };
         assert!(matches!(
             plan.first().unwrap(),
-            Turn::Ask(Ask::Page { after: None, .. })
+            Next::Call(IoCall::Page { after: None, .. })
         ));
         let rows = vec![(b"u1".to_vec(), Vec::new())];
-        let Turn::Ask(Ask::Page { after, .. }) =
-            plan.next(Answer::Page(rows, Some(b"u1".to_vec()))).unwrap()
+        let Next::Call(IoCall::Page { after, .. }) =
+            plan.next(page_result(rows, Some(b"u1".to_vec()))).unwrap()
         else {
             panic!("a next key reads the next page");
         };
         assert_eq!(after, Some(b"u1".to_vec()));
-        let Turn::Finish(accounts) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        let Next::Done(accounts) = plan.next(page_result(Vec::new(), None)).unwrap() else {
             panic!("the last page ends the listing");
         };
         assert!(accounts.is_empty());
-        assert!(plan.next(Answer::Done).is_err());
+        assert!(plan.next(IoResult::Done).is_err());
     }
 }

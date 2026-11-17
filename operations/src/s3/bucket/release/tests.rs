@@ -1,4 +1,4 @@
-//! Tests the release membership operation with hand-fed events: pinned versions, access, gone
+//! Tests the release membership operation with hand-fed results: pinned versions, access, gone
 //! or untagged crates, and coordinators asked for the ranges this node does not coordinate.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
@@ -166,13 +167,17 @@ fn rows(pointers: &[(Ulid, &str)]) -> Event {
             )
         })
         .collect();
-    Event::Storage(StorageEvent::IterResult {
-        values,
-        next_start_after: None,
-    })
+    IoResult::Page {
+        rows: values,
+        next: None,
+    }
 }
 
-fn crate_read(label: &str, pinned: &[String]) -> Event {
+fn net(event: NetEvent) -> IoResult {
+    IoResult::Event(Box::new(Event::Net(event)))
+}
+
+fn crate_read(label: &str, pinned: &[String]) -> IoResult {
     let files: Vec<_> = (pinned.iter())
         .map(|id| json!({"@id": id, "@type": "File"}))
         .collect();
@@ -180,17 +185,32 @@ fn crate_read(label: &str, pinned: &[String]) -> Event {
     graph.extend(files);
     let bytes = serde_json::to_vec(&json!({ "@graph": graph })).unwrap();
     let metadata = HashMap::from([(RELEASE_TAG.to_string(), label.to_string())]);
-    Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(Ok(CrateBytes {
+    net(NetEvent::Release(ReleaseEvent::CrateRead(Ok(CrateBytes {
         metadata,
         bytes,
     }))))
 }
 
-fn reads_crate(effects: &Effects) -> bool {
-    matches!(
-        effects.as_slice(),
-        [Effect::Net(NetEffect::Release(effect))] if matches!(**effect, ReleaseEffect::ReadCrate(_))
-    )
+/// The release effect a step asks for, if it asks for one.
+fn release_effect(turn: &Step) -> Option<&ReleaseEffect> {
+    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        return None;
+    };
+    match effect.as_ref() {
+        Effect::Net(NetEffect::Release(effect)) => Some(effect),
+        _ => None,
+    }
+}
+
+fn reads_crate(turn: &Step) -> bool {
+    matches!(release_effect(turn), Some(ReleaseEffect::ReadCrate(_)))
+}
+
+fn output(turn: Step) -> MembersOutput {
+    match turn {
+        Ok(Next::Done(output)) => output,
+        other => panic!("expected the membership answer, got {other:?}"),
+    }
 }
 
 fn query(key: &str, seed: u8) -> MembershipQuery {
@@ -220,17 +240,12 @@ async fn pins_exact_versions() {
         .exact("db/a.fasta", Ulid::from_bytes([10; 16]))
         .unwrap()
         .to_id();
-    assert!(matches!(
-        op.start().as_slice(),
-        [Effect::Storage(StorageEffect::Iter { .. })]
-    ));
+    assert!(matches!(op.first(), Ok(Next::Call(IoCall::Page { .. }))));
     let crate_id = Ulid::from_bytes([20; 16]);
     assert!(reads_crate(
-        &op.step(rows(&[(crate_id, "db/release.json")]))
+        &op.next(rows(&[(crate_id, "db/release.json")]))
     ));
-    assert!(op.step(crate_read("6.0", &[pinned])).is_empty());
-    assert!(op.is_complete());
-    let output = op.finalize().unwrap();
+    let output = output(op.next(crate_read("6.0", &[pinned])));
     assert_eq!(
         output.answers[0].releases.len(),
         1,
@@ -256,31 +271,26 @@ async fn access_and_tags() {
     let crate_id = Ulid::from_bytes([20; 16]);
     // A caller who may not read the crate never has it opened.
     let mut stranger = operation(&fixture, (&fixture.stranger, info.clone()), vec![], None).await;
-    stranger.start();
-    assert!(
-        stranger
-            .step(rows(&[(crate_id, "db/release.json")]))
-            .is_empty()
-    );
-    assert!(stranger.finalize().unwrap().releases.is_empty());
+    let _ = stranger.first();
+    let listed = output(stranger.next(rows(&[(crate_id, "db/release.json")])));
+    assert!(listed.releases.is_empty());
 
     // A gone version and a version without the release tag are no release.
-    let gone = Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
+    let gone = net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
         CrateReadError::Missing,
     ))));
     for (answer, complete) in [(gone, true), (crate_read("5.0", &[]), true)] {
         let mut op = operation(&fixture, (&fixture.owner, info.clone()), vec![], None).await;
-        op.start();
+        let _ = op.first();
         assert!(reads_crate(
-            &op.step(rows(&[(crate_id, "db/release.json")]))
+            &op.next(rows(&[(crate_id, "db/release.json")]))
         ));
-        op.step(answer);
-        let output = op.finalize().unwrap();
+        let output = output(op.next(answer));
         assert!(output.releases.is_empty());
         assert_eq!(output.complete, complete);
     }
     // A crate that cannot be read leaves the answer incomplete.
-    let failed = Event::Net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
+    let failed = net(NetEvent::Release(ReleaseEvent::CrateRead(Err(
         CrateReadError::Failed("backend down".into()),
     ))));
     let mut op = operation(
@@ -290,10 +300,9 @@ async fn access_and_tags() {
         None,
     )
     .await;
-    op.start();
-    op.step(rows(&[(crate_id, "db/release.json")]));
-    op.step(failed);
-    let output = op.finalize().unwrap();
+    let _ = op.first();
+    let _ = op.next(rows(&[(crate_id, "db/release.json")]));
+    let output = output(op.next(failed));
     assert!(!output.complete && !output.answers[0].complete);
 }
 
@@ -303,19 +312,12 @@ async fn asks_range_coordinators() {
     let (snapshot, bytes) = record(true);
     let mut info = info(fixture.group_id);
     info.distribution = Some(binding(&snapshot, 1, 5));
-    let set = |bytes: &Vec<u8>| {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(vec![1]), Some(bytes.clone().into())),
-                (Key::from(vec![2]), None),
-            ],
-        })
-    };
+    let set = |bytes: &Vec<u8>| IoResult::Values(vec![Some(bytes.clone().into()), None]);
     let other = (snapshot.config.ranges.iter())
         .find(|range| range.coordinator != binding(&snapshot, 1, 5).member_id)
         .unwrap();
     let remote_answer = |refused: Vec<Ulid>| {
-        Event::Net(NetEvent::Release(ReleaseEvent::Holder(Ok(
+        net(NetEvent::Release(ReleaseEvent::Holder(Ok(
             HolderAnswer::Members(RangeMembers {
                 answers: vec![ReleaseMembers::complete()],
                 releases: Vec::new(),
@@ -333,24 +335,17 @@ async fn asks_range_coordinators() {
         Some("token"),
     )
     .await;
-    assert!(matches!(
-        op.start().as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { .. })]
-    ));
-    op.step(set(&bytes));
-    let asked = op.step(rows(&[]));
-    let [Effect::Net(NetEffect::Release(effect))] = asked.as_slice() else {
+    assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let _ = op.next(set(&bytes));
+    let asked = op.next(rows(&[]));
+    let Some(ReleaseEffect::Holder(request)) = release_effect(&asked) else {
         panic!("the coordinator is asked: {asked:?}");
-    };
-    let ReleaseEffect::Holder(request) = effect.as_ref() else {
-        panic!("a holder request");
     };
     assert_eq!(request.bearer, "token");
     assert!(
         matches!(&request.ask, HolderAsk::Members { range_ids, .. } if range_ids == &vec![other.range_id])
     );
-    op.step(remote_answer(Vec::new()));
-    assert!(op.finalize().unwrap().complete);
+    assert!(output(op.next(remote_answer(Vec::new()))).complete);
 
     // A refusing coordinator, or no bearer to ask with, leaves the answer incomplete.
     let mut op = operation(
@@ -360,17 +355,14 @@ async fn asks_range_coordinators() {
         Some("token"),
     )
     .await;
-    op.start();
-    op.step(set(&bytes));
-    op.step(rows(&[]));
-    op.step(remote_answer(vec![other.range_id]));
-    assert!(!op.finalize().unwrap().answers[0].complete);
+    let _ = op.first();
+    let _ = op.next(set(&bytes));
+    let _ = op.next(rows(&[]));
+    let refused = output(op.next(remote_answer(vec![other.range_id])));
+    assert!(!refused.answers[0].complete);
     let mut op = operation(&fixture, (&fixture.owner, info), queries, None).await;
-    op.start();
-    op.step(set(&bytes));
-    assert!(
-        op.step(rows(&[])).is_empty(),
-        "no other node is asked without a bearer"
-    );
-    assert!(!op.finalize().unwrap().complete);
+    let _ = op.first();
+    let _ = op.next(set(&bytes));
+    // No other node is asked without a bearer.
+    assert!(!output(op.next(rows(&[]))).complete);
 }

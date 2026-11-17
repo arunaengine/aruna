@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{RUN_RETENTION_MS, run_key};
 use aruna_core::structs::execution::job::{
@@ -15,8 +17,8 @@ use ulid::Ulid;
 
 use super::marks::{Mark, mark_row};
 use super::rows::{
-    Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode, row,
-    unexpected, values,
+    Row, Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
+    read_call, row, unexpected, values,
 };
 
 /// The row of a work under its key.
@@ -199,6 +201,12 @@ pub enum WorkError {
     Store(#[from] StoreError),
 }
 
+impl From<IoError> for WorkError {
+    fn from(error: IoError) -> Self {
+        Self::Store(error.into())
+    }
+}
+
 /// How the row of a call was found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reserve {
@@ -228,7 +236,7 @@ pub fn reserve(
     (install, identity): (&PluginInstall, &Identity),
     proposed: WorkRow,
     marked: Option<(&str, &str)>,
-) -> Result<RowsOperation<ReserveWork>, WorkError> {
+) -> Result<ReserveWork, WorkError> {
     let mark = match (marked, proposed.version_id) {
         (Some((bucket, object)), Some(version_id)) => {
             let mark = Mark {
@@ -242,14 +250,14 @@ pub fn reserve(
         }
         _ => None,
     };
-    Ok(RowsOperation::transaction(ReserveWork {
+    Ok(ReserveWork {
         key: row_key(install.install_id, identity)?,
         install_id: install.install_id,
         account: install.account,
         proposed: Some(Box::new(proposed)),
         mark,
         phase: ReservePhase::Reading,
-    }))
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -270,16 +278,20 @@ enum ReservePhase {
     Writing,
 }
 
-impl Plan for ReserveWork {
+impl Operation for ReserveWork {
     type Output = (WorkRow, Reserve);
     type Error = WorkError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, WorkError> {
-        let read = vec![(PLUGIN_WORK_KEYSPACE, self.key.clone())];
-        Ok(Turn::Ask(Ask::Read(read)))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, WorkError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, WorkError> {
+        let read = vec![(PLUGIN_WORK_KEYSPACE, self.key.clone())];
+        Ok(Next::Call(read_call(read)))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, WorkError> {
         match std::mem::replace(&mut self.phase, ReservePhase::Writing) {
             ReservePhase::Reading => {
                 let [stored] = values::<1>(answer)?;
@@ -287,7 +299,7 @@ impl Plan for ReserveWork {
                 let proposed = self.proposed.as_deref().ok_or(WorkError::Conflict)?;
                 if let Some(stored) = stored.as_ref().filter(|row| row.account == self.account) {
                     return match stored.digest == proposed.digest {
-                        true => Ok(Turn::Finish((stored.clone(), Reserve::Earlier))),
+                        true => Ok(Next::Done((stored.clone(), Reserve::Earlier))),
                         false => Err(WorkError::Conflict),
                     };
                 }
@@ -299,20 +311,20 @@ impl Plan for ReserveWork {
                 rows.extend(self.mark.take());
                 // A former install's index goes too, so no index row leads to the replacement.
                 let Some(former) = stored else {
-                    return Ok(Turn::Ask(Ask::Write(rows)));
+                    return Ok(Next::Call(IoCall::Write(rows)));
                 };
                 self.phase = ReservePhase::Deleting(rows);
                 let index = index_key(self.install_id, former.work_id);
-                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, index)])))
+                Ok(Next::Call(delete_call(vec![(PLUGIN_WORK_KEYSPACE, index)])))
             }
             ReservePhase::Deleting(rows) => {
                 done(answer)?;
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             ReservePhase::Writing => {
                 done(answer)?;
                 let proposed = self.proposed.take().ok_or(WorkError::Conflict)?;
-                Ok(Turn::Finish((*proposed, Reserve::Fresh)))
+                Ok(Next::Done((*proposed, Reserve::Fresh)))
             }
         }
     }
@@ -330,7 +342,7 @@ pub struct WorkLookup {
 /// What a lookup needs next, or the row it found.
 #[derive(Debug, PartialEq)]
 pub enum Found {
-    Ask(Ask),
+    Ask(IoCall),
     Row(Option<(Vec<u8>, WorkRow)>),
 }
 
@@ -343,19 +355,19 @@ impl WorkLookup {
         }
     }
 
-    pub fn ask(&self) -> Ask {
+    pub fn ask(&self) -> IoCall {
         let index = index_key(self.install_id, self.work_id);
-        Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, index)])
+        read_call(vec![(PLUGIN_WORK_KEYSPACE, index)])
     }
 
-    pub fn take(&mut self, answer: Answer) -> Result<Found, StoreError> {
+    pub fn take(&mut self, answer: IoResult) -> Result<Found, StoreError> {
         let [value] = values::<1>(answer)?;
         let Some(value) = value else {
             return Ok(Found::Row(None));
         };
         let Some(key) = self.key.take() else {
             self.key = Some(value.clone());
-            return Ok(Found::Ask(Ask::Read(vec![(PLUGIN_WORK_KEYSPACE, value)])));
+            return Ok(Found::Ask(read_call(vec![(PLUGIN_WORK_KEYSPACE, value)])));
         };
         let row: WorkRow = decode(&value)?;
         Ok(Found::Row(
@@ -364,54 +376,49 @@ impl WorkLookup {
     }
 }
 
-pub fn read_work(install_id: Ulid, work_id: Ulid) -> RowsOperation<ReadWork> {
-    RowsOperation::direct(ReadWork(WorkLookup::new(install_id, work_id)))
+pub fn read_work(install_id: Ulid, work_id: Ulid) -> ReadWork {
+    ReadWork(WorkLookup::new(install_id, work_id))
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ReadWork(WorkLookup);
 
-impl Plan for ReadWork {
+impl Operation for ReadWork {
     type Output = Option<WorkRow>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(self.0.ask()))
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.0.ask()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         Ok(match self.0.take(answer)? {
-            Found::Ask(ask) => Turn::Ask(ask),
-            Found::Row(found) => Turn::Finish(found.map(|(_, row)| row)),
+            Found::Ask(ask) => Next::Call(ask),
+            Found::Row(found) => Next::Done(found.map(|(_, row)| row)),
         })
     }
 }
 
 /// Whether a plugin work job must keep its record: its work row exists and is not settled yet.
-pub(crate) fn holds_job(spec: &PluginWorkSpec) -> RowsOperation<HoldsJob> {
-    RowsOperation::direct(HoldsJob(ReadWork(WorkLookup::new(
-        spec.install_id,
-        spec.work_id,
-    ))))
+pub(crate) fn holds_job(spec: &PluginWorkSpec) -> HoldsJob {
+    HoldsJob(ReadWork(WorkLookup::new(spec.install_id, spec.work_id)))
 }
 
 #[derive(Debug, PartialEq)]
 pub struct HoldsJob(ReadWork);
 
-impl Plan for HoldsJob {
+impl Operation for HoldsJob {
     type Output = bool;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<bool>, StoreError> {
-        Ok(Turn::Ask(self.0.0.ask()))
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
+        Ok(Next::Call(self.0.0.ask()))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
         Ok(match self.0.next(answer)? {
-            Turn::Ask(ask) => Turn::Ask(ask),
-            Turn::Finish(row) => {
-                Turn::Finish(row.is_some_and(|row| row.state != WorkState::Settled))
-            }
+            Next::Call(ask) => Next::Call(ask),
+            Next::Done(row) => Next::Done(row.is_some_and(|row| row.state != WorkState::Settled)),
         })
     }
 }
@@ -492,12 +499,12 @@ impl WorkChange {
 }
 
 /// Changes the row of work `work_id` in one transaction; `None` when it is gone.
-pub fn update_work(ids: (Ulid, Ulid), change: WorkChange) -> RowsOperation<UpdateWork> {
-    RowsOperation::transaction(UpdateWork {
+pub fn update_work(ids: (Ulid, Ulid), change: WorkChange) -> UpdateWork {
+    UpdateWork {
         lookup: WorkLookup::new(ids.0, ids.1),
         change: Some(change),
         written: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -508,22 +515,26 @@ pub struct UpdateWork {
     written: Option<Box<WorkRow>>,
 }
 
-impl Plan for UpdateWork {
+impl Operation for UpdateWork {
     type Output = Option<WorkRow>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(self.lookup.ask()))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         if let Some(row) = self.written.take() {
             done(answer)?;
-            return Ok(Turn::Finish(Some(*row)));
+            return Ok(Next::Done(Some(*row)));
         }
         let (key, mut row) = match self.lookup.take(answer)? {
-            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
-            Found::Row(None) => return Ok(Turn::Finish(None)),
+            Found::Ask(ask) => return Ok(Next::Call(ask)),
+            Found::Row(None) => return Ok(Next::Done(None)),
             Found::Row(Some(found)) => found,
         };
         let change = self
@@ -533,18 +544,18 @@ impl Plan for UpdateWork {
         change.apply(&mut row);
         let write = vec![row_of(key, &row)?];
         self.written = Some(Box::new(row));
-        Ok(Turn::Ask(Ask::Write(write)))
+        Ok(Next::Call(IoCall::Write(write)))
     }
 }
 
 /// Moves the send boundary of work `work_id` before an attempt sends, in one transaction, unless
 /// the boundary earlier attempts left decides already.
-pub(crate) fn begin_send(ids: (Ulid, Ulid), again: bool) -> RowsOperation<BeginSend> {
-    RowsOperation::transaction(BeginSend {
+pub(crate) fn begin_send(ids: (Ulid, Ulid), again: bool) -> BeginSend {
+    BeginSend {
         lookup: WorkLookup::new(ids.0, ids.1),
         again,
         written: false,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -554,26 +565,30 @@ pub struct BeginSend {
     written: bool,
 }
 
-impl Plan for BeginSend {
+impl Operation for BeginSend {
     type Output = Option<Send>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(self.lookup.ask()))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         if self.written {
             done(answer)?;
-            return Ok(Turn::Finish(Some(Send::Now)));
+            return Ok(Next::Done(Some(Send::Now)));
         }
         let (key, mut row) = match self.lookup.take(answer)? {
-            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
-            Found::Row(None) => return Ok(Turn::Finish(None)),
+            Found::Ask(ask) => return Ok(Next::Call(ask)),
+            Found::Row(None) => return Ok(Next::Done(None)),
             Found::Row(Some(found)) => found,
         };
         if let Some(decided) = decided(row.boundary.as_ref(), self.again) {
-            return Ok(Turn::Finish(Some(decided)));
+            return Ok(Next::Done(Some(decided)));
         }
         let attempt = match &row.boundary {
             Some(SendBoundary::Sending { attempt }) => attempt + 1,
@@ -581,7 +596,7 @@ impl Plan for BeginSend {
         };
         row.boundary = Some(SendBoundary::Sending { attempt });
         self.written = true;
-        Ok(Turn::Ask(Ask::Write(vec![row_of(key, &row)?])))
+        Ok(Next::Call(IoCall::Write(vec![row_of(key, &row)?])))
     }
 }
 
@@ -660,11 +675,11 @@ pub(crate) fn work_scan() -> Scan {
 
 /// Deletes the rows nobody can ask for again: settled and delivered, no cancel open, kept past
 /// the run retention, and their run record pruned.
-pub(crate) fn prune_work(now_ms: u64) -> RowsOperation<PruneWork> {
-    RowsOperation::direct(PruneWork {
+pub(crate) fn prune_work(now_ms: u64) -> PruneWork {
+    PruneWork {
         now_ms,
         phase: PrunePhase::Scanning(work_scan()),
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -681,43 +696,41 @@ enum PrunePhase {
     Deleting(usize),
 }
 
-impl Plan for PruneWork {
+impl Operation for PruneWork {
     type Output = usize;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<usize>, StoreError> {
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
-            PrunePhase::Scanning(scan) => Ok(Turn::Ask(scan.ask())),
+            PrunePhase::Scanning(scan) => Ok(Next::Call(scan.ask())),
             _ => Err(StoreError("prune started twice".into())),
         }
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<usize>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, PrunePhase::Deleting(0)) {
             PrunePhase::Scanning(mut scan) => {
                 let Some(rows) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = PrunePhase::Scanning(scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 let (aged, runs) = aged_work(rows, self.now_ms)?;
                 self.phase = PrunePhase::Runs(aged);
-                Ok(Turn::Ask(Ask::Read(runs)))
+                Ok(Next::Call(read_call(runs)))
             }
             PrunePhase::Runs(aged) => {
-                let Answer::Values(runs) = answer else {
-                    return Err(unexpected(answer));
-                };
+                let runs = all_values(answer)?;
                 let dropped: Vec<_> = (aged.into_iter().zip(runs))
                     .filter(|(_, run)| run.is_none())
                     .flat_map(|(keys, _)| keys.map(|key| (PLUGIN_WORK_KEYSPACE, key)))
                     .collect();
                 self.phase = PrunePhase::Deleting(dropped.len() / 2);
-                Ok(Turn::Ask(Ask::Delete(dropped)))
+                Ok(Next::Call(delete_call(dropped)))
             }
             PrunePhase::Deleting(count) => {
                 done(answer)?;
-                Ok(Turn::Finish(count))
+                Ok(Next::Done(count))
             }
         }
     }
@@ -749,42 +762,43 @@ type WorkRuns = (Vec<[Vec<u8>; 2]>, Vec<(&'static str, Vec<u8>)>);
 
 /// At most `limit` works of an install after the work `after`, oldest first, and the id of the
 /// last one when more may follow.
-pub fn list_work(install_id: Ulid, after: Option<Ulid>, limit: usize) -> RowsOperation<ListWork> {
-    RowsOperation::direct(ListWork {
-        page: Some(Ask::Page {
-            space: PLUGIN_WORK_KEYSPACE,
-            prefix: [&[WORK_INDEX][..], &install_id.to_bytes()].concat(),
-            after: after.map(|work_id| index_key(install_id, work_id)),
+pub fn list_work(install_id: Ulid, after: Option<Ulid>, limit: usize) -> ListWork {
+    ListWork {
+        page: Some(page_call(
+            PLUGIN_WORK_KEYSPACE,
+            [&[WORK_INDEX][..], &install_id.to_bytes()].concat(),
+            after.map(|work_id| index_key(install_id, work_id)),
             limit,
-        }),
+        )),
         indexes: Vec::new(),
         next: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
 pub struct ListWork {
-    page: Option<Ask>,
+    page: Option<IoCall>,
     /// The index rows read, whose rows are read next.
     indexes: Vec<Vec<u8>>,
     next: Option<Ulid>,
 }
 
-impl Plan for ListWork {
+impl Operation for ListWork {
     type Output = (Vec<WorkRow>, Option<Ulid>);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
         let page = self
             .page
             .take()
             .ok_or_else(|| StoreError("listed twice".into()))?;
-        Ok(Turn::Ask(page))
+        Ok(Next::Call(page))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         match answer {
-            Answer::Page(rows, next) => {
+            IoResult::Page { .. } => {
+                let (rows, next) = page_of(answer)?;
                 // The cursor is the last index row read, whatever row it leads to.
                 let last = (rows.last()).and_then(|(index, _)| work_at(index));
                 self.next = next.and(last);
@@ -792,9 +806,10 @@ impl Plan for ListWork {
                     .map(|(_, key)| (PLUGIN_WORK_KEYSPACE, key.clone()))
                     .collect();
                 self.indexes = rows.into_iter().map(|(index, _)| index).collect();
-                Ok(Turn::Ask(Ask::Read(reads)))
+                Ok(Next::Call(read_call(reads)))
             }
-            Answer::Values(values) => {
+            IoResult::Values(_) => {
+                let values = all_values(answer)?;
                 let mut works = Vec::with_capacity(values.len());
                 for (index, value) in self.indexes.iter().zip(values) {
                     let Some(value) = value else {
@@ -805,7 +820,7 @@ impl Plan for ListWork {
                         works.push(row);
                     }
                 }
-                Ok(Turn::Finish((works, self.next)))
+                Ok(Next::Done((works, self.next)))
             }
             other => Err(unexpected(other)),
         }

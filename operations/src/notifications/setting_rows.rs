@@ -6,13 +6,13 @@ use std::collections::BTreeSet;
 
 use aruna_core::NodeId;
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentSyncRevision,
 };
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::Event;
+use aruna_core::operation::Operation;
 use aruna_core::realm_vault::seal_setting;
 use aruna_core::register::{RegisterError, RegisterStamp};
 use aruna_core::storage_entries::sync_revision_entry;
@@ -20,12 +20,12 @@ use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::execution::setting::{SettingChannel, SettingHead, current_setting};
 use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::notifications::unexpected;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
@@ -40,10 +40,8 @@ pub enum SettingError {
     Storage(String),
     #[error(transparent)]
     Register(#[from] RegisterError),
-    #[error("unexpected event while handling the setting: {0}")]
-    UnexpectedEvent(String),
-    #[error("the setting operation did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// Rows read per page from a settings keyspace.
@@ -56,14 +54,13 @@ struct SettingScan {
 }
 
 impl SettingScan {
-    fn page(channel: SettingChannel, owner: UserId, start: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: channel.keyspace().to_string(),
-            prefix: Some(owner.to_bytes().into()),
-            start: start.map(IterStart::After),
+    fn page(channel: SettingChannel, owner: UserId, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: channel.keyspace().to_string(),
+            prefix: owner.to_bytes().into(),
+            after,
             limit: SETTING_PAGE,
-            txn_id: None,
-        })]
+        }
     }
 
     fn add(&mut self, channel: SettingChannel, values: Vec<(Key, Value)>) {
@@ -76,29 +73,13 @@ impl SettingScan {
     }
 }
 
-fn unexpected(event: Event) -> SettingError {
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => SettingError::Storage(error.to_string()),
-        other => SettingError::UnexpectedEvent(format!("{other:?}")),
-    }
-}
-
-#[derive(Debug, Default, PartialEq)]
-enum ReadState {
-    #[default]
-    Init,
-    Scan(SettingScan),
-    Done(Option<Vec<u8>>),
-    Failed(SettingError),
-}
-
 /// The current setting of one user and channel on this node when it is on. A node that has not
 /// received a recent write yet shows the previous one.
 #[derive(Debug, PartialEq)]
 pub struct ReadSettingOperation {
     channel: SettingChannel,
     owner: UserId,
-    state: ReadState,
+    scan: SettingScan,
 }
 
 impl ReadSettingOperation {
@@ -106,60 +87,40 @@ impl ReadSettingOperation {
         Self {
             channel,
             owner,
-            state: ReadState::Init,
+            scan: SettingScan::default(),
         }
     }
 }
 
-impl EffectOperation for ReadSettingOperation {
+impl Operation for ReadSettingOperation {
     type Output = Option<Vec<u8>>;
     type Error = SettingError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReadState::Scan(SettingScan::default());
-        SettingScan::page(self.channel, self.owner, None)
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(Next::Call(SettingScan::page(
+            self.channel,
+            self.owner,
+            None,
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (
-                ReadState::Scan(mut scan),
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                scan.add(self.channel, values);
-                if next_start_after.is_some() {
-                    self.state = ReadState::Scan(scan);
-                    return SettingScan::page(self.channel, self.owner, next_start_after);
-                }
-                let winner = current_setting(scan.rows, |(head, _)| *head);
-                let on = winner.filter(|(head, _)| head.on).map(|(_, bytes)| bytes);
-                self.state = ReadState::Done(on);
-                smallvec![]
-            }
-            (_, event) => {
-                self.state = ReadState::Failed(unexpected(event));
-                smallvec![]
-            }
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(unexpected("IoResult::Page", &result).into());
+        };
+        self.scan.add(self.channel, rows);
+        if next.is_some() {
+            return Ok(Next::Call(SettingScan::page(
+                self.channel,
+                self.owner,
+                next,
+            )));
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ReadState::Done(_) | ReadState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            ReadState::Done(bytes) => Ok(bytes),
-            ReadState::Failed(error) => Err(error),
-            _ => Err(SettingError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        let rows = std::mem::take(&mut self.scan.rows);
+        let winner = current_setting(rows, |(head, _)| *head);
+        Ok(Next::Done(
+            winner.filter(|(head, _)| head.on).map(|(_, bytes)| bytes),
+        ))
     }
 }
 
@@ -255,7 +216,7 @@ impl SettingWrite {
     }
 
     /// The document row, its revision and the sync outbox upsert, written in one batch.
-    fn rows(&self, write_id: Ulid, bytes: &[u8]) -> Result<Effect, SettingError> {
+    fn rows(&self, write_id: Ulid, bytes: &[u8]) -> Result<IoCall, SettingError> {
         let storage = |error: String| SettingError::Storage(error);
         let target = self.value.channel().target(self.owner, write_id);
         let change = DocumentChange {
@@ -288,22 +249,16 @@ impl SettingWrite {
             target.storage_key(),
             bytes.to_vec().into(),
         );
-        Ok(Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![row, revision, outbox],
-            txn_id: None,
-        }))
+        Ok(IoCall::Write(vec![row, revision, outbox]))
     }
 }
 
 #[derive(Debug, Default, PartialEq)]
 enum WriteState {
     #[default]
-    Init,
-    Scan(SettingScan),
+    Scan,
     Store(Vec<u8>),
     Schedule(Vec<u8>),
-    Done(Vec<u8>),
-    Failed(SettingError),
 }
 
 /// Writes a new register write on this node and returns its bytes. The counter is one above
@@ -311,6 +266,7 @@ enum WriteState {
 #[derive(Debug, PartialEq)]
 pub struct WriteSettingOperation {
     write: SettingWrite,
+    scan: SettingScan,
     state: WriteState,
 }
 
@@ -318,84 +274,60 @@ impl WriteSettingOperation {
     pub fn new(write: SettingWrite) -> Self {
         Self {
             write,
-            state: WriteState::Init,
+            scan: SettingScan::default(),
+            state: WriteState::Scan,
         }
     }
 
-    fn store(&mut self, scan: SettingScan) -> Effects {
-        let held = scan.rows.iter().map(|(head, _)| head.stamp.counter).max();
-        let built = RegisterStamp::next(held, self.write.local, self.write.write_id)
-            .map_err(SettingError::from)
-            .and_then(|stamp| Ok((stamp, self.write.bytes(stamp)?)))
-            .and_then(|(stamp, bytes)| Ok((self.write.rows(stamp.write_id, &bytes)?, bytes)));
-        match built {
-            Ok((rows, bytes)) => {
-                self.state = WriteState::Store(bytes);
-                smallvec![rows]
-            }
-            Err(error) => {
-                self.state = WriteState::Failed(error);
-                smallvec![]
-            }
-        }
+    fn store(&mut self) -> Result<Next<Vec<u8>>, SettingError> {
+        let held = self
+            .scan
+            .rows
+            .iter()
+            .map(|(head, _)| head.stamp.counter)
+            .max();
+        let stamp = RegisterStamp::next(held, self.write.local, self.write.write_id)?;
+        let bytes = self.write.bytes(stamp)?;
+        let rows = self.write.rows(stamp.write_id, &bytes)?;
+        self.state = WriteState::Store(bytes);
+        Ok(Next::Call(rows))
     }
 }
 
-impl EffectOperation for WriteSettingOperation {
+impl Operation for WriteSettingOperation {
     type Output = Vec<u8>;
     type Error = SettingError;
 
-    fn start(&mut self) -> Effects {
-        self.state = WriteState::Scan(SettingScan::default());
-        SettingScan::page(self.write.value.channel(), self.write.owner, None)
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let channel = self.write.value.channel();
+        Ok(Next::Call(SettingScan::page(
+            channel,
+            self.write.owner,
+            None,
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
         let channel = self.write.value.channel();
-        match (std::mem::take(&mut self.state), event) {
-            (
-                WriteState::Scan(mut scan),
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
-                scan.add(channel, values);
-                if next_start_after.is_some() {
-                    self.state = WriteState::Scan(scan);
-                    return SettingScan::page(channel, self.write.owner, next_start_after);
+        match (std::mem::take(&mut self.state), result) {
+            (WriteState::Scan, IoResult::Page { rows, next }) => {
+                self.scan.add(channel, rows);
+                match next {
+                    Some(_) => Ok(Next::Call(SettingScan::page(
+                        channel,
+                        self.write.owner,
+                        next,
+                    ))),
+                    None => self.store(),
                 }
-                self.store(scan)
             }
-            (WriteState::Store(bytes), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+            (WriteState::Store(bytes), IoResult::Done) => {
                 self.state = WriteState::Schedule(bytes);
-                smallvec![schedule_drain_effect()]
+                Ok(Next::Call(IoCall::Effect(schedule_drain_effect())))
             }
             // The write is stored; a failed schedule waits for the drain's own re-arm.
-            (WriteState::Schedule(bytes), Event::Task(_)) => {
-                self.state = WriteState::Done(bytes);
-                smallvec![]
-            }
-            (_, event) => {
-                self.state = WriteState::Failed(unexpected(event));
-                smallvec![]
-            }
+            (WriteState::Schedule(bytes), IoResult::Event(Event::Task(_))) => Ok(Next::Done(bytes)),
+            (_, other) => Err(unexpected("a setting scan, write or schedule", &other).into()),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, WriteState::Done(_) | WriteState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            WriteState::Done(bytes) => Ok(bytes),
-            WriteState::Failed(error) => Err(error),
-            _ => Err(SettingError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }

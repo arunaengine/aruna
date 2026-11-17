@@ -2,22 +2,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::list::{load_group_records, load_pending_records};
+use super::preflight::{reference_document_title, resolve_graph_reference};
 use super::read_types::{
     ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
     MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
 };
 use super::{
     AuthContext, AuthToken, AuthorizationError, CheckPermissionsConfig, CheckPermissionsOperation,
-    DISTRIBUTED_QUERY_DEADLINE, DriverContext, Event, GRAPH_LIFECYCLE_KEYSPACE,
-    GraphLifecycleRecord, GroupId, ListGroupOperation, MetadataApiError, MetadataFanoutScope,
-    MetadataFanoutStats, MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId,
-    Permission, REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId,
-    StorageEffect, StorageEvent, StorageReadError, TxnId, Ulid, check_policy_limit, drive,
-    graph_lifecycle_key, load_document_record, load_group_records, load_pending_records,
-    load_realm_config, map_query_error, merge_pending_records, parse_registry_read,
-    query_fingerprint, read_document_registry, record_materialized_read, reference_document_title,
-    replica_query_nodes, resolve_graph_reference, warn,
+    DISTRIBUTED_QUERY_DEADLINE, Event, GRAPH_LIFECYCLE_KEYSPACE, GraphLifecycleRecord, GroupId,
+    ListGroupOperation, MetadataApiError, MetadataFanoutScope, MetadataFanoutStats,
+    MetadataQueryResults, MetadataReadError, MetadataRegistryRecord, NodeId, Permission,
+    REFERENCES_LIMIT, REFERENCES_MAX_LIMIT, REGISTRY_CANDIDATE_LIMIT, RealmId, StorageEffect,
+    StorageEvent, StorageReadError, TxnId, Ulid, check_policy_limit, graph_lifecycle_key,
+    map_query_error, merge_pending_records, parse_registry_read, query_fingerprint,
+    read_document_registry, replica_query_nodes, warn,
 };
+use crate::driver::{DriverContext, drive};
+use crate::metadata::record_reads::{load_document_record, record_materialized_read};
+use crate::realm::load_config::load_realm_config;
 
 use super::distributed::run_query_distributed;
 use super::fanout::ensure_query_form;

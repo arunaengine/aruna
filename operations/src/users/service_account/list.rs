@@ -4,14 +4,14 @@
 
 use aruna_core::USER_KEYSPACE;
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{EffectOperation, boxed_suboperation};
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::GroupId;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
@@ -38,13 +38,21 @@ pub enum ListServiceError {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum ListServiceState {
-    Init,
-    Authorize,
-    Scan,
-    Finish,
-    Error,
+impl From<IoError> for ListServiceError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ListService".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 /// Scans the realm's user records, since ownership lives on the account and not on the group.
@@ -52,130 +60,106 @@ enum ListServiceState {
 pub struct ListServiceOperation {
     auth_context: AuthContext,
     group_id: GroupId,
+    pages: PrefixPages,
     accounts: Vec<User>,
-    state: ListServiceState,
-    output: Option<Result<Vec<User>, ListServiceError>>,
 }
 
 impl ListServiceOperation {
     pub fn new(auth_context: AuthContext, group_id: GroupId) -> Self {
+        let prefix = UserId::storage_prefix(auth_context.realm_id);
         Self {
             auth_context,
             group_id,
+            pages: PrefixPages::new(USER_KEYSPACE, prefix, PAGE),
             accounts: Vec::new(),
-            state: ListServiceState::Init,
-            output: None,
-        }
-    }
-
-    fn fail(&mut self, error: ListServiceError) -> Effects {
-        self.state = ListServiceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(ListServiceError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: event.label(),
-        })
-    }
-
-    fn scan(&mut self, start: Option<Key>) -> Effects {
-        self.state = ListServiceState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USER_KEYSPACE.to_string(),
-            prefix: Some(UserId::storage_prefix(self.auth_context.realm_id)),
-            start: start.map(IterStart::After),
-            limit: PAGE,
-            txn_id: None,
-        })]
-    }
-
-    fn handle_authorized(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) }) => {
-                self.scan(None)
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(false) }) => {
-                self.fail(ListServiceError::Unauthorized)
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: Err(error),
-            }) => self.fail(error.into()),
-            other => self.unexpected("authorization result", other),
-        }
-    }
-
-    fn handle_page(&mut self, event: Event) -> Effects {
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => return self.unexpected("user page", other),
-        };
-        for (_, value) in values {
-            match User::from_bytes(&value) {
-                Ok(user) if user.service_group() == Some(self.group_id) => {
-                    self.accounts.push(user);
-                }
-                Ok(_) => {}
-                Err(error) => return self.fail(error.into()),
-            }
-        }
-        match next_start_after {
-            Some(start) => self.scan(Some(start)),
-            None => {
-                self.state = ListServiceState::Finish;
-                self.output = Some(Ok(std::mem::take(&mut self.accounts)));
-                smallvec![]
-            }
         }
     }
 }
 
-impl EffectOperation for ListServiceOperation {
+impl Operation for ListServiceOperation {
     type Output = Vec<User>;
     type Error = ListServiceError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ListServiceState::Authorize;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            ServiceCheckOperation::new(ServiceCheckConfig {
-                auth_context: self.auth_context.clone(),
-                group_id: self.group_id,
-                target: None,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+    fn first(&mut self) -> Result<Next<Vec<User>>, ListServiceError> {
+        let check = ServiceCheckOperation::new(ServiceCheckConfig {
+            auth_context: self.auth_context.clone(),
+            group_id: self.group_id,
+            target: None,
+        });
+        let child = boxed_suboperation(check, |result| {
+            Event::SubOperation(SubOperationEvent::AuthorizationResult {
                 allowed: ServiceCheckError::allowed(result),
-            }),
-        ))]
+            })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ListServiceState::Authorize => self.handle_authorized(event),
-            ListServiceState::Scan => self.handle_page(event),
-            ListServiceState::Init => self.unexpected("no event before start", event),
-            ListServiceState::Finish | ListServiceState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<User>>, ListServiceError> {
+        if let IoResult::Event(event) = result {
+            let got = event.label();
+            let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = *event
+            else {
+                return Err(ListServiceError::UnexpectedEvent {
+                    state: "Authorize".to_string(),
+                    expected: "authorization result",
+                    got,
+                });
+            };
+            if !allowed? {
+                return Err(ListServiceError::Unauthorized);
+            }
+            return Ok(Next::Call(self.pages.call()));
         }
+        for (_, value) in self.pages.take(result)? {
+            let user = User::from_bytes(&value)?;
+            if user.service_group() == Some(self.group_id) {
+                self.accounts.push(user);
+            }
+        }
+        if !self.pages.done() {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.accounts)))
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListServiceState::Finish | ListServiceState::Error
-        )
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ListServiceError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    #[test]
+    fn scans_after_authorization() {
+        // A refused caller scans nothing; an allowed one pages through the realm's users.
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let auth = AuthContext {
+            user_id: UserId::local(Ulid::from_bytes([2; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let group_id = Ulid::from_bytes([3; 16]);
+        let answer = |allowed| {
+            let event = SubOperationEvent::AuthorizationResult {
+                allowed: Ok(allowed),
+            };
+            IoResult::Event(Box::new(Event::SubOperation(event)))
+        };
+        let mut refused = ListServiceOperation::new(auth.clone(), group_id);
+        refused.first().unwrap();
+        assert_eq!(
+            refused.next(answer(false)),
+            Err(ListServiceError::Unauthorized)
+        );
+        let mut operation = ListServiceOperation::new(auth, group_id);
+        operation.first().unwrap();
+        let scan = PrefixPages::new(USER_KEYSPACE, UserId::storage_prefix(realm_id), PAGE);
+        assert_eq!(operation.next(answer(true)), Ok(Next::Call(scan.call())));
+        let last = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(last), Ok(Next::Done(Vec::new())));
     }
 }

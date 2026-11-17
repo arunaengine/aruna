@@ -6,17 +6,15 @@ use super::{
     HEARTBEAT_STALE_MS, HolderCandidate, HolderChoiceError, HolderChoiceOperation, candidate,
     link_bandwidth, pick,
 };
+use crate::calls::{IoCall, IoResult, Next};
 use crate::document::DocumentTarget;
 use crate::download_slots::DownloadSlots;
-use crate::effects::{Effect, NetEffect, StorageEffect};
-use crate::events::{Event, NetError, NetEvent, StorageEvent};
+use crate::effects::{Effect, NetEffect};
+use crate::events::{Event, NetError, NetEvent};
 use crate::heartbeat::{HeartbeatEffect, HeartbeatEvent, HolderFacts};
 use crate::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use crate::keyspaces::NODE_INFO_KEYSPACE;
-use crate::operation::EffectOperation;
-use crate::operation_check::{
-    check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-};
+use crate::operation::Operation;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::compute_config::{LocationLink, RealmComputeConfig};
 use crate::structs::storage::node_info::node_info_key;
@@ -158,18 +156,18 @@ fn links_rank_bandwidth() {
 
 const REALM: RealmId = RealmId([1; 32]);
 
-fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::NodeId>) -> Event {
-    Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(Box::new(
-        HolderFacts {
-            local: node(9),
-            realm_id: REALM,
-            held,
-            avoided,
-        },
-    ))))
+fn facts(held: Vec<HeldHeartbeat>, avoided: Vec<crate::NodeId>) -> IoResult {
+    let facts = HolderFacts {
+        local: node(9),
+        realm_id: REALM,
+        held,
+        avoided,
+    };
+    let event = NetEvent::Heartbeat(HeartbeatEvent::Holders(Box::new(facts)));
+    IoResult::Event(Box::new(Event::Net(event)))
 }
 
-fn reads(holders: &[u8]) -> Effect {
+fn reads(holders: &[u8]) -> Next<Vec<HolderCandidate>> {
     let config = DocumentTarget::RealmConfig { realm_id: REALM };
     let mut reads: Vec<_> = (holders.iter().chain([9u8].iter()))
         .map(|seed| {
@@ -178,28 +176,15 @@ fn reads(holders: &[u8]) -> Effect {
         })
         .collect();
     reads.push((config.storage_keyspace().to_string(), config.storage_key()));
-    Effect::Storage(StorageEffect::BatchRead {
-        reads,
-        txn_id: None,
-    })
+    Next::Call(IoCall::Read(reads))
 }
 
-fn rows(documents: Vec<Option<NodeInfoDocument>>) -> Event {
+fn rows(documents: Vec<Option<NodeInfoDocument>>) -> IoResult {
     let mut values: Vec<_> = (documents.into_iter())
-        .map(|document| {
-            let value = document.map(|document| Value::from(document.to_bytes().unwrap()));
-            (Key::from(Vec::new()), value)
-        })
+        .map(|document| document.map(|document| Value::from(document.to_bytes().unwrap())))
         .collect();
-    values.push((Key::from(Vec::new()), None));
-    Event::Storage(StorageEvent::BatchReadResult { values })
-}
-
-fn facts_effect(holders: &[u8]) -> Effect {
-    Effect::Net(NetEffect::Heartbeat(Box::new(HeartbeatEffect::Holders {
-        holders: holders.iter().map(|seed| node(*seed)).collect(),
-        now_ms: 5,
-    })))
+    values.push(None);
+    IoResult::Values(values)
 }
 
 fn chooser(holders: &[u8]) -> HolderChoiceOperation {
@@ -211,7 +196,18 @@ fn chooser(holders: &[u8]) -> HolderChoiceOperation {
 fn fresh_holders_qualify() {
     // Holder 1 is fresh, 2 is avoided, 3 has no heartbeat and 4 no document.
     let mut operation = chooser(&[1, 2, 3, 4]);
+    let request = HeartbeatEffect::Holders {
+        holders: [1, 2, 3, 4].iter().map(|seed| node(*seed)).collect(),
+        now_ms: 5,
+    };
+    let request = Effect::Net(NetEffect::Heartbeat(Box::new(request)));
+    assert_eq!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Effect(Box::new(request))))
+    );
     let held = vec![held(1, 1_000, slots(6, 0)), held(2, 1_000, slots(6, 0))];
+    let answer = operation.next(facts(held, vec![node(2)]));
+    assert_eq!(answer, Ok(reads(&[1, 2, 3, 4])));
     let documents = vec![
         Some(document(1)),
         Some(document(2)),
@@ -219,80 +215,42 @@ fn fresh_holders_qualify() {
         None,
         None,
     ];
-    check_trace(
-        &mut operation,
-        &[facts_effect(&[1, 2, 3, 4])],
-        vec![
-            (facts(held, vec![node(2)]), vec![reads(&[1, 2, 3, 4])]),
-            (rows(documents), vec![]),
-        ],
-    );
-    let chosen = operation.finalize().unwrap();
-    assert_eq!(
-        chosen
-            .iter()
-            .map(|chosen| chosen.node_id)
-            .collect::<Vec<_>>(),
-        vec![node(1)]
-    );
+    let Ok(Next::Done(chosen)) = operation.next(rows(documents)) else {
+        panic!("the choice did not finish");
+    };
+    let chosen: Vec<_> = chosen.iter().map(|chosen| chosen.node_id).collect();
+    assert_eq!(chosen, vec![node(1)]);
 }
 
 #[test]
 fn failures_leave_none() {
-    // No network, an unreadable advertisement or a failed read leave no candidate.
+    // No network or an unreadable advertisement leave no candidate.
     let mut offline = chooser(&[1]);
-    offline.start();
-    assert!(
-        offline
-            .step(Event::Net(NetEvent::Error(NetError::ChannelClosed)))
-            .is_empty()
-    );
-    assert_eq!(offline.finalize(), Ok(Vec::new()));
+    let closed = IoResult::Event(Box::new(Event::Net(NetEvent::Error(
+        NetError::ChannelClosed,
+    ))));
+    assert_eq!(offline.next(closed), Ok(Next::Done(Vec::new())));
     let mut garbled = chooser(&[1]);
-    garbled.start();
-    garbled.step(facts(vec![held(1, 1_000, slots(6, 0))], Vec::new()));
-    let values = vec![
-        (Key::from(Vec::new()), Some(Value::from(vec![0xff; 3]))),
-        (Key::from(Vec::new()), None),
-        (Key::from(Vec::new()), None),
-    ];
-    garbled.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    assert_eq!(garbled.finalize(), Ok(Vec::new()));
-    let mut failed = chooser(&[1]);
-    failed.start();
-    failed.step(facts(Vec::new(), Vec::new()));
-    failed.step(Event::Storage(StorageEvent::Error {
-        error: crate::errors::StorageError::Timeout,
-    }));
-    assert_eq!(failed.finalize(), Ok(Vec::new()));
+    garbled
+        .next(facts(vec![held(1, 1_000, slots(6, 0))], Vec::new()))
+        .unwrap();
+    let values = vec![Some(Value::from(vec![0xff; 3])), None, None];
+    let answer = garbled.next(IoResult::Values(values));
+    assert_eq!(answer, Ok(Next::Done(Vec::new())));
 }
 
 #[test]
-fn rejects_stray_events() {
-    let started = || {
-        let mut operation = chooser(&[1]);
-        operation.start();
-        operation
-    };
-    let expected = |event: &Event| matches!(event, Event::Net(_));
-    for (label, effects, error) in rejects_events(started, sample_events, expected) {
-        assert!(effects.is_empty(), "{label} emitted effects");
-        assert!(
-            matches!(error, HolderChoiceError::UnexpectedEvent(_)),
-            "{label}"
-        );
-    }
-    assert_eq!(
-        rejects_events(|| chooser(&[1]), sample_events, |_| false).len(),
-        sample_events().len()
-    );
-}
-
-#[test]
-fn abort_and_finalize() {
-    let mut operation = chooser(&[1]);
-    check_abort(&mut operation, &[]);
-    operation.start();
-    check_abort(&mut operation, &[]);
-    rejects_finalize(operation);
+fn refuses_stray_results() {
+    // Documents before the facts, and facts twice, are refused.
+    let mut early = chooser(&[1]);
+    let answer = early.next(rows(vec![None]));
+    assert!(matches!(answer, Err(HolderChoiceError::Io(_))));
+    let mut twice = chooser(&[1]);
+    twice.next(facts(Vec::new(), Vec::new())).unwrap();
+    let answer = twice.next(facts(Vec::new(), Vec::new()));
+    assert!(matches!(answer, Err(HolderChoiceError::Io(_))));
+    let mut pushed = chooser(&[1]);
+    let event = Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Pushed));
+    let answer = pushed.next(IoResult::Event(Box::new(event)));
+    assert!(matches!(answer, Err(HolderChoiceError::Io(_))));
 }

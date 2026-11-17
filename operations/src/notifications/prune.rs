@@ -4,22 +4,25 @@
 
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{
     NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::notification::{
     DIRECT_TTL_MS, NotificationClass, NotificationRecord, TRANSIENT_TTL_MS, TRANSIENT_USER_CAP,
     notification_inbox_key, notification_prune_key, parse_prune_key,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
+
+use crate::notifications::unexpected;
 
 pub(crate) const PRUNE_PAGE_SIZE: usize = 512;
 pub(crate) const NOTIFICATION_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
@@ -50,10 +53,19 @@ impl NotificationPruneOutcome {
 pub enum PruneError {
     #[error(transparent)]
     Storage(#[from] StorageError),
-    #[error("unexpected event in {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
-    #[error("the notification prune did not finish")]
-    NotFinished,
+    #[error("pruning outlived deletion times failed: {0}")]
+    Cutoff(String),
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for PruneError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            error => Self::Io(error),
+        }
+    }
 }
 
 /// One due row of the prune index and the two inbox rows it may name; only one class matches.
@@ -74,7 +86,6 @@ struct Scan {
 #[derive(Debug, Default, PartialEq)]
 enum PruneState {
     #[default]
-    Init,
     IndexPage,
     IndexRows {
         candidates: Vec<Candidate>,
@@ -86,54 +97,13 @@ enum PruneState {
         next: Option<Key>,
     },
     CutoffPage,
-    CutoffStart {
-        keys: Vec<Key>,
+    /// Waits for the child that deletes one page of outlived deletion times.
+    Cutoff {
         next: Option<Key>,
     },
-    CutoffRead {
-        txn_id: TxnId,
-        next: Option<Key>,
-    },
-    CutoffDelete {
-        txn_id: TxnId,
-        next: Option<Key>,
-    },
-    CutoffCommit {
-        txn_id: TxnId,
-        next: Option<Key>,
-    },
-    Done,
-    Failed(PruneError),
 }
 
-impl PruneState {
-    fn name(&self) -> &'static str {
-        match self {
-            PruneState::Init => "init",
-            PruneState::IndexPage => "index page",
-            PruneState::IndexRows { .. } => "index rows",
-            PruneState::IndexDelete => "index delete",
-            PruneState::InboxPage => "inbox page",
-            PruneState::InboxDelete { .. } => "inbox delete",
-            PruneState::CutoffPage => "cutoff page",
-            PruneState::CutoffStart { .. } => "cutoff start",
-            PruneState::CutoffRead { .. } => "cutoff read",
-            PruneState::CutoffDelete { .. } => "cutoff delete",
-            PruneState::CutoffCommit { .. } => "cutoff commit",
-            PruneState::Done => "done",
-            PruneState::Failed(_) => "failed",
-        }
-    }
-
-    fn txn_id(&self) -> Option<TxnId> {
-        match self {
-            PruneState::CutoffRead { txn_id, .. }
-            | PruneState::CutoffDelete { txn_id, .. }
-            | PruneState::CutoffCommit { txn_id, .. } => Some(*txn_id),
-            _ => None,
-        }
-    }
-}
+type Turn = Result<Next<NotificationPruneOutcome>, PruneError>;
 
 /// One prune run: the due rows of the prune index (at most four pages of them), then a sweep of
 /// the inbox for expired and over-cap transient rows, then a sweep of outlived deletion times.
@@ -155,7 +125,7 @@ impl PruneNotificationsOperation {
         Self {
             now_ms,
             page_size,
-            state: PruneState::Init,
+            state: PruneState::IndexPage,
             outcome: NotificationPruneOutcome::default(),
             processed: 0,
             deletes: Vec::new(),
@@ -164,38 +134,18 @@ impl PruneNotificationsOperation {
         }
     }
 
-    fn iter(&self, key_space: &str, start_after: Option<Key>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
+    fn page(&mut self, state: PruneState, space: &str, after: Option<Key>) -> Turn {
+        self.state = state;
+        Ok(Next::Call(IoCall::Page {
+            space: space.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
             limit: self.page_size,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn fail(&mut self, error: PruneError) -> Effects {
-        let txn_id = self.state.txn_id();
-        self.state = PruneState::Failed(error);
-        match txn_id {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-
-    fn unexpected(&mut self, event: Event) -> Effects {
-        let error = match event {
-            Event::Storage(StorageEvent::Error { error }) => PruneError::Storage(error),
-            other => PruneError::UnexpectedEvent {
-                state: self.state.name(),
-                got: format!("{other:?}"),
-            },
-        };
-        self.fail(error)
-    }
-
-    fn index_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        if values.is_empty() {
+    fn index_page(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        if rows.is_empty() {
             return self.delete_index();
         }
         let deletion_cap = self.page_size.saturating_mul(4);
@@ -204,7 +154,7 @@ impl PruneNotificationsOperation {
             next,
             stopped: false,
         };
-        for (key, _) in values {
+        for (key, _) in rows {
             let (expires_at_ms, recipient, notification_id) = match parse_prune_key(key.as_ref()) {
                 Ok(parsed) => parsed,
                 Err(error) => {
@@ -249,19 +199,16 @@ impl PruneNotificationsOperation {
             })
             .collect();
         self.state = PruneState::IndexRows { candidates, scan };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     fn index_rows(
         &mut self,
         candidates: Vec<Candidate>,
         scan: Scan,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Effects {
-        let exists = |at: usize| values.get(at).is_some_and(|(_, value)| value.is_some());
+        values: Vec<Option<Value>>,
+    ) -> Turn {
+        let exists = |at: usize| values.get(at).is_some_and(Option::is_some);
         for (at, row) in candidates.into_iter().enumerate() {
             self.deletes
                 .push((PRUNE_INDEX_KEYSPACE.to_string(), row.index));
@@ -284,39 +231,30 @@ impl PruneNotificationsOperation {
         self.index_continue(scan)
     }
 
-    fn index_continue(&mut self, scan: Scan) -> Effects {
+    fn index_continue(&mut self, scan: Scan) -> Turn {
         match (scan.stopped, scan.next) {
             (false, Some(next)) => {
-                self.state = PruneState::IndexPage;
-                self.iter(PRUNE_INDEX_KEYSPACE, Some(next))
+                self.page(PruneState::IndexPage, PRUNE_INDEX_KEYSPACE, Some(next))
             }
             _ => self.delete_index(),
         }
     }
 
-    fn delete_index(&mut self) -> Effects {
+    fn delete_index(&mut self) -> Turn {
         let deletes = std::mem::take(&mut self.deletes);
         if deletes.is_empty() {
-            return self.inbox_next(None);
+            return self.page(PruneState::InboxPage, NOTIFICATION_INBOX_KEYSPACE, None);
         }
         self.state = PruneState::IndexDelete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn inbox_next(&mut self, start_after: Option<Key>) -> Effects {
-        self.state = PruneState::InboxPage;
-        self.iter(NOTIFICATION_INBOX_KEYSPACE, start_after)
-    }
-
-    fn inbox_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        if values.is_empty() {
-            return self.cutoff_next(None);
+    fn inbox_page(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        if rows.is_empty() {
+            return self.page(PruneState::CutoffPage, NOTIFICATION_CUTOFF_KEYSPACE, None);
         }
         let mut deletes = Vec::new();
-        for (key, value) in values {
+        for (key, value) in rows {
             if key.len() != 72 {
                 warn!(key = ?key.as_ref(), "Skipping malformed notification inbox key during prune sweep");
                 continue;
@@ -358,174 +296,126 @@ impl PruneNotificationsOperation {
             return self.inbox_after(next);
         }
         self.state = PruneState::InboxDelete { next };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None
-        })]
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn inbox_after(&mut self, next: Option<Key>) -> Effects {
+    fn inbox_after(&mut self, next: Option<Key>) -> Turn {
         match next {
-            Some(next) => self.inbox_next(Some(next)),
-            None => self.cutoff_next(None),
+            Some(next) => self.page(
+                PruneState::InboxPage,
+                NOTIFICATION_INBOX_KEYSPACE,
+                Some(next),
+            ),
+            None => self.page(PruneState::CutoffPage, NOTIFICATION_CUTOFF_KEYSPACE, None),
         }
     }
 
-    fn cutoff_next(&mut self, start_after: Option<Key>) -> Effects {
-        self.state = PruneState::CutoffPage;
-        self.iter(NOTIFICATION_CUTOFF_KEYSPACE, start_after)
-    }
-
-    fn cutoff_page(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
-        let keys: Vec<Key> = (values.into_iter())
+    fn cutoff_page(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
+        let keys: Vec<Key> = (rows.into_iter())
             .filter(|(_, value)| cutoff_expired(Some(value), self.now_ms))
             .map(|(key, _)| key)
             .collect();
         if keys.is_empty() {
             return self.cutoff_after(next);
         }
-        self.state = PruneState::CutoffStart { keys, next };
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = PruneState::Cutoff { next };
+        let child = CutoffPruneOperation {
+            keys,
+            now_ms: self.now_ms,
+            deleting: false,
+        };
+        // A conflict leaves the outlived times to the next sweep.
+        let child = boxed_suboperation(child, |result| {
+            let result = match result {
+                Ok(()) | Err(IoError::Conflict) => Ok(()),
+                Err(error) => Err(error.to_string()),
+            };
+            Event::SubOperation(SubOperationEvent::CutoffsPruned { result })
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 
-    fn cutoff_after(&mut self, next: Option<Key>) -> Effects {
+    fn cutoff_after(&mut self, next: Option<Key>) -> Turn {
         match next {
-            Some(next) => self.cutoff_next(Some(next)),
-            None => {
-                self.state = PruneState::Done;
-                smallvec![]
-            }
+            Some(next) => self.page(
+                PruneState::CutoffPage,
+                NOTIFICATION_CUTOFF_KEYSPACE,
+                Some(next),
+            ),
+            None => Ok(Next::Done(std::mem::take(&mut self.outcome))),
         }
-    }
-
-    /// Deletes only the deletion times still outlived when read again inside the transaction,
-    /// so one a bucket deletion renewed meanwhile stays.
-    fn cutoff_read(
-        &mut self,
-        txn_id: TxnId,
-        next: Option<Key>,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Effects {
-        let deletes: Vec<(KeySpace, Key)> = (values.into_iter())
-            .filter(|(_, value)| cutoff_expired(value.as_ref(), self.now_ms))
-            .map(|(key, _)| (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key))
-            .collect();
-        if deletes.is_empty() {
-            return self.cutoff_commit(txn_id, next);
-        }
-        self.state = PruneState::CutoffDelete { txn_id, next };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id)
-        })]
-    }
-
-    fn cutoff_commit(&mut self, txn_id: TxnId, next: Option<Key>) -> Effects {
-        self.state = PruneState::CutoffCommit { txn_id, next };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 }
 
-impl EffectOperation for PruneNotificationsOperation {
+impl Operation for PruneNotificationsOperation {
     type Output = NotificationPruneOutcome;
     type Error = PruneError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PruneState::IndexPage;
-        self.iter(PRUNE_INDEX_KEYSPACE, None)
+    fn first(&mut self) -> Turn {
+        self.page(PruneState::IndexPage, PRUNE_INDEX_KEYSPACE, None)
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let state = std::mem::take(&mut self.state);
-        match (state, event) {
-            (
-                PruneState::IndexPage,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.index_page(values, next_start_after),
-            (
-                PruneState::IndexRows { candidates, scan },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.index_rows(candidates, scan, values),
-            (PruneState::IndexDelete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.inbox_next(None)
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (std::mem::take(&mut self.state), result) {
+            (PruneState::IndexPage, IoResult::Page { rows, next }) => self.index_page(rows, next),
+            (PruneState::IndexRows { candidates, scan }, IoResult::Values(values)) => {
+                self.index_rows(candidates, scan, values)
             }
+            (PruneState::IndexDelete, IoResult::Done) => {
+                self.page(PruneState::InboxPage, NOTIFICATION_INBOX_KEYSPACE, None)
+            }
+            (PruneState::InboxPage, IoResult::Page { rows, next }) => self.inbox_page(rows, next),
+            (PruneState::InboxDelete { next }, IoResult::Done) => self.inbox_after(next),
+            (PruneState::CutoffPage, IoResult::Page { rows, next }) => self.cutoff_page(rows, next),
             (
-                PruneState::InboxPage,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.inbox_page(values, next_start_after),
-            (
-                PruneState::InboxDelete { next },
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => self.inbox_after(next),
-            (
-                PruneState::CutoffPage,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.cutoff_page(values, next_start_after),
-            (
-                PruneState::CutoffStart { keys, next },
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+                PruneState::Cutoff { next },
+                IoResult::Event(Event::SubOperation(SubOperationEvent::CutoffsPruned { result })),
             ) => {
-                let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
-                let reads = keys.into_iter().map(|key| (space(), key)).collect();
-                self.state = PruneState::CutoffRead { txn_id, next };
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: Some(txn_id)
-                })]
+                result.map_err(PruneError::Cutoff)?;
+                self.cutoff_after(next)
             }
-            (
-                PruneState::CutoffRead { txn_id, next },
-                Event::Storage(StorageEvent::BatchReadResult { values }),
-            ) => self.cutoff_read(txn_id, next, values),
-            (
-                PruneState::CutoffDelete { txn_id, next },
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
-            ) => self.cutoff_commit(txn_id, next),
-            // A conflict leaves the outlived times to the next sweep.
-            (
-                PruneState::CutoffCommit { next, .. },
-                Event::Storage(
-                    StorageEvent::TransactionCommitted { .. }
-                    | StorageEvent::Error {
-                        error: StorageError::TransactionConflict,
-                    },
-                ),
-            ) => self.cutoff_after(next),
-            (state, event) => {
-                self.state = state;
-                self.unexpected(event)
+            (_, other) => Err(unexpected("a prune page, read, delete or cutoff", &other).into()),
+        }
+    }
+}
+
+/// Deletes only the deletion times still outlived when read again inside its transaction, so
+/// one a bucket deletion renewed meanwhile stays.
+#[derive(Debug, PartialEq)]
+struct CutoffPruneOperation {
+    keys: Vec<Key>,
+    now_ms: u64,
+    deleting: bool,
+}
+
+impl Operation for CutoffPruneOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
+        let reads = self.keys.iter().map(|key| (space(), key.clone())).collect();
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match (self.deleting, result) {
+            (false, IoResult::Values(values)) => {
+                let deletes: Vec<(KeySpace, Key)> = (std::mem::take(&mut self.keys).into_iter())
+                    .zip(values)
+                    .filter(|(_, value)| cutoff_expired(value.as_ref(), self.now_ms))
+                    .map(|(key, _)| (NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key))
+                    .collect();
+                self.deleting = true;
+                Ok(Next::Call(IoCall::Delete(deletes)))
             }
+            (true, IoResult::Done) => Ok(Next::Done(())),
+            (_, other) => Err(unexpected("a cutoff read or delete", &other)),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PruneState::Done | PruneState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            PruneState::Done => Ok(self.outcome),
-            PruneState::Failed(error) => Err(error),
-            _ => Err(PruneError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state.txn_id() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn transaction(&self) -> bool {
+        true
     }
 }
 
@@ -552,32 +442,28 @@ pub struct RestorePruneOperation {
 #[derive(Debug, Default, PartialEq)]
 enum RestoreState {
     #[default]
-    Init,
     Scan,
     Delete,
     Arm,
-    Done,
-    Failed(PruneError),
 }
 
 impl RestorePruneOperation {
     pub fn new(now_ms: u64) -> Self {
         Self {
             now_ms,
-            state: RestoreState::Init,
+            state: RestoreState::Scan,
         }
     }
 
-    fn arm(&mut self, after: Duration) -> Effects {
+    fn arm(&mut self, after: Duration) -> Result<Next<()>, IoError> {
         self.state = RestoreState::Arm;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::PruneNotifications,
-            after,
-        })]
+        let key = TaskKey::PruneNotifications;
+        let arm = TaskEffect::ShortenTimer { key, after };
+        Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
     }
 
-    fn scanned(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let Some((key, _)) = values.into_iter().next() else {
+    fn scanned(&mut self, rows: Vec<(Key, Value)>) -> Result<Next<()>, IoError> {
+        let Some((key, _)) = rows.into_iter().next() else {
             return self.arm(NOTIFICATION_POLL_AFTER);
         };
         match parse_prune_key(key.as_ref()) {
@@ -588,69 +474,35 @@ impl RestorePruneOperation {
             Err(error) => {
                 warn!(%error, key = ?key.as_ref(), "Deleting malformed notification prune index row during restore");
                 self.state = RestoreState::Delete;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)],
-                    txn_id: None,
-                })]
+                let deletes = vec![(PRUNE_INDEX_KEYSPACE.to_string(), key)];
+                Ok(Next::Call(IoCall::Delete(deletes)))
             }
         }
     }
 }
 
-impl EffectOperation for RestorePruneOperation {
+impl Operation for RestorePruneOperation {
     type Output = ();
-    type Error = PruneError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.state = RestoreState::Scan;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: PRUNE_INDEX_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Page {
+            space: PRUNE_INDEX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
             limit: 1,
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (std::mem::take(&mut self.state), event) {
-            (RestoreState::Scan, Event::Storage(StorageEvent::IterResult { values, .. })) => {
-                self.scanned(values)
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        match (&self.state, result) {
+            (RestoreState::Scan, IoResult::Page { rows, .. }) => self.scanned(rows),
+            (RestoreState::Delete, IoResult::Done) => self.arm(Duration::ZERO),
+            (RestoreState::Arm, IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. }))) => {
+                Ok(Next::Done(()))
             }
-            (RestoreState::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.arm(Duration::ZERO)
-            }
-            (RestoreState::Arm, Event::Task(TaskEvent::TimerScheduled { .. })) => {
-                self.state = RestoreState::Done;
-                smallvec![]
-            }
-            (_, event) => {
-                self.state = RestoreState::Failed(match event {
-                    Event::Storage(StorageEvent::Error { error }) => PruneError::Storage(error),
-                    other => PruneError::UnexpectedEvent {
-                        state: "restore",
-                        got: format!("{other:?}"),
-                    },
-                });
-                smallvec![]
-            }
+            (_, other) => Err(unexpected("a prune index page, delete or timer", &other)),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RestoreState::Done | RestoreState::Failed(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.state {
-            RestoreState::Done => Ok(()),
-            RestoreState::Failed(error) => Err(error),
-            _ => Err(PruneError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -1175,30 +1027,23 @@ mod tests {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+mod call_tests {
     use super::*;
     use crate::tests::notifications::{record, user};
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
 
     const NOW_MS: u64 = 400 * 24 * 60 * 60 * 1000;
 
-    fn iter(key_space: &str, start_after: Option<Key>, limit: usize) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit,
-            txn_id: None,
-        })
+    fn page_call(space: &str, after: Option<Key>) -> Turn {
+        Ok(Next::Call(IoCall::Page {
+            space: space.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: 4,
+        }))
     }
 
-    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after: next,
-        })
+    fn rows(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
+        IoResult::Page { rows, next }
     }
 
     fn space(key_space: &str, key: Key) -> (KeySpace, Key) {
@@ -1209,8 +1054,14 @@ mod state_machine_tests {
         Value::from(0u64.to_be_bytes().to_vec())
     }
 
+    fn pruned(result: Result<(), String>) -> IoResult {
+        IoResult::Event(Event::SubOperation(SubOperationEvent::CutoffsPruned {
+            result,
+        }))
+    }
+
     #[test]
-    fn prune_success_trace() {
+    fn prune_success_calls() {
         let due = record(user(1, 2), NotificationClass::Direct, 1_000);
         let index = notification_prune_key(&due);
         let direct = notification_inbox_key(due.recipient, 1_000, due.notification_id);
@@ -1219,83 +1070,38 @@ mod state_machine_tests {
             (1_000 + DIRECT_TTL_MS).saturating_sub(TRANSIENT_TTL_MS),
             due.notification_id,
         );
-        let cutoff = Key::from(b"cutoff".to_vec());
-        let txn_id = TxnId::from_parts(7, 7);
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        check_trace(
-            &mut operation,
-            &[iter(PRUNE_INDEX_KEYSPACE, None, 4)],
-            vec![
-                (
-                    page(vec![(index.clone(), Value::from(Vec::new()))], None),
-                    vec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: vec![
-                            space(NOTIFICATION_INBOX_KEYSPACE, direct.clone()),
-                            space(NOTIFICATION_INBOX_KEYSPACE, transient.clone()),
-                        ],
-                        txn_id: None,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchReadResult {
-                        values: vec![
-                            (direct.clone(), Some(Value::from(vec![1]))),
-                            (transient, None),
-                        ],
-                    }),
-                    vec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: vec![
-                            space(PRUNE_INDEX_KEYSPACE, index),
-                            space(NOTIFICATION_INBOX_KEYSPACE, direct),
-                        ],
-                        txn_id: None,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchDeleteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![iter(NOTIFICATION_INBOX_KEYSPACE, None, 4)],
-                ),
-                (
-                    page(Vec::new(), None),
-                    vec![iter(NOTIFICATION_CUTOFF_KEYSPACE, None, 4)],
-                ),
-                (
-                    page(vec![(cutoff.clone(), outlived())], None),
-                    vec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-                    vec![Effect::Storage(StorageEffect::BatchRead {
-                        reads: vec![space(NOTIFICATION_CUTOFF_KEYSPACE, cutoff.clone())],
-                        txn_id: Some(txn_id),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchReadResult {
-                        values: vec![(cutoff.clone(), Some(outlived()))],
-                    }),
-                    vec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: vec![space(NOTIFICATION_CUTOFF_KEYSPACE, cutoff)],
-                        txn_id: Some(txn_id),
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchDeleteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })],
-                ),
-                (
-                    Event::Storage(StorageEvent::TransactionCommitted { txn_id }),
-                    vec![],
-                ),
-            ],
+        assert_eq!(operation.first(), page_call(PRUNE_INDEX_KEYSPACE, None));
+        assert_eq!(
+            operation.next(rows(vec![(index.clone(), Value::from(Vec::new()))], None)),
+            Ok(Next::Call(IoCall::Read(vec![
+                space(NOTIFICATION_INBOX_KEYSPACE, direct.clone()),
+                space(NOTIFICATION_INBOX_KEYSPACE, transient),
+            ])))
         );
-        let outcome = operation.finalize().expect("prune finishes");
+        assert_eq!(
+            operation.next(IoResult::Values(vec![Some(Value::from(vec![1])), None])),
+            Ok(Next::Call(IoCall::Delete(vec![
+                space(PRUNE_INDEX_KEYSPACE, index),
+                space(NOTIFICATION_INBOX_KEYSPACE, direct),
+            ])))
+        );
+        assert_eq!(
+            operation.next(IoResult::Done),
+            page_call(NOTIFICATION_INBOX_KEYSPACE, None)
+        );
+        assert_eq!(
+            operation.next(rows(Vec::new(), None)),
+            page_call(NOTIFICATION_CUTOFF_KEYSPACE, None)
+        );
+        let cutoff = Key::from(b"cutoff".to_vec());
+        assert!(matches!(
+            operation.next(rows(vec![(cutoff, outlived())], None)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let Ok(Next::Done(outcome)) = operation.next(pruned(Ok(()))) else {
+            panic!("prune finishes");
+        };
         assert_eq!(outcome.expired, 1);
         assert_eq!(outcome.rearm(), NOTIFICATION_POLL_AFTER);
     }
@@ -1304,16 +1110,16 @@ mod state_machine_tests {
     fn future_row_stops() {
         let future = record(user(1, 2), NotificationClass::Direct, NOW_MS);
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        operation.start();
+        operation.first().unwrap();
         let index = (notification_prune_key(&future), Value::from(Vec::new()));
-        let effects = operation.step(page(vec![index], Some(Key::from(vec![9]))));
         assert_eq!(
-            effects.as_slice(),
-            [iter(NOTIFICATION_INBOX_KEYSPACE, None, 4)]
+            operation.next(rows(vec![index], Some(Key::from(vec![9])))),
+            page_call(NOTIFICATION_INBOX_KEYSPACE, None)
         );
-        operation.step(page(Vec::new(), None));
-        operation.step(page(Vec::new(), None));
-        let outcome = operation.finalize().expect("prune finishes");
+        operation.next(rows(Vec::new(), None)).unwrap();
+        let Ok(Next::Done(outcome)) = operation.next(rows(Vec::new(), None)) else {
+            panic!("prune finishes");
+        };
         assert_eq!(
             outcome.next_due_after,
             Some(Duration::from_millis(DIRECT_TTL_MS))
@@ -1322,108 +1128,45 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn storage_error_fails() {
+    fn cutoff_failure_fails() {
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        operation.start();
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert!(effects.is_empty());
+        operation.state = PruneState::Cutoff { next: None };
         assert_eq!(
-            operation.finalize(),
-            Err(PruneError::Storage(StorageError::Timeout))
+            operation.next(pruned(Err("timeout".to_string()))),
+            Err(PruneError::Cutoff("timeout".to_string()))
         );
-    }
-
-    fn in_cutoff_read() -> PruneNotificationsOperation {
+        assert_eq!(
+            PruneError::from(IoError::Storage(StorageError::Timeout)),
+            PruneError::Storage(StorageError::Timeout)
+        );
         let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        operation.start();
-        operation.step(page(Vec::new(), None));
-        operation.step(page(Vec::new(), None));
-        operation.step(page(vec![(Key::from(vec![1]), outlived())], None));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::from_parts(7, 7),
-        }));
-        operation
-    }
-
-    #[test]
-    fn txn_error_aborts() {
-        let mut operation = in_cutoff_read();
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TxnId::from_parts(7, 7)
-            })]
-        );
-        assert!(operation.finalize().is_err());
+        operation.first().unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(PruneError::Io(IoError::Unexpected { .. }))
+        ));
     }
 
     // A deletion that renewed a time the sweep saw expired keeps it.
     #[test]
     fn renewed_cutoff_kept() {
-        let mut operation = in_cutoff_read();
-        let renewed = Value::from(NOW_MS.to_be_bytes().to_vec());
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(vec![1]), Some(renewed))],
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction {
-                txn_id: TxnId::from_parts(7, 7)
-            })]
-        );
-    }
-
-    #[test]
-    fn commit_conflict_continues() {
-        let mut operation = in_cutoff_read();
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(vec![1]), None)],
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.finalize().is_ok());
-    }
-
-    #[test]
-    fn unexpected_events_fail() {
-        let make = || {
-            let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-            operation.start();
-            operation
+        let key = Key::from(vec![1]);
+        let mut cutoff = CutoffPruneOperation {
+            keys: vec![key.clone(), Key::from(vec![2])],
+            now_ms: NOW_MS,
+            deleting: false,
         };
-        let expected =
-            |event: &Event| matches!(event, Event::Storage(StorageEvent::IterResult { .. }));
-        let refusals = rejects_events(make, sample_events, expected);
-        assert!(!refusals.is_empty());
-    }
-
-    #[test]
-    fn abort_per_phase() {
-        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        let mut operation = in_cutoff_read();
-        check_abort(
-            &mut operation,
-            &[Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id: TxnId::from_parts(7, 7),
-            })],
+        assert!(cutoff.transaction());
+        assert!(matches!(cutoff.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 2));
+        let renewed = Value::from(NOW_MS.to_be_bytes().to_vec());
+        assert_eq!(
+            cutoff.next(IoResult::Values(vec![Some(outlived()), Some(renewed)])),
+            Ok(Next::Call(IoCall::Delete(vec![space(
+                NOTIFICATION_CUTOFF_KEYSPACE,
+                key
+            )])))
         );
-    }
-
-    #[test]
-    fn unfinished_prune_fails() {
-        let mut operation = PruneNotificationsOperation::new(NOW_MS, 4);
-        operation.start();
-        rejects_finalize(operation);
-        rejects_finalize(RestorePruneOperation::new(NOW_MS));
+        assert_eq!(cutoff.next(IoResult::Done), Ok(Next::Done(())));
     }
 
     #[test]
@@ -1431,50 +1174,41 @@ mod state_machine_tests {
         let mut operation = RestorePruneOperation::new(NOW_MS);
         let malformed = (Key::from(vec![1, 2]), Value::from(Vec::new()));
         let arm = |after| {
-            Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::PruneNotifications,
-                after,
-            })
+            Ok(Next::Call(IoCall::Effect(Effect::Task(
+                TaskEffect::ShortenTimer {
+                    key: TaskKey::PruneNotifications,
+                    after,
+                },
+            ))))
         };
-        check_trace(
-            &mut operation,
-            &[iter(PRUNE_INDEX_KEYSPACE, None, 1)],
-            vec![
-                (
-                    page(vec![malformed.clone()], None),
-                    vec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: vec![space(PRUNE_INDEX_KEYSPACE, malformed.0)],
-                        txn_id: None,
-                    })],
-                ),
-                (
-                    Event::Storage(StorageEvent::BatchDeleteResult {
-                        entries: Vec::new(),
-                    }),
-                    vec![arm(Duration::ZERO)],
-                ),
-                (
-                    Event::Task(TaskEvent::TimerScheduled {
-                        key: TaskKey::PruneNotifications,
-                        after: Duration::ZERO,
-                    }),
-                    vec![],
-                ),
-            ],
+        let rows = |rows| IoResult::Page { rows, next: None };
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
+        ));
+        assert_eq!(
+            operation.next(rows(vec![malformed.clone()])),
+            Ok(Next::Call(IoCall::Delete(vec![space(
+                PRUNE_INDEX_KEYSPACE,
+                malformed.0
+            )])))
         );
-        assert_eq!(operation.finalize(), Ok(()));
+        assert_eq!(operation.next(IoResult::Done), arm(Duration::ZERO));
+        let scheduled = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::PruneNotifications,
+            after: Duration::ZERO,
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(scheduled)),
+            Ok(Next::Done(()))
+        );
 
         let mut empty = RestorePruneOperation::new(NOW_MS);
-        empty.start();
-        assert_eq!(
-            empty.step(page(Vec::new(), None)).as_slice(),
-            [arm(NOTIFICATION_POLL_AFTER)]
-        );
-        let failed = empty.step(Event::Task(TaskEvent::Error {
+        assert_eq!(empty.next(rows(Vec::new())), arm(NOTIFICATION_POLL_AFTER));
+        let failed = Event::Task(TaskEvent::Error {
             key: None,
             message: "closed".to_string(),
-        }));
-        assert!(failed.is_empty());
-        assert!(empty.finalize().is_err());
+        });
+        assert!(empty.next(IoResult::Event(failed)).is_err());
     }
 }

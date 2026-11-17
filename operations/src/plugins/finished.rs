@@ -3,16 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_RUNS_KEYSPACE, PLUGIN_WORK_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{PluginRun, RunState, SourceEvent, SourceKind, run_key};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use ulid::Ulid;
 
 use super::intents::{intent_scan, undone_keys};
-use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, decode, done, encode, row, values,
-};
+use super::rows::{Row, Scan, decode, delete_call, done, encode, read_call, row, values};
 use super::runs::{Admission, RunError, audit_rows};
 use super::work::{Found, WorkKind, WorkLookup, WorkRow, WorkState, work_state};
 
@@ -42,27 +42,31 @@ impl NotifyWork {
     }
 }
 
-impl Plan for NotifyWork {
+impl Operation for NotifyWork {
     type Output = bool;
     type Error = RunError;
 
-    fn first(&mut self) -> Result<Turn<bool>, RunError> {
-        Ok(Turn::Ask(self.lookup.ask()))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<bool>, RunError> {
+    fn first(&mut self) -> Result<Next<bool>, RunError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, RunError> {
         match std::mem::replace(&mut self.phase, NotifyPhase::Writing) {
             NotifyPhase::Looking => {
                 let (key, mut stored) = match self.lookup.take(answer)? {
                     Found::Ask(ask) => {
                         self.phase = NotifyPhase::Looking;
-                        return Ok(Turn::Ask(ask));
+                        return Ok(Next::Call(ask));
                     }
-                    Found::Row(None) => return Ok(Turn::Finish(false)),
+                    Found::Row(None) => return Ok(Next::Done(false)),
                     Found::Row(Some(found)) => found,
                 };
                 if stored.notified {
-                    return Ok(Turn::Finish(false));
+                    return Ok(Next::Done(false));
                 }
                 stored.notified = true;
                 let work = row(PLUGIN_WORK_KEYSPACE, key, encode(&stored)?);
@@ -70,9 +74,9 @@ impl Plan for NotifyWork {
                     Some(admission) => {
                         let ask = admission.ask();
                         self.phase = NotifyPhase::Admitting(work);
-                        Ok(Turn::Ask(ask))
+                        Ok(Next::Call(ask))
                     }
-                    None => Ok(Turn::Ask(Ask::Write(vec![work]))),
+                    None => Ok(Next::Call(IoCall::Write(vec![work]))),
                 }
             }
             NotifyPhase::Admitting(work) => {
@@ -80,14 +84,14 @@ impl Plan for NotifyWork {
                 let Some(mut rows) = admission.take(answer)? else {
                     let ask = admission.ask();
                     self.phase = NotifyPhase::Admitting(work);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 rows.push(work);
-                Ok(Turn::Ask(Ask::Write(rows)))
+                Ok(Next::Call(IoCall::Write(rows)))
             }
             NotifyPhase::Writing => {
                 done(answer)?;
-                Ok(Turn::Finish(true))
+                Ok(Next::Done(true))
             }
         }
     }
@@ -110,13 +114,13 @@ pub(crate) fn retry_run(
     (install_id, run_id): (Ulid, Ulid),
     audit: &AdminAuditRecord,
     now_ms: u64,
-) -> Result<RowsOperation<RetryRun>, RunError> {
-    Ok(RowsOperation::transaction(RetryRun {
+) -> Result<RetryRun, RunError> {
+    Ok(RetryRun {
         key: run_key(install_id, run_id),
         now_ms,
         audit: audit_rows(audit)?,
         phase: RetryPhase::Reading,
-    }))
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,18 +140,22 @@ enum RetryPhase {
     Writing(Box<PluginRun>),
 }
 
-impl Plan for RetryRun {
+impl Operation for RetryRun {
     type Output = PluginRun;
     type Error = RunError;
 
-    fn first(&mut self) -> Result<Turn<PluginRun>, RunError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<PluginRun>, RunError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_RUNS_KEYSPACE,
             self.key.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<PluginRun>, RunError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<PluginRun>, RunError> {
         match std::mem::replace(&mut self.phase, RetryPhase::Reading) {
             RetryPhase::Reading => {
                 let [found] = values::<1>(answer)?;
@@ -161,37 +169,37 @@ impl Plan for RetryRun {
                 let admission = Admission::new(run.clone());
                 let ask = admission.ask();
                 self.phase = RetryPhase::Admitting(Box::new(run), admission);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             RetryPhase::Admitting(run, mut admission) => {
                 let Some(rows) = admission.take(answer)? else {
                     let ask = admission.ask();
                     self.phase = RetryPhase::Admitting(run, admission);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 self.audit.splice(0..0, rows);
                 let scan = intent_scan(run.run_id);
                 let ask = scan.ask();
                 self.phase = RetryPhase::Intents(run, scan);
-                Ok(Turn::Ask(ask))
+                Ok(Next::Call(ask))
             }
             RetryPhase::Intents(run, mut scan) => {
                 let Some(intents) = scan.take(answer)? else {
                     let ask = scan.ask();
                     self.phase = RetryPhase::Intents(run, scan);
-                    return Ok(Turn::Ask(ask));
+                    return Ok(Next::Call(ask));
                 };
                 self.phase = RetryPhase::Deleting(run);
-                Ok(Turn::Ask(Ask::Delete(undone_keys(intents)?)))
+                Ok(Next::Call(delete_call(undone_keys(intents)?)))
             }
             RetryPhase::Deleting(run) => {
                 done(answer)?;
                 self.phase = RetryPhase::Writing(run);
-                Ok(Turn::Ask(Ask::Write(std::mem::take(&mut self.audit))))
+                Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.audit))))
             }
             RetryPhase::Writing(run) => {
                 done(answer)?;
-                Ok(Turn::Finish(*run))
+                Ok(Next::Done(*run))
             }
         }
     }
@@ -201,12 +209,12 @@ impl Plan for RetryRun {
 pub fn drop_completion(
     (install_id, work_id): (Ulid, Ulid),
     audit: &AdminAuditRecord,
-) -> Result<RowsOperation<DropCompletion>, RunError> {
-    Ok(RowsOperation::transaction(DropCompletion {
+) -> Result<DropCompletion, RunError> {
+    Ok(DropCompletion {
         lookup: WorkLookup::new(install_id, work_id),
         audit: audit_rows(audit)?,
         dropped: None,
-    }))
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -216,21 +224,25 @@ pub struct DropCompletion {
     dropped: Option<Box<WorkRow>>,
 }
 
-impl Plan for DropCompletion {
+impl Operation for DropCompletion {
     type Output = WorkRow;
     type Error = RunError;
 
-    fn first(&mut self) -> Result<Turn<WorkRow>, RunError> {
-        Ok(Turn::Ask(self.lookup.ask()))
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<WorkRow>, RunError> {
+    fn first(&mut self) -> Result<Next<WorkRow>, RunError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<WorkRow>, RunError> {
         if let Some(row) = self.dropped.take() {
             done(answer)?;
-            return Ok(Turn::Finish(*row));
+            return Ok(Next::Done(*row));
         }
         let (key, mut stored) = match self.lookup.take(answer)? {
-            Found::Ask(ask) => return Ok(Turn::Ask(ask)),
+            Found::Ask(ask) => return Ok(Next::Call(ask)),
             Found::Row(None) => return Err(RunError::NotFound),
             Found::Row(Some(found)) => found,
         };
@@ -241,7 +253,7 @@ impl Plan for DropCompletion {
         let mut rows = vec![row(PLUGIN_WORK_KEYSPACE, key, encode(&stored)?)];
         rows.append(&mut self.audit);
         self.dropped = Some(Box::new(stored));
-        Ok(Turn::Ask(Ask::Write(rows)))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 

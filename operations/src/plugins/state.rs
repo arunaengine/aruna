@@ -3,15 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_STATE_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{StateEntry, StateRefusal, StateRemoval, StateWrite};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::intents::settled_row;
 use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, StoreError, Turn, decode, encode, row, unexpected,
-    values,
+    Row, StoreError, decode, delete_call, encode, read_call, row, unexpected, values,
 };
 
 /// Bytes of one key, of one value, and of all keys and values of one install.
@@ -31,12 +32,18 @@ struct StateRow {
 }
 
 /// Why a put changed nothing, or failed in storage.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum PutError {
     #[error("{0}")]
     Refused(String, StateRefusal),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl From<IoError> for PutError {
+    fn from(error: IoError) -> Self {
+        Self::Store(error.into())
+    }
 }
 
 fn value_key(install_id: Ulid, key: &str) -> Vec<u8> {
@@ -59,10 +66,10 @@ fn version_key(install_id: Ulid) -> Vec<u8> {
 }
 
 /// Reads the install's value at `key`.
-pub(crate) fn read_state(install_id: Ulid, key: &str) -> RowsOperation<ReadState> {
-    RowsOperation::direct(ReadState {
+pub(crate) fn read_state(install_id: Ulid, key: &str) -> ReadState {
+    ReadState {
         key: value_key(install_id, key),
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -70,21 +77,21 @@ pub struct ReadState {
     key: Vec<u8>,
 }
 
-impl Plan for ReadState {
+impl Operation for ReadState {
     type Output = Option<StateEntry>;
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_STATE_KEYSPACE,
             self.key.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         let [row] = values::<1>(answer)?;
         let row = row.map(|bytes| decode::<StateRow>(&bytes)).transpose()?;
-        Ok(Turn::Finish(row.map(|row| StateEntry {
+        Ok(Next::Done(row.map(|row| StateEntry {
             version: row.version,
             value: row.value,
         })))
@@ -94,17 +101,13 @@ impl Plan for ReadState {
 /// Writes the value if the stored version is still `expected` (`None`: no value yet) and the
 /// install stays within its bytes, and settles the call's intent with the new version. Versions
 /// never repeat within an install, so one read before a removal never matches a later value.
-pub(crate) fn put_state(
-    run_id: Ulid,
-    install_id: Ulid,
-    put: StateWrite,
-) -> RowsOperation<PutState> {
-    RowsOperation::transaction(PutState {
+pub(crate) fn put_state(run_id: Ulid, install_id: Ulid, put: StateWrite) -> PutState {
+    PutState {
         run_id,
         install_id,
         put,
         written: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -116,16 +119,20 @@ pub struct PutState {
     written: Option<u64>,
 }
 
-impl Plan for PutState {
+impl Operation for PutState {
     type Output = u64;
     type Error = PutError;
 
-    fn first(&mut self) -> Result<Turn<u64>, PutError> {
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<u64>, PutError> {
         if self.put.value.len() > MAX_STATE_VALUE {
             let message = "a state value has at most 256 KiB".to_string();
             return Err(PutError::Refused(message, StateRefusal::Limit));
         }
-        Ok(Turn::Ask(Ask::Read(vec![
+        Ok(Next::Call(read_call(vec![
             (
                 PLUGIN_STATE_KEYSPACE,
                 value_key(self.install_id, &self.put.key),
@@ -135,10 +142,10 @@ impl Plan for PutState {
         ])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<u64>, PutError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<u64>, PutError> {
         if let Some(next) = self.written {
             return match answer {
-                Answer::Done => Ok(Turn::Finish(next)),
+                IoResult::Done => Ok(Next::Done(next)),
                 other => Err(unexpected(other).into()),
             };
         }
@@ -185,23 +192,19 @@ impl Plan for PutState {
             settled_row(self.run_id, &self.put.intent, next.to_string())?,
         ];
         self.written = Some(next);
-        Ok(Turn::Ask(Ask::Write(rows)))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
 /// Removes the value if the stored version is still `expected`, frees its bytes, and settles the
 /// call's intent; an absent value is a conflict, as it was not at that version.
-pub(crate) fn remove_state(
-    run_id: Ulid,
-    install_id: Ulid,
-    remove: StateRemoval,
-) -> RowsOperation<RemoveState> {
-    RowsOperation::transaction(RemoveState {
+pub(crate) fn remove_state(run_id: Ulid, install_id: Ulid, remove: StateRemoval) -> RemoveState {
+    RemoveState {
         run_id,
         install_id,
         remove,
         phase: RemovePhase::Reading,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -220,12 +223,16 @@ enum RemovePhase {
     Writing,
 }
 
-impl Plan for RemoveState {
+impl Operation for RemoveState {
     type Output = ();
     type Error = PutError;
 
-    fn first(&mut self) -> Result<Turn<()>, PutError> {
-        Ok(Turn::Ask(Ask::Read(vec![
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<()>, PutError> {
+        Ok(Next::Call(read_call(vec![
             (
                 PLUGIN_STATE_KEYSPACE,
                 value_key(self.install_id, &self.remove.key),
@@ -234,7 +241,7 @@ impl Plan for RemoveState {
         ])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, PutError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, PutError> {
         match (
             std::mem::replace(&mut self.phase, RemovePhase::Writing),
             answer,
@@ -257,10 +264,10 @@ impl Plan for RemoveState {
                 ];
                 self.phase = RemovePhase::Deleting(rows);
                 let key = value_key(self.install_id, &self.remove.key);
-                Ok(Turn::Ask(Ask::Delete(vec![(PLUGIN_STATE_KEYSPACE, key)])))
+                Ok(Next::Call(delete_call(vec![(PLUGIN_STATE_KEYSPACE, key)])))
             }
-            (RemovePhase::Deleting(rows), Answer::Done) => Ok(Turn::Ask(Ask::Write(rows))),
-            (RemovePhase::Writing, Answer::Done) => Ok(Turn::Finish(())),
+            (RemovePhase::Deleting(rows), IoResult::Done) => Ok(Next::Call(IoCall::Write(rows))),
+            (RemovePhase::Writing, IoResult::Done) => Ok(Next::Done(())),
             (_, other) => Err(unexpected(other).into()),
         }
     }
@@ -272,6 +279,7 @@ mod tests {
     use crate::driver::drive;
     use crate::plugins::broker::call_intent;
     use crate::plugins::intents::{Begun, begin};
+    use crate::plugins::rows::{page_result, values_result};
     use crate::plugins::runs::tests::opened;
     use aruna_plugins::broker::Intent;
 
@@ -454,7 +462,7 @@ mod tests {
             put: put("k", b"v", Some(3), 0),
             written: None,
         };
-        let Turn::Ask(Ask::Read(reads)) = plan.first().unwrap() else {
+        let Next::Call(IoCall::Read(reads)) = plan.first().unwrap() else {
             panic!("a put reads first");
         };
         assert_eq!(reads.len(), 3);
@@ -468,7 +476,7 @@ mod tests {
             )
         };
         let answer = |version, total: u64, last: u64| {
-            Answer::Values(vec![
+            values_result(vec![
                 stored(version),
                 Some(encode(&total).unwrap()),
                 Some(encode(&last).unwrap()),
@@ -481,12 +489,12 @@ mod tests {
             Err(PutError::Refused(_, StateRefusal::Conflict))
         ));
         // The stored version writes the value, the bytes, the version and the settled intent.
-        let Turn::Ask(Ask::Write(rows)) = plan.next(answer(3, 4, 7)).unwrap() else {
+        let Next::Call(IoCall::Write(rows)) = plan.next(answer(3, 4, 7)).unwrap() else {
             panic!("a matching put writes");
         };
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[2].2.to_vec(), encode(&8u64).unwrap());
-        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(8));
+        assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(8));
         // A value over its bound is refused before any read.
         let mut big = PutState {
             run_id: run,
@@ -499,7 +507,7 @@ mod tests {
             Err(PutError::Refused(_, StateRefusal::Limit))
         ));
         assert!(matches!(
-            plan.next(Answer::Page(Vec::new(), None)),
+            plan.next(page_result(Vec::new(), None)),
             Err(PutError::Store(_))
         ));
     }
@@ -518,27 +526,27 @@ mod tests {
             remove,
             phase: RemovePhase::Reading,
         };
-        assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+        assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
         let row = encode(&StateRow {
             version: 3,
             value: b"abc".to_vec(),
         })
         .unwrap();
-        let read = Answer::Values(vec![Some(row), Some(encode(&10u64).unwrap())]);
-        let Turn::Ask(Ask::Delete(keys)) = plan.next(read).unwrap() else {
+        let read = values_result(vec![Some(row), Some(encode(&10u64).unwrap())]);
+        let Next::Call(IoCall::Delete(keys)) = plan.next(read).unwrap() else {
             panic!("a matching removal deletes the value");
         };
         assert_eq!(keys, [(PLUGIN_STATE_KEYSPACE, value_key(install, "k"))]);
-        let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Done).unwrap() else {
+        let Next::Call(IoCall::Write(rows)) = plan.next(IoResult::Done).unwrap() else {
             panic!("the bytes and intent follow");
         };
         assert_eq!(rows[0].2.to_vec(), encode(&6u64).unwrap());
-        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
+        assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(()));
         let mut absent = RemoveState {
             phase: RemovePhase::Reading,
             ..plan
         };
-        let missing = absent.next(Answer::Values(vec![None, None]));
+        let missing = absent.next(values_result(vec![None, None]));
         assert!(matches!(
             missing,
             Err(PutError::Refused(_, StateRefusal::Conflict))
@@ -548,20 +556,20 @@ mod tests {
     #[test]
     fn read_state_entry() {
         let mut plan = ReadState { key: b"k".to_vec() };
-        assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+        assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
         let row = StateRow {
             version: 3,
             value: b"v".to_vec(),
         };
         let stored = encode(&row).unwrap();
-        let entry = plan.next(Answer::Values(vec![Some(stored)])).unwrap();
+        let entry = plan.next(values_result(vec![Some(stored)])).unwrap();
         let expected = StateEntry {
             version: 3,
             value: b"v".to_vec(),
         };
-        assert_eq!(entry, Turn::Finish(Some(expected)));
-        let missing = plan.next(Answer::Values(vec![None])).unwrap();
-        assert_eq!(missing, Turn::Finish(None));
-        assert!(plan.next(Answer::Done).is_err());
+        assert_eq!(entry, Next::Done(Some(expected)));
+        let missing = plan.next(values_result(vec![None])).unwrap();
+        assert_eq!(missing, Next::Done(None));
+        assert!(plan.next(IoResult::Done).is_err());
     }
 }

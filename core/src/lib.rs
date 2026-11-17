@@ -17,6 +17,7 @@ pub mod crate_merge;
 pub mod credential_encryption;
 pub mod cursor;
 pub mod deferred_topics;
+pub mod device_wipe;
 pub mod document;
 pub mod download_slots;
 pub mod effects;

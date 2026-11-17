@@ -242,7 +242,7 @@ pub async fn dispatch_payload(ctx: &JobContext, payload: &JobPayload) -> JobRunO
             Box::pin(crate::notifications::email::run_email_job(ctx, spec)).await
         }
         JobPayload::PluginWork(spec) => {
-            Box::pin(crate::jobs::plugin_work::run_plugin_work(ctx, spec)).await
+            Box::pin(crate::plugins::plugin_work::run_plugin_work(ctx, spec)).await
         }
         // Guard: an execution job must run through the external attempt path.
         JobPayload::Execution(_) => JobRunOutcome::Failed(JobError::permanent(

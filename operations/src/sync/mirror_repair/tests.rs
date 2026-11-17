@@ -16,7 +16,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Runnable};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::Actor;
@@ -174,11 +174,13 @@ fn storage_context() -> (tempfile::TempDir, DriverContext) {
     (tempdir, context)
 }
 
-async fn read_value(context: &DriverContext, effect: Effect) -> Option<Value> {
-    let Effect::Storage(effect) = effect else {
-        panic!("expected a storage read");
+async fn read_value(context: &DriverContext, space: &str, key: Key) -> Option<Value> {
+    let read = StorageEffect::Read {
+        key_space: space.to_string(),
+        key,
+        txn_id: None,
     };
-    match context.storage_handle.send_storage_effect(effect).await {
+    match context.storage_handle.send_storage_effect(read).await {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
         other => panic!("unexpected read event: {other:?}"),
     }
@@ -189,7 +191,7 @@ async fn repair_record(
     relationship: &SyncRelationship,
 ) -> Option<SyncMirrorRecord> {
     let key = repair_key(relationship);
-    let value = read_value(context, repair_read(&key, None)).await;
+    let value = read_value(context, MIRROR_REPAIR_KEYSPACE, key.clone()).await;
     decode_record(&key, value).unwrap()
 }
 
@@ -241,7 +243,7 @@ async fn outgoing(
     relationship: &SyncRelationship,
 ) -> Option<SyncRelationship> {
     let key = sync_relationship_key(relationship.source.bucket().unwrap(), relationship.id);
-    read_value(context, outgoing_read(&key.into(), None))
+    read_value(context, RELATIONSHIP_OUT_KEYSPACE, key.into())
         .await
         .map(|value| SyncRelationship::from_bytes(&value).unwrap())
 }
@@ -323,8 +325,9 @@ async fn claims_conflict() {
         let (_tempdir, context) = storage_context();
         let relationship = relationship();
         let record = staged_record(&context, &relationship).await;
-        let mut activation = CreateRelationshipOperation::activate(relationship.clone());
-        let mut rollback = SettleReconcileOperation::new(record.clone());
+        let mut activation =
+            CreateRelationshipOperation::activate(relationship.clone()).into_machine();
+        let mut rollback = SettleReconcileOperation::new(record.clone()).into_machine();
         let activation_commit = run_to_commit(&context, &mut activation).await;
         let rollback_commit = run_to_commit(&context, &mut rollback).await;
         let (first, second) = match activation_first {
@@ -392,7 +395,7 @@ async fn rollback_skips_stub() {
 
 #[test]
 fn repair_record_roundtrips() {
-    let record = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Reconcile);
+    let record = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Reconcile, 1);
     let key = record.relationship.id.to_bytes();
 
     assert_eq!(
@@ -659,7 +662,7 @@ async fn status_stays_handling() {
 async fn stale_reconcile_survives() {
     let (_tempdir, context) = storage_context();
     let relationship = relationship();
-    let mut stale = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    let mut stale = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile, 1);
     stale.due_at_ms = 0;
     store_record(&context, stale.clone()).await;
 
@@ -727,7 +730,7 @@ async fn repair_backs_off() {
     .unwrap();
     stage(&context, &relationship, SyncMirrorIntent::Reconcile).await;
 
-    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile, 1);
     record.due_at_ms = 0;
     let (key_space, key, value) = repair_entry(record).unwrap();
     assert!(matches!(
@@ -799,7 +802,7 @@ async fn policy_retry_survives() {
     )
     .await
     .unwrap();
-    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile);
+    let mut record = SyncMirrorRecord::new(relationship.clone(), SyncMirrorIntent::Reconcile, 1);
     record.due_at_ms = 0;
     store_record(&context, record).await;
 

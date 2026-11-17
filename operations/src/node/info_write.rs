@@ -5,23 +5,20 @@
 use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot};
 use aruna_core::document::{DocumentChange, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE, SYNC_REVISION_KEYSPACE,
 };
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUtilization, node_info_key,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 
 use aruna_core::node_state::OPERATOR_DRAIN_KEY;
@@ -33,17 +30,9 @@ pub(crate) const PUBLISH_OWED_KEY: &[u8] = b"publish_owed";
 #[derive(Debug, Error, PartialEq)]
 pub enum InfoWriteError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error("the node info document is invalid: {0}")]
     Document(String),
-    #[error("node info seed conflicted with another revision")]
-    SeedConflict,
-    #[error("node info revision lost a transaction conflict")]
-    Conflict,
-    #[error("unexpected event while {0}")]
-    UnexpectedEvent(&'static str),
-    #[error("the node info write has not finished")]
-    Unfinished,
 }
 
 /// What one revision changes in the stored advertisement.
@@ -114,34 +103,18 @@ enum Write {
     Revise { node_id: NodeId, change: InfoChange },
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
-    Idle,
     Generation,
-    Begin,
-    Read(TxnId),
-    Write(TxnId),
-    Commit,
-    Done(Result<bool, InfoWriteError>),
+    Read,
+    Write,
 }
 
-impl Phase {
-    fn label(&self) -> &'static str {
-        match self {
-            Phase::Idle => "idle",
-            Phase::Generation => "reading the membership generation",
-            Phase::Begin => "starting the transaction",
-            Phase::Read(_) => "reading the node info row",
-            Phase::Write(_) => "writing the node info row",
-            Phase::Commit => "committing the node info row",
-            Phase::Done(_) => "done",
-        }
-    }
-}
+type Turn = Result<Next<bool>, InfoWriteError>;
 
-/// Writes the info row and its owed revision marker together. A revision re-reads the row and
-/// the operator drain inside its transaction, so no publisher carries a stale drain forward;
-/// its lost conflict is retried by the runner. True when a row was written.
+/// Writes the info row and its owed revision marker in one transaction. A revision reads the
+/// membership generation, the row and the operator drain inside it, so no publisher carries a
+/// stale drain forward; its lost conflict is retried by the runner. True when a row was written.
 #[derive(Debug, PartialEq)]
 pub(crate) struct InfoWriteOperation {
     realm_id: RealmId,
@@ -171,82 +144,55 @@ impl InfoWriteOperation {
             write,
             now_ms,
             generation: 0,
-            phase: Phase::Idle,
+            phase: Phase::Generation,
         }
     }
 
-    fn begin(&mut self) -> Effects {
-        self.phase = Phase::Begin;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    /// Ends the run and releases its open transaction; the runner still sends the abort.
-    fn abort_with(&mut self, txn_id: TxnId, result: Result<bool, InfoWriteError>) -> Effects {
-        self.phase = Phase::Done(result);
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn writes(document: &NodeInfoDocument, txn_id: TxnId) -> Result<Effects, InfoWriteError> {
+    fn writes(document: &NodeInfoDocument) -> Result<Vec<(KeySpace, Key, Value)>, InfoWriteError> {
         // `to_bytes` validates, so an advertisement that broke its own bounds is never stored.
         let row = document
             .to_bytes()
             .map_err(|error| InfoWriteError::Document(error.to_string()))?;
         let owed = document.epoch.publisher_generation.to_be_bytes().to_vec();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    NODE_INFO_KEYSPACE.to_string(),
-                    Key::from(node_info_key(document.node_id)),
-                    Value::from(row),
-                ),
-                (
-                    COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-                    Key::from(PUBLISH_OWED_KEY.to_vec()),
-                    Value::from(owed),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
+        Ok(vec![
+            (
+                NODE_INFO_KEYSPACE.to_string(),
+                Key::from(node_info_key(document.node_id)),
+                Value::from(row),
+            ),
+            (
+                COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                Key::from(PUBLISH_OWED_KEY.to_vec()),
+                Value::from(owed),
+            ),
+        ])
     }
 
-    fn started(&mut self, txn_id: TxnId) -> Result<Effects, InfoWriteError> {
+    /// The info row and the operator drain of the revised node.
+    fn row_reads(&self) -> Vec<(KeySpace, Key)> {
         let node_id = match &self.write {
-            Write::Seed(document) => {
-                self.phase = Phase::Write(txn_id);
-                return Self::writes(document, txn_id);
-            }
+            Write::Seed(document) => document.node_id,
             Write::Revise { node_id, .. } => *node_id,
         };
-        self.phase = Phase::Read(txn_id);
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    NODE_INFO_KEYSPACE.to_string(),
-                    Key::from(node_info_key(node_id))
-                ),
-                (
-                    COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-                    Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
+        vec![
+            (
+                NODE_INFO_KEYSPACE.to_string(),
+                Key::from(node_info_key(node_id)),
+            ),
+            (
+                COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+                Key::from(OPERATOR_DRAIN_KEY.to_vec()),
+            ),
+        ]
     }
 
     /// The revised row, or `None` when there is no row or nothing durable changed.
     fn revised(
         &self,
-        values: &[(Key, Option<Value>)],
+        row: Option<Value>,
+        drain: Option<Value>,
     ) -> Result<Option<NodeInfoDocument>, InfoWriteError> {
-        let Write::Revise { change, .. } = &self.write else {
-            return Err(InfoWriteError::UnexpectedEvent("revising a seed"));
-        };
-        let [(_, row), (_, drain)] = values else {
-            return Err(InfoWriteError::UnexpectedEvent("reading the node info row"));
-        };
-        let Some(row) = row else {
+        let (Write::Revise { change, .. }, Some(row)) = (&self.write, row) else {
             return Ok(None);
         };
         let mut document = postcard::from_bytes::<NodeInfoDocument>(row.as_ref())
@@ -269,73 +215,14 @@ impl InfoWriteOperation {
         document.updated_at_ms = self.now_ms;
         Ok(Some(document))
     }
+}
 
-    fn read(&mut self, txn_id: TxnId, values: &[(Key, Option<Value>)]) -> Effects {
-        match self.revised(values) {
-            Ok(Some(document)) => match Self::writes(&document, txn_id) {
-                Ok(effects) => {
-                    self.phase = Phase::Write(txn_id);
-                    effects
-                }
-                Err(error) => self.abort_with(txn_id, Err(error)),
-            },
-            Ok(None) => self.abort_with(txn_id, Ok(false)),
-            Err(error) => self.abort_with(txn_id, Err(error)),
-        }
-    }
-
-    fn committed(&mut self, error: Option<StorageError>) -> Effects {
-        let result = match error {
-            None => Ok(true),
-            Some(StorageError::TransactionConflict) => match self.write {
-                Write::Seed(_) => Err(InfoWriteError::SeedConflict),
-                Write::Revise { .. } => Err(InfoWriteError::Conflict),
-            },
-            Some(error) => Err(error.into()),
-        };
-        self.phase = Phase::Done(result);
-        smallvec![]
-    }
-
-    fn advance(&mut self, event: StorageEvent) -> Effects {
-        let unexpected = Err(InfoWriteError::UnexpectedEvent(self.phase.label()));
-        match (std::mem::replace(&mut self.phase, Phase::Idle), event) {
-            (Phase::Generation, StorageEvent::ReadResult { value, .. }) => {
-                // An unreadable revision counts as generation zero, as a missing one does.
-                self.generation = value
-                    .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
-                    .map_or(0, |change| change.current.generation);
-                self.begin()
-            }
-            (Phase::Begin, StorageEvent::TransactionStarted { txn_id }) => {
-                match self.started(txn_id) {
-                    Ok(effects) => effects,
-                    Err(error) => self.abort_with(txn_id, Err(error)),
-                }
-            }
-            (Phase::Read(txn_id), StorageEvent::BatchReadResult { values }) => {
-                self.read(txn_id, &values)
-            }
-            (Phase::Write(txn_id), StorageEvent::BatchWriteResult { .. }) => {
-                self.phase = Phase::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (Phase::Commit, StorageEvent::TransactionCommitted { .. }) => self.committed(None),
-            (Phase::Commit, StorageEvent::Error { error }) => self.committed(Some(error)),
-            (Phase::Read(txn_id) | Phase::Write(txn_id), StorageEvent::Error { error }) => {
-                self.abort_with(txn_id, Err(error.into()))
-            }
-            (Phase::Generation | Phase::Begin, StorageEvent::Error { error }) => {
-                self.phase = Phase::Done(Err(error.into()));
-                smallvec![]
-            }
-            (Phase::Read(txn_id) | Phase::Write(txn_id), _) => self.abort_with(txn_id, unexpected),
-            _ => {
-                self.phase = Phase::Done(unexpected);
-                smallvec![]
-            }
-        }
-    }
+/// The realm config generation of its stored revision row; an unreadable revision counts as
+/// generation zero, as a missing one does.
+pub(crate) fn revision_generation(revision: Option<Value>) -> u64 {
+    revision
+        .and_then(|bytes| postcard::from_bytes::<DocumentChange>(bytes.as_ref()).ok())
+        .map_or(0, |change| change.current.generation)
 }
 
 /// The advertisement without telemetry and publication stamps; only a change here publishes.
@@ -360,80 +247,68 @@ fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
     view
 }
 
-impl EffectOperation for InfoWriteOperation {
+impl Operation for InfoWriteOperation {
     type Output = bool;
     type Error = InfoWriteError;
 
-    fn start(&mut self) -> Effects {
-        if matches!(self.write, Write::Seed(_)) {
-            return self.begin();
+    fn first(&mut self) -> Turn {
+        if let Write::Seed(document) = &self.write {
+            let writes = Self::writes(document)?;
+            self.phase = Phase::Write;
+            return Ok(Next::Call(IoCall::Write(writes)));
         }
-        self.phase = Phase::Generation;
         let target = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: SYNC_REVISION_KEYSPACE.to_string(),
-            key: sync_revision_key(&target),
-            txn_id: None,
-        })]
+        let read = (
+            SYNC_REVISION_KEYSPACE.to_string(),
+            sync_revision_key(&target),
+        );
+        Ok(Next::Call(IoCall::Read(vec![read])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(event) => self.advance(event),
-            _ => {
-                let unexpected = InfoWriteError::UnexpectedEvent(self.phase.label());
-                match std::mem::replace(&mut self.phase, Phase::Idle) {
-                    Phase::Read(txn_id) | Phase::Write(txn_id) => {
-                        self.abort_with(txn_id, Err(unexpected))
-                    }
-                    _ => {
-                        self.phase = Phase::Done(Err(unexpected));
-                        smallvec![]
-                    }
-                }
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (self.phase, result) {
+            (Phase::Generation, IoResult::Values(values)) => {
+                self.generation = revision_generation(values.into_iter().next().flatten());
+                self.phase = Phase::Read;
+                Ok(Next::Call(IoCall::Read(self.row_reads())))
             }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.phase, Phase::Done(_))
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.phase {
-            Phase::Done(result) => result,
-            _ => Err(InfoWriteError::Unfinished),
-        }
-    }
-
-    fn is_conflict(error: &Self::Error) -> bool {
-        *error == InfoWriteError::Conflict
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.phase {
-            Phase::Read(txn_id) | Phase::Write(txn_id) => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            (Phase::Read, IoResult::Values(values)) => {
+                let mut values = values.into_iter();
+                let (row, drain) = (values.next().flatten(), values.next().flatten());
+                let Some(document) = self.revised(row, drain)? else {
+                    return Ok(Next::Done(false));
+                };
+                self.phase = Phase::Write;
+                Ok(Next::Call(IoCall::Write(Self::writes(&document)?)))
             }
-            _ => smallvec![],
+            (Phase::Write, IoResult::Done) => Ok(Next::Done(true)),
+            _ => Err(IoError::Unexpected {
+                expected: "the answer to the node info call",
+                got: "another result",
+            }
+            .into()),
         }
+    }
+
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    /// Three attempts in all, as the publishers' own retry had.
+    fn conflict_retries() -> u32 {
+        2
     }
 }
 
 #[cfg(test)]
 mod state_machine_tests {
-    use aruna_core::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use aruna_core::structs::storage::node_info::NodeUrls;
-    use ulid::Ulid;
 
     use super::*;
 
     const REALM: RealmId = RealmId([3; 32]);
-    const TXN: TxnId = Ulid::from_parts(5, 5);
     const NOW: u64 = 9_000;
 
     fn node() -> NodeId {
@@ -470,72 +345,23 @@ mod state_machine_tests {
         }
     }
 
-    fn storage(event: StorageEvent) -> Event {
-        Event::Storage(event)
+    fn generation_read() -> Turn {
+        let target = DocumentTarget::RealmConfig { realm_id: REALM };
+        let read = (
+            SYNC_REVISION_KEYSPACE.to_string(),
+            sync_revision_key(&target),
+        );
+        Ok(Next::Call(IoCall::Read(vec![read])))
     }
 
-    fn begin() -> Effect {
-        Effect::Storage(StorageEffect::StartTransaction { read: false })
-    }
-
-    fn started() -> Event {
-        storage(StorageEvent::TransactionStarted { txn_id: TXN })
-    }
-
-    fn commit() -> Effect {
-        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
-    }
-
-    fn rollback() -> Effect {
-        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
-    }
-
-    fn conflict() -> Event {
-        storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        })
-    }
-
-    fn generation_read() -> Effect {
-        Effect::Storage(StorageEffect::Read {
-            key_space: SYNC_REVISION_KEYSPACE.to_string(),
-            key: sync_revision_key(&DocumentTarget::RealmConfig { realm_id: REALM }),
-            txn_id: None,
-        })
-    }
-
-    fn row_read() -> Effect {
-        Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    NODE_INFO_KEYSPACE.to_string(),
-                    Key::from(node_info_key(node())),
-                ),
-                (
-                    COMPUTE_DEPARTURE_KEYSPACE.to_string(),
-                    Key::from(OPERATOR_DRAIN_KEY.to_vec()),
-                ),
-            ],
-            txn_id: Some(TXN),
-        })
-    }
-
-    fn rows(row: Option<&NodeInfoDocument>, drained: bool) -> Event {
+    fn rows(row: Option<&NodeInfoDocument>, drained: bool) -> IoResult {
         let row = row.map(|document| Value::from(document.to_bytes().unwrap()));
-        let drain = drained.then(|| Value::from(vec![1]));
-        storage(StorageEvent::BatchReadResult {
-            values: vec![(Key::from(Vec::new()), row), (Key::from(Vec::new()), drain)],
-        })
+        IoResult::Values(vec![row, drained.then(|| Value::from(vec![1]))])
     }
 
-    fn written() -> Event {
-        storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        })
-    }
-
-    fn committed() -> Event {
-        storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    fn written(document: &NodeInfoDocument) -> Turn {
+        let writes = InfoWriteOperation::writes(document).unwrap();
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn leaving() -> InfoChange {
@@ -546,19 +372,19 @@ mod state_machine_tests {
         }
     }
 
-    fn revise(change: InfoChange) -> InfoWriteOperation {
-        InfoWriteOperation::revise(REALM, node(), change, NOW)
+    fn snapshots() -> InfoChange {
+        InfoChange::Snapshots {
+            reservation: ComputeReservationSnapshot::default(),
+            demand: ComputeDemandSnapshot::default(),
+        }
     }
 
-    /// A revision at the read step, generation zero.
+    /// A revision at the row read, generation zero.
     fn reading(change: InfoChange) -> InfoWriteOperation {
-        let mut operation = revise(change);
-        operation.start();
-        operation.step(storage(StorageEvent::ReadResult {
-            key: Key::from(Vec::new()),
-            value: None,
-        }));
-        operation.step(started());
+        let mut operation = InfoWriteOperation::revise(REALM, node(), change, NOW);
+        assert_eq!(operation.first(), generation_read());
+        let row_reads = Ok(Next::Call(IoCall::Read(operation.row_reads())));
+        assert_eq!(operation.next(IoResult::Values(vec![None])), row_reads);
         operation
     }
 
@@ -566,29 +392,14 @@ mod state_machine_tests {
     fn seed_writes_row() {
         let seeded = document(1);
         let mut operation = InfoWriteOperation::seed(REALM, seeded.clone());
-        let writes = InfoWriteOperation::writes(&seeded, TXN).unwrap().to_vec();
-        check_trace(
-            &mut operation,
-            &[begin()],
-            vec![
-                (started(), writes),
-                (written(), vec![commit()]),
-                (committed(), vec![]),
-            ],
-        );
-        assert_eq!(operation.finalize(), Ok(true));
-
-        let mut racing = InfoWriteOperation::seed(REALM, seeded);
-        racing.start();
-        racing.step(started());
-        racing.step(written());
-        racing.step(conflict());
-        assert_eq!(racing.finalize(), Err(InfoWriteError::SeedConflict));
+        assert!(operation.transaction());
+        assert_eq!(operation.first(), written(&seeded));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
     #[test]
     fn revision_stamps_epoch() {
-        let mut operation = revise(leaving());
+        let mut operation = reading(leaving());
         let mut expected = document(4);
         expected.leaving = true;
         expected.compute_draining = true;
@@ -600,134 +411,47 @@ mod state_machine_tests {
         expected.demand.epoch = expected.epoch;
         expected.reservation.epoch = expected.epoch;
         expected.updated_at_ms = NOW;
-        let writes = InfoWriteOperation::writes(&expected, TXN).unwrap().to_vec();
-        check_trace(
-            &mut operation,
-            &[generation_read()],
-            vec![
-                (
-                    storage(StorageEvent::ReadResult {
-                        key: Key::from(Vec::new()),
-                        value: None,
-                    }),
-                    vec![begin()],
-                ),
-                (started(), vec![row_read()]),
-                (rows(Some(&document(4)), false), writes),
-                (written(), vec![commit()]),
-                (committed(), vec![]),
-            ],
-        );
-        assert_eq!(operation.finalize(), Ok(true));
+        let answer = operation.next(rows(Some(&document(4)), false));
+        assert_eq!(answer, written(&expected));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
     }
 
     #[test]
-    fn unchanged_rows_abort() {
+    fn unchanged_rows_write_nothing() {
         // No row, or a change that alters nothing durable, writes nothing.
-        let snapshots = InfoChange::Snapshots {
-            reservation: ComputeReservationSnapshot::default(),
-            demand: ComputeDemandSnapshot::default(),
-        };
-        for (row, change) in [(None, leaving()), (Some(document(2)), snapshots)] {
+        for (row, change) in [(None, leaving()), (Some(document(2)), snapshots())] {
             let mut operation = reading(change);
-            assert_eq!(
-                operation.step(rows(row.as_ref(), false)).to_vec(),
-                vec![rollback()]
-            );
-            assert_eq!(operation.finalize(), Ok(false));
+            let answer = operation.next(rows(row.as_ref(), false));
+            assert_eq!(answer, Ok(Next::Done(false)));
         }
         // The operator's flag drains the advertisement although the change does not.
-        let mut drained = reading(InfoChange::Snapshots {
-            reservation: ComputeReservationSnapshot::default(),
-            demand: ComputeDemandSnapshot::default(),
-        });
-        let effects = drained.step(rows(Some(&document(2)), true));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchWrite { .. })]
-        ));
+        let mut drained = reading(snapshots());
+        let answer = drained.next(rows(Some(&document(2)), true));
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Write(_)))));
     }
 
     #[test]
     fn runner_retries_conflict() {
-        // A lost revision conflict ends the run for the runner's retry; a seed conflict is final.
-        let mut operation = reading(leaving());
-        operation.step(rows(Some(&document(1)), false));
-        operation.step(written());
-        assert!(operation.step(conflict()).is_empty());
-        let error = operation.finalize().unwrap_err();
-        assert_eq!(error, InfoWriteError::Conflict);
-        assert!(InfoWriteOperation::is_conflict(&error));
-        assert!(!InfoWriteOperation::is_conflict(
-            &InfoWriteError::SeedConflict
-        ));
+        // A lost conflict reruns the revision twice; other errors end it.
+        let conflict = InfoWriteError::from(IoError::Conflict);
+        assert!(InfoWriteOperation::is_conflict(&conflict));
+        assert_eq!(InfoWriteOperation::conflict_retries(), 2);
+        let document = InfoWriteError::Document(String::new());
+        assert!(!InfoWriteOperation::is_conflict(&document));
     }
 
     #[test]
-    fn failures_abort_open() {
-        let failed = || {
-            storage(StorageEvent::Error {
-                error: StorageError::Timeout,
-            })
-        };
-        let mut operation = reading(leaving());
-        assert_eq!(operation.step(failed()).to_vec(), vec![rollback()]);
-        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
-
+    fn refuses_bad_answers() {
         let mut garbled = reading(leaving());
-        let row = storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Key::from(Vec::new()), Some(Value::from(vec![0xff; 3]))),
-                (Key::from(Vec::new()), None),
-            ],
-        });
-        assert_eq!(garbled.step(row).to_vec(), vec![rollback()]);
+        let row = IoResult::Values(vec![Some(Value::from(vec![0xff; 3])), None]);
         assert!(matches!(
-            garbled.finalize(),
+            garbled.next(row),
             Err(InfoWriteError::Document(_))
         ));
-
-        let mut unknown = reading(leaving());
-        unknown.step(rows(Some(&document(1)), false));
-        unknown.step(written());
-        unknown.step(storage(StorageEvent::Error {
-            error: StorageError::CommitFailed,
-        }));
-        assert_eq!(unknown.finalize(), Err(StorageError::CommitFailed.into()));
-    }
-
-    #[test]
-    fn rejects_stray_events() {
-        let open = |event: &Event| {
-            matches!(
-                event,
-                Event::Storage(StorageEvent::BatchReadResult { .. } | StorageEvent::Error { .. })
-            )
-        };
-        for (label, effects, error) in rejects_events(|| reading(leaving()), sample_events, open) {
-            assert_eq!(effects.to_vec(), vec![rollback()], "{label}");
-            assert!(
-                matches!(error, InfoWriteError::UnexpectedEvent(_)),
-                "{label}"
-            );
-        }
-        let fresh = || revise(leaving());
-        assert_eq!(
-            rejects_events(fresh, sample_events, |_| false).len(),
-            sample_events().len()
-        );
-    }
-
-    #[test]
-    fn abort_releases_transaction() {
-        let mut operation = revise(leaving());
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        let mut open = reading(leaving());
-        check_abort(&mut open, &[rollback()]);
-        open.step(rows(Some(&document(1)), false));
-        check_abort(&mut open, &[rollback()]);
-        rejects_finalize(open);
+        let mut early = reading(leaving());
+        assert!(matches!(
+            early.next(IoResult::Done),
+            Err(InfoWriteError::Io(_))
+        ));
     }
 }

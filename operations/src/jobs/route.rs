@@ -2,17 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_repository::read_effect;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
-use aruna_core::events::{Event, JobControlEvent, NetEvent, StorageEvent};
+use aruna_core::events::{Event, JobControlEvent, NetEvent};
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::JobId;
 use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument, RealmId};
-use aruna_core::types::Effects;
-use smallvec::smallvec;
 use thiserror::Error;
 
 /// Where a routed job-control request must be served.
@@ -24,13 +23,7 @@ pub(crate) enum JobRouteOutcome {
     Remote(JobResponse),
 }
 
-#[derive(Debug, PartialEq)]
-enum RouteState {
-    Init,
-    LoadConfig,
-    AwaitResponse,
-    Done,
-}
+type Step = Result<Next<JobRouteOutcome>, JobRouteError>;
 
 /// Routes one job-control request to the node that can answer it. An external
 /// job names its responder from the family projection; every other job still
@@ -43,8 +36,8 @@ pub(crate) struct JobRouteOperation {
     request: Option<JobRequest>,
     /// Responder the caller resolved from the family projection, if any.
     responder: Option<NodeId>,
-    state: RouteState,
-    output: Option<Result<JobRouteOutcome, JobRouteError>>,
+    /// Whether the request went to a remote owner, so the next result is its answer.
+    sent: bool,
 }
 
 impl JobRouteOperation {
@@ -60,8 +53,7 @@ impl JobRouteOperation {
             job_id,
             request,
             responder: None,
-            state: RouteState::Init,
-            output: None,
+            sent: false,
         }
     }
 
@@ -71,112 +63,84 @@ impl JobRouteOperation {
         self
     }
 
-    fn send(&mut self, node: NodeId) -> Effects {
+    fn send(&mut self, node: NodeId) -> Step {
         if node == self.local_node {
-            return self.finish(Ok(JobRouteOutcome::Local));
+            return Ok(Next::Done(JobRouteOutcome::Local));
         }
-        match self.request.take() {
-            Some(request) => {
-                self.state = RouteState::AwaitResponse;
-                smallvec![Effect::Net(NetEffect::JobControl(Box::new(
-                    JobControlEffect {
-                        owner: node,
-                        request
-                    }
-                )))]
-            }
-            None => self.finish(Err(JobRouteError::Unauthorized)),
-        }
+        let request = self.request.take().ok_or(JobRouteError::Unauthorized)?;
+        self.sent = true;
+        let effect = JobControlEffect {
+            owner: node,
+            request,
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
+            NetEffect::JobControl(Box::new(effect)),
+        )))))
     }
 
-    fn finish(&mut self, result: Result<JobRouteOutcome, JobRouteError>) -> Effects {
-        self.state = RouteState::Done;
-        self.output = Some(result);
-        smallvec![]
-    }
-
-    fn route(&mut self, config: RealmConfigDocument) -> Effects {
+    fn route(&mut self, result: IoResult) -> Step {
+        let [value] = values::<1>(result)?;
+        let value = value
+            .ok_or_else(|| JobRouteError::Unavailable("realm config unavailable".to_string()))?;
+        let config = RealmConfigDocument::from_bytes(&value).map_err(|error| {
+            JobRouteError::Unavailable(format!("realm config undecodable: {error}"))
+        })?;
         match config.job_owner(self.job_id) {
             // Only a provably invalid id is absence; unsynced state is 503.
-            Err(JobOwnerError::NotJobControl) => self.finish(Err(JobRouteError::NotFound)),
-            Err(JobOwnerError::Unavailable(message)) => {
-                self.finish(Err(JobRouteError::Unavailable(message)))
-            }
+            Err(JobOwnerError::NotJobControl) => Err(JobRouteError::NotFound),
+            Err(JobOwnerError::Unavailable(message)) => Err(JobRouteError::Unavailable(message)),
             Ok(owner) => self.send(owner),
         }
     }
 }
 
-impl EffectOperation for JobRouteOperation {
+/// The remote owner's answer to a sent request.
+fn answer(result: IoResult) -> Step {
+    let event = match result {
+        IoResult::Event(event) => *event,
+        other => {
+            let got = other.label();
+            return Err(JobRouteError::Unavailable(format!(
+                "unexpected result while awaiting job response: {got}"
+            )));
+        }
+    };
+    match event {
+        Event::Net(NetEvent::JobControl(JobControlEvent::Response(response))) => {
+            Ok(Next::Done(JobRouteOutcome::Remote(*response)))
+        }
+        Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(message))) => Err(
+            JobRouteError::Unavailable(format!("job owner unreachable: {message}")),
+        ),
+        other => Err(JobRouteError::Unavailable(format!(
+            "unexpected event while awaiting job response: {}",
+            other.label()
+        ))),
+    }
+}
+
+impl Operation for JobRouteOperation {
     type Output = JobRouteOutcome;
     type Error = JobRouteError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> Step {
         if let Some(responder) = self.responder {
             return self.send(responder);
         }
-        self.state = RouteState::LoadConfig;
-        smallvec![read_effect(
-            &DocumentTarget::RealmConfig {
-                realm_id: self.realm_id,
-            },
-            None,
-        )]
+        let config = DocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        Ok(Next::Call(IoCall::Read(vec![(
+            config.storage_keyspace().to_string(),
+            config.storage_key(),
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            RouteState::LoadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => match RealmConfigDocument::from_bytes(&value) {
-                    Ok(config) => self.route(config),
-                    Err(error) => self.finish(Err(JobRouteError::Unavailable(format!(
-                        "realm config undecodable: {error}"
-                    )))),
-                },
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => self.finish(Err(
-                    JobRouteError::Unavailable("realm config unavailable".to_string()),
-                )),
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.finish(Err(JobRouteError::Unavailable(error.to_string())))
-                }
-                other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while loading realm config: {}",
-                    other.label()
-                )))),
-            },
-            RouteState::AwaitResponse => match event {
-                Event::Net(NetEvent::JobControl(JobControlEvent::Response(response))) => {
-                    self.finish(Ok(JobRouteOutcome::Remote(*response)))
-                }
-                Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(message))) => self
-                    .finish(Err(JobRouteError::Unavailable(format!(
-                        "job owner unreachable: {message}"
-                    )))),
-                other => self.finish(Err(JobRouteError::Unavailable(format!(
-                    "unexpected event while awaiting job response: {}",
-                    other.label()
-                )))),
-            },
-            RouteState::Init | RouteState::Done => self.finish(Err(JobRouteError::Unavailable(
-                format!("unexpected event outside a route: {}", event.label()),
-            ))),
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.sent {
+            true => answer(result),
+            false => self.route(result),
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RouteState::Done)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(JobRouteError::Unavailable(
-            "job routing finished without output".to_string(),
-        )))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -201,11 +165,19 @@ pub enum JobRouteError {
     Internal(String),
 }
 
+impl From<aruna_core::calls::IoError> for JobRouteError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Storage(error) => Self::Unavailable(error.to_string()),
+            error => Self::Unavailable(error.to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::jobs::{JobKind, JobResponse, JobStatusView};
     use aruna_core::metadata::AuthToken;
     use aruna_core::structs::execution::job::{JobProgress, JobState, WorkspaceMode};
@@ -217,36 +189,20 @@ mod pure_tests {
     use aruna_core::structured_id::{BucketId, PlacementHandle};
     use ulid::Ulid;
 
-    // An event before `start`, or after the route settled, is refused.
+    // A result that is not the config read is refused.
     #[test]
-    fn rejects_unsent_events() {
-        let route = || {
-            JobRouteOperation::new(
-                RealmId([1u8; 32]),
-                node(1),
-                JobId::from_bytes([1u8; 16]),
-                None,
-            )
-        };
-        let empty = || {
-            Event::Storage(StorageEvent::ReadResult {
-                key: Vec::<u8>::new().into(),
-                value: None,
-            })
-        };
-        let unexpected = |result: Result<JobRouteOutcome, JobRouteError>| matches!(result, Err(JobRouteError::Unavailable(message)) if message.contains("unexpected"));
-
-        let mut early = route();
-        early.step(empty());
-        assert!(early.is_complete());
-        assert!(unexpected(early.finalize()));
-
-        let mut settled = route();
-        settled.start();
-        settled.step(empty());
-        assert!(settled.is_complete());
-        settled.step(empty());
-        assert!(unexpected(settled.finalize()));
+    fn rejects_unfit_result() {
+        let mut route = JobRouteOperation::new(
+            RealmId([1u8; 32]),
+            node(1),
+            JobId::from_bytes([1u8; 16]),
+            None,
+        );
+        assert!(matches!(route.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 1));
+        assert!(matches!(
+            route.next(IoResult::Done),
+            Err(JobRouteError::Unavailable(_))
+        ));
     }
 
     fn node(seed: u8) -> NodeId {
@@ -313,15 +269,16 @@ mod pure_tests {
         })
     }
 
-    fn config_read(bytes: Vec<u8>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: Some(bytes.into()),
-        })
+    fn config_read(bytes: Vec<u8>) -> IoResult {
+        IoResult::Values(vec![Some(bytes.into())])
     }
 
-    // The remote path emits exactly one JobControl effect, then the response
-    // becomes the operation output; no I/O runs inside start/step.
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    // The remote path makes exactly one JobControl call, then the response
+    // becomes the operation output.
     #[test]
     fn remote_routes_effect() {
         let realm_id = RealmId([1u8; 32]);
@@ -331,15 +288,13 @@ mod pure_tests {
             job_id,
         };
         let mut op = JobRouteOperation::new(realm_id, node(3), job_id, Some(request));
-        let start = op.start();
-        assert!(matches!(
-            start.as_slice(),
-            [Effect::Storage(StorageEffect::Read { .. })]
-        ));
+        assert!(matches!(op.first(), Ok(Next::Call(IoCall::Read(_)))));
 
-        let effects = op.step(config_read(config));
-        let [Effect::Net(NetEffect::JobControl(job_control))] = effects.as_slice() else {
-            panic!("remote owner must emit one job-control effect");
+        let Ok(Next::Call(IoCall::Effect(effect))) = op.next(config_read(config)) else {
+            panic!("remote owner must make one job-control call");
+        };
+        let Effect::Net(NetEffect::JobControl(job_control)) = *effect else {
+            panic!("remote owner must make one job-control call");
         };
         assert_eq!(job_control.owner, node(7));
 
@@ -347,25 +302,27 @@ mod pure_tests {
             job: status_view(job_id, user(realm_id)),
             run_crate: None,
         };
-        let done = op.step(Event::Net(NetEvent::JobControl(JobControlEvent::Response(
-            Box::new(response.clone()),
+        let answered = Event::Net(NetEvent::JobControl(JobControlEvent::Response(Box::new(
+            response.clone(),
         ))));
-        assert!(done.is_empty());
-        assert!(op.is_complete());
-        assert_eq!(op.finalize(), Ok(JobRouteOutcome::Remote(response)));
+        assert_eq!(
+            op.next(event(answered)),
+            Ok(Next::Done(JobRouteOutcome::Remote(response)))
+        );
     }
 
-    // An owner that matches the serving node resolves locally with no effect.
+    // An owner that matches the serving node resolves locally with no call.
     #[test]
     fn local_owner_resolves() {
         let realm_id = RealmId([1u8; 32]);
         let owner = node(5);
         let (config, job_id) = owned_job(realm_id, owner);
         let mut op = JobRouteOperation::new(realm_id, owner, job_id, None);
-        op.start();
-        let effects = op.step(config_read(config));
-        assert!(effects.is_empty());
-        assert_eq!(op.finalize(), Ok(JobRouteOutcome::Local));
+        op.first().expect("config read");
+        assert_eq!(
+            op.next(config_read(config)),
+            Ok(Next::Done(JobRouteOutcome::Local))
+        );
     }
 
     // An unreachable owner is Unavailable (503), never a false 404.
@@ -378,26 +335,27 @@ mod pure_tests {
             job_id,
         };
         let mut op = JobRouteOperation::new(realm_id, node(3), job_id, Some(request));
-        op.start();
-        op.step(config_read(config));
-        op.step(Event::Net(NetEvent::JobControl(
-            JobControlEvent::Unavailable("stream open timed out".to_string()),
+        op.first().expect("config read");
+        op.next(config_read(config)).expect("job-control call");
+        let unreachable = Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(
+            "stream open timed out".to_string(),
         )));
         assert!(matches!(
-            op.finalize(),
+            op.next(event(unreachable)),
             Err(JobRouteError::Unavailable(message)) if message.contains("job owner unreachable")
         ));
     }
 
-    // A remote owner reached without a token is Unauthorized before any effect.
+    // A remote owner reached without a token is Unauthorized before any call.
     #[test]
     fn remote_without_token() {
         let realm_id = RealmId([1u8; 32]);
         let (config, job_id) = owned_job(realm_id, node(7));
         let mut op = JobRouteOperation::new(realm_id, node(3), job_id, None);
-        op.start();
-        let effects = op.step(config_read(config));
-        assert!(effects.is_empty());
-        assert_eq!(op.finalize(), Err(JobRouteError::Unauthorized));
+        op.first().expect("config read");
+        assert_eq!(
+            op.next(config_read(config)),
+            Err(JobRouteError::Unauthorized)
+        );
     }
 }

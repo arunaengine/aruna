@@ -13,6 +13,7 @@ use super::*;
 use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;
+use crate::plugins::rows::page_result;
 use crate::plugins::store::Txn;
 use crate::plugins::worker::prune_audit;
 
@@ -139,19 +140,22 @@ fn old_hooks_go() {
         phase: HooksPhase::Times,
         pruned: 0,
     };
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
     let (old, young) = (
         hook_time_key(50, install, "d1"),
         hook_time_key(150, install, "d2"),
     );
     let page = vec![(old.clone(), Vec::new()), (young, Vec::new())];
-    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Page(page, None)).unwrap() else {
+    let Next::Call(IoCall::Delete(keys)) = plan.next(page_result(page, None)).unwrap() else {
         panic!("the old delivery id and its time row go");
     };
     let expected = vec![
         (PLUGIN_HOOKS_KEYSPACE, hook_key(install, "d1")),
         (PLUGIN_HOOKS_KEYSPACE, old),
     ];
-    assert_eq!(keys, expected);
-    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+    assert_eq!(IoCall::Delete(keys), delete_call(expected));
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
 }

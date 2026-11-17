@@ -6,18 +6,14 @@ use super::{
     S3SessionCredentials, S3SessionError, build_session, decode_index, expiry_key, owner_key,
 };
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{PreviousCredential, S3Session, SESSION_MAX_TTL};
-use aruna_core::types::{Effects, GroupId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Value};
 use std::time::SystemTime;
-use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub struct RefreshS3Config {
@@ -30,16 +26,11 @@ pub struct RefreshS3Config {
     pub issued_by: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RefreshSessionState {
-    Init,
-    StartTransaction,
-    ReadRecords,
-    DeleteExpiry,
-    WriteSession,
-    CommitTransaction,
-    Finish,
-    Error,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshPhase {
+    Read,
+    Delete,
+    Write,
 }
 
 #[derive(Debug, PartialEq)]
@@ -47,9 +38,7 @@ pub struct RefreshS3Operation {
     config: RefreshS3Config,
     encryption_key: CredentialEncryptionKey,
     pending: Option<S3SessionCredentials>,
-    txn_id: Option<Ulid>,
-    state: RefreshSessionState,
-    output: Result<S3SessionCredentials, S3SessionError>,
+    phase: RefreshPhase,
 }
 
 impl RefreshS3Operation {
@@ -58,112 +47,53 @@ impl RefreshS3Operation {
             config,
             encryption_key,
             pending: None,
-            txn_id: None,
-            state: RefreshSessionState::Init,
-            output: Err(S3SessionError::NotFinished),
+            phase: RefreshPhase::Read,
         }
     }
 
-    fn fail(&mut self, error: S3SessionError) -> Effects {
-        self.state = RefreshSessionState::Error;
-        self.output = Err(error);
-        self.abort()
-    }
-
-    fn start_refresh(&mut self) -> Effects {
-        if !matches!(self.state, RefreshSessionState::Init) {
-            return self.fail(S3SessionError::Failed);
-        }
-        if !S3Session::valid_access_key(&self.config.access_key) {
-            return self.fail(S3SessionError::InvalidAccessKey);
-        }
-        let Ok(ttl) = self.config.expiry.duration_since(self.config.now) else {
-            return self.fail(S3SessionError::InvalidExpiry);
-        };
-        if ttl.is_zero() || ttl > SESSION_MAX_TTL {
-            return self.fail(S3SessionError::InvalidExpiry);
-        }
-        self.state = RefreshSessionState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionStarted");
-        };
-        self.txn_id = Some(txn_id);
-        self.state = RefreshSessionState::ReadRecords;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    S3_SESSION_KEYSPACE.to_string(),
-                    self.config.access_key.as_bytes().into(),
-                ),
-                (
-                    SESSION_OWNER_KEYSPACE.to_string(),
-                    owner_key(self.config.user_identity, self.config.group_id),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn records_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected(event, "StorageEvent::BatchReadResult");
-        };
-        if values.len() != 2 {
-            return self.fail(S3SessionError::IndexInconsistent);
-        }
-        let Some(session_value) = values[0].1.as_ref() else {
-            return self.fail(S3SessionError::NotFound);
-        };
-        let session = match S3Session::from_bytes(session_value.as_ref()) {
-            Ok(session) => session,
-            Err(error) => return self.fail(error.into()),
-        };
+    /// Checks that the session may be refreshed now and builds its successor; the old expiry
+    /// row goes next.
+    fn records_read(
+        &mut self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        let [session_value, index_value] = <[Option<Value>; 2]>::try_from(values)
+            .map_err(|_| S3SessionError::IndexInconsistent)?;
+        let session_value = session_value.ok_or(S3SessionError::NotFound)?;
+        let session = S3Session::from_bytes(session_value.as_ref())?;
         if session.access_key != self.config.access_key {
-            return self.fail(S3SessionError::IndexInconsistent);
+            return Err(S3SessionError::IndexInconsistent);
         }
         if session.user_identity != self.config.user_identity {
-            return self.fail(S3SessionError::WrongOwner);
+            return Err(S3SessionError::WrongOwner);
         }
         if session.group_id != self.config.group_id {
-            return self.fail(S3SessionError::WrongGroup);
+            return Err(S3SessionError::WrongGroup);
         }
         if session.issued_by != self.config.issued_by {
-            return self.fail(S3SessionError::WrongIssuer);
+            return Err(S3SessionError::WrongIssuer);
         }
         if session.is_expired(self.config.now) {
-            return self.fail(S3SessionError::Expired);
+            return Err(S3SessionError::Expired);
         }
         if !session.can_refresh(self.config.now) {
-            return self.fail(S3SessionError::TooEarly);
+            return Err(S3SessionError::TooEarly);
         }
         if session.last_used_at.is_none() {
-            return self.fail(S3SessionError::Idle);
+            return Err(S3SessionError::Idle);
         }
         if self.config.expiry <= session.expiry {
-            return self.fail(S3SessionError::NotExtended);
+            return Err(S3SessionError::NotExtended);
         }
         // Only one replaced pair is kept, so it must lapse before the next rotation.
-        if session
-            .previous
-            .as_ref()
-            .is_some_and(|previous| previous.expiry > self.config.now)
-        {
-            return self.fail(S3SessionError::TooEarly);
+        if (session.previous.as_ref()).is_some_and(|previous| previous.expiry > self.config.now) {
+            return Err(S3SessionError::TooEarly);
         }
-        let index = match decode_index(values[1].1.as_ref()) {
-            Ok(index) => index,
-            Err(error) => return self.fail(error),
-        };
+        let index = decode_index(index_value.as_ref())?;
         if !index.contains(&self.config.access_key) {
-            return self.fail(S3SessionError::IndexInconsistent);
+            return Err(S3SessionError::IndexInconsistent);
         }
-        let mut pending = match build_session(
+        let mut pending = build_session(
             self.config.access_key.clone(),
             self.config.user_identity,
             self.config.group_id,
@@ -171,139 +101,133 @@ impl RefreshS3Operation {
             self.config.path_restrictions.clone(),
             self.config.issued_by,
             &self.encryption_key,
-        ) {
-            Ok(pending) => pending,
-            Err(error) => return self.fail(error),
-        };
+        )?;
         // Requests signed before this refresh stay valid until the old expiry.
         pending.session.previous = Some(PreviousCredential {
             secret: session.secret.clone(),
             token_hash: session.token_hash.clone(),
             expiry: session.expiry,
         });
-        let old_expiry = session.expiry;
-        let old_key = match expiry_key(old_expiry, &self.config.access_key) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error),
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
+        let old_key = expiry_key(session.expiry, &self.config.access_key)?;
         self.pending = Some(pending);
-        self.state = RefreshSessionState::DeleteExpiry;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: SESSION_EXPIRY_KEYSPACE.to_string(),
-            key: old_key,
-            txn_id: Some(txn_id),
-        })]
+        self.phase = RefreshPhase::Delete;
+        Ok(Next::Call(IoCall::Delete(vec![(
+            SESSION_EXPIRY_KEYSPACE.to_string(),
+            old_key,
+        )])))
     }
 
-    fn expiry_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::DeleteResult");
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        let Some(pending) = self.pending.as_ref() else {
-            return self.fail(S3SessionError::Failed);
-        };
-        let session_bytes = match pending.session.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-        let expiry_key = match expiry_key(pending.session.expiry, &pending.access_key_id) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error),
-        };
-        let owner_key = owner_key(self.config.user_identity, self.config.group_id);
-        self.state = RefreshSessionState::WriteSession;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    S3_SESSION_KEYSPACE.to_string(),
-                    pending.access_key_id.as_bytes().into(),
-                    session_bytes.into(),
-                ),
-                (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key, owner_key,),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn session_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::BatchWriteResult");
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = RefreshSessionState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionCommitted");
-        };
-        self.txn_id = None;
-        let Some(pending) = self.pending.take() else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.output = Ok(pending);
-        self.state = RefreshSessionState::Finish;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, received: Event, expected: &'static str) -> Effects {
-        self.fail(S3SessionError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            received: received.label(),
-        })
+    /// The refreshed session row and its new expiry row.
+    fn write(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        let pending = self.pending.as_ref().ok_or(S3SessionError::Failed)?;
+        let session_bytes = pending.session.to_bytes()?;
+        let expiry = expiry_key(pending.session.expiry, &pending.access_key_id)?;
+        let owner = owner_key(self.config.user_identity, self.config.group_id);
+        self.phase = RefreshPhase::Write;
+        Ok(Next::Call(IoCall::Write(vec![
+            (
+                S3_SESSION_KEYSPACE.to_string(),
+                pending.access_key_id.as_bytes().into(),
+                session_bytes.into(),
+            ),
+            (SESSION_EXPIRY_KEYSPACE.to_string(), expiry, owner),
+        ])))
     }
 }
 
-impl EffectOperation for RefreshS3Operation {
+impl Operation for RefreshS3Operation {
     type Output = S3SessionCredentials;
     type Error = S3SessionError;
 
-    fn start(&mut self) -> Effects {
-        self.start_refresh()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone().into());
+    fn first(&mut self) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        if !S3Session::valid_access_key(&self.config.access_key) {
+            return Err(S3SessionError::InvalidAccessKey);
         }
-        match self.state {
-            RefreshSessionState::StartTransaction => self.transaction_started(event),
-            RefreshSessionState::ReadRecords => self.records_read(event),
-            RefreshSessionState::DeleteExpiry => self.expiry_deleted(event),
-            RefreshSessionState::WriteSession => self.session_written(event),
-            RefreshSessionState::CommitTransaction => self.transaction_committed(event),
-            RefreshSessionState::Init
-            | RefreshSessionState::Finish
-            | RefreshSessionState::Error => self.unexpected(event, "valid session operation event"),
+        let ttl = (self.config.expiry.duration_since(self.config.now))
+            .map_err(|_| S3SessionError::InvalidExpiry)?;
+        if ttl.is_zero() || ttl > SESSION_MAX_TTL {
+            return Err(S3SessionError::InvalidExpiry);
+        }
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                S3_SESSION_KEYSPACE.to_string(),
+                self.config.access_key.as_bytes().into(),
+            ),
+            (
+                SESSION_OWNER_KEYSPACE.to_string(),
+                owner_key(self.config.user_identity, self.config.group_id),
+            ),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<S3SessionCredentials>, S3SessionError> {
+        match self.phase {
+            RefreshPhase::Read => self.records_read(result.values()?),
+            RefreshPhase::Delete => {
+                result.done()?;
+                self.write()
+            }
+            RefreshPhase::Write => {
+                result.done()?;
+                let pending = self.pending.take().ok_or(S3SessionError::Failed)?;
+                Ok(Next::Done(pending))
+            }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RefreshSessionState::Finish | RefreshSessionState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use std::time::Duration;
+    use ulid::Ulid;
+
+    fn config(expiry: Duration) -> RefreshS3Config {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        RefreshS3Config {
+            access_key: S3Session::build_access_key("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1; 32])),
+            group_id: Ulid::from_parts(3, 3),
+            now,
+            expiry: now + expiry,
+            path_restrictions: None,
+            issued_by: [1; 32],
+        }
+    }
+
+    fn operation(expiry: Duration) -> RefreshS3Operation {
+        let key = CredentialEncryptionKey::derive(&[7u8; 32]);
+        RefreshS3Operation::new(config(expiry), key)
+    }
+
+    #[test]
+    fn reads_session_index() {
+        let mut refresh = operation(Duration::from_secs(60));
+        let Ok(Next::Call(IoCall::Read(reads))) = refresh.first() else {
+            panic!("expected the session and index read");
+        };
+        assert_eq!(reads.len(), 2);
+        assert!(refresh.transaction());
+        let missing = refresh.next(IoResult::Values(vec![None, None]));
+        assert_eq!(missing, Err(S3SessionError::NotFound));
+        let short = refresh.next(IoResult::Values(vec![None]));
+        assert_eq!(short, Err(S3SessionError::IndexInconsistent));
+    }
+
+    #[test]
+    fn refuses_bad_expiry() {
+        let mut zero = operation(Duration::ZERO);
+        assert_eq!(zero.first(), Err(S3SessionError::InvalidExpiry));
+        let mut long = operation(SESSION_MAX_TTL + Duration::from_secs(1));
+        assert_eq!(long.first(), Err(S3SessionError::InvalidExpiry));
     }
 }

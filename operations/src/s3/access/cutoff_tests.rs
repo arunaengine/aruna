@@ -9,7 +9,7 @@ use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::TokenRevocation;
 use aruna_core::structs::storage::blob::never_expiry;
-use aruna_core::types::Value;
+use aruna_core::types::{Key, Value};
 
 const CUTOFF: u64 = 1_000_000;
 
@@ -79,43 +79,40 @@ fn deletes_cut_off() {
         row(&credential(user(4), CUTOFF - 10, node(1), 4)),
     ];
     let mut operation = sweep(CUTOFF + 60);
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
-    ));
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
     let value = Some(config.to_bytes(&actor).unwrap().into());
-    let key = Key::from(Vec::new());
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult { key, value }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { start: None, .. })]
-    ));
+    let next = operation.next(IoResult::Values(vec![value]));
+    let first_page = Next::Call(IoCall::Page {
+        space: USER_ACCESS_KEYSPACE.to_string(),
+        prefix: Key::from(Vec::new()),
+        after: None,
+        limit: PAGE,
+    });
+    assert_eq!(next, Ok(first_page));
 
     let last = rows[3].0.clone();
-    let page = StorageEvent::IterResult {
-        values: rows,
-        next_start_after: Some(last.clone()),
+    let page = IoResult::Page {
+        rows,
+        next: Some(last.clone()),
     };
-    let effects = operation.step(Event::Storage(page));
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    let next = operation.next(page);
+    assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
     assert!(
         operation.pending.is_empty(),
         "exactly one credential is cut off"
     );
 
     let revoked = SubOperationEvent::TokenRevoked { result: Ok(()) };
-    let effects = operation.step(Event::SubOperation(revoked));
-    let [Effect::Storage(StorageEffect::Iter { start, .. })] = effects.as_slice() else {
-        panic!("expected the next page, got {effects:?}");
+    let next = operation.next(IoResult::Event(Box::new(Event::SubOperation(revoked))));
+    let Ok(Next::Call(IoCall::Page { after, .. })) = next else {
+        panic!("expected the next page, got {next:?}");
     };
-    assert_eq!(start, &Some(IterStart::After(last)));
-    let empty = StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
+    assert_eq!(after, Some(last));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
     };
-    assert!(operation.step(Event::Storage(empty)).is_empty());
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Ok(1));
+    assert_eq!(operation.next(empty), Ok(Next::Done(1)));
 }
 
 #[test]
@@ -131,21 +128,15 @@ fn pruned_cutoff_keeps() {
 #[test]
 fn missing_config_finishes() {
     let mut operation = sweep(CUTOFF);
-    operation.start();
-    let read = StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value: None,
-    };
-    assert!(operation.step(Event::Storage(read)).is_empty());
-    assert_eq!(operation.finalize(), Ok(0));
+    let read = IoResult::Values(vec![None]);
+    assert_eq!(operation.next(read), Ok(Next::Done(0)));
 
-    // An event that does not fit the state fails the sweep instead of being ignored.
+    // A result that does not fit the state fails the sweep instead of being ignored.
     let mut operation = sweep(CUTOFF);
-    operation.start();
     let revoked = SubOperationEvent::TokenRevoked { result: Ok(()) };
-    operation.step(Event::SubOperation(revoked));
+    let wrong = IoResult::Event(Box::new(Event::SubOperation(revoked)));
     assert!(matches!(
-        operation.finalize(),
-        Err(CutoffSweepError::UnexpectedEvent { .. })
+        operation.next(wrong),
+        Err(CutoffSweepError::Io(IoError::Unexpected { .. }))
     ));
 }

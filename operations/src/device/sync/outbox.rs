@@ -29,14 +29,15 @@ use crate::device::backlog::{ForwardOutcome, QueueDrain, arm_timer, drain_queue}
 
 use crate::device::drain::DrainOutcome;
 use crate::device::retry::{exhausted, retry_due_ms};
+use crate::device::scan_rows::ScanRowsOperation;
 use crate::driver::{DriverContext, drive};
 use crate::placement::process_placements::load_realm_config;
 
 use super::folders::FolderError;
 use super::pull::forward_pull;
 use super::repository::{
-    MAX_UPLOAD_ATTEMPTS, RequeueUploadsOperation, SYNC_PAGE_SIZE, StoreUploadOperation, SyncUpload,
-    UploadState, base_entry, base_key, folder_key, same_version,
+    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, StoreUploadOperation, SyncUpload, UploadState, base_entry,
+    base_key, folder_key, requeued, same_version,
 };
 use super::rows::{abort_txn, commit_txn, read_value, start_txn, write_rows};
 
@@ -397,8 +398,21 @@ async fn park(context: &Arc<DriverContext>, upload: &SyncUpload, reason: String,
 /// Makes every backed-off upload due now and re-arms retryable failures, for an explicit
 /// owner-requested sync. A running pull keeps its polls.
 pub(crate) async fn requeue_uploads(context: &Arc<DriverContext>, now_ms: u64) {
-    if let Err(error) = drive(RequeueUploadsOperation::new(now_ms), context).await {
-        warn!(error = %error, "Failed to requeue the folder uploads");
+    let scan = ScanRowsOperation::new(SYNC_UPLOAD_KEYSPACE, None, SYNC_PAGE_SIZE);
+    let rows = match drive(scan, context).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            warn!(error = %error, "Failed to scan the folder uploads");
+            return;
+        }
+    };
+    for upload in rows
+        .iter()
+        .filter_map(|bytes| SyncUpload::from_bytes(bytes).ok())
+    {
+        if let Some(state) = requeued(&upload.state, now_ms) {
+            store_state(context, &upload, state, true).await;
+        }
     }
 }
 

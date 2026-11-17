@@ -87,14 +87,6 @@ pub fn write_placement_effect(record: &PendingShardPlacement) -> Result<Effect, 
     }))
 }
 
-pub fn delete_placement_effect(realm_id: RealmId, placement: &PlacementRef) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(realm_id, placement),
-        txn_id: None,
-    })
-}
-
 pub fn schedule_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
     schedule_retry_after(realm_id, local_node_id, PLACEMENT_RETRY_AFTER)
 }

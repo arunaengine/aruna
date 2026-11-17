@@ -2,32 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::keyspaces::{
+    BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
+    STORAGE_BACKEND_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobVersion, BlobVersionState, VersionKey,
 };
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::Key;
 use thiserror::Error;
 
-use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::groups::backends::backend_key;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CheckState {
-    Init,
     ReadVersion,
     ReadLocation,
     ReadStorage,
     Stat,
     Record,
-    Finish,
 }
 
 /// What a check found for one version.
@@ -47,14 +48,20 @@ pub enum CheckVersionError {
     Conversion(#[from] ConversionError),
     #[error(transparent)]
     Blob(#[from] BlobError),
-    #[error("version check did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state:?}: {received}")]
-    InvalidStateEvent {
-        state: &'static str,
-        received: &'static str,
-    },
+    #[error("version check failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for CheckVersionError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<CheckOutcome>, CheckVersionError>;
 
 /// Checks one version's copy: its location row, its group storage and one existence probe.
 /// A broken version is recorded with the version record it saw; any other answer clears it.
@@ -65,7 +72,7 @@ pub struct CheckVersionOperation {
     state: CheckState,
     version: Option<BlobVersion>,
     location: Option<BackendLocation>,
-    output: Option<Result<CheckOutcome, CheckVersionError>>,
+    outcome: Option<CheckOutcome>,
 }
 
 impl CheckVersionOperation {
@@ -73,63 +80,35 @@ impl CheckVersionOperation {
         Self {
             version_key,
             now_ms,
-            state: CheckState::Init,
+            state: CheckState::ReadVersion,
             version: None,
             location: None,
-            output: None,
+            outcome: None,
         }
     }
 
-    fn fail(&mut self, error: CheckVersionError) -> Effects {
-        self.state = CheckState::Finish;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, state: &'static str, received: Event) -> Effects {
-        let received = received.label();
-        self.fail(CheckVersionError::InvalidStateEvent { state, received })
-    }
-
     /// Writes or clears the broken row, then ends with `outcome`.
-    fn record(&mut self, outcome: CheckOutcome) -> Effects {
-        let key = match self.version_key.to_bytes() {
-            Ok(key) => Key::from(key),
-            Err(error) => return self.fail(error.into()),
-        };
-        let effect = match (outcome, self.version.clone()) {
+    fn record(&mut self, outcome: CheckOutcome) -> Step {
+        let key = Key::from(self.version_key.to_bytes()?);
+        let call = match (outcome, self.version.clone()) {
             (CheckOutcome::Broken(reason), Some(version)) => {
                 let row = BrokenVersion {
                     reason,
                     version,
                     found_at_ms: self.now_ms,
                 };
-                match row.to_bytes() {
-                    Ok(value) => StorageEffect::Write {
-                        key_space: BROKEN_VERSION_KEYSPACE.to_string(),
-                        key,
-                        value: value.into(),
-                        txn_id: None,
-                    },
-                    Err(error) => return self.fail(error.into()),
-                }
+                let value = row.to_bytes()?.into();
+                IoCall::Write(vec![(BROKEN_VERSION_KEYSPACE.to_string(), key, value)])
             }
-            _ => StorageEffect::Delete {
-                key_space: BROKEN_VERSION_KEYSPACE.to_string(),
-                key,
-                txn_id: None,
-            },
+            _ => IoCall::Delete(vec![(BROKEN_VERSION_KEYSPACE.to_string(), key)]),
         };
-        self.output = Some(Ok(outcome));
+        self.outcome = Some(outcome);
         self.state = CheckState::Record;
-        smallvec![Effect::Storage(effect)]
+        Ok(Next::Call(call))
     }
 
-    fn handle_version(&mut self, value: Option<&[u8]>) -> Effects {
-        let version = match value.map(BlobVersion::from_bytes).transpose() {
-            Ok(version) => version,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn handle_version(&mut self, value: Option<&[u8]>) -> Step {
+        let version = value.map(BlobVersion::from_bytes).transpose()?;
         let key = version.as_ref().and_then(|version| match &version.state {
             BlobVersionState::Materialized { .. } => version.location_key(),
             _ => None,
@@ -139,14 +118,15 @@ impl CheckVersionOperation {
             return self.record(CheckOutcome::Skipped);
         };
         self.state = CheckState::ReadLocation;
-        smallvec![blob_location_read(&key, None)]
+        Ok(Next::Call(read_row(
+            BLOB_LOCATIONS_KEYSPACE,
+            key.to_bytes(),
+        )))
     }
 
-    fn handle_location(&mut self, value: Option<&[u8]>) -> Effects {
-        let location = match value.map(BackendLocation::from_bytes).transpose() {
-            Ok(Some(location)) => location,
-            Ok(None) => return self.record(CheckOutcome::Broken(BrokenReason::MissingRecord)),
-            Err(error) => return self.fail(error.into()),
+    fn handle_location(&mut self, value: Option<&[u8]>) -> Step {
+        let Some(location) = value.map(BackendLocation::from_bytes).transpose()? else {
+            return self.record(CheckOutcome::Broken(BrokenReason::MissingRecord));
         };
         if location.staging || location.partial {
             return self.record(CheckOutcome::Skipped);
@@ -155,95 +135,63 @@ impl CheckVersionOperation {
             BackendRef::Group(backend_id) => Some(backend_key(*backend_id)),
             BackendRef::Node(_) => None,
         };
-        self.location = Some(location);
         let Some(key) = storage else {
-            return self.stat();
+            return Ok(self.stat(location));
         };
+        self.location = Some(location);
         self.state = CheckState::ReadStorage;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-            key,
-            txn_id: None,
-        })]
+        Ok(Next::Call(read_row(STORAGE_BACKEND_KEYSPACE, key)))
     }
 
-    fn handle_storage(&mut self, value: Option<&[u8]>) -> Effects {
-        match value.map(GroupStorage::from_bytes).transpose() {
-            Ok(Some(storage)) if !storage.disabled => self.stat(),
-            Ok(_) => self.record(CheckOutcome::Broken(BrokenReason::StorageRemoved)),
-            Err(error) => self.fail(error.into()),
+    fn handle_storage(&mut self, value: Option<&[u8]>) -> Step {
+        let storage = value.map(GroupStorage::from_bytes).transpose()?;
+        match (storage, self.location.take()) {
+            (Some(storage), Some(location)) if !storage.disabled => Ok(self.stat(location)),
+            _ => self.record(CheckOutcome::Broken(BrokenReason::StorageRemoved)),
         }
     }
 
-    fn stat(&mut self) -> Effects {
-        let Some(location) = self.location.clone() else {
-            return self.fail(CheckVersionError::NotFinished);
-        };
+    fn stat(&mut self, location: BackendLocation) -> Next<CheckOutcome> {
         self.state = CheckState::Stat;
-        smallvec![Effect::Blob(BlobEffect::StatCopy { location })]
+        let stat = Effect::Blob(BlobEffect::StatCopy { location });
+        Next::Call(IoCall::Effect(Box::new(stat)))
     }
 }
 
-impl EffectOperation for CheckVersionOperation {
+impl Operation for CheckVersionOperation {
     type Output = CheckOutcome;
     type Error = CheckVersionError;
 
-    fn start(&mut self) -> Effects {
-        match read_version_effect(&self.version_key, None) {
-            Ok(effect) => {
-                self.state = CheckState::ReadVersion;
-                smallvec![effect]
-            }
-            Err(error) => self.fail(error.into()),
-        }
+    fn first(&mut self) -> Step {
+        let key = self.version_key.to_bytes()?;
+        Ok(Next::Call(read_row(BLOB_VERSIONS_KEYSPACE, key)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (CheckState::ReadVersion, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.handle_version(value.as_deref())
-            }
-            (CheckState::ReadLocation, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.handle_location(value.as_deref())
-            }
-            (CheckState::ReadStorage, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.handle_storage(value.as_deref())
-            }
-            (CheckState::Stat, Event::Blob(BlobEvent::CopyStat { exists })) => match exists {
-                true => self.record(CheckOutcome::Healthy),
-                false => self.record(CheckOutcome::Broken(BrokenReason::MissingBlob)),
-            },
-            (CheckState::Stat, Event::Blob(BlobEvent::Error(error))) => self.fail(error.into()),
-            (
-                CheckState::Record,
-                Event::Storage(
-                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-                ),
-            ) => {
-                self.state = CheckState::Finish;
-                smallvec![]
-            }
-            (CheckState::Init, _) => self.start(),
-            (_, event) => self.unexpected("Check", event),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.state == CheckState::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
+    fn next(&mut self, result: IoResult) -> Step {
         match self.state {
-            CheckState::Finish => self.output.unwrap_or(Err(CheckVersionError::NotFinished)),
-            _ => Err(CheckVersionError::NotFinished),
+            CheckState::ReadVersion => self.handle_version(result.value()?.as_deref()),
+            CheckState::ReadLocation => self.handle_location(result.value()?.as_deref()),
+            CheckState::ReadStorage => self.handle_storage(result.value()?.as_deref()),
+            CheckState::Stat => match result.event()? {
+                Event::Blob(BlobEvent::CopyStat { exists: true }) => {
+                    self.record(CheckOutcome::Healthy)
+                }
+                Event::Blob(BlobEvent::CopyStat { exists: false }) => {
+                    self.record(CheckOutcome::Broken(BrokenReason::MissingBlob))
+                }
+                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                other => Err(IoError::Unexpected {
+                    expected: "BlobEvent::CopyStat",
+                    got: other.label(),
+                }
+                .into()),
+            },
+            CheckState::Record => {
+                result.done()?;
+                let outcome = self.outcome.take().ok_or(IoError::Unfinished)?;
+                Ok(Next::Done(outcome))
+            }
         }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
     }
 }
 
@@ -256,11 +204,12 @@ mod tests {
     use std::time::SystemTime;
     use ulid::Ulid;
 
-    fn read(value: Option<Vec<u8>>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::new().into(),
-            value: value.map(Into::into),
-        })
+    fn read(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Into::into)])
+    }
+
+    fn stat(exists: bool) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(BlobEvent::CopyStat { exists })))
     }
 
     fn version(backend: BackendRef) -> BlobVersion {
@@ -294,42 +243,38 @@ mod tests {
     }
 
     /// Drives a check of a version on `backend` up to the answer after its location read.
-    fn located(backend: BackendRef) -> (CheckVersionOperation, Effects) {
+    fn located(backend: BackendRef) -> (CheckVersionOperation, Step) {
         let key = VersionKey::new("b", "k", Ulid::from_bytes([2; 16]));
         let mut operation = CheckVersionOperation::new(key, 9);
-        operation.start();
-        operation.step(read(Some(version(backend.clone()).to_bytes().unwrap())));
-        let effects = operation.step(read(Some(location(backend).to_bytes().unwrap())));
-        (operation, effects)
+        let _ = operation.first();
+        let _ = operation.next(read(Some(version(backend.clone()).to_bytes().unwrap())));
+        let turn = operation.next(read(Some(location(backend).to_bytes().unwrap())));
+        (operation, turn)
     }
 
     /// Answers the broken row write or delete and returns the outcome and the effect.
-    fn recorded(mut operation: CheckVersionOperation, effects: Effects) -> (CheckOutcome, bool) {
-        let [Effect::Storage(effect)] = effects.as_slice() else {
-            panic!("expected the broken row effect, got {effects:?}")
+    fn recorded(mut operation: CheckVersionOperation, turn: Step) -> (CheckOutcome, bool) {
+        let written = match turn {
+            Ok(Next::Call(IoCall::Write(_))) => true,
+            Ok(Next::Call(IoCall::Delete(_))) => false,
+            other => panic!("expected the broken row call, got {other:?}"),
         };
-        let written = matches!(effect, StorageEffect::Write { .. });
-        let answer = match written {
-            true => StorageEvent::WriteResult {
-                key: Vec::new().into(),
-            },
-            false => StorageEvent::DeleteResult {
-                key: Vec::new().into(),
-            },
-        };
-        operation.step(Event::Storage(answer));
-        (operation.finalize().unwrap(), written)
+        match operation.next(IoResult::Done) {
+            Ok(Next::Done(outcome)) => (outcome, written),
+            other => panic!("expected the outcome, got {other:?}"),
+        }
     }
 
     #[test]
     fn missing_blob_recorded() {
-        let (mut operation, effects) = located(BackendRef::node_default());
+        let (mut operation, turn) = located(BackendRef::node_default());
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::StatCopy { .. })]
+            &turn,
+            Ok(Next::Call(IoCall::Effect(effect)))
+                if matches!(effect.as_ref(), Effect::Blob(BlobEffect::StatCopy { .. }))
         ));
-        let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: false }));
-        let outcome = recorded(operation, effects);
+        let turn = operation.next(stat(false));
+        let outcome = recorded(operation, turn);
         assert_eq!(
             outcome,
             (CheckOutcome::Broken(BrokenReason::MissingBlob), true)
@@ -339,20 +284,20 @@ mod tests {
     #[test]
     fn healthy_copy_cleared() {
         let (mut operation, _) = located(BackendRef::node_default());
-        let effects = operation.step(Event::Blob(BlobEvent::CopyStat { exists: true }));
-        assert_eq!(recorded(operation, effects), (CheckOutcome::Healthy, false));
+        let turn = operation.next(stat(true));
+        assert_eq!(recorded(operation, turn), (CheckOutcome::Healthy, false));
     }
 
     #[test]
     fn removed_storage_recorded() {
         // A removed group storage is broken without asking the storage.
-        let (mut operation, effects) = located(BackendRef::Group(Ulid::from_bytes([5; 16])));
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected the storage record read, got {effects:?}")
+        let (mut operation, turn) = located(BackendRef::Group(Ulid::from_bytes([5; 16])));
+        let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+            panic!("expected the storage record read, got {turn:?}")
         };
-        assert_eq!(key_space, STORAGE_BACKEND_KEYSPACE);
-        let effects = operation.step(read(None));
-        let outcome = recorded(operation, effects);
+        assert_eq!(reads[0].0, STORAGE_BACKEND_KEYSPACE);
+        let turn = operation.next(read(None));
+        let outcome = recorded(operation, turn);
         assert_eq!(
             outcome,
             (CheckOutcome::Broken(BrokenReason::StorageRemoved), true)
@@ -363,12 +308,11 @@ mod tests {
     fn missing_record_recorded() {
         let key = VersionKey::new("b", "k", Ulid::from_bytes([2; 16]));
         let mut operation = CheckVersionOperation::new(key, 9);
-        operation.start();
-        operation.step(read(Some(
-            version(BackendRef::node_default()).to_bytes().unwrap(),
-        )));
-        let effects = operation.step(read(None));
-        let outcome = recorded(operation, effects);
+        let _ = operation.first();
+        let stored = version(BackendRef::node_default()).to_bytes().unwrap();
+        let _ = operation.next(read(Some(stored)));
+        let turn = operation.next(read(None));
+        let outcome = recorded(operation, turn);
         assert_eq!(
             outcome,
             (CheckOutcome::Broken(BrokenReason::MissingRecord), true)

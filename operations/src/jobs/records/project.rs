@@ -2,17 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FAMILY_ALIAS_KEYSPACE, FAMILY_PROJECTION_KEYSPACE};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobId, JobProjection, JobRecord, JobRecordEnvelope, JobRecordKey, JobState,
     LogicalJobState, job_record_key, validate_transition,
 };
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use tracing::debug;
 
 use super::reduce::reduce_family;
@@ -20,8 +20,8 @@ use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::structs::execution::job::record_keys::{
     MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix, record_key,
 };
+use aruna_core::structs::execution::job::JobWrites;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes, to_bytes};
-use aruna_core::structs::execution::job::{JobDeletes, JobWrites};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
@@ -55,6 +55,8 @@ pub struct ProjectedFamily {
     pub cached: bool,
 }
 
+/// Reads the cache outside any transaction; a rebuild pages, bridges and caches the family in
+/// one write transaction, which the runner opens at the first row call and commits on success.
 #[derive(Debug, PartialEq)]
 pub struct ProjectFamilyOperation {
     config: ProjectFamilyConfig,
@@ -64,24 +66,23 @@ pub struct ProjectFamilyOperation {
     cursor: Option<JobRecordKey>,
     truncated: bool,
     projection: Option<JobProjection>,
-    bridged: JobDeletes,
     state: ProjectState,
-    outcome: Option<Result<ProjectedFamily, RecordStoreError>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectState {
-    Init,
     ResolveAlias,
     ReadCache,
-    Begin,
-    Page { txn_id: TxnId },
-    ReadJobs { txn_id: TxnId },
-    Write { txn_id: TxnId },
-    Clear { txn_id: TxnId },
-    Commit { txn_id: TxnId },
-    Finish,
-    Error,
+    Page,
+    ReadJobs,
+    Write,
+}
+
+type Step = Result<Next<ProjectedFamily>, RecordStoreError>;
+
+/// A storage effect outside the operation's transaction, answered by its event.
+fn outside(effect: StorageEffect) -> Next<ProjectedFamily> {
+    Next::Call(IoCall::Effect(Box::new(Effect::Storage(effect))))
 }
 
 impl ProjectFamilyOperation {
@@ -97,36 +98,33 @@ impl ProjectFamilyOperation {
             cursor: None,
             truncated: false,
             projection: None,
-            bridged: Vec::new(),
-            state: ProjectState::Init,
-            outcome: None,
+            state: ProjectState::ResolveAlias,
         }
     }
 
-    fn read_cache(&mut self) -> Effects {
-        let Some(family) = self.family else {
-            return self.fail(RecordStoreError::UnknownAlias);
-        };
+    fn family(&self) -> Result<JobFamilyId, RecordStoreError> {
+        self.family.ok_or(RecordStoreError::UnknownAlias)
+    }
+
+    fn read_cache(&mut self) -> Step {
+        let family = self.family()?;
         self.state = ProjectState::ReadCache;
-        smallvec![Effect::Storage(StorageEffect::Read {
+        Ok(outside(StorageEffect::Read {
             key_space: FAMILY_PROJECTION_KEYSPACE.to_string(),
             key: family_prefix(&family),
             txn_id: None,
-        })]
+        }))
     }
 
-    fn page(&mut self, txn_id: TxnId) -> Effects {
-        let Some(family) = self.family else {
-            return self.fail(RecordStoreError::UnknownAlias);
-        };
-        self.state = ProjectState::Page { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(family_prefix(&family)),
-            start: self.cursor.map(|key| IterStart::After(record_key(&key))),
+    fn page(&mut self) -> Step {
+        let family = self.family()?;
+        self.state = ProjectState::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: family_prefix(&family),
+            after: self.cursor.map(|key| record_key(&key)),
             limit: RECORD_PAGE_SIZE,
-            txn_id: Some(txn_id),
-        })]
+        }))
     }
 
     /// Keeps one page of records. A key or envelope this node cannot read is a
@@ -147,18 +145,12 @@ impl ProjectFamilyOperation {
 
     /// Reduces the loaded records, then reads the local rows of every alias the
     /// projection names so they can be bridged in the same transaction.
-    fn reduce(&mut self, txn_id: TxnId) -> Effects {
-        let Some(family) = self.family else {
-            return self.fail(RecordStoreError::UnknownAlias);
-        };
-        self.projection = match reduce_family(family, &self.records) {
-            Ok(projection) => projection,
-            Err(error) => return self.fail(error.into()),
-        };
+    fn reduce(&mut self) -> Step {
+        self.projection = reduce_family(self.family()?, &self.records)?;
         // A truncated projection is partial: it is neither bridged into the
         // mutable rows nor cached, so a later read reduces the family again.
         if self.truncated {
-            return self.commit(txn_id);
+            return self.settle(false);
         }
         let reads: Vec<(String, Key)> = self
             .projection
@@ -168,31 +160,24 @@ impl ProjectFamilyOperation {
             .map(|job_id| (JOB_KEYSPACE.to_string(), job_record_key(*job_id)))
             .collect();
         if reads.is_empty() {
-            return self.write(txn_id, Vec::new(), Vec::new());
+            return self.write(Vec::new());
         }
-        self.state = ProjectState::ReadJobs { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        self.state = ProjectState::ReadJobs;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// Bridges the reduced state into the unscheduled logical cache rows. A row
     /// that already settled terminally, or whose state machine forbids the
     /// transition, is left untouched.
-    fn bridge(&self, values: Vec<(Key, Option<Value>)>) -> (JobWrites, JobDeletes) {
+    fn bridge(&self, values: Vec<Option<Value>>) -> JobWrites {
         let mut writes: JobWrites = Vec::new();
-        let deletes: JobDeletes = Vec::new();
         let Some(projection) = self.projection.as_ref() else {
-            return (writes, deletes);
+            return writes;
         };
         let Some(state) = bridged_state(projection.state) else {
-            return (writes, deletes);
+            return writes;
         };
-        for (_, value) in values {
-            let Some(value) = value else {
-                continue;
-            };
+        for value in values.into_iter().flatten() {
             let Ok(record) = JobRecord::from_bytes(&value) else {
                 continue;
             };
@@ -223,59 +208,29 @@ impl ProjectFamilyOperation {
                 Value::from(bytes.as_slice()),
             ));
         }
-        (writes, deletes)
+        writes
     }
 
-    fn write(&mut self, txn_id: TxnId, mut writes: JobWrites, deletes: JobDeletes) -> Effects {
-        let Some(family) = self.family else {
-            return self.fail(RecordStoreError::UnknownAlias);
-        };
+    fn write(&mut self, mut writes: JobWrites) -> Step {
+        let family = self.family()?;
         let cache = self
             .cache
             .clone()
             .unwrap_or_else(|| ProjectionCache::invalidated(None))
             .updated(self.projection.clone());
-        let bytes = match to_bytes(&cache) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
+        let bytes = to_bytes(&cache)?;
         writes.push((
             FAMILY_PROJECTION_KEYSPACE.to_string(),
             family_prefix(&family),
             Value::from(bytes.as_slice()),
         ));
         self.cache = Some(cache);
-        self.bridged = deletes;
-        self.state = ProjectState::Write { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.state = ProjectState::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    /// Index rows the bridged job states left behind, cleared in the same
-    /// transaction as the row and cache writes.
-    fn clear(&mut self, txn_id: TxnId) -> Effects {
-        let deletes = std::mem::take(&mut self.bridged);
-        if deletes.is_empty() {
-            return self.commit(txn_id);
-        }
-        self.state = ProjectState::Clear { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = ProjectState::Commit { txn_id };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn settle(&mut self, cached: bool) -> Effects {
-        let Some(family) = self.family else {
-            return self.fail(RecordStoreError::UnknownAlias);
-        };
+    fn settle(&mut self, cached: bool) -> Step {
+        let family = self.family()?;
         let revision = self.cache.as_ref().map_or(0, |cache| cache.revision);
         let duplicates = self
             .projection
@@ -304,86 +259,83 @@ impl ProjectFamilyOperation {
             truncated = self.truncated,
             "Job family projection resolved"
         );
-        self.outcome = Some(Ok(ProjectedFamily {
+        Ok(Next::Done(ProjectedFamily {
             family,
             revision,
             projection: self.projection.clone(),
             truncated: self.truncated,
             cached,
-        }));
-        self.state = ProjectState::Finish;
-        smallvec![]
+        }))
     }
 
-    /// Fails the projection, rolling back an open transaction so a partial
-    /// rebuild never replaces the cached projection or the local job rows.
-    fn fail(&mut self, error: RecordStoreError) -> Effects {
-        self.outcome = Some(Err(error));
-        let open = self.txn();
-        self.state = ProjectState::Error;
-        match open {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> RecordStoreError {
+        RecordStoreError::unexpected(&self.state, expected, got)
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
-        self.fail(RecordStoreError::unexpected(&self.state, expected, got))
-    }
-
-    fn txn(&self) -> Option<TxnId> {
-        match self.state {
-            ProjectState::Page { txn_id }
-            | ProjectState::ReadJobs { txn_id }
-            | ProjectState::Write { txn_id }
-            | ProjectState::Clear { txn_id }
-            | ProjectState::Commit { txn_id } => Some(txn_id),
-            _ => None,
+    /// The answer to a read outside the transaction: its event, or the storage error it carried.
+    fn outside_event(
+        &self,
+        expected: &'static str,
+        result: IoResult,
+    ) -> Result<StorageEvent, RecordStoreError> {
+        let IoResult::Event(event) = result else {
+            return Err(self.unexpected(expected, result.label()));
+        };
+        match *event {
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            Event::Storage(event) => Ok(event),
+            other => Err(self.unexpected(expected, other.label())),
         }
     }
 }
 
-impl EffectOperation for ProjectFamilyOperation {
+impl Operation for ProjectFamilyOperation {
     type Output = ProjectedFamily;
     type Error = RecordStoreError;
+
+    fn transaction(&self) -> bool {
+        true
+    }
 
     fn is_conflict(error: &Self::Error) -> bool {
         error.is_conflict()
     }
 
-    fn start(&mut self) -> Effects {
+    /// The bounded attempts the hand-written loop made before: one try and seven retries.
+    fn conflict_retries() -> u32 {
+        7
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(error, RecordStoreError::UnknownAlias)
+    }
+
+    fn first(&mut self) -> Step {
         match self.config.family {
             FamilyRef::Family(_) => self.read_cache(),
-            FamilyRef::Alias(job_id) => {
-                self.state = ProjectState::ResolveAlias;
-                smallvec![Effect::Storage(StorageEffect::Iter {
-                    key_space: FAMILY_ALIAS_KEYSPACE.to_string(),
-                    prefix: Some(alias_prefix(job_id)),
-                    start: None,
-                    limit: MAX_ALIAS_FAMILIES,
-                    txn_id: None,
-                })]
-            }
+            FamilyRef::Alias(job_id) => Ok(outside(StorageEffect::Iter {
+                key_space: FAMILY_ALIAS_KEYSPACE.to_string(),
+                prefix: Some(alias_prefix(job_id)),
+                start: None,
+                limit: MAX_ALIAS_FAMILIES,
+                txn_id: None,
+            })),
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
+    fn next(&mut self, result: IoResult) -> Step {
         match self.state {
-            ProjectState::ResolveAlias => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            ProjectState::ResolveAlias => match self.outside_event("alias scan", result)? {
+                StorageEvent::IterResult { values, .. } => {
                     // Ordered by key, so two families claiming one alias resolve
                     // identically on every replica.
                     self.family = values.iter().filter_map(|(key, _)| alias_family(key)).min();
-                    match self.family {
-                        Some(_) => self.read_cache(),
-                        None => self.fail(RecordStoreError::UnknownAlias),
-                    }
+                    self.read_cache()
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("alias scan", other.label()),
+                other => Err(self.unexpected("alias scan", Event::Storage(other).label())),
             },
-            ProjectState::ReadCache => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            ProjectState::ReadCache => match self.outside_event("projection cache read", result)? {
+                StorageEvent::ReadResult { value, .. } => {
                     self.cache = value
                         .as_ref()
                         .and_then(|value| ProjectionCache::decode(value));
@@ -398,79 +350,32 @@ impl EffectOperation for ProjectFamilyOperation {
                             .and_then(|cache| cache.projection.clone());
                         return self.settle(true);
                     }
-                    self.state = ProjectState::Begin;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
+                    self.page()
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", other.label()),
-            },
-            ProjectState::Begin => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.page(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", other.label()),
-            },
-            ProjectState::Page { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    match self.keep_page(values) {
-                        Ok(true) => self.page(txn_id),
-                        Ok(false) => self.reduce(txn_id),
-                        Err(error) => self.fail(error),
-                    }
+                other => {
+                    let got = Event::Storage(other).label();
+                    Err(self.unexpected("projection cache read", got))
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record page", other.label()),
             },
-            ProjectState::ReadJobs { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let (writes, deletes) = self.bridge(values);
-                    self.write(txn_id, writes, deletes)
+            ProjectState::Page => match result {
+                IoResult::Page { rows, .. } => match self.keep_page(rows)? {
+                    true => self.page(),
+                    false => self.reduce(),
+                },
+                other => Err(self.unexpected("record page", other.label())),
+            },
+            ProjectState::ReadJobs => match result {
+                IoResult::Values(values) => {
+                    let writes = self.bridge(values);
+                    self.write(writes)
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("job row read", other.label()),
+                other => Err(self.unexpected("job row read", other.label())),
             },
-            ProjectState::Write { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection write", other.label()),
+            ProjectState::Write => match result {
+                IoResult::Done => self.settle(false),
+                other => Err(self.unexpected("projection write", other.label())),
             },
-            ProjectState::Clear { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.commit(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("index clear", other.label()),
-            },
-            ProjectState::Commit { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.settle(false),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", other.label()),
-            },
-            ProjectState::Init | ProjectState::Finish | ProjectState::Error => {
-                self.unexpected("no event", event.label())
-            }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ProjectState::Finish | ProjectState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(RecordStoreError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn() {
-            Some(txn_id) => {
-                self.state = ProjectState::Error;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
-    }
-
-    fn expected_error(error: &Self::Error) -> bool {
-        matches!(error, RecordStoreError::UnknownAlias)
     }
 }
 
