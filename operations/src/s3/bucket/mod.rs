@@ -6,6 +6,7 @@ pub mod audit_retry;
 pub mod compression;
 pub mod cors;
 pub mod create;
+pub mod dataset;
 pub mod delete;
 pub mod encryption;
 pub(crate) mod forward;

@@ -15,7 +15,7 @@ use aruna_core::structs::storage::dataset_description::DatasetDescription;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::metadata::create_document::CreateDocumentPayload;
 use aruna_operations::metadata::forward::route_metadata_delete;
-use aruna_operations::s3::bucket::metadata::{
+use aruna_operations::s3::bucket::dataset::{
     DescriptionError, bucket_metadata, dataset_description,
 };
 use axum::extract::rejection::JsonRejection;

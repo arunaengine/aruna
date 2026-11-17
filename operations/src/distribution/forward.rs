@@ -35,9 +35,9 @@ use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
 use crate::replication::bootstrap::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use crate::s3::bucket::dataset::{DescriptionError, dataset_description};
 use crate::s3::bucket::delete::DeleteBucketOperation;
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::bucket::metadata::{DescriptionError, dataset_description};
 
 /// A publish attempt retries a storage conflict this often before it gives up.
 const PUBLISH_ATTEMPTS: usize = 3;

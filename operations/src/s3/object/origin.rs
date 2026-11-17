@@ -34,8 +34,8 @@ use crate::connectors::repository::source_connector_key;
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use crate::driver::{DriverContext, drive};
 use crate::effect_adapters::dispatch_effect;
+use crate::s3::bucket::dataset::bucket_metadata;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::metadata::bucket_metadata;
 
 #[derive(Debug, Error)]
 pub enum OriginError {
