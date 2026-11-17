@@ -9,7 +9,8 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, values};
 
-use super::mutation::{MutateJobCalls, NoGuard, forward, settle_attempt};
+use super::mutation::{MutateJobCalls, NoGuard, forward};
+use super::settle_attempt;
 use super::*;
 use crate::driver::drive;
 

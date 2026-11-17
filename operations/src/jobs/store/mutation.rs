@@ -526,26 +526,6 @@ where
 /// A mutation without a guard names this guard type.
 pub(crate) type NoGuard = fn(&JobRecord, Option<&AttemptControl>) -> Result<(), JobMutationError>;
 
-/// What one attempt of a job write leaves: `None` after a lost conflict that is retried, once
-/// a short growing pause passed; otherwise the result, or the `exhausted` error after the last
-/// of [`MUTATE_MAX_ATTEMPTS`] attempts.
-pub(crate) async fn settle_attempt<T>(
-    result: Result<T, JobMutationError>,
-    attempt: u32,
-    exhausted: &str,
-) -> Option<Result<T, JobMutationError>> {
-    match result {
-        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
-            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
-            None
-        }
-        Err(JobMutationError::Conflict) => {
-            Some(Err(JobMutationError::Storage(exhausted.to_string())))
-        }
-        other => Some(other),
-    }
-}
-
 /// Forwards a call of folded job mutation calls; only calls and the outcome come from them.
 pub(crate) fn forward<T>(next: Next<JobRecord>) -> Result<Next<T>, JobMutationError> {
     match next {

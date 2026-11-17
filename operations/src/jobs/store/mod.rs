@@ -47,6 +47,7 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 pub mod attempt;
 pub mod key_wait;
 pub mod list_jobs;
+pub mod mark_start;
 pub mod mutation;
 pub mod query;
 pub mod remote_wait;
@@ -55,7 +56,7 @@ pub mod state;
 use crate::driver::drive;
 use attempt::*;
 use key_wait::*;
-use mutation::{MutateJobOperation, NoGuard, settle_attempt};
+use mutation::{MutateJobOperation, NoGuard};
 use query::*;
 use state::*;
 
@@ -140,6 +141,26 @@ where
             Some(result) => return result,
             None => attempt += 1,
         }
+    }
+}
+
+/// What one attempt of a job write leaves: `None` after a lost conflict that is retried, once
+/// a short growing pause passed; otherwise the result, or the `exhausted` error after the last
+/// of [`MUTATE_MAX_ATTEMPTS`] attempts.
+pub(crate) async fn settle_attempt<T>(
+    result: Result<T, JobMutationError>,
+    attempt: u32,
+    exhausted: &str,
+) -> Option<Result<T, JobMutationError>> {
+    match result {
+        Err(JobMutationError::Conflict) if attempt + 1 < MUTATE_MAX_ATTEMPTS => {
+            tokio::time::sleep(std::time::Duration::from_millis(1 << attempt.min(6))).await;
+            None
+        }
+        Err(JobMutationError::Conflict) => {
+            Some(Err(JobMutationError::Storage(exhausted.to_string())))
+        }
+        other => Some(other),
     }
 }
 
