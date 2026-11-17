@@ -18,7 +18,8 @@ use aruna_core::structs::storage::distribution::ticket::{
 use thiserror::Error;
 
 use crate::auth::bearer_token::grant_valid;
-use crate::distribution::delegate::{DelegateError, SpendNonceOperation};
+use crate::distribution::delegate::DelegateError;
+use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::placement::process_placements::load_realm_config;

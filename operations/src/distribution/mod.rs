@@ -18,6 +18,7 @@ pub mod index_feed;
 pub mod inventory;
 pub mod keep;
 pub mod lifecycle;
+pub mod nonce;
 pub mod publish;
 pub mod pull;
 pub mod purge;

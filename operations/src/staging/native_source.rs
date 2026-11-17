@@ -29,7 +29,7 @@ use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::distribution::delegate::SpendNonceOperation;
+use crate::distribution::nonce::SpendNonceOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
