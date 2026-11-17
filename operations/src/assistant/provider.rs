@@ -122,7 +122,11 @@ impl CreateProviderOperation {
         let (provider_space, provider_key) = provider_row(&self.provider.provider_id);
         let (owner_space, owner_key) = owner_row(self.provider.user_id);
         Ok(IoCall::Write(vec![
-            (provider_space, provider_key, self.provider.to_bytes()?.into()),
+            (
+                provider_space,
+                provider_key,
+                self.provider.to_bytes()?.into(),
+            ),
             (owner_space, owner_key, encode_index(index)?),
         ]))
     }
@@ -134,7 +138,9 @@ impl Operation for CreateProviderOperation {
 
     fn first(&mut self) -> Result<Next<AssistantProvider>, ProviderStoreError> {
         Ulid::from_string(&self.provider.provider_id).map_err(ConversionError::from)?;
-        Ok(Next::Call(IoCall::Read(vec![owner_row(self.provider.user_id)])))
+        Ok(Next::Call(IoCall::Read(vec![owner_row(
+            self.provider.user_id,
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<AssistantProvider>, ProviderStoreError> {
@@ -188,7 +194,9 @@ impl Operation for GetProviderOperation {
 
     fn first(&mut self) -> Result<Next<Self::Output>, ProviderStoreError> {
         Ulid::from_string(&self.provider_id).map_err(ConversionError::from)?;
-        Ok(Next::Call(IoCall::Read(vec![provider_row(&self.provider_id)])))
+        Ok(Next::Call(IoCall::Read(vec![provider_row(
+            &self.provider_id,
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
@@ -248,7 +256,9 @@ impl Operation for ListProviderOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProviderStoreError> {
         if let Some(provider_ids) = self.provider_ids.take() {
-            return Ok(Next::Done(self.collect(&provider_ids, rows::all_values(result)?)?));
+            return Ok(Next::Done(
+                self.collect(&provider_ids, rows::all_values(result)?)?,
+            ));
         }
         let index = decode_index(rows::value(result)?.as_ref())?;
         if index.is_empty() {
@@ -406,7 +416,9 @@ impl Operation for DeleteProviderOperation {
         if Ulid::from_string(&self.provider_id).is_err() {
             return Err(ProviderStoreError::NotFound);
         }
-        Ok(Next::Call(IoCall::Read(vec![provider_row(&self.provider_id)])))
+        Ok(Next::Call(IoCall::Read(vec![provider_row(
+            &self.provider_id,
+        )])))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, ProviderStoreError> {
@@ -425,7 +437,9 @@ impl Operation for DeleteProviderOperation {
                     return Err(ProviderStoreError::IndexInconsistent);
                 }
                 self.stage = DeleteStage::Deleted(encode_index(&index)?);
-                Ok(Next::Call(IoCall::Delete(vec![provider_row(&self.provider_id)])))
+                Ok(Next::Call(IoCall::Delete(vec![provider_row(
+                    &self.provider_id,
+                )])))
             }
             DeleteStage::Deleted(index) => {
                 rows::done(result)?;

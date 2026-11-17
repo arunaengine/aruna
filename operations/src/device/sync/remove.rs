@@ -153,7 +153,12 @@ mod tests {
     }
 
     fn remove() -> RemoveEntryOperation {
-        RemoveEntryOperation::new(folder(), "a.txt".to_string(), WriteGuard::MustNotExist, record())
+        RemoveEntryOperation::new(
+            folder(),
+            "a.txt".to_string(),
+            WriteGuard::MustNotExist,
+            record(),
+        )
     }
 
     fn answer(event: LocalFileEvent) -> IoResult {
@@ -165,10 +170,7 @@ mod tests {
     fn moves_then_drops_base() {
         let mut remove = remove();
         assert!(remove.transaction());
-        assert!(matches!(
-            remove.first(),
-            Ok(Next::Call(IoCall::Effect(_)))
-        ));
+        assert!(matches!(remove.first(), Ok(Next::Call(IoCall::Effect(_)))));
         let moved = answer(LocalFileEvent::Moved {
             to: ".trash/a.txt".to_string(),
         });

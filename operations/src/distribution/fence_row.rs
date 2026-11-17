@@ -4,9 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::rows::done;
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
 use aruna_core::types::Key;
 use thiserror::Error;

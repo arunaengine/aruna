@@ -327,7 +327,9 @@ fn rewrites_the_tail() {
     operation.first().unwrap();
     let page = call(operation.next(head_value(Some(&head(CHAT, 4, 9)))));
     assert_eq!(turns_from(&page), (3, 1));
-    assert!(is_heads_page(&call(operation.next(turns_rows(&[turn(3, "abcd")])))));
+    assert!(is_heads_page(&call(
+        operation.next(turns_rows(&[turn(3, "abcd")]))
+    )));
     let write = call(operation.next(heads_rows(&[head(CHAT, 4, 9)])));
     let saved = written_head(&write);
     assert_eq!(

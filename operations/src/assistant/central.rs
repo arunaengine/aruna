@@ -180,7 +180,8 @@ impl Operation for ChargeUsageOperation {
             return Ok(Next::Done(charged));
         }
         let usage = decode_usage(rows::value(result)?.as_ref())?;
-        let next = charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
+        let next =
+            charge(usage, self.today, self.limit).map_err(CentralStoreError::QuotaReached)?;
         let (space, key) = usage_row(self.user_id);
         let call = IoCall::Write(vec![(space, key, next.to_bytes()?.into())]);
         self.charged = Some(next);

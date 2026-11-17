@@ -84,12 +84,18 @@ impl WriteChatOperation {
         }
     }
 
-    fn rename(&mut self, mut head: AssistantChatHead) -> Result<Next<AssistantChatHead>, ChatStoreError> {
+    fn rename(
+        &mut self,
+        mut head: AssistantChatHead,
+    ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
         if !head.is_live() {
             return Err(ChatStoreError::Deleted);
         }
         // No expectation writes over whatever is there; an expectation must match.
-        if self.expected_revision.is_some_and(|expected| expected != head.revision) {
+        if self
+            .expected_revision
+            .is_some_and(|expected| expected != head.revision)
+        {
             return Err(ChatStoreError::Stale);
         }
         head.title = std::mem::take(&mut self.title);
@@ -119,7 +125,10 @@ impl WriteChatOperation {
         self.write(head)
     }
 
-    fn write(&mut self, head: AssistantChatHead) -> Result<Next<AssistantChatHead>, ChatStoreError> {
+    fn write(
+        &mut self,
+        head: AssistantChatHead,
+    ) -> Result<Next<AssistantChatHead>, ChatStoreError> {
         let row = (
             CHAT_HEAD_KEYSPACE.to_string(),
             head_key(self.user_id, &self.chat_id),
@@ -149,7 +158,10 @@ impl Operation for WriteChatOperation {
             },
             WriteHeadStage::Count => {
                 let (rows, _) = rows::page(result)?;
-                let live = decode_heads(rows)?.iter().filter(|head| head.is_live()).count();
+                let live = decode_heads(rows)?
+                    .iter()
+                    .filter(|head| head.is_live())
+                    .count();
                 self.create(live)
             }
             WriteHeadStage::Written(head) => {
