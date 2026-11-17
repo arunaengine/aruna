@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
@@ -111,7 +111,28 @@ impl DrainOutboxOperation {
         self.state = state;
         let space = || NOTIFICATION_OUTBOX_KEYSPACE.to_string();
         let deletes = keys.into_iter().map(|key| (space(), key)).collect();
-        Ok(Next::Call(IoCall::Delete(deletes)))
+        // Sent as an effect, so a failed delete comes back as an event and the run goes on.
+        let delete = StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        };
+        Ok(Next::Call(IoCall::Effect(Effect::Storage(delete))))
+    }
+
+    /// Logs a failed delete: the rows stay and the drain runs again later.
+    fn deleted(&mut self, event: StorageEvent) -> Result<(), IoError> {
+        match event {
+            StorageEvent::BatchDeleteResult { .. } => Ok(()),
+            StorageEvent::Error { error } => {
+                warn!(%error, "Failed to delete notification outbox records");
+                self.retry = true;
+                Ok(())
+            }
+            other => {
+                let other = IoResult::Event(Event::Storage(other));
+                Err(unexpected("a delete result", &other))
+            }
+        }
     }
 
     fn page_read(&mut self, rows: Vec<(Key, Value)>) -> Turn {
@@ -365,7 +386,10 @@ impl Operation for DrainOutboxOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match (std::mem::take(&mut self.state), result) {
             (DrainState::Page, IoResult::Page { rows, .. }) => self.page_read(rows),
-            (DrainState::Expire, IoResult::Done) => self.read_configs(),
+            (DrainState::Expire, IoResult::Event(Event::Storage(event))) => {
+                self.deleted(event)?;
+                self.read_configs()
+            }
             (DrainState::Configs { realms }, IoResult::Values(values)) => {
                 self.configs_read(realms, values)
             }
@@ -392,7 +416,11 @@ impl Operation for DrainOutboxOperation {
                 let turn = enqueue.next(result);
                 self.enqueued(*enqueue, turn)
             }
-            (DrainState::DeleteLocal | DrainState::DeleteRemote, IoResult::Done) => {
+            (
+                DrainState::DeleteLocal | DrainState::DeleteRemote,
+                IoResult::Event(Event::Storage(event)),
+            ) => {
+                self.deleted(event)?;
                 self.next_remote()
             }
             (
@@ -516,6 +544,20 @@ mod call_tests {
         IoResult::Page { rows, next: None }
     }
 
+    fn delete_call(key: Key) -> Turn {
+        let delete = StorageEffect::BatchDelete {
+            deletes: vec![(NOTIFICATION_OUTBOX_KEYSPACE.to_string(), key)],
+            txn_id: None,
+        };
+        Ok(Next::Call(IoCall::Effect(Effect::Storage(delete))))
+    }
+
+    fn delete_result() -> IoResult {
+        IoResult::Event(Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        }))
+    }
+
     fn answer(message: NotificationTransportMessage) -> IoResult {
         IoResult::Event(Event::Net(NetEvent::Notification(Ok(Box::new(message)))))
     }
@@ -554,15 +596,24 @@ mod call_tests {
     fn remote_success_calls() {
         let (mut operation, key) = at_remote(node_id(2));
         let ack = answer(NotificationTransportMessage::DeliverAck { written: 1 });
-        assert_eq!(
-            operation.next(ack),
-            Ok(Next::Call(IoCall::Delete(vec![(
-                NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                key
-            )])))
-        );
-        assert_eq!(operation.next(IoResult::Done), scan(None, 2));
+        assert_eq!(operation.next(ack), delete_call(key));
+        assert_eq!(operation.next(delete_result()), scan(None, 2));
         assert_eq!(operation.next(rows(Vec::new())), Ok(Next::Done(None)));
+    }
+
+    /// A failed delete keeps the rows, goes on with the run and asks for a retry.
+    #[test]
+    fn delete_failure_continues() {
+        let (mut operation, _) = at_remote(node_id(2));
+        let ack = answer(NotificationTransportMessage::DeliverAck { written: 1 });
+        operation.next(ack).unwrap();
+        let failed = IoResult::Event(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::Timeout,
+        }));
+        assert_eq!(
+            operation.next(failed),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
     }
 
     #[test]
@@ -585,10 +636,7 @@ mod call_tests {
         operation.first().unwrap();
         assert_eq!(
             operation.next(rows(vec![(key.clone(), value)])),
-            Ok(Next::Call(IoCall::Delete(vec![(
-                NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
-                key
-            )])))
+            delete_call(key)
         );
     }
 
