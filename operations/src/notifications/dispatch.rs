@@ -32,10 +32,11 @@ use crate::notifications::watch::authorization::{
 };
 use crate::notifications::watch::interest::schedule_interest_publish;
 use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::subscriptions::{
+use crate::notifications::watch::records::{
     WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
-    WatchSubscriptionError, create_holder_watch, delete_holder_watch,
+    WatchSubscriptionError,
 };
+use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
 use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.

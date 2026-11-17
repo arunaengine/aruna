@@ -18,9 +18,8 @@ use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
-use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_UNAUTHORIZED, create_local_watch, list_watch_subscriptions,
-};
+use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
+use crate::notifications::watch::subscriptions::{create_local_watch, list_watch_subscriptions};
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{

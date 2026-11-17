@@ -34,10 +34,10 @@ use crate::notifications::watch::authorization::{
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
 use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::subscriptions::{
-    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE, create_holder_watch,
-    delete_holder_watch,
+use crate::notifications::watch::records::{
+    WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
 };
+use crate::notifications::watch::subscriptions::{create_holder_watch, delete_holder_watch};
 
 const NOTIFICATION_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -16,9 +16,8 @@ use crate::notifications::client::deliver_events_remote;
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::mark_interest_dirty;
-use crate::notifications::watch::subscriptions::{
-    WatchSubscriptionError, list_realm_subscriptions,
-};
+use crate::notifications::watch::records::WatchSubscriptionError;
+use crate::notifications::watch::subscriptions::list_realm_subscriptions;
 use crate::realm::get_config::GetConfigOperation;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
