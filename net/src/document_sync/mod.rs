@@ -31,6 +31,10 @@ use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::auth::valid_revocation_expiry;
+use aruna_core::deferred_topics::{
+    DeferredRegistrationOutcome, DocumentSyncDependency, register_deferred_topic,
+    remove_deferred_topic, satisfied_dependencies,
+};
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
     DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
@@ -142,8 +146,6 @@ const INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
 const INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const REPLAY_BATCH_LIMIT: usize = 1_024;
-const MAX_DEFERRED_TOPICS: usize = 1_024;
-const TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
 /// an unbounded number of simultaneous sync streams.
 const SHARD_PROBE_CONCURRENCY: usize = 8;
@@ -575,26 +577,6 @@ fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
     input.extend_from_slice(subject);
     input.extend_from_slice(peer.as_bytes());
     *DhtKeyId::from_data(&input).as_bytes()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-enum DocumentSyncDependency {
-    RealmConfig(RealmId),
-    RealmAuthorization(RealmId),
-    PlacementStrategy {
-        realm_id: RealmId,
-        strategy_id: Ulid,
-    },
-    /// Roles of the group that owns a placement policy; without them its
-    /// publication authority cannot be decided here.
-    GroupAuthorization(GroupId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredRegistrationOutcome {
-    Inserted,
-    AlreadyRegistered,
-    CapacityExceeded,
 }
 
 #[cfg(test)]

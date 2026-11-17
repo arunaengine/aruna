@@ -10,6 +10,7 @@ use aruna_core::admin_documents::{
 };
 use aruna_core::alpn::Alpn;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
+use aruna_core::deferred_topics::TOPICS_PER_DEPENDENCY;
 use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
