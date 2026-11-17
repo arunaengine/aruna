@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -14,26 +14,19 @@ use aruna_core::structs::execution::notification_watch::{
     watch_subscription_prefix,
 };
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::TxnId;
 use aruna_storage::StorageHandle;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
 use crate::notifications::watch::authorization::evaluate_watch_creation;
 use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
-    WatchReplication, WatchSubscriptionError, decode_stored_subscription, validated_subscription,
-    watch_delete_replication, watch_subscription_target, watch_upsert_replication,
+    WatchReplication, WatchSubscriptionError, validated_subscription, watch_delete_replication,
+    watch_subscription_target, watch_upsert_replication,
 };
 use crate::sync::outbox_record::{outbox_write_entry, schedule_drain_effect};
-
-/// Single owner-prefix scan bound. Watches are hard-capped per user, so one page
-/// always covers a subscription set with a wide safety margin.
-const WATCH_LIST_LIMIT: usize = 256;
-const SUBSCRIPTION_PAGE_LIMIT: usize = 256;
 
 enum CreateFailure {
     Cap,
@@ -411,151 +404,6 @@ async fn schedule_replication(context: &DriverContext) {
     let _ = task_handle.send_effect(schedule_drain_effect()).await;
 }
 
-pub async fn list_watch_subscriptions(
-    storage: &StorageHandle,
-    owner: UserId,
-) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
-    let values = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(watch_subscription_prefix(owner)),
-            start: None,
-            limit: WATCH_LIST_LIMIT,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(WatchSubscriptionError::Storage(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let mut subscriptions = Vec::with_capacity(values.len());
-    for (key, value) in values {
-        let subscription = decode_stored_subscription(&key, &value)?;
-        if subscription.owner != owner {
-            return Err(WatchSubscriptionError::Storage(
-                "stored watch subscription belongs to a different owner".to_string(),
-            ));
-        }
-        subscriptions.push(subscription);
-    }
-    Ok(subscriptions)
-}
-
-/// Pages every watch subscription this node holds for `realm_id` (all owners),
-/// used by holder-side watch-event expansion. Subscription keys are realm-first,
-/// so one realm's rows form a single contiguous scan range.
-pub async fn list_realm_subscriptions(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
-    let prefix = UserId::storage_prefix(realm_id);
-    let mut subscriptions = Vec::with_capacity(SUBSCRIPTION_SCAN_CAP);
-    let mut start = None;
-    loop {
-        let remaining = SUBSCRIPTION_SCAN_CAP - subscriptions.len();
-        let limit = remaining.saturating_add(1).min(SUBSCRIPTION_PAGE_LIMIT);
-        let (values, next) = match storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start.map(IterStart::After),
-                limit,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(WatchSubscriptionError::Storage(error.to_string()));
-            }
-            other => {
-                return Err(WatchSubscriptionError::Storage(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        };
-        if values.len() > remaining {
-            return Err(WatchSubscriptionError::Storage(
-                "notification watch subscription scan cap reached".to_string(),
-            ));
-        }
-        for (key, value) in values {
-            let subscription = decode_stored_subscription(&key, &value)?;
-            if subscription.owner.realm_id != realm_id {
-                return Err(WatchSubscriptionError::Storage(
-                    "stored watch subscription belongs to a different realm".to_string(),
-                ));
-            }
-            subscriptions.push(subscription);
-        }
-        match next {
-            Some(next) => start = Some(next),
-            None => break,
-        }
-    }
-    Ok(subscriptions)
-}
-
-/// Reads one bounded realm page and returns the last key as its continuation.
-pub async fn list_watch_page(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    start: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
-    if limit == 0 || limit > SUBSCRIPTION_SCAN_CAP {
-        return Err(WatchSubscriptionError::Storage(
-            "notification watch subscription page cap exceeded".to_string(),
-        ));
-    }
-    let prefix = UserId::storage_prefix(realm_id);
-    let values = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start: start.map(|key| IterStart::After(key.into())),
-            limit: limit.saturating_add(1),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(WatchSubscriptionError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(WatchSubscriptionError::Storage(format!(
-                "unexpected watch subscription page event: {other:?}"
-            )));
-        }
-    };
-    let has_more = values.len() > limit;
-    let page: Vec<_> = values.into_iter().take(limit).collect();
-    let next = has_more.then(|| page.last().map(|(key, _)| key.to_vec()));
-    let mut subscriptions = Vec::with_capacity(page.len());
-    for (key, value) in page {
-        let subscription = decode_stored_subscription(&key, &value)?;
-        if subscription.owner.realm_id != realm_id {
-            return Err(WatchSubscriptionError::Storage(
-                "stored watch subscription belongs to a different realm".to_string(),
-            ));
-        }
-        subscriptions.push(subscription);
-    }
-    Ok((subscriptions, next.flatten()))
-}
-
 fn classify(error: StorageError) -> CreateFailure {
     if matches!(error, StorageError::TransactionConflict) {
         CreateFailure::Conflict
@@ -582,6 +430,50 @@ async fn abort_and_classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::protocol::SUBSCRIPTION_SCAN_CAP;
+    use crate::notifications::watch::listing::{
+        ListWatchesOperation, SUBSCRIPTION_PAGE_LIMIT, WatchScope,
+    };
+    use crate::notifications::watch::records::decode_stored_subscription;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    async fn list_scope(
+        storage: &StorageHandle,
+        scope: WatchScope,
+    ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
+        let list = ListWatchesOperation::new(scope);
+        let page = crate::driver::drive(list, &context(storage)).await?;
+        Ok((page.subscriptions, page.next))
+    }
+
+    async fn list_watch_subscriptions(
+        storage: &StorageHandle,
+        owner: UserId,
+    ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
+        Ok(list_scope(storage, WatchScope::Owner(owner)).await?.0)
+    }
+
+    async fn list_realm_subscriptions(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+    ) -> Result<Vec<WatchSubscription>, WatchSubscriptionError> {
+        Ok(list_scope(storage, WatchScope::Realm(realm_id)).await?.0)
+    }
+
+    async fn list_watch_page(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        start: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<(Vec<WatchSubscription>, Option<Vec<u8>>), WatchSubscriptionError> {
+        let scope = WatchScope::Page {
+            realm_id,
+            start,
+            limit,
+        };
+        list_scope(storage, scope).await
+    }
+
     use crate::notifications::watch::records::WATCH_CAP_REACHED;
     use crate::tests::notifications::{context, temp_storage, user};
     use aruna_core::NodeId;

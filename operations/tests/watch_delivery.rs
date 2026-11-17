@@ -36,7 +36,7 @@ use aruna_operations::notifications::watch::emit::emit_watch_event;
 use aruna_operations::notifications::watch::interest::{
     ensure_interest_digest, mark_interest_dirty, refresh_target_interest,
 };
-use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
+use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -501,9 +501,10 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     .await?;
     let old_holder_node = node_by_id(&nodes, old_holder);
     wait_for(|| async {
-        list_watch_subscriptions(&old_holder_node.context.storage_handle, watcher)
+        let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+        drive(list, old_holder_node.context.as_ref())
             .await
-            .is_ok_and(|rows| rows.contains(&subscription))
+            .is_ok_and(|page| page.subscriptions.contains(&subscription))
     })
     .await?;
     // The row and outbox record commit atomically; wait until the record has
@@ -575,9 +576,10 @@ async fn subscription_survives_rerank() -> Result<(), Box<dyn std::error::Error>
     }
 
     wait_for(|| async {
-        list_watch_subscriptions(&new_holder_node.context.storage_handle, watcher)
+        let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+        drive(list, new_holder_node.context.as_ref())
             .await
-            .is_ok_and(|rows| rows.contains(&subscription))
+            .is_ok_and(|page| page.subscriptions.contains(&subscription))
     })
     .await?;
     wait_for(|| async {

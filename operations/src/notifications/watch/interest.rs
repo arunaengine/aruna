@@ -32,8 +32,8 @@ use crate::notifications::watch::digest::{
     catchall_digest, digest_over, dirty_marker_write, schedule_publish_effect,
 };
 use crate::notifications::watch::expand::drain_watch_events;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
-use crate::notifications::watch::subscriptions::list_realm_subscriptions;
 use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
@@ -296,8 +296,9 @@ async fn build_realm_digest(
     realm_id: RealmId,
     realm_config: &RealmConfigDocument,
 ) -> Result<(WatchInterestDigest, bool), String> {
-    let subscriptions = match list_realm_subscriptions(&ctx.storage_handle, realm_id).await {
-        Ok(subscriptions) => subscriptions,
+    let list = ListWatchesOperation::new(WatchScope::Realm(realm_id));
+    let subscriptions = match drive(list, ctx).await {
+        Ok(page) => page.subscriptions,
         Err(WatchSubscriptionError::Storage(error))
             if error.contains("subscription scan cap reached") =>
         {

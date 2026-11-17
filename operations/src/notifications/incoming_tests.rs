@@ -18,8 +18,9 @@ use crate::notifications::inbox::UpsertInboxOperation;
 use crate::notifications::outbox::OUTBOX_BATCH_SIZE;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::protocol::EVENT_BATCH_SIZE;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
-use crate::notifications::watch::subscriptions::{create_local_watch, list_watch_subscriptions};
+use crate::notifications::watch::subscriptions::create_local_watch;
 use crate::sync::incoming::initialize_incoming_fixture;
 use aruna_core::UserId;
 use aruna_core::keyspaces::{
@@ -353,6 +354,19 @@ async fn webhook_queued(node: &Node, record: &NotificationRecord) -> bool {
 
 /// An upload the inbox drops after its bucket's deletion queues no webhook, even beside a
 /// stored record of the same batch.
+/// The watches of `owner` stored on the node behind `storage`.
+async fn list_watch_subscriptions(
+    storage: &aruna_storage::StorageHandle,
+    owner: UserId,
+) -> Result<
+    Vec<aruna_core::structs::execution::notification_watch::WatchSubscription>,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let list = ListWatchesOperation::new(WatchScope::Owner(owner));
+    let page = drive(list, &crate::tests::notifications::context(storage)).await?;
+    Ok(page.subscriptions)
+}
+
 /// Delivers `records` to `holder` and returns the written count or the rejection.
 async fn deliver_remote(
     net: &NetHandle,

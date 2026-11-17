@@ -26,7 +26,7 @@ use aruna_operations::driver::DriverContext;
 use aruna_operations::driver::drive;
 use aruna_operations::notifications::inbox::UpsertInboxOperation;
 use aruna_operations::notifications::routing::route_watch_event;
-use aruna_operations::notifications::watch::subscriptions::list_watch_subscriptions;
+use aruna_operations::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_storage::storage::FjallStorage;
 use axum::http::StatusCode;
 use base64::Engine;
@@ -1143,9 +1143,11 @@ async fn cross_group_watch() {
 
     let canonical = watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/");
     assert_eq!(created.path_prefix, canonical);
-    let subscriptions = list_watch_subscriptions(&state.get_ctx().storage_handle, watcher)
+    let list = ListWatchesOperation::new(WatchScope::Owner(watcher));
+    let subscriptions = drive(list, &state.get_ctx())
         .await
-        .expect("watch lists");
+        .expect("watch lists")
+        .subscriptions;
     let event_path =
         watch_resource_path(bucket_group, bucket_node, "reports", "quarterly/result.csv");
     let event = WatchEvent {

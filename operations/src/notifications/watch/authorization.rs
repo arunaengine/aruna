@@ -21,11 +21,11 @@ use crate::auth::request_policy::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::notifications::placement::filter_local_subscriptions;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::paths::{
     WatchAuthorization, WatchAuthorizationDenial, event_permission_path,
     notification_permission_path, watch_permission_path,
 };
-use crate::notifications::watch::subscriptions::list_watch_subscriptions;
 
 const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
 const WATCH_LIST_OPERATION: &str = "notifications.list_watches";
@@ -373,9 +373,11 @@ pub async fn list_authorized_subscriptions(
     context: &DriverContext,
     owner: UserId,
 ) -> Result<Vec<WatchSubscription>, String> {
-    let subscriptions = list_watch_subscriptions(&context.storage_handle, owner)
+    let list = ListWatchesOperation::new(WatchScope::Owner(owner));
+    let subscriptions = drive(list, context)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .subscriptions;
     let mut authorized = Vec::with_capacity(subscriptions.len());
     for mut subscription in subscriptions {
         match evaluate_watch_authorization(

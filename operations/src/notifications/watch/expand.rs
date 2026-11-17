@@ -28,8 +28,8 @@ use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
 use crate::notifications::watch::digest::dirty_marker_write;
 use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::paths::WatchAuthorization;
-use crate::notifications::watch::subscriptions::list_watch_page;
 
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
@@ -90,10 +90,15 @@ async fn expand_events_once(
     retry_key: Option<Vec<u8>>,
 ) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
     let page_size = page_limit(events.len()).map_err(UpsertFailure::Fatal)?;
-    let (subscriptions, next) =
-        list_watch_page(&context.storage_handle, realm_id, start, page_size)
-            .await
-            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+    let scope = WatchScope::Page {
+        realm_id,
+        start,
+        limit: page_size,
+    };
+    let page = drive(ListWatchesOperation::new(scope), context)
+        .await
+        .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+    let (subscriptions, next) = (page.subscriptions, page.next);
     let (subscriptions, found_stale) =
         filter_local_subscriptions(subscriptions, realm_config, local_node_id)
             .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;

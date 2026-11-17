@@ -16,8 +16,8 @@ use crate::notifications::client::deliver_events_remote;
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::expand::expand_watch_events;
 use crate::notifications::watch::interest::mark_interest_dirty;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
-use crate::notifications::watch::subscriptions::list_realm_subscriptions;
 use crate::realm::get_config::GetConfigOperation;
 
 /// Post-commit, best-effort emission of an origin watch event. Matches the
@@ -128,19 +128,19 @@ async fn include_local_holder(
     let realm_config = drive(GetConfigOperation::new(event.realm_id), context)
         .await
         .map_err(|error| error.to_string())?;
-    let subscriptions =
-        match list_realm_subscriptions(&context.storage_handle, event.realm_id).await {
-            Ok(subscriptions) => subscriptions,
-            Err(WatchSubscriptionError::Storage(error))
-                if error.contains("subscription scan cap reached") =>
-            {
-                if !holders.contains(&local_node_id) {
-                    holders.push(local_node_id);
-                }
-                return Ok(realm_config);
+    let list = ListWatchesOperation::new(WatchScope::Realm(event.realm_id));
+    let subscriptions = match drive(list, context).await {
+        Ok(page) => page.subscriptions,
+        Err(WatchSubscriptionError::Storage(error))
+            if error.contains("subscription scan cap reached") =>
+        {
+            if !holders.contains(&local_node_id) {
+                holders.push(local_node_id);
             }
-            Err(error) => return Err(error.to_string()),
-        };
+            return Ok(realm_config);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     let (subscriptions, found_stale) =
         filter_local_subscriptions(subscriptions, &realm_config, local_node_id)
             .map_err(|error| error.to_string())?;
