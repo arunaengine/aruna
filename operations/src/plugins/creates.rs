@@ -4,15 +4,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_CREATES_KEYSPACE;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_plugins::broker::{Created, HostError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::rows::{
-    Answer, Ask, Plan, RowsOperation, StoreError, Turn, decode, done, encode, row, values,
-};
+use super::rows::{StoreError, decode, done, encode, read_call, row, values};
 use super::unavailable;
 use crate::metadata::forward::write::PinnedCreate;
 
@@ -43,7 +43,7 @@ pub enum Step {
     Dispatch,
     /// Look the stored document up first.
     Lookup,
-    /// Answer the existing document and its establishing revision.
+    /// IoResult the existing document and its establishing revision.
     Adopt(Ulid),
     /// The outcome stays unknown until a person resolves it.
     Unknown,
@@ -79,16 +79,13 @@ fn create_key(install_id: Ulid, key: &str) -> Vec<u8> {
 
 /// Opens an attempt of `key` in one transaction, so concurrent calls adopt one document. A new key
 /// (or a former install's) stores `minted`; a refused one with no open attempt takes its arguments.
-pub fn claim_key(
-    (install, key): (&PluginInstall, &str),
-    minted: PinnedCreate,
-) -> RowsOperation<ClaimKey> {
-    RowsOperation::transaction(ClaimKey {
+pub fn claim_key((install, key): (&PluginInstall, &str), minted: PinnedCreate) -> ClaimKey {
+    ClaimKey {
         row: create_key(install.install_id, key),
         account: install.account,
         minted: Box::new(minted),
         claimed: None,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -99,21 +96,25 @@ pub struct ClaimKey {
     claimed: Option<(Box<PinnedCreate>, Claim)>,
 }
 
-impl Plan for ClaimKey {
+impl Operation for ClaimKey {
     type Output = (PinnedCreate, Claim);
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_CREATES_KEYSPACE,
             self.row.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
         if let Some((create, claim)) = self.claimed.take() {
             done(answer)?;
-            return Ok(Turn::Finish((*create, claim)));
+            return Ok(Next::Done((*create, claim)));
         }
         let [stored] = values::<1>(answer)?;
         let stored = stored.map(|bytes| decode::<KeyRow>(&bytes)).transpose()?;
@@ -140,22 +141,19 @@ impl Plan for ClaimKey {
         };
         self.claimed = Some((Box::new(create), claim));
         let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&value)?);
-        Ok(Turn::Ask(Ask::Write(vec![write])))
+        Ok(Next::Call(IoCall::Write(vec![write])))
     }
 }
 
 /// Closes one attempt of `key` whose outcome is known: it committed, or it was refused without
 /// an effect, `rejected` when the refusal concerns its arguments.
-pub(crate) fn settle_key(
-    (install, key): (&PluginInstall, &str),
-    rejected: bool,
-) -> RowsOperation<SettleKey> {
-    RowsOperation::transaction(SettleKey {
+pub(crate) fn settle_key((install, key): (&PluginInstall, &str), rejected: bool) -> SettleKey {
+    SettleKey {
         row: create_key(install.install_id, key),
         account: install.account,
         rejected,
         written: false,
-    })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -166,35 +164,39 @@ pub struct SettleKey {
     written: bool,
 }
 
-impl Plan for SettleKey {
+impl Operation for SettleKey {
     type Output = ();
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        Ok(Turn::Ask(Ask::Read(vec![(
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<()>, StoreError> {
+        Ok(Next::Call(read_call(vec![(
             PLUGIN_CREATES_KEYSPACE,
             self.row.clone(),
         )])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         if self.written {
             done(answer)?;
-            return Ok(Turn::Finish(()));
+            return Ok(Next::Done(()));
         }
         let [stored] = values::<1>(answer)?;
         let Some(bytes) = stored else {
-            return Ok(Turn::Finish(()));
+            return Ok(Next::Done(()));
         };
         let mut stored: KeyRow = decode(&bytes)?;
         if stored.account != self.account {
-            return Ok(Turn::Finish(()));
+            return Ok(Next::Done(()));
         }
         stored.open = stored.open.saturating_sub(1);
         stored.rejected = self.rejected;
         self.written = true;
         let write = row(PLUGIN_CREATES_KEYSPACE, self.row.clone(), encode(&stored)?);
-        Ok(Turn::Ask(Ask::Write(vec![write])))
+        Ok(Next::Call(IoCall::Write(vec![write])))
     }
 }
 

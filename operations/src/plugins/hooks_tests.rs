@@ -16,6 +16,7 @@ use crate::plugins::dispatch::{admit_hook, checks_authorization};
 use crate::plugins::install::read_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::outbound::tests::leaks;
+use crate::plugins::rows::{page_result, values_result};
 use crate::plugins::runs::list_runs;
 
 /// An install moved to a version whose webhook the `header` slot `hook_key` verifies, bound to
@@ -229,25 +230,25 @@ fn delivery_admitted_once() {
     let run = crate::plugins::runs::tests::queued(Ulid::from_parts(1, 1), 1);
     let ids = (run.install_id, Some("d1".to_string()));
     let mut plan = AdmitHook::new(run.clone(), ids.clone(), 9).unwrap();
-    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
     // A delivery id the receiver admitted before starts nothing.
-    let seen = Answer::Values(vec![Some(encode(&9u64).unwrap())]);
-    assert_eq!(plan.next(seen).unwrap(), Turn::Finish(false));
+    let seen = values_result(vec![Some(encode(&9u64).unwrap())]);
+    assert_eq!(plan.next(seen).unwrap(), Next::Done(false));
     let mut fresh = AdmitHook::new(run.clone(), ids, 9).unwrap();
     fresh.first().unwrap();
     assert!(matches!(
-        fresh.next(Answer::Values(vec![None])).unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        fresh.next(values_result(vec![None])).unwrap(),
+        Next::Call(IoCall::Page { .. })
     ));
-    let Turn::Ask(Ask::Write(rows)) = fresh.next(Answer::Page(Vec::new(), None)).unwrap() else {
+    let Next::Call(IoCall::Write(rows)) = fresh.next(page_result(Vec::new(), None)).unwrap() else {
         panic!("the delivery and the run are written");
     };
     assert_eq!(rows.len(), 4);
-    assert_eq!(fresh.next(Answer::Done).unwrap(), Turn::Finish(true));
+    assert_eq!(fresh.next(IoResult::Done).unwrap(), Next::Done(true));
     // Without a delivery id the run is admitted at once.
     let mut plain = AdmitHook::new(run.clone(), (run.install_id, None), 9).unwrap();
     assert!(matches!(
         plain.first().unwrap(),
-        Turn::Ask(Ask::Page { .. })
+        Next::Call(IoCall::Page { .. })
     ));
 }
