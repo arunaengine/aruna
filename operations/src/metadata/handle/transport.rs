@@ -739,14 +739,14 @@ impl MetadataHandle {
         &self,
         node_id: NodeId,
         auth_token: AuthToken,
-        request: crate::jobs::lifecycle::ingress::InputResolveRequest,
+        request: aruna_core::jobs::InputResolveRequest,
     ) -> Result<
         Result<
             Vec<(
                 aruna_core::structs::execution::job::InputSelection,
                 aruna_core::structs::execution::job::CapturedInput,
             )>,
-            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+            aruna_core::jobs::SubmissionRefusal,
         >,
         String,
     > {

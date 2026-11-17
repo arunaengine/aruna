@@ -40,12 +40,12 @@ use ulid::Ulid;
 
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::jobs::lifecycle::ids::SubmissionRequest;
-use crate::jobs::lifecycle::ingress::{SubmissionAck, SubmissionRefusal};
 use crate::metadata::api::{ReferenceNodeExecution, ReferenceNodeRequest, RoCrateExportView};
 use crate::metadata::create_document::CreateDocumentPayload;
 use crate::metadata::update_document::UpdateDocumentMutation;
 use crate::s3::bucket::search::BucketPage;
 use crate::s3::object::search::{ObjectKeyMatch, SearchNodePage};
+use aruna_core::jobs::{SubmissionAck, SubmissionRefusal};
 use aruna_core::structs::storage::release::{HolderAnswer, HolderAsk};
 
 pub use aruna_core::metadata::{AuthToken, AuthTokenError};
@@ -643,7 +643,7 @@ pub enum MetadataTransportMessage {
     /// Inputs an ingress asks their source node to resolve and grant, under the caller's bearer.
     ResolveJobInputs {
         auth_token: AuthToken,
-        request: Box<crate::jobs::lifecycle::ingress::InputResolveRequest>,
+        request: Box<aruna_core::jobs::InputResolveRequest>,
     },
     ResolvedJobInputs {
         result: Result<
@@ -651,7 +651,7 @@ pub enum MetadataTransportMessage {
                 aruna_core::structs::execution::job::InputSelection,
                 aruna_core::structs::execution::job::CapturedInput,
             )>,
-            crate::jobs::lifecycle::ingress::SubmissionRefusal,
+            aruna_core::jobs::SubmissionRefusal,
         >,
     },
     /// Release membership or release files of some ranges, asked of their coordinator with the

@@ -57,6 +57,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::jobs::{InputResolveRequest, SubmissionAck, SubmissionRefusal};
 use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
@@ -75,33 +76,6 @@ pub struct AcceptedSubmission {
     /// what this holder currently reduces for a replay of a request that may
     /// already be running or finished.
     pub state: LogicalJobState,
-}
-
-/// The holder's answer to a forwarded submission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubmissionAck {
-    pub job_id: JobId,
-    pub created: bool,
-    pub state: LogicalJobState,
-}
-
-/// Why a holder did not accept a forwarded submission. Only a definitive
-/// refusal ends the ingress; anything else lets it try the next holder.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SubmissionRefusal {
-    Unauthorized,
-    /// This node does not hold the family in its own unconflicted view.
-    NotHolder,
-    /// The recomputed identity or request digest differs from the forwarded one.
-    IdentityMismatch,
-    Conflict {
-        existing_job_id: JobId,
-    },
-    /// The holder read the request and refused it; the reason reaches the caller.
-    Invalid {
-        reason: String,
-    },
-    Unavailable,
 }
 
 /// What one resolve request or answer may carry: half a transport message, so the bearer and
@@ -130,16 +104,6 @@ fn batch_len<T: Serialize>(items: &[T]) -> usize {
         .iter()
         .take_while(|item| fits(&mut size, *item))
         .count()
-}
-
-/// The inputs an ingress asks their source node to resolve and grant for one caller.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InputResolveRequest {
-    pub created_by: UserId,
-    pub submission_id: SubmissionId,
-    /// Unix seconds the grants end at, bounded by this node's job retention.
-    pub expires_at: u64,
-    pub inputs: Vec<InputSelection>,
 }
 
 /// Resolves inputs this node holds for an ingress, under a bearer validated here, so grants
