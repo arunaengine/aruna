@@ -46,7 +46,7 @@ use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_publish::wake_publish;
-use crate::node::usage_stats::dirty_rows;
+use crate::s3::usage::dirty_rows;
 use crate::replication::members::owes_fanout;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 

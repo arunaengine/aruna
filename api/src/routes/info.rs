@@ -33,7 +33,7 @@ use aruna_operations::metadata::stats::{count_realm_documents, count_realm_group
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use aruna_operations::node::read_info::ReadInfoOperation;
 use aruna_operations::node::realm_usage::RealmUsageOperation;
-use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
+use aruna_operations::s3::usage::{LoadCountersOperation, RealmUsage, RealmUsageScope};
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };

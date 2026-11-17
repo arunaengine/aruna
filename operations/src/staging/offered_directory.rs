@@ -5,7 +5,7 @@
 
 use crate::blob::records::{HeadAliasContext, build_transition_effects, write_version_effect};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::plugins::journal::journaled;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_core::UserId;
@@ -1027,7 +1027,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
 
         crate::driver::drive(
-            crate::node::usage_stats::RebuildStatsOperation::new(),
+            crate::s3::usage::RebuildStatsOperation::new(),
             context,
         )
         .await
@@ -1061,7 +1061,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
 
         crate::driver::drive(
-            crate::node::usage_stats::RebuildStatsOperation::new(),
+            crate::s3::usage::RebuildStatsOperation::new(),
             context,
         )
         .await

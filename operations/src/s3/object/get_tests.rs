@@ -4,7 +4,7 @@
 
 use crate::connectors::repository::source_connector_key;
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate};
+use crate::s3::usage::{RowChange, UsageCounterUpdate};
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
 use crate::replication::queue::LiveObligationRecord;
@@ -2222,7 +2222,7 @@ async fn offered_drift_replaces() {
     let counters = usage().await;
     assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
     drive(
-        crate::node::usage_stats::RebuildStatsOperation::new(),
+        crate::s3::usage::RebuildStatsOperation::new(),
         context,
     )
     .await

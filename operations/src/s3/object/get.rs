@@ -17,7 +17,7 @@ use crate::distribution::pull::{
 };
 use crate::distribution::source_keep::{SourceKeep, keep_first};
 use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
 use crate::replication::protocol::{
     BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,

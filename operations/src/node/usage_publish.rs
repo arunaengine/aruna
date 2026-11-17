@@ -30,7 +30,7 @@ use tracing::warn;
 use crate::distribution::usage::replica_shares;
 use crate::driver::{DriverContext, drive};
 use crate::node::realm_usage::RealmUsageOperation;
-use crate::node::usage_stats::{PublishedUsage, dirty_rows, schedule_snapshot_publish};
+use crate::s3::usage::{PublishedUsage, dirty_rows, schedule_snapshot_publish};
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 

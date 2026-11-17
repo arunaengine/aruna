@@ -11,7 +11,7 @@ use aruna_core::time::unix_timestamp_secs;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::stats::count_realm_documents;
 use crate::node::realm_usage::RealmUsageOperation;
-use crate::node::usage_stats::RealmUsageScope;
+use crate::s3::usage::RealmUsageScope;
 
 /// The realm's totals from the realm usage sum and the live document count. Fails when one
 /// part is unknown, so a caller shows nothing instead of a zero.

@@ -8,7 +8,7 @@ use crate::distribution::inventory::{
     AddedVersion, InventoryChange, entry_of, stamp_head, stamp_version, version_written,
 };
 use crate::jobs::store::ClaimGuard;
-use crate::node::usage_stats::UsageUpdateError;
+use crate::s3::usage::UsageUpdateError;
 use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
 use crate::staging::descriptor::build_source_binding;

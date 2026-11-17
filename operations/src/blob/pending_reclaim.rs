@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::blob::reclaim::{ReclaimBlobError, ReclaimVerdict};
 use crate::blob::records::owners_scan_effect;
-use crate::node::usage_stats::{StoredDelta, UsageCounterUpdate};
+use crate::s3::usage::{StoredDelta, UsageCounterUpdate};
 
 #[derive(Debug, PartialEq)]
 enum State {

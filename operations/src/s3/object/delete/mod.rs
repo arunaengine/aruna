@@ -12,7 +12,7 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, HeadChange, InventoryChange, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{
+use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use crate::replication::queue::build_live_obligation;

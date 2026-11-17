@@ -21,7 +21,7 @@ use aruna_core::types::{Effects, GroupId, Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::node::usage_stats::{RealmUsage, RealmUsageScope};
+use crate::s3::usage::{RealmUsage, RealmUsageScope};
 
 /// Snapshot rows one page reads.
 const PAGE_LIMIT: usize = 1_000;
@@ -431,7 +431,7 @@ mod state_machine_tests {
     use ulid::Ulid;
 
     use super::{RealmUsageError, RealmUsageOperation, UsageCompleteOperation};
-    use crate::node::usage_stats::{RealmUsage, RealmUsageScope};
+    use crate::s3::usage::{RealmUsage, RealmUsageScope};
 
     const REALM: RealmId = RealmId([7; 32]);
     const GROUP: GroupId = Ulid::from_parts(4, 4);

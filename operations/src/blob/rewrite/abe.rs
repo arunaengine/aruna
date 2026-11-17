@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::abe::copies::copy_row;
-use crate::node::usage_stats::{RowChange, StoredDelta};
+use crate::s3::usage::{RowChange, StoredDelta};
 use crate::s3::bucket::key::rows::Row;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};
 use aruna_core::keyspaces::{

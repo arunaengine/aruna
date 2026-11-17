@@ -7,7 +7,7 @@ use crate::distribution::guard::{
 };
 use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryUpdate};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
-use crate::node::usage_stats::count_upload;
+use crate::s3::usage::count_upload;
 use crate::placement::policy::{
     GateContext, GatedBucket, PolicyGateError, PolicyGateOperation, gate_decision, write_gate,
 };

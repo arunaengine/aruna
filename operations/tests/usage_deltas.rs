@@ -36,7 +36,7 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::blob::records::HeadAliasContext;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::node::realm_usage::RealmUsageOperation;
-use aruna_operations::node::usage_stats::{
+use aruna_operations::s3::usage::{
     RealmUsageScope, RebuildStatsOperation,
 };
 use aruna_operations::s3::bucket::create::CreateBucketOperation;

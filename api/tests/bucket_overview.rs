@@ -35,7 +35,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::node::usage_stats::RebuildStatsOperation;
+use aruna_operations::s3::usage::RebuildStatsOperation;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};

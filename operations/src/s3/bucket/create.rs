@@ -7,7 +7,7 @@ use crate::groups::backends::backend_key;
 use crate::groups::imports::ImportRuleError;
 use crate::groups::imports::create::{CreateImportInput, CreateImportOperation};
 use crate::groups::storage_routing::routing_key;
-use crate::node::usage_stats::{
+use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use aruna_core::effects::abort_effects;

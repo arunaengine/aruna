@@ -36,7 +36,7 @@ use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOpe
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
 use crate::driver::{bucket_snapshot, drive, gate_context, now_ms};
 use crate::jobs::executor::JobContext;
-use crate::node::usage_stats::QuotaGateError;
+use crate::s3::usage::QuotaGateError;
 use crate::placement::policy::gate::PolicyGateError;
 use crate::placement::policy::read::ReadPolicyError;
 use crate::realm::get_config::GetConfigOperation;
