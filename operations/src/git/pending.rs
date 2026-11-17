@@ -85,8 +85,7 @@ async fn apply_one(
         .ok_or(GitError::Unavailable)?;
     let mut files = super::dataset::target(context, store, document, merge).await?;
     for _ in 0..8 {
-        let exported = metadata
-            .send_metadata_effect(MetadataEffect::ExportVersioned {
+        let exported = crate::metadata::send_metadata_effect(context, MetadataEffect::ExportVersioned {
                 graph_iri: document.graph_iri.clone(),
             })
             .await;
@@ -234,6 +233,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };

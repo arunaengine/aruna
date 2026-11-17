@@ -40,8 +40,7 @@ pub async fn query_metadata_document(
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
     if request.mode == Some(ApiQueryMode::Local) {
         ensure_record_materialized(context, &record).await?;
-        let results = metadata
-            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+        let results = crate::metadata::query_authorized_local(context, request.auth, Some(vec![record.graph_iri]), request.query)
             .await
             .map_err(map_query_error)?;
         return Ok(MetadataQueryExecution {
@@ -58,8 +57,7 @@ pub async fn query_metadata_document(
             return Err(MetadataApiError::ServiceUnavailable);
         }
         ensure_record_materialized(context, &record).await?;
-        let results = metadata
-            .query_authorized_local(request.auth, Some(vec![record.graph_iri]), request.query)
+        let results = crate::metadata::query_authorized_local(context, request.auth, Some(vec![record.graph_iri]), request.query)
             .await
             .map_err(map_query_error)?;
         return Ok(MetadataQueryExecution {
@@ -89,9 +87,7 @@ pub async fn query_metadata_document(
         fanout_stats.nodes_queried += 1;
         let result: Result<MetadataQueryResults, MetadataReadError> = if holder == local_node_id {
             match ensure_record_materialized(context, &record).await {
-                Ok(()) => metadata
-                    .query_authorized_local(
-                        request.auth.clone(),
+                Ok(()) => crate::metadata::query_authorized_local(context, request.auth.clone(),
                         Some(vec![record.graph_iri.clone()]),
                         request.query.clone(),
                     )

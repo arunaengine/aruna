@@ -673,13 +673,11 @@ pub(super) async fn reference_document_title(
     context: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Option<String> {
-    let handle = context.metadata_handle.clone()?;
-    let properties = handle
-        .describe_root_properties(record.graph_iri.clone())
-        .await;
+    let graph = context.graph_handle.as_ref()?;
+    let properties = graph.describe_root(record.graph_iri.clone()).await;
     // Root subject "./" makes the fallback the document path, not the id tail.
     let title =
-        crate::metadata::search_enrichment::hit_title(&properties, &record.document_path, "./");
+        aruna_core::search_enrichment::hit_title(&properties, &record.document_path, "./");
     (!title.is_empty()).then_some(title)
 }
 

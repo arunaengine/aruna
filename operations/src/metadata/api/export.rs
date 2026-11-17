@@ -179,8 +179,7 @@ async fn export_rocrate_jsonld(
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_jsonld(graph_iri.to_string())
+    crate::metadata::export_rocrate_jsonld(context, graph_iri.to_string())
         .await
         .map_err(map_event_error)
 }
@@ -206,8 +205,7 @@ pub(super) async fn export_summary_jsonld(
         summary_cache().remove(graph_iri);
     }
 
-    let summary = handle
-        .export_summary_jsonld(graph_iri.to_string())
+    let summary = crate::metadata::export_summary_jsonld(context, graph_iri.to_string())
         .await
         .map_err(map_event_error)?;
     summary_cache().insert(graph_iri, cursor, &summary, Instant::now());
@@ -229,8 +227,7 @@ async fn export_rocrate_page(
         .metadata_handle
         .clone()
         .ok_or_else(|| MetadataApiError::Internal("metadata handle unavailable".to_string()))?;
-    handle
-        .export_rocrate_page(graph_iri.to_string(), limit, offset, after)
+    crate::metadata::export_rocrate_page(context, graph_iri.to_string(), limit, offset, after)
         .await
         .map_err(map_event_error)
 }

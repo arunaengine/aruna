@@ -210,8 +210,7 @@ async fn install_state(
     let clock = state.snapshot.clock.clone();
     let graph_bytes = postcard::to_allocvec(&state.snapshot).map_or(0, |bytes| bytes.len() as u64);
     let preserve_display = local_is_ahead(&replica.local_clock, &clock);
-    match metadata
-        .send_metadata_effect(MetadataEffect::InstallSnapshot {
+    match crate::metadata::send_metadata_effect(context, MetadataEffect::InstallSnapshot {
             graph_iri: graph_iri.clone(),
             snapshot: Box::new(state.snapshot),
         })

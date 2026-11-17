@@ -288,8 +288,7 @@ pub async fn process_graph_tombstones(
         let Some(metadata_handle) = metadata_handle.as_ref() else {
             continue;
         };
-        match metadata_handle
-            .prune_if_deleted(tombstone.graph_iri.clone())
+        match crate::metadata::prune_if_deleted(context, tombstone.graph_iri.clone())
             .await
         {
             Ok(true) => result.pruned = result.pruned.saturating_add(1),
@@ -362,7 +361,7 @@ async fn process_prune_job(
     };
 
     // A retry after a failed link queueing finds the graph already pruned, so it queues again.
-    let pruned = match metadata_handle.prune_if_deleted(graph_iri.clone()).await {
+    let pruned = match crate::metadata::prune_if_deleted(context, graph_iri.clone()).await {
         Ok(_) => queue_deleted(context, &graph_iri)
             .await
             .map_err(|error| format!("queueing the repository links failed: {error}")),
@@ -851,20 +850,21 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            node_id,
-            storage.clone(),
-            None,
-            None,
-            None,
-        )
+        let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
         .expect("metadata handle opens");
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle.clone()),
+            graph_handle: Some(graph_handle.clone()),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
@@ -875,8 +875,7 @@ mod tests {
         )
         .await;
         metadata_handle.expire_visibility_caches();
-        let stale = metadata_handle
-            .list_cached_group(record.group_id)
+        let stale = crate::metadata::list_cached_group(&context, record.group_id)
             .await
             .expect("registry cache fills");
         assert_eq!(stale.as_ref(), &vec![record.clone()]);
@@ -896,8 +895,7 @@ mod tests {
         let processed = process_graph_tombstones(&context, vec![tombstone.clone()]).await;
 
         assert_eq!(processed.enqueued, 1);
-        let listed = metadata_handle
-            .list_cached_group(record.group_id)
+        let listed = crate::metadata::list_cached_group(&context, record.group_id)
             .await
             .expect("registry cache reads");
         assert!(listed.is_empty());
@@ -914,20 +912,21 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            node_id,
-            storage.clone(),
-            None,
-            None,
-            None,
-        )
+        let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
         .expect("metadata handle opens");
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
         let context = DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
         };
@@ -980,6 +979,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1010,6 +1010,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };
@@ -1239,6 +1240,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };

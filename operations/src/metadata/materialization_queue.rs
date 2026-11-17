@@ -2289,13 +2289,11 @@ async fn project_materialized_iris(
     (Vec<(String, ByteView, ByteView)>, Vec<(String, ByteView)>),
     MetadataMaterializationError,
 > {
-    let metadata_handle = context
-        .metadata_handle
+    let graph = context
+        .graph_handle
         .as_ref()
         .ok_or(MetadataMaterializationError::MetadataHandleMissing)?;
-    let references = metadata_handle
-        .snapshot_iri_references(event.record.graph_iri.clone())
-        .await?;
+    let references = graph.iri_references(event.record.graph_iri.clone()).await?;
     let mut links =
         super::data_links::project_links(&event.record.graph_iri, event.event_id, &references);
     super::data_links::associate_versions(&context.storage_handle, &mut links)

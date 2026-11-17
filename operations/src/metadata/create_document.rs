@@ -2085,20 +2085,21 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
         let metadata_storage =
             FjallStorage::open(temp.join("meta-store").to_str().unwrap()).unwrap();
-        let metadata_handle = MetadataHandle::new(
-            temp.join("meta"),
-            node_id,
-            metadata_storage,
-            None,
-            None,
-            None,
-        )
+        let graph_handle = aruna_graph::GraphHandle::open(
+temp.join("meta"),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
         .unwrap();
+let metadata_handle = MetadataHandle::new(temp.join("meta"), metadata_storage, None, Default::default());
         Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
         })

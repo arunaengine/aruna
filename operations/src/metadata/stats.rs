@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
 use aruna_core::effects::{IterStart, StorageEffect};
@@ -22,7 +23,6 @@ use crate::metadata::get_document::record_materialized_read;
 const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
 const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
-const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupDocumentCounts {
@@ -41,8 +41,7 @@ pub async fn count_realm_documents(
     let Some(metadata_handle) = context.metadata_handle.as_ref() else {
         return Ok(None);
     };
-    let records = metadata_handle
-        .list_cached_records()
+    let records = crate::metadata::list_cached_records(context)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let records =
@@ -151,8 +150,7 @@ pub async fn count_group_purpose(
     let Some(metadata_handle) = context.metadata_handle.clone() else {
         return Ok(None);
     };
-    let records = metadata_handle
-        .list_cached_group(group_id)
+    let records = crate::metadata::list_cached_group(context, group_id)
         .await
         .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
     let records = super::api::filter_live_records(&context.storage_handle, records.as_ref())
@@ -177,8 +175,7 @@ pub async fn count_group_purpose(
             {
                 return Err(MetadataApiError::ServiceUnavailable);
             }
-            let summary = metadata_handle
-                .export_summary_jsonld(record.graph_iri.clone())
+            let summary = crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
                 .await
                 .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
             classify_root_summary(&summary, &record.graph_iri)
@@ -358,20 +355,21 @@ mod tests {
         let storage = FjallStorage::open(storage_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            node_id,
-            storage.clone(),
-            None,
-            None,
-            None,
-        )
+        let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)
         .expect("metadata handle opens");
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
         });
@@ -480,9 +478,7 @@ mod tests {
                 root
             ]
         });
-        let handle = fixture.context.metadata_handle.as_ref().unwrap();
-        match handle
-            .send_metadata_effect(MetadataEffect::ApplyRoCrate {
+        match crate::metadata::send_metadata_effect(&fixture.context, MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
                     graph_iri: record.graph_iri.clone(),
                     jsonld: jsonld.to_string(),
@@ -681,6 +677,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         };

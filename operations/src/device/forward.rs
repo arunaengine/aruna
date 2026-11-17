@@ -360,8 +360,7 @@ pub(super) async fn read_graph_state(
         .await
         .map_err(sync_refusal)?;
     let graph_iri = record.graph_iri.clone();
-    let snapshot = match metadata
-        .send_metadata_effect(MetadataEffect::GraphSnapshot { graph_iri })
+    let snapshot = match crate::metadata::send_metadata_effect(context, MetadataEffect::GraphSnapshot { graph_iri })
         .await
     {
         Event::Metadata(MetadataEvent::GraphSnapshotResult { snapshot, .. }) => *snapshot,
@@ -416,8 +415,7 @@ async fn scaffold_display(
     }
     let Event::Metadata(MetadataEvent::VersionedExport {
         jsonld, version, ..
-    }) = metadata
-        .send_metadata_effect(MetadataEffect::ExportVersioned {
+    }) = crate::metadata::send_metadata_effect(context, MetadataEffect::ExportVersioned {
             graph_iri: record.graph_iri.clone(),
         })
         .await
@@ -523,8 +521,7 @@ pub(super) async fn run_device_batch(
         .as_ref()
         .ok_or(SyncRefusal::Unavailable)?;
     for (actor, counter) in &batch.base_clock.0 {
-        let known = metadata
-            .send_metadata_effect(MetadataEffect::ContainsDot {
+        let known = crate::metadata::send_metadata_effect(context, MetadataEffect::ContainsDot {
                 graph_iri: record.graph_iri.clone(),
                 actor: actor.0,
                 counter: *counter,
@@ -594,6 +591,7 @@ mod tests {
             net_handle: None,
             blob_handle: None,
             metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
         });

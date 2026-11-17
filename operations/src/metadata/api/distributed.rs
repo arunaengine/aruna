@@ -162,8 +162,7 @@ pub(super) async fn run_query_distributed(
             fetch_ties(query, ties, deadline, MERGE_PERMITS.clone(), |query| {
                 let (handle, auth, graph_iris) = (handle.clone(), auth.clone(), graph_iris.clone());
                 async move {
-                    handle
-                        .query_authorized_local(auth, graph_iris, query)
+                    crate::metadata::query_authorized_local(context, auth, graph_iris, query)
                         .await
                         .map_err(crate::metadata::handle::metadata_read_error)
                 }
@@ -355,13 +354,11 @@ pub(super) async fn run_search_distributed(
                         crate::metadata::profile::validation::equivalent_profile_iris(&object_iri)
                     {
                         hits.extend(
-                            handle
-                                .search_local_filtered(
-                                    auth.clone(),
+                            crate::metadata::search_local_filtered(context, auth.clone(),
                                     graph_iris.clone(),
                                     query.clone(),
                                     limit,
-                                    crate::metadata::iri_index::DCTERMS_CONFORMS_IRI.to_string(),
+                                    aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
                                     object_iri,
                                     group_id,
                                 )
@@ -371,8 +368,7 @@ pub(super) async fn run_search_distributed(
                     }
                     merge_search_hits(hits).into_iter().take(limit).collect()
                 }
-                None => handle
-                    .search_authorized_local(auth, graph_iris, query, limit, group_id)
+                None => crate::metadata::search_authorized_local(context, auth, graph_iris, query, limit, group_id)
                     .await
                     .map_err(crate::metadata::handle::metadata_read_error)?,
             };
@@ -407,7 +403,7 @@ pub(super) async fn run_search_distributed(
                                     graph_iris.clone(),
                                     query.clone(),
                                     limit,
-                                    crate::metadata::iri_index::DCTERMS_CONFORMS_IRI.to_string(),
+                                    aruna_core::entity_patch::DCTERMS_CONFORMS_IRI.to_string(),
                                     object_iri,
                                     group_id,
                                 )

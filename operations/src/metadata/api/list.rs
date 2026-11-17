@@ -190,8 +190,7 @@ pub(super) async fn load_group_records(
     let records = if let Some(metadata_handle) = context.metadata_handle.as_ref() {
         // Listing remains eventually consistent: the handle-owned visibility
         // cache serves stale snapshots while one refill updates the read path.
-        metadata_handle
-            .list_group_records(group_id, limit)
+        crate::metadata::list_group_records(context, group_id, limit)
             .await
             .map_err(|_| MetadataApiError::ServiceUnavailable)?
             .as_ref()

@@ -201,8 +201,7 @@ async fn plan_local(
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match metadata
-        .send_metadata_effect(MetadataEffect::PlanBatch {
+    match crate::metadata::send_metadata_effect(context, MetadataEffect::PlanBatch {
             graph_iri: record.graph_iri.clone(),
             actor,
             counter,
@@ -235,8 +234,7 @@ async fn merge_local(
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    match metadata
-        .send_metadata_effect(MetadataEffect::MergeBatch {
+    match crate::metadata::send_metadata_effect(context, MetadataEffect::MergeBatch {
             graph_iri: batch.graph_iri.clone(),
             batch: batch.clone(),
         })
@@ -256,8 +254,7 @@ async fn render(context: &Arc<DriverContext>, graph_iri: &str) -> Result<String,
         .metadata_handle
         .as_ref()
         .ok_or(DeviceEditError::Unavailable)?;
-    metadata
-        .export_rocrate_jsonld(graph_iri.to_string())
+    crate::metadata::export_rocrate_jsonld(context, graph_iri.to_string())
         .await
         .map_err(|error| {
             warn!(error = %error, "Could not render an edited replica");
@@ -281,10 +278,10 @@ async fn arm_drain(context: &Arc<DriverContext>) {
 /// Asks the metadata backend to make what it just wrote durable. Best effort:
 /// a failure leaves exactly the queued work the replay covers.
 async fn request_persist(context: &Arc<DriverContext>) {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
+    let Some(graph) = context.graph_handle.as_ref() else {
         return;
     };
-    if let Err(error) = metadata.flush_persistence().await {
+    if let Err(error) = graph.flush_persistence().await {
         warn!(error = %error, "Could not persist an offline edit's graph");
     }
 }
@@ -315,8 +312,7 @@ pub async fn replay_queued_edits(context: &Arc<DriverContext>) -> usize {
         if !replays_edit(&entry) {
             continue;
         }
-        match metadata
-            .send_metadata_effect(MetadataEffect::MergeBatch {
+        match crate::metadata::send_metadata_effect(context, MetadataEffect::MergeBatch {
                 graph_iri: batch.graph_iri.clone(),
                 batch: (**batch).clone(),
             })
@@ -350,7 +346,7 @@ mod tests {
     };
     use crate::device::replica::{ReplicaOrigin, ReplicaRecord};
     use crate::driver::DriverContext;
-    use crate::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+    use crate::metadata::MetadataHandle;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -420,21 +416,21 @@ mod tests {
             dir.path().join("storage").to_str().expect("storage path"),
         )
         .unwrap();
-        let metadata = MetadataHandle::new_with_options(
-            dir.path().join("metadata"),
-            node(1),
-            storage.clone(),
-            None,
-            None,
-            None,
-            MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
-        )
+        let graph = aruna_graph::GraphHandle::open(
+dir.path().join("metadata"),
+node(1),
+None,
+None,
+aruna_graph::GraphOptions::default().with_search_storage(aruna_graph::MetadataSearchStorage::Memory),
+)
         .unwrap();
+let metadata = MetadataHandle::new(dir.path().join("metadata"), storage.clone(), None, Default::default());
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata),
+            graph_handle: Some(graph),
             task_handle: None,
             compute_handle: None,
         });
@@ -639,9 +635,7 @@ mod tests {
             ReplicaOrigin::Realm,
         );
         replica.record = Some(Box::new(record.clone()));
-        let metadata = context.metadata_handle.as_ref().unwrap();
-        let before = metadata
-            .export_rocrate_jsonld(record.graph_iri.clone())
+        let before = crate::metadata::export_rocrate_jsonld(&context, record.graph_iri.clone())
             .await
             .unwrap();
 
@@ -664,8 +658,7 @@ mod tests {
         // The refused edit must not consume a dot either.
         assert_eq!(read_actor(&context, record.document_id).await, Ok(None));
         assert_eq!(
-            metadata
-                .export_rocrate_jsonld(record.graph_iri.clone())
+            crate::metadata::export_rocrate_jsonld(&context, record.graph_iri.clone())
                 .await
                 .unwrap(),
             before

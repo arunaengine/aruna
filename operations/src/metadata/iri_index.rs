@@ -5,6 +5,7 @@
 // Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
 // own rows, so a materialization replaces exactly its own postings.
 
+use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -40,7 +41,6 @@ use super::repository::{
 const INDEX_PAGE_SIZE: usize = 128;
 const INDEX_BATCH_SIZE: usize = 128;
 
-pub(crate) const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
@@ -411,8 +411,8 @@ async fn rebuild_page(
     context: &DriverContext,
     records: &[MetadataRegistryRecord],
 ) -> Result<usize, MetadataError> {
-    let metadata_handle = context
-        .metadata_handle
+    let graph = context
+        .graph_handle
         .as_ref()
         .ok_or(MetadataError::HandleMissing)?;
     let storage = &context.storage_handle;
@@ -429,9 +429,7 @@ async fn rebuild_page(
             continue;
         }
 
-        let references = metadata_handle
-            .snapshot_iri_references(record.graph_iri.clone())
-            .await?;
+        let references = graph.iri_references(record.graph_iri.clone()).await?;
         let mut links =
             super::data_links::project_links(&record.graph_iri, record.last_event_id, &references);
         super::data_links::associate_versions(storage, &mut links).await?;

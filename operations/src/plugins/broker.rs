@@ -69,7 +69,7 @@ use crate::metadata::forward::{
     CreateAuthorizedError, PinnedCreate, create_with_id, export_rocrate_routed,
     get_metadata_routed, route_metadata_update,
 };
-use crate::metadata::handle::craqle_patch_request;
+use aruna_core::entity_patch::craqle_patch_request;
 use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentMutation};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};

@@ -139,8 +139,7 @@ pub(super) async fn device_export(
         RoCrateExportView::Raw => {
             let merged = if replica.findings > 0 {
                 Some(
-                    handle
-                        .export_rocrate_jsonld(record.graph_iri.clone())
+                    crate::metadata::export_rocrate_jsonld(context, record.graph_iri.clone())
                         .await
                         .map_err(|_| MetadataApiError::ServiceUnavailable)?,
                 )
@@ -164,16 +163,13 @@ pub(super) async fn device_export(
             })
         }
         RoCrateExportView::Summary => Ok(ExportMetadataResult::Summary {
-            jsonld: handle
-                .export_summary_jsonld(record.graph_iri.clone())
+            jsonld: crate::metadata::export_summary_jsonld(context, record.graph_iri.clone())
                 .await
                 .map_err(|_| MetadataApiError::ServiceUnavailable)?,
             record,
         }),
         RoCrateExportView::Page => Ok(ExportMetadataResult::Page {
-            page: handle
-                .export_rocrate_page(
-                    record.graph_iri.clone(),
+            page: crate::metadata::export_rocrate_page(context, record.graph_iri.clone(),
                     request.limit.unwrap_or(100).clamp(1, 1_000),
                     request.offset,
                     request.after.clone(),
@@ -1104,8 +1100,7 @@ pub(crate) async fn apply_document_query(
     )
     .await
     .map_err(read_error)?;
-    metadata
-        .query_authorized_local(auth, Some(vec![record.graph_iri]), sparql)
+    crate::metadata::query_authorized_local(context, auth, Some(vec![record.graph_iri]), sparql)
         .await
         .map_err(|_| MetadataReadError::Unavailable)
 }
