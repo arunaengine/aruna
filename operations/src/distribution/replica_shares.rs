@@ -367,3 +367,98 @@ impl Operation for ReplicaSharesOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::distribution::test_record::{binding, record};
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const TXN: TxnId = Ulid::from_bytes([9; 16]);
+
+    fn share() -> BindingShareOperation {
+        let (snapshot, _) = record(true);
+        BindingShareOperation::new(binding(&snapshot, 1, 1), TXN)
+    }
+
+    fn read(values: Vec<Option<Vec<u8>>>) -> Event {
+        let values = values.into_iter();
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: (values.map(|value| (Vec::new().into(), value.map(Into::into)))).collect(),
+        })
+    }
+
+    fn empty_page() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
+    }
+
+    // A set without local accounts shares nothing but names its record number.
+    #[test]
+    fn reads_set_accounts() {
+        let (snapshot, bytes) = record(true);
+        let set_id = snapshot.set_id();
+        let mut operation = share();
+        let start = batch_read(
+            vec![(
+                DISTRIBUTION_KEYSPACE.to_string(),
+                set_id.to_bytes().to_vec().into(),
+            )],
+            TXN,
+        );
+        let prefix = Some(set_id.to_bytes().to_vec().into());
+        let accounts = scan(RANGE_ACCOUNT_KEYSPACE, prefix, None, TXN);
+        check_trace(
+            &mut operation,
+            &start,
+            vec![
+                (read(vec![Some(bytes)]), accounts.into_vec()),
+                (empty_page(), batch_read(Vec::new(), TXN).into_vec()),
+                (read(Vec::new()), Vec::new()),
+            ],
+        );
+        let expected = (RangeCounters::default(), Some((set_id, snapshot.number)));
+        assert_eq!(operation.finalize(), Ok(expected));
+    }
+
+    // A set this node has no record of shares nothing; a failed read fails.
+    #[test]
+    fn missing_set_empty() {
+        let mut operation = share();
+        operation.start();
+        assert!(operation.step(read(vec![None])).is_empty());
+        assert_eq!(operation.finalize(), Ok((RangeCounters::default(), None)));
+        let mut operation = share();
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(operation.finalize(), Err(StorageError::Timeout.into()));
+    }
+
+    // A node without bound buckets has no shares.
+    #[test]
+    fn empty_without_buckets() {
+        let mut operation = ReplicaSharesOperation::new(TXN);
+        let buckets = scan(S3_BUCKET_KEYSPACE, None, None, TXN);
+        check_trace(&mut operation, &buckets, vec![(empty_page(), Vec::new())]);
+        assert_eq!(operation.finalize(), Ok(BTreeMap::new()));
+    }
+
+    // Unstarted reads refuse every event, abort nothing and never finish early.
+    #[test]
+    fn shares_reject_unexpected() {
+        let shares = || ReplicaSharesOperation::new(TXN);
+        let all = sample_events().len();
+        assert_eq!(rejects_events(share, sample_events, |_| false).len(), all);
+        assert_eq!(rejects_events(shares, sample_events, |_| false).len(), all);
+        rejects_finalize(share());
+        rejects_finalize(shares());
+        assert!(share().abort().is_empty());
+        assert!(shares().abort().is_empty());
+    }
+}

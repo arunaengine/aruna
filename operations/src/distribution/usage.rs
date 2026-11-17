@@ -3,26 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    DISTRIBUTION_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
-use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::accounting::{
-    CounterOverflow, RangeAccount, RangeCounters,
-};
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, DistributionView,
-};
-use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionSnapshot};
+use aruna_core::types::{GroupId, TxnId};
 use ulid::Ulid;
 
-use super::charged_ranges::{ChargedRangesOperation, UsageError, charged_rows, sum_rows};
+use super::charged_ranges::{ChargedRangesOperation, UsageError, charged_rows};
+use super::replica_shares::{GroupShare, ReplicaSharesOperation};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::usage_complete;
 use crate::replication::members::bound_record;
@@ -38,26 +27,6 @@ pub struct RangeUsage {
     /// Every range is held here and its counters are exact (active, not rebuilding, and no
     /// node-wide usage rebuild is running).
     pub complete: bool,
-}
-
-async fn batch_read(
-    context: &DriverContext,
-    reads: Vec<(String, Key)>,
-    txn_id: TxnId,
-) -> Result<Vec<Option<Value>>, UsageError> {
-    let read = StorageEffect::BatchRead {
-        reads,
-        txn_id: Some(txn_id),
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            Ok(values.into_iter().map(|(_, value)| value).collect())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => {
-            Err(StorageError::ReadError(format!("unexpected answer {}", other.label())).into())
-        }
-    }
 }
 
 /// The charged counter rows of one range this member holds, so a member that does not hold the
@@ -129,134 +98,50 @@ pub fn sum_held<'a>(
     Ok(total)
 }
 
-/// What this member holds of `bucket`'s set as copies: every range with an account here, one
-/// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
-/// Also names the set and the number of the record the share was computed under.
+/// Each group's replica share on this node; see [`ReplicaSharesOperation`].
+pub async fn replica_shares(
+    context: &DriverContext,
+    txn_id: TxnId,
+) -> Result<BTreeMap<GroupId, GroupShare>, UsageError> {
+    drive(ReplicaSharesOperation::new(txn_id), context).await
+}
+
 #[cfg(test)]
-async fn replica_share(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
-    let Some((binding, _)) = bound_record(context, bucket)
-        .await
-        .map_err(UsageError::Record)?
-    else {
-        return Ok((RangeCounters::default(), None));
+mod tests {
+    use super::*;
+    use crate::distribution::charged_ranges::sum_rows;
+    use crate::distribution::replica_shares::BindingShareOperation;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{
+        RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
     };
-    let txn_id = match (context.storage_handle)
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => {
-            return Err(
-                StorageError::ReadError(format!("unexpected answer {}", other.label())).into(),
-            );
-        }
+    use aruna_core::structs::storage::blob::BucketInfo;
+    use aruna_core::structs::storage::distribution::accounting::{
+        Charge, RangeAccount, account_key, generation_key, pending_key,
     };
-    let share = binding_share(context, &binding, txn_id).await;
-    (context.storage_handle)
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-    share
-}
+    use aruna_core::structs::storage::usage::UsageCounters;
+    use aruna_core::types::Value;
 
-/// A bound bucket's share and its record number, both read in `txn_id`.
-async fn binding_share(
-    context: &DriverContext,
-    binding: &DistributionBinding,
-    txn_id: TxnId,
-) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
-    let read = vec![(
-        DISTRIBUTION_KEYSPACE.to_string(),
-        binding.set_id.to_bytes().to_vec().into(),
-    )];
-    let Some(Some(value)) = batch_read(context, read, txn_id).await?.pop() else {
-        return Ok((RangeCounters::default(), None));
-    };
-    let snapshot = DistributionView::from_bytes(&value)?.head.snapshot;
-    let share = copied_rows(context, (binding, &snapshot), txn_id).await?;
-    Ok((share, Some((binding.set_id, snapshot.number))))
-}
-
-/// The charged rows of every local account of the set less those of the coordinated ranges, so
-/// a split parent's row shared with a coordinated child is not subtracted.
-async fn copied_rows(
-    context: &DriverContext,
-    (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
-    txn_id: TxnId,
-) -> Result<RangeCounters, UsageError> {
-    let set_id = binding.set_id;
-    let accounts = local_accounts(context, set_id, txn_id).await?;
-    // A split parent this node has not split its accounting for yet counts with its children.
-    let coordinated = |range_id: &Ulid| {
-        (snapshot.config.ranges.iter()).any(|range| {
-            range.coordinator == binding.member_id && snapshot.descends(range, *range_id)
-        })
-    };
-    let own: Vec<_> = (accounts.iter())
-        .filter(|(range_id, _)| coordinated(range_id))
-        .cloned()
-        .collect();
-    let (held, own) = (charged_rows(set_id, &accounts), charged_rows(set_id, &own));
-    let keys: BTreeSet<Vec<u8>> = held.iter().chain(&own).cloned().collect();
-    let reads = (keys.iter())
-        .map(|key| (RANGE_COUNTER_KEYSPACE.to_string(), key.clone().into()))
-        .collect();
-    let stored: BTreeMap<_, _> = keys
-        .into_iter()
-        .zip(batch_read(context, reads, txn_id).await?)
-        .collect();
-    let sum = |rows: &[Vec<u8>]| {
-        let values: Vec<_> = rows.iter().map(|key| stored[key].clone()).collect();
-        sum_rows(&values)
-    };
-    Ok(sum(&held)?.merge(sum(&own)?.negate()?)?)
-}
-
-/// Every range account this node keeps for the set, read in `txn_id`.
-async fn local_accounts(
-    context: &DriverContext,
-    set_id: Ulid,
-    txn_id: TxnId,
-) -> Result<Vec<(Ulid, RangeAccount)>, UsageError> {
-    let prefix = Some(set_id.to_bytes().to_vec().into());
-    let mut accounts = Vec::new();
-    for (key, value) in scan_in(context, RANGE_ACCOUNT_KEYSPACE, prefix, txn_id).await? {
-        let Some(range_id) = key.get(16..).and_then(|id| <[u8; 16]>::try_from(id).ok()) else {
-            continue;
+    /// What this member holds of `bucket`'s set as copies: every range with an account here, one
+    /// being purged included, less the ranges it coordinates. Zero for an ordinary bucket.
+    /// Also names the set and the number of the record the share was computed under.
+    async fn replica_share(
+        context: &DriverContext,
+        bucket: &str,
+    ) -> Result<(RangeCounters, Option<(Ulid, u64)>), UsageError> {
+        let Some((binding, _)) = bound_record(context, bucket)
+            .await
+            .map_err(UsageError::Record)?
+        else {
+            return Ok((RangeCounters::default(), None));
         };
-        accounts.push((
-            Ulid::from_bytes(range_id),
-            RangeAccount::from_bytes(&value)?,
-        ));
-    }
-    Ok(accounts)
-}
-
-/// Every row of `key_space` under `prefix`, read in `txn_id`.
-async fn scan_in(
-    context: &DriverContext,
-    key_space: &str,
-    prefix: Option<Key>,
-    txn_id: TxnId,
-) -> Result<Vec<(Key, Value)>, UsageError> {
-    let mut rows = Vec::new();
-    let mut start = None;
-    loop {
-        let iter = StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: prefix.clone(),
-            start: start.map(IterStart::After),
-            limit: 1_000,
-            txn_id: Some(txn_id),
-        };
-        let (values, next) = match context.storage_handle.send_storage_effect(iter).await {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
+        let txn_id = match (context.storage_handle)
+            .send_storage_effect(StorageEffect::StartTransaction { read: true })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
             Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
             other => {
                 return Err(StorageError::ReadError(format!(
@@ -266,57 +151,12 @@ async fn scan_in(
                 .into());
             }
         };
-        rows.extend(values);
-        match next {
-            Some(next) => start = Some(next),
-            None => return Ok(rows),
-        }
+        let share = drive(BindingShareOperation::new(binding, txn_id), context).await;
+        (context.storage_handle)
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        share
     }
-}
-
-/// Each group's replica share on this node, summed over its local distributed buckets and read
-/// in `txn_id`. A share that cannot be read fails the whole run, so the publish retries.
-pub async fn replica_shares(
-    context: &DriverContext,
-    txn_id: TxnId,
-) -> Result<BTreeMap<GroupId, GroupShare>, UsageError> {
-    let buckets = scan_in(context, S3_BUCKET_KEYSPACE, None, txn_id).await?;
-    let mut shares: BTreeMap<GroupId, GroupShare> = BTreeMap::new();
-    for (_, value) in buckets {
-        let info = BucketInfo::from_bytes(value.as_ref())?;
-        let Some(binding) = &info.distribution else {
-            continue;
-        };
-        let (share, revision) = binding_share(context, binding, txn_id).await?;
-        let count = |value: i128| u64::try_from(value.max(0)).unwrap_or(u64::MAX);
-        let counters = UsageCounters {
-            objects: count(share.objects),
-            logical_bytes: count(share.logical_bytes),
-            referenced_bytes: count(share.referenced_bytes),
-            ..UsageCounters::default()
-        };
-        let total = shares.entry(info.group_id).or_default();
-        (total.replicas)
-            .add(&counters)
-            .map_err(|_| CounterOverflow("replicas"))?;
-        total.revisions.extend(revision);
-    }
-    Ok(shares)
-}
-
-/// One group's replica share on this node, and the record number of each set it covers.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct GroupShare {
-    pub replicas: UsageCounters,
-    pub revisions: BTreeMap<Ulid, u64>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::structs::storage::distribution::accounting::{
-        Charge, account_key, generation_key, pending_key,
-    };
 
     fn account(charge: Charge) -> RangeAccount {
         RangeAccount {
