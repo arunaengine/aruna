@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     LINKED_JOB_KEYSPACE, RENAME_MOVE_KEYSPACE, RENAME_TOTAL_KEYSPACE, S3_BUCKET_KEYSPACE,
     TRANSITION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{RenameRequest, RenameTotal, TokenGrant};
 use aruna_core::structs::storage::blob::BucketInfo;
@@ -279,8 +279,8 @@ impl Operation for StartMoveOperation {
         })
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -427,7 +427,7 @@ mod tests {
         let mut operation = StartMoveOperation::new("b".into(), group_id, "in/".into(), 7)
             .renaming((asker(), node()), grant(), 0)
             .with_guards(vec![guard]);
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), TransactionMode::Write);
         let first = operation.first();
         let Ok(Next::Call(IoCall::Read(reads))) = &first else {
             panic!("expected the reads, got {first:?}")

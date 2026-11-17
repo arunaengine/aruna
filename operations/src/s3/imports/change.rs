@@ -13,7 +13,7 @@ use aruna_core::keyspaces::{
     IMPORT_DISCOVERY_KEYSPACE, IMPORT_PATTERN_KEYSPACE, JOB_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::job_record_key;
 use aruna_core::structs::identity::group_delete::check_group_write;
@@ -238,8 +238,8 @@ impl Operation for ChangeImportOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -312,7 +312,7 @@ mod tests {
         let (group_id, import_id) = (stored.group_id, stored.import_id);
         let mut operation =
             ChangeImportOperation::new(group_id, import_id, change, SystemTime::now());
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), TransactionMode::Write);
         let _ = operation.first();
         let values = vec![Some(stored.to_bytes().unwrap().into()), None];
         let turn = operation.next(IoResult::Values(values));

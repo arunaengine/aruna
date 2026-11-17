@@ -6,7 +6,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{CHECK_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_CHECK_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::broken::StorageCheck;
@@ -108,8 +108,8 @@ impl Operation for StartCheckOperation {
         })
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -142,7 +142,7 @@ mod tests {
     #[test]
     fn wakes_after_commit() {
         let mut operation = StartCheckOperation::new("b".to_string(), group(), 5);
-        assert!(operation.transaction());
+        assert_eq!(operation.transaction(), TransactionMode::Write);
         let read = read_row(S3_BUCKET_KEYSPACE, b"b".as_slice());
         assert_eq!(operation.first(), Ok(Next::Call(read)));
         let Ok(Next::Call(IoCall::Write(writes))) = operation.next(bucket(group())) else {
