@@ -2,34 +2,43 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
+use aruna_core::keyspaces::WATCH_INTEREST_KEYSPACE;
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
+use aruna_core::structs::execution::notification::InboxWriteOutcome;
 use aruna_core::structs::execution::notification_watch::{
-    WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, watch_retry_key,
-    watch_retry_prefix, watch_subscription_key,
+    WatchEvent, WatchEventRetry, watch_retry_prefix,
 };
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::{Key, KeySpace, TxnId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::warn;
 
-use crate::driver::DriverContext;
-use crate::driver::drive;
-use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
-use crate::notifications::placement::filter_local_subscriptions;
-use crate::notifications::protocol::{
-    EVENT_BATCH_SIZE, EXPANSION_CANDIDATE_CAP, EXPANSION_RECORD_CAP, RETRY_BATCH_CAP,
-    RETRY_BYTES_CAP, add_limit, expansion_budget, page_limit, valid_retry,
-};
-use crate::notifications::routing::route_watch_event;
-use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::notifications::protocol::{RETRY_BATCH_CAP, RETRY_BYTES_CAP, valid_retry};
 use crate::notifications::watch::digest::InterestOperation;
-use crate::notifications::watch::digest::dirty_marker_write;
-use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
-use crate::notifications::watch::paths::WatchAuthorization;
+use crate::notifications::watch::expansion::{ExpandError, ExpandOutcome, WatchExpandOperation};
+
+/// Runs one expansion, once more after a conflict, and records its delivery suppressions.
+async fn expand_once(
+    context: &DriverContext,
+    build: impl FnMut() -> WatchExpandOperation,
+    seed: &[u8],
+) -> Result<ExpandOutcome, ExpandError> {
+    let expanded = drive_retry(build, context, seed).await;
+    match &expanded {
+        Ok(outcome) => {
+            for reason in &outcome.suppressed {
+                record_delivery_suppression(context, *reason);
+            }
+        }
+        Err(ExpandError::Unavailable(_)) => {
+            record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
+        }
+        Err(_) => {}
+    }
+    expanded
+}
 
 /// Expands one bounded subscription page into idempotent inbox records.
 /// Later pages are durably retried; placement and authorization are rechecked.
@@ -37,226 +46,25 @@ use crate::notifications::watch::paths::WatchAuthorization;
 pub(crate) async fn expand_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    local_node_id: aruna_core::NodeId,
+    realm_config: &RealmConfigDocument,
+    local_node_id: NodeId,
     events: &[WatchEvent],
 ) -> Result<(InboxWriteOutcome, bool), String> {
-    if events.is_empty() {
-        return Ok((InboxWriteOutcome::default(), false));
-    }
-    if events.len() > EVENT_BATCH_SIZE {
-        return Err(format!(
-            "watch event batch count {} exceeds cap {}",
-            events.len(),
-            EVENT_BATCH_SIZE
-        ));
-    }
-    for attempt in 0..2 {
-        match expand_events_once(
-            context,
-            realm_id,
-            realm_config,
-            local_node_id,
-            events,
-            None,
-            None,
-        )
-        .await
-        {
-            Ok(outcome) => return Ok(outcome),
-            Err(UpsertFailure::Conflict) if attempt == 0 => {}
-            Err(UpsertFailure::Conflict) => {
-                return Err("watch event expansion conflicted twice".to_string());
-            }
-            Err(UpsertFailure::Fatal(error)) => return Err(error),
-        }
-    }
-    unreachable!()
-}
-
-type WatchCandidate<'a> = (
-    &'a WatchSubscription,
-    &'a WatchEvent,
-    Vec<NotificationRecord>,
-);
-
-async fn expand_events_once(
-    context: &DriverContext,
-    realm_id: RealmId,
-    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    local_node_id: aruna_core::NodeId,
-    events: &[WatchEvent],
-    start: Option<Vec<u8>>,
-    retry_key: Option<Vec<u8>>,
-) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
-    let page_size = page_limit(events.len()).map_err(UpsertFailure::Fatal)?;
-    let scope = WatchScope::Page {
-        realm_id,
-        start,
-        limit: page_size,
+    let build = || {
+        let events = events.to_vec();
+        WatchExpandOperation::new(realm_id, realm_config.clone(), local_node_id, events, None)
     };
-    let page = drive(ListWatchesOperation::new(scope), context)
-        .await
-        .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
-    let (subscriptions, next) = (page.subscriptions, page.next);
-    let (subscriptions, found_stale) =
-        filter_local_subscriptions(subscriptions, realm_config, local_node_id)
-            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
-    let work = expansion_budget(events.len(), subscriptions.len()).map_err(UpsertFailure::Fatal)?;
-    let mut candidates = Vec::with_capacity(work.min(EXPANSION_CANDIDATE_CAP));
-    let mut record_count = 0;
-    for event in events {
-        for subscription in &subscriptions {
-            let routed = route_watch_event(event, std::slice::from_ref(subscription));
-            if !routed.is_empty() {
-                add_limit(candidates.len(), 1, EXPANSION_CANDIDATE_CAP, "candidate")
-                    .map_err(UpsertFailure::Fatal)?;
-                record_count =
-                    add_limit(record_count, routed.len(), EXPANSION_RECORD_CAP, "record")
-                        .map_err(UpsertFailure::Fatal)?;
-                candidates.push((subscription, event, routed));
-            }
-        }
-    }
-    let retry_key = retry_key.or_else(|| {
-        next.as_ref()
-            .map(|_| watch_retry_key(realm_id, events[0].event_id))
-    });
-    let retry_value = next
-        .as_ref()
-        .map(|cursor| {
-            postcard::to_allocvec(&WatchEventRetry {
-                events: events.to_vec(),
-                cursor: Some(cursor.clone()),
-            })
-            .map_err(|error| UpsertFailure::Fatal(error.to_string()))
-        })
-        .transpose()?;
-    if retry_value
-        .as_ref()
-        .is_some_and(|value| value.len() > RETRY_BYTES_CAP)
-    {
-        return Err(UpsertFailure::Fatal(
-            "watch retry event exceeds byte cap".to_string(),
-        ));
-    }
-    if candidates.is_empty() && retry_key.is_none() {
-        return Ok((InboxWriteOutcome::default(), found_stale));
-    }
-
-    let txn_id = start_write_transaction(context).await?;
-    let (outcome, denied) = match if candidates.is_empty() {
-        Ok((InboxWriteOutcome::default(), false))
-    } else {
-        stage_watch_expansion(context, realm_id, txn_id, candidates).await
-    } {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            abort_transaction(context, txn_id).await;
-            return Err(error);
-        }
-    };
-    let queue_changed =
-        match stage_retry_change(context, realm_id, txn_id, retry_key, retry_value).await {
-            Ok(changed) => changed,
-            Err(error) => {
-                abort_transaction(context, txn_id).await;
-                return Err(error);
-            }
-        };
-    let dropped = found_stale || denied;
-    if (next.is_some() || dropped)
-        && let Err(error) = stage_dirty_marker(context, realm_id, txn_id).await
-    {
-        abort_transaction(context, txn_id).await;
-        return Err(error);
-    }
-    if outcome.written == 0 && !queue_changed && !dropped {
-        abort_transaction(context, txn_id).await;
-        return Ok((outcome, dropped));
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-            if queue_changed && next.is_some() {
-                let _ = drive(InterestOperation::publish(), context).await;
-            }
-            Ok((outcome, dropped))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-async fn stage_retry_change(
-    context: &DriverContext,
-    realm_id: RealmId,
-    txn_id: TxnId,
-    retry_key: Option<Vec<u8>>,
-    retry_value: Option<Vec<u8>>,
-) -> Result<bool, UpsertFailure> {
-    let key = match retry_key {
-        Some(key) => key,
-        None => {
-            return match retry_value {
-                None => Ok(false),
-                Some(_) => unreachable!(),
-            };
-        }
-    };
-    let Some(value) = retry_value else {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                key: key.clone().into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
-            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                return Err(UpsertFailure::Conflict);
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(classify_storage_error(error));
-            }
-            other => {
-                return Err(UpsertFailure::Fatal(format!(
-                    "unexpected watch retry guard event: {other:?}"
-                )));
-            }
-        }
-        return match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                key: key.into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(true),
-            Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
-            other => Err(UpsertFailure::Fatal(format!(
-                "unexpected watch retry delete event: {other:?}"
-            ))),
-        };
-    };
-    stage_retry_write(context, realm_id, txn_id, key, value).await?;
-    Ok(true)
+    let expanded = expand_once(context, build, realm_id.as_bytes()).await;
+    expanded
+        .map(|outcome| (outcome.inbox, outcome.dropped))
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn drain_watch_events(
     context: &DriverContext,
     realm_id: RealmId,
-    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    local_node_id: aruna_core::NodeId,
+    realm_config: &RealmConfigDocument,
+    local_node_id: NodeId,
 ) -> Result<(), String> {
     let values = match context
         .storage_handle
@@ -274,12 +82,8 @@ pub(crate) async fn drain_watch_events(
             return Err(defer_retry(context, realm_id, error.to_string()).await);
         }
         other => {
-            return Err(defer_retry(
-                context,
-                realm_id,
-                format!("unexpected watch retry scan event: {other:?}"),
-            )
-            .await);
+            let error = format!("unexpected watch retry scan event: {}", other.label());
+            return Err(defer_retry(context, realm_id, error).await);
         }
     };
     let over_batch = values.len() > RETRY_BATCH_CAP;
@@ -302,41 +106,25 @@ pub(crate) async fn drain_watch_events(
                 continue;
             }
         };
-        let mut applied = false;
-        for attempt in 0..2 {
-            match expand_events_once(
-                context,
+        let build = || {
+            let resume = Some((key.clone(), retry.cursor.clone()));
+            let events = retry.events.clone();
+            WatchExpandOperation::new(
                 realm_id,
-                realm_config,
+                realm_config.clone(),
                 local_node_id,
-                &retry.events,
-                retry.cursor.clone(),
-                Some(key.clone()),
+                events,
+                resume,
             )
-            .await
-            {
-                Ok(_) => {
-                    applied = true;
-                    break;
-                }
-                Err(UpsertFailure::Conflict) if attempt == 0 => {}
-                Err(error) => {
-                    warn!(%realm_id, error = %retry_error(&error), "Watch retry row deferred");
-                    break;
-                }
-            }
-        }
-        if !applied {
+        };
+        if let Err(error) = expand_once(context, build, &key).await {
+            warn!(%realm_id, %error, "Watch retry row deferred");
             failed = true;
         }
     }
     if failed {
-        return Err(defer_retry(
-            context,
-            realm_id,
-            "watch retry drain deferred work".to_string(),
-        )
-        .await);
+        let error = "watch retry drain deferred work".to_string();
+        return Err(defer_retry(context, realm_id, error).await);
     }
     Ok(())
 }
@@ -347,302 +135,6 @@ async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) 
         return format!("{error}; failed to retain retry marker: {marker}");
     }
     error
-}
-
-fn retry_error(error: &UpsertFailure) -> String {
-    match error {
-        UpsertFailure::Conflict => "storage conflict".to_string(),
-        UpsertFailure::Fatal(error) => error.clone(),
-    }
-}
-
-async fn stage_retry_write(
-    context: &DriverContext,
-    realm_id: RealmId,
-    txn_id: TxnId,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<(), UpsertFailure> {
-    let values = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(watch_retry_prefix(realm_id).into()),
-            start: None,
-            limit: RETRY_BATCH_CAP.saturating_add(1),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(classify_storage_error(error));
-        }
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected watch retry budget event: {other:?}"
-            )));
-        }
-    };
-    if values.len() > RETRY_BATCH_CAP {
-        warn!(%realm_id, "Watch retry queue row cap reached");
-        return Err(UpsertFailure::Fatal(
-            "watch retry row cap reached".to_string(),
-        ));
-    }
-    let current_bytes = values.iter().try_fold(0usize, |total, (_, value)| {
-        total
-            .checked_add(value.len())
-            .ok_or_else(|| "watch retry byte budget overflow".to_string())
-    });
-    let current_bytes = current_bytes.map_err(UpsertFailure::Fatal)?;
-    let existing = values
-        .iter()
-        .find(|(current, _)| current.as_ref() == key.as_slice());
-    let replaced = existing.map_or(0, |(_, value)| value.len());
-    if replaced == 0 && values.len() >= RETRY_BATCH_CAP {
-        warn!(%realm_id, "Watch retry queue row cap reached");
-        return Err(UpsertFailure::Fatal(
-            "watch retry row cap reached".to_string(),
-        ));
-    }
-    let mut write_value = value;
-    if let Some((_, current)) = existing
-        && let Ok(current_retry) = postcard::from_bytes::<WatchEventRetry>(current.as_ref())
-        && let Ok(next_retry) = postcard::from_bytes::<WatchEventRetry>(&write_value)
-        && let (Some(current_cursor), Some(next_cursor)) =
-            (current_retry.cursor.as_ref(), next_retry.cursor.as_ref())
-        && current_cursor >= next_cursor
-    {
-        write_value = current.to_vec();
-    }
-    let next_bytes = current_bytes
-        .checked_sub(replaced)
-        .and_then(|bytes| bytes.checked_add(write_value.len()))
-        .ok_or_else(|| UpsertFailure::Fatal("watch retry byte budget overflow".to_string()))?;
-    if next_bytes > RETRY_BYTES_CAP {
-        warn!(%realm_id, "Watch retry queue byte cap reached");
-        return Err(UpsertFailure::Fatal(
-            "watch retry byte cap reached".to_string(),
-        ));
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-            key: key.into(),
-            value: write_value.into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(classify_storage_error(error));
-        }
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected watch retry write event: {other:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-async fn stage_dirty_marker(
-    context: &DriverContext,
-    realm_id: RealmId,
-    txn_id: TxnId,
-) -> Result<(), UpsertFailure> {
-    let (key_space, key, value) = dirty_marker_write(realm_id);
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected watch interest marker event: {other:?}"
-        ))),
-    }
-}
-
-async fn stage_watch_expansion(
-    context: &DriverContext,
-    realm_id: RealmId,
-    txn_id: TxnId,
-    candidates: Vec<WatchCandidate<'_>>,
-) -> Result<(InboxWriteOutcome, bool), UpsertFailure> {
-    let mut record_budget = 0;
-    for (_, _, routed) in &candidates {
-        record_budget = add_limit(record_budget, routed.len(), EXPANSION_RECORD_CAP, "record")
-            .map_err(UpsertFailure::Fatal)?;
-    }
-    let mut subscriptions = Vec::with_capacity(candidates.len());
-    for (subscription, _, _) in &candidates {
-        if !subscriptions
-            .iter()
-            .any(|current: &&WatchSubscription| current.watch_id == subscription.watch_id)
-        {
-            subscriptions.push(*subscription);
-        }
-    }
-    let mut reads: Vec<(KeySpace, Key)> = subscriptions
-        .iter()
-        .map(|subscription| {
-            (
-                WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                watch_subscription_key(subscription.owner, subscription.watch_id),
-            )
-        })
-        .collect();
-    let subscription_count = reads.len();
-    reads.push((
-        AUTH_KEYSPACE.to_string(),
-        realm_id.as_bytes().to_vec().into(),
-    ));
-    for (_, event, _) in &candidates {
-        let group_id = match &event.detail {
-            WatchEventDetail::MetadataCreated { group_id, .. }
-            | WatchEventDetail::DataUploaded { group_id, .. }
-            | WatchEventDetail::SyncCompleted { group_id, .. }
-            | WatchEventDetail::SyncFailed { group_id, .. } => *group_id,
-        };
-        let key: Key = group_id.to_bytes().to_vec().into();
-        if !reads
-            .iter()
-            .any(|(key_space, current)| key_space == AUTH_KEYSPACE && current == &key)
-        {
-            reads.push((AUTH_KEYSPACE.to_string(), key));
-        }
-    }
-    let expected_count = reads.len();
-    let guarded = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(classify_storage_error(error));
-        }
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-    if guarded.len() != expected_count {
-        return Err(UpsertFailure::Fatal(
-            "watch authorization guard returned the wrong result count".to_string(),
-        ));
-    }
-    for (subscription, (_, stored)) in subscriptions
-        .iter()
-        .zip(guarded.into_iter().take(subscription_count))
-    {
-        let expected = subscription
-            .to_bytes()
-            .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
-        if stored.as_deref() != Some(expected.as_slice()) {
-            return Err(UpsertFailure::Conflict);
-        }
-    }
-
-    let mut records = Vec::with_capacity(record_budget);
-    let mut dropped = false;
-    for (subscription, event, routed) in candidates {
-        match evaluate_watch_delivery(
-            context,
-            realm_id,
-            subscription.owner,
-            &subscription.path_prefix,
-            subscription.event_mask,
-            &subscription.authorization,
-        )
-        .await
-        {
-            Ok(WatchAuthorization::Authorized) => {}
-            Ok(WatchAuthorization::Denied(reason)) => {
-                record_delivery_suppression(context, reason.metric_reason());
-                dropped = true;
-                continue;
-            }
-            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
-                return Err(UpsertFailure::Fatal(error));
-            }
-        }
-        match authorize_watch_event(
-            context,
-            subscription.owner,
-            &subscription.authorization,
-            event,
-        )
-        .await
-        {
-            Ok(WatchAuthorization::Authorized) => records.extend(routed),
-            Ok(WatchAuthorization::Denied(reason)) => {
-                record_delivery_suppression(context, reason.metric_reason());
-            }
-            Ok(WatchAuthorization::Unavailable(error)) | Err(error) => {
-                record_delivery_suppression(context, WatchMetricReason::AuthorizationUnavailable);
-                return Err(UpsertFailure::Fatal(error));
-            }
-        }
-    }
-    if records.is_empty() {
-        return Ok((InboxWriteOutcome::default(), dropped));
-    }
-    match drive(UpsertInboxOperation::within(records, txn_id), context).await {
-        Ok(outcome) => Ok((outcome, dropped)),
-        Err(InboxError::Conflict) => Err(UpsertFailure::Conflict),
-        Err(error) => Err(UpsertFailure::Fatal(error.to_string())),
-    }
-}
-
-async fn start_write_transaction(context: &DriverContext) -> Result<TxnId, UpsertFailure> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify_storage_error(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum UpsertFailure {
-    Conflict,
-    Fatal(String),
-}
-
-fn classify_storage_error(error: StorageError) -> UpsertFailure {
-    if matches!(error, StorageError::TransactionConflict) {
-        UpsertFailure::Conflict
-    } else {
-        UpsertFailure::Fatal(error.to_string())
-    }
-}
-
-async fn abort_transaction(context: &DriverContext, txn_id: TxnId) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
 }
 
 fn record_delivery_suppression(context: &DriverContext, reason: WatchMetricReason) {
@@ -891,28 +383,6 @@ mod tests {
         ));
     }
 
-    async fn commit_retry(
-        context: &DriverContext,
-        realm: RealmId,
-        key: &[u8],
-        retry: &WatchEventRetry,
-    ) -> Result<(), UpsertFailure> {
-        let value = postcard::to_allocvec(retry).expect("encode retry");
-        let txn_id = start_write_transaction(context).await?;
-        if let Err(error) = stage_retry_write(context, realm, txn_id, key.to_vec(), value).await {
-            abort_transaction(context, txn_id).await;
-            return Err(error);
-        }
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await
-        {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-            other => panic!("unexpected commit event: {other:?}"),
-        }
-    }
-
     async fn count_inbox(storage: &StorageHandle) -> usize {
         match storage
             .send_storage_effect(StorageEffect::Iter {
@@ -1056,7 +526,7 @@ mod tests {
         let replacement_owner = user(realm, 3);
         let group_id = Ulid::from_bytes([4u8; 16]);
         install_authorization(&context, realm, local_node_id, group_id, owner).await;
-        let subscription = create_local_watch(
+        create_local_watch(
             &context.storage_handle,
             owner,
             watch_resource_path(group_id, local_node_id, "bucket", ""),
@@ -1080,20 +550,6 @@ mod tests {
 
         let mut second_event = first_event;
         second_event.event_id = Ulid::from_bytes([8u8; 16]);
-        let txn_id = start_write_transaction(&context)
-            .await
-            .expect("start transaction");
-        let routed = route_watch_event(&second_event, std::slice::from_ref(&subscription));
-        let staged = stage_watch_expansion(
-            &context,
-            realm,
-            txn_id,
-            vec![(&subscription, &second_event, routed)],
-        )
-        .await
-        .expect("stage authorized event");
-        assert_eq!(staged.0.written, 1);
-
         let replacement =
             GroupAuthorizationDocument::default_group_doc(replacement_owner, realm, group_id);
         let actor_record = Actor {
@@ -1113,17 +569,6 @@ mod tests {
                 .await,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
-        assert!(matches!(
-            context
-                .storage_handle
-                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-                .await,
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict
-            })
-        ));
-        assert_eq!(count_inbox(&context.storage_handle).await, 1);
-
         let second = expand_watch_events(&context, realm, &config, local_node_id, &[second_event])
             .await
             .expect("revoked delivery fails closed");
@@ -1294,97 +739,6 @@ mod tests {
             .expect("in-realm row applies");
         assert!(retry_rows(&context.storage_handle, realm).await.is_empty());
         assert_eq!(count_inbox(&context.storage_handle).await, 1);
-    }
-
-    #[tokio::test]
-    async fn retry_cursor_monotonic() {
-        // The last write rewinds the cursor; only an advancing second write can
-        // leave the queued row at `ahead`.
-        let (_dir, context) = temp_context();
-        let realm = RealmId([9u8; 32]);
-        let node_id = local_config(realm).0;
-        let event = upload_event(realm, user(realm, 2), Ulid::from_bytes([3u8; 16]), node_id);
-        let key = watch_retry_key(realm, event.event_id);
-        let behind = watch_subscription_key(user(realm, 2), Ulid::nil()).to_vec();
-        let ahead = watch_subscription_key(user(realm, 9), Ulid::nil()).to_vec();
-        for cursor in [behind.clone(), ahead.clone(), behind] {
-            commit_retry(
-                &context,
-                realm,
-                &key,
-                &WatchEventRetry {
-                    events: vec![event.clone()],
-                    cursor: Some(cursor),
-                },
-            )
-            .await
-            .expect("stage retry");
-        }
-
-        let rows = retry_rows(&context.storage_handle, realm).await;
-        assert_eq!(rows.len(), 1, "a retry row is replaced, not duplicated");
-        let stored: WatchEventRetry = postcard::from_bytes(&rows[0].1).expect("decode retry");
-        assert_eq!(stored.cursor, Some(ahead));
-    }
-
-    #[tokio::test]
-    async fn retry_row_cap() {
-        // The row cap must not strand a queued page: an existing row still updates.
-        let (_dir, context) = temp_context();
-        let realm = RealmId([10u8; 32]);
-        let node_id = local_config(realm).0;
-        let base = upload_event(realm, user(realm, 2), Ulid::from_bytes([3u8; 16]), node_id);
-        let cursor = watch_subscription_key(user(realm, 2), Ulid::nil()).to_vec();
-        let mut queued = Vec::new();
-        for seed in 0..RETRY_BATCH_CAP {
-            let mut event = base.clone();
-            event.event_id = Ulid::from_bytes([seed as u8 + 20; 16]);
-            let key = watch_retry_key(realm, event.event_id);
-            commit_retry(
-                &context,
-                realm,
-                &key,
-                &WatchEventRetry {
-                    events: vec![event.clone()],
-                    cursor: Some(cursor.clone()),
-                },
-            )
-            .await
-            .expect("seed row");
-            queued.push((key, event));
-        }
-
-        let mut overflow = base;
-        overflow.event_id = Ulid::from_bytes([99u8; 16]);
-        let error = commit_retry(
-            &context,
-            realm,
-            &watch_retry_key(realm, overflow.event_id),
-            &WatchEventRetry {
-                events: vec![overflow],
-                cursor: Some(cursor),
-            },
-        )
-        .await
-        .expect_err("row cap refuses a new row");
-        assert!(matches!(error, UpsertFailure::Fatal(message) if message.contains("row cap")));
-
-        let (key, event) = queued.remove(0);
-        commit_retry(
-            &context,
-            realm,
-            &key,
-            &WatchEventRetry {
-                events: vec![event],
-                cursor: Some(watch_subscription_key(user(realm, 9), Ulid::nil()).to_vec()),
-            },
-        )
-        .await
-        .expect("queued row still advances");
-        assert_eq!(
-            retry_rows(&context.storage_handle, realm).await.len(),
-            RETRY_BATCH_CAP
-        );
     }
 
     #[tokio::test]
