@@ -220,7 +220,8 @@ async fn native_repository() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{change, current, drain, due_now, linked, run_push, succeeded};
     use aruna_core::repository::{LinkFailure, LinkPatch, LinkStatus};
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::link_store::change_link;
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -409,7 +410,8 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
 async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     use super::link::{attach, current, drain, due_now, import_dataset, run_push, succeeded};
     use aruna_core::repository::{LinkPatch, LinkReview};
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link};
+    use aruna_operations::jobs::repository::link_store::change_link;
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();
@@ -730,7 +732,8 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::{LinkPatch, RepositoryPull};
     use aruna_core::structs::secondary_id::SecondaryIdKind;
     use aruna_operations::jobs::repository::link_queue::drain_links;
-    use aruna_operations::jobs::repository::links::{LinkChange, change_link, list_links};
+    use aruna_operations::jobs::repository::link_store::{change_link, list_links};
+    use aruna_operations::jobs::repository::links::LinkChange;
     let endpoint = std::env::var("ARUNA_INVENIO_ENDPOINT")?;
     let token = std::fs::read_to_string(std::env::var("ARUNA_INVENIO_TOKEN_FILE")?)?;
     let token = token.trim();

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::link_queue::ensure_holder;
-use super::links::{LinkChange, LinkError, change_link, ensure_lineage, read_link};
+use super::link_store::{change_link, ensure_lineage, read_link};
+use super::links::{LinkChange, LinkError};
 use super::push::creator_auth;
 use super::{TransferError, latest_version};
 use crate::driver::DriverContext;

@@ -13,7 +13,8 @@ use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-use aruna_operations::jobs::repository::links::{LinkChange, LinkError, change_link};
+use aruna_operations::jobs::repository::link_store::change_link;
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::remote_state;
 use aruna_operations::metadata::raw_revision::load_raw_revision;
 

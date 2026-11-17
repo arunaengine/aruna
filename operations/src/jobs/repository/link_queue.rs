@@ -26,9 +26,9 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::TransferError;
+use super::link_store::{change_link, document_links, ensure_lineage, read_link};
 use super::links::{
-    ChangeLinkOperation, LinkChange, LinkError, change_link, document_links, ensure_lineage,
-    id_key, read_link, schedule_drain,
+    ACTIVE_RETRY_MS, ChangeLinkOperation, LinkChange, LinkError, id_key, schedule_drain,
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::submit_export_job;
@@ -43,8 +43,6 @@ use crate::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
 
 const QUEUE_PAGE: usize = 256;
-/// How often a check waits for a running push before it looks again.
-pub(super) const ACTIVE_RETRY_MS: u64 = 30_000;
 const ERROR_RETRY_MS: u64 = 60_000;
 
 /// Push-check rows for the push links of changed documents that push or retry after unmet
