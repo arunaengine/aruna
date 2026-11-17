@@ -22,12 +22,12 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
 use aruna_operations::metadata::AuthToken;
-use aruna_operations::replication::drain::relationship_job_stats;
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
     consent_write, relationship_consent,
 };
+use aruna_operations::replication::queue::JobStatsOperation;
 use aruna_operations::replication::queue::QueueBlobOperation;
 use aruna_operations::sync::mirror_repair::{
     SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
@@ -1329,7 +1329,7 @@ async fn load_relationship(
 }
 
 async fn load_job_stats(state: &ServerState, id: Ulid) -> ServerResult<(usize, Option<u64>)> {
-    let (pending, oldest) = relationship_job_stats(&state.get_ctx(), id)
+    let (pending, oldest) = drive(JobStatsOperation::new(id), &state.get_ctx())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok((

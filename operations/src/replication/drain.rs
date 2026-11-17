@@ -63,8 +63,6 @@ use aruna_core::structs::storage::replication_queue::{
 
 const REPLICATION_BATCH_SIZE: usize = 64;
 
-const STATS_PAGE_SIZE: usize = 256;
-
 pub(super) const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
 
 pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
@@ -110,74 +108,6 @@ pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandl
             }
         }
         Err(error) => warn!(error = ?error, "Failed to scan blob replication jobs"),
-    }
-}
-
-pub async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
-    if live_obligations_exist(storage).await? {
-        return Ok(true);
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(!values.is_empty()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-/// Counts queued replication jobs bound to a relationship and reports the
-/// oldest enqueue timestamp among them in unix milliseconds.
-pub async fn relationship_job_stats(
-    context: &DriverContext,
-    relationship_id: Ulid,
-) -> Result<(usize, Option<u64>), BlobQueueError> {
-    let mut start = None;
-    let mut pending = 0usize;
-    let mut oldest = None::<u64>;
-    loop {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: REPLICATION_JOB_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.map(IterStart::After),
-                limit: STATS_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                for (_, value) in values {
-                    let record = BlobJobRecord::from_bytes(value.as_ref())?;
-                    if record.relationship_id == Some(relationship_id) {
-                        pending = pending.saturating_add(1);
-                        oldest = Some(oldest.map_or(record.enqueued_at_ms, |current: u64| {
-                            current.min(record.enqueued_at_ms)
-                        }));
-                    }
-                }
-                let Some(next_start_after) = next_start_after else {
-                    return Ok((pending, oldest));
-                };
-                start = Some(next_start_after);
-            }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}")));
-            }
-        }
     }
 }
 

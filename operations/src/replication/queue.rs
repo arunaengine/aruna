@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE};
@@ -16,7 +16,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, GroupId, Key};
+use aruna_core::types::{Effects, GroupId, Key, Value};
 use aruna_core::{NodeId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -622,6 +622,106 @@ pub async fn queue_live(
     }
 }
 
+/// Rows of the job queue one page of the statistics reads.
+const STATS_PAGE_SIZE: usize = 256;
+
+/// Counts queued replication jobs bound to a relationship and the oldest enqueue time among
+/// them, in Unix milliseconds.
+#[derive(Debug, PartialEq)]
+pub struct JobStatsOperation {
+    relationship_id: Ulid,
+    pending: usize,
+    oldest: Option<u64>,
+    output: Option<Result<(usize, Option<u64>), BlobQueueError>>,
+}
+
+impl JobStatsOperation {
+    pub fn new(relationship_id: Ulid) -> Self {
+        Self {
+            relationship_id,
+            pending: 0,
+            oldest: None,
+            output: None,
+        }
+    }
+
+    fn read_page(start: Option<Key>) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: REPLICATION_JOB_KEYSPACE.to_string(),
+            prefix: None,
+            start: start.map(IterStart::After),
+            limit: STATS_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
+    fn page_read(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Effects {
+        for (_, value) in values {
+            let record = match BlobJobRecord::from_bytes(value.as_ref()) {
+                Ok(record) => record,
+                Err(error) => {
+                    self.output = Some(Err(error.into()));
+                    return smallvec![];
+                }
+            };
+            if record.relationship_id == Some(self.relationship_id) {
+                self.pending = self.pending.saturating_add(1);
+                let enqueued = record.enqueued_at_ms;
+                self.oldest = Some(self.oldest.map_or(enqueued, |oldest| oldest.min(enqueued)));
+            }
+        }
+        match next {
+            Some(next) => Self::read_page(Some(next)),
+            None => {
+                self.output = Some(Ok((self.pending, self.oldest)));
+                smallvec![]
+            }
+        }
+    }
+}
+
+impl Operation for JobStatsOperation {
+    type Output = (usize, Option<u64>);
+    type Error = BlobQueueError;
+
+    fn start(&mut self) -> Effects {
+        Self::read_page(None)
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.output, event) {
+            (
+                None,
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }),
+            ) => self.page_read(values, next_start_after),
+            (None, Event::Storage(StorageEvent::Error { error })) => {
+                self.output = Some(Err(error.into()));
+                smallvec![]
+            }
+            (_, event) => {
+                self.output = Some(Err(BlobQueueError::UnexpectedEvent(format!("{event:?}"))));
+                smallvec![]
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, BlobQueueError> {
+        self.output
+            .unwrap_or_else(|| Err(BlobQueueError::UnexpectedEvent("not finished".into())))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,12 +735,26 @@ mod tests {
     use tracing::info;
 
     use super::super::drain::{
-        REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor, blob_jobs_exist,
-        job_source_auth, load_source_authorization, mark_failure, mark_progress, mark_success,
-        process_blob_batch, read_job_relationships, read_relationships, read_replication_cursor,
-        reschedule_blob_job, scan_due_jobs, store_relationship, write_blob_job,
+        REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor, job_source_auth,
+        load_source_authorization, mark_failure, mark_progress, mark_success, process_blob_batch,
+        read_job_relationships, read_relationships, read_replication_cursor, reschedule_blob_job,
+        scan_due_jobs, store_relationship, write_blob_job,
     };
     use super::super::retire::{BlobJobOutcome, RetireJobOperation};
+
+    /// Whether any job or live obligation is queued.
+    async fn blob_jobs_exist(storage: &StorageHandle) -> Result<bool, BlobQueueError> {
+        for key_space in [REPLICATION_OBLIGATION_KEYSPACE, REPLICATION_JOB_KEYSPACE] {
+            let (rows, _) =
+                crate::storage_read::iter_prefix_page(storage, key_space, None, None, 1, None)
+                    .await
+                    .map_err(|error| BlobQueueError::Storage(StorageError::ReadError(error)))?;
+            if !rows.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 
     /// Retires through the operation at the current time, as the drain does.
     async fn retire_job(
