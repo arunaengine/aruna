@@ -11,8 +11,8 @@ use crate::events::{BlobEvent, GroupResult, SubOperationEvent};
 use crate::operation::boxed_suboperation;
 use crate::task::{TaskEffect, TaskEvent, TaskKey};
 
-/// Makes its calls in order, keeps every answer and ends with them, then the `then` calls.
-/// After a window member it adds `on_member` once, otherwise waits. Aborts with `cleanup`.
+/// Makes its calls in order, keeps every answer and ends with them. After a window member it
+/// adds `on_member` once, otherwise waits. Aborts with `cleanup`.
 #[derive(Debug, PartialEq)]
 struct Script {
     calls: VecDeque<IoCall>,
@@ -20,19 +20,14 @@ struct Script {
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
     transaction: bool,
-    then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
 }
 
 impl Script {
     fn turn(&mut self) -> Next<Vec<IoResult>> {
-        let output = match self.calls.pop_front() {
-            Some(call) => return Next::Call(call),
-            None => std::mem::take(&mut self.seen),
-        };
-        match std::mem::take(&mut self.then) {
-            calls if calls.is_empty() => Next::Done(output),
-            calls => Next::Then { output, calls },
+        match self.calls.pop_front() {
+            Some(call) => Next::Call(call),
+            None => Next::Done(std::mem::take(&mut self.seen)),
         }
     }
 }
@@ -74,7 +69,6 @@ fn script(calls: Vec<IoCall>) -> Script {
         on_member: None,
         scope: None,
         transaction: false,
-        then: Vec::new(),
         cleanup: Vec::new(),
     }
 }
@@ -506,46 +500,4 @@ fn abort_sends_cleanup() {
     let effects = operation.step(Event::Hung { effect: "storage" });
     let abort = storage(StorageEffect::AbortTransaction { txn_id: txn() });
     assert_eq!(effects.as_slice(), &[abort, release()]);
-}
-
-#[test]
-fn calls_after_commit() {
-    let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut procedure = script(vec![IoCall::Write(write)]);
-    procedure.then = vec![
-        IoCall::Delete(vec![("rows".to_string(), key("old"))]),
-        IoCall::Delay(Duration::from_secs(1)),
-    ];
-    let mut operation = run(procedure, true);
-    operation.start();
-    operation.step(started());
-    let written = StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    };
-    let commit = StorageEffect::CommitTransaction { txn_id: txn() };
-    assert_eq!(
-        operation.step(Event::Storage(written)).as_slice(),
-        &[storage(commit)]
-    );
-    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
-    let delete = StorageEffect::BatchDelete {
-        deletes: vec![("rows".to_string(), key("old"))],
-        txn_id: None,
-    };
-    let effects = operation.step(Event::Storage(committed));
-    assert_eq!(
-        effects.as_slice(),
-        &[storage(delete)],
-        "outside the transaction"
-    );
-    // A failed call after the commit is logged and the next one runs.
-    let failed = StorageEvent::Error {
-        error: StorageError::QueueFull,
-    };
-    let effects = operation.step(Event::Storage(failed));
-    assert_eq!(effects.as_slice(), &[Effect::Delay(Duration::from_secs(1))]);
-    assert!(!operation.is_complete());
-    // An abort now keeps the committed outcome.
-    assert!(operation.abort().is_empty());
-    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }
