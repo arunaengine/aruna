@@ -136,6 +136,8 @@ enum State<O, E> {
     Starting(IoCall),
     Waiting(Wait),
     Committing(O),
+    /// Waits for the answer to the effect sent after the outcome committed.
+    Settling(O),
     Finished(Result<O, E>),
 }
 
@@ -267,6 +269,17 @@ impl<P: Operation> CallRun<P> {
                 self.state = State::Committing(output);
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
+            None => self.settle(output),
+        }
+    }
+
+    /// Ends with `output`, after the operation's effect for a committed outcome, if any.
+    fn settle(&mut self, output: P::Output) -> Effects {
+        match self.operation.after_commit() {
+            Some(effect) => {
+                self.state = State::Settling(output);
+                smallvec![effect]
+            }
             None => {
                 self.state = State::Finished(Ok(output));
                 smallvec![]
@@ -316,8 +329,7 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
-                    self.state = State::Finished(Ok(output));
-                    smallvec![]
+                    self.settle(output)
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
@@ -325,6 +337,11 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }
             },
+            // The outcome is committed: any answer, a refusal too, ends the operation.
+            State::Settling(output) => {
+                self.state = State::Finished(Ok(output));
+                smallvec![]
+            }
             State::Created | State::Finished(_) => self.fail(unexpected("no event", event.label())),
         }
     }
@@ -342,7 +359,7 @@ impl<P: Operation> EffectOperation for CallRun<P> {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            State::Committing(_) | State::Finished(_) => smallvec![],
+            State::Committing(_) | State::Settling(_) | State::Finished(_) => smallvec![],
             _ => self.fail(IoError::Aborted),
         }
     }

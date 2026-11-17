@@ -5,6 +5,7 @@
 use std::any::Any;
 
 use crate::calls::{CallRun, IoError, IoResult, Next};
+use crate::effects::Effect;
 use crate::{events::Event, types::Effects};
 
 /// A backend scope at most one operation holds at a time.
@@ -35,6 +36,12 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
 
     /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
+
+    /// An effect the runner sends once the outcome is committed, such as a wake of a drain that
+    /// reads the committed rows. Its answer is not checked: the outcome stands either way.
+    fn after_commit(&mut self) -> Option<Effect> {
+        None
+    }
 
     /// See [`EffectOperation::hold_scope`].
     fn hold_scope(&self) -> Option<HoldScope> {

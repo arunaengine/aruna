@@ -20,6 +20,7 @@ struct Script {
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
     transaction: bool,
+    after: Option<Effect>,
 }
 
 impl Script {
@@ -55,6 +56,10 @@ impl Operation for Script {
     fn transaction(&self) -> bool {
         self.transaction
     }
+
+    fn after_commit(&mut self) -> Option<Effect> {
+        self.after.take()
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -64,6 +69,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         on_member: None,
         scope: None,
         transaction: false,
+        after: None,
     }
 }
 
@@ -112,6 +118,39 @@ fn effects_join_transaction() {
         txn_id: Some(txn()),
     };
     assert_eq!(operation.step(started()).as_slice(), &[storage(joined)]);
+}
+
+#[test]
+fn sends_after_commit() {
+    // The effect for a committed outcome follows the commit; even a refusal keeps the outcome.
+    let write = vec![("rows".to_string(), key("a"), key("1"))];
+    let mut script = script(vec![IoCall::Write(write)]);
+    let wake = || {
+        Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainNotificationOutbox,
+            after: Duration::ZERO,
+        })
+    };
+    script.after = Some(wake());
+    let mut operation = run(script, true);
+    operation.start();
+    operation.step(started());
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    operation.step(Event::Storage(written));
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(committed)).as_slice(),
+        &[wake()]
+    );
+    assert!(!operation.is_complete());
+    let refused = TaskEvent::Error {
+        key: None,
+        message: "timer refused".to_string(),
+    };
+    assert!(operation.step(Event::Task(refused)).is_empty());
+    assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }
 
 #[test]
