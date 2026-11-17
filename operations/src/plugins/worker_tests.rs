@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use std::time::Duration;
 use crate::driver::drive;
 use crate::plugins::copies::store_local;
 use crate::plugins::dispatch::event_run;
@@ -22,6 +21,7 @@ use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_plugins::artifact::{ArtifactDigest, attach_manifest, read_manifest};
 use aruna_plugins::broker::Intent;
+use std::time::Duration;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
 

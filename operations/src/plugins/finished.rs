@@ -161,7 +161,7 @@ pub fn waits_for(row: &WorkRow, run: Option<RunState>) -> Option<Ulid> {
 /// Queues a failed or cancelled run again with its intents kept, so its calls reach the same
 /// ordinals and its jobs the same ids; a call resolved as not done is made again. The audit row
 /// commits with it. The caller holds `ADMISSIONS`.
-pub fn retry_run(
+pub(crate) fn retry_run(
     (install_id, run_id): (Ulid, Ulid),
     audit: &AdminAuditRecord,
     now_ms: u64,
@@ -250,6 +250,17 @@ impl Plan for RetryRun {
             }
         }
     }
+}
+
+/// Queues a failed or cancelled run again under the admission lock; see [`retry_run`].
+pub async fn run_again(
+    ctx: &DriverContext,
+    ids: (Ulid, Ulid),
+    audit: &AdminAuditRecord,
+    now_ms: u64,
+) -> Result<PluginRun, RunError> {
+    let _admitting = ADMISSIONS.lock().await;
+    drive(retry_run(ids, audit, now_ms)?, ctx).await
 }
 
 /// Marks the held end of job `work_id` delivered without a run; the audit row commits with it.

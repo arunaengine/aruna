@@ -16,10 +16,10 @@ use aruna_operations::driver::drive;
 use aruna_operations::jobs::store::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, start_run};
-use aruna_operations::plugins::finished::{drop_completion, retry_run, waits_for};
+use aruna_operations::plugins::finished::{drop_completion, run_again, waits_for};
 use aruna_operations::plugins::install::{InstallError, read_config};
 use aruna_operations::plugins::receiver::lost_reason;
-use aruna_operations::plugins::runs::{ADMISSIONS, RunError, list_runs, read_run, resolve_run};
+use aruna_operations::plugins::runs::{RunError, list_runs, read_run, resolve_run};
 use aruna_operations::plugins::work::{
     WorkKind, WorkRow, list_work as list_work_rows, read_work, work_state,
 };
@@ -925,12 +925,7 @@ pub async fn retry(
         Err(response) => return response,
     };
     let ids = (served.install_id, run_id);
-    let _admitting = ADMISSIONS.lock().await;
-    let retried = match retry_run(ids, &audit, unix_timestamp_millis()) {
-        Ok(retry) => drive(retry, &ctx).await,
-        Err(error) => Err(error),
-    };
-    match retried {
+    match run_again(&ctx, ids, &audit, unix_timestamp_millis()).await {
         Ok(run) => Json(view(run)).into_response(),
         Err(error) => run_error(error),
     }
