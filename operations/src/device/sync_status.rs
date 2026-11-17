@@ -26,7 +26,8 @@ use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::outbox::requeue_uploads;
-use super::sync::repository::{scan_folder, scan_page};
+use super::sync::repository::scan_folder;
+use super::sync::rows::scan_page;
 
 /// How recently the realm must have answered for the device to call it
 /// reachable. Two folder beats, so one missed pass does not flip the view.

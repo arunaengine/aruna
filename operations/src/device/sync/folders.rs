@@ -39,8 +39,10 @@ use crate::staging::offered_directory::{
 };
 
 use super::repository::{
-    MAX_SYNCED_FOLDERS, SyncUpload, abort_txn, commit_txn, delete_rows, folder_entry, folder_key,
-    key_path, read_value, scan_folder, scan_folders, scan_page, start_txn, sync_all, write_rows,
+    MAX_SYNCED_FOLDERS, SyncUpload, folder_entry, folder_key, key_path, scan_folder, scan_folders,
+};
+use super::rows::{
+    abort_txn, commit_txn, delete_rows, read_value, scan_page, start_txn, sync_all, write_rows,
 };
 use super::{ReconcileFolderError, request_versions};
 
@@ -1052,7 +1054,7 @@ mod tests {
         store_folder(&context, &folder).await.expect("row stored");
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
             .expect("base encodes");
-        assert!(super::super::repository::write_rows(&context, vec![row], None).await);
+        assert!(super::super::rows::write_rows(&context, vec![row], None).await);
 
         finish_unbind(&context, folder.folder_id, node())
             .await
@@ -1072,7 +1074,8 @@ mod tests {
     // next pass deletes the rest.
     #[tokio::test]
     async fn limits_row_cleanup() {
-        use super::super::repository::{base_entry, write_rows};
+        use super::super::repository::base_entry;
+        use super::super::rows::write_rows;
 
         let (_dir, context) = context().await;
         let context = Arc::new(context);
@@ -1173,7 +1176,7 @@ mod tests {
         let key = upload.upload_id.to_bytes().to_vec().into();
         let value = upload.to_bytes().expect("upload encodes").into();
         let row = (UPLOAD_KEYSPACE.to_string(), key, value);
-        assert!(super::super::repository::write_rows(context, vec![row], None).await);
+        assert!(super::super::rows::write_rows(context, vec![row], None).await);
     }
 
     async fn bucket_gone(context: &Arc<DriverContext>, bucket: &str) -> bool {
@@ -1453,7 +1456,7 @@ mod tests {
         });
         let row = super::super::repository::base_entry(folder.folder_id, "note.txt", &base_row())
             .expect("base encodes");
-        assert!(super::super::repository::write_rows(&context, vec![row], None).await);
+        assert!(super::super::rows::write_rows(&context, vec![row], None).await);
         drop(pass);
 
         assert_eq!(unbind.await.expect("the unbind task ends"), Ok(()));

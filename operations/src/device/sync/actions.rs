@@ -28,9 +28,9 @@ use super::materialize::{
     MaterializeEntryOperation, MaterializeInput, MaterializeOutcome, fetch_remote,
 };
 use super::repository::{
-    SyncUpload, UploadState, action_entry, base_entry, base_key, read_value, upload_entry,
-    write_rows,
+    SyncUpload, UploadState, action_entry, base_entry, base_key, upload_entry,
 };
+use super::rows::{read_value, write_rows};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
 /// these bytes or to nothing.

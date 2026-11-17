@@ -10,6 +10,7 @@ pub mod outbox;
 pub(crate) mod pull;
 pub mod reconcile;
 pub mod repository;
+pub(crate) mod rows;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

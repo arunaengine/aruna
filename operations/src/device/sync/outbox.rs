@@ -35,9 +35,10 @@ use crate::placement::process_placements::load_realm_config;
 use super::folders::FolderError;
 use super::pull::forward_pull;
 use super::repository::{
-    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, abort_txn, base_entry, base_key,
-    commit_txn, folder_key, read_value, start_txn, upload_entry, write_rows,
+    MAX_UPLOAD_ATTEMPTS, SYNC_PAGE_SIZE, SyncUpload, UploadState, base_entry, base_key, folder_key,
+    upload_entry,
 };
+use super::rows::{abort_txn, commit_txn, read_value, start_txn, write_rows};
 
 /// Delay before a deferred pass looks for the realm again.
 pub const UPLOAD_DEFER_AFTER: Duration = Duration::from_secs(15);
@@ -186,7 +187,7 @@ async fn record_progress(context: &Arc<DriverContext>, current: &Mutex<SyncUploa
 
 /// Removes one upload row whose folder no longer exists.
 async fn drop_upload(context: &Arc<DriverContext>, upload: &SyncUpload) {
-    if !super::repository::delete_rows(
+    if !super::rows::delete_rows(
         context,
         vec![(
             SYNC_UPLOAD_KEYSPACE.to_string(),
@@ -242,7 +243,7 @@ async fn settle_upload(context: &Arc<DriverContext>, upload: &SyncUpload, ack: &
     let holds = stored.is_some_and(|stored| same_version(&stored, upload));
     let settled = write_rows(context, rows, Some(txn_id)).await
         && (!holds
-            || super::repository::delete_rows(
+            || super::rows::delete_rows(
                 context,
                 vec![(
                     SYNC_UPLOAD_KEYSPACE.to_string(),
@@ -582,7 +583,8 @@ mod tests {
     };
     use crate::device::drain::DrainOutcome;
     use crate::device::sync::folders::store_folder;
-    use crate::device::sync::repository::{base_key, read_value, upload_entry, write_rows};
+    use crate::device::sync::repository::{base_key, upload_entry};
+    use crate::device::sync::rows::{read_value, write_rows};
     use crate::driver::DriverContext;
     use crate::tests::device::context;
     use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_UPLOAD_KEYSPACE};

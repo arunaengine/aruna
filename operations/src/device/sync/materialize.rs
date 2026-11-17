@@ -30,7 +30,8 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 
 use super::reconcile::Download;
-use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
+use super::repository::{action_entry, base_entry, base_key};
+use super::rows::{read_value, write_rows};
 
 /// What one materialization did to the folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
