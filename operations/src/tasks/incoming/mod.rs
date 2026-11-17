@@ -64,6 +64,7 @@ use crate::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, UPLOAD_CONTINUE_AFTER,
     UPLOAD_DEFER_AFTER, restore_sync_timers,
 };
+use crate::device::sync_note::{NoteSyncOperation, SyncNote};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::remove::remove_drained_backends;
 use crate::jobs::drain::{JobClassBudget, drain_job_batch, restore_drain_timer};
@@ -702,9 +703,13 @@ impl OperationsTaskHandler {
             REALM_DOCUMENTS_BUDGET,
         )
         .await;
-        match fetched {
-            true => crate::device::sync_status::note_contact(&self.context).await,
-            false => crate::device::sync_status::note_failure(&self.context).await,
+        let note = match fetched {
+            true => SyncNote::Contact,
+            false => SyncNote::Failure,
+        };
+        let note = NoteSyncOperation::new(note, unix_timestamp_millis());
+        if let Err(error) = drive(note, &self.context).await {
+            warn!(%error, "Failed to note the device sync state");
         }
         let mut state = self
             .realm_documents
@@ -725,7 +730,10 @@ impl OperationsTaskHandler {
     /// folders run on. A node that keeps none does nothing.
     async fn refresh_device_replicas(&self) {
         if crate::device::refresh::refresh_replicas(&self.context).await > 0 {
-            crate::device::sync_status::note_sync(&self.context).await;
+            let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
+            if let Err(error) = drive(note, &self.context).await {
+                warn!(%error, "Failed to note the device sync state");
+            }
         }
     }
 

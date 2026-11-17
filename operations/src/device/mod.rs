@@ -21,6 +21,7 @@ pub mod replica;
 pub mod retry;
 pub mod selection;
 pub mod sync;
+pub mod sync_note;
 pub mod sync_status;
 #[cfg(test)]
 mod tests;

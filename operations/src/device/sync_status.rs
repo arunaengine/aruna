@@ -15,7 +15,6 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key};
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
@@ -28,42 +27,7 @@ use super::sync::folders::{list_folders, list_transfers};
 use super::sync::outbox::requeue_uploads;
 use super::sync::repository::scan_folder;
 use super::sync::rows::scan_page;
-
-/// How recently the realm must have answered for the device to call it
-/// reachable. Two folder beats, so one missed pass does not flip the view.
-const REALM_CONTACT_WINDOW: Duration = Duration::from_secs(90);
-
-/// How long a run stays active without finishing. A crashed run must not block
-/// the next one for longer than this.
-const SYNC_RUN_LIFETIME: Duration = Duration::from_secs(120);
-
-/// The one row this device keeps about its exchange with the realm.
-const SYNC_STATE_KEY: [u8; 1] = [0];
-
-/// When the realm last answered, when the last pass finished, and whether one
-/// is in flight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceSyncState {
-    /// When the realm last answered. A failed contact attempt clears it, so the device shows
-    /// disconnected at once and connected again after the next answer.
-    pub last_contact_ms: Option<u64>,
-    pub last_sync_ms: Option<u64>,
-    pub run_started_ms: Option<u64>,
-}
-
-impl DeviceSyncState {
-    pub fn realm_reachable(&self, now_ms: u64) -> bool {
-        self.last_contact_ms.is_some_and(|contact| {
-            now_ms.saturating_sub(contact) <= REALM_CONTACT_WINDOW.as_millis() as u64
-        })
-    }
-
-    pub fn run_active(&self, now_ms: u64) -> bool {
-        self.run_started_ms.is_some_and(|started| {
-            now_ms.saturating_sub(started) <= SYNC_RUN_LIFETIME.as_millis() as u64
-        })
-    }
-}
+use super::sync_note::{DeviceSyncState, read_state, sync_state_key};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,46 +247,13 @@ pub(crate) async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
     }
 }
 
-/// Records that the realm answered this device.
-pub async fn note_contact(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(unix_timestamp_millis());
-    write_sync_state(context, &state).await;
-}
-
-/// Records that the realm did not answer this device's last contact attempt.
-pub async fn note_failure(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    if state.last_contact_ms.take().is_some() {
-        write_sync_state(context, &state).await;
-    }
-}
-
-/// Records that a sync pass finished, which also ends the run it belonged to.
-pub async fn note_sync(context: &Arc<DriverContext>) {
-    let now = unix_timestamp_millis();
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(now);
-    state.last_sync_ms = Some(now);
-    state.run_started_ms = None;
-    write_sync_state(context, &state).await;
-}
-
 pub async fn read_sync_state(context: &Arc<DriverContext>) -> DeviceSyncState {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return DeviceSyncState::default();
+    let read = StorageEffect::Read {
+        key_space: SYNC_STATE_KEYSPACE.to_string(),
+        key: sync_state_key(),
+        txn_id: None,
     };
-    postcard::from_bytes(&bytes).unwrap_or_default()
+    read_state(&context.storage_handle.send_storage_effect(read).await)
 }
 
 async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState) {
@@ -341,10 +272,6 @@ async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState)
     {
         warn!(error = %error, "Failed to store the device sync state");
     }
-}
-
-fn sync_state_key() -> Key {
-    ByteView::from(SYNC_STATE_KEY.to_vec())
 }
 
 pub(crate) async fn read_publish_entries(context: &Arc<DriverContext>) -> Vec<PublishEntry> {
@@ -413,6 +340,7 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
+    use crate::device::sync_note::{NoteSyncOperation, SyncNote};
     use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::{FolderMode, RemoteBinding};
@@ -621,12 +549,13 @@ mod tests {
             task_handle: None,
             compute_handle: None,
         });
-        note_contact(&context).await;
         let now = unix_timestamp_millis();
+        let note = |note| crate::driver::drive(NoteSyncOperation::new(note, now), &context);
+        note(SyncNote::Contact).await.unwrap();
         assert!(read_sync_state(&context).await.realm_reachable(now));
-        note_failure(&context).await;
+        note(SyncNote::Failure).await.unwrap();
         assert!(!read_sync_state(&context).await.realm_reachable(now));
-        note_contact(&context).await;
+        note(SyncNote::Contact).await.unwrap();
         assert!(read_sync_state(&context).await.realm_reachable(now));
     }
 
