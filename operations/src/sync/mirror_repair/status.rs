@@ -267,3 +267,189 @@ fn failure_event(relationship: &SyncRelationship, info: &BucketInfo) -> SourceEv
     )
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    const TXN: TxnId = Ulid(13);
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: value.map(ByteView::from),
+        })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    fn outgoing_key() -> Key {
+        ByteView::from(sync_relationship_key("source", relationship().id))
+    }
+
+    fn reading(relationship: SyncRelationship) -> StoreStatusOperation {
+        let mut operation = StoreStatusOperation::new(relationship);
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
+        operation
+    }
+
+    fn batch(effects: &[Effect]) -> Vec<String> {
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(TXN),
+            }),
+        ] = effects
+        else {
+            panic!("expected one batch write: {effects:?}");
+        };
+        writes
+            .iter()
+            .map(|(key_space, ..)| key_space.clone())
+            .collect()
+    }
+
+    #[test]
+    fn stores_status() {
+        let mut operation = StoreStatusOperation::new(relationship());
+        check_trace(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![outgoing_read(&outgoing_key(), Some(TXN))],
+                ),
+                (
+                    read(Some(relationship().to_bytes().unwrap())),
+                    vec![repair_read(&repair_key(&relationship()), Some(TXN))],
+                ),
+            ],
+        );
+        let effects = operation.step(read(None));
+        assert_eq!(
+            batch(&effects),
+            vec![
+                RELATIONSHIP_OUT_KEYSPACE.to_string(),
+                aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE.to_string()
+            ]
+        );
+        let written = Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        });
+        assert_eq!(operation.step(written).as_slice(), &[commit()]);
+        operation.step(committed());
+        assert_eq!(operation.finalize(), Ok(true));
+    }
+
+    #[test]
+    fn failure_reads_bucket() {
+        let mut failed = relationship();
+        failed.state = SyncState::Failed {
+            reason: "access_denied".to_string(),
+        };
+        let mut operation = reading(failed);
+        operation.step(read(Some(relationship().to_bytes().unwrap())));
+        let effects = operation.step(read(None));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
+        ));
+        // A missing source bucket journals nothing.
+        assert_eq!(batch(&operation.step(read(None))).len(), 2);
+    }
+
+    #[test]
+    fn skips_without_change() {
+        let mut missing = reading(relationship());
+        assert_eq!(missing.step(read(None)).as_slice(), &[commit()]);
+        missing.step(committed());
+        assert_eq!(missing.finalize(), Ok(false));
+
+        let mut stub = relationship();
+        stub.state = SyncState::Detached;
+        let mut detached = reading(relationship());
+        assert_eq!(
+            detached
+                .step(read(Some(stub.to_bytes().unwrap())))
+                .as_slice(),
+            &[commit()]
+        );
+
+        let staged = SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Delete);
+        let mut deleting = reading(relationship());
+        deleting.step(read(Some(relationship().to_bytes().unwrap())));
+        assert_eq!(
+            deleting
+                .step(read(Some(staged.to_bytes().unwrap())))
+                .as_slice(),
+            &[commit()]
+        );
+    }
+
+    #[test]
+    fn errors_abort_transaction() {
+        let mut changed = relationship();
+        changed.replicate_deletes = false;
+        let mut operation = reading(changed);
+        assert_eq!(
+            operation
+                .step(read(Some(relationship().to_bytes().unwrap())))
+                .as_slice(),
+            &[abort()]
+        );
+        assert!(matches!(
+            operation.finalize(),
+            Err(SyncMirrorError::Mirror(_))
+        ));
+        let mut failed = reading(relationship());
+        let error = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert_eq!(failed.step(error).as_slice(), &[abort()]);
+    }
+
+    #[test]
+    fn rejects_foreign_events() {
+        let make = || reading(relationship());
+        let refusals = rejects_events(make, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        });
+        assert!(!refusals.is_empty());
+        for (label, effects, error) in refusals {
+            assert_eq!(effects.as_slice(), &[abort()], "{label}");
+            assert!(matches!(error, SyncMirrorError::Unexpected(_)), "{label}");
+        }
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        rejects_finalize(StoreStatusOperation::new(relationship()));
+        rejects_finalize(reading(relationship()));
+        let mut operation = reading(relationship());
+        check_abort(&mut operation, &[abort()]);
+        assert_eq!(operation.finalize(), Err(SyncMirrorError::Unfinished));
+    }
+}

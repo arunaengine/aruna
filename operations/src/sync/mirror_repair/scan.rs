@@ -158,3 +158,144 @@ impl Operation for ScanRepairsOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::super::{SyncMirrorIntent, repair_key};
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use byteview::ByteView;
+    use ulid::Ulid;
+
+    fn record(seed: u8, due_at_ms: u64) -> (Key, Value) {
+        let mut relationship = relationship();
+        relationship.id = Ulid::from_bytes([seed; 16]);
+        let record = SyncMirrorRecord {
+            due_at_ms,
+            ..SyncMirrorRecord::new(relationship, SyncMirrorIntent::Reconcile)
+        };
+        (
+            repair_key(&record.relationship),
+            ByteView::from(record.to_bytes().unwrap()),
+        )
+    }
+
+    fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: next,
+        })
+    }
+
+    fn iter(start_after: Option<Key>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            prefix: None,
+            start: start_after.map(IterStart::After),
+            limit: REPAIR_PAGE_SIZE,
+            txn_id: None,
+        })
+    }
+
+    fn listing() -> ScanRepairsOperation {
+        let mut operation = ScanRepairsOperation::new(50);
+        operation.start();
+        operation
+    }
+
+    #[test]
+    fn scans_pages_ordered() {
+        let (late, early, future) = (record(1, 40), record(2, 10), record(3, 90));
+        let mut operation = ScanRepairsOperation::new(50);
+        check_trace(
+            &mut operation,
+            &[iter(None)],
+            vec![
+                (
+                    page(vec![late.clone(), future.clone()], Some(future.0.clone())),
+                    vec![iter(Some(future.0.clone()))],
+                ),
+                (page(vec![early.clone()], None), vec![]),
+            ],
+        );
+        let scan = operation.finalize().expect("scan finishes");
+        let due: Vec<_> = scan.records.iter().map(|record| record.due_at_ms).collect();
+        assert_eq!(due, vec![10, 40]);
+        assert_eq!(scan.next_due_ms, Some(90));
+        assert!(!scan.has_more_due);
+    }
+
+    #[test]
+    fn drops_malformed_rows() {
+        let bad: (Key, Value) = (vec![7].into(), vec![0xff].into());
+        let mut operation = listing();
+        assert_eq!(
+            operation
+                .step(page(vec![bad.clone(), record(1, 1)], None))
+                .as_slice(),
+            &[Effect::Storage(StorageEffect::BatchDelete {
+                deletes: vec![(MIRROR_REPAIR_KEYSPACE.to_string(), bad.0)],
+                txn_id: None,
+            })]
+        );
+        let dropped = Event::Storage(StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        });
+        assert!(operation.step(dropped).is_empty());
+        assert_eq!(
+            operation.finalize().expect("scan finishes").records.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bounds_the_batch() {
+        let values = (0..=REPAIR_BATCH_SIZE as u8)
+            .map(|seed| record(seed + 1, 1))
+            .collect();
+        let mut operation = listing();
+        operation.step(page(values, None));
+        let scan = operation.finalize().expect("scan finishes");
+        assert_eq!(scan.records.len(), REPAIR_BATCH_SIZE);
+        assert!(scan.has_more_due);
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let mut operation = listing();
+        operation.step(Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        }));
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncMirrorError::Storage(StorageError::Timeout))
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_events() {
+        let refusals = rejects_events(listing, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        });
+        assert!(!refusals.is_empty());
+        for (label, effects, error) in refusals {
+            assert!(effects.is_empty(), "{label}");
+            assert!(matches!(error, SyncMirrorError::Unexpected(_)), "{label}");
+        }
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        rejects_finalize(ScanRepairsOperation::new(1));
+        rejects_finalize(listing());
+        let mut operation = listing();
+        check_abort(&mut operation, &[]);
+        assert_eq!(operation.finalize(), Err(SyncMirrorError::Unfinished));
+    }
+}

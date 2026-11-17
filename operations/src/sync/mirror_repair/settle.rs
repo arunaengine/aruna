@@ -184,3 +184,170 @@ impl Operation for SettleReconcileOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::super::tests::relationship;
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use ulid::Ulid;
+
+    const TXN: TxnId = Ulid(11);
+
+    fn scanned() -> SyncMirrorRecord {
+        SyncMirrorRecord {
+            due_at_ms: 3,
+            ..SyncMirrorRecord::new(relationship(), SyncMirrorIntent::Reconcile)
+        }
+    }
+
+    fn read(value: Option<Vec<u8>>) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: value.map(ByteView::from),
+        })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn committed() -> Event {
+        Event::Storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    }
+
+    fn abort() -> Effect {
+        Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN })
+    }
+
+    fn outgoing_key() -> Key {
+        ByteView::from(sync_relationship_key("source", relationship().id))
+    }
+
+    fn reading() -> SettleReconcileOperation {
+        let mut operation = SettleReconcileOperation::new(scanned());
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: TXN,
+        }));
+        operation
+    }
+
+    fn outgoing_phase() -> SettleReconcileOperation {
+        let mut operation = reading();
+        operation.step(read(Some(scanned().to_bytes().unwrap())));
+        operation
+    }
+
+    #[test]
+    fn claims_missing_activation() {
+        let mut operation = SettleReconcileOperation::new(scanned());
+        check_trace(
+            &mut operation,
+            &[Effect::Storage(StorageEffect::StartTransaction {
+                read: false,
+            })],
+            vec![
+                (
+                    Event::Storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![repair_read(&repair_key(&relationship()), Some(TXN))],
+                ),
+                (
+                    read(Some(scanned().to_bytes().unwrap())),
+                    vec![outgoing_read(&outgoing_key(), Some(TXN))],
+                ),
+            ],
+        );
+        let effects = operation.step(read(None));
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("a missing activation must claim the rollback: {effects:?}");
+        };
+        assert_eq!(key_space, MIRROR_REPAIR_KEYSPACE);
+        let claimed = SyncMirrorRecord::from_bytes(&repair_key(&relationship()), value).unwrap();
+        assert!(claimed.rollback);
+        assert_eq!(claimed.intent, SyncMirrorIntent::Delete);
+        let written = Event::Storage(StorageEvent::WriteResult {
+            key: Vec::<u8>::new().into(),
+        });
+        assert_eq!(operation.step(written).as_slice(), &[commit()]);
+        operation.step(committed());
+        assert_eq!(operation.finalize(), Ok(RollbackClaim::Claimed));
+    }
+
+    #[test]
+    fn active_and_stale() {
+        let mut active = outgoing_phase();
+        let stored = relationship().to_bytes().unwrap();
+        assert_eq!(active.step(read(Some(stored))).as_slice(), &[commit()]);
+        active.step(committed());
+        assert_eq!(active.finalize(), Ok(RollbackClaim::Active(relationship())));
+
+        let mut changed = scanned();
+        changed.due_at_ms = 99;
+        let mut stale = reading();
+        assert_eq!(
+            stale
+                .step(read(Some(changed.to_bytes().unwrap())))
+                .as_slice(),
+            &[commit()]
+        );
+        stale.step(committed());
+        assert_eq!(stale.finalize(), Ok(RollbackClaim::Stale));
+    }
+
+    #[test]
+    fn errors_abort_transaction() {
+        let mut operation = outgoing_phase();
+        let failed = Event::Storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert_eq!(operation.step(failed).as_slice(), &[abort()]);
+        assert_eq!(
+            operation.finalize(),
+            Err(SyncMirrorError::Storage(StorageError::Timeout))
+        );
+        let mut corrupt = outgoing_phase();
+        assert_eq!(corrupt.step(read(Some(vec![0xff]))).as_slice(), &[abort()]);
+        let mut conflict = outgoing_phase();
+        conflict.step(read(Some(relationship().to_bytes().unwrap())));
+        let conflicted = Event::Storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        });
+        assert!(conflict.step(conflicted).is_empty());
+        assert_eq!(
+            conflict.finalize(),
+            Err(SyncMirrorError::Storage(StorageError::TransactionConflict))
+        );
+    }
+
+    #[test]
+    fn rejects_foreign_events() {
+        let refusals = rejects_events(outgoing_phase, sample_events, |event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        });
+        assert!(!refusals.is_empty());
+        for (label, effects, error) in refusals {
+            assert_eq!(effects.as_slice(), &[abort()], "{label}");
+            assert!(matches!(error, SyncMirrorError::Unexpected(_)), "{label}");
+        }
+    }
+
+    #[test]
+    fn abort_and_finalize() {
+        rejects_finalize(SettleReconcileOperation::new(scanned()));
+        rejects_finalize(reading());
+        let mut operation = outgoing_phase();
+        check_abort(&mut operation, &[abort()]);
+        assert_eq!(operation.finalize(), Err(SyncMirrorError::Unfinished));
+    }
+}
