@@ -26,6 +26,8 @@ pub enum Ask {
     Write(Vec<Row>),
     /// Deletes these rows; an empty list is answered without storage.
     Delete(Vec<(&'static str, Vec<u8>)>),
+    /// Persists every pending write with `SyncAll` durability.
+    Sync,
 }
 
 /// The answer to an [`Ask`].
@@ -82,6 +84,7 @@ enum Wait {
     Page,
     Written,
     Deleted,
+    Synced,
 }
 
 impl<P: Plan> PartialEq for RowsOperation<P> {
@@ -176,6 +179,7 @@ impl<P: Plan> RowsOperation<P> {
                     txn_id,
                 },
             ),
+            Ask::Sync => (Wait::Synced, StorageEffect::SyncAll),
         };
         self.state = State::Waiting(wait);
         smallvec![Effect::Storage(effect)]
@@ -402,6 +406,43 @@ impl Plan for PageRows {
     }
 }
 
+/// Writes rows, then deletes rows, in one transaction.
+pub fn writes(rows: Vec<Row>, deletes: Vec<(&'static str, Vec<u8>)>) -> RowsOperation<Writes> {
+    RowsOperation::transaction(Writes {
+        rows: Some(rows),
+        deletes: Some(deletes),
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Writes {
+    rows: Option<Vec<Row>>,
+    deletes: Option<Vec<(&'static str, Vec<u8>)>>,
+}
+
+impl Plan for Writes {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        let rows = self.rows.take().unwrap_or_default();
+        Ok(Turn::Ask(Ask::Write(rows)))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        done(answer)?;
+        Ok(match self.deletes.take() {
+            Some(deletes) => Turn::Ask(Ask::Delete(deletes)),
+            None => Turn::Finish(()),
+        })
+    }
+}
+
+/// Persists every pending write of this node with `SyncAll` durability.
+pub fn sync_all() -> RowsOperation<Change> {
+    RowsOperation::direct(Change(Some(Ask::Sync)))
+}
+
 /// Writes rows, each batch on its own.
 pub fn write_rows(rows: Vec<Row>) -> RowsOperation<Change> {
     RowsOperation::direct(Change(Some(Ask::Write(rows))))
@@ -488,6 +529,7 @@ fn answer(wait: Wait, event: StorageEvent) -> Result<Answer, StoreError> {
         )),
         (Wait::Written, StorageEvent::BatchWriteResult { .. }) => Ok(Answer::Done),
         (Wait::Deleted, StorageEvent::BatchDeleteResult { .. }) => Ok(Answer::Done),
+        (Wait::Synced, StorageEvent::SyncAllFinished) => Ok(Answer::Done),
         (_, event) => Err(StoreError(format!("{event:?}"))),
     }
 }

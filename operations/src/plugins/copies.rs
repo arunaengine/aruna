@@ -4,23 +4,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeSet;
-use std::pin::pin;
 use std::time::Duration;
 
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::PLUGIN_ARTIFACT_KEYSPACE;
 use aruna_core::plugins::MAX_ARTIFACT;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::types::TxnId;
 use aruna_plugins::artifact::{ArtifactDigest, check_artifact};
-use futures_util::TryStreamExt;
 use tokio::sync::{Mutex, Semaphore, SemaphorePermit};
 
 use super::ArtifactBytes;
 use super::artifacts::ArtifactError;
-use crate::driver::DriverContext;
-use crate::storage_read::scan_pages;
+use super::rows::{self, Row, Scan, read_rows, row, sync_all, writes};
+use super::store::StoreError;
+use crate::driver::{DriverContext, drive};
 
 /// Bytes of one artifact chunk; node messages stay far below their 16 MiB limit.
 pub const CHUNK: usize = 8 << 20;
@@ -434,14 +430,7 @@ async fn finish(
 }
 
 async fn sync(ctx: &DriverContext) -> Result<(), ArtifactError> {
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::SyncAll)
-        .await
-    {
-        Event::Storage(StorageEvent::SyncAllFinished) => Ok(()),
-        other => Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
+    drive(sync_all(), ctx).await.map_err(stored)
 }
 
 /// Writes `rows` and deletes `keys` in one transaction: all of them or none.
@@ -450,62 +439,8 @@ async fn apply(
     rows: Vec<(Vec<u8>, Vec<u8>)>,
     keys: Vec<Vec<u8>>,
 ) -> Result<(), ArtifactError> {
-    let start = StorageEffect::StartTransaction { read: false };
-    let txn_id = match ctx.storage_handle.send_storage_effect(start).await {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(ArtifactError::Storage(format!("{other:?}"))),
-    };
-    match apply_in(ctx, txn_id, rows, keys).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let abort = StorageEffect::AbortTransaction { txn_id };
-            ctx.storage_handle.send_storage_effect(abort).await;
-            Err(error)
-        }
-    }
-}
-
-async fn apply_in(
-    ctx: &DriverContext,
-    txn_id: TxnId,
-    rows: Vec<(Vec<u8>, Vec<u8>)>,
-    keys: Vec<Vec<u8>>,
-) -> Result<(), ArtifactError> {
-    let writes = (rows.into_iter())
-        .map(|(key, value)| {
-            (
-                PLUGIN_ARTIFACT_KEYSPACE.to_string(),
-                key.into(),
-                value.into(),
-            )
-        })
-        .collect();
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: Some(txn_id),
-    };
-    match ctx.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        other => return Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
-    if !keys.is_empty() {
-        let deletes = (keys.into_iter())
-            .map(|key| (PLUGIN_ARTIFACT_KEYSPACE.to_string(), key.into()))
-            .collect();
-        let delete = StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        };
-        match ctx.storage_handle.send_storage_effect(delete).await {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-            other => return Err(ArtifactError::Storage(format!("{other:?}"))),
-        }
-    }
-    let commit = StorageEffect::CommitTransaction { txn_id };
-    match ctx.storage_handle.send_storage_effect(commit).await {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        other => Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
+    let deletes = keys.into_iter().map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key)).collect();
+    drive(writes(artifact_rows(rows), deletes), ctx).await.map_err(stored)
 }
 
 /// The rows below `prefix`, keyed by digest, that decode; others are left for a later sweep.
@@ -514,71 +449,40 @@ async fn scan_rows<T>(
     prefix: &[u8],
     decode: fn(&[u8]) -> Option<T>,
 ) -> Result<Vec<(String, T)>, ArtifactError> {
-    let prefix_key = Some(prefix.to_vec().into());
-    let mut pages = pin!(scan_pages(
-        &ctx.storage_handle,
-        PLUGIN_ARTIFACT_KEYSPACE,
-        prefix_key
-    ));
-    let mut decoded = Vec::new();
-    while let Some(page) = pages.try_next().await.map_err(ArtifactError::Storage)? {
-        decoded.extend(page.into_iter().filter_map(|(key, value)| {
-            let digest = std::str::from_utf8(key.get(prefix.len()..)?)
-                .ok()?
-                .to_string();
-            Some((digest, decode(&value)?))
-        }));
-    }
-    Ok(decoded)
+    let scan = Scan::new(PLUGIN_ARTIFACT_KEYSPACE, prefix.to_vec());
+    let rows = drive(rows::scan_rows(scan), ctx).await.map_err(stored)?;
+    Ok((rows.into_iter())
+        .filter_map(|(key, value)| {
+            let digest = std::str::from_utf8(key.get(prefix.len()..)?).ok()?;
+            Some((digest.to_string(), decode(&value)?))
+        })
+        .collect())
 }
 
 async fn read_row(ctx: &DriverContext, key: Vec<u8>) -> Result<Option<Vec<u8>>, ArtifactError> {
-    let read = StorageEffect::Read {
-        key_space: PLUGIN_ARTIFACT_KEYSPACE.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|v| v.to_vec())),
-        other => Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
+    let read = drive(read_rows(vec![(PLUGIN_ARTIFACT_KEYSPACE, key)]), ctx).await;
+    Ok(read.map_err(stored)?.into_iter().next().flatten())
 }
 
 async fn write_rows(
     ctx: &DriverContext,
     rows: Vec<(Vec<u8>, Vec<u8>)>,
 ) -> Result<(), ArtifactError> {
-    let writes = (rows.into_iter())
-        .map(|(key, value)| {
-            (
-                PLUGIN_ARTIFACT_KEYSPACE.to_string(),
-                key.into(),
-                value.into(),
-            )
-        })
-        .collect();
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-        other => Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
+    drive(rows::write_rows(artifact_rows(rows)), ctx).await.map_err(stored)
 }
 
 async fn delete_rows(ctx: &DriverContext, keys: Vec<Vec<u8>>) -> Result<(), ArtifactError> {
-    let deletes = (keys.into_iter())
-        .map(|key| (PLUGIN_ARTIFACT_KEYSPACE.to_string(), key.into()))
-        .collect();
-    let delete = StorageEffect::BatchDelete {
-        deletes,
-        txn_id: None,
-    };
-    match ctx.storage_handle.send_storage_effect(delete).await {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        other => Err(ArtifactError::Storage(format!("{other:?}"))),
-    }
+    let keys = keys.into_iter().map(|key| (PLUGIN_ARTIFACT_KEYSPACE, key)).collect();
+    drive(rows::delete_rows(keys), ctx).await.map_err(stored)
+}
+
+fn artifact_rows(rows: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Row> {
+    let rows = rows.into_iter();
+    rows.map(|(key, value)| row(PLUGIN_ARTIFACT_KEYSPACE, key, value)).collect()
+}
+
+fn stored(error: StoreError) -> ArtifactError {
+    ArtifactError::Storage(error.0)
 }
 
 #[cfg(test)]

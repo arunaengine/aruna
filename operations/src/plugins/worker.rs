@@ -318,7 +318,7 @@ impl Worker {
 
     /// Writes the run; one that ended leaves the queue in the same transaction.
     async fn save(&self, run: &PluginRun) -> Result<(), RunError> {
-        drive(save_run(run)?, &self.ctx).await
+        Ok(drive(save_run(run)?, &self.ctx).await?)
     }
 
     /// Stops claiming, cancels every running guest and waits until each attempt ended.

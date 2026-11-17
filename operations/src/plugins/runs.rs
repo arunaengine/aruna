@@ -15,7 +15,8 @@ use ulid::Ulid;
 use super::finished::{audit_rows, held_runs};
 use super::intents::{first_open, intent_keys, intent_scan, resolved_rows};
 use super::rows::{
-    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, done, row, unexpected, values,
+    Answer, Ask, Plan, Row, RowsOperation, Scan, Turn, Writes, done, row, unexpected, values,
+    writes,
 };
 use super::store::{StoreError, decode, encode};
 use super::work::work_scan;
@@ -222,41 +223,7 @@ pub fn saved_rows(run: &PluginRun) -> Result<(Vec<Row>, Vec<(&'static str, Vec<u
 /// Writes the run; a run that ended leaves the queue in the same transaction.
 pub fn save_run(run: &PluginRun) -> Result<RowsOperation<Writes>, RunError> {
     let (rows, deletes) = saved_rows(run)?;
-    Ok(RowsOperation::transaction(Writes::new(rows, deletes)))
-}
-
-/// Writes rows, then deletes rows, in one transaction.
-#[derive(Debug, PartialEq)]
-pub struct Writes {
-    rows: Option<Vec<Row>>,
-    deletes: Option<Vec<(&'static str, Vec<u8>)>>,
-}
-
-impl Writes {
-    pub fn new(rows: Vec<Row>, deletes: Vec<(&'static str, Vec<u8>)>) -> Self {
-        Self {
-            rows: Some(rows),
-            deletes: Some(deletes),
-        }
-    }
-}
-
-impl Plan for Writes {
-    type Output = ();
-    type Error = RunError;
-
-    fn first(&mut self) -> Result<Turn<()>, RunError> {
-        let rows = self.rows.take().unwrap_or_default();
-        Ok(Turn::Ask(Ask::Write(rows)))
-    }
-
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, RunError> {
-        match (answer, self.deletes.take()) {
-            (Answer::Done, Some(deletes)) => Ok(Turn::Ask(Ask::Delete(deletes))),
-            (Answer::Done, None) => Ok(Turn::Finish(())),
-            (other, _) => Err(unexpected(other).into()),
-        }
-    }
+    Ok(writes(rows, deletes))
 }
 
 /// Ends a run that needs attention as a person decided: `done` when its effects happened.
