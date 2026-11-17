@@ -6,16 +6,12 @@
 use std::sync::Arc;
 
 use aruna_core::MetaResourceId;
-use aruna_core::document::DocumentTarget;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::MetadataError;
 use aruna_core::structs::identity::auth::Actor;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
 
-use crate::driver::{DriverContext, drive_retry};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     CreateDocumentResult, mint_document_for,
@@ -23,6 +19,7 @@ use crate::metadata::create_document::{
 use crate::metadata::profile::rules::not_profiled_status;
 use crate::metadata::profile::validation::validate_submission;
 use crate::metadata::projector::schedule_projection_drain;
+use crate::realm::get_config::{GetConfigError, GetConfigOperation};
 
 pub async fn create_metadata_document(
     mut template: CreateDocumentOperation,
@@ -64,7 +61,9 @@ pub(crate) async fn mint_local_id(
     context: &DriverContext,
     config: &CreateDocumentConfig,
 ) -> Result<MetaResourceId, CreateDocumentError> {
-    let realm_config = load_create_config(context, config.actor.realm_id).await?;
+    let realm_config = drive(GetConfigOperation::new(config.actor.realm_id), context)
+        .await
+        .map_err(config_error)?;
     mint_document_for(
         &realm_config,
         &config.actor,
@@ -81,36 +80,22 @@ pub async fn mint_job_document(
     group_id: GroupId,
     document_path: &str,
 ) -> Result<MetaResourceId, CreateDocumentError> {
-    let realm_config = load_create_config(context, actor.realm_id).await?;
+    let realm_config = drive(GetConfigOperation::new(actor.realm_id), context)
+        .await
+        .map_err(config_error)?;
     mint_document_for(&realm_config, actor, group_id, document_path, true)
 }
 
-async fn load_create_config(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<RealmConfigDocument, CreateDocumentError> {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => Ok(RealmConfigDocument::from_bytes(&bytes)?),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            Err(CreateDocumentError::PlacementBindingUnavailable(
-                "realm config document missing".to_string(),
-            ))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(CreateDocumentError::PlacementBindingUnavailable(format!(
-            "unexpected storage event reading realm config: {}",
-            other.label()
-        ))),
+/// Maps a realm config read failure into the create error; a missing config fails closed.
+fn config_error(error: GetConfigError) -> CreateDocumentError {
+    match error {
+        GetConfigError::StorageError(error) => error.into(),
+        GetConfigError::ConversionError(error) => error.into(),
+        GetConfigError::DocumentNotFound => CreateDocumentError::PlacementBindingUnavailable(
+            "realm config document missing".to_string(),
+        ),
+        other => CreateDocumentError::PlacementBindingUnavailable(format!(
+            "unexpected storage event reading realm config: {other}"
+        )),
     }
 }
