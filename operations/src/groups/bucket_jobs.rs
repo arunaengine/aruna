@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::purge::PausedOperation;
+use crate::blob::pause::PausedOperation;
 use crate::driver::{DriverContext, drive};
 use crate::groups::imports::cron::is_running;
 use crate::groups::imports::last_run;

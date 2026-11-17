@@ -56,7 +56,7 @@ pub async fn run_storage_purge(
     // The planned files wait in the cleanup queue until the job has ended.
     let outcome = run_fenced_purge(ctx, spec, files).await;
     if !matches!(outcome, Err(PurgeRunError::Interrupted)) {
-        let resume = crate::blob::purge::PausePurgeOperation::new(ctx.job_id.as_ulid(), false);
+        let resume = crate::blob::pause::PausePurgeOperation::new(ctx.job_id.as_ulid(), false);
         if let Err(error) = drive(resume, &ctx.driver).await {
             tracing::warn!(%error, "A purge's pause mark could not be removed");
         }
@@ -800,7 +800,7 @@ async fn drop_indexes(
 /// Waits while the caller paused the purge; a cancel or a shutdown ends the wait.
 async fn wait_paused(ctx: &JobContext) -> Result<(), PurgeRunError> {
     loop {
-        let paused = crate::blob::purge::PausedOperation::new(ctx.job_id.as_ulid());
+        let paused = crate::blob::pause::PausedOperation::new(ctx.job_id.as_ulid());
         let paused = drive(paused, &ctx.driver).await;
         match paused {
             Ok(false) => return Ok(()),

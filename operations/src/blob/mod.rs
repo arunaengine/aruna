@@ -8,6 +8,7 @@ pub(crate) mod hidden;
 pub mod holders;
 pub mod managed_copy;
 pub mod migration;
+pub mod pause;
 pub(crate) mod pending_reclaim;
 pub mod permission_paths;
 pub(crate) mod promote;

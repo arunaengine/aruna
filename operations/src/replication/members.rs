@@ -352,6 +352,19 @@ impl QueueWalk {
     }
 }
 
+/// The rows of one queue page and whether more follow; any other event, or one after the
+/// answer, is refused.
+fn queue_page(answered: bool, event: Event) -> Result<(Vec<(Key, Value)>, bool), RecordError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) if !answered => Ok((values, next_start_after.is_some())),
+        Event::Storage(StorageEvent::Error { error }) if !answered => Err(error.into()),
+        event => Err(RecordError::UnexpectedEvent(format!("{event:?}"))),
+    }
+}
+
 /// Whether this node still owes a publication of a key in `range` of the set: a queued member
 /// job or a live obligation that has not become jobs yet. A queue longer than one check reads
 /// counts as owing, so the caller looks again later.
@@ -424,16 +437,9 @@ impl Operation for OwesFanoutOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match (&self.output, event) {
-            (
-                None,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page_read(values, next_start_after.is_some()),
-            (None, Event::Storage(StorageEvent::Error { error })) => self.finish(Err(error.into())),
-            (_, event) => self.finish(Err(RecordError::UnexpectedEvent(format!("{event:?}")))),
+        match queue_page(self.output.is_some(), event) {
+            Ok((values, more)) => self.page_read(values, more),
+            Err(error) => self.finish(Err(error)),
         }
     }
 
@@ -567,16 +573,9 @@ impl Operation for CopyLagOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
-        match (&self.output, event) {
-            (
-                None,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.page_read(values, next_start_after.is_some()),
-            (None, Event::Storage(StorageEvent::Error { error })) => self.finish(Err(error.into())),
-            (_, event) => self.finish(Err(RecordError::UnexpectedEvent(format!("{event:?}")))),
+        match queue_page(self.output.is_some(), event) {
+            Ok((values, more)) => self.page_read(values, more),
+            Err(error) => self.finish(Err(error)),
         }
     }
 
