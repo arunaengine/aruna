@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::IoError;
 use aruna_core::document::DocumentOutboxEvent;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -40,6 +41,18 @@ pub enum PersistentIdError {
     /// The mapping's bucket cut over to a new holder set mid-transition.
     #[error("persistent id mapping bucket cut over; retry the transition")]
     PlacementFenced,
+}
+
+// A storage failure or a lost conflict keeps its storage error, as before the runner owned
+// the transaction; anything else leaves the authority unavailable.
+impl From<IoError> for PersistentIdError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Unavailable(other.to_string()),
+        }
+    }
 }
 
 pub(crate) fn read_mapping_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {

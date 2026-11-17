@@ -2,24 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::EffectOperation;
-use aruna_core::structs::PersistentIdMapping;
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::placement::fence::{admits, fence_read};
+use aruna_core::rows::{done, read_row};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdentifier};
-use aruna_core::types::{Effects, TxnId};
-use byteview::ByteView;
+use aruna_core::structs::{PersistentIdMapping, persistent_id_key};
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use ulid::Ulid;
 
+use crate::metadata::call_results::read_value;
 use crate::metadata::id_mapping::{
-    MappingRoute, PersistentIdError, mapping_revision, parse_mapping_read, read_mapping_effect,
-    transition_entries,
+    MappingRoute, PersistentIdError, mapping_revision, transition_entries,
 };
-
-const COMMIT_ATTEMPTS: usize = 4;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddIdentifiersInput {
@@ -30,72 +26,44 @@ pub struct AddIdentifiersInput {
 }
 
 #[derive(Debug, PartialEq)]
-enum State {
-    Init,
-    Start,
+enum Step {
     Read,
     Fence,
     Write,
-    Commit,
-    Aborting,
-    Finish,
 }
+
+type AddTurn = Result<Next<(PersistentIdMapping, bool)>, PersistentIdError>;
 
 /// Unions identifiers into the existing row with its index, sync and outbox entries in one
 /// transaction behind the bucket's write fence. A missing row is never created here.
 #[derive(Debug, PartialEq)]
 pub struct AddIdentifiersOperation {
     input: AddIdentifiersInput,
-    state: State,
-    attempts: usize,
-    txn_id: Option<TxnId>,
+    step: Step,
     merged: Option<PersistentIdMapping>,
-    output: Option<Result<(PersistentIdMapping, bool), PersistentIdError>>,
 }
 
 impl AddIdentifiersOperation {
     pub fn new(input: AddIdentifiersInput) -> Self {
         Self {
             input,
-            state: State::Init,
-            attempts: 0,
-            txn_id: None,
+            step: Step::Read,
             merged: None,
-            output: None,
         }
     }
 
-    fn begin(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: PersistentIdError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
-    }
-
-    /// Ends without writing, keeping the stored row as the answer.
-    fn unchanged(&mut self, mapping: PersistentIdMapping) -> Effects {
-        self.output = Some(Ok((mapping, false)));
-        self.abort()
-    }
-
-    fn handle_read(&mut self, event: Event) -> Effects {
-        let mapping = match parse_mapping_read(event) {
-            Ok(Some(mapping)) => mapping,
-            Ok(None) => return self.fail(PersistentIdError::IntentMissing),
-            Err(error) => return self.fail(error),
-        };
+    fn mapping_read(&mut self, result: IoResult) -> AddTurn {
+        let mapping = read_value(result)?
+            .map(|value| PersistentIdMapping::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(PersistentIdError::Conversion)?
+            .ok_or(PersistentIdError::IntentMissing)?;
         if mapping.is_retired() {
-            return self.unchanged(mapping);
+            return Ok(Next::Done((mapping, false)));
         }
         let mut merged = mapping.clone();
         if !merged.add_identifiers(self.input.identifiers.iter().cloned()) {
-            return self.unchanged(mapping);
+            return Ok(Next::Done((mapping, false)));
         }
         // A new revision orders after the replaced one, so holders and sync accept the row.
         let occurred_at_ms = self
@@ -103,136 +71,70 @@ impl AddIdentifiersOperation {
             .occurred_at_ms
             .max(mapping.revision.occurred_at_ms.saturating_add(1));
         merged.revision = mapping_revision(&self.input.route, occurred_at_ms);
-        self.merged = Some(merged);
-        match self
+        let fenced = self
             .input
             .route
             .as_ref()
-            .filter(|route| route.generation > 0)
-        {
-            Some(route) => {
-                let (key_space, key) =
-                    aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
-                self.state = State::Fence;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space,
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            }
-            None => self.write(),
-        }
+            .filter(|route| route.generation > 0);
+        let Some(route) = fenced else {
+            return self.write(merged);
+        };
+        self.step = Step::Fence;
+        self.merged = Some(merged);
+        Ok(Next::Call(IoCall::Read(vec![fence_read(
+            &route.realm_id,
+            &route.placement,
+        )])))
     }
 
-    fn handle_fence(&mut self, value: Option<ByteView>) -> Effects {
+    fn fence_answer(&mut self, result: IoResult) -> AddTurn {
         let generation = self
             .input
             .route
             .as_ref()
             .map_or(0, |route| route.generation);
-        if !aruna_core::placement::fence::admits(value.as_ref(), generation) {
-            self.merged = None;
-            return self.fail(PersistentIdError::PlacementFenced);
+        if !admits(read_value(result)?.as_ref(), generation) {
+            return Err(PersistentIdError::PlacementFenced);
         }
-        self.write()
+        let merged = self
+            .merged
+            .take()
+            .ok_or_else(|| PersistentIdError::Unavailable("merged row missing".into()))?;
+        self.write(merged)
     }
 
-    fn write(&mut self) -> Effects {
-        let Some(merged) = self.merged.as_ref() else {
-            return self.fail(PersistentIdError::Unavailable("merged row missing".into()));
-        };
-        let writes = match transition_entries(&self.input.route, merged) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error),
-        };
-        self.state = State::Write;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(PersistentIdError::Unavailable("transaction missing".into()));
-        };
-        self.state = State::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    fn write(&mut self, merged: PersistentIdMapping) -> AddTurn {
+        let writes = transition_entries(&self.input.route, &merged)?;
+        self.step = Step::Write;
+        self.merged = Some(merged);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
-impl EffectOperation for AddIdentifiersOperation {
+impl Operation for AddIdentifiersOperation {
     type Output = (PersistentIdMapping, bool);
     type Error = PersistentIdError;
 
-    fn start(&mut self) -> Effects {
-        self.begin()
+    fn transaction(&self) -> bool {
+        true
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (&self.state, event) {
-            (State::Aborting, _) => {
-                self.state = State::Finish;
-                smallvec![]
-            }
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                smallvec![read_mapping_effect(self.input.document_id, Some(txn_id))]
-            }
-            (State::Read, event) => self.handle_read(event),
-            (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.handle_fence(value)
-            }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => self.commit(),
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.state = State::Finish;
-                self.txn_id = None;
-                self.output = self.merged.take().map(|mapping| Ok((mapping, true)));
-                smallvec![]
-            }
-            (
-                State::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) if self.attempts < COMMIT_ATTEMPTS => {
-                self.txn_id = None;
-                self.merged = None;
-                self.begin()
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => {
-                if self.state == State::Commit {
-                    self.txn_id = None;
-                }
-                self.fail(PersistentIdError::Storage(error))
-            }
-            (state, event) => {
-                let message = format!("unexpected event {} in state {state:?}", event.label());
-                self.fail(PersistentIdError::Unavailable(message))
-            }
-        }
+    fn first(&mut self) -> AddTurn {
+        let key = persistent_id_key(self.input.document_id);
+        Ok(Next::Call(read_row(ID_MAPPING_KEYSPACE, key)))
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Finish
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PersistentIdError::Unavailable(
-            "identifier update did not finish".into(),
-        )))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = State::Aborting;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => {
-                self.state = State::Finish;
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> AddTurn {
+        match self.step {
+            Step::Read => self.mapping_read(result),
+            Step::Fence => self.fence_answer(result),
+            Step::Write => {
+                done(result)?;
+                let merged = self
+                    .merged
+                    .take()
+                    .ok_or_else(|| PersistentIdError::Unavailable("merged row missing".into()))?;
+                Ok(Next::Done((merged, true)))
             }
         }
     }
@@ -273,7 +175,9 @@ pub(crate) fn merge_matches(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
+    use aruna_core::calls::IoError;
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SECONDARY_ID_KEYSPACE;
     use aruna_core::structs::PersistentIdRevision;
     use aruna_core::structs::execution::job::JobId;
@@ -317,27 +221,29 @@ pub(crate) mod tests {
 
     pub(crate) fn read_event(value: Option<&PersistentIdMapping>) -> Event {
         Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: value.map(|mapping| ByteView::from(mapping.to_bytes().unwrap())),
+            key: Vec::<u8>::new().into(),
+            value: value.map(|mapping| mapping.to_bytes().unwrap().into()),
         })
     }
 
-    fn started(op: &mut AddIdentifiersOperation) -> Effects {
-        op.start();
-        op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }))
+    fn stored(mapping: &PersistentIdMapping) -> IoResult {
+        IoResult::Values(vec![Some(mapping.to_bytes().unwrap().into())])
     }
 
     #[test]
     fn writes_with_index() {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
-        started(&mut op);
-        let effects = op.step(read_event(Some(&mapping(document_id))));
-        let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first()
-        else {
-            panic!("expected one batch write, got {effects:?}");
+        assert!(op.transaction());
+        assert_eq!(
+            op.first(),
+            Ok(Next::Call(read_row(
+                ID_MAPPING_KEYSPACE,
+                persistent_id_key(document_id)
+            )))
+        );
+        let Ok(Next::Call(IoCall::Write(writes))) = op.next(stored(&mapping(document_id))) else {
+            panic!("expected one write");
         };
         let row = writes
             .iter()
@@ -351,122 +257,74 @@ pub(crate) mod tests {
                 && key.as_ref() == doi().index_key(document_id)
                 && value.as_ref() == document_id.to_bytes()
         }));
-        op.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        op.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }));
-        let (stored, changed) = op.finalize().unwrap();
-        assert!(changed);
-        assert_eq!(stored, row);
+        assert_eq!(op.next(IoResult::Done), Ok(Next::Done((row, true))));
     }
 
     #[test]
     fn missing_row_errors() {
         let document_id = Ulid::from_bytes([3; 16]);
         let mut op = operation(document_id);
-        started(&mut op);
-        let effects = op.step(read_event(None));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        op.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }));
-        assert_eq!(op.finalize().unwrap_err(), PersistentIdError::IntentMissing);
+        op.first().unwrap();
+        assert_eq!(
+            op.next(IoResult::Values(vec![None])),
+            Err(PersistentIdError::IntentMissing)
+        );
     }
 
     #[test]
     fn known_identifier_noop() {
         let document_id = Ulid::from_bytes([3; 16]);
-        let mut stored = mapping(document_id);
-        stored.secondary_identifiers.insert(doi());
+        let mut known = mapping(document_id);
+        known.secondary_identifiers.insert(doi());
         let mut op = operation(document_id);
-        started(&mut op);
-        op.step(read_event(Some(&stored)));
-        op.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }));
-        assert_eq!(op.finalize().unwrap(), (stored, false));
+        op.first().unwrap();
+        assert_eq!(op.next(stored(&known)), Ok(Next::Done((known, false))));
     }
 
     #[test]
-    fn conflict_exhausts_retries() {
-        let document_id = Ulid::from_bytes([3; 16]);
-        let mut op = operation(document_id);
-        for attempt in 1..=COMMIT_ATTEMPTS {
-            if attempt == 1 {
-                started(&mut op);
-            } else {
-                op.step(Event::Storage(StorageEvent::TransactionStarted {
-                    txn_id: Ulid::from_bytes([9; 16]),
-                }));
-            }
-            op.step(read_event(Some(&mapping(document_id))));
-            op.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            let effects = op.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }));
-            let restarted = matches!(
-                effects.first(),
-                Some(Effect::Storage(StorageEffect::StartTransaction { .. }))
-            );
-            assert_eq!(restarted, attempt < COMMIT_ATTEMPTS);
-        }
-        assert!(op.is_complete());
+    fn conflict_reruns() {
+        // A lost commit reads as the storage conflict and lets the runner rerun the operation.
+        let conflict = PersistentIdError::from(IoError::Conflict);
         assert_eq!(
-            op.finalize().unwrap_err(),
+            conflict,
             PersistentIdError::Storage(StorageError::TransactionConflict)
         );
+        assert!(AddIdentifiersOperation::is_conflict(&conflict));
+        assert!(!AddIdentifiersOperation::is_conflict(
+            &PersistentIdError::PlacementFenced
+        ));
     }
 
     #[test]
     fn fence_rejects_add() {
         let document_id = Ulid::from_bytes([3; 16]);
+        let route = MappingRoute {
+            realm_id: RealmId([5; 32]),
+            placement: aruna_core::structs::placement::record::PlacementRef {
+                strategy_id: Ulid::from_bytes([6; 16]),
+                shard: 1,
+            },
+            peers: Vec::new(),
+            actor: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            generation: 3,
+        };
         let mut op = AddIdentifiersOperation::new(AddIdentifiersInput {
             document_id,
             identifiers: vec![doi()],
-            route: Some(MappingRoute {
-                realm_id: RealmId([5; 32]),
-                placement: aruna_core::structs::placement::record::PlacementRef {
-                    strategy_id: Ulid::from_bytes([6; 16]),
-                    shard: 1,
-                },
-                peers: Vec::new(),
-                actor: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-                generation: 3,
-            }),
+            route: Some(route.clone()),
             occurred_at_ms: 10,
         });
-        started(&mut op);
-        let effects = op.step(read_event(Some(&mapping(document_id))));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::Read {
-                txn_id: Some(_),
-                ..
-            }))
-        ));
-        // A bucket closed at generation 5 no longer admits a write resolved at 3.
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(ByteView::from(5u64.to_be_bytes().to_vec())),
-        }));
-        assert!(matches!(
-            effects.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        op.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::from_bytes([9; 16]),
-        }));
+        op.first().unwrap();
         assert_eq!(
-            op.finalize().unwrap_err(),
-            PersistentIdError::PlacementFenced
+            op.next(stored(&mapping(document_id))),
+            Ok(Next::Call(IoCall::Read(vec![fence_read(
+                &route.realm_id,
+                &route.placement
+            )])))
         );
+        // A bucket closed at generation 5 no longer admits a write resolved at 3.
+        let closed = IoResult::Values(vec![Some(5u64.to_be_bytes().to_vec().into())]);
+        assert_eq!(op.next(closed), Err(PersistentIdError::PlacementFenced));
     }
 
     #[test]

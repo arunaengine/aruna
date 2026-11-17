@@ -58,18 +58,14 @@ pub(crate) async fn add_secondary_ids(
     occurred_at_ms: u64,
 ) -> Result<(PersistentIdMapping, bool), PersistentIdError> {
     let route = mapping_route(ctx, realm_id, document_id).await?;
-    let result = crate::driver::drive(
-        crate::metadata::secondary_ids::AddIdentifiersOperation::new(
-            crate::metadata::secondary_ids::AddIdentifiersInput {
-                document_id,
-                identifiers,
-                route,
-                occurred_at_ms,
-            },
-        ),
-        ctx,
-    )
-    .await?;
+    let input = crate::metadata::secondary_ids::AddIdentifiersInput {
+        document_id,
+        identifiers,
+        route,
+        occurred_at_ms,
+    };
+    let build = || crate::metadata::secondary_ids::AddIdentifiersOperation::new(input.clone());
+    let result = crate::driver::drive_retry(build, ctx, &document_id.to_bytes()).await?;
     if result.1 {
         schedule_drain(ctx).await;
     }
