@@ -2,35 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::effects::warn_slow_call;
 use super::lifecycle::list_read_records;
 use super::search::{LocalReadScope, resolve_visibility_scope};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
-use aruna_core::metadata::{MetadataError, MetadataQueryResults};
+use aruna_core::metadata::{MetadataError, MetadataQueryResults, QUERY_PREFIXES};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms};
-use craqle::{
-    CraqleError, CraqleErrorKind, CraqleNode, GraphId, QueryCancellation, QueryOptions,
-    QueryRequest, QueryResults,
-};
-use oxrdf::{NamedNode, Term};
+use aruna_core::telemetry::{record_duration_ms, record_elapsed_ms, record_error};
+use aruna_graph::{GraphHandle, ReadScope};
 use spargebra::{Query, SparqlParser};
 use tracing::{Span, debug_span, field};
 
-use super::effects::{graph_ids, record_error, record_query_counts};
-use super::search::{AllowedGraphAuthorizer, ScopeAuthorizer, select_authorized_graphs};
+use super::effects::record_query_counts;
+use super::search::select_authorized_graphs;
 use super::{
-    MAX_RESULT_BYTES, METADATA_QUERY_DEADLINE, MetadataHandle, MetadataInner, QUERY_MAX_BYTES,
-    QUERY_MAX_ROWS, QUERY_PREFIXES, REGISTRY_CANDIDATE_LIMIT,
+    METADATA_QUERY_DEADLINE, MetadataInner, QUERY_MAX_BYTES, REGISTRY_CANDIDATE_LIMIT, handles,
 };
+use crate::driver::DriverContext;
 use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, local_key};
 #[tracing::instrument(
     name = "metadata.query.local",
     level = "debug",
-    skip(inner, auth_context, sparql),
+    skip(inner, graph, auth_context, sparql),
     fields(
         query_len = sparql.len() as u64,
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
@@ -48,6 +43,7 @@ use crate::metadata::query_cache::{CachedQuery, LocalScopeKind, graphs_digest, l
 )]
 pub(super) async fn query_local_graphs(
     inner: Arc<MetadataInner>,
+    graph: &GraphHandle,
     auth_context: Option<AuthContext>,
     graph_iris: Option<Vec<String>>,
     sparql: String,
@@ -69,7 +65,7 @@ pub(super) async fn query_local_graphs(
         .query_cache
         .stamp(inner.visibility_cache.current_generation());
 
-    let records = list_read_records(inner.clone(), &span).await?;
+    let records = list_read_records(inner.clone(), graph, &span).await?;
 
     let authorization_started = Instant::now();
     // Document-scoped queries keep the eager per-record selection; the
@@ -78,7 +74,7 @@ pub(super) async fn query_local_graphs(
         Some(graph_iris) => {
             let requested_graphs = graph_iris.iter().collect::<HashSet<_>>().len();
             let allowed =
-                select_authorized_graphs(inner.clone(), auth_context, records, Some(graph_iris))
+                select_authorized_graphs(&inner, auth_context, records, Some(graph_iris))
                     .await?;
             if allowed.len() != requested_graphs {
                 return Err(MetadataError::GraphNotFound);
@@ -86,7 +82,9 @@ pub(super) async fn query_local_graphs(
             LocalReadScope::Eager(allowed)
         }
         None => {
-            LocalReadScope::Lazy(resolve_visibility_scope(&inner, auth_context, records).await?)
+            LocalReadScope::Lazy(Arc::new(
+                resolve_visibility_scope(&inner, auth_context, records).await?,
+            ))
         }
     };
     record_elapsed_ms(&span, "authorization_ms", authorization_started);
@@ -136,42 +134,20 @@ pub(super) async fn query_local_graphs(
     if let LocalReadScope::Eager(allowed) = &scope {
         query_span.record("graph_count", allowed.len() as u64);
     }
-    let blocking_span = query_span.clone();
     let cache_inner = inner.clone();
     let query_started = Instant::now();
-    // Queries are reads: take from the read pool so they never queue behind
-    // long-running materializations holding the mutation permits.
-    let query_deadline = tokio::time::Instant::now() + METADATA_QUERY_DEADLINE;
-    let permit = tokio::time::timeout_at(
-        query_deadline,
-        inner.craqle_read_permits.clone().acquire_owned(),
-    )
-    .await
-    .map_err(|_| {
-        MetadataError::InvalidInput(format!(
-            "metadata query timed out after {} seconds",
-            METADATA_QUERY_DEADLINE.as_secs()
-        ))
-    })?
-    .ok();
-    let cancellation = QueryCancellation::new();
-    let _cancel_on_drop = MetadataCancellationGuard(cancellation.clone());
-    let blocking_cancellation = cancellation.clone();
-    let mut blocking = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        blocking_span.in_scope(|| evaluate_query(&inner, scope, &sparql, blocking_cancellation))
-    });
-    let result = match tokio::time::timeout_at(query_deadline, &mut blocking).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(MetadataError::TaskJoin(error.to_string())),
-        Err(_) => {
-            cancellation.cancel();
-            Err(MetadataError::InvalidInput(format!(
-                "metadata query timed out after {} seconds",
-                METADATA_QUERY_DEADLINE.as_secs()
-            )))
+    let read_scope = match scope {
+        LocalReadScope::Eager(allowed) => ReadScope::Graphs(allowed),
+        LocalReadScope::Lazy(scope) => {
+            let inner = inner.clone();
+            ReadScope::Visible(Arc::new(move |graph_iri: &str| {
+                scope.graph_visible(&inner.visibility_cache, graph_iri)
+            }))
         }
     };
+    let result = graph
+        .query(read_scope, sparql, METADATA_QUERY_DEADLINE, &query_span)
+        .await;
     let query_elapsed = query_started.elapsed();
     record_duration_ms(&query_span, "elapsed_ms", query_elapsed);
     record_duration_ms(&span, "craqle_query_ms", query_elapsed);
@@ -200,17 +176,8 @@ pub(super) async fn query_local_graphs(
             record_error(&span, &error.to_string());
         }
     }
-    warn_slow_call("query_graphs", None, query_elapsed);
     record_elapsed_ms(&span, "elapsed_ms", total_started);
     result
-}
-
-struct MetadataCancellationGuard(QueryCancellation);
-
-impl Drop for MetadataCancellationGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
 }
 
 pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError> {
@@ -238,156 +205,22 @@ pub(super) fn parse_metadata_query(sparql: &str) -> Result<Query, MetadataError>
     Ok(query)
 }
 
-fn evaluate_query(
-    inner: &MetadataInner,
-    scope: LocalReadScope<Vec<String>>,
-    sparql: &str,
-    cancellation: QueryCancellation,
+/// Runs one SPARQL query over the local graphs `auth_context` may read.
+#[tracing::instrument(
+    name = "metadata.query.local_authorized",
+    level = "debug",
+    skip(context, auth_context, sparql),
+    fields(
+        query_len = sparql.len() as u64,
+        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+    )
+)]
+pub async fn query_authorized_local(
+    context: &DriverContext,
+    auth_context: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    sparql: String,
 ) -> Result<MetadataQueryResults, MetadataError> {
-    let sparql = format!("{QUERY_PREFIXES}{sparql}");
-    let mut options = QueryOptions::results_only();
-    options.cancellation = cancellation;
-    options.limits.max_query_bytes = sparql.len();
-    options.limits.max_result_rows = QUERY_MAX_ROWS;
-    options.limits.max_result_bytes = MAX_RESULT_BYTES;
-    let execution = match scope {
-        LocalReadScope::Eager(allowed) => {
-            let graphs = graph_ids(&allowed);
-            for graph in &graphs {
-                if !inner.node.contains_graph(graph).map_err(query_error)? {
-                    return Err(MetadataError::GraphNotFound);
-                }
-            }
-            let authorizer = AllowedGraphAuthorizer {
-                graph_iris: allowed.into_iter().collect(),
-            };
-            inner
-                .node
-                .query_in_graphs_with_options(&authorizer, &graphs, &sparql, &options)
-        }
-        LocalReadScope::Lazy(scope) => {
-            let authorizer = ScopeAuthorizer {
-                scope: &scope,
-                visibility_cache: &inner.visibility_cache,
-            };
-            let request = QueryRequest {
-                sparql: &sparql,
-                options: &options,
-            };
-            inner.node.query_with_options(&authorizer, request)
-        }
-    }
-    .map_err(query_error)?;
-    let results = match execution.results {
-        QueryResults::Solutions(rows) => MetadataQueryResults::Solutions(
-            rows.into_iter()
-                .map(|row| row.into_iter().map(|(name, term)| (name, term.0)).collect())
-                .collect(),
-        ),
-        QueryResults::Boolean(value) => MetadataQueryResults::Boolean(value),
-        QueryResults::Graph(_) => {
-            return Err(MetadataError::InvalidInput(
-                "only SELECT and ASK metadata queries are supported".to_string(),
-            ));
-        }
-    };
-    let serialized =
-        serde_json::to_vec(&results).map_err(|error| MetadataError::Backend(error.to_string()))?;
-    if serialized.len() > MAX_RESULT_BYTES {
-        return Err(MetadataError::InvalidInput(format!(
-            "metadata query result exceeds the {MAX_RESULT_BYTES}-byte limit"
-        )));
-    }
-    Ok(results)
-}
-
-// Limits, cancellation and rejected queries are the caller's input, not a backend fault.
-fn query_error(error: CraqleError) -> MetadataError {
-    match error.kind() {
-        CraqleErrorKind::InvalidInput
-        | CraqleErrorKind::Unsupported
-        | CraqleErrorKind::QueryLimit
-        | CraqleErrorKind::Cancelled => MetadataError::InvalidInput(error.to_string()),
-        _ => MetadataError::Backend(error.to_string()),
-    }
-}
-
-pub(super) fn snapshot_iri_references(
-    node: &CraqleNode,
-    graph: &GraphId,
-) -> Result<Vec<(String, String, String)>, MetadataError> {
-    let snapshot = node
-        .graph_snapshot(graph)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let orphaned = node
-        .graph_diagnostics(graph)
-        .map_err(|error| MetadataError::Backend(error.to_string()))?
-        .orphaned_entities
-        .into_iter()
-        .map(|entity| craqle::EncodedTerm::from_named_node(&NamedNode::new_unchecked(entity)))
-        .collect::<HashSet<_>>();
-    let mut references = Vec::new();
-    for quad in snapshot.quads {
-        if orphaned.contains(&quad.subject) || orphaned.contains(&quad.object) {
-            continue;
-        }
-        let subject = match quad.subject.to_term() {
-            Some(Term::NamedNode(node)) => node.as_str().to_string(),
-            Some(Term::BlankNode(node)) => format!("_:{}", node.as_str()),
-            _ => continue,
-        };
-        let Some(predicate) = quad.predicate.to_named_node() else {
-            continue;
-        };
-        let object = match quad.object.to_term() {
-            Some(Term::NamedNode(object)) => object.as_str().to_string(),
-            // A literal `contentUrl` that names Aruna data is indexed like an IRI.
-            Some(Term::Literal(literal))
-                if CONTENT_URL_IRIS.contains(&predicate.as_str())
-                    && names_aruna_data(literal.value()) =>
-            {
-                literal.value().to_string()
-            }
-            _ => continue,
-        };
-        references.push((subject, predicate.as_str().to_string(), object));
-    }
-    Ok(references)
-}
-
-const CONTENT_URL_IRIS: [&str; 2] = [
-    "http://schema.org/contentUrl",
-    "https://schema.org/contentUrl",
-];
-
-fn names_aruna_data(value: &str) -> bool {
-    use aruna_core::structs::storage::replication::VersionedObjectArn;
-    aruna_core::structs::storage::data::link::DataLink::parse(value).is_some()
-        || VersionedObjectArn::parse(value).is_ok()
-        || VersionedObjectArn::parse(
-            value
-                .strip_prefix(aruna_core::structs::storage::replication::ARUNA_DATA_PREFIX)
-                .unwrap_or_default(),
-        )
-        .is_ok()
-}
-
-impl MetadataHandle {
-    #[tracing::instrument(
-        name = "metadata.query.local_authorized",
-        level = "debug",
-        skip(self, auth_context, sparql),
-        fields(
-            query_len = sparql.len() as u64,
-            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
-        )
-    )]
-    pub async fn query_authorized_local(
-        &self,
-        auth_context: Option<AuthContext>,
-        graph_iris: Option<Vec<String>>,
-        sparql: String,
-    ) -> Result<MetadataQueryResults, MetadataError> {
-        query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
-    }
+    let (metadata, graph) = handles(context)?;
+    query_local_graphs(metadata.inner.clone(), graph, auth_context, graph_iris, sparql).await
 }
