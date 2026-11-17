@@ -8,9 +8,7 @@ use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::backoff::capped_backoff;
-use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult, DocumentTarget};
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::document::{DocumentNetEvent, DocumentReconcileResult};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::time::unix_timestamp_millis;
@@ -18,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::driver::{DriverContext, drive};
 use crate::node::document_sync::apply_metadata;
 use crate::node::recovery::{
     PhaseOutcome, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass, RecoveryRotation,
@@ -310,7 +309,7 @@ async fn presence_phase(
             error: None,
         };
     }
-    let result = crate::driver::drive(
+    let result = drive(
         crate::realm::announce_presence::AnnouncePresenceOperation::new(
             crate::realm::announce_presence::AnnouncePresenceConfig {
                 realm_id: config.realm_id,
@@ -831,7 +830,7 @@ pub(crate) async fn apply_restored_reconcile(
 
     let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
     let refresh = RefreshUsageOperation::new(node_id, realm_id, &result.targets, Ulid::generate());
-    if let Err(error) = crate::driver::drive(refresh, context.as_ref()).await {
+    if let Err(error) = drive(refresh, context.as_ref()).await {
         warn!(%error, "Realm usage refresh stopped after the shard restore");
     }
     refresh_target_interest(context, &result.targets).await;
@@ -841,32 +840,11 @@ pub(crate) async fn apply_restored_reconcile(
 }
 
 async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {
-    let target = DocumentTarget::RealmConfig { realm_id };
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => match RealmConfigDocument::from_bytes(&bytes) {
-            Ok(config) => RealmConfigLoad::Found(config),
-            Err(error) => {
-                warn!(%realm_id, error = %error, "Failed to decode realm config for recovery");
-                RealmConfigLoad::StorageFailure
-            }
-        },
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => RealmConfigLoad::Absent,
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(%realm_id, error = %error, "Failed to read realm config for recovery");
-            RealmConfigLoad::StorageFailure
-        }
-        other => {
-            warn!(%realm_id, event = other.label(), "Unexpected realm config read result for recovery");
+    match drive(GetConfigOperation::new(realm_id), context).await {
+        Ok(config) => RealmConfigLoad::Found(config),
+        Err(GetConfigError::DocumentNotFound) => RealmConfigLoad::Absent,
+        Err(error) => {
+            warn!(%realm_id, error = %error, "Failed to load realm config for recovery");
             RealmConfigLoad::StorageFailure
         }
     }
@@ -880,9 +858,9 @@ mod tests {
         RESTORE_CHUNK_TOPICS, RESTORE_TOPIC_COUNT, RESTORE_UNIT_BUDGET, shared_topic_peers,
     };
     use aruna_core::UserId;
-    use aruna_core::document::shard_topic_id;
-    use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect};
-    use aruna_core::events::{DhtEntry, DhtEvent, NetEvent};
+    use aruna_core::document::{DocumentTarget, shard_topic_id};
+    use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, NetEffect, StorageEffect};
+    use aruna_core::events::{DhtEntry, DhtEvent, Event, NetEvent, StorageEvent};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
     use aruna_core::structs::placement::record::PlacementRef;
