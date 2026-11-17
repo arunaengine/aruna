@@ -37,8 +37,9 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
 
-    /// An effect the runner sends once the outcome is committed, such as a wake of a drain that
-    /// reads the committed rows. Its answer is not checked: the outcome stands either way.
+    /// The next effect the runner sends once the outcome is committed, such as a wake of a drain
+    /// that reads the committed rows; asked again after each answer until `None`. Answers are
+    /// not checked: the outcome stands either way.
     fn after_commit(&mut self) -> Option<Effect> {
         None
     }

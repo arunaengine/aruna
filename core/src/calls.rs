@@ -273,7 +273,7 @@ impl<P: Operation> CallRun<P> {
         }
     }
 
-    /// Ends with `output`, after the operation's effect for a committed outcome, if any.
+    /// Ends with `output`, after the operation's effects for a committed outcome, one at a time.
     fn settle(&mut self, output: P::Output) -> Effects {
         match self.operation.after_commit() {
             Some(effect) => {
@@ -337,11 +337,8 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }
             },
-            // The outcome is committed: any answer, a refusal too, ends the operation.
-            State::Settling(output) => {
-                self.state = State::Finished(Ok(output));
-                smallvec![]
-            }
+            // The outcome is committed: any answer, a refusal too, moves on to the next effect.
+            State::Settling(output) => self.settle(output),
             State::Created | State::Finished(_) => self.fail(unexpected("no event", event.label())),
         }
     }

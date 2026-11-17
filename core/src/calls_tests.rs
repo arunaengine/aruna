@@ -20,7 +20,7 @@ struct Script {
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
     transaction: bool,
-    after: Option<Effect>,
+    after: Vec<Effect>,
 }
 
 impl Script {
@@ -58,7 +58,7 @@ impl Operation for Script {
     }
 
     fn after_commit(&mut self) -> Option<Effect> {
-        self.after.take()
+        (!self.after.is_empty()).then(|| self.after.remove(0))
     }
 }
 
@@ -69,7 +69,7 @@ fn script(calls: Vec<IoCall>) -> Script {
         on_member: None,
         scope: None,
         transaction: false,
-        after: None,
+        after: Vec::new(),
     }
 }
 
@@ -125,7 +125,7 @@ fn effects_join_transaction() {
 
 #[test]
 fn sends_after_commit() {
-    // The effect for a committed outcome follows the commit; even a refusal keeps the outcome.
+    // The effects for a committed outcome follow the commit; even a refusal keeps the outcome.
     let write = vec![("rows".to_string(), key("a"), key("1"))];
     let mut script = script(vec![IoCall::Write(write)]);
     let wake = || {
@@ -134,7 +134,8 @@ fn sends_after_commit() {
             after: Duration::ZERO,
         })
     };
-    script.after = Some(wake());
+    let sync = || Effect::Storage(StorageEffect::SyncAll);
+    script.after = vec![wake(), sync()];
     let mut operation = run(script, true);
     operation.start();
     operation.step(started());
@@ -152,7 +153,10 @@ fn sends_after_commit() {
         key: None,
         message: "timer refused".to_string(),
     };
-    assert!(operation.step(Event::Task(refused)).is_empty());
+    assert_eq!(operation.step(Event::Task(refused)).as_slice(), &[sync()]);
+    let synced = Event::Storage(StorageEvent::SyncAllFinished);
+    assert!(operation.step(synced).is_empty());
+    assert!(operation.is_complete());
     assert_eq!(operation.finalize(), Ok(vec![IoResult::Done]));
 }
 
