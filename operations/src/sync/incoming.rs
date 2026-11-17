@@ -39,8 +39,7 @@ use crate::tasks::queue_backoff::retry_delay_ms;
 use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::execution::job::RoCrateLimits;
@@ -53,7 +52,7 @@ use aruna_core::structs::storage::blob::{
     HashIndex, bucket_permission_path, object_permission_path,
 };
 use aruna_core::structs::storage::replication::ReplicationItemKind;
-use aruna_core::task::{TaskEvent, TaskKey};
+use aruna_core::task::TaskKey;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;

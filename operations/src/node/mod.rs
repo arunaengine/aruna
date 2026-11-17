@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod dashboard;
-mod document_sync;
+pub(crate) mod document_sync;
 pub mod heartbeat;
 pub mod holder_choice;
 pub mod node_info;
