@@ -355,7 +355,7 @@ async fn mint_dedups_ingress() -> TestResult<()> {
     assert_eq!(first.job_id, second.job_id);
 
     for node in realm.nodes.iter() {
-        let stored = read_job_record(&node.context.storage_handle, first.job_id, None).await?;
+        let stored = read_job_record(&node.context, first.job_id, None).await?;
         assert_eq!(
             stored.is_some(),
             node.node_id() == authority.node_id(),
@@ -365,13 +365,7 @@ async fn mint_dedups_ingress() -> TestResult<()> {
     // Either user resolves the reservation, which is what makes it document-global.
     for user in [realm.user_id, other] {
         assert_eq!(
-            find_dedup_job(
-                &authority.context.storage_handle,
-                user,
-                &pid_dedup_key(document_id),
-                None,
-            )
-            .await?,
+            find_dedup_job(&authority.context, user, &pid_dedup_key(document_id), None,).await?,
             Some(first.job_id)
         );
     }

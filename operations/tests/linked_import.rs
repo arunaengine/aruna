@@ -335,17 +335,17 @@ async fn run_import(context: &TestContext, tag: u8) -> (u64, u64, u64) {
 /// A running job `tag` of the test's user with `payload`.
 async fn claimed(context: &TestContext, tag: u8, payload: JobPayload) -> JobContext {
     let job_id = JobId::from_bytes([tag; 16]);
-    let storage = &context.driver.storage_handle;
     let (user, node) = (context.auth.user_id, context.node_id);
     let record = JobRecord::new(job_id, payload, user, node, 1, 1, None);
-    insert_job(storage, &record).await.unwrap();
+    insert_job(&context.driver, &record).await.unwrap();
     let now = unix_timestamp_millis();
-    let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node, now).await.unwrap()
+    let ClaimOutcome::Claimed(claimed) =
+        claim_job(&context.driver, job_id, node, now).await.unwrap()
     else {
         panic!("the job was not claimed")
     };
     let claim_token = claimed.claim.as_ref().unwrap().claim_token;
-    let running = transition_to_running(storage, job_id, claim_token, now)
+    let running = transition_to_running(&context.driver, job_id, claim_token, now)
         .await
         .unwrap();
     JobContext {
@@ -796,15 +796,21 @@ async fn s3_purges_named() {
     else {
         panic!("the purge did not succeed")
     };
-    let storage = &context.driver.storage_handle;
     let (result, progress) = (
         JobResultPayload::StoragePurge(result),
         job.progress.snapshot(),
     );
     let now = unix_timestamp_millis();
-    complete_job(storage, job.job_id, job.claim_token, result, progress, now)
-        .await
-        .unwrap();
+    complete_job(
+        &context.driver,
+        job.job_id,
+        job.claim_token,
+        result,
+        progress,
+        now,
+    )
+    .await
+    .unwrap();
     process_cleanup_batch(&context.driver).await.unwrap();
     assert!(!exists(&context, &named).await);
     assert!(exists(&context, "old/b.txt").await);

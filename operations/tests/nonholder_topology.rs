@@ -256,13 +256,7 @@ async fn origin_scoped_dedup() -> TestResult<()> {
     // on their origin, nothing was reserved on any other node.
     let dedup_key = user_dedup_key(realm.user_id, "origin-scoped-retry");
     for (index, node) in realm.nodes.iter().enumerate() {
-        let row = find_dedup_job(
-            &node.context.storage_handle,
-            realm.user_id,
-            &dedup_key,
-            None,
-        )
-        .await?;
+        let row = find_dedup_job(&node.context, realm.user_id, &dedup_key, None).await?;
         match index {
             0 => assert_eq!(row, Some(first.job_id)),
             1 => assert_eq!(row, Some(elsewhere.job_id)),
@@ -302,8 +296,8 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         expires_at_ms: u64::MAX,
         claimed_by: None,
     };
-    let storage = &node.context.storage_handle;
-    aruna_operations::jobs::import::upload_store::write_rocrate_upload(storage, &record).await?;
+    aruna_operations::jobs::import::upload_store::write_rocrate_upload(&node.context, &record)
+        .await?;
     Ok(())
 }
 
@@ -393,13 +387,8 @@ async fn owner_claims() -> TestResult<()> {
     .await?;
     let passive = realm.node(1);
 
-    let passive_result = drain_job_batch(
-        &passive.context.storage_handle,
-        passive.node_id(),
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
+    let passive_result =
+        drain_job_batch(&passive.context, passive.node_id(), JOB_BUDGET, None).await?;
     assert!(passive_result.claimed.is_empty());
     assert!(
         read_owned_job(passive.context.as_ref(), realm.user_id, submitted.job_id)
@@ -408,13 +397,8 @@ async fn owner_claims() -> TestResult<()> {
         "a non-owner has nothing to claim"
     );
 
-    let owner_result = drain_job_batch(
-        &ingress.context.storage_handle,
-        ingress.node_id(),
-        JOB_BUDGET,
-        None,
-    )
-    .await?;
+    let owner_result =
+        drain_job_batch(&ingress.context, ingress.node_id(), JOB_BUDGET, None).await?;
     assert_eq!(owner_result.claimed.len(), 1);
     assert_eq!(owner_result.claimed[0].job_id, submitted.job_id);
     assert_eq!(owner_result.claimed[0].owner_node_id, ingress.node_id());
@@ -478,13 +462,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = drain_job_batch(
-            &node.context.storage_handle,
-            node.node_id(),
-            JOB_BUDGET,
-            None,
-        )
-        .await?;
+        let result = drain_job_batch(&node.context, node.node_id(), JOB_BUDGET, None).await?;
         assert!(result.claimed.is_empty(), "a non-owner must never claim");
         assert!(
             read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)
@@ -495,7 +473,7 @@ async fn swap_keeps_owner() -> TestResult<()> {
     }
 
     let owner = realm.find(owner_id);
-    let result = drain_job_batch(&owner.context.storage_handle, owner_id, JOB_BUDGET, None).await?;
+    let result = drain_job_batch(&owner.context, owner_id, JOB_BUDGET, None).await?;
     assert_eq!(
         result.claimed.len(),
         1,
@@ -577,13 +555,7 @@ async fn owner_down_unavailable() -> TestResult<()> {
         .iter()
         .filter(|node| node.is_sync_eligible() && node.node_id() != owner_id)
     {
-        let result = drain_job_batch(
-            &node.context.storage_handle,
-            node.node_id(),
-            JOB_BUDGET,
-            None,
-        )
-        .await?;
+        let result = drain_job_batch(&node.context, node.node_id(), JOB_BUDGET, None).await?;
         assert!(result.claimed.is_empty(), "no survivor may adopt the job");
         assert!(
             read_owned_job(node.context.as_ref(), realm.user_id, submitted.job_id)

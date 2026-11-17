@@ -498,7 +498,7 @@ async fn final_retry_resumes() -> Result<(), Box<dyn std::error::Error>> {
     gate.fail_buckets(false);
 
     release_job(
-        &fixture.context.storage_handle,
+        &fixture.context,
         job_id,
         first_token,
         unix_timestamp_millis(),
@@ -579,7 +579,7 @@ async fn rollback_keeps_released() -> Result<(), Box<dyn std::error::Error>> {
     put_tagged(&fixture, "imported/release.json", release, tags).await?;
 
     release_job(
-        &fixture.context.storage_handle,
+        &fixture.context,
         job_id,
         first_token,
         unix_timestamp_millis(),
@@ -679,7 +679,7 @@ async fn rollback_counts_earlier() -> Result<(), Box<dyn std::error::Error>> {
     put_tagged(&fixture, "imported/release.json", release, tags).await?;
 
     release_job(
-        &fixture.context.storage_handle,
+        &fixture.context,
         job_id,
         first_token,
         unix_timestamp_millis(),
@@ -1130,7 +1130,7 @@ async fn write_restart_dedupes() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(version_keys(&fixture).await?, vec![version_id]);
 
     release_job(
-        &fixture.context.storage_handle,
+        &fixture.context,
         job_id,
         first_token,
         unix_timestamp_millis(),
@@ -1813,17 +1813,13 @@ async fn claim_context(
     job_id: JobId,
     payload: JobPayload,
 ) -> Result<JobContext, Box<dyn std::error::Error>> {
-    if aruna_operations::jobs::store::state::read_job_record(
-        &fixture.context.storage_handle,
-        job_id,
-        None,
-    )
-    .await?
-    .is_none()
+    if aruna_operations::jobs::store::state::read_job_record(&fixture.context, job_id, None)
+        .await?
+        .is_none()
     {
         let now = unix_timestamp_millis();
         insert_job(
-            &fixture.context.storage_handle,
+            &fixture.context,
             &JobRecord::new(
                 job_id,
                 payload,
@@ -1837,7 +1833,7 @@ async fn claim_context(
         .await?;
     }
     let ClaimOutcome::Claimed(claimed) = claim_job(
-        &fixture.context.storage_handle,
+        &fixture.context,
         job_id,
         fixture.actor.node_id,
         unix_timestamp_millis(),
@@ -1851,13 +1847,8 @@ async fn claim_context(
         .as_ref()
         .ok_or("claimed job has no claim")?
         .claim_token;
-    let running = transition_to_running(
-        &fixture.context.storage_handle,
-        job_id,
-        token,
-        unix_timestamp_millis(),
-    )
-    .await?;
+    let running =
+        transition_to_running(&fixture.context, job_id, token, unix_timestamp_millis()).await?;
     Ok(JobContext {
         driver: fixture.context.clone(),
         job_id,
@@ -1876,8 +1867,7 @@ async fn read_rows(
     fixture: &Fixture,
     job_id: JobId,
 ) -> Result<Vec<ImportReportRow>, Box<dyn std::error::Error>> {
-    let (entries, next) =
-        list_job_entries(&fixture.context.storage_handle, job_id, None, 100).await?;
+    let (entries, next) = list_job_entries(&fixture.context, job_id, None, 100).await?;
     assert_eq!(next, None);
     entries
         .into_iter()
