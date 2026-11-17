@@ -28,7 +28,6 @@ use super::plaintext::{consent_delete, consent_write, job_consent};
 use super::version_replication::ReplicateScopeError;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::plugins::store::StoreError;
 use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
 use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
 use aruna_core::structs::storage::replication_queue::{
@@ -52,8 +51,6 @@ pub enum BlobQueueError {
     Replication(#[from] ReplicateScopeError),
     #[error("unexpected event while processing blob replication queue: {0}")]
     UnexpectedEvent(String),
-    #[error(transparent)]
-    Store(#[from] StoreError),
     #[error("a parked copy job could not wake: {0}")]
     Wake(String),
 }
