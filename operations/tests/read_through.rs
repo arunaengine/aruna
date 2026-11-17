@@ -35,11 +35,7 @@ async fn usable(device: &TestNode, document_id: Ulid) -> bool {
     let Some(replica) = read_replica(&device.context, document_id).await else {
         return false;
     };
-    let Some(metadata) = device.context.metadata_handle.as_ref() else {
-        return false;
-    };
-    let Ok(installed) = metadata
-        .export_rocrate_jsonld(replica.graph_iri.clone())
+    let Ok(installed) = aruna_operations::metadata::export_rocrate_jsonld(&device.context, replica.graph_iri.clone())
         .await
     else {
         return false;
@@ -217,11 +213,7 @@ async fn replacement_removes_scaffold() -> TestResult<()> {
         drain_publish_queue(&device.context).await;
         let _ = replay_event_log(holder.context.as_ref()).await;
         let _ = process_materialization_batch(holder.context.as_ref()).await;
-        let Some(metadata) = holder.context.metadata_handle.as_ref() else {
-            return false;
-        };
-        metadata
-            .export_rocrate_jsonld(replica.graph_iri.clone())
+        aruna_operations::metadata::export_rocrate_jsonld(&holder.context, replica.graph_iri.clone())
             .await
             .is_ok_and(|jsonld| {
                 jsonld.contains("owner-replaced") && !jsonld.contains("scaffold-notes")

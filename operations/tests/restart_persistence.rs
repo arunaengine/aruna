@@ -23,7 +23,7 @@ use aruna_operations::metadata::get_document::GetDocumentOperation;
 use aruna_operations::metadata::list_documents::ListDocumentsOperation;
 use aruna_operations::metadata::materialization_queue::process_materialization_batch;
 use aruna_operations::metadata::projector::replay_event_log;
-use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::{FjallPersistPolicy, FjallStorage};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -95,9 +95,9 @@ async fn child_writes_flushes() -> Result<(), Box<dyn std::error::Error>> {
     seed_realm_config(&context, &actor, &config).await?;
     create_materialized_document(&context, actor, &config).await?;
     context
-        .metadata_handle
+        .graph_handle
         .as_ref()
-        .expect("metadata handle installed")
+        .expect("graph handle installed")
         .flush_persistence()
         .await?;
     context.storage_handle.sync_all().await?;
@@ -171,17 +171,16 @@ fn build_context(
         FjallPersistPolicy::SyncAll,
     )?;
     let actor = actor();
-    let metadata_handle = MetadataHandle::new_with_options(
-        metadata_path,
-        actor.node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-        MetadataHandleOptions::default()
-            .with_search_storage(MetadataSearchStorage::Disk)
-            .with_sync_policy(FjallPersistPolicy::SyncAll),
-    )?;
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_path,
+actor.node_id,
+None,
+None,
+aruna_graph::GraphOptions::default()
+            .with_search_storage(aruna_graph::MetadataSearchStorage::Disk)
+            .with_sync_all(true),
+)?;
+let metadata_handle = MetadataHandle::new(metadata_path, storage_handle.clone(), None, Default::default());
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.seed_default_placement();
     config.ensure_node(actor.node_id, RealmNodeKind::Server);
@@ -193,6 +192,7 @@ fn build_context(
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
         }),

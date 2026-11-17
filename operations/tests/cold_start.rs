@@ -17,7 +17,9 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
+use aruna_graph::{GraphHandle, GraphOptions, MetadataSearchStorage};
+use aruna_operations::driver::DriverContext;
+use aruna_operations::metadata::MetadataHandle;
 use aruna_storage::FjallStorage;
 use ulid::Ulid;
 
@@ -35,17 +37,25 @@ fn env_usize(name: &str, default: usize) -> usize {
 fn open_handle(
     metadata_dir: &std::path::Path,
     storage: &aruna_storage::StorageHandle,
-) -> Result<MetadataHandle, BoxError> {
+) -> Result<DriverContext, BoxError> {
     let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
-    Ok(MetadataHandle::new_with_options(
+    let graph = GraphHandle::open(
         metadata_dir,
         node_id,
-        storage.clone(),
         None,
         None,
-        None,
-        MetadataHandleOptions::default().with_search_storage(MetadataSearchStorage::Memory),
-    )?)
+        GraphOptions::default().with_search_storage(MetadataSearchStorage::Memory),
+    )?;
+    let metadata = MetadataHandle::new(metadata_dir, storage.clone(), None, Default::default());
+    Ok(DriverContext {
+        storage_handle: storage.clone(),
+        net_handle: None,
+        blob_handle: None,
+        metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
+        task_handle: None,
+        compute_handle: None,
+    })
 }
 
 fn graph_iri(index: usize) -> String {
@@ -100,9 +110,8 @@ async fn write_registry_records(
     Ok(())
 }
 
-async fn create_crate_graph(handle: &MetadataHandle, index: usize) -> Result<(), BoxError> {
-    let event = handle
-        .send_metadata_effect(MetadataEffect::CreateCrate {
+async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), BoxError> {
+    let event = aruna_operations::metadata::send_metadata_effect(handle, MetadataEffect::CreateCrate {
             request: MetadataCrateRequest {
                 graph_iri: graph_iri(index),
                 name: format!("Cold Start Dataset {index:05}"),
@@ -125,13 +134,11 @@ async fn create_crate_graph(handle: &MetadataHandle, index: usize) -> Result<(),
 }
 
 async fn timed_query(
-    handle: &MetadataHandle,
+    handle: &DriverContext,
     label: &str,
 ) -> Result<std::time::Duration, BoxError> {
     let started = Instant::now();
-    let results = handle
-        .query_authorized_local(
-            None,
+    let results = aruna_operations::metadata::query_authorized_local(handle, None,
             None,
             "SELECT ?s ?name WHERE { ?s a schema:Dataset . ?s schema:name ?name } LIMIT 25"
                 .to_string(),
@@ -197,7 +204,7 @@ async fn first_cold_query() -> Result<(), BoxError> {
 
     // Cold fill of the handle-owned list-path registry cache over the same storage.
     let list_fill_started = Instant::now();
-    let listed = handle.list_cached_records().await?;
+    let listed = aruna_operations::metadata::list_cached_records(&handle).await?;
     println!(
         "registry cache cold fill: {:?} ({} records)",
         list_fill_started.elapsed(),
@@ -209,7 +216,7 @@ async fn first_cold_query() -> Result<(), BoxError> {
     drop(handle);
     let handle = open_handle(metadata_dir.path(), &storage)?;
     let warmup_started = Instant::now();
-    handle.warm_caches().await?;
+    aruna_operations::metadata::warm_caches(&handle).await?;
     println!("warm_caches after reopen: {:?}", warmup_started.elapsed());
     let warmed = timed_query(&handle, "first query (after warmup)").await?;
 

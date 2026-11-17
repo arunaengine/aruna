@@ -1343,17 +1343,11 @@ async fn graph_exists(
     test: &TestContext,
     document_id: Ulid,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let metadata = test
-        .context
-        .metadata_handle
-        .as_ref()
-        .ok_or("metadata handle is configured")?;
     let graph_iri =
         aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord::graph_iri_for(
             document_id,
         );
-    match metadata
-        .send_metadata_effect(MetadataEffect::ContainsGraph { graph_iri })
+    match aruna_operations::metadata::send_metadata_effect(&test.context, MetadataEffect::ContainsGraph { graph_iri })
         .await
     {
         Event::Metadata(MetadataEvent::ContainsGraphResult { exists, .. }) => Ok(exists),
@@ -1629,15 +1623,14 @@ async fn build_context(
     let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let realm_id = RealmId([77u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[77u8; 32]).public();
-    let metadata = MetadataHandle::new_with_options(
-        metadata_dir.path(),
-        node_id,
-        storage.clone(),
-        None,
-        None,
-        None,
-        MetadataHandleOptions::default().with_validation_disabled(validator_disabled),
-    )?;
+    let graph = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default().with_validation_disabled(validator_disabled),
+)?;
+let metadata = MetadataHandle::new(metadata_dir.path(), storage.clone(), None, Default::default());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
@@ -1664,6 +1657,7 @@ async fn build_context(
         net_handle: None,
         blob_handle: None,
         metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });

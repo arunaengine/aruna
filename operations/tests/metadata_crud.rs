@@ -690,7 +690,7 @@ async fn projector_cleans_registry() -> Result<(), Box<dyn std::error::Error>> {
         .metadata_handle
         .as_ref()
         .expect("metadata handle installed");
-    let warm = metadata_handle.list_cached_group(group_id).await?;
+    let warm = aruna_operations::metadata::list_cached_group(&test.context, group_id).await?;
     assert_eq!(warm.as_ref(), &vec![record.clone()]);
     metadata_handle.cache_registry_records(std::slice::from_ref(&record));
     write_tombstone(&test, &record).await?;
@@ -704,7 +704,7 @@ async fn projector_cleans_registry() -> Result<(), Box<dyn std::error::Error>> {
 
     assert_eq!(projected, 0);
     assert_projection_absent(&test, &record).await?;
-    let visible = metadata_handle.list_cached_group(group_id).await?;
+    let visible = aruna_operations::metadata::list_cached_group(&test.context, group_id).await?;
     assert!(visible.is_empty());
     Ok(())
 }
@@ -982,14 +982,14 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone()).await?;
     let node_id = net_handle.node_id();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-    )?;
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)?;
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), RealmId([5u8; 32])),
@@ -1001,6 +1001,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });
@@ -1020,14 +1021,14 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let realm_id = RealmId([6u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-        None,
-        None,
-    )?;
+    let graph_handle = aruna_graph::GraphHandle::open(
+metadata_dir.path(),
+node_id,
+None,
+None,
+aruna_graph::GraphOptions::default(),
+)?;
+let metadata_handle = MetadataHandle::new(metadata_dir.path(), storage_handle.clone(), None, Default::default());
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
@@ -1039,6 +1040,7 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         net_handle: None,
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });

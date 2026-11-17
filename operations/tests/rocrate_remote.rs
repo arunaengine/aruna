@@ -46,6 +46,7 @@ use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, insert_job, list_job_entries, read_job_record, transition_to_running,
 };
 use aruna_operations::jobs::submit::mint_job_id;
+use aruna_graph::GraphHandle;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
@@ -293,25 +294,22 @@ async fn build_node(
         net.clone(),
     )
     .await?;
-    let metadata = if with_metadata {
+    let (metadata, graph) = if with_metadata {
         let metadata_path = root.path().join("metadata");
         std::fs::create_dir_all(&metadata_path)?;
-        Some(MetadataHandle::new(
-            &metadata_path,
-            net.node_id(),
-            storage.clone(),
-            None,
-            None,
-            None,
-        )?)
+        let graph = GraphHandle::open(&metadata_path, net.node_id(), None, None, Default::default())?;
+        let metadata =
+            MetadataHandle::new(&metadata_path, storage.clone(), None, Default::default());
+        (Some(metadata), Some(graph))
     } else {
-        None
+        (None, None)
     };
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: Some(blob),
         metadata_handle: metadata,
+        graph_handle: graph,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
     });

@@ -316,6 +316,7 @@ async fn dispatch_proxies_nonholder() -> Result<(), Box<dyn std::error::Error>> 
         net_handle: None,
         blob_handle: None,
         metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
     });
@@ -497,21 +498,21 @@ async fn build_node(
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let (metadata_dir, metadata_handle) = match metadata {
+    let (metadata_dir, metadata_handle, graph_handle) = match metadata {
         Some(options) => {
             let dir = tempfile::tempdir()?;
-            let handle = MetadataHandle::new_with_options(
+            let graph = aruna_graph::GraphHandle::open(
                 dir.path().join("metadata"),
                 net.node_id(),
-                storage.clone(),
-                Some(net.clone()),
                 Some(net.document_sync_node()),
                 Some(net.document_sync_database()),
-                options,
+                aruna_graph::GraphOptions::default(),
             )?;
-            (Some(dir), Some(handle))
+            let path = dir.path().join("metadata");
+            let handle = MetadataHandle::new(path, storage.clone(), Some(net.clone()), options);
+            (Some(dir), Some(handle), Some(graph))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     let context = Arc::new(DriverContext {
@@ -519,6 +520,7 @@ async fn build_node(
         net_handle: Some(net.clone()),
         blob_handle: None,
         metadata_handle,
+        graph_handle,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
     });
