@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::driver::{DriverContext, drive};
+use aruna_core::effects::StorageEffect;
 use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
@@ -361,60 +362,47 @@ async fn materialized_archive_changed() {
 
 #[test]
 fn copy_skips_content() {
-    // Every effect is a storage effect, so a locked bucket copies the same way.
+    // Every call is a storage call, so a locked bucket copies the same way.
     let location = sealed_location();
     let source_id = Ulid::generate();
     let mut operation = SealedCopyOperation::new(input(&location, source_id));
-    let missing = || {
-        Event::Storage(StorageEvent::ReadResult {
-            key: Vec::<u8>::new().into(),
-            value: None,
-        })
+    let event = |event: StorageEvent| IoResult::Event(Box::new(Event::Storage(event)));
+    let missing = StorageEvent::ReadResult {
+        key: Vec::<u8>::new().into(),
+        value: None,
     };
-    let mut effects = operation.start();
-    // An ungoverned bucket needs no gate; a source without envelope rows needs no key.
-    effects.extend(operation.step(missing()));
-    effects.extend(
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(Vec::<u8>::new().into(), None); 4],
-        })),
-    );
-    let txn_id = Ulid::from_bytes([1; 16]);
-    effects.extend(operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id })));
-    effects.extend(operation.step(missing()));
-    effects.extend(
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (Vec::<u8>::new().into(), None),
-                (Vec::<u8>::new().into(), None),
-            ],
-        })),
-    );
+    let unset = StorageEvent::BatchReadResult {
+        values: vec![(Vec::<u8>::new().into(), None); 2],
+    };
     let source = BlobVersion::pending(
         ArchiveKey::of(&location),
         SystemTime::UNIX_EPOCH,
         UserId::default(),
         None,
     );
-    effects.extend(
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    Vec::<u8>::new().into(),
-                    Some(source.to_bytes().unwrap().into()),
-                ),
-                (Vec::<u8>::new().into(), None),
-            ],
-        })),
-    );
-    assert!(
-        effects
-            .iter()
-            .all(|effect| matches!(effect, Effect::Storage(_)))
-    );
+    let mut calls = vec![operation.first().unwrap()];
+    // An ungoverned bucket needs no gate; a source without envelope rows needs no key.
+    for result in [
+        IoResult::Values(vec![None]),
+        IoResult::Values(vec![None; 4]),
+        event(missing),
+        event(unset),
+        IoResult::Values(vec![Some(source.to_bytes().unwrap().into()), None]),
+    ] {
+        calls.push(operation.next(result).unwrap());
+    }
+    let storage = |next: &Next<SealedCopyResult>| match next {
+        Next::Call(IoCall::Effect(effect)) => matches!(**effect, Effect::Storage(_)),
+        Next::Call(IoCall::Child(_) | IoCall::Read(_)) => true,
+        _ => false,
+    };
+    assert!(calls.iter().all(storage));
+    let Some(Next::Call(IoCall::Effect(effect))) = calls.last() else {
+        panic!("expected the head write")
+    };
     assert!(matches!(
-        effects.last(),
-        Some(Effect::Storage(StorageEffect::Write { key_space, .. })) if key_space == BLOB_HEAD_KEYSPACE
+        &**effect,
+        Effect::Storage(StorageEffect::Write { key_space, .. }) if key_space == BLOB_HEAD_KEYSPACE
     ));
 }
 
@@ -514,7 +502,7 @@ fn copy_carries_hint() {
 
     let mut operation = SealedCopyOperation::new(input(&sealed_location(), Ulid::generate()));
     let minted = operation.version_id;
-    operation.start();
+    operation.first().unwrap();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([2; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -531,10 +519,8 @@ fn copy_carries_hint() {
             revision: Default::default(),
         }),
     };
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: Some(info.to_bytes().unwrap().into()),
-    }));
+    let bucket = IoResult::Values(vec![Some(info.to_bytes().unwrap().into())]);
+    operation.next(bucket).unwrap();
     let hint = SetHint::of_set(Ulid::from_bytes([5u8; 16]));
     assert_eq!(SetHint::of_version(operation.version_id), hint);
     assert_eq!(operation.version_id.timestamp_ms(), minted.timestamp_ms());
