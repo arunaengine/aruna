@@ -658,7 +658,8 @@ mod tests {
     }
 
     // A transfer away that opens while a staging job is admitted refuses the job: the admission
-    // retries once the record changed under it, so no job lands after the transfer's job scan.
+    // conflicts once the record changed under it, and its rerun refuses, so no job lands after
+    // the transfer's job scan.
     #[tokio::test]
     async fn refuses_moving_admission() {
         use crate::distribution::test_record::store_record;
@@ -666,7 +667,8 @@ mod tests {
         use crate::jobs::submit::{SubmitJobError, SubmitJobOperation, SubmitJobSpec};
         use aruna_core::effects::Effect;
         use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-        use aruna_core::operation::EffectOperation;
+        use aruna_core::errors::StorageError;
+        use aruna_core::operation::{EffectOperation, Runnable};
         use aruna_core::structs::execution::job::WorkspaceMode;
         use aruna_core::structs::storage::distribution::snapshot::OpenTransfer;
         use aruna_core::structs::storage::distribution::{SignedSnapshot, TransferRole};
@@ -720,7 +722,8 @@ mod tests {
             workspace_bucket: None,
             active_cap: None,
         };
-        let mut operation = SubmitJobOperation::new(submission, JobId::from_bytes([1; 16]));
+        let job_id = JobId::from_bytes([1; 16]);
+        let mut operation = SubmitJobOperation::new(submission.clone(), job_id).into_machine();
         let mut effects = operation.start().into_vec();
         let mut raced = false;
         while let Some(Effect::Storage(effect)) = effects.pop() {
@@ -735,10 +738,8 @@ mod tests {
             }
         }
         assert!(raced);
-        assert_eq!(
-            operation.finalize(),
-            Err(SubmitJobError::RangeMoving(set_id))
-        );
+        let conflict = SubmitJobError::Storage(StorageError::TransactionConflict);
+        assert_eq!(operation.finalize(), Err(conflict));
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -749,6 +750,8 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
+        let rerun = drive(SubmitJobOperation::new(submission, job_id), &context).await;
+        assert_eq!(rerun, Err(SubmitJobError::RangeMoving(set_id)));
         assert!(open_imports(&context, "spire").await.unwrap().is_empty());
     }
 

@@ -53,7 +53,7 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
 use crate::metadata::record_reads::load_document_record;
@@ -110,7 +110,8 @@ pub(crate) async fn submit_local_job(
     if let Some(net_handle) = context.net_handle.as_ref() {
         spec.owner_node_id = net_handle.node_id();
     }
-    drive(SubmitJobOperation::new(spec, job_id), context).await
+    let build = || SubmitJobOperation::new(spec.clone(), job_id);
+    drive_retry(build, context, &job_id.to_bytes()).await
 }
 
 /// Normalizes one execution request and enforces every bound that holds

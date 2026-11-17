@@ -6,12 +6,16 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     ACTIVE_USER_KEYSPACE, BACKEND_IMPORT_KEYSPACE, DEDUP_INDEX_KEYSPACE, DISTRIBUTION_KEYSPACE,
     HARVEST_SOURCE_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
+use aruna_core::operation::{AfterConflict, Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::execution::harvest::HarvestSource;
 use aruna_core::structs::execution::job::{
     ActiveJobKind, ImportRoCrateSource, ImportRoCrateSpec, JobId, JobPayload, JobRecord,
@@ -24,6 +28,8 @@ use aruna_core::structs::storage::distribution::DistributionView;
 use aruna_core::structured_id::{
     BucketId, ClockHealthError, JobId as RoutableJobId, PlacementHandle, StructuredIdGenerator,
 };
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::warn;
@@ -157,23 +163,48 @@ pub enum SubmitJobError {
     RangeMoving(ulid::Ulid),
 }
 
+impl From<IoError> for SubmitJobError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::UnexpectedEvent(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SubmitState {
+    Start,
+    GroupFence,
+    ReadDedup,
     VerifyDedup {
         job_id: JobId,
         digest_matches: bool,
     },
+    CheckActive,
+    ClaimUpload,
     /// Reads the rule of a backend import run, then the run it last started.
+    ReadImport,
+    CheckImportRun,
     /// Reads a harvest source, then the run it last started.
+    ReadSource,
+    CheckSourceRun,
     /// Reads the destination of a staging job, then the record of its distributed set.
+    ReadBucket,
     ReadRecord {
         set_id: ulid::Ulid,
         member_id: ulid::Ulid,
     },
+    WriteJob,
 }
 
+type Step = Result<Next<SubmitJobResult>, SubmitJobError>;
+
+/// Call-driven submit; a live `job_dedup_index` entry short-circuits to the
 /// existing id (matching plan digest) or raises `JobPlanConflict` (differing
 /// digest), a dangling entry creates fresh; at-least-once, so consumers must be idempotent.
+/// Every check reads in the write transaction the job row commits in.
 #[derive(Debug, PartialEq)]
 pub struct SubmitJobOperation {
     record: JobRecord,
@@ -235,61 +266,107 @@ impl SubmitJobOperation {
             source_claim: None,
             staging_checked: false,
             active_cap,
+            state: SubmitState::Start,
         }
     }
 
+    /// Whether a check reads before the job is written, so the job commits with what it read.
+    fn checks(&self) -> bool {
+        self.record.dedup_key.is_some()
+            || self.active_cap.is_some()
+            || self.record.payload.owner_group().is_some()
+            || self.upload().is_some()
+            || matches!(
+                self.record.payload,
+                JobPayload::BackendImport(_) | JobPayload::Harvest(_) | JobPayload::Staging(_)
+            )
     }
 
+    /// Reads one row in the next state.
+    fn read(&mut self, state: SubmitState, key_space: &str, key: Key) -> Step {
+        self.state = state;
+        Ok(Next::Call(IoCall::Read(vec![(key_space.to_string(), key)])))
     }
 
+    fn read_dedup(&mut self) -> Step {
+        let Some(dedup_key) = self.record.dedup_key.clone() else {
+            return self.check_active();
+        };
+        // Must use the same index-key builder `job_insert_entries` uses, which decides
+        // owner prefixing per key, or the reservation read misses its own row.
+        let key = dedup_index_key(self.record.created_by, &dedup_key);
+        self.read(SubmitState::ReadDedup, DEDUP_INDEX_KEYSPACE, key)
     }
 
+    fn check_active(&mut self) -> Step {
         let Some(limit) = self.active_cap else {
+            return self.write_job();
         };
         // Only the kinds that hold a slot can be counted against one.
         let Some(kind) = ActiveJobKind::of(&self.record.payload) else {
+            return self.write_job();
         };
         if limit == 0 {
+            return Err(SubmitJobError::ActiveJobLimit { limit });
         }
+        self.state = SubmitState::CheckActive;
+        Ok(Next::Call(IoCall::Page {
+            space: ACTIVE_USER_KEYSPACE.to_string(),
+            prefix: job_active_prefix(self.record.created_by, kind),
+            after: None,
             limit: limit as usize,
+        }))
     }
 
+    fn verify_dedup(&mut self, job_id: JobId, digest_matches: bool) -> Step {
+        let state = SubmitState::VerifyDedup {
             job_id,
             digest_matches,
         };
+        self.read(state, JOB_KEYSPACE, job_record_key(job_id))
     }
 
+    fn write_job(&mut self) -> Step {
         if !self.group_checked
             && let Some(group_id) = self.record.payload.owner_group()
         {
             let (key_space, key) = crate::groups::fence::group_fence_key(group_id);
+            return self.read(SubmitState::GroupFence, &key_space, key);
         }
         // An upload-backed import claims its upload with the job, so it keeps it across expiry.
         if !self.upload_checked
             && let Some(upload_id) = self.upload()
         {
+            let key = upload_key(upload_id);
+            return self.read(SubmitState::ClaimUpload, ROCRATE_UPLOAD_KEYSPACE, key);
         }
         // A rule records its run with the job, so two starts never both pass the check.
         if !self.import_checked
             && let JobPayload::BackendImport(spec) = &self.record.payload
         {
             let key = import_key(spec.group_id, spec.import_id);
+            return self.read(SubmitState::ReadImport, BACKEND_IMPORT_KEYSPACE, key);
         }
         // A harvest source records its run with the job, the same way.
         if !self.source_checked
             && let JobPayload::Harvest(spec) = &self.record.payload
         {
             let key = source_key(spec.group_id, spec.source_id);
+            return self.read(SubmitState::ReadSource, HARVEST_SOURCE_KEYSPACE, key);
         }
         // A staging job waits while a range of its distributed destination moves away.
         if !self.staging_checked
             && let JobPayload::Staging(spec) = &self.record.payload
         {
             let key = spec.bucket.as_bytes().into();
+            return self.read(SubmitState::ReadBucket, S3_BUCKET_KEYSPACE, key);
         }
+        let mut writes = job_insert_entries(&self.record)?;
         writes.extend(self.upload_claim.clone());
         writes.extend(self.import_claim.clone());
         writes.extend(self.source_claim.clone());
+        self.state = SubmitState::WriteJob;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn upload(&self) -> Option<ulid::Ulid> {
@@ -327,28 +404,89 @@ impl SubmitJobOperation {
     }
 
     /// Reads the run the rule last started, or records this job when it has none.
+    fn import_read(&mut self, value: Option<&[u8]>) -> Step {
+        let value = value.ok_or(SubmitJobError::ImportMissing)?;
+        let rule = BackendImport::from_bytes(value)?;
         let Some(last_job) = rule.last_job else {
+            return self.claim_import(rule);
         };
         self.import_rule = Some(rule);
+        self.read(
+            SubmitState::CheckImportRun,
+            JOB_KEYSPACE,
+            job_record_key(last_job),
+        )
     }
 
     /// A pruned last run no longer holds the rule.
+    fn import_run_read(&mut self, value: Option<&[u8]>) -> Step {
+        let rule = self.import_rule.take().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("import run check without a rule".to_string())
+        })?;
+        match value.map(JobRecord::from_bytes).transpose()? {
+            Some(last) if is_running(last.state) => Err(SubmitJobError::ImportRunning),
+            _ => self.claim_import(rule),
         }
     }
 
+    fn claim_import(&mut self, mut rule: BackendImport) -> Step {
         rule.last_job = Some(self.record.job_id);
         rule.last_started_ms = Some(self.record.created_at_ms);
+        let value = rule.to_bytes()?;
+        let key_space = BACKEND_IMPORT_KEYSPACE.to_string();
+        self.import_claim = Some((key_space, rule.key(), value.into()));
+        self.import_checked = true;
+        self.write_job()
+    }
+
+    /// Reads the run the source last started, or records this job when it has none.
+    fn source_read(&mut self, value: Option<&[u8]>) -> Step {
+        let value = value.ok_or(SubmitJobError::SourceMissing)?;
+        let source = HarvestSource::from_bytes(value)?;
+        let Some(last_job) = source.last_job else {
+            return self.claim_source(source);
+        };
+        self.harvest_source = Some(source);
+        self.read(
+            SubmitState::CheckSourceRun,
+            JOB_KEYSPACE,
+            job_record_key(last_job),
+        )
+    }
+
+    fn source_run_read(&mut self, value: Option<&[u8]>) -> Step {
+        let source = self.harvest_source.take().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("source run check without a source".to_string())
+        })?;
+        match value.map(JobRecord::from_bytes).transpose()? {
+            Some(last) if is_running(last.state) => Err(SubmitJobError::SourceRunning),
+            _ => self.claim_source(source),
         }
     }
 
+    fn claim_source(&mut self, mut source: HarvestSource) -> Step {
         source.last_job = Some(self.record.job_id);
+        let value = source.to_bytes()?;
+        let key = source_key(source.group_id, source.source_id);
+        let key_space = HARVEST_SOURCE_KEYSPACE.to_string();
+        self.source_claim = Some((key_space, key, value.into()));
+        self.source_checked = true;
+        self.write_job()
     }
 
     /// A destination that is gone or not distributed needs no record.
+    fn bucket_read(&mut self, value: Option<&[u8]>) -> Step {
+        let bucket = value.map(BucketInfo::from_bytes).transpose()?;
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution) else {
+            self.staging_checked = true;
+            return self.write_job();
         };
+        let state = SubmitState::ReadRecord {
             set_id: binding.set_id,
             member_id: binding.member_id,
         };
+        let key = binding.set_id.to_bytes().to_vec().into();
+        self.read(state, DISTRIBUTION_KEYSPACE, key)
     }
 
     /// Refuses the job while the record lists a transfer away from this member: the transfer
@@ -357,18 +495,67 @@ impl SubmitJobOperation {
         &mut self,
         (set_id, member_id): (ulid::Ulid, ulid::Ulid),
         value: Option<&[u8]>,
+    ) -> Step {
+        let view = value.map(DistributionView::from_bytes).transpose()?;
         let transfers = (view.as_ref()).map(|view| &view.snapshot().lifecycle.transfers);
         if transfers.is_some_and(|open| open.iter().any(|transfer| transfer.from == member_id)) {
+            return Err(SubmitJobError::RangeMoving(set_id));
         }
         self.staging_checked = true;
+        self.write_job()
     }
 
+    /// Reads the job a live dedup row points at, or checks the active cap when there is none.
+    fn dedup_read(&mut self, value: Option<Value>) -> Step {
+        let Some(value) = value else {
+            return self.check_active();
+        };
+        match parse_dedup_value(value.as_ref()) {
+            // Same key and plan is idempotent; a different plan is a conflict. Either way
+            // the target record is verified first so no ghost row answers for a dead job.
+            Ok((existing_job_id, existing_digest)) => {
+                let digest_matches = self.record.plan_digest.unwrap_or_default() == existing_digest;
+                self.verify_dedup(existing_job_id, digest_matches)
+            }
+            Err(_) => self.check_active(),
+        }
     }
 
+    fn verified(&mut self, job_id: JobId, digest_matches: bool, value: Option<Value>) -> Step {
+        let Some(value) = value else {
+            warn!(job_id = %job_id, "Dedup entry points at a missing job; creating fresh");
+            return self.check_active();
+        };
+        match JobRecord::from_bytes(&value) {
+            Ok(_) if digest_matches => Ok(Next::Done(SubmitJobResult {
+                job_id,
+                created: false,
+            })),
+            Ok(_) => Err(SubmitJobError::JobPlanConflict {
+                existing_job_id: job_id,
+            }),
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Dedup entry points at an undecodable job; creating fresh");
+                self.check_active()
+            }
+        }
     }
 
+    /// Applies the upload claim rule to the stored upload `value` for this job.
+    fn claim_read(&mut self, value: Option<&[u8]>) -> Step {
+        let upload_id = self.upload().ok_or_else(|| {
+            SubmitJobError::UnexpectedEvent("upload claim without an upload".to_string())
+        })?;
+        self.claim(upload_id, value)?;
+        self.write_job()
     }
 
+    fn active_read(&mut self, rows: usize) -> Step {
+        let limit = self.active_cap.unwrap_or_default();
+        if rows >= limit as usize {
+            return Err(SubmitJobError::ActiveJobLimit { limit });
+        }
+        self.write_job()
     }
 }
 
@@ -393,16 +580,74 @@ fn workspace_plan_digest(
     *hasher.finalize().as_bytes()
 }
 
+impl Operation for SubmitJobOperation {
     type Output = SubmitJobResult;
     type Error = SubmitJobError;
 
+    fn transaction(&self) -> TransactionMode {
+        match self.checks() {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
         }
     }
 
+    /// A lost commit always runs again with fresh reads, as the submit has always done.
+    fn on_conflict(&mut self, _attempt: u32) -> AfterConflict<SubmitJobResult> {
+        AfterConflict::Rerun
     }
 
+    fn first(&mut self) -> Step {
+        match self.checks() {
+            true => self.read_dedup(),
+            false => self.write_job(),
+        }
     }
 
+    fn next(&mut self, result: IoResult) -> Step {
+        let state = self.state.clone();
+        if let SubmitState::CheckActive = state {
+            let IoResult::Page { rows, .. } = result else {
+                return Err(SubmitJobError::UnexpectedEvent(result.label().to_string()));
+            };
+            return self.active_read(rows.len());
+        }
+        if let SubmitState::WriteJob = state {
+            let IoResult::Done = result else {
+                return Err(SubmitJobError::UnexpectedEvent(result.label().to_string()));
+            };
+            // Kick the drain so the job is claimed promptly; a lost timer only delays it.
+            let output = SubmitJobResult {
+                job_id: self.record.job_id,
+                created: true,
+            };
+            let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+            return Ok(Next::Then { output, calls });
+        }
+        let [value] = values::<1>(result)?;
+        match state {
+            SubmitState::GroupFence => {
+                aruna_core::structs::identity::group_delete::check_group_write(value.as_deref())?;
+                self.group_checked = true;
+                self.write_job()
+            }
+            SubmitState::ReadDedup => self.dedup_read(value),
+            SubmitState::VerifyDedup {
+                job_id,
+                digest_matches,
+            } => self.verified(job_id, digest_matches, value),
+            SubmitState::ClaimUpload => self.claim_read(value.as_deref()),
+            SubmitState::ReadImport => self.import_read(value.as_deref()),
+            SubmitState::CheckImportRun => self.import_run_read(value.as_deref()),
+            SubmitState::ReadSource => self.source_read(value.as_deref()),
+            SubmitState::CheckSourceRun => self.source_run_read(value.as_deref()),
+            SubmitState::ReadBucket => self.bucket_read(value.as_deref()),
+            SubmitState::ReadRecord { set_id, member_id } => {
+                self.record_read((set_id, member_id), value.as_deref())
+            }
+            SubmitState::Start | SubmitState::CheckActive | SubmitState::WriteJob => Err(
+                SubmitJobError::UnexpectedEvent("a result before the first call".to_string()),
+            ),
+        }
     }
 }
 
@@ -411,6 +656,8 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use crate::jobs::store::state::read_job_record;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{JOB_INDEX_KEYSPACE, JOB_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
     use aruna_core::structs::execution::job::{
         ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportRoCrateSource,
@@ -454,7 +701,38 @@ mod tests {
         SubmitJobOperation::new(spec, job_id)
     }
 
+    // A plain job writes its rows without a transaction, then kicks the drain after them.
     #[test]
+    fn plain_job_writes() {
+        let mut operation = operation(spec(None));
+        assert_eq!(operation.transaction(), TransactionMode::None);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("the write ends the submit");
+        };
+        assert!(output.created);
+        assert_eq!(
+            calls,
+            vec![IoCall::Effect(Box::new(schedule_drain_effect()))]
+        );
+    }
+
+    // A deduplicated job reads its dedup row first, in a write transaction that reruns on conflict.
+    #[test]
+    fn dedup_reads_first() {
+        let mut operation = operation(spec(Some(b"key".to_vec())));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert!(
+            matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 1)
+        );
+        assert_eq!(operation.on_conflict(9), AfterConflict::Rerun);
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(SubmitJobError::UnexpectedEvent(_))
+        ));
     }
 
     fn spec(dedup_key: Option<Vec<u8>>) -> SubmitJobSpec {
