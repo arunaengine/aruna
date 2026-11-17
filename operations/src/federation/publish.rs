@@ -157,7 +157,7 @@ pub enum PublishError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -232,7 +232,7 @@ impl PublishOperation {
         })])
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(PublishError::UnexpectedEvent {
             state,
@@ -267,7 +267,7 @@ impl Operation for PublishOperation {
                     let [(_, config), (_, stored)] = values.as_slice() else {
                         return self.unexpected_event(
                             "realm config and publication state",
-                            format!("{values:?}"),
+                            "a batch read of another size",
                         );
                     };
                     match self.on_read(config.as_deref(), stored.as_deref()) {
@@ -276,7 +276,7 @@ impl Operation for PublishOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
+                other => self.unexpected_event("storage batch read result", other.label()),
             },
             PublishState::Write => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
@@ -284,7 +284,7 @@ impl Operation for PublishOperation {
                     smallvec![]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                other => self.unexpected_event("storage write result", other.label()),
             },
             PublishState::Init | PublishState::Finish | PublishState::Error => smallvec![],
         }
@@ -346,7 +346,7 @@ impl PublishSoonOperation {
     }
 
     fn decide(&mut self, event: Event) -> Result<Effects, PublishError> {
-        let (state, got) = (self.label(), event_kind(&event));
+        let (state, got) = (self.label(), event.label());
         let expected = match self.state {
             SoonState::ReadConfig => "storage read result",
             _ => "task timer result",
@@ -354,7 +354,7 @@ impl PublishSoonOperation {
         let unexpected = move || PublishError::UnexpectedEvent {
             state: state.to_string(),
             expected,
-            got: got.to_string(),
+            got,
         };
         match self.state {
             SoonState::ReadConfig => match event {
@@ -384,15 +384,6 @@ impl PublishSoonOperation {
             },
             SoonState::Idle | SoonState::Done(_) => Err(unexpected()),
         }
-    }
-}
-
-/// The kind of an event, for an error message without formatting its payload.
-fn event_kind(event: &Event) -> &'static str {
-    match event {
-        Event::Storage(_) => "storage event",
-        Event::Task(_) => "task event",
-        _ => "other event",
     }
 }
 

@@ -70,11 +70,11 @@ pub enum RebuildStatsError {
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
     CounterError(#[from] UsageCounterError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected}] - received [{received}]")]
     InvalidStateEvent {
         state: RebuildStatsState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("RebuildUsageStats failed")]
     RebuildFailed,
@@ -240,7 +240,7 @@ impl RebuildStatsOperation {
         self.fail(RebuildStatsError::InvalidStateEvent {
             state: self.state.clone(),
             expected,
-            received,
+            received: received.label(),
         })
     }
 

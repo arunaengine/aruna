@@ -359,7 +359,7 @@ async fn iter_page(
             Ok((values, next))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("{key_space} iteration failed: {other:?}")),
+        other => Err(format!("{key_space} iteration failed: {}", other.label())),
     }
 }
 
@@ -378,7 +378,7 @@ async fn read_subject_record(storage: &StorageHandle) -> Result<Option<NodeSubje
             })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node subject read failed: {other:?}")),
+        other => Err(format!("node subject read failed: {}", other.label())),
     }
 }
 
@@ -416,7 +416,7 @@ async fn membership_generation(ctx: &DriverContext, realm_id: RealmId) -> Result
             .map(|change| change.current.generation)
             .unwrap_or_default()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("realm config revision read failed: {other:?}")),
+        other => Err(format!("realm config revision read failed: {}", other.label())),
     }
 }
 
@@ -649,7 +649,7 @@ async fn operator_drain(ctx: &DriverContext) -> Result<bool, String> {
     {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain read failed: {other:?}")),
+        other => Err(format!("operator drain read failed: {}", other.label())),
     }
 }
 
@@ -672,7 +672,7 @@ async fn write_operator_drain(ctx: &DriverContext, draining: bool) -> Result<(),
         Event::Storage(StorageEvent::WriteResult { .. })
         | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("operator drain write failed: {other:?}")),
+        other => Err(format!("operator drain write failed: {}", other.label())),
     }
 }
 
@@ -710,7 +710,7 @@ async fn write_departure_report(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("departure report write failed: {other:?}")),
+        other => Err(format!("departure report write failed: {}", other.label())),
     }
 }
 
@@ -895,7 +895,7 @@ pub(crate) async fn write_info_document(
     {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info write failed: {other:?}")),
+        other => Err(format!("node info write failed: {}", other.label())),
     }
 }
 
@@ -918,7 +918,7 @@ async fn node_info_row(
             })
             .transpose(),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("node info read failed: {other:?}")),
+        other => Err(format!("node info read failed: {}", other.label())),
     }
 }
 

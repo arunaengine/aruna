@@ -76,7 +76,7 @@ pub(crate) async fn read_local_global(
             global_sum::<LoadCountersError>(values).map_err(|error| error.to_string())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected global read event: {other:?}")),
+        other => Err(format!("unexpected global read event: {}", other.label())),
     }
 }
 
@@ -100,7 +100,7 @@ async fn read_local_group(
             Ok(UsageCounters::default())
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected group read event: {other:?}")),
+        other => Err(format!("unexpected group read event: {}", other.label())),
     }
 }
 
@@ -184,7 +184,7 @@ async fn publish_retaining_markers(
         .await
     {
         Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => return Err(format!("unexpected transaction answer {other:?}")),
+        other => return Err(format!("unexpected transaction answer {}", other.label())),
     };
     let group_list: Vec<GroupId> = groups.into_iter().collect();
     let read = async {
@@ -318,7 +318,7 @@ async fn signal_snapshot_retry(
             Ok(())
         }
         other => {
-            warn!(event = ?other, "Unexpected usage snapshot retry schedule result");
+            warn!(event = other.label(), "Unexpected usage snapshot retry schedule result");
             Ok(())
         }
     }
@@ -371,7 +371,7 @@ async fn write_retry_markers(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("retry marker write failed: {other:?}")),
+        other => Err(format!("retry marker write failed: {}", other.label())),
     }
 }
 
@@ -393,7 +393,7 @@ async fn write_snapshot_documents(
     {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("snapshot write failed: {other:?}")),
+        other => Err(format!("snapshot write failed: {}", other.label())),
     }
 }
 
@@ -431,7 +431,7 @@ pub(crate) async fn clear_consumed_markers(
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(format!("marker re-read failed: {other:?}"));
+            return Err(format!("marker re-read failed: {}", other.label()));
         }
     };
 
@@ -461,7 +461,7 @@ pub(crate) async fn clear_consumed_markers(
             storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
                 .await;
-            return Err(format!("marker delete failed: {other:?}"));
+            return Err(format!("marker delete failed: {}", other.label()));
         }
     }
 
@@ -475,7 +475,7 @@ pub(crate) async fn clear_consumed_markers(
         Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
         }) => Ok(()),
-        other => Err(format!("marker cleanup commit failed: {other:?}")),
+        other => Err(format!("marker cleanup commit failed: {}", other.label())),
     }
 }
 
@@ -498,7 +498,7 @@ pub(crate) async fn mark_dirty(
     match ctx.storage_handle.send_storage_effect(write).await {
         Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("dirty marker write failed: {other:?}")),
+        other => return Err(format!("dirty marker write failed: {}", other.label())),
     }
     wake_publish(ctx).await;
     Ok(())
@@ -522,7 +522,7 @@ pub(crate) async fn restore_usage_timer(storage: &StorageHandle, task_handle: &T
             return;
         }
         other => {
-            warn!(event = ?other, "Unexpected event while scanning node usage dirty markers");
+            warn!(event = other.label(), "Unexpected event while scanning node usage dirty markers");
             return;
         }
     };

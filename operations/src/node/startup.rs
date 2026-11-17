@@ -1629,7 +1629,7 @@ async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> R
             RealmConfigLoad::StorageFailure
         }
         other => {
-            warn!(%realm_id, event = ?other, "Unexpected realm config read result for recovery");
+            warn!(%realm_id, event = other.label(), "Unexpected realm config read result for recovery");
             RealmConfigLoad::StorageFailure
         }
     }

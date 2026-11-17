@@ -31,8 +31,8 @@ use crate::distribution::inventory::{InventoryChange, InventoryError, InventoryU
 
 #[derive(Debug, Error, PartialEq)]
 pub enum UsageUpdateError {
-    #[error("usage counter update received unexpected event: {0:?}")]
-    UnexpectedEvent(Event),
+    #[error("usage counter update received unexpected event: {0}")]
+    UnexpectedEvent(&'static str),
     #[error(transparent)]
     Inventory(#[from] InventoryError),
 }
@@ -366,7 +366,7 @@ impl UsageCounterUpdate {
             }
             (UsageUpdatePhase::Inventory, event) => {
                 let Some(inventory) = self.inventory.as_mut() else {
-                    return Err(UsageUpdateError::UnexpectedEvent(event));
+                    return Err(UsageUpdateError::UnexpectedEvent(event.label()));
                 };
                 match inventory.step(event, txn_id)? {
                     Some(effects) => Ok(Some(effects)),
@@ -376,7 +376,7 @@ impl UsageCounterUpdate {
                     }
                 }
             }
-            (_, received) => Err(UsageUpdateError::UnexpectedEvent(received)),
+            (_, received) => Err(UsageUpdateError::UnexpectedEvent(received.label())),
         }
     }
 
@@ -414,8 +414,8 @@ enum QuotaGatePhase {
 pub enum QuotaGateError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("quota gate received unexpected event: {0:?}")]
-    UnexpectedEvent(Event),
+    #[error("quota gate received unexpected event: {0}")]
+    UnexpectedEvent(&'static str),
 }
 
 /// Read side of the per-group quota gate: sums realm-wide `logical_bytes` in the caller's write
@@ -630,7 +630,7 @@ impl QuotaGate {
                 self.phase = QuotaGatePhase::Done;
                 Ok(None)
             }
-            (_, received) => Err(QuotaGateError::UnexpectedEvent(received)),
+            (_, received) => Err(QuotaGateError::UnexpectedEvent(received.label())),
         }
     }
 
@@ -758,12 +758,12 @@ pub enum LoadCountersError {
     #[error(transparent)]
     CounterError(#[from] UsageCounterError),
     #[error(
-        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received:?}"
+        "usage counter read received unexpected event in state {state:?}: expected {expected}, got {received}"
     )]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("usage counter read did not finish")]
     NotFinished,
@@ -799,7 +799,7 @@ impl LoadCountersOperation {
         self.finish(Err(LoadCountersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
-            received,
+            received: received.label(),
         }))
     }
 
