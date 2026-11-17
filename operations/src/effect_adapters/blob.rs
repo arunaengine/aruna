@@ -21,12 +21,7 @@ pub(super) async fn dispatch_staging_source(
     effect: StagingSourceEffect,
     context: &DriverContext,
 ) -> Event {
-    if crate::staging::native_source::is_native_effect(&effect) {
-        Box::pin(crate::staging::native_source::send_native_effect(
-            effect, context,
-        ))
-        .await
-    } else if let Some(blob_handle) = &context.blob_handle {
+    if let Some(blob_handle) = &context.blob_handle {
         Box::pin(blob_handle.send_staging_effect(effect)).await
     } else {
         Event::StagingSource(StagingSourceEvent::Error {

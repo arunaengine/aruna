@@ -67,7 +67,8 @@ use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use crate::staging::native_source::{body_stream, granted_read};
+use crate::staging::native_source::granted_read;
+use aruna_blob::native::body_stream;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;

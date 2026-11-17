@@ -24,8 +24,9 @@ use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION, SourceReadError, 
 use crate::jobs::workflow::input_view::ViewStream;
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use crate::staging::native_source::{body_stream, delegated_read};
+use crate::staging::native_source::delegated_read;
 use crate::staging::reference::{ReferenceWrite, write_reference_version};
+use aruna_blob::native::body_stream;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum LinkError {

@@ -20,6 +20,7 @@ pub mod hash;
 pub mod invenio;
 pub mod local_fs;
 mod messages;
+pub mod native;
 pub mod opendal;
 pub mod pace;
 mod part_chain;

@@ -10,7 +10,7 @@ use crate::blob::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::blob::records::blob_location_read;
-use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, NATIVE_SET_ID};
+use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
 use crate::driver::{DriverContext, drive};
 use crate::groups::backends::{RecordReadError, parse_read};
@@ -35,6 +35,7 @@ use aruna_core::keyspaces::{
     OBJECT_METADATA_KEYSPACE, PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
     SYNC_REFERENCE_KEYSPACE,
 };
+use aruna_core::native_reference::NATIVE_RELATIONSHIP_ID;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::checksum::unmatched_checksum;
 use aruna_core::structs::execution::source_access::{

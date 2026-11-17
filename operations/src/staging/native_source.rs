@@ -2,17 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::str::FromStr;
-use std::time::Duration;
-
+use aruna_blob::native::{NATIVE_IO_TIMEOUT, read_frame, send_request, write_frame};
 use aruna_core::NodeId;
-use aruna_core::alpn::Alpn;
-use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::StagingSourceError;
-use aruna_core::events::{Event, StagingSourceEvent};
+use aruna_core::native_reference::{
+    NativeAuthority, NativeRange, NativeReferenceReject, NativeReferenceRequest,
+    NativeReferenceResponse,
+};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
-use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::distribution::delegation::SignedDelegation;
@@ -22,19 +20,15 @@ use aruna_core::structs::storage::read_grant::{
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::{SyncRelationship, SyncState};
 use aruna_net::NetHandle;
-use aruna_net::streams::{BiStream, RecvStream, SendStream};
+use aruna_net::streams::{BiStream, SendStream};
 use futures_util::StreamExt;
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
-use tokio_util::io::ReaderStream;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
-use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use crate::distribution::delegate::{prune_nonces, spend_nonce};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
@@ -52,184 +46,10 @@ use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 
-const NATIVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_HEADER_SIZE: usize = 64 * 1024;
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct NativeReferenceRequest {
-    authority: NativeAuthority,
-    bucket: String,
-    key: String,
-    version_id: Ulid,
-    head: bool,
-    range: Option<NativeRange>,
-}
-
-/// On whose behalf a native read runs: a sync relationship's creator, or a caller a read grant
-/// of this node names, presented by the reading node in one signed request.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum NativeAuthority {
-    Relationship(Ulid),
-    Granted(Box<SignedRequest>),
-    /// A caller the reading node verified itself, for one request bound by a D33 delegation.
-    Delegated(Box<SignedDelegation>),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct NativeRange {
-    start: u64,
-    end: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum NativeReferenceResponse {
-    Content(SourceMetadata),
-    Rejected(NativeReferenceReject),
-    /// A caller read's answer, with the group of the bucket that holds the version.
-    Described {
-        metadata: SourceMetadata,
-        group_id: aruna_core::types::GroupId,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum NativeReferenceReject {
-    AccessDenied,
-    NotFound,
-    Unavailable(String),
-}
-
 struct PreparedReference {
     metadata: SourceMetadata,
     group_id: Option<aruna_core::types::GroupId>,
     body: Option<BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>>>,
-}
-
-pub(crate) fn is_native_effect(effect: &StagingSourceEffect) -> bool {
-    let access = match effect {
-        StagingSourceEffect::Check { access }
-        | StagingSourceEffect::Head { access }
-        | StagingSourceEffect::List { access, .. }
-        | StagingSourceEffect::Read { access, .. } => access,
-        StagingSourceEffect::Health { .. } => return false,
-    };
-    matches!(
-        access,
-        ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::ArunaNative,
-            ..
-        }
-    )
-}
-
-pub(crate) async fn send_native_effect(
-    effect: StagingSourceEffect,
-    context: &DriverContext,
-) -> Event {
-    let result = match effect {
-        StagingSourceEffect::Head { access } => native_head(context, access).await,
-        StagingSourceEffect::Read { access, range, .. } => {
-            native_read(context, access, range).await
-        }
-        StagingSourceEffect::Check { .. }
-        | StagingSourceEffect::List { .. }
-        | StagingSourceEffect::Health { .. } => Err(StagingSourceError::UnsupportedKind(
-            SourceConnectorKind::ArunaNative.to_string(),
-        )),
-    };
-    match result {
-        Ok(event) => Event::StagingSource(event),
-        Err(error) => Event::StagingSource(StagingSourceEvent::Error { error }),
-    }
-}
-
-async fn native_head(
-    context: &DriverContext,
-    access: ResolvedSourceAccess,
-) -> Result<StagingSourceEvent, StagingSourceError> {
-    let (origin, request) = native_request(&access, None, true)?;
-    let (response, mut stream) = send_request(context, origin, request).await?;
-    close_stream(&mut stream);
-    match response {
-        NativeReferenceResponse::Content(metadata)
-        | NativeReferenceResponse::Described { metadata, .. } => {
-            Ok(StagingSourceEvent::HeadResult { metadata })
-        }
-        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
-    }
-}
-
-async fn native_read(
-    context: &DriverContext,
-    access: ResolvedSourceAccess,
-    range: Option<std::ops::Range<u64>>,
-) -> Result<StagingSourceEvent, StagingSourceError> {
-    let (origin, request) = native_request(&access, range, false)?;
-    let (response, stream) = send_request(context, origin, request).await?;
-    match response {
-        NativeReferenceResponse::Content(metadata)
-        | NativeReferenceResponse::Described { metadata, .. } => {
-            let reader = ReaderStream::new(stream.into_recv());
-            Ok(StagingSourceEvent::ReadResult {
-                metadata,
-                stream: BackendStream::new(reader),
-            })
-        }
-        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
-    }
-}
-
-fn native_request(
-    access: &ResolvedSourceAccess,
-    range: Option<std::ops::Range<u64>>,
-    head: bool,
-) -> Result<(NodeId, NativeReferenceRequest), StagingSourceError> {
-    let ResolvedSourceAccess::OpenDal {
-        kind: SourceConnectorKind::ArunaNative,
-        config,
-        path,
-        version: Some(version),
-    } = access
-    else {
-        return Err(StagingSourceError::UnsupportedKind(
-            "invalid ArunaNative access".to_string(),
-        ));
-    };
-    let origin_node_id = config
-        .get(ORIGIN_NODE_ID)
-        .and_then(|value| NodeId::from_str(value).ok())
-        .ok_or_else(|| StagingSourceError::ReadError("missing origin node".to_string()))?;
-    let relationship_id = config
-        .get(NATIVE_RELATIONSHIP_ID)
-        .and_then(|value| Ulid::from_string(value).ok())
-        .ok_or_else(|| StagingSourceError::ReadError("missing relationship id".to_string()))?;
-    let version_id = Ulid::from_string(version)
-        .map_err(|_| StagingSourceError::ReadError("invalid source version".to_string()))?;
-    let (bucket, key) = path
-        .split_once('/')
-        .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
-        .ok_or_else(|| StagingSourceError::ReadError("invalid source path".to_string()))?;
-    let range = range
-        .map(|range| {
-            (range.start < range.end)
-                .then_some(NativeRange {
-                    start: range.start,
-                    end: range.end,
-                })
-                .ok_or_else(|| StagingSourceError::ReadError("invalid source range".to_string()))
-        })
-        .transpose()?;
-    Ok((
-        origin_node_id,
-        NativeReferenceRequest {
-            authority: NativeAuthority::Relationship(relationship_id),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id,
-            head,
-            range,
-        },
-    ))
 }
 
 /// Seconds a granted request this node signs stays valid.
@@ -251,16 +71,7 @@ pub(crate) async fn granted_read(
     let GrantScope::Version(arn) = &grant.grant.scope else {
         return Err(StagingSourceError::AccessDenied);
     };
-    let range = range
-        .map(|range| {
-            (range.start < range.end)
-                .then_some(NativeRange {
-                    start: range.start,
-                    end: range.end,
-                })
-                .ok_or_else(|| StagingSourceError::ReadError("invalid source range".to_string()))
-        })
-        .transpose()?;
+    let range = NativeRange::checked(range)?;
     let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
     let scope = &grant.grant.scope;
     let digest = read_grant::request_digest(
@@ -295,11 +106,11 @@ pub(crate) async fn granted_read(
         head,
         range,
     };
-    let (response, stream) = send_request(context, holder, request).await?;
+    let (response, stream) = send_request(net, holder, request).await?;
     match response {
         NativeReferenceResponse::Content(metadata)
         | NativeReferenceResponse::Described { metadata, .. } => Ok((metadata, stream)),
-        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
+        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
     }
 }
 
@@ -312,16 +123,7 @@ pub(crate) async fn delegated_read(
     range: Option<std::ops::Range<u64>>,
     head: bool,
 ) -> Result<(SourceMetadata, Option<aruna_core::types::GroupId>, BiStream), StagingSourceError> {
-    let range = range
-        .map(|range| {
-            (range.start < range.end)
-                .then_some(NativeRange {
-                    start: range.start,
-                    end: range.end,
-                })
-                .ok_or_else(|| StagingSourceError::ReadError("invalid source range".to_string()))
-        })
-        .transpose()?;
+    let range = NativeRange::checked(range)?;
     let operation = if head { HEAD_OPERATION } else { READ_OPERATION };
     let scope = GrantScope::Version(arn.clone());
     let digest = read_grant::request_digest(
@@ -349,59 +151,17 @@ pub(crate) async fn delegated_read(
         head,
         range,
     };
-    let (response, stream) = send_request(context, arn.node_id, request).await?;
+    let net = context
+        .net_handle
+        .as_ref()
+        .ok_or(StagingSourceError::HandleMissing)?;
+    let (response, stream) = send_request(net, arn.node_id, request).await?;
     match response {
         NativeReferenceResponse::Content(metadata) => Ok((metadata, None, stream)),
         NativeReferenceResponse::Described { metadata, group_id } => {
             Ok((metadata, Some(group_id), stream))
         }
-        NativeReferenceResponse::Rejected(reject) => Err(map_reject(reject)),
-    }
-}
-
-/// The body of a granted read as a byte stream.
-pub(crate) fn body_stream(
-    stream: BiStream,
-) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
-    BackendStream::new(ReaderStream::new(stream.into_recv()))
-}
-
-async fn send_request(
-    context: &DriverContext,
-    origin: NodeId,
-    request: NativeReferenceRequest,
-) -> Result<(NativeReferenceResponse, BiStream), StagingSourceError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(StagingSourceError::HandleMissing)?;
-    let mut stream = net_handle
-        .open_stream(origin, Alpn::NativeReference)
-        .await
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    timeout(NATIVE_IO_TIMEOUT, write_frame(&mut stream.0, &request))
-        .await
-        .map_err(|_| StagingSourceError::ReadError("native request timed out".to_string()))?
-        .map_err(StagingSourceError::ReadError)?;
-    stream
-        .0
-        .finish()
-        .map_err(|error| StagingSourceError::ReadError(error.to_string()))?;
-    let response = timeout(
-        NATIVE_IO_TIMEOUT,
-        read_frame::<NativeReferenceResponse>(&mut stream.1),
-    )
-    .await
-    .map_err(|_| StagingSourceError::ReadError("native response timed out".to_string()))?
-    .map_err(StagingSourceError::ReadError)?;
-    Ok((response, stream))
-}
-
-fn map_reject(reject: NativeReferenceReject) -> StagingSourceError {
-    match reject {
-        NativeReferenceReject::AccessDenied => StagingSourceError::AccessDenied,
-        NativeReferenceReject::NotFound => StagingSourceError::NotFound,
-        NativeReferenceReject::Unavailable(message) => StagingSourceError::ReadError(message),
+        NativeReferenceResponse::Rejected(reject) => Err(reject.into()),
     }
 }
 
@@ -897,40 +657,6 @@ async fn mark_access_denied(context: &DriverContext, mut relationship: SyncRelat
     }
 }
 
-async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(), String> {
-    let bytes = postcard::to_allocvec(value).map_err(|error| error.to_string())?;
-    if bytes.len() > MAX_HEADER_SIZE {
-        return Err("native reference header is too large".to_string());
-    }
-    send.write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
-    send.write_all(&bytes)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, String> {
-    let mut length = [0u8; 4];
-    recv.read_exact(&mut length)
-        .await
-        .map_err(|error| error.to_string())?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length > MAX_HEADER_SIZE {
-        return Err("native reference header is too large".to_string());
-    }
-    let mut bytes = vec![0u8; length];
-    recv.read_exact(&mut bytes)
-        .await
-        .map_err(|error| error.to_string())?;
-    postcard::from_bytes(&bytes).map_err(|error| error.to_string())
-}
-
-fn close_stream(stream: &mut BiStream) {
-    stream.0.finish().ok();
-    stream.1.stop(0u32.into()).ok();
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -956,40 +682,6 @@ mod tests {
                 NativeReferenceReject::Unavailable(_)
             ));
         }
-    }
-
-    #[test]
-    fn request_roundtrips() {
-        let request = NativeReferenceRequest {
-            authority: NativeAuthority::Relationship(Ulid::from_bytes([1u8; 16])),
-            bucket: "source".to_string(),
-            key: "nested/data.txt".to_string(),
-            version_id: Ulid::from_bytes([2u8; 16]),
-            head: false,
-            range: Some(NativeRange { start: 3, end: 9 }),
-        };
-        let bytes = postcard::to_allocvec(&request).unwrap();
-        assert_eq!(
-            postcard::from_bytes::<NativeReferenceRequest>(&bytes).unwrap(),
-            request
-        );
-    }
-
-    #[test]
-    fn response_roundtrips() {
-        let response = NativeReferenceResponse::Content(SourceMetadata {
-            content_length: 42,
-            content_type: Some("text/plain".to_string()),
-            etag: Some("etag".to_string()),
-            last_modified: Some(std::time::SystemTime::UNIX_EPOCH),
-            source_version: None,
-            digests: Default::default(),
-        });
-        let bytes = postcard::to_allocvec(&response).unwrap();
-        assert_eq!(
-            postcard::from_bytes::<NativeReferenceResponse>(&bytes).unwrap(),
-            response
-        );
     }
 
     #[tokio::test]

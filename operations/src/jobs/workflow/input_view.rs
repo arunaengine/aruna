@@ -29,7 +29,8 @@ use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation, ObjectRangeRequest};
 use crate::s3::object::visible::SCAN_BUDGET;
-use crate::staging::native_source::{body_stream, granted_read};
+use crate::staging::native_source::granted_read;
+use aruna_blob::native::body_stream;
 
 /// Keys one listing page returns at most, as S3 does.
 pub const MAX_VIEW_KEYS: usize = 1000;

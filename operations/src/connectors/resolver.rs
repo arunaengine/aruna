@@ -30,12 +30,11 @@ use crate::connectors::repository::{
 };
 use crate::harvest::create_connector::INVENIO_TOKEN;
 use crate::staging::root_record::{parse_root, read_root};
+use aruna_core::native_reference::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 
-pub(crate) const NATIVE_RELATIONSHIP_ID: &str = "relationship_id";
 /// Names the distributed bucket whose holders keep the bytes of a record-only version.
 pub(crate) const NATIVE_SET_ID: &str = "set_id";
-pub(crate) const ORIGIN_NODE_ID: &str = "origin_node_id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveConnectorInput {
