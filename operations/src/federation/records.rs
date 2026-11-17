@@ -8,7 +8,7 @@ use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     DEDUP_INDEX_KEYSPACE, FEDERATION_KEYSPACE, JOB_KEYSPACE, ROCRATE_UPLOAD_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{decode, done, encode, encoded_row, read_row, values};
 use aruna_core::structs::execution::job::{
     JobRecord, RoCrateUploadRecord, job_record_key, parse_dedup_value,
@@ -247,7 +247,10 @@ impl Operation for RecordOperation {
     type Error = RecordError;
 
     fn first(&mut self) -> Turn {
-        let key = (FEDERATION_KEYSPACE.to_string(), self.change.key().to_vec().into());
+        let key = (
+            FEDERATION_KEYSPACE.to_string(),
+            self.change.key().to_vec().into(),
+        );
         // A stale upload is read in this transaction, so a racing claim conflicts.
         let reads = match self.stale() {
             Some(stale) => vec![
@@ -285,8 +288,8 @@ impl Operation for RecordOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     /// Six attempts in all, as the change's own retry had.
@@ -519,7 +522,10 @@ mod tests {
             let mut operation = RecordOperation::new(binding(stale(old)));
             operation.first().unwrap();
             let read = read_row(JOB_KEYSPACE, job_record_key(JobId::from_bytes([7; 16])));
-            assert_eq!(operation.next(checked(old, None, true)), Ok(Next::Call(read)));
+            assert_eq!(
+                operation.next(checked(old, None, true)),
+                Ok(Next::Call(read))
+            );
             let turn = operation.next(stored(vec![row]));
             assert_eq!(wrote(&turn).is_none(), kept);
         }

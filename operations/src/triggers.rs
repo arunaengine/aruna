@@ -9,7 +9,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::calls::{IoError, IoResult, Next};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
@@ -85,6 +85,9 @@ fn timer_turn<O: TimerRun>(
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
         Ok(Next::Done(output)) => O::rearm(Ok(output)).map(Next::Done),
+        Ok(Next::Then { output, calls }) => {
+            O::rearm(Ok(output)).map(|output| Next::Then { output, calls })
+        }
         Err(error) => O::rearm(Err(error)).map(Next::Done),
     }
 }
@@ -115,7 +118,7 @@ impl Operation for TimerOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
+    fn transaction(&self) -> TransactionMode {
         match self {
             TimerOperation::DrainNotificationOutbox(operation) => operation.transaction(),
             TimerOperation::PruneNotifications(operation) => operation.transaction(),
@@ -243,6 +246,9 @@ fn peer_turn<O: PeerRun>(
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
         Ok(Next::Done(output)) => O::answer(Ok(output)).map(Next::Done),
+        Ok(Next::Then { output, calls }) => {
+            O::answer(Ok(output)).map(|output| Next::Then { output, calls })
+        }
         Err(error) => O::answer(Err(error)).map(Next::Done),
     }
 }
@@ -273,7 +279,7 @@ impl Operation for PeerOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
+    fn transaction(&self) -> TransactionMode {
         match self {
             PeerOperation::DeliverNotifications(operation) => operation.transaction(),
             PeerOperation::RemoveWatch(operation) => operation.transaction(),
@@ -315,7 +321,10 @@ mod tests {
             operation.first(),
             timer_turn::<PruneNotificationsOperation>(inner.first())
         );
-        assert!(!operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::None
+        );
         let drain = timer_operation(&TaskKey::DrainNotificationOutbox, &INPUT);
         assert_eq!(
             drain.unwrap().first(),

@@ -11,7 +11,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, MAX_HEARTBEAT_AGE};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{EffectOperation, HoldScope, Runnable};
+use aruna_core::operation::{AfterConflict, EffectOperation, HoldScope, Runnable};
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::structs::{BlobState, NetState, RequestSummaryState, Status};
@@ -1331,9 +1331,9 @@ async fn drive_machine<O: EffectOperation>(
     result
 }
 
-/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it waits a backoff
-/// seeded by `seed` and reruns, at most `conflict_retries` times. The same seed gives the same
-/// waits; distinct seeds spread conflicting writers out.
+/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it builds the next
+/// attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`, finish or fail.
+/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
 pub async fn drive_retry<O, K>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
@@ -1350,15 +1350,22 @@ async fn retry_machine<O: EffectOperation>(
     context: &DriverContext,
     seed: &[u8],
 ) -> Result<O::Output, O::Error> {
-    let mut attempt = 0;
+    let mut operation = build();
+    let mut attempt: u32 = 0;
     loop {
-        match drive_machine(build(), context).await {
-            Err(error) if O::is_conflict(&error) && attempt < O::conflict_retries() => {
-                let wait = conflict_backoff(usize::try_from(attempt).unwrap_or(usize::MAX), seed);
-                tokio::time::sleep(wait).await;
-                attempt += 1;
-            }
+        let error = match drive_machine(operation, context).await {
+            Err(error) if O::is_conflict(&error) => error,
             result => return result,
+        };
+        attempt = attempt.saturating_add(1);
+        operation = build();
+        match operation.on_conflict(attempt) {
+            AfterConflict::Rerun => {
+                let index = usize::try_from(attempt - 1).unwrap_or(usize::MAX);
+                tokio::time::sleep(conflict_backoff(index, seed)).await;
+            }
+            AfterConflict::Finish(output) => return Ok(output),
+            AfterConflict::Fail => return Err(error),
         }
     }
 }
@@ -1371,6 +1378,7 @@ mod test {
         TransactionTracker, dispatch_bounded, drive, drive_retry, drive_until, extend_unblocked,
         run_all, run_window,
     };
+    use aruna_core::calls::{IoError, IoResult, Next};
     use aruna_core::effects::{
         BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
     };
@@ -1379,7 +1387,9 @@ mod test {
         BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
         SubOperationEvent,
     };
-    use aruna_core::operation::{EffectOperation, HoldScope, boxed_suboperation};
+    use aruna_core::operation::{
+        AfterConflict, EffectOperation, HoldScope, Operation, boxed_suboperation,
+    };
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
@@ -3321,16 +3331,65 @@ mod test {
     async fn retry_reruns_conflict() {
         let context = bare_context();
         let conflict = Err(StorageError::TransactionConflict);
+        // The hook of the attempt after the last run is asked too, so one more is built.
         assert_eq!(retried::<3>(&context, 2).await, (Ok(2), 3));
         assert_eq!(
             retried::<3>(&context, usize::MAX).await,
-            (conflict.clone(), 4)
+            (conflict.clone(), 5)
         );
         assert_eq!(
             retried::<5>(&context, usize::MAX).await,
-            (conflict.clone(), 6)
+            (conflict.clone(), 7)
         );
-        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 1));
+        assert_eq!(retried::<0>(&context, usize::MAX).await, (conflict, 2));
+    }
+
+    /// Loses a conflict until its hook sets `recheck`; finishes on the attempt `finish_at`.
+    #[derive(Debug, PartialEq)]
+    struct Rechecking {
+        recheck: bool,
+        finish_at: Option<u32>,
+    }
+
+    impl Operation for Rechecking {
+        type Output = &'static str;
+        type Error = IoError;
+
+        fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+            match self.recheck {
+                true => Ok(Next::Done("rechecked")),
+                false => Err(IoError::Conflict),
+            }
+        }
+
+        fn next(&mut self, _: IoResult) -> Result<Next<Self::Output>, IoError> {
+            Err(IoError::Conflict)
+        }
+
+        fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
+            if self.finish_at == Some(attempt) {
+                return AfterConflict::Finish("finished");
+            }
+            self.recheck = attempt >= 2;
+            AfterConflict::Rerun
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn conflict_hook_decides() {
+        let context = bare_context();
+        for (finish_at, expected) in [(None, ("rechecked", 3)), (Some(1), ("finished", 2))] {
+            let mut built = 0;
+            let build = || {
+                built += 1;
+                Rechecking {
+                    recheck: false,
+                    finish_at,
+                }
+            };
+            let result = drive_retry(build, &context, &[7u8; 16]).await;
+            assert_eq!((result, built), (Ok(expected.0), expected.1));
+        }
     }
 
     /// Logs its name at start, then spools a stream that ends once `gate` opens, or without a

@@ -10,7 +10,7 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
     InboxWriteOutcome, NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
@@ -465,8 +465,11 @@ impl Operation for UpsertInboxOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        self.outer_txn.is_none()
+    fn transaction(&self) -> TransactionMode {
+        match self.outer_txn.is_none() {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
+        }
     }
 }
 
@@ -842,7 +845,10 @@ mod call_tests {
     fn upsert_success_calls() {
         let record = notice();
         let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
-        assert!(upsert.transaction());
+        assert_eq!(
+            upsert.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let space = NOTIFICATION_INBOX_KEYSPACE.to_string();
         assert_eq!(
             upsert.first(),
@@ -877,7 +883,10 @@ mod call_tests {
     #[test]
     fn within_caller_transaction() {
         let mut upsert = UpsertInboxOperation::within(vec![notice()], TXN);
-        assert!(!upsert.transaction());
+        assert_eq!(
+            upsert.transaction(),
+            aruna_core::operation::TransactionMode::None
+        );
         assert!(matches!(
             upsert.first(),
             Ok(Next::Call(IoCall::Effect(Effect::Storage(

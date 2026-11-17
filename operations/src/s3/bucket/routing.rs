@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::rows::read_row;
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::routing::{
@@ -152,8 +152,8 @@ impl Operation for PutRoutingOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -280,7 +280,10 @@ mod pure_tests {
     fn writes_bucket_rules() {
         let rules = vec![rule(RoutingTarget::Class("cold".to_string()))];
         let mut operation = PutRoutingOperation::new("b".to_string(), group(), rules.clone());
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         assert!(reads_bucket(&loaded(&mut operation, BTreeSet::new())));
 
         let turn = operation.next(read(Some(&bucket())));

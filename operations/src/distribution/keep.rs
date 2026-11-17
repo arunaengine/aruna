@@ -11,7 +11,7 @@ use aruna_core::keyspaces::{
     ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE, CACHE_ORDER_KEYSPACE, DISTRIBUTION_FENCE_KEYSPACE,
     DISTRIBUTION_KEYSPACE, FILL_CLAIM_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{done, read_row, values};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::distribution::DistributionView;
@@ -105,8 +105,8 @@ impl Operation for ClaimFillOperation {
         self.claim_held(value)
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -188,7 +188,10 @@ impl PublishKeptOperation {
     fn unkept(&mut self) -> PublishNext {
         self.output = Some(Published::Unkept);
         self.step = PublishStep::Write;
-        let claim = (FILL_CLAIM_KEYSPACE.to_string(), self.copy.claim_key.clone().into());
+        let claim = (
+            FILL_CLAIM_KEYSPACE.to_string(),
+            self.copy.claim_key.clone().into(),
+        );
         Ok(Next::Call(IoCall::Delete(vec![claim])))
     }
 
@@ -211,7 +214,10 @@ impl PublishKeptOperation {
             return self.unkept();
         }
         // Departure cleanup drops the fence row last; the record no longer names us then.
-        let view = record.as_deref().map(DistributionView::from_bytes).transpose()?;
+        let view = record
+            .as_deref()
+            .map(DistributionView::from_bytes)
+            .transpose()?;
         let member = view.is_some_and(|view| view.snapshot().member(self.copy.member_id).is_some());
         if self.copy.kind == KeptKind::Attachment {
             return match member {
@@ -221,8 +227,14 @@ impl PublishKeptOperation {
         }
         self.step = PublishStep::ReadCache;
         Ok(Next::Call(IoCall::Read(vec![
-            (CACHE_ENTRY_KEYSPACE.to_string(), self.copy.identity.to_vec().into()),
-            (CACHE_ENTRY_KEYSPACE.to_string(), CACHE_TOTALS_KEY.to_vec().into()),
+            (
+                CACHE_ENTRY_KEYSPACE.to_string(),
+                self.copy.identity.to_vec().into(),
+            ),
+            (
+                CACHE_ENTRY_KEYSPACE.to_string(),
+                CACHE_TOTALS_KEY.to_vec().into(),
+            ),
         ])))
     }
 
@@ -230,7 +242,11 @@ impl PublishKeptOperation {
         if existing.is_some() {
             return self.unkept();
         }
-        self.totals = totals.as_deref().map(CacheTotals::from_bytes).transpose()?.unwrap_or_default();
+        self.totals = totals
+            .as_deref()
+            .map(CacheTotals::from_bytes)
+            .transpose()?
+            .unwrap_or_default();
         if self.copy.size > self.copy.capacity {
             return self.unkept();
         }
@@ -281,7 +297,9 @@ impl PublishKeptOperation {
             }
             KeptKind::Cache => self.cache_rows(&mut writes, &mut deletes)?,
         }
-        let evicted = (self.evicted.iter()).map(|entry| entry.location.clone()).collect();
+        let evicted = (self.evicted.iter())
+            .map(|entry| entry.location.clone())
+            .collect();
         self.output = Some(Published::Kept { evicted });
         self.step = PublishStep::Delete(writes);
         Ok(Next::Call(IoCall::Delete(deletes)))
@@ -328,7 +346,6 @@ impl PublishKeptOperation {
         ));
         Ok(())
     }
-
 }
 
 impl Operation for PublishKeptOperation {
@@ -338,7 +355,10 @@ impl Operation for PublishKeptOperation {
     fn first(&mut self) -> PublishNext {
         let set_key = LocalFence::key(self.copy.set_id);
         Ok(Next::Call(IoCall::Read(vec![
-            (DISTRIBUTION_FENCE_KEYSPACE.to_string(), set_key.clone().into()),
+            (
+                DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                set_key.clone().into(),
+            ),
             (DISTRIBUTION_KEYSPACE.to_string(), set_key.into()),
         ])))
     }
@@ -369,8 +389,8 @@ impl Operation for PublishKeptOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

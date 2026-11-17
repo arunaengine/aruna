@@ -8,7 +8,7 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
@@ -200,8 +200,8 @@ impl Operation for SettleOwedOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -272,7 +272,10 @@ mod state_machine_tests {
     #[test]
     fn settle_clears_published() {
         let mut settle = SettleOwedOperation { published: 4 };
-        assert!(settle.transaction());
+        assert_eq!(
+            settle.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let read = Ok(Next::Call(IoCall::Read(vec![owed_row()])));
         assert_eq!(settle.first(), read);
         let delete = Ok(Next::Call(IoCall::Delete(vec![owed_row()])));

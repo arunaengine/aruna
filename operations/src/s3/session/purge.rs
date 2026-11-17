@@ -8,7 +8,7 @@ use super::{
 };
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Key, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,8 +230,8 @@ impl Operation for PurgeSessionsOperation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -255,7 +255,10 @@ mod tests {
             limit: PURGE_BATCH,
         };
         assert_eq!(purge.first(), Ok(Next::Call(scan)));
-        assert!(purge.transaction());
+        assert_eq!(
+            purge.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         // A malformed index row only goes; nothing else is read.
         let malformed = vec![(Key::from(vec![1u8]), Value::from(Vec::new()))];
         assert_eq!(

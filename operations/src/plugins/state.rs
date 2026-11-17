@@ -5,7 +5,7 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_STATE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_runs::{StateEntry, StateRefusal, StateRemoval, StateWrite};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -123,8 +123,8 @@ impl Operation for PutState {
     type Output = u64;
     type Error = PutError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<u64>, PutError> {
@@ -227,8 +227,8 @@ impl Operation for RemoveState {
     type Output = ();
     type Error = PutError;
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn first(&mut self) -> Result<Next<()>, PutError> {

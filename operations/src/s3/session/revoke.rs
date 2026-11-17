@@ -6,7 +6,7 @@ use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::identity::s3_session::S3Session;
 use aruna_core::types::{Key, Value};
 
@@ -128,8 +128,8 @@ impl Operation for RevokeS3Operation {
         }
     }
 
-    fn transaction(&self) -> bool {
-        true
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -161,7 +161,10 @@ mod tests {
         let mut operation = RevokeS3Operation::new(config(&key));
         let read = vec![(S3_SESSION_KEYSPACE.to_string(), key.as_bytes().into())];
         assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
-        assert!(operation.transaction());
+        assert_eq!(
+            operation.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
         let missing = operation.next(IoResult::Values(vec![None]));
         assert_eq!(missing, Err(S3SessionError::NotFound));
     }

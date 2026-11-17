@@ -39,7 +39,10 @@ fn checks_before_reading() {
     let mut skipped = InstallEntryOperation::new(config(Some(4)));
     assert_eq!(skipped.first(), Err(RecordError::Mismatch));
     let mut write = InstallEntryOperation::new(config(None));
-    assert!(write.transaction());
+    assert_eq!(
+        write.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
     assert!(matches!(write.first(), Ok(Next::Call(IoCall::Child(_)))));
     let mut refused = InstallEntryOperation::new(config(None));
     refused.first().unwrap();
