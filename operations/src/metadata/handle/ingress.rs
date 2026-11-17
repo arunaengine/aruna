@@ -40,7 +40,8 @@ use crate::s3::bucket::release::publish::{PublishError, holder_answer};
 use crate::s3::bucket::search::{SearchBucketsInput, search_local_buckets};
 use crate::s3::object::search::SearchObjectsInput;
 use crate::s3::object::search_scan::search_local_objects;
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::sync_relationship::{
     DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
     SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
@@ -130,7 +131,10 @@ impl MetadataHandle {
         }
 
         // A read-only bucket refuses a mirror like a denied write, before any bucket is created.
-        match guard_bucket_write(context.as_ref(), local_bucket).await {
+        match drive(BucketGuardOperation::new(local_bucket), context.as_ref())
+            .await
+            .map_err(OfferedDirectoryError::from)
+        {
             Ok(()) => {}
             Err(OfferedDirectoryError::ReadOnly(_)) => {
                 return MetadataTransportMessage::Reject("access_denied".to_string());

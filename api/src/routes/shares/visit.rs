@@ -31,7 +31,7 @@ use aruna_operations::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
-use aruna_operations::staging::offered_directory::guard_bucket_write;
+use aruna_operations::staging::bucket_guard::BucketGuardOperation;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -882,9 +882,12 @@ pub async fn upload_file(
     crate::s3::util::validate_object_key(&wanted)
         .map_err(|_| ServerError::BadRequestReason("the name is not a valid object key".into()))?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
-    guard_bucket_write(state.get_ctx().as_ref(), &bucket)
-        .await
-        .map_err(|_| ServerError::Forbidden)?;
+    drive(
+        BucketGuardOperation::new(bucket.as_str()),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)?;
     let user = share_access(&state, &link, (&auth, &info), visit_end);
     let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers

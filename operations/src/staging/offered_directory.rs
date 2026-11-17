@@ -7,14 +7,13 @@ use crate::blob::records::{HeadAliasContext, build_transition_effects, write_ver
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use crate::staging::bucket_guard::BucketGuardError;
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StagingSourceError, StorageError};
 use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
-};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::plugin_runs::SourceEvent;
 use aruna_core::plugin_runs::journaled;
 use aruna_core::structs::execution::offered_directory::{
@@ -33,7 +32,6 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::{FolderState, SyncedFolder};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId};
 use std::collections::{BTreeSet, HashMap};
@@ -140,33 +138,14 @@ pub enum OfferedDirectoryError {
     Usage(#[from] UsageUpdateError),
 }
 
-/// Refuses a write addressed to an offered bucket or to the bucket of a folder being unbound.
-/// Called on the write path so the read-only rule lives with the registration, not in a handler.
-pub async fn guard_bucket_write(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<(), OfferedDirectoryError> {
-    if read_offered(context, bucket, None).await?.is_some()
-        || folder_deleting(context, bucket).await?
-    {
-        return Err(OfferedDirectoryError::ReadOnly(bucket.to_string()));
+impl From<BucketGuardError> for OfferedDirectoryError {
+    fn from(error: BucketGuardError) -> Self {
+        match error {
+            BucketGuardError::ReadOnly(bucket) => OfferedDirectoryError::ReadOnly(bucket),
+            BucketGuardError::Storage(error) => OfferedDirectoryError::Storage(error),
+            BucketGuardError::Conversion(error) => OfferedDirectoryError::Conversion(error),
+        }
     }
-    Ok(())
-}
-
-/// Whether `bucket` belongs to a synced folder marked `Deleting`, offered or not.
-async fn folder_deleting(
-    context: &DriverContext,
-    bucket: &str,
-) -> Result<bool, OfferedDirectoryError> {
-    let Some(folder_id) = crate::device::sync::folders::bucket_folder(bucket) else {
-        return Ok(false);
-    };
-    let key = folder_id.to_bytes();
-    let Some(value) = read(context, SYNCED_FOLDER_KEYSPACE, &key, None).await? else {
-        return Ok(false);
-    };
-    Ok(SyncedFolder::from_bytes(&value)?.state == FolderState::Deleting)
 }
 
 /// Registers `root` as a read-only bucket and mints one reference version per
@@ -880,6 +859,7 @@ async fn commit(context: &DriverContext, txn_id: TxnId) -> Result<(), OfferedDir
 mod tests {
     use super::*;
     use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
+    use crate::staging::bucket_guard::BucketGuardOperation;
     use crate::tests::staging::setup_driver_context;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
     use futures_util::StreamExt;
@@ -946,10 +926,17 @@ mod tests {
             .expect("offer must succeed");
 
         assert_eq!(
-            guard_bucket_write(context, "locked").await,
+            drive(BucketGuardOperation::new("locked"), context)
+                .await
+                .map_err(OfferedDirectoryError::from),
             Err(OfferedDirectoryError::ReadOnly("locked".to_string()))
         );
-        assert_eq!(guard_bucket_write(context, "other").await, Ok(()));
+        assert_eq!(
+            drive(BucketGuardOperation::new("other"), context)
+                .await
+                .map_err(OfferedDirectoryError::from),
+            Ok(())
+        );
     }
 
     // A bucket that is not this offer's must keep its ordinary write semantics.
@@ -1112,7 +1099,12 @@ mod tests {
                 .await
                 .is_deleted()
         );
-        assert_eq!(guard_bucket_write(context, "withdrawn").await, Ok(()));
+        assert_eq!(
+            drive(BucketGuardOperation::new("withdrawn"), context)
+                .await
+                .map_err(OfferedDirectoryError::from),
+            Ok(())
+        );
         let usage = group_usage(context, offer.group_id).await;
         assert_eq!((usage.objects, usage.referenced_bytes), (0, 0));
     }

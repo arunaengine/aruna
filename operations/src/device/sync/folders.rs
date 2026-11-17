@@ -39,7 +39,8 @@ use crate::staging::offered_directory::{
 };
 
 use super::repository::{
-    MAX_SYNCED_FOLDERS, SyncUpload, folder_entry, folder_key, key_path, scan_folder, scan_folders,
+    MAX_SYNCED_FOLDERS, SyncUpload, bucket_folder, folder_bucket, folder_entry, folder_key,
+    key_path, scan_folder, scan_folders,
 };
 use super::rows::{
     abort_txn, commit_txn, delete_rows, read_value, scan_page, start_txn, sync_all, write_rows,
@@ -458,18 +459,6 @@ fn map_remote_error(error: ReconcileFolderError, remote: &RemoteBinding) -> Fold
         | ReconcileFolderError::Sweep(_)
         | ReconcileFolderError::Decide(_) => FolderError::Unavailable,
     }
-}
-
-/// The device-local bucket a folder is observed as. The owner never names it:
-/// a derived name cannot collide with a bucket they already use.
-pub fn folder_bucket(folder_id: Ulid) -> String {
-    format!("folder-{}", folder_id.to_string().to_lowercase())
-}
-
-/// The folder whose device-local bucket `bucket` is, if it is one.
-pub(crate) fn bucket_folder(bucket: &str) -> Option<Ulid> {
-    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
-    (folder_bucket(folder_id) == bucket).then_some(folder_id)
 }
 
 /// Whether two roots are the same directory or one contains the other. The
@@ -1289,7 +1278,8 @@ mod tests {
     // is read-only for clients, and the cleanup still deletes it.
     #[tokio::test]
     async fn guards_unoffered_bucket() {
-        use crate::staging::offered_directory::guard_bucket_write;
+        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::staging::offered_directory::OfferedDirectoryError;
 
         let fixture = crate::tests::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
@@ -1304,7 +1294,9 @@ mod tests {
         assert_eq!(withdraw_offer(&context, withdrawal).await, Ok(1));
 
         assert_eq!(
-            guard_bucket_write(&context, &bucket).await,
+            drive(BucketGuardOperation::new(&bucket), &context)
+                .await
+                .map_err(OfferedDirectoryError::from),
             Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
         );
         assert_eq!(
@@ -1312,14 +1304,20 @@ mod tests {
             Ok(())
         );
         assert!(bucket_gone(&context, &bucket).await);
-        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
+        assert_eq!(
+            drive(BucketGuardOperation::new(&bucket), &context)
+                .await
+                .map_err(OfferedDirectoryError::from),
+            Ok(())
+        );
     }
 
     // A cleanup cut short midway, here by an upload being completed, leaves the bucket read-only
     // for clients, so no upload can be opened before the next pass deletes it.
     #[tokio::test]
     async fn guards_interrupted_cleanup() {
-        use crate::staging::offered_directory::guard_bucket_write;
+        use crate::staging::bucket_guard::BucketGuardOperation;
+        use crate::staging::offered_directory::OfferedDirectoryError;
 
         let fixture = crate::tests::staging::setup_driver_context().await;
         let context = Arc::new(fixture.driver_context);
@@ -1336,7 +1334,9 @@ mod tests {
         );
         let bucket = folder.local_bucket.clone();
         assert_eq!(
-            guard_bucket_write(&context, &bucket).await,
+            drive(BucketGuardOperation::new(&bucket), &context)
+                .await
+                .map_err(OfferedDirectoryError::from),
             Err(OfferedDirectoryError::ReadOnly(bucket.clone()))
         );
 
@@ -1348,7 +1348,12 @@ mod tests {
             Ok(())
         );
         assert!(bucket_gone(&context, &bucket).await);
-        assert_eq!(guard_bucket_write(&context, &bucket).await, Ok(()));
+        assert_eq!(
+            drive(BucketGuardOperation::new(&bucket), &context)
+                .await
+                .map_err(OfferedDirectoryError::from),
+            Ok(())
+        );
     }
 
     // A reconcile pass that started before the owner's change keeps it, and a

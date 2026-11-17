@@ -46,7 +46,8 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 
 /// Pulls this node is running, by receipt key. The registry lives as long as the process, so a
 /// restart forgets a running pull and the device asks for it again.
@@ -246,7 +247,10 @@ async fn admit_pull(
 
 /// A pull writes like a client, so a bucket that is read-only for clients refuses it too.
 async fn guard_target(context: &DriverContext, bucket: &str) -> Result<(), SyncRefusal> {
-    match guard_bucket_write(context, bucket).await {
+    match drive(BucketGuardOperation::new(bucket), context)
+        .await
+        .map_err(OfferedDirectoryError::from)
+    {
         Ok(()) => Ok(()),
         Err(OfferedDirectoryError::ReadOnly(_)) => Err(SyncRefusal::Forbidden),
         Err(error) => {
@@ -1145,7 +1149,8 @@ mod tests {
     // being unbound after its offer is gone. The cleanup on this node still deletes the bucket.
     #[tokio::test]
     async fn guards_folder_pull() {
-        use crate::device::sync::folders::{finish_unbind, folder_bucket, store_folder};
+        use crate::device::sync::folders::{finish_unbind, store_folder};
+        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{
             OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
         };

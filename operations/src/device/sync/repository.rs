@@ -175,6 +175,18 @@ pub fn scan_folder(
     })
 }
 
+/// The device-local bucket a folder is observed as. The owner never names it:
+/// a derived name cannot collide with a bucket they already use.
+pub fn folder_bucket(folder_id: Ulid) -> String {
+    format!("folder-{}", folder_id.to_string().to_lowercase())
+}
+
+/// The folder whose device-local bucket `bucket` is, if it is one.
+pub fn bucket_folder(bucket: &str) -> Option<Ulid> {
+    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
+    (folder_bucket(folder_id) == bucket).then_some(folder_id)
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::{base_key, key_path};

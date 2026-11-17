@@ -36,7 +36,8 @@ use crate::replication::protocol::{
     BaoReadRequest, LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
 };
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use crate::staging::bucket_guard::BucketGuardOperation;
+use crate::staging::offered_directory::OfferedDirectoryError;
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };
@@ -643,7 +644,10 @@ async fn manifest_policy(
 ) -> Result<(Option<String>, Option<String>), String> {
     // Denied like a missing policy, so the sender stops and no destination is created. An unbound
     // folder stays `Deleting` until its row is gone, so checking before the create suffices.
-    match guard_bucket_write(context, &manifest.bucket).await {
+    match drive(BucketGuardOperation::new(manifest.bucket.as_str()), context)
+        .await
+        .map_err(OfferedDirectoryError::from)
+    {
         Ok(()) => {}
         Err(OfferedDirectoryError::ReadOnly(_)) => return Ok((None, None)),
         Err(error) => return Err(error.to_string()),
@@ -1710,7 +1714,7 @@ mod tests {
     // A replica into an offered bucket, delete markers included, is denied, so the sender stops.
     #[tokio::test]
     async fn denies_offered_bucket() {
-        use crate::device::sync::folders::folder_bucket;
+        use crate::device::sync::repository::folder_bucket;
         use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
 
         let fixture = crate::tests::staging::setup_driver_context().await;
