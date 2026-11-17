@@ -23,8 +23,8 @@ use aruna_operations::metadata::AuthToken;
 use aruna_operations::replication::drain::relationship_job_stats;
 use aruna_operations::replication::parking::awaiting_jobs;
 use aruna_operations::replication::plaintext::{
-    consent_delete, consent_write, read_consent, relationship_consent, source_encrypted,
-    store_consent,
+    ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
+    consent_write, relationship_consent,
 };
 use aruna_operations::replication::protocol::ReplicationMode;
 use aruna_operations::replication::queue::QueueBlobOperation;
@@ -465,7 +465,7 @@ pub async fn create_sync(
     if plaintext {
         let consent = consent_write(relationship_consent(relationship.id), auth.user_id)
             .map_err(|error| ServerError::InternalError(error.into()))?;
-        store_consent(&context, consent)
+        drive(ConsentStoreOperation::new(consent), &context)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?;
     }
@@ -999,7 +999,7 @@ pub async fn delete_sync(
         clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
     }
     let consent = consent_delete(relationship_consent(relationship.id));
-    if let Err(error) = store_consent(&context, consent).await {
+    if let Err(error) = drive(ConsentStoreOperation::new(consent), &context).await {
         warn!(%error, relationship_id = %relationship.id, "Failed to remove a plaintext copy request");
     }
 
@@ -1434,7 +1434,11 @@ async fn annotate(
 ) -> ServerResult<()> {
     let id = parse_id(&response.id)?;
     let context = state.get_ctx();
-    let consent = read_consent(&context, relationship_consent(id)).await;
+    let consent = drive(
+        ConsentReadOperation::new(relationship_consent(id)),
+        &context,
+    )
+    .await;
     response.plaintext = consent
         .map_err(|error| ServerError::InternalError(error.into()))?
         .is_some();
@@ -1447,7 +1451,7 @@ async fn annotate(
 /// An encrypted source refuses a target bucket of this node that does not encrypt.
 async fn refuse_plain_target(state: &ServerState, source: &str, target: &str) -> ServerResult<()> {
     let context = state.get_ctx();
-    let encrypted = |bucket| source_encrypted(&context, bucket);
+    let encrypted = |bucket| drive(EncryptionCheckOperation::new(bucket, false), &context);
     let source = encrypted(source)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;

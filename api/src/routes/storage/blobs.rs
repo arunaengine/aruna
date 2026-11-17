@@ -20,7 +20,7 @@ use aruna_operations::replication::locations::{
     LocationSummaryError, LocationSummaryOperation, QueuedNodesOperation, QueuedReplicas,
     RelationshipNodesOperation, RemoteLocationOperation,
 };
-use aruna_operations::replication::plaintext::{consent_required, is_holder};
+use aruna_operations::replication::plaintext::{EncryptionCheckOperation, HolderCheckOperation};
 use aruna_operations::replication::protocol::{
     CopyCompliance, LocationCopyStorage, LocationSummary, LocationSummaryRequest, ReplicationMode,
 };
@@ -236,13 +236,14 @@ pub(crate) async fn plaintext_holder(
     user: aruna_core::UserId,
 ) -> ServerResult<bool> {
     let context = state.get_ctx();
-    let encrypted = consent_required(&context, bucket)
+    let encrypted = drive(EncryptionCheckOperation::new(bucket, true), &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     if !encrypted {
         return Ok(false);
     }
-    match is_holder(&context, state.get_realm_id(), bucket, user).await {
+    let holder = HolderCheckOperation::new(state.get_realm_id(), bucket, user);
+    match drive(holder, &context).await {
         Ok(true) => Ok(true),
         Ok(false) => Err(ServerError::Refused(
             StatusCode::FORBIDDEN,

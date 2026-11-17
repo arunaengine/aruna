@@ -2164,9 +2164,14 @@ async fn holder_allows(
         return Ok(true);
     }
     let auth = &spec.auth_context;
-    crate::replication::plaintext::is_holder(driver, auth.realm_id, bucket, auth.user_id)
+    let holder = crate::replication::plaintext::HolderCheckOperation::new(
+        auth.realm_id,
+        bucket,
+        auth.user_id,
+    );
+    drive(holder, driver)
         .await
-        .map_err(ExportFailure::Retryable)
+        .map_err(|error| ExportFailure::Retryable(error.to_string()))
 }
 
 /// The bucket of a candidate read on this node.

@@ -43,7 +43,7 @@ use super::obligations::{REPLICATION_PAGE_SIZE, live_obligations_exist, process_
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
 use super::parking::{PARKED_DUE, park_job};
-use super::plaintext::{job_consent, plaintext_allowed};
+use super::plaintext::{HolderCheckOperation, job_consent};
 use super::queue::BlobQueueError;
 use super::records::{
     BlobJobRecord, blob_job_entry, blob_job_key, blob_job_preferred, merge_due_job,
@@ -602,10 +602,13 @@ async fn process_blob_job(
         };
         let consent = super::plaintext::relationship_consent(relationship.id);
         let realm_id = job.input.auth_context.realm_id;
-        let plaintext =
-            plaintext_allowed(context, realm_id, bucket, relationship.created_by, consent);
+        let plaintext = HolderCheckOperation::new(realm_id, bucket, relationship.created_by)
+            .with_consent(consent);
+        let plaintext = drive(plaintext, context)
+            .await
+            .map_err(|error| error.to_string())?;
         operation = operation
-            .with_plaintext(plaintext.await?)
+            .with_plaintext(plaintext)
             .with_relationship(
                 relationship.clone(),
                 job.origin.clone(),
@@ -644,11 +647,15 @@ async fn process_blob_job(
         };
         let consent = job_consent(&blob_job_key(job).map_err(|error| error.to_string())?);
         let (realm_id, bucket) = (job.input.auth_context.realm_id, &job.input.bucket);
-        let plaintext = plaintext_allowed(context, realm_id, bucket, writer.user_id, consent);
+        let plaintext =
+            HolderCheckOperation::new(realm_id, bucket, writer.user_id).with_consent(consent);
+        let plaintext = drive(plaintext, context)
+            .await
+            .map_err(|error| error.to_string())?;
         operation = operation
             .with_source_authorization(source_authorization)
             .with_writer_auth(writer.clone())
-            .with_plaintext(plaintext.await?);
+            .with_plaintext(plaintext);
         None
     };
 
