@@ -131,6 +131,10 @@ pub enum SubOperationEvent {
     VersionRekeyed {
         outcome: RekeyOutcome,
     },
+    /// The emission stored no notification; its failure as text.
+    NotificationsFailed {
+        reason: String,
+    },
 }
 
 /// How the re-key of one version ended.
