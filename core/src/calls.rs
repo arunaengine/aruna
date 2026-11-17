@@ -61,6 +61,20 @@ pub enum IoResult {
     Woke,
 }
 
+impl IoResult {
+    /// Names the result kind without its values, for unexpected-result errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Values(_) => "IoResult::Values",
+            Self::Page { .. } => "IoResult::Page",
+            Self::Done => "IoResult::Done",
+            Self::Event(event) => event.label(),
+            Self::Group(_) => "IoResult::Group",
+            Self::Woke => "IoResult::Woke",
+        }
+    }
+}
+
 /// What an operation does next.
 #[derive(Debug, PartialEq)]
 pub enum Next<T> {
@@ -88,6 +102,8 @@ pub enum IoError {
     Hung { effect: &'static str },
     #[error("the operation did not finish")]
     Unfinished,
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
