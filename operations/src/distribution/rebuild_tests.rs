@@ -174,3 +174,62 @@ async fn keeps_epoch_maximum() {
     assert_eq!(run(&handle, 2, 100).await, RebuildOutcome::Done);
     assert_eq!(generation(&handle, 2).await.max_epoch, OriginalEpoch(7));
 }
+
+fn accounts_page(rows: Vec<(Vec<u8>, Vec<u8>)>, more: bool) -> Event {
+    let values = rows.into_iter();
+    Event::Storage(StorageEvent::IterResult {
+        values: values
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect(),
+        next_start_after: more.then(|| b"next".to_vec().into()),
+    })
+}
+
+/// An active account without a rebuild begins one; malformed rows are skipped.
+#[test]
+fn begins_active_rebuilds() {
+    let active = RangeAccount::fresh(String::new(), None).to_bytes().unwrap();
+    let rows = vec![
+        (b"short".to_vec(), active.clone()),
+        (account_key(set(), range_id()), active),
+    ];
+    let rebuild = RebuildOperation::new(RebuildConfig {
+        set_id: set(),
+        range_id: range_id(),
+        page_rows: 2,
+        page_bytes: 64,
+        max_pages: 0,
+        group_id: None,
+    })
+    .start();
+    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
+    let first = begin.page();
+    aruna_core::operation_check::check_trace(
+        &mut begin,
+        &first,
+        vec![(accounts_page(rows, false), rebuild.into_vec())],
+    );
+    assert!(!begin.is_complete());
+}
+
+/// A node without accounts begins nothing; a failed scan fails; other events are refused.
+#[test]
+fn begins_nothing_empty() {
+    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
+    begin.start();
+    assert!(begin.step(accounts_page(Vec::new(), false)).is_empty());
+    assert_eq!(begin.finalize(), Ok(0));
+    let mut begin = BeginRebuildsOperation::new(8, (2, 64));
+    begin.start();
+    begin.step(Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    }));
+    assert!(begin.finalize().is_err());
+
+    use aruna_core::operation_check::{rejects_events, rejects_finalize, sample_events};
+    let fresh = || BeginRebuildsOperation::new(8, (2, 64));
+    let all = sample_events().len();
+    assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), all);
+    rejects_finalize(fresh());
+    assert!(fresh().abort().is_empty());
+}

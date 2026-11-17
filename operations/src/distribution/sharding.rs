@@ -29,7 +29,9 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
+use super::rebuild::{
+    BeginRebuildsOperation, RebuildConfig, RebuildOperation, RebuildOutcome, decode,
+};
 use super::refill::{RefillConfig, RefillOperation};
 use super::refresh::{RefreshCursor, RefreshRangesOperation};
 use super::split::{SplitConfig, SplitError, SplitOperation};
@@ -161,49 +163,14 @@ async fn maintain_accounts(context: &Arc<DriverContext>) -> Duration {
     }
 }
 
-/// Begins a counter rebuild of every active range account without one, a page at a time, so
-/// range counters are confirmed again after a node-wide usage rebuild started. The range
-/// maintenance runs the rebuilds; until they activate, the counters report incomplete.
+/// Begins a counter rebuild of every active range account without one, so range counters are
+/// confirmed again after a node-wide usage rebuild started. The range maintenance runs the
+/// rebuilds; until they activate, the counters report incomplete.
 pub async fn begin_range_rebuilds(context: &DriverContext) -> Result<usize, String> {
-    let mut start = None;
-    let mut begun = 0usize;
-    loop {
-        let (rows, more) = accounts(context, start.take()).await?;
-        for (key, value) in rows {
-            start = Some(key.clone());
-            let Some((set_id, range_id, account)) = decode(&key, &value) else {
-                continue;
-            };
-            if account.rebuild.is_some() || !matches!(account.charge, Charge::Active(_)) {
-                continue;
-            }
-            // No page budget: the run only records the new generation's rebuild.
-            let config = RebuildConfig {
-                set_id,
-                range_id,
-                page_rows: WALK_ROWS,
-                page_bytes: WALK_BYTES,
-                max_pages: 0,
-                group_id: None,
-            };
-            match drive(RebuildOperation::new(config), context).await {
-                Ok(_) => begun += 1,
-                Err(error) => {
-                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
-                }
-            }
-        }
-        if !more {
-            return Ok(begun);
-        }
-    }
-}
-
-fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
-    let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
-    let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
-    let account = RangeAccount::from_bytes(value).ok()?;
-    (key.len() == 32).then_some((set_id, range_id, account))
+    let begin = BeginRebuildsOperation::new(ACCOUNT_PAGE, (WALK_ROWS, WALK_BYTES));
+    drive(begin, context)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 async fn accounts(
