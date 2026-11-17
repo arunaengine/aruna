@@ -1,4 +1,4 @@
-//! Tests the procedure layer: every call kind, refused and late events, commits and conflicts.
+//! Tests the call runner: every call kind, refused and late events, commits and conflicts.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -19,6 +19,7 @@ struct Script {
     seen: Vec<IoResult>,
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
+    transaction: bool,
 }
 
 impl Script {
@@ -30,15 +31,15 @@ impl Script {
     }
 }
 
-impl Procedure for Script {
+impl Operation for Script {
     type Output = Vec<IoResult>;
-    type Error = ProcedureError;
+    type Error = IoError;
 
-    fn first(&mut self) -> Result<Next<Self::Output>, ProcedureError> {
+    fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
         Ok(self.turn())
     }
 
-    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ProcedureError> {
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IoError> {
         let member = matches!(result, IoResult::Group(GroupEvent::Member { .. }));
         self.seen.push(result);
         if member {
@@ -50,6 +51,10 @@ impl Procedure for Script {
     fn hold_scope(&self) -> Option<HoldScope> {
         self.scope
     }
+
+    fn transaction(&self) -> bool {
+        self.transaction
+    }
 }
 
 fn script(calls: Vec<IoCall>) -> Script {
@@ -58,7 +63,14 @@ fn script(calls: Vec<IoCall>) -> Script {
         seen: Vec::new(),
         on_member: None,
         scope: None,
+        transaction: false,
     }
+}
+
+/// The runner's machine for `script`, in one transaction or not.
+fn run(mut script: Script, transaction: bool) -> CallRun<Script> {
+    script.transaction = transaction;
+    CallRun::new(script)
 }
 
 fn key(text: &str) -> Key {
@@ -84,8 +96,7 @@ fn read_a() -> IoCall {
 #[test]
 fn transaction_commits_outcome() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut operation =
-        ProcedureOperation::transaction(script(vec![read_a(), IoCall::Write(write.clone())]));
+    let mut operation = run(script(vec![read_a(), IoCall::Write(write.clone())]), true);
     let start = storage(StorageEffect::StartTransaction { read: false });
     assert_eq!(operation.start().as_slice(), &[start]);
     let read = StorageEffect::BatchRead {
@@ -126,7 +137,7 @@ fn direct_pages_syncs() {
         limit: 10,
     };
     let calls = vec![IoCall::Read(Vec::new()), page, IoCall::Sync];
-    let mut operation = ProcedureOperation::direct(script(calls));
+    let mut operation = run(script(calls), false);
     // The empty read is answered without storage.
     let iter = StorageEffect::Iter {
         key_space: "rows".to_string(),
@@ -159,9 +170,7 @@ fn direct_pages_syncs() {
 #[test]
 fn passes_other_calls() {
     let id = ulid::Ulid::from(3u128);
-    let child = boxed_suboperation(ProcedureOperation::direct(script(Vec::new())), |_| {
-        Event::Delayed
-    });
+    let child = boxed_suboperation(script(Vec::new()), |_| Event::Delayed);
     let calls = vec![
         IoCall::Effect(Effect::Task(TaskEffect::CancelTimer {
             key: TaskKey::DrainSyncOutbox,
@@ -175,7 +184,7 @@ fn passes_other_calls() {
         }),
         IoCall::Delay(Duration::from_secs(5)),
     ];
-    let mut operation = ProcedureOperation::direct(script(calls));
+    let mut operation = run(script(calls), false);
     assert!(matches!(
         operation.start().as_slice(),
         [Effect::Task(TaskEffect::CancelTimer { .. })]
@@ -219,7 +228,7 @@ fn window_adds_members() {
     });
     let mut procedure = script(vec![window]);
     procedure.on_member = Some(IoCall::Delay(Duration::from_secs(2)));
-    let mut operation = ProcedureOperation::direct(procedure);
+    let mut operation = run(procedure, false);
     assert!(matches!(operation.start().as_slice(), [Effect::Group(_)]));
     let first = GroupEvent::Member {
         index: 0,
@@ -247,14 +256,14 @@ fn window_adds_members() {
 
 #[test]
 fn refuses_wrong_event() {
-    let mut operation = ProcedureOperation::transaction(script(vec![read_a()]));
+    let mut operation = run(script(vec![read_a()]), true);
     operation.start();
     operation.step(started());
     let effects = operation.step(Event::Delayed);
     let abort = StorageEffect::AbortTransaction { txn_id: txn() };
     assert_eq!(effects.as_slice(), &[storage(abort)]);
     assert!(operation.is_complete());
-    let refused = ProcedureError::Unexpected {
+    let refused = IoError::Unexpected {
         expected: "StorageEvent::BatchReadResult",
         got: "Event::Delayed",
     };
@@ -263,12 +272,11 @@ fn refuses_wrong_event() {
     let task = TaskEffect::CancelTimer {
         key: TaskKey::DrainSyncOutbox,
     };
-    let mut operation =
-        ProcedureOperation::direct(script(vec![IoCall::Effect(Effect::Task(task))]));
+    let mut operation = run(script(vec![IoCall::Effect(Effect::Task(task))]), false);
     operation.start();
     let id = ulid::Ulid::from(4u128);
     operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
-    let refused = ProcedureError::Unexpected {
+    let refused = IoError::Unexpected {
         expected: "a task event",
         got: "BlobEvent::ReservationReleased",
     };
@@ -277,11 +285,11 @@ fn refuses_wrong_event() {
 
 #[test]
 fn refuses_late_event() {
-    let mut operation = ProcedureOperation::direct(script(Vec::new()));
+    let mut operation = run(script(Vec::new()), false);
     assert!(operation.start().is_empty());
     assert!(operation.is_complete());
     assert!(operation.step(Event::Delayed).is_empty());
-    let refused = ProcedureError::Unexpected {
+    let refused = IoError::Unexpected {
         expected: "no event",
         got: "Event::Delayed",
     };
@@ -291,9 +299,9 @@ fn refuses_late_event() {
 #[test]
 fn refuses_control_effect() {
     let start = storage(StorageEffect::StartTransaction { read: false });
-    let mut operation = ProcedureOperation::direct(script(vec![IoCall::Effect(start)]));
+    let mut operation = run(script(vec![IoCall::Effect(start)]), false);
     assert!(operation.start().is_empty());
-    let refused = ProcedureError::Unexpected {
+    let refused = IoError::Unexpected {
         expected: "an effect without its own call",
         got: "a transaction control effect",
     };
@@ -302,17 +310,17 @@ fn refuses_control_effect() {
 
 #[test]
 fn abort_ends_transaction() {
-    let mut operation = ProcedureOperation::transaction(script(vec![read_a()]));
+    let mut operation = run(script(vec![read_a()]), true);
     operation.start();
     operation.step(started());
     let abort = StorageEffect::AbortTransaction { txn_id: txn() };
     assert_eq!(operation.abort().as_slice(), &[storage(abort)]);
     assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Err(ProcedureError::Aborted));
+    assert_eq!(operation.finalize(), Err(IoError::Aborted));
 
     // A sent commit owns the transaction: abort adds nothing.
     let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut operation = ProcedureOperation::transaction(script(vec![IoCall::Write(write)]));
+    let mut operation = run(script(vec![IoCall::Write(write)]), true);
     operation.start();
     operation.step(started());
     let written = StorageEvent::BatchWriteResult {
@@ -326,7 +334,7 @@ fn abort_ends_transaction() {
 #[test]
 fn conflict_marks_retry() {
     let write = vec![("rows".to_string(), key("a"), key("1"))];
-    let mut operation = ProcedureOperation::transaction(script(vec![IoCall::Write(write)]));
+    let mut operation = run(script(vec![IoCall::Write(write)]), true);
     operation.start();
     operation.step(started());
     let written = StorageEvent::BatchWriteResult {
@@ -340,17 +348,29 @@ fn conflict_marks_retry() {
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
     };
-    assert_eq!(error, ProcedureError::Conflict);
-    assert!(ProcedureOperation::<Script>::is_conflict(&error));
-    let full = ProcedureError::Storage(StorageError::QueueFull);
-    assert!(!ProcedureOperation::<Script>::is_conflict(&full));
-    assert_eq!(ProcedureOperation::<Script>::conflict_retries(), 3);
+    assert_eq!(error, IoError::Conflict);
+    assert!(CallRun::<Script>::is_conflict(&error));
+    let full = IoError::Storage(StorageError::QueueFull);
+    assert!(!CallRun::<Script>::is_conflict(&full));
+    assert_eq!(CallRun::<Script>::conflict_retries(), 3);
 }
 
 #[test]
 fn passes_hold_scope() {
     let mut procedure = script(Vec::new());
     procedure.scope = Some(HoldScope::DocumentReconcile);
-    let operation = ProcedureOperation::direct(procedure);
+    let operation = run(procedure, false);
     assert_eq!(operation.hold_scope(), Some(HoldScope::DocumentReconcile));
+}
+
+#[test]
+fn hung_adapter_fails() {
+    let mut operation = run(script(vec![read_a()]), true);
+    operation.start();
+    operation.step(started());
+    let effects = operation.step(Event::Hung { effect: "storage" });
+    let abort = StorageEffect::AbortTransaction { txn_id: txn() };
+    assert_eq!(effects.as_slice(), &[storage(abort)]);
+    let hung = IoError::Hung { effect: "storage" };
+    assert_eq!(operation.finalize(), Err(hung));
 }

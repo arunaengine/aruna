@@ -1,9 +1,10 @@
-//! Declares the operation and sub operation traits the runner drives with effects and events.
+//! Declares the operation traits the runner drives: calls and results, or effects and events.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::any::Any;
 
+use crate::calls::{CallRun, IoError, IoResult, Next};
 use crate::{events::Event, types::Effects};
 
 /// A backend scope at most one operation holds at a time.
@@ -14,10 +15,61 @@ pub enum HoldScope {
     DocumentReconcile,
 }
 
-/// One driven operation: `start` returns the first effects, `step` consumes each
-/// dispatched event, `is_complete` ends the stream, `finalize` reads the outcome,
-/// `abort` requests cleanup. Effects are requests the runner dispatches.
+/// One use case as decisions without I/O: `first` and `next` return the next call or the
+/// outcome. The runner makes each call, checks that the event answers it, runs the storage calls
+/// in one write transaction when `transaction` holds, commits the outcome and aborts on an error.
 pub trait Operation: Send + std::fmt::Debug + PartialEq {
+    type Output: Send + std::fmt::Debug;
+    /// `From<IoError::Conflict>` must give a value equal only to itself (see `is_conflict`).
+    type Error: Send + std::fmt::Debug + PartialEq + From<IoError>;
+
+    /// The first call, or the outcome when the operation needs no I/O.
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error>;
+    /// The next call after `result`, or the outcome.
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error>;
+
+    /// Whether the storage calls run in one write transaction; otherwise each runs on its own.
+    fn transaction(&self) -> bool {
+        false
+    }
+
+    /// See [`EffectOperation::stamp`].
+    fn stamp(&mut self, _now_ms: u64) {}
+
+    /// See [`EffectOperation::hold_scope`].
+    fn hold_scope(&self) -> Option<HoldScope> {
+        None
+    }
+
+    /// See [`EffectOperation::expected_error`].
+    fn expected_error(_error: &Self::Error) -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
+    /// Whether `error` is a lost transaction conflict; by default the runner's own conflict.
+    fn is_conflict(error: &Self::Error) -> bool
+    where
+        Self: Sized,
+    {
+        *error == Self::Error::from(IoError::Conflict)
+    }
+
+    /// See [`EffectOperation::conflict_retries`].
+    fn conflict_retries() -> u32
+    where
+        Self: Sized,
+    {
+        3
+    }
+}
+
+/// An operation written against raw effects and events: `start` returns the first effects,
+/// `step` consumes each dispatched event, `is_complete` ends the stream, `finalize` reads the
+/// outcome, `abort` requests cleanup. It goes away once every one is an [`Operation`].
+pub trait EffectOperation: Send + std::fmt::Debug + PartialEq {
     type Output: Send + std::fmt::Debug;
     type Error: Send + std::fmt::Debug;
 
@@ -85,7 +137,7 @@ pub trait SubOperation: Send + std::fmt::Debug {
     fn is_complete(&self) -> bool;
     fn finalize(self: Box<Self>) -> Event;
     fn abort(&mut self) -> Effects;
-    /// See [`Operation::stamp`].
+    /// See [`EffectOperation::stamp`].
     fn stamp(&mut self, _now_ms: u64) {}
     fn as_any(&self) -> &dyn Any;
     fn eq_dyn(&self, other: &dyn SubOperation) -> bool;
@@ -99,7 +151,7 @@ impl PartialEq for dyn SubOperation {
 
 struct MappedSubOperation<O, F>
 where
-    O: Operation,
+    O: EffectOperation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     operation: Option<O>,
@@ -108,7 +160,7 @@ where
 
 impl<O, F> PartialEq for MappedSubOperation<O, F>
 where
-    O: Operation,
+    O: EffectOperation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     fn eq(&self, other: &Self) -> bool {
@@ -118,7 +170,7 @@ where
 
 impl<O, F> std::fmt::Debug for MappedSubOperation<O, F>
 where
-    O: Operation,
+    O: EffectOperation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -130,7 +182,7 @@ where
 
 impl<O, F> MappedSubOperation<O, F>
 where
-    O: Operation,
+    O: EffectOperation,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
 {
     fn new(operation: O, map_result: F) -> Self {
@@ -143,7 +195,7 @@ where
 
 impl<O, F> SubOperation for MappedSubOperation<O, F>
 where
-    O: Operation + 'static,
+    O: EffectOperation + 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
@@ -206,12 +258,50 @@ where
     }
 }
 
-pub fn boxed_suboperation<O, F>(operation: O, map_result: F) -> Box<dyn SubOperation>
+/// Boxes an operation of either kind as a child whose outcome `map_result` turns into an event.
+pub fn boxed_suboperation<O, K, F>(operation: O, map_result: F) -> Box<dyn SubOperation>
 where
-    O: Operation + 'static,
+    O: Runnable<K> + 'static,
+    K: 'static,
     O::Output: Send + 'static,
     O::Error: Send + 'static,
     F: FnOnce(Result<O::Output, O::Error>) -> Event + Send + 'static,
 {
-    Box::new(MappedSubOperation::new(operation, map_result))
+    Box::new(MappedSubOperation::new(
+        operation.into_machine(),
+        map_result,
+    ))
+}
+
+/// Marks an [`EffectOperation`] for [`Runnable`].
+pub enum ByEffects {}
+
+/// Marks an [`Operation`] for [`Runnable`].
+pub enum ByCalls {}
+
+/// An operation of either kind, as the effect machine the runner drives. `K` only tells the
+/// two blanket implementations apart, so callers never name it.
+pub trait Runnable<K> {
+    type Output: Send + std::fmt::Debug;
+    type Error: Send + std::fmt::Debug;
+
+    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error>;
+}
+
+impl<T: EffectOperation> Runnable<ByEffects> for T {
+    type Output = T::Output;
+    type Error = T::Error;
+
+    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error> {
+        self
+    }
+}
+
+impl<T: Operation> Runnable<ByCalls> for T {
+    type Output = T::Output;
+    type Error = T::Error;
+
+    fn into_machine(self) -> impl EffectOperation<Output = Self::Output, Error = Self::Error> {
+        CallRun::new(self)
+    }
 }

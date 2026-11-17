@@ -1,4 +1,4 @@
-//! Runs a pure procedure of I/O calls as one operation, with its transaction and event checks.
+//! Declares the I/O calls of an operation and runs an operation as calls, events and checks.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -9,11 +9,11 @@ use smallvec::smallvec;
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
-use crate::operation::{HoldScope, Operation, SubOperation};
+use crate::operation::{EffectOperation, HoldScope, Operation, SubOperation};
 use crate::types::{Effects, Key, KeySpace, TxnId, Value};
 
-/// One I/O request of a procedure. Storage reads, pages, writes and deletes run in the
-/// procedure's transaction when it has one; every other call runs on its own.
+/// One I/O request of an operation. Storage reads, pages, writes and deletes run in the
+/// operation's transaction when it has one; every other call runs on its own.
 #[derive(Debug, PartialEq)]
 pub enum IoCall {
     /// The values of these rows, in this order; an empty list is answered without storage.
@@ -61,7 +61,7 @@ pub enum IoResult {
     Woke,
 }
 
-/// What a procedure does next.
+/// What an operation does next.
 #[derive(Debug, PartialEq)]
 pub enum Next<T> {
     Call(IoCall),
@@ -70,9 +70,9 @@ pub enum Next<T> {
     Wait,
 }
 
-/// An I/O failure the procedure layer reports into the procedure's error type.
+/// An I/O failure the runner reports into the operation's error type.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ProcedureError {
+pub enum IoError {
     #[error("a storage transaction conflicted")]
     Conflict,
     #[error(transparent)]
@@ -82,47 +82,20 @@ pub enum ProcedureError {
         expected: &'static str,
         got: &'static str,
     },
-    #[error("the runner aborted the procedure")]
+    #[error("the runner aborted the operation")]
     Aborted,
-    #[error("the procedure did not finish")]
+    #[error("the {effect} adapter did not answer in time")]
+    Hung { effect: &'static str },
+    #[error("the operation did not finish")]
     Unfinished,
 }
 
-/// The decisions of one use case, without I/O. [`ProcedureOperation`] runs it: it turns each
-/// call into effects, checks every event, and opens, commits and aborts the transaction.
-pub trait Procedure: Send + std::fmt::Debug + PartialEq {
-    type Output: Send + std::fmt::Debug;
-    /// `From<ProcedureError::Conflict>` must give a value equal only to itself, so the runner's
-    /// conflict retry can recognize it.
-    type Error: Send + std::fmt::Debug + PartialEq + From<ProcedureError>;
-
-    /// The first call, or the outcome when the procedure needs no I/O.
-    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error>;
-    /// The next call after `result`, or the outcome.
-    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error>;
-
-    /// See [`Operation::stamp`].
-    fn stamp(&mut self, _now_ms: u64) {}
-
-    /// See [`Operation::hold_scope`].
-    fn hold_scope(&self) -> Option<HoldScope> {
-        None
-    }
-
-    /// See [`Operation::conflict_retries`].
-    fn conflict_retries() -> u32
-    where
-        Self: Sized,
-    {
-        3
-    }
-}
-
-/// Runs a [`Procedure`]: in one write transaction that commits its outcome and aborts on an
-/// error, or with each call on its own.
+/// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
+/// storage calls in one write transaction when the operation asks for one, commits its outcome
+/// and aborts on an error.
 #[derive(Debug)]
-pub struct ProcedureOperation<P: Procedure> {
-    procedure: P,
+pub(crate) struct CallRun<P: Operation> {
+    operation: P,
     transaction: bool,
     txn_id: Option<TxnId>,
     state: State<P::Output, P::Error>,
@@ -188,30 +161,20 @@ impl Wait {
     }
 }
 
-impl<P: Procedure> PartialEq for ProcedureOperation<P> {
+impl<P: Operation> PartialEq for CallRun<P> {
     fn eq(&self, other: &Self) -> bool {
-        self.procedure == other.procedure
+        self.operation == other.operation
             && self.transaction == other.transaction
             && self.txn_id == other.txn_id
             && std::mem::discriminant(&self.state) == std::mem::discriminant(&other.state)
     }
 }
 
-impl<P: Procedure> ProcedureOperation<P> {
-    /// Runs `procedure` with its storage calls in one write transaction.
-    pub fn transaction(procedure: P) -> Self {
-        Self::new(procedure, true)
-    }
-
-    /// Runs `procedure` with each call on its own.
-    pub fn direct(procedure: P) -> Self {
-        Self::new(procedure, false)
-    }
-
-    fn new(procedure: P, transaction: bool) -> Self {
+impl<P: Operation> CallRun<P> {
+    pub(crate) fn new(operation: P) -> Self {
         Self {
-            procedure,
-            transaction,
+            transaction: operation.transaction(),
+            operation,
             txn_id: None,
             state: State::Created,
         }
@@ -229,7 +192,7 @@ impl<P: Procedure> ProcedureOperation<P> {
                 Ok(Next::Call(call)) => call,
             };
             if let Some(result) = empty_result(&call) {
-                turn = self.procedure.next(result);
+                turn = self.operation.next(result);
                 continue;
             }
             if self.transaction && self.txn_id.is_none() && in_storage(&call) {
@@ -251,10 +214,10 @@ impl<P: Procedure> ProcedureOperation<P> {
         }
     }
 
-    /// Hands a window member to the procedure; a call it returns joins the window.
+    /// Hands a window member to the operation; a call it returns joins the window.
     fn member(&mut self, event: GroupEvent) -> Effects {
         self.state = State::Waiting(Wait::Window);
-        match self.procedure.next(IoResult::Group(event)) {
+        match self.operation.next(IoResult::Group(event)) {
             Ok(Next::Wait) => smallvec![],
             Ok(Next::Call(call)) => match call_effect(call, self.txn_id) {
                 Ok((_, effect)) => smallvec![effect],
@@ -291,12 +254,12 @@ impl<P: Procedure> ProcedureOperation<P> {
     }
 }
 
-impl<P: Procedure> Operation for ProcedureOperation<P> {
+impl<P: Operation> EffectOperation for CallRun<P> {
     type Output = P::Output;
     type Error = P::Error;
 
     fn start(&mut self) -> Effects {
-        let turn = self.procedure.first();
+        let turn = self.operation.first();
         self.advance(turn)
     }
 
@@ -339,27 +302,31 @@ impl<P: Procedure> Operation for ProcedureOperation<P> {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             State::Finished(result) => result,
-            _ => Err(ProcedureError::Unfinished.into()),
+            _ => Err(IoError::Unfinished.into()),
         }
     }
 
     fn abort(&mut self) -> Effects {
         match self.state {
             State::Committing(_) | State::Finished(_) => smallvec![],
-            _ => self.fail(ProcedureError::Aborted),
+            _ => self.fail(IoError::Aborted),
         }
     }
 
     fn stamp(&mut self, now_ms: u64) {
-        self.procedure.stamp(now_ms);
+        self.operation.stamp(now_ms);
     }
 
     fn hold_scope(&self) -> Option<HoldScope> {
-        self.procedure.hold_scope()
+        self.operation.hold_scope()
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        P::expected_error(error)
     }
 
     fn is_conflict(error: &Self::Error) -> bool {
-        *error == P::Error::from(ProcedureError::Conflict)
+        P::is_conflict(error)
     }
 
     fn conflict_retries() -> u32 {
@@ -367,12 +334,12 @@ impl<P: Procedure> Operation for ProcedureOperation<P> {
     }
 }
 
-impl<P: Procedure> ProcedureOperation<P> {
-    /// Hands the answer to the procedure, or fails when the event does not answer the call.
+impl<P: Operation> CallRun<P> {
+    /// Hands the answer to the operation, or fails when the event does not answer the call.
     fn deliver(&mut self, wait: Wait, event: Event) -> Effects {
         match answer(wait, event) {
             Ok(result) => {
-                let turn = self.procedure.next(result);
+                let turn = self.operation.next(result);
                 self.advance(turn)
             }
             Err(error) => self.fail(error),
@@ -380,22 +347,23 @@ impl<P: Procedure> ProcedureOperation<P> {
     }
 }
 
-fn unexpected(expected: &'static str, got: &'static str) -> ProcedureError {
-    ProcedureError::Unexpected { expected, got }
+fn unexpected(expected: &'static str, got: &'static str) -> IoError {
+    IoError::Unexpected { expected, got }
 }
 
 /// The error for an event that does not answer the call: a storage failure, or a refusal.
-fn failure(expected: &'static str, event: Event) -> ProcedureError {
+fn failure(expected: &'static str, event: Event) -> IoError {
     match event {
         Event::Storage(StorageEvent::Error {
             error: StorageError::TransactionConflict,
-        }) => ProcedureError::Conflict,
-        Event::Storage(StorageEvent::Error { error }) => ProcedureError::Storage(error),
+        }) => IoError::Conflict,
+        Event::Storage(StorageEvent::Error { error }) => IoError::Storage(error),
+        Event::Hung { effect } => IoError::Hung { effect },
         other => unexpected(expected, other.label()),
     }
 }
 
-fn answer(wait: Wait, event: Event) -> Result<IoResult, ProcedureError> {
+fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
     match (wait, event) {
         (Wait::Values(count), Event::Storage(StorageEvent::BatchReadResult { values }))
             if values.len() == count =>
@@ -440,7 +408,7 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the procedure's transaction.
+/// Whether the call runs in the operation's transaction.
 fn in_storage(call: &IoCall) -> bool {
     matches!(
         call,
@@ -448,7 +416,7 @@ fn in_storage(call: &IoCall) -> bool {
     )
 }
 
-fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), ProcedureError> {
+fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), IoError> {
     let (wait, storage) = match call {
         IoCall::Read(reads) => (
             Wait::Values(reads.len()),
@@ -491,7 +459,7 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Pr
 
 /// The family whose event answers a passed-through effect; effects with their own call and
 /// transaction control effects are refused.
-fn effect_family(effect: &Effect) -> Result<Family, ProcedureError> {
+fn effect_family(effect: &Effect) -> Result<Family, IoError> {
     let expected = "an effect without its own call";
     match effect {
         Effect::Blob(_) => Ok(Family::Blob),
@@ -528,10 +496,11 @@ fn event_family(event: &Event) -> Option<Family> {
         | Event::Search()
         | Event::Stream()
         | Event::Group(_)
-        | Event::Delayed => None,
+        | Event::Delayed
+        | Event::Hung { .. } => None,
     }
 }
 
 #[cfg(test)]
-#[path = "procedure_tests.rs"]
+#[path = "calls_tests.rs"]
 mod tests;
