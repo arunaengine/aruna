@@ -169,7 +169,13 @@ impl NodeSecretOperation {
     fn send(&mut self) -> Next<Option<SecretRecord>> {
         match self.queue.pop_front() {
             Some(call) => Next::Call(call),
-            None => Next::Done(self.result.take().flatten()),
+            // The notice rows are committed; a missed timer leaves them to the next drain.
+            None => Next::Then {
+                output: self.result.take().flatten(),
+                calls: (self.notices.then(schedule_drain_effect).into_iter())
+                    .map(IoCall::from)
+                    .collect(),
+            },
         }
     }
 }
@@ -211,11 +217,6 @@ impl Operation for NodeSecretOperation {
 
     fn transaction(&self) -> bool {
         true
-    }
-
-    /// The notice rows are committed; a missed timer leaves them to the next drain.
-    fn after_commit(&mut self) -> Option<Effect> {
-        std::mem::take(&mut self.notices).then(schedule_drain_effect)
     }
 }
 

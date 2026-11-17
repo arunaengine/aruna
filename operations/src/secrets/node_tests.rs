@@ -90,11 +90,15 @@ fn create_writes_record() {
     assert!(!format!("{next:?}").contains("canary"));
     let key = ByteView::from(entry.key());
     let done = operation.next(storage(StorageEvent::WriteResult { key }));
-    let Ok(Next::Done(Some(info))) = done else {
+    let Ok(Next::Then {
+        output: Some(info),
+        calls,
+    }) = done
+    else {
         panic!("expected the stored record, got {done:?}");
     };
     assert_eq!(info.value_id, Ulid::from_bytes([10; 16]));
-    assert_eq!(operation.after_commit(), None);
+    assert!(calls.is_empty(), "no notice, no drain");
 }
 
 #[test]
@@ -123,7 +127,13 @@ fn rotate_replaces_value() {
     assert_eq!(*entry, value_entry(current.value_id));
     let key = ByteView::from(entry.key());
     let done = operation.next(storage(StorageEvent::DeleteResult { key }));
-    assert!(matches!(done, Ok(Next::Done(Some(_)))));
+    assert!(matches!(
+        done,
+        Ok(Next::Then {
+            output: Some(_),
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -145,7 +155,7 @@ fn delete_removes_both() {
     assert!(matches!(passed(&next), StorageEffect::VaultDelete { .. }));
     let key = ByteView::from(value_entry(current.value_id).key());
     let done = operation.next(storage(StorageEvent::DeleteResult { key }));
-    assert_eq!(done, Ok(Next::Done(None)));
+    assert!(matches!(done, Ok(Next::Then { output: None, .. })));
 }
 
 #[test]
@@ -225,12 +235,17 @@ fn widening_notifies_admins() {
             if notified == "catalog-key"
     ));
     let done = operation.next(IoResult::Done);
-    assert!(matches!(done, Ok(Next::Done(Some(_)))));
+    let Ok(Next::Then {
+        output: Some(_),
+        calls,
+    }) = done
+    else {
+        panic!("expected the stored record, got {done:?}");
+    };
     assert!(
-        matches!(operation.after_commit(), Some(Effect::Task(_))),
+        matches!(calls.as_slice(), [IoCall::Effect(effect)] if matches!(**effect, Effect::Task(_))),
         "the notice drain is scheduled"
     );
-    assert_eq!(operation.after_commit(), None);
 
     // The same rules again widen nothing and send no notice.
     let mut stored = current.clone();

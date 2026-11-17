@@ -461,20 +461,8 @@ impl<P: Operation> CallRun<P> {
                 self.state = State::Committing(output, calls);
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            None => {
-                let calls = self.drain_after_commit(calls);
-                self.after(output, calls)
-            }
+            None => self.after(output, calls.into()),
         }
-    }
-
-    /// Appends the effects of the operation's `after_commit` to its calls after the commit.
-    fn drain_after_commit(&mut self, calls: Vec<IoCall>) -> VecDeque<IoCall> {
-        let mut calls: VecDeque<IoCall> = calls.into();
-        while let Some(effect) = self.operation.after_commit() {
-            calls.push_back(IoCall::Effect(Box::new(effect)));
-        }
-        calls
     }
 
     /// Makes the next call after the commit; a refused call is logged and skipped.
@@ -547,10 +535,7 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
-                    {
-                        let calls = self.drain_after_commit(calls);
-                        self.after(output, calls)
-                    }
+                    self.after(output, calls.into())
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
