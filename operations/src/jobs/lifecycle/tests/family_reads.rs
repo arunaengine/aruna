@@ -10,12 +10,12 @@ use aruna_core::structs::execution::job::{
 };
 use aruna_core::types::Value;
 
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::keys::record_key;
 use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
-    load_kind_complete,
+    AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::tests::records::{Family, REALM, context};
 
@@ -102,10 +102,10 @@ async fn reads_kind_only() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (_spec, receipt) = seed(&ctx, &family).await;
 
-    let all = load_family_complete(&ctx, family.family())
+    let all = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family reads completely");
-    let receipts = load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt)
+    let receipts = drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt), &ctx)
         .await
         .expect("receipts read completely");
     assert_eq!(all.len(), 5);
@@ -216,11 +216,11 @@ async fn undecodable_blocks_chain() {
     poison(&ctx, &family).await;
 
     assert!(matches!(
-        load_family_complete(&ctx, family.family()).await,
+        drive(LoadFamilyOperation::family(family.family()), &ctx).await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(matches!(
-        load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt).await,
+        drive(LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt), &ctx).await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(

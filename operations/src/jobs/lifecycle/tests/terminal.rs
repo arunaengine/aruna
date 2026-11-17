@@ -14,13 +14,14 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::jobs::lifecycle::updates::{execution_chain, publish_state, publish_terminal};
 use crate::jobs::output_record::store_outputs;
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
+    AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
 use crate::tests::records::{Family, REALM, context};
@@ -217,7 +218,7 @@ async fn publishes_terminal_success() {
     });
     assert!(publish_terminal(&ctx, &terminal).await);
 
-    let records = load_family_complete(&ctx, family.family())
+    let records = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family read completes");
     assert!(records.iter().any(|envelope| matches!(

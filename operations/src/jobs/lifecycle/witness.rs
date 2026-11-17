@@ -32,13 +32,13 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::plan::build_plan;
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
-    load_kind_complete,
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::jobs::store::{batch_delete, iter_prefix_page};
 use crate::metadata::api::load_realm_config;
@@ -185,7 +185,7 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
 /// lowest order key, which every holder reduces the same way. An unreadable
 /// claim set leaves the order to the digest alone.
 async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
-    let records = load_kind_complete(context, family, JobRecordKind::Claim)
+    let records = drive(LoadFamilyOperation::kind(family, JobRecordKind::Claim), context)
         .await
         .ok()?;
     records
@@ -452,7 +452,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }
     // An incomplete family read is undecided evidence: a suppression, cancel or
     // earlier launch may be in the unloaded part, so no budget and no offer.
-    let records = match load_family_complete(context, family).await {
+    let records = match drive(LoadFamilyOperation::family(family), context).await {
         Ok(records) => records,
         Err(error) => {
             warn!(error = %error, "Job family read is incomplete; witness round deferred");

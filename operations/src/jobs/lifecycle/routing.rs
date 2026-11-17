@@ -18,11 +18,11 @@ use aruna_core::time::unix_timestamp_millis;
 use std::time::Duration;
 
 use super::ids::{session_of, workspace_of};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::{alias_family, alias_prefix};
 use crate::jobs::records::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
-    load_family_complete,
 };
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
 use crate::jobs::store::iter_prefix_page;
@@ -109,7 +109,7 @@ pub async fn family_projection(
         .as_ref()
         .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?
         .canonical_job_id;
-    let records = load_family_complete(context, projected.family)
+    let records = drive(LoadFamilyOperation::family(projected.family), context)
         .await
         .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
     let spec = records.iter().find_map(|envelope| match &envelope.record {
@@ -206,7 +206,7 @@ pub async fn session_job(
     record.finished_at_ms = status.finished_at_ms;
     let physical = match execution {
         Some(execution) => {
-            let records = load_family_complete(context, projected.family)
+            let records = drive(LoadFamilyOperation::family(projected.family), context)
                 .await
                 .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
             Some(

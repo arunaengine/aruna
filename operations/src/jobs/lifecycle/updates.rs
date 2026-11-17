@@ -21,9 +21,10 @@ use super::held::HeldReservations;
 use super::reservation::ReleaseExecutionOperation;
 use super::routing::family_of_alias;
 use super::witness::arm_family;
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::jobs::store::read_job_record;
 use crate::node::dashboard::notify_dashboard_change;
@@ -151,7 +152,7 @@ async fn receipt_of(
     family: JobFamilyId,
     execution_id: Ulid,
 ) -> Option<ExecutionReceipt> {
-    let records = load_kind_complete(context, family, JobRecordKind::Receipt)
+    let records = drive(LoadFamilyOperation::kind(family, JobRecordKind::Receipt), context)
         .await
         .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
         .ok()?;
@@ -224,7 +225,7 @@ pub async fn publish_state(
         warn!(execution_id = %chain.execution_id, "Execution receipt digest failed");
         return false;
     };
-    let records = match load_kind_complete(context, chain.family, JobRecordKind::Update).await {
+    let records = match drive(LoadFamilyOperation::kind(chain.family, JobRecordKind::Update), context).await {
         Ok(records) => records,
         Err(error) => {
             warn!(error = %error, "Execution update read is incomplete; publication deferred");

@@ -24,7 +24,6 @@ pub mod verify;
 pub use admit::Admission;
 pub use append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 pub use audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-pub use family::{FamilyReadError, load_family_complete, load_kind_complete};
 pub use project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily};
 pub use transport::{dispatch_offer, dispatch_record, serve_job_record, serve_launch_offer};
 pub use verify::FamilyView;

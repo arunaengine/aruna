@@ -41,6 +41,7 @@ use super::cancel::cancel_local_run;
 use super::ids::{self, workspace_of};
 use super::plan::{REALM_STAGING, network_access};
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive, gate_context, now_ms};
@@ -48,8 +49,7 @@ use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
-    load_kind_complete,
+    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
@@ -175,7 +175,7 @@ async fn family_records(
     context: &Arc<DriverContext>,
     family: JobFamilyId,
 ) -> Option<Vec<JobRecordEnvelope>> {
-    load_family_complete(context.as_ref(), family)
+    drive(LoadFamilyOperation::family(family), context.as_ref())
         .await
         .inspect_err(|error| {
             warn!(error = %error, "Job family read is incomplete; launch stays undecided");
@@ -436,7 +436,7 @@ async fn committed_receipt(
     family: JobFamilyId,
     intent: &LaunchIntent,
 ) -> Option<Result<ReceiptFrame, LaunchDecline>> {
-    let records = load_kind_complete(context.as_ref(), family, JobRecordKind::Receipt)
+    let records = drive(LoadFamilyOperation::kind(family, JobRecordKind::Receipt), context.as_ref())
         .await
         .inspect_err(|error| {
             warn!(error = %error, "Receipt read is incomplete after a reservation race");

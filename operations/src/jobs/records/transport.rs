@@ -25,7 +25,7 @@ use tracing::warn;
 use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-use super::load_kind_complete;
+use super::family::LoadFamilyOperation;
 use super::rows::PendingNeed;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::api::load_realm_config;
@@ -405,7 +405,7 @@ async fn accept_record(
                         ServeError::Unavailable
                     })?;
             }
-            let cancels = load_kind_complete(context.as_ref(), family, JobRecordKind::Cancel)
+            let cancels = drive(LoadFamilyOperation::kind(family, JobRecordKind::Cancel), context.as_ref())
                 .await
                 .map_err(|_| ServeError::Unavailable)?;
             // Admission may promote a pending cancel, and retries must reapply its side effect.
