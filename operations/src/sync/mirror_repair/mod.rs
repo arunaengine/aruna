@@ -2,47 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+mod drain;
+mod kick;
+mod record;
+mod scan;
+mod settle;
+mod status;
+#[cfg(test)]
+mod tests;
+
+pub use drain::{
+    delete_sync_mirror, process_mirror_repairs, request_mirror_create, restore_mirror_timer,
+};
+pub use kick::KickRepairOperation;
+pub use record::MirrorRecordOperation;
+pub use status::StoreStatusOperation;
+
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE,
-};
-use aruna_core::metadata::MetadataError;
-use aruna_core::plugin_runs::{SourceEvent, journal_entries};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::{
-    BucketInfo, bucket_permission_path, object_permission_path,
-};
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::structs::SyncRelationship;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{Key, KeySpace, TxnId, Value};
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
-use ulid::Ulid;
 
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::{DriverContext, drive};
-use crate::metadata::AuthToken;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, StoreRelationshipOperation, SyncRelationshipDirection,
-    SyncRelationshipError, remove_outgoing_relationship,
-};
-use crate::tasks::queue_backoff::retry_delay_ms;
+use crate::sync::sync_relationship::SyncRelationshipError;
 
-const REPAIR_PAGE_SIZE: usize = 128;
-const REPAIR_BATCH_SIZE: usize = 64;
 pub(crate) const RECONCILE_GRACE: Duration = Duration::from_secs(30);
 pub const REPAIR_RETRY_AFTER: Duration = Duration::from_secs(1);
 
@@ -86,7 +76,7 @@ impl SyncMirrorRecord {
         Ok(postcard::to_allocvec(self)?)
     }
 
-    fn from_bytes(key: &[u8], value: &[u8]) -> Result<Self, ConversionError> {
+    pub(crate) fn from_bytes(key: &[u8], value: &[u8]) -> Result<Self, ConversionError> {
         let record: Self = postcard::from_bytes(value)?;
         record.relationship.validate()?;
         if key != record.relationship.id.to_bytes() {
@@ -107,7 +97,7 @@ pub struct SyncMirrorResult {
     pub next_due_after: Option<Duration>,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum SyncMirrorError {
     #[error(transparent)]
     Storage(#[from] StorageError),
@@ -119,21 +109,76 @@ pub enum SyncMirrorError {
     Mirror(String),
     #[error("unexpected storage event: {0:?}")]
     Unexpected(Event),
+    #[error("sync mirror operation did not finish")]
+    Unfinished,
 }
 
-/// What a reconcile pass finds when it tries to claim a rollback.
-#[derive(Debug, PartialEq)]
-enum RollbackClaim {
-    /// The scanned record changed, so this pass has nothing to do.
-    Stale,
-    /// The relationship was activated and is reconciled as usual.
-    Active(SyncRelationship),
-    /// The create never activated; the record now asks for a rollback.
-    Claimed,
+impl SyncMirrorError {
+    /// The error for an event a phase did not expect; storage errors keep their kind.
+    fn from_event(event: Event) -> Self {
+        match event {
+            Event::Storage(StorageEvent::Error { error }) => error.into(),
+            other => Self::Unexpected(other),
+        }
+    }
 }
 
-struct RepairScan {
-    records: Vec<(Vec<u8>, SyncMirrorRecord)>,
-    has_more_due: bool,
-    next_due_ms: Option<u64>,
+pub fn mirror_delete_entry(
+    relationship: &SyncRelationship,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    repair_entry(SyncMirrorRecord::new(
+        relationship.clone(),
+        SyncMirrorIntent::Delete,
+    ))
+}
+
+fn repair_entry(record: SyncMirrorRecord) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let value = record.to_bytes()?;
+    Ok((
+        MIRROR_REPAIR_KEYSPACE.to_string(),
+        repair_key(&record.relationship),
+        ByteView::from(value),
+    ))
+}
+
+/// The repair record key of a relationship: its id.
+fn repair_key(relationship: &SyncRelationship) -> Key {
+    ByteView::from(relationship.id.to_bytes().to_vec())
+}
+
+fn repair_read(key: &Key, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: MIRROR_REPAIR_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id,
+    })
+}
+
+fn outgoing_read(key: &Key, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: RELATIONSHIP_OUT_KEYSPACE.to_string(),
+        key: key.clone(),
+        txn_id,
+    })
+}
+
+fn decode_record(
+    key: &Key,
+    value: Option<Value>,
+) -> Result<Option<SyncMirrorRecord>, ConversionError> {
+    value
+        .map(|value| SyncMirrorRecord::from_bytes(key, &value))
+        .transpose()
+}
+
+pub(crate) fn same_relationship(left: &SyncRelationship, right: &SyncRelationship) -> bool {
+    left.id == right.id
+        && left.source == right.source
+        && left.target == right.target
+        && left.mode == right.mode
+        && left.reference_handling == right.reference_handling
+        && left.reference_serving == right.reference_serving
+        && left.replicate_deletes == right.replicate_deletes
+        && left.created_by == right.created_by
+        && left.created_at == right.created_at
 }
