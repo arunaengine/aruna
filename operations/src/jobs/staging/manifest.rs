@@ -251,7 +251,7 @@ pub(super) async fn manifest_digests(
     let values = match event {
         Event::Storage(StorageEvent::BatchReadResult { values }) => values,
         Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-        other => return Err(format!("unexpected manifest read event: {other:?}")),
+        other => return Err(format!("unexpected manifest read event: {}", other.label())),
     };
     values
         .into_iter()
@@ -398,7 +398,7 @@ mod tests {
             claim_token,
             lease_expires_ms: u64::MAX,
         });
-        crate::jobs::store::insert_job(&storage_handle, &record)
+        crate::jobs::store::query::insert_job(&storage_handle, &record)
             .await
             .unwrap();
         let driver = DriverContext {

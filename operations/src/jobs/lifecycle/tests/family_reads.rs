@@ -12,10 +12,10 @@ use aruna_core::types::Value;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM, context};
+use aruna_core::structs::execution::job::record_keys::record_key;
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
@@ -119,8 +119,8 @@ async fn reads_kind_only() {
 
 #[tokio::test]
 async fn resolves_session_alias() {
-    use crate::jobs::JobRouteError;
     use crate::jobs::lifecycle::routing::session_job;
+    use crate::jobs::route::JobRouteError;
     use crate::jobs::service::read_owned_job;
 
     let family = Family::new([7u8; 32]);
@@ -152,7 +152,7 @@ async fn resolves_session_alias() {
     physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
-    crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
+    crate::jobs::store::query::insert_job(&ctx.storage_handle, &physical)
         .await
         .unwrap();
     let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {

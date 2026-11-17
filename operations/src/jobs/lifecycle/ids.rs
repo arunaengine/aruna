@@ -21,22 +21,22 @@ use thiserror::Error;
 use ulid::Ulid;
 
 /// Domain tag of the normalized request digest.
-pub const REQUEST_DIGEST_DOMAIN: &[u8] = b"aruna-job-request-v1";
+const REQUEST_DIGEST_DOMAIN: &[u8] = b"aruna-job-request-v1";
 
 /// Reserved tag namespace of the scheduling directives an execution spec stores.
 /// The spec is the complete request, so these travel inside it rather than
 /// beside it, in the tag namespace the engine already owns.
-pub const WORKSPACE_MODE_TAG: &str = "aruna-engine.org/workspace-mode";
-pub const WORKSPACE_BUCKET_TAG: &str = "aruna-engine.org/workspace-bucket";
+const WORKSPACE_MODE_TAG: &str = "aruna-engine.org/workspace-mode";
+const WORKSPACE_BUCKET_TAG: &str = "aruna-engine.org/workspace-bucket";
 /// `aruna-engine.org/label/<key> = <value>` is one required target label.
-pub const LABEL_TAG_PREFIX: &str = "aruna-engine.org/label/";
+const LABEL_TAG_PREFIX: &str = "aruna-engine.org/label/";
 
 /// Cores assumed when a request declares none.
-pub const DEFAULT_CPU_CORES: u32 = 1;
+const DEFAULT_CPU_CORES: u32 = 1;
 /// Memory assumed when a request declares none: 1 GiB.
-pub const DEFAULT_RAM_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_RAM_BYTES: u64 = 1024 * 1024 * 1024;
 /// Walltime assumed when a request declares none, matching the executor default.
-pub const DEFAULT_WALLTIME_MS: u64 = 24 * 60 * 60 * 1000;
+const DEFAULT_WALLTIME_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, PartialEq, Error)]
 pub enum RequestError {

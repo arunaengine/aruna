@@ -37,15 +37,15 @@ use std::sync::Arc;
 use tracing::warn;
 
 use super::REPORT_MAX_ROWS;
-use super::protocol::{JobRequest, JobResponse, WireRange, send_job_request};
+use super::protocol::send_job_request;
 use super::route::JobRouteError;
 use super::runtime::JobsRuntime;
 use super::staging::read_staging_checkpoint;
-use super::store::{
-    CancelRequestOutcome, JobMutationError, RunDelete, delete_finished_run, find_dedup_plan,
-    list_job_entries, list_user_jobs, read_artifact_tombstone, read_crate_status, read_job_record,
-    read_key_waits, set_cancel_requested,
-};
+use super::store::attempt::{CancelRequestOutcome, read_crate_status, set_cancel_requested};
+use super::store::key_wait::read_key_waits;
+use super::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
+use super::store::state::{read_artifact_tombstone, read_job_record};
+use super::store::{JobMutationError, RunDelete, delete_finished_run};
 use super::submit::{
     SubmitJobError, SubmitJobOperation, SubmitJobResult, SubmitJobSpec, mint_job_id,
     schedule_drain_effect,
@@ -58,6 +58,7 @@ use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::repository::StorageReadError;
+use aruna_core::jobs::{JobRequest, JobResponse, WireRange};
 
 use super::lifecycle::alias::AliasFamilyOperation;
 use super::lifecycle::cancel::{self, cancel_family};
@@ -65,7 +66,7 @@ use super::lifecycle::ids::session_of;
 use super::lifecycle::routing::{family_responder, family_status};
 use super::route::{JobRouteOperation, JobRouteOutcome};
 
-pub use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
+use aruna_core::jobs::{JobKind, JobReportView, JobStatusView};
 
 /// Mints a JobId whose handle is the serving node's JobControl handle, so the
 /// owner is encoded in the id itself. The bucket is a local queue shard only;
@@ -669,7 +670,7 @@ pub async fn submit_export_job(
 }
 
 /// Read the run-crate obligation status surfaced alongside an execution job.
-pub async fn read_crate_obligation(
+async fn read_crate_obligation(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<RunCrateStatus>, String> {
@@ -1448,7 +1449,10 @@ pub async fn read_artifact_range(
             Ok(ArtifactRead { blob, stream_size })
         }
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        event => Err(format!("unexpected hidden artifact read event: {event:?}")),
+        event => Err(format!(
+            "unexpected hidden artifact read event: {}",
+            event.label()
+        )),
     }
 }
 
@@ -1652,7 +1656,8 @@ pub(crate) async fn kick_drain(context: &DriverContext) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::store::{insert_job, preserve_artifact_tombstone, read_job_record};
+    use super::super::store::query::insert_job;
+    use super::super::store::state::{preserve_artifact_tombstone, read_job_record};
     use super::*;
     use aruna_core::structs::execution::job::{
         ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,

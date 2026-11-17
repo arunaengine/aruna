@@ -12,9 +12,9 @@ use crate::blob::migration::queue::resume_transitions;
 use crate::blob::promote::{PromoteError, promote_unlocked};
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::{
-    AwaitOutcome, JobMutationError, iter_prefix_page, park_job, satisfy_key_wait, wake_key_waits,
-};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait, wake_key_waits};
+use crate::jobs::store::query::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -77,7 +77,7 @@ pub async fn wake_unlocked(
 
 /// Local inputs whose exact source version needs a key that is locked here. Remote inputs are
 /// left to their source node; a version without a local alias is left to staging.
-pub(crate) async fn locked_inputs(
+async fn locked_inputs(
     context: &DriverContext,
     inputs: &[CapturedInput],
     node_id: NodeId,
@@ -233,7 +233,7 @@ pub(crate) async fn read_row(
             Ok(value.map(|value| value.to_vec()))
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+        other => Err(format!("unexpected storage event: {}", other.label())),
     }
 }
 
@@ -297,14 +297,17 @@ pub(crate) async fn park_locked(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::store::{ClaimOutcome, claim_job, insert_job, park_job, read_job_record};
+    use crate::jobs::store::key_wait::park_job;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, read_job_record};
     use aruna_core::UserId;
     use aruna_core::structs::execution::job::{JobId, JobPayload, JobState};
     use byteview::ByteView;
 
     #[tokio::test]
     async fn corrupt_archive_wakes() {
-        use crate::jobs::store::{owed_wakes, register_remote_wait};
+        use crate::driver::drive;
+        use crate::jobs::store::remote_wait::{OwedWakesOperation, WaitRowOperation};
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
         use aruna_core::structs::identity::auth::AuthContext;
@@ -330,9 +333,8 @@ mod tests {
             session: None,
         };
         let job_id = JobId::from_bytes([5; 16]);
-        register_remote_wait(storage, key, waiter, job_id, &auth)
-            .await
-            .unwrap();
+        let register = WaitRowOperation::register(key, waiter, job_id, &auth);
+        drive(register, &context).await.unwrap();
         // A pending row that cannot be decoded makes promotion fail.
         let corrupt = StorageEffect::Write {
             key_space: PENDING_LOCATION_KEYSPACE.to_string(),
@@ -347,7 +349,9 @@ mod tests {
         let result = wake_unlocked(&context, key, 4_000, origin, &limits).await;
 
         assert!(matches!(result, Err(KeyWakeError::Promote(_))));
-        let (owed, _) = owed_wakes(storage, None).await.unwrap();
+        let (owed, _) = drive(OwedWakesOperation::new(None), &context)
+            .await
+            .unwrap();
         assert_eq!(owed.len(), 1);
         assert_eq!((owed[0].waiter, owed[0].job_id), (waiter, job_id));
     }
@@ -597,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
-        use crate::jobs::store::read_key_waits;
+        use crate::jobs::store::key_wait::read_key_waits;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;

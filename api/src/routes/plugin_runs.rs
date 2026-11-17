@@ -13,7 +13,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::store::read_job_record;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::plugins::decide::event_delivery;
 use aruna_operations::plugins::dispatch::{StartError, run_again, start_run};
 use aruna_operations::plugins::finished::{drop_completion, waits_for};
@@ -1308,7 +1308,7 @@ mod tests {
         use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
         use aruna_core::structured_id::{BucketId, PlacementHandle};
         use aruna_operations::driver::drive;
-        use aruna_operations::jobs::store::insert_job;
+        use aruna_operations::jobs::store::query::insert_job;
         use aruna_operations::plugins::work::{
             Identity, WorkChange, WorkRow, reserve, update_work,
         };

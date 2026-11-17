@@ -10,8 +10,10 @@ use aruna_core::structs::execution::job::{JobFamilyId, JobId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 
-use crate::jobs::JobRouteError;
-use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_family, alias_prefix};
+use crate::jobs::route::JobRouteError;
+use aruna_core::structs::execution::job::record_keys::{
+    MAX_ALIAS_FAMILIES, alias_family, alias_prefix,
+};
 
 /// The family of one alias, ordered by key, so two families claiming one alias
 /// resolve identically on every replica. `None` names no family here.
@@ -55,7 +57,7 @@ impl Operation for AliasFamilyOperation {
     fn step(&mut self, event: Event) -> Effects {
         let outcome = match event {
             _ if !self.started || self.outcome.is_some() => Err(JobRouteError::Unavailable(
-                format!("unexpected storage event: {event:?}"),
+                format!("unexpected storage event: {}", event.label()),
             )),
             Event::Storage(StorageEvent::IterResult { values, .. }) => {
                 Ok(values.iter().filter_map(|(key, _)| alias_family(key)).min())
@@ -64,7 +66,8 @@ impl Operation for AliasFamilyOperation {
                 Err(JobRouteError::Unavailable(error.to_string()))
             }
             other => Err(JobRouteError::Unavailable(format!(
-                "unexpected storage event: {other:?}"
+                "unexpected storage event: {}",
+                other.label()
             ))),
         };
         self.finish(outcome)
@@ -99,8 +102,10 @@ mod state_machine_tests {
     use aruna_core::types::{Key, Value};
 
     use super::AliasFamilyOperation;
-    use crate::jobs::JobRouteError;
-    use crate::jobs::records::keys::{MAX_ALIAS_FAMILIES, alias_key, alias_prefix};
+    use crate::jobs::route::JobRouteError;
+    use aruna_core::structs::execution::job::record_keys::{
+        MAX_ALIAS_FAMILIES, alias_key, alias_prefix,
+    };
 
     fn job() -> JobId {
         JobId::from_bytes([4u8; 16])

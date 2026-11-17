@@ -18,9 +18,10 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::federation::import::read_import;
-use aruna_operations::jobs::import::{
-    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation, load_rocrate_upload,
+use aruna_operations::jobs::import::upload::{
+    CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
 };
+use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::{lookup_job_dedup, read_owned_job, submit_rocrate_import};
 use aruna_operations::metadata::create_document::mint_job_document;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};

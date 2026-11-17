@@ -19,8 +19,8 @@ use ulid::Ulid;
 use super::LifecycleError;
 use super::alias::AliasFamilyOperation;
 use super::held::HeldReservations;
-use crate::jobs::JobRouteError;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
+use crate::jobs::route::JobRouteError;
 
 /// The replicated identity of one physical execution, read back from the
 /// receipt that authorized it. Without it there is no distributed chain to
@@ -244,7 +244,7 @@ impl Operation for ExecutionChainOperation {
             self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
                 state: "execution chain".to_string(),
                 expected: "storage page",
-                got: format!("{event:?}"),
+                got: event.label(),
             }));
             return smallvec![];
         }

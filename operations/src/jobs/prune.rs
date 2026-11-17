@@ -21,13 +21,13 @@ use byteview::ByteView;
 use tracing::warn;
 
 use super::JOB_PRUNE_PAGE;
-use super::store::{
-    artifact_tombstone_key, batch_delete, first_schedule_entry, iter_prefix_page,
-    job_entry_deletes, preserve_artifact_tombstone, prune_delete_entries, read_job_record,
-    staging_row_deletes,
+use super::store::query::{
+    batch_delete, first_schedule_entry, iter_prefix_page, job_entry_deletes, staging_row_deletes,
 };
+use super::store::state::{artifact_tombstone_key, preserve_artifact_tombstone, read_job_record};
 use crate::driver::{DriverContext, drive};
 use crate::plugins::work::holds_job;
+use aruna_core::structs::execution::job::prune_delete_entries;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct JobPruneOutcome {
@@ -40,7 +40,7 @@ pub async fn prune_job_batch(context: &DriverContext) -> Result<JobPruneOutcome,
     prune_job_page(context, JOB_PRUNE_PAGE).await
 }
 
-pub(crate) async fn prune_job_page(
+async fn prune_job_page(
     context: &DriverContext,
     page_size: usize,
 ) -> Result<JobPruneOutcome, String> {
@@ -177,7 +177,8 @@ async fn delete_job_artifact(context: &DriverContext, record: &JobRecord) -> Res
         Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
         Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
         event => Err(format!(
-            "unexpected hidden artifact delete event: {event:?}"
+            "unexpected hidden artifact delete event: {}",
+            event.label()
         )),
     }
 }
@@ -223,9 +224,9 @@ pub async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHand
 mod tests {
     use super::*;
     use crate::jobs::JOB_RETENTION_MS;
-    use crate::jobs::store::{
-        ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
-    };
+    use crate::jobs::store::put_job_entry;
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::{ClaimOutcome, claim_job, complete_job, transition_to_running};
     use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::id::NodeId;

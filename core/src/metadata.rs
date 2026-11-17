@@ -1475,12 +1475,45 @@ pub enum MetadataError {
     MissingDependencies(String),
 }
 
+impl MetadataError {
+    /// A missing graph is a durable registry row whose materialization has not
+    /// caught up, which the read API already reports as service unavailable. Only a
+    /// rejected document stays permanent.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::ProfileValidation(findings) => {
+                !findings.is_empty()
+                    && findings.iter().all(|finding| {
+                        matches!(
+                            finding.code.as_str(),
+                            "profile_unavailable" | "validator_unavailable"
+                        )
+                    })
+            }
+            Self::Validation(_) | Self::InvalidInput(_) | Self::InvalidEffect => false,
+            Self::Storage(error) => error.is_transient(),
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataValidationViolation {
     pub code: String,
     pub message: String,
     pub pointer: String,
     pub entity_id: Option<String>,
+}
+
+impl From<craqle::CrateViolation> for MetadataValidationViolation {
+    fn from(violation: craqle::CrateViolation) -> Self {
+        Self {
+            code: violation.code.to_string(),
+            message: violation.message,
+            pointer: violation.pointer,
+            entity_id: violation.entity_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

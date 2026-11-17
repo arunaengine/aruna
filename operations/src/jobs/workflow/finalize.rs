@@ -23,10 +23,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use super::super::output_record::store_outputs;
-use super::super::store::{
-    ExecutionCompleteOutcome, cancel_execution, complete_cancelled, complete_execution,
-    fail_execution, read_attempt_control, read_job_record, record_attempt_started,
+use super::super::store::attempt::{
+    cancel_execution, fail_execution, read_attempt_control, record_attempt_started,
     transition_to_cancelling,
+};
+use super::super::store::state::{
+    ExecutionCompleteOutcome, complete_cancelled, complete_execution, read_job_record,
 };
 use super::super::submit::schedule_drain_effect;
 use super::prepare::job_bucket;

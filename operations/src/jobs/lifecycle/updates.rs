@@ -20,9 +20,10 @@ use super::held::HeldReservations;
 use super::reservation::ReleaseExecutionOperation;
 use super::witness::arm_family;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::{Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::read_job_record;
+use crate::jobs::store::state::read_job_record;
 use crate::node::dashboard::notify_dashboard_change;
 
 /// Spacing between retries of a terminal publication that stayed pending.
@@ -193,7 +194,7 @@ pub async fn publish_state(
             if state == PhysicalExecutionState::Error {
                 arm_family(context, chain.family, unix_timestamp_millis()).await;
             }
-            super::outbox::kick(context).await;
+            super::outbox::timers::kick(context).await;
             true
         }
         Ok(outcome) => {

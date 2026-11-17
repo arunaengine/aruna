@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod drain;
+pub mod timers;
 
 use std::time::Duration;
 
@@ -12,7 +13,6 @@ use aruna_core::effects::{
     StorageEffect,
 };
 use aruna_core::events::{Event, JobRecordEvent, NetEvent, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_OUTBOX_KEYSPACE;
 use aruna_core::operation::Operation;
@@ -25,19 +25,18 @@ use smallvec::smallvec;
 use tracing::{debug, warn};
 
 use super::LifecycleError;
-use crate::driver::DriverContext;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::rows::{OutboxEntry, from_bytes, to_bytes};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, to_bytes};
 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;
 /// Wall-clock budget of one record publish.
-pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
+const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 /// Spacing between drain passes while entries remain undeliverable.
 pub const OUTBOX_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Definitive refusals one record is offered through before it is dropped.
 /// Unreachable holders never count: only a holder's own refusal does.
-pub const MAX_PUBLISH_REJECTIONS: u32 = 16;
+const MAX_PUBLISH_REJECTIONS: u32 = 16;
 
 /// Kicks the outbox drain without persisting a timer of its own.
 pub fn schedule_outbox_drain(after: Duration) -> Effect {
@@ -45,15 +44,6 @@ pub fn schedule_outbox_drain(after: Duration) -> Effect {
         key: TaskKey::DrainFamilyOutbox,
         after,
     })
-}
-
-/// Asks the drain to run now, after a record was queued for replication.
-pub async fn kick(context: &DriverContext) {
-    if let Some(task) = context.task_handle.as_ref() {
-        let _ = task
-            .send_effect(schedule_outbox_drain(Duration::ZERO))
-            .await;
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,7 +228,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Read".to_string(),
                     expected: "outbox read result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Offer => match event {
@@ -277,7 +267,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Offer".to_string(),
                     expected: "job record publish result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Store => match event {
@@ -286,7 +276,7 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Store".to_string(),
                     expected: "outbox write result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Clear => match event {
@@ -295,14 +285,14 @@ impl Operation for PublishRecordOperation {
                 other => self.fail(LifecycleError::UnexpectedEvent {
                     state: "Clear".to_string(),
                     expected: "outbox delete result",
-                    got: format!("{other:?}"),
+                    got: other.label(),
                 }),
             },
             PublishState::Init | PublishState::Finish | PublishState::Error => {
                 self.fail(LifecycleError::UnexpectedEvent {
                     state: format!("{:?}", self.state),
                     expected: "no event",
-                    got: format!("{event:?}"),
+                    got: event.label(),
                 })
             }
         }
@@ -318,38 +308,6 @@ impl Operation for PublishRecordOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
-    }
-}
-
-/// Re-arms the replication and witness queues after a restart. Both queues are
-/// durable rows, so the timers only have to be brought back, never the work.
-pub async fn restore_lifecycle_timers(
-    storage: &aruna_storage::StorageHandle,
-    task_handle: &aruna_tasks::TaskHandle,
-) {
-    let pending = crate::jobs::store::iter_prefix_page(
-        storage,
-        aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
-        None,
-        None,
-        1,
-        None,
-    )
-    .await
-    .map(|(rows, _)| !rows.is_empty())
-    .unwrap_or(false);
-    let mut timers = vec![schedule_outbox_drain(OUTBOX_RETRY_AFTER)];
-    if pending {
-        timers.push(super::witness::schedule_witness_drain(Duration::from_secs(
-            1,
-        )));
-    }
-    for timer in timers {
-        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(timer).await
-        {
-            warn!(message = %message, "Failed to restore a job lifecycle timer");
-        }
     }
 }
 

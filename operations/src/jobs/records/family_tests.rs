@@ -17,9 +17,9 @@ use aruna_core::types::{Key, Value};
 
 use super::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::RECORD_PAGE_SIZE;
-use crate::jobs::records::keys::{family_prefix, kind_prefix, record_key};
-use crate::jobs::records::rows::to_bytes;
 use crate::tests::records::Family;
+use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix, record_key};
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 fn fixture() -> Family {
     Family::new([1u8; 32])

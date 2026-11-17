@@ -6,6 +6,7 @@
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::execution::job::record_rows::OutboxEntry;
 use aruna_core::structs::execution::job::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::node_state::PersistedNodeState;
@@ -25,7 +26,6 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use aruna_operations::jobs::lifecycle::witness::WitnessDeadline;
-use aruna_operations::jobs::records::rows::OutboxEntry;
 use aruna_operations::placement::policy::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use serde::Serialize;

@@ -17,14 +17,15 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
+use crate::jobs::lifecycle::ingress::submit_external_job;
 use crate::jobs::lifecycle::routing::family_status;
-use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::AuthToken;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
@@ -129,7 +130,7 @@ async fn admits_local_claim() {
         drive(AliasFamilyOperation::new(job_id), &ctx).await,
         Ok(Some(family.family()))
     );
-    let record = crate::jobs::store::read_job_record(&ctx.storage_handle, job_id, None)
+    let record = crate::jobs::store::state::read_job_record(&ctx.storage_handle, job_id, None)
         .await
         .expect("logical row read")
         .expect("logical row exists");
@@ -263,7 +264,7 @@ async fn answers_by_alias() {
     };
     assert!(matches!(
         family_status(&ctx, &stranger, family.job_id).await,
-        Some(Err(crate::jobs::JobRouteError::NotFound))
+        Some(Err(crate::jobs::route::JobRouteError::NotFound))
     ));
 }
 

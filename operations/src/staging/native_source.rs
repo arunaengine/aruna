@@ -38,7 +38,6 @@ use crate::connectors::resolver::{NATIVE_RELATIONSHIP_ID, ORIGIN_NODE_ID};
 use crate::distribution::delegate::{prune_nonces, spend_nonce};
 use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
-use crate::jobs::source_read::{HEAD_OPERATION, READ_OPERATION};
 use crate::metadata::api::load_realm_config;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::get::{
@@ -51,6 +50,7 @@ use crate::sync::mirror_repair::{KickRepairOperation, StoreStatusOperation};
 use crate::sync::sync_relationship::{
     GetRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 const NATIVE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADER_SIZE: usize = 64 * 1024;

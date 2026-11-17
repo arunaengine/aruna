@@ -19,6 +19,7 @@ aruna-kpabe = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }
+unicode-normalization = { workspace = true }
 thiserror = { workspace = true }
 craqle = { workspace = true }
 byteview = { workspace = true }

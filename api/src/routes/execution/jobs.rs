@@ -8,6 +8,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use aruna_core::NodeId;
+use aruna_core::jobs::JobKind;
 use aruna_core::structs::execution::job::{
     CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
@@ -21,11 +22,11 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::family_report;
+use aruna_operations::jobs::lifecycle::report::family_report;
 use aruna_operations::jobs::service::{
-    ArtifactLookup, JobKind, JobReportLookup, OwnedArtifact, RoutedCancelOutcome,
-    cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
-    read_report_routed, resolve_job_owner,
+    ArtifactLookup, JobReportLookup, OwnedArtifact, RoutedCancelOutcome, cancel_job_routed,
+    delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed, read_report_routed,
+    resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
 use aruna_operations::node::node_info::read_info_documents;
@@ -500,7 +501,7 @@ pub(crate) fn map_submit_error(
             ServerError::ServiceUnavailableReason(moving.to_string())
         }
         SubmitJobError::Upload(error) => {
-            use aruna_operations::jobs::import::UploadClaimError;
+            use aruna_operations::jobs::import::upload::UploadClaimError;
             match error {
                 UploadClaimError::NotFound => ServerError::NotFound,
                 UploadClaimError::WrongOwner => ServerError::Forbidden,

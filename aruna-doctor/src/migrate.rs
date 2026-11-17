@@ -38,6 +38,9 @@ use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
 use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
 use aruna_core::structs::execution::job::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
@@ -55,7 +58,6 @@ use aruna_core::structs::placement::policy::attachment::{
 use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
-use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use aruna_operations::plugins::decide::WaitingRow;
 use aruna_operations::replication::queue::LiveObligationRecord;
 use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
@@ -1077,13 +1079,15 @@ mod tests {
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
     use aruna_core::node_vault::NodeVaultKey;
+    use aruna_core::structs::execution::job::record_rows::{
+        PendingNeed, PendingRecord, ProjectionCache,
+    };
     use aruna_core::structs::execution::job::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-    use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
     use std::path::Path;

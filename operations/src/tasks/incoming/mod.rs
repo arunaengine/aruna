@@ -73,7 +73,7 @@ use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, settle_terminals};
 use crate::jobs::lifecycle::witness::{WITNESS_RETRY_AFTER, drain_witness_deadlines};
 use crate::jobs::prune::{prune_job_batch, restore_prune_timer};
 use crate::jobs::runtime::JobsRuntime;
-use crate::jobs::store::release_job;
+use crate::jobs::store::state::release_job;
 use crate::jobs::{DRAIN_RETRY_AFTER, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::metadata::materialization_queue::{
     MATERIALIZATION_POLL_AFTER, MATERIALIZATION_RETRY_AFTER, MetadataDrainResult, NEXT_BATCH_AFTER,

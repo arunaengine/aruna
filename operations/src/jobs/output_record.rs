@@ -11,10 +11,11 @@ use aruna_core::structs::execution::job::{
 use tracing::{debug, warn};
 
 use super::lifecycle::chain::ExecutionChainOperation;
-use super::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
-};
-use super::store::{JobMutationError, persist_output_record, read_output_record};
+use super::records::RecordStoreError;
+use super::records::admit::Admission;
+use super::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use super::store::JobMutationError;
+use super::store::state::{persist_output_record, read_output_record};
 use crate::driver::{DriverContext, drive};
 
 /// Build, sign, and make durable this execution's exact output record, then
@@ -219,7 +220,8 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use super::super::store::{insert_job, read_attempt_control, reserve_output_commits};
+    use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
+    use super::super::store::query::insert_job;
     use super::*;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
@@ -311,7 +313,7 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        super::super::store::record_attempt_intent(
+        super::super::store::state::record_attempt_intent(
             &context.storage_handle,
             record.job_id,
             TOKEN,

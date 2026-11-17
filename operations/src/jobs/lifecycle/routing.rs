@@ -14,16 +14,15 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::time::unix_timestamp_millis;
 
-use std::time::Duration;
-
 use super::ids::{session_of, workspace_of};
-use crate::driver::{DriverContext, drive};
+use crate::driver::{DriverContext, drive, drive_retry};
+use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
+use crate::jobs::records::project::{
+    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
 };
+use crate::jobs::route::JobRouteError;
 use crate::jobs::service::{RoutedJobStatus, read_owned_job};
-use crate::jobs::{JobRouteError, MUTATE_MAX_ATTEMPTS};
 
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.
@@ -42,32 +41,25 @@ pub(crate) fn decidable(projected: &ProjectedFamily) -> Result<(), JobRouteError
     }
 }
 
-/// Drives one projection, retrying a lost optimistic transaction with the same
-/// bounded backoff a job mutation uses. `None` names no family here.
+/// Drives one projection, retrying a lost optimistic transaction with the
+/// runner's conflict rule. `None` names no family here.
 async fn project_alias(
     context: &DriverContext,
     job_id: JobId,
 ) -> Result<Option<ProjectedFamily>, JobRouteError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        match drive(
-            ProjectFamilyOperation::new(ProjectFamilyConfig {
-                family: FamilyRef::Alias(job_id),
-                now_ms: unix_timestamp_millis(),
-                rebuild: false,
-            }),
-            context,
-        )
-        .await
-        {
-            Ok(projected) => return Ok(Some(projected)),
-            Err(RecordStoreError::UnknownAlias) => return Ok(None),
-            Err(error) if error.is_conflict() => {
-                tokio::time::sleep(Duration::from_millis(1 << attempt.min(6))).await;
-            }
-            Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
-        }
+    let build = || {
+        ProjectFamilyOperation::new(ProjectFamilyConfig {
+            family: FamilyRef::Alias(job_id),
+            now_ms: unix_timestamp_millis(),
+            rebuild: false,
+        })
+    };
+    match drive_retry(build, context, &job_id.to_bytes()).await {
+        Ok(projected) => Ok(Some(projected)),
+        Err(RecordStoreError::UnknownAlias) => Ok(None),
+        Err(error) if error.is_conflict() => Err(JobRouteError::Unavailable(BUSY.to_string())),
+        Err(error) => Err(JobRouteError::Unavailable(error.to_string())),
     }
-    Err(JobRouteError::Unavailable(BUSY.to_string()))
 }
 
 /// The reduced family of one alias plus the stored spec of its canonical claim.

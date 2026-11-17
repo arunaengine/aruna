@@ -26,10 +26,12 @@ use tracing::{debug, warn};
 use ulid::Ulid;
 
 use super::{LifecycleError, stored_view};
-use crate::jobs::records::keys::{family_prefix, record_key};
-use crate::jobs::records::rows::{OutboxEntry, ProjectionCache, from_bytes, to_bytes};
 use crate::jobs::records::verify::{Evidence, FamilyView};
-use crate::jobs::store::job_insert_entries;
+use aruna_core::structs::execution::job::job_insert_entries;
+use aruna_core::structs::execution::job::record_keys::{family_prefix, record_key};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, ProjectionCache, from_bytes, to_bytes,
+};
 
 /// Reservations one capacity decision reads. A node cannot run more concurrent
 /// executions than this without its backend ceiling stopping it first.
@@ -311,13 +313,8 @@ impl ReserveExecutionOperation {
         smallvec![]
     }
 
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(LifecycleError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&mut self, expected: &'static str, got: &'static str) -> Effects {
+        self.fail(LifecycleError::unexpected(&self.state, expected, got))
     }
 }
 
@@ -343,12 +340,12 @@ impl Operation for ReserveExecutionOperation {
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", format!("{other:?}")),
+                other => self.unexpected("realm config read", other.label()),
             },
             ReserveState::Begin => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => self.scan(txn_id),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
+                other => self.unexpected("transaction start", other.label()),
             },
             ReserveState::Scan { txn_id } => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -373,7 +370,7 @@ impl Operation for ReserveExecutionOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("reservation scan", format!("{other:?}")),
+                other => self.unexpected("reservation scan", other.label()),
             },
             ReserveState::ReadCache { txn_id } => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -386,7 +383,7 @@ impl Operation for ReserveExecutionOperation {
                     self.write(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("projection cache read", format!("{other:?}")),
+                other => self.unexpected("projection cache read", other.label()),
             },
             ReserveState::Write { txn_id } => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
@@ -395,19 +392,21 @@ impl Operation for ReserveExecutionOperation {
                     self.commit(txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("reservation write", format!("{other:?}")),
+                other => self.unexpected("reservation write", other.label()),
             },
             ReserveState::Commit { .. } => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
+                other => self.unexpected("transaction commit", other.label()),
             },
             ReserveState::Cancel { .. } => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", format!("{other:?}")),
+                other => self.unexpected("transaction abort", other.label()),
             },
-            ReserveState::Init | ReserveState::Finish | ReserveState::Error => smallvec![],
+            ReserveState::Init | ReserveState::Finish | ReserveState::Error => {
+                self.unexpected("no event", event.label())
+            }
         }
     }
 
@@ -493,12 +492,8 @@ impl ReleaseExecutionOperation {
         smallvec![]
     }
 
-    fn unexpected(&self, expected: &'static str, got: String) -> LifecycleError {
-        LifecycleError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got,
-        }
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> LifecycleError {
+        LifecycleError::unexpected(&self.state, expected, got)
     }
 }
 
@@ -526,7 +521,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction start", format!("{other:?}"));
+                    let error = self.unexpected("transaction start", other.label());
                     self.fail(error)
                 }
             },
@@ -546,7 +541,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
                 other => {
-                    let error = self.unexpected("reservation read result", format!("{other:?}"));
+                    let error = self.unexpected("reservation read result", other.label());
                     self.cancel(txn_id, error)
                 }
             },
@@ -558,7 +553,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.cancel(txn_id, error.into()),
                 other => {
-                    let error = self.unexpected("reservation delete result", format!("{other:?}"));
+                    let error = self.unexpected("reservation delete result", other.label());
                     self.cancel(txn_id, error)
                 }
             },
@@ -569,7 +564,7 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction commit", format!("{other:?}"));
+                    let error = self.unexpected("transaction commit", other.label());
                     self.fail(error)
                 }
             },
@@ -583,11 +578,14 @@ impl Operation for ReleaseExecutionOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    let error = self.unexpected("transaction abort", format!("{other:?}"));
+                    let error = self.unexpected("transaction abort", other.label());
                     self.fail(error)
                 }
             },
-            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => smallvec![],
+            ReleaseState::Init | ReleaseState::Finish | ReleaseState::Error => {
+                let error = self.unexpected("no event", event.label());
+                self.fail(error)
+            }
         }
     }
 

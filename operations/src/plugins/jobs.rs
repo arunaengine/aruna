@@ -24,7 +24,9 @@ use super::work::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::jobs::service::find_dedup_job;
-use crate::jobs::store::{JobMutationError, read_job_record, set_cancel_requested};
+use crate::jobs::store::JobMutationError;
+use crate::jobs::store::attempt::set_cancel_requested;
+use crate::jobs::store::state::read_job_record;
 
 /// Outputs of one page.
 const PAGE: usize = 100;

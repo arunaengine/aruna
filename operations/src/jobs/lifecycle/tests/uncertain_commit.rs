@@ -36,10 +36,10 @@ use crate::jobs::lifecycle::target::{
     CommitVerdict, RESERVE_ATTEMPTS, classify, commit_receipt, commit_with, local_capability,
 };
 use crate::jobs::records::family::LoadFamilyOperation;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::rows::to_bytes;
 use crate::node::node_info::set_operator_drain;
 use crate::tests::records::{Family, REALM, context};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_core::structs::execution::job::record_rows::to_bytes;
 
 /// Detects a wakeup that never arrives, not a slow machine.
 const WAKEUP_LIMIT: Duration = Duration::from_secs(30);

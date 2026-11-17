@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::jobs::JobRouteError;
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::runs::{RunReadError, read_run};
 use aruna_operations::jobs::service::resolve_job_owner;
 use axum::extract::{Path, State};

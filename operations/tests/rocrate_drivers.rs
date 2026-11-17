@@ -48,10 +48,12 @@ use aruna_operations::connectors::create_connector::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use aruna_operations::jobs::export::run_export_job;
-use aruna_operations::jobs::import::{load_rocrate_upload, run_rocrate_import};
+use aruna_operations::jobs::import::run_rocrate_import;
+use aruna_operations::jobs::import::upload_store::load_rocrate_upload;
 use aruna_operations::jobs::service::read_artifact_range;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, insert_job, list_job_entries, release_job, transition_to_running,
+use aruna_operations::jobs::store::query::{insert_job, list_job_entries};
+use aruna_operations::jobs::store::state::{
+    ClaimOutcome, claim_job, release_job, transition_to_running,
 };
 use aruna_operations::jobs::submit::mint_job_id;
 use aruna_operations::metadata::MetadataHandle;
@@ -1809,9 +1811,13 @@ async fn claim_context(
     job_id: JobId,
     payload: JobPayload,
 ) -> Result<JobContext, Box<dyn std::error::Error>> {
-    if aruna_operations::jobs::store::read_job_record(&fixture.context.storage_handle, job_id, None)
-        .await?
-        .is_none()
+    if aruna_operations::jobs::store::state::read_job_record(
+        &fixture.context.storage_handle,
+        job_id,
+        None,
+    )
+    .await?
+    .is_none()
     {
         let now = unix_timestamp_millis();
         insert_job(

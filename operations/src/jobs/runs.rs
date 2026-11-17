@@ -12,7 +12,7 @@ use ulid::Ulid;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::DriverContext;
-use crate::jobs::store::{read_crate_status, read_run_link};
+use crate::jobs::store::attempt::{read_crate_status, read_run_link};
 
 #[derive(Debug, Error)]
 pub enum RunReadError {

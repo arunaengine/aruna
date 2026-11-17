@@ -15,9 +15,9 @@ use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use super::keys::{family_prefix, kind_prefix};
-use super::rows::from_bytes;
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE};
+use aruna_core::structs::execution::job::record_keys::{family_prefix, kind_prefix};
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 
 /// Why one family could not be read completely. Every variant leaves the caller
 /// undecided; none of them means the family is empty.
@@ -111,7 +111,8 @@ impl Operation for LoadFamilyOperation {
     fn step(&mut self, event: Event) -> Effects {
         if !self.started || self.outcome.is_some() {
             return self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {event:?}"
+                "unexpected storage event: {}",
+                event.label()
             ))));
         }
         match event {
@@ -138,7 +139,8 @@ impl Operation for LoadFamilyOperation {
                 self.finish(Err(FamilyReadError::Storage(error.to_string())))
             }
             other => self.finish(Err(FamilyReadError::Storage(format!(
-                "unexpected storage event: {other:?}"
+                "unexpected storage event: {}",
+                other.label()
             )))),
         }
     }
