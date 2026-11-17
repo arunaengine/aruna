@@ -6,6 +6,7 @@
 use std::sync::OnceLock;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -279,7 +280,7 @@ impl Operation for DeselectDocumentOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<ReplicaRecord>, SelectionError> {
         if let Some(replica) = self.replica.take() {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(ReplicaRecord {
                 selected: false,
                 ..replica
@@ -328,7 +329,7 @@ impl Operation for TrackCreatedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SelectionError> {
         if self.written {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(()));
         }
         if read_replica_row(result)?.is_some() {

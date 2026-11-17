@@ -5,6 +5,7 @@
 use crate::device::retry::RetryView;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
@@ -329,7 +330,7 @@ impl Operation for ClaimStateOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
         if self.written {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(true));
         }
         let stored = result.values()?.into_iter().next().flatten();

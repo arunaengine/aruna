@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
@@ -275,7 +276,7 @@ impl Operation for StoreUploadOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, StoreUploadError> {
         if self.written {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(true));
         }
         let stored = result.values()?.into_iter().next().flatten();

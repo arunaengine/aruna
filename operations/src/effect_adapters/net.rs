@@ -29,7 +29,7 @@ pub(super) async fn dispatch_heartbeat(effect: HeartbeatEffect, context: &Driver
     };
     let event = match effect {
         HeartbeatEffect::Record(heartbeat) => {
-            net_handle.record_own_heartbeat(heartbeat);
+            net_handle.record_own_heartbeat(*heartbeat);
             HeartbeatEvent::Peers(net_handle.realm_peers().await)
         }
         HeartbeatEffect::Push { peer, frame } => {

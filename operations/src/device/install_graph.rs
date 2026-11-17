@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::keyspaces::DEVICE_GRAPH_KEYSPACE;
@@ -102,12 +103,12 @@ impl Operation for InstallGraphOperation {
             return Ok(Next::Done(false));
         };
         let install = self.join(graph);
-        Ok(Next::Call(IoCall::Effect(Effect::Metadata(install))))
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(install)))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, InstallError> {
         if self.installed {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(true));
         }
         match result.event()? {
@@ -159,10 +160,10 @@ mod tests {
     }
 
     fn installed() -> IoResult {
-        IoResult::Event(Event::Metadata(MetadataEvent::SnapshotInstalled {
+        IoResult::Event(Box::new(Event::Metadata(MetadataEvent::SnapshotInstalled {
             graph_iri: String::new(),
             applied: true,
-        }))
+        })))
     }
 
     // The snapshot is installed, then its size and the refreshed row are written together.
@@ -174,7 +175,7 @@ mod tests {
         let rows = joined.store_rows();
         assert_eq!(
             install.first(),
-            Ok(Next::Call(IoCall::Effect(Effect::Metadata(snapshot))))
+            Ok(Next::Call(IoCall::Effect(Box::new(Effect::Metadata(snapshot)))))
         );
         assert_eq!(install.next(installed()), Ok(rows));
         assert_eq!(joined.replica.last_synced_ms, Some(9));
@@ -191,9 +192,9 @@ mod tests {
         let mut install = InstallGraphOperation::new(ahead, graph(1), 9);
         install.first().unwrap();
         assert_eq!(install.replica.displayed_jsonld, "local");
-        let refused = IoResult::Event(Event::Metadata(MetadataEvent::ValidationResult {
+        let refused = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::ValidationResult {
             graph_iri: String::new(),
-        }));
+        })));
         assert_eq!(install.next(refused), Ok(Next::Done(false)));
         let mut install = InstallGraphOperation::new(replica(), graph(1), 9);
         install.first().unwrap();

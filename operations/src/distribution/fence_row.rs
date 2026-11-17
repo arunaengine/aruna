@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::rows::done;
 use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
@@ -91,7 +92,7 @@ impl Operation for UpdateFenceOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<LocalFence>, FenceError> {
         if let Some(fence) = self.written.take() {
-            result.done()?;
+            done(result)?;
             return Ok(Next::Done(fence));
         }
         let value = result.values()?.into_iter().next().flatten();

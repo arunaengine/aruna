@@ -114,7 +114,7 @@ impl EffectOperation for SendHeartbeatOperation {
         self.frame = Value::from([length.as_slice(), &bytes].concat());
         self.phase = SendPhase::Record;
         smallvec![Effect::Net(NetEffect::Heartbeat(Box::new(
-            HeartbeatEffect::Record(heartbeat)
+            HeartbeatEffect::Record(Box::new(heartbeat))
         )))]
     }
 
@@ -426,7 +426,7 @@ mod tests {
         });
         check_trace(
             &mut operation,
-            &[heartbeat(HeartbeatEffect::Record(sent.clone()))],
+            &[heartbeat(HeartbeatEffect::Record(Box::new(sent.clone())))],
             vec![
                 (
                     answer(HeartbeatEvent::Peers(vec![node(1), node(2), node(3)])),
