@@ -5,10 +5,13 @@
 
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_RUNS_KEYSPACE};
 use aruna_core::plugin_runs::{
-    ATTENTION_ROW, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState, WAITING_ROW,
-    parse_queue_key, queue_key, run_key, run_prefix,
+    ATTENTION_ROW, MAX_ATTEMPTS, PluginRun, RUN_RETENTION_MS, RUN_ROW, RUNS_QUEUED, RunState,
+    WAITING_ROW, parse_queue_key, queue_key, run_key, run_prefix,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
@@ -467,6 +470,74 @@ pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
     audit
         .entries()
         .map_err(|error| StoreError(error.to_string()))
+}
+
+/// How often the worker looks for due runs.
+pub const TICK: Duration = Duration::from_secs(1);
+/// The longest wait before a failed attempt runs again.
+const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
+
+/// How one attempt of a run ended, before its intents are inspected.
+#[derive(Debug)]
+pub(crate) enum Ended {
+    Output(Option<String>),
+    Failed(String),
+    /// A host or infrastructure error: the run starts again later.
+    Retry(String),
+    Cancelled(String),
+    /// The runtime had no free slot: the run waits without using an attempt.
+    Busy(String),
+    /// The node stops; the run starts again from the top at the next start.
+    Stopped,
+}
+
+pub(crate) fn conclude(
+    run: &mut PluginRun,
+    ended: Ended,
+    changed: bool,
+    open: Result<Option<String>, StoreError>,
+    now_ms: u64,
+) {
+    match open {
+        Ok(Some(reason)) => return run.finish(RunState::NeedsAttention, Some(reason), now_ms),
+        Err(error) => return hold(run, format!("its calls are not readable: {error}"), now_ms),
+        Ok(None) => {}
+    }
+    if changed {
+        let message = "the run made a call that differs from its earlier attempt";
+        return run.finish(RunState::Failed, Some(message.into()), now_ms);
+    }
+    match ended {
+        Ended::Output(output) => {
+            run.output = output;
+            run.finish(RunState::Succeeded, None, now_ms);
+        }
+        Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
+        Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
+        Ended::Retry(message) => retry(run, message, now_ms),
+        Ended::Busy(message) => hold(run, message, now_ms),
+        Ended::Stopped => {}
+    }
+}
+
+/// Queues the run again soon without counting the attempt that just ended.
+fn hold(run: &mut PluginRun, message: String, now_ms: u64) {
+    run.attempts = run.attempts.saturating_sub(1);
+    run.state = RunState::Queued;
+    run.message = Some(message);
+    run.due_ms = now_ms.saturating_add(u64::try_from(TICK.as_millis()).unwrap_or(u64::MAX));
+}
+
+/// Queues the run again after a backoff, or fails it after its last attempt.
+fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
+    if run.attempts >= MAX_ATTEMPTS {
+        run.finish(RunState::Failed, Some(message), now_ms);
+        return;
+    }
+    let backoff = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, run.attempts, 0);
+    run.state = RunState::Queued;
+    run.message = Some(message);
+    run.due_ms = now_ms.saturating_add(u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX));
 }
 
 #[cfg(test)]

@@ -4,6 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::{
@@ -37,7 +40,8 @@ use crate::metadata::projector::dot_applied;
 const BATCH: usize = 100;
 /// Encoded row bytes of one request at most, well below the transport's 16 MiB message bound.
 const REQUEST_BYTES: usize = 4 * 1024 * 1024;
-const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
+/// The longest wait before a receiver is tried again.
+const MAX_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
 /// When each receiver is tried again after a failed or busy send.
 #[derive(Debug, Default)]
@@ -50,7 +54,8 @@ impl Backoff {
 
     fn failed(&mut self, node: NodeId, now_ms: u64) {
         let tries = self.0.get(&node).map_or(0, |(tries, _)| *tries) + 1;
-        let wait = (1000u64 << tries.min(20)).min(MAX_BACKOFF_MS);
+        let wait = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, tries, 0);
+        let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
         self.0.insert(node, (tries, now_ms + wait));
     }
 }

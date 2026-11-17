@@ -6,13 +6,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    EVENTS_QUEUED, MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
+    EVENTS_QUEUED, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
 };
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -53,15 +52,13 @@ use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, replay_page, replay_scan};
 use super::rows::{StoreError, decode, page_rows, scan_rows};
-use super::runs::{RunError, prune_runs, read_run, save_run, unfinished};
+use super::runs::{Ended, RunError, TICK, conclude, prune_runs, read_run, save_run, unfinished};
 use super::waiting::recheck_waiting;
 use super::work::prune_work;
 use crate::driver::{DriverContext, drive};
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::plugin_runs::{Decisions, EventBatch};
 
-/// How often the worker looks for due runs.
-pub const TICK: Duration = Duration::from_secs(1);
 /// How often the worker rechecks the events waiting for their install record or account.
 const RECHECK_MS: u64 = 10 * 1000;
 /// How often the worker prunes runs that ended before the retention period.
@@ -69,21 +66,6 @@ const PRUNE_MS: u64 = 3600 * 1000;
 /// How often the worker keeps the summaries of finished plugin work.
 const SETTLE_MS: u64 = 30 * 1000;
 /// Longest wait before a run that failed in the host starts again.
-const MAX_BACKOFF_MS: u64 = 10 * 60 * 1000;
-
-/// How one attempt of a run ended, before its intents are inspected.
-#[derive(Debug)]
-enum Ended {
-    Output(Option<String>),
-    Failed(String),
-    /// A host or infrastructure error: the run starts again later.
-    Retry(String),
-    Cancelled(String),
-    /// The runtime had no free slot: the run waits without using an attempt.
-    Busy(String),
-    /// The node stops; the run starts again from the top at the next start.
-    Stopped,
-}
 
 /// The node service that owns the plugin runtime and the runs it executes.
 pub struct Worker {
@@ -524,57 +506,6 @@ fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
         Ended::Busy(message) => Ended::Busy(broker.scrub(&message)),
         Ended::Stopped => Ended::Stopped,
     }
-}
-
-fn conclude(
-    run: &mut PluginRun,
-    ended: Ended,
-    changed: bool,
-    open: Result<Option<String>, StoreError>,
-    now_ms: u64,
-) {
-    match open {
-        Ok(Some(reason)) => return run.finish(RunState::NeedsAttention, Some(reason), now_ms),
-        Err(error) => return hold(run, format!("its calls are not readable: {error}"), now_ms),
-        Ok(None) => {}
-    }
-    if changed {
-        let message = "the run made a call that differs from its earlier attempt";
-        return run.finish(RunState::Failed, Some(message.into()), now_ms);
-    }
-    match ended {
-        Ended::Output(output) => {
-            run.output = output;
-            run.finish(RunState::Succeeded, None, now_ms);
-        }
-        Ended::Failed(message) => run.finish(RunState::Failed, Some(message), now_ms),
-        Ended::Cancelled(message) => run.finish(RunState::Cancelled, Some(message), now_ms),
-        Ended::Retry(message) => retry(run, message, now_ms),
-        Ended::Busy(message) => hold(run, message, now_ms),
-        Ended::Stopped => {}
-    }
-}
-
-/// Queues the run again soon without counting the attempt that just ended.
-fn hold(run: &mut PluginRun, message: String, now_ms: u64) {
-    run.attempts = run.attempts.saturating_sub(1);
-    run.state = RunState::Queued;
-    run.message = Some(message);
-    run.due_ms = now_ms.saturating_add(TICK.as_millis() as u64);
-}
-
-/// Queues the run again after a backoff, or fails it after its last attempt.
-fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
-    if run.attempts >= MAX_ATTEMPTS {
-        run.finish(RunState::Failed, Some(message), now_ms);
-        return;
-    }
-    let backoff = 1000u64
-        .saturating_mul(1 << run.attempts.min(20))
-        .min(MAX_BACKOFF_MS);
-    run.state = RunState::Queued;
-    run.message = Some(message);
-    run.due_ms = now_ms.saturating_add(backoff);
 }
 
 /// Matches every pending journal row of this node with at most `bound` forward rows per install,
