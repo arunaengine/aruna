@@ -38,7 +38,9 @@ use super::channel::ChannelStream;
 use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit};
+use super::{
+    BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, host_capabilities,
+};
 use aruna_core::time::unix_timestamp_millis;
 
 /// Label recording the effective walltime ceiling in milliseconds.
@@ -702,14 +704,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     fn capabilities(&self) -> BackendCaps {
-        BackendCaps {
-            file_staging: true,
-            direct_s3: true,
-            local_site: true,
-            session: true,
-            limits: self.config.envelope,
-            ..BackendCaps::default()
-        }
+        host_capabilities(self.config.envelope)
     }
 
     fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {

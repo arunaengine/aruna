@@ -86,6 +86,19 @@ pub fn enforced_limit(
     }
 }
 
+/// What a backend offers whose attempts run on the controller host with an open channel.
+#[cfg(any(all(feature = "apptainer", unix), feature = "docker"))]
+pub(crate) fn host_capabilities(limits: ResourceEnvelope) -> BackendCaps {
+    BackendCaps {
+        file_staging: true,
+        direct_s3: true,
+        local_site: true,
+        session: true,
+        limits,
+        ..BackendCaps::default()
+    }
+}
+
 #[cfg(any(feature = "apptainer", feature = "docker", feature = "kubernetes"))]
 pub(crate) fn digest_pinned(image: &str) -> bool {
     image
