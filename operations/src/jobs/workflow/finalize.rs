@@ -53,8 +53,7 @@ pub(super) async fn finalize_session(
     session: Option<&Arc<Session>>,
     reason: EndReason,
 ) {
-    let storage = &context.storage_handle;
-    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let _ = transition_to_cancelling(context, job_id, token, unix_timestamp_millis()).await;
     let logs = match backend.cancel(fence).await {
         Ok(CancelEvidence::Stopped(_)) => {
             let Some(logs) =
@@ -78,7 +77,7 @@ pub(super) async fn finalize_session(
     };
     info!(job_id = %job_id, reason = reason.as_str(), "Session finished");
     Box::pin(write_session_report(
-        storage, job_id, token, session, reason,
+        context, job_id, token, session, reason,
     ))
     .await;
     // A kernel that died, or a helper that never answered, is a permanent
@@ -86,7 +85,7 @@ pub(super) async fn finalize_session(
     if reason == EndReason::KernelExit {
         let result = execution_result_for(bucket, Some(1), Vec::new(), logs);
         let terminal = Box::pin(terminal_fail(
-            storage,
+            context,
             job_id,
             token,
             JobError::permanent("session kernel exited"),
@@ -109,7 +108,7 @@ pub(super) async fn finalize_session(
         return;
     };
     name_output_record(&mut result, digest);
-    let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
+    let record = Box::pin(terminal_complete(context, job_id, token, result)).await;
     Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }
 
@@ -121,8 +120,7 @@ pub(super) async fn finalize_walltime(
     fence: &FenceContext,
     bucket: &str,
 ) {
-    let storage = &context.storage_handle;
-    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let _ = transition_to_cancelling(context, job_id, token, unix_timestamp_millis()).await;
     let logs = match backend.cancel(fence).await {
         Ok(CancelEvidence::Stopped(_)) => {
             let Some(logs) =
@@ -146,7 +144,7 @@ pub(super) async fn finalize_walltime(
     };
     let result = execution_result_for(bucket, None, Vec::new(), logs);
     let record = Box::pin(terminal_fail(
-        storage,
+        context,
         job_id,
         token,
         JobError::permanent("walltime limit exceeded"),
@@ -170,8 +168,7 @@ pub(crate) async fn finalize_attempt(
     result: Result<AttemptStatus, BackendError>,
     cancel: &CancellationToken,
 ) {
-    let storage = &context.storage_handle;
-    let cancel_requested = read_job_record(storage, job_id, None)
+    let cancel_requested = read_job_record(context, job_id, None)
         .await
         .ok()
         .flatten()
@@ -195,7 +192,7 @@ pub(crate) async fn finalize_attempt(
     };
 
     if let Some(started_at_ms) = status.started_at_ms
-        && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
+        && let Err(error) = record_attempt_started(context, job_id, token, started_at_ms).await
     {
         warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed");
         return;
@@ -269,7 +266,7 @@ pub(crate) async fn finalize_attempt(
                 return;
             };
             name_output_record(&mut result, digest);
-            match Box::pin(terminal_execution(storage, job_id, token, result)).await {
+            match Box::pin(terminal_execution(context, job_id, token, result)).await {
                 Some(ExecutionCompleteOutcome::Completed(record)) => {
                     Box::pin(cleanup_and_crate(context, job_id, Some(record))).await;
                 }
@@ -311,7 +308,7 @@ pub(crate) async fn finalize_attempt(
             let message = exit_message(code, detail);
             let result = execution_result_for(bucket, Some(code), outputs, logs);
             let record = Box::pin(terminal_fail(
-                storage,
+                context,
                 job_id,
                 token,
                 JobError::permanent(message),
@@ -328,7 +325,7 @@ pub(crate) async fn finalize_attempt(
             };
             let result = execution_result_for(bucket, None, Vec::new(), logs);
             let record = Box::pin(terminal_fail(
-                storage,
+                context,
                 job_id,
                 token,
                 JobError::permanent(format!("backend failure: {reason}")),
@@ -375,9 +372,8 @@ pub(super) async fn finalize_cancel(
     spec: &ExecutionSpec,
     bucket: &str,
 ) {
-    let storage = &context.storage_handle;
     // Running -> Cancelling (idempotent: a re-entry may already be Cancelling).
-    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let _ = transition_to_cancelling(context, job_id, token, unix_timestamp_millis()).await;
     // Stop the container first: the identity is only needed to record outputs.
     let evidence = backend.cancel(fence).await;
     let Some(control) = Box::pin(control_or_park(context, job_id, token, fence)).await else {
@@ -437,7 +433,7 @@ pub(super) async fn finalize_cancel(
                         return;
                     };
                     name_output_record(&mut result, digest);
-                    let record = Box::pin(terminal_complete(storage, job_id, token, result)).await;
+                    let record = Box::pin(terminal_complete(context, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Exited { code } => {
@@ -451,7 +447,7 @@ pub(super) async fn finalize_cancel(
                     let message = exit_message(code, status.detail.as_deref());
                     let result = execution_result_for(bucket, Some(code), outputs, logs);
                     let record = Box::pin(terminal_fail(
-                        storage,
+                        context,
                         job_id,
                         token,
                         JobError::permanent(message),
@@ -463,7 +459,7 @@ pub(super) async fn finalize_cancel(
                 AttemptPhase::Failed { reason } => {
                     let result = execution_result_for(bucket, None, Vec::new(), logs);
                     let record = Box::pin(terminal_fail(
-                        storage,
+                        context,
                         job_id,
                         token,
                         JobError::permanent(format!("backend failure: {reason}")),
@@ -477,7 +473,7 @@ pub(super) async fn finalize_cancel(
                 AttemptPhase::SystemError { reason } => {
                     warn!(job_id = %job_id, %reason, "Cancelled attempt lost backend evidence");
                     let result = execution_result_for(bucket, None, Vec::new(), logs);
-                    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+                    let record = Box::pin(terminal_cancel(context, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
                 AttemptPhase::Cancelled | AttemptPhase::Submitted | AttemptPhase::Running => {
@@ -489,7 +485,7 @@ pub(super) async fn finalize_cancel(
                         return;
                     };
                     let result = execution_result_for(bucket, None, outputs, logs);
-                    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+                    let record = Box::pin(terminal_cancel(context, job_id, token, result)).await;
                     Box::pin(cleanup_and_crate(context, job_id, record)).await;
                 }
             }
@@ -503,7 +499,7 @@ pub(super) async fn finalize_cancel(
                 return;
             };
             let result = execution_result_for(bucket, None, outputs, LogTails::default());
-            let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+            let record = Box::pin(terminal_cancel(context, job_id, token, result)).await;
             Box::pin(cleanup_and_crate(context, job_id, record)).await;
         }
         // No definitive stop evidence yet: park in Indeterminate.
@@ -520,19 +516,19 @@ pub(super) async fn finalize_cancel(
 }
 
 async fn terminal_complete(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     result: JobResultPayload,
 ) -> Option<JobRecord> {
-    let progress = read_job_record(storage, job_id, None)
+    let progress = read_job_record(context, job_id, None)
         .await
         .ok()
         .flatten()
         .map(|record| record.progress)
         .unwrap_or_else(|| aruna_core::structs::execution::job::JobProgress::new("phases"));
     match complete_cancelled(
-        storage,
+        context,
         job_id,
         token,
         result,
@@ -570,7 +566,7 @@ async fn store_or_fail(
     let JobResultPayload::Execution { outputs, .. } = result else {
         return None;
     };
-    let record = match read_job_record(&context.storage_handle, job_id, None).await {
+    let record = match read_job_record(&context, job_id, None).await {
         Ok(Some(record)) => record,
         _ => {
             Box::pin(park_attempt(
@@ -600,19 +596,19 @@ async fn store_or_fail(
 }
 
 async fn terminal_execution(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     result: JobResultPayload,
 ) -> Option<ExecutionCompleteOutcome> {
-    let progress = read_job_record(storage, job_id, None)
+    let progress = read_job_record(context, job_id, None)
         .await
         .ok()
         .flatten()
         .map(|record| record.progress)
         .unwrap_or_else(|| aruna_core::structs::execution::job::JobProgress::new("phases"));
     match complete_execution(
-        storage,
+        context,
         job_id,
         token,
         result,
@@ -630,14 +626,14 @@ async fn terminal_execution(
 }
 
 async fn terminal_fail(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     error: JobError,
     result: JobResultPayload,
 ) -> Option<JobRecord> {
     match fail_execution(
-        storage,
+        context,
         job_id,
         token,
         error,
@@ -655,7 +651,7 @@ async fn terminal_fail(
 }
 
 async fn cancel_requested(context: &DriverContext, job_id: JobId) -> bool {
-    read_job_record(&context.storage_handle, job_id, None)
+    read_job_record(context, job_id, None)
         .await
         .ok()
         .flatten()
@@ -664,20 +660,19 @@ async fn cancel_requested(context: &DriverContext, job_id: JobId) -> bool {
 
 /// Settles a cancelled run without its outputs; cleanup removes its capture helpers.
 async fn cancel_capture(context: &DriverContext, job_id: JobId, token: ulid::Ulid, bucket: &str) {
-    let storage = &context.storage_handle;
-    let _ = transition_to_cancelling(storage, job_id, token, unix_timestamp_millis()).await;
+    let _ = transition_to_cancelling(context, job_id, token, unix_timestamp_millis()).await;
     let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
-    let record = Box::pin(terminal_cancel(storage, job_id, token, result)).await;
+    let record = Box::pin(terminal_cancel(context, job_id, token, result)).await;
     Box::pin(cleanup_and_crate(context, job_id, record)).await;
 }
 
 async fn terminal_cancel(
-    storage: &aruna_storage::StorageHandle,
+    context: &DriverContext,
     job_id: JobId,
     token: ulid::Ulid,
     result: JobResultPayload,
 ) -> Option<JobRecord> {
-    match cancel_execution(storage, job_id, token, result, unix_timestamp_millis()).await {
+    match cancel_execution(context, job_id, token, result, unix_timestamp_millis()).await {
         Ok(record) => Some(record),
         Err(error) => {
             warn!(job_id = %job_id, error = %error, "Execution cancel write failed");
@@ -770,7 +765,7 @@ pub(super) async fn fail_and_crate(
 ) {
     let result = execution_result(record, None, Vec::new());
     let terminal = Box::pin(terminal_fail(
-        &context.storage_handle,
+        context,
         job_id,
         token,
         error,
@@ -788,7 +783,7 @@ async fn control_or_park(
     fence: &FenceContext,
 ) -> Option<AttemptControl> {
     let control =
-        read_attempt_control(&context.storage_handle, job_id, fence.attempt_epoch, None).await;
+        read_attempt_control(context, job_id, fence.attempt_epoch, None).await;
     let error = match control {
         Ok(Some(control)) if !control.execution_id.is_nil() => return Some(control),
         Ok(_) => JobError::retryable("attempt control carries no execution identity"),
@@ -810,7 +805,7 @@ async fn fail_bad_outputs(
     warn!(job_id = %job_id, error = %error, "Output identity incomplete; failing");
     let result = execution_result_for(bucket, None, Vec::new(), LogTails::default());
     let terminal = Box::pin(terminal_fail(
-        &context.storage_handle,
+        context,
         job_id,
         token,
         JobError::permanent(format!("output identity incomplete: {error}")),
@@ -851,7 +846,7 @@ pub(super) async fn collect_or_park(
 /// Terminalize on a permanent output error so cleanup runs; a job record that
 /// cannot be read is parked instead, leaving the terminal write to a later pass.
 async fn fail_or_park(context: &DriverContext, job_id: JobId, token: ulid::Ulid, error: JobError) {
-    match read_job_record(&context.storage_handle, job_id, None).await {
+    match read_job_record(context, job_id, None).await {
         Ok(Some(record)) => Box::pin(fail_and_crate(context, job_id, token, &record, error)).await,
         _ => Box::pin(park_attempt(context, job_id, token, error)).await,
     }
@@ -893,7 +888,7 @@ async fn export_or_park(
     if spec.file_outputs.is_empty() {
         return Some(Vec::new());
     }
-    let record = match read_job_record(&context.storage_handle, job_id, None).await {
+    let record = match read_job_record(context, job_id, None).await {
         Ok(Some(record)) => record,
         Ok(None) => return None,
         Err(error) => {
@@ -911,7 +906,7 @@ async fn export_or_park(
         let error = JobError::permanent("output capture needs a net handle");
         let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
         let terminal = Box::pin(terminal_fail(
-            &context.storage_handle,
+            context,
             job_id,
             token,
             error,
@@ -955,7 +950,7 @@ async fn export_or_park(
         Err(error) => {
             let result = execution_result_for(bucket, Some(0), Vec::new(), LogTails::default());
             let terminal = Box::pin(terminal_fail(
-                &context.storage_handle,
+                context,
                 job_id,
                 token,
                 error,

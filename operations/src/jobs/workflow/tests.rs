@@ -7,7 +7,7 @@ use super::prepare::{NETWORK_TAG_KEY, PreparedTask, build_task_spec, prepare_wor
 use super::recovery::{pre_submit_failure, recover_failed_submit};
 use super::supervise::{supervise_and_finalize, walltime_anchor};
 use super::*;
-use crate::driver::drive;
+use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome, ProgressReporter};
 use crate::jobs::store::attempt::{
     put_crate_status, read_attempt_control, record_attempt_started, set_cancel_requested,
@@ -342,7 +342,7 @@ async fn denied_write_blocks() {
 
 /// A claimed execution job in `Ready` with its attempt intent written, i.e.
 /// the exact state at the moment `backend.submit()` fails.
-async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, AttemptRef) {
+async fn ready_with_intent(context: &DriverContext) -> (JobRecord, ulid::Ulid, AttemptRef) {
     let job_id = job_id();
     let record = JobRecord::new(
         job_id,
@@ -353,16 +353,16 @@ async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, A
         1,
         None,
     );
-    insert_job(storage, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node_id(7), 2).await.unwrap()
+    insert_job(context, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(context, job_id, node_id(7), 2).await.unwrap()
     else {
         panic!("claim failed");
     };
     let token = claimed.claim.as_ref().unwrap().claim_token;
-    transition_to_preparing(storage, job_id, token, 3)
+    transition_to_preparing(context, job_id, token, 3)
         .await
         .unwrap();
-    transition_to_ready(storage, job_id, token, 4)
+    transition_to_ready(context, job_id, token, 4)
         .await
         .unwrap();
     let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), claimed.attempts);
@@ -375,7 +375,7 @@ async fn ready_with_intent(storage: &StorageHandle) -> (JobRecord, ulid::Ulid, A
                 .to_string(),
         attempt_epoch: 0,
     };
-    let record = record_attempt_intent(storage, job_id, token, intent, None, None, 5)
+    let record = record_attempt_intent(context, job_id, token, intent, None, None, 5)
         .await
         .unwrap();
     (record.record, token, attempt)
@@ -388,7 +388,7 @@ async fn ambiguous_submit_parks() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let ctx = context(storage.clone());
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::Unavailable);
 
     recover_failed_submit(
@@ -404,7 +404,7 @@ async fn ambiguous_submit_parks() {
     )
     .await;
 
-    let stored = read_job_record(&storage, record.job_id, None)
+    let stored = read_job_record(&ctx, record.job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -425,10 +425,11 @@ async fn inventory_failure_parks() {
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, _net) = net_context(storage.clone()).await;
-    let (record, token, _attempt) = ready_with_intent(&storage).await;
+    let (record, token, _attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, 6)
+    begin_external_running(&context, job_id, token, None, 6)
         .await
         .unwrap();
 
@@ -460,7 +461,7 @@ async fn inventory_failure_parks() {
     });
     spec.output_prefixes = vec!["poison".to_string()];
     let epoch = record.attempt_intent.as_ref().unwrap().attempt_epoch;
-    let control = read_attempt_control(&storage, job_id, epoch, None)
+    let control = read_attempt_control(&context, job_id, epoch, None)
         .await
         .unwrap()
         .unwrap();
@@ -472,7 +473,7 @@ async fn inventory_failure_parks() {
         .is_none()
     );
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -488,9 +489,9 @@ async fn system_error_parks() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
     let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
@@ -516,7 +517,7 @@ async fn system_error_parks() {
     ))
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -537,9 +538,9 @@ async fn cancel_lost_evidence() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
     let stub = StubBackend::new(StubReconcile::NotFound);
@@ -558,7 +559,7 @@ async fn cancel_lost_evidence() {
     ))
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -574,9 +575,9 @@ async fn capture_failure_caps() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
     let stub = StubBackend::new(StubReconcile::NotFound);
@@ -604,7 +605,7 @@ async fn capture_failure_caps() {
         .await;
     }
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -651,10 +652,11 @@ fn exited_zero() -> Result<AttemptStatus, BackendError> {
 async fn cancel_stops_capture() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&context, job_id, token, Some(1), 6)
         .await
         .unwrap();
     let stub = StubBackend::new(StubReconcile::NotFound);
@@ -681,7 +683,7 @@ async fn cancel_stops_capture() {
     .await
     .expect("capture ignored the cancel");
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -696,13 +698,14 @@ async fn cancel_stops_capture() {
 async fn cancelled_capture_settles() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&context, job_id, token, Some(1), 6)
         .await
         .unwrap();
-    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
     let stub = StubBackend::new(StubReconcile::NotFound);
     stub.capture_fails.store(true, Ordering::Relaxed);
     stub.cancel_exited.store(true, Ordering::Relaxed);
@@ -722,7 +725,7 @@ async fn cancelled_capture_settles() {
     ))
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -739,18 +742,18 @@ async fn cancelled_exhaustion_settles() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
-    crate::jobs::store::mutate_job(&storage, job_id, |record| {
+    crate::jobs::store::mutate_job(&ctx, job_id, |record| {
         record.attempts = JOB_MAX_ATTEMPTS - 1;
         Ok(crate::jobs::store::JobMutation::Persist)
     })
     .await
     .unwrap();
-    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    set_cancel_requested(&ctx, job_id, 7).await.unwrap();
     let stub = StubBackend::new(StubReconcile::NotFound);
     stub.logs_fail.store(true, Ordering::Relaxed);
     stub.cancel_exited.store(true, Ordering::Relaxed);
@@ -769,7 +772,7 @@ async fn cancelled_exhaustion_settles() {
     ))
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -784,9 +787,9 @@ async fn finalize_renews_lease() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&ctx, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);
@@ -802,7 +805,7 @@ async fn finalize_renews_lease() {
         CancellationToken::new(),
     ));
     backend.logs_started.notified().await;
-    let before = read_job_record(&storage, job_id, None)
+    let before = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap()
@@ -818,7 +821,7 @@ async fn finalize_renews_lease() {
     let mut after = before;
     for _ in 0..100 {
         tokio::task::yield_now().await;
-        after = read_job_record(&storage, job_id, None)
+        after = read_job_record(&ctx, job_id, None)
             .await
             .unwrap()
             .unwrap()
@@ -918,16 +921,17 @@ async fn session_end_succeeds() {
     // Ending a session finishes its job, so quota is released at once.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    crate::jobs::store::mutate_job(&storage, job_id, |record| {
+    crate::jobs::store::mutate_job(&context, job_id, |record| {
         record.payload = JobPayload::Execution(session_spec(None));
         Ok(crate::jobs::store::JobMutation::Persist)
     })
     .await
     .unwrap();
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -946,7 +950,7 @@ async fn session_end_succeeds() {
     session.end(EndReason::Ended);
     supervisor.await.unwrap();
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -977,10 +981,11 @@ async fn session_idle_succeeds() {
     // The idle timer finishes the job on its own, with reason `idle`.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, _registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -997,7 +1002,7 @@ async fn session_idle_succeeds() {
     )
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1010,10 +1015,11 @@ async fn session_kernel_fails() {
     // A kernel that died is a permanent execution failure, not a clean end.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -1033,7 +1039,7 @@ async fn session_kernel_fails() {
         .end(EndReason::KernelExit);
     supervisor.await.unwrap();
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1056,10 +1062,11 @@ async fn skip_heartbeat() {
 async fn superseded_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -1075,7 +1082,7 @@ async fn superseded_releases_session() {
         CancellationToken::new(),
     ));
     let session = wait_for_session(&registry, job_id, &backend).await;
-    let taken_over = lose_claim(&storage, job_id, token).await;
+    let taken_over = lose_claim(&context, job_id, token).await;
 
     skip_heartbeat().await;
     tokio::time::timeout(
@@ -1091,7 +1098,7 @@ async fn superseded_releases_session() {
         registry.sessions().get(&job_id.to_string()).is_none(),
         "the superseded session must be released"
     );
-    let after = read_job_record(&storage, job_id, None)
+    let after = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1105,10 +1112,11 @@ async fn superseded_releases_session() {
 async fn superseded_keeps_replacement() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -1141,7 +1149,7 @@ async fn superseded_keeps_replacement() {
         fence(&attempt),
     );
     assert!(!Arc::ptr_eq(&first, &replacement));
-    let taken_over = lose_claim(&storage, job_id, token).await;
+    let taken_over = lose_claim(&context, job_id, token).await;
 
     skip_heartbeat().await;
     tokio::time::timeout(
@@ -1157,7 +1165,7 @@ async fn superseded_keeps_replacement() {
         .get(&job_id.to_string())
         .expect("the replacement must survive the old cleanup");
     assert!(Arc::ptr_eq(&registered, &replacement));
-    let after = read_job_record(&storage, job_id, None)
+    let after = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1170,13 +1178,14 @@ async fn superseded_keeps_replacement() {
 async fn cancel_releases_session() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net, registry) = session_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
-    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);
 
     supervise_and_finalize(
@@ -1191,7 +1200,7 @@ async fn cancel_releases_session() {
     )
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1207,10 +1216,11 @@ async fn cancel_releases_session() {
 async fn cancel_beats_success() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (ctx, net) = net_context(storage.clone()).await;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, None, unix_timestamp_millis())
+    begin_external_running(&context, job_id, token, None, unix_timestamp_millis())
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);
@@ -1226,11 +1236,11 @@ async fn cancel_beats_success() {
         CancellationToken::new(),
     ));
     backend.logs_started.notified().await;
-    set_cancel_requested(&storage, job_id, 7).await.unwrap();
+    set_cancel_requested(&context, job_id, 7).await.unwrap();
     backend.logs_release.notify_one();
     task.await.unwrap();
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1244,9 +1254,9 @@ async fn walltime_fails_job() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    begin_external_running(&storage, job_id, token, Some(1), 6)
+    begin_external_running(&ctx, job_id, token, Some(1), 6)
         .await
         .unwrap();
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -1265,7 +1275,7 @@ async fn walltime_fails_job() {
     )
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1285,7 +1295,7 @@ async fn arms_missing_start() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
     assert!(record.started_at_ms.is_none());
     let backend = StubBackend::new(StubReconcile::Waiting);
@@ -1304,7 +1314,7 @@ async fn arms_missing_start() {
     )
     .await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1322,27 +1332,28 @@ async fn anchor_survives_restart() {
     // pre-Running window, so the first derived anchor is the durable one.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let (record, token, _attempt) = ready_with_intent(&storage).await;
+    let context = crate::testing::test_context(storage.clone());
+    let (record, token, _attempt) = ready_with_intent(&context).await;
     let job_id = record.job_id;
     assert!(record.started_at_ms.is_none());
 
-    let first = Box::pin(walltime_anchor(&storage, job_id, token)).await;
+    let first = Box::pin(walltime_anchor(&context, job_id, token)).await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(stored.started_at_ms, Some(first));
     assert_eq!(
-        Box::pin(walltime_anchor(&storage, job_id, token)).await,
+        Box::pin(walltime_anchor(&context, job_id, token)).await,
         first
     );
     // Backend start evidence never moves an anchor that already exists.
-    record_attempt_started(&storage, job_id, token, first.saturating_add(60_000))
+    record_attempt_started(&context, job_id, token, first.saturating_add(60_000))
         .await
         .unwrap();
     assert_eq!(
-        Box::pin(walltime_anchor(&storage, job_id, token)).await,
+        Box::pin(walltime_anchor(&context, job_id, token)).await,
         first
     );
 }
@@ -1353,9 +1364,9 @@ async fn reconcile_skips_submit() {
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let mut ctx = context(storage.clone());
     Arc::get_mut(&mut ctx).unwrap().task_handle = None;
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let job_id = record.job_id;
-    set_cancel_requested(&storage, job_id, 6).await.unwrap();
+    set_cancel_requested(&ctx, job_id, 6).await.unwrap();
     let backend = StubBackend::new(StubReconcile::NotFound);
 
     reconcile::resume_attempt(
@@ -1373,7 +1384,7 @@ async fn reconcile_skips_submit() {
     .await;
 
     assert!(backend.submits.lock().unwrap().is_empty());
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&ctx, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1386,7 +1397,7 @@ async fn absent_retries_same() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let ctx = context(storage.clone());
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&ctx).await;
     let backend: Arc<dyn ExecutorBackend> = StubBackend::new(StubReconcile::NotFound);
 
     recover_failed_submit(
@@ -1402,7 +1413,7 @@ async fn absent_retries_same() {
     )
     .await;
 
-    let stored = read_job_record(&storage, record.job_id, None)
+    let stored = read_job_record(&ctx, record.job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1420,6 +1431,7 @@ async fn recovery_reuses_credential() {
     };
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.mounts.store(true, Ordering::Relaxed);
@@ -1427,7 +1439,7 @@ async fn recovery_reuses_credential() {
         .with_backend(backend.clone())
         .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
-    let (record, token, attempt) = ready_with_intent(&storage).await;
+    let (record, token, attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
     let mut spec = session_spec(None);
     spec.executor_constraint = Some("docker".to_string());
@@ -1465,7 +1477,7 @@ async fn recovery_reuses_credential() {
     let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = crate::jobs::store::mutate_job(&storage, record.job_id, |record| {
+    let record = crate::jobs::store::mutate_job(&context, record.job_id, |record| {
         record.payload = JobPayload::Execution(spec.clone());
         record.created_by = owner;
         record.captured_inputs = vec![captured.clone()];
@@ -1504,13 +1516,14 @@ async fn recovery_reuses_credential() {
 async fn workspace_run_credential() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let (mut ctx, net) = net_context(storage.clone()).await;
     let backend = StubBackend::new(StubReconcile::NotFound);
     let registry = ExecutorRegistry::new()
         .with_backend(backend.clone())
         .with_workspace_endpoint(Some("http://s3.test".to_string()), String::new());
     Arc::get_mut(&mut ctx).unwrap().compute_handle = Some(Arc::new(registry));
-    let (record, _token, _attempt) = ready_with_intent(&storage).await;
+    let (record, _token, _attempt) = ready_with_intent(&context).await;
     let local = net.node_id();
     let mut spec = execution_spec();
     spec.executor_constraint = Some("docker".to_string());
@@ -1518,7 +1531,7 @@ async fn workspace_run_credential() {
     let owner = crate::tests::access::seed_access(&ctx, scope, "/none")
         .await
         .user_id;
-    let record = crate::jobs::store::mutate_job(&storage, record.job_id, |record| {
+    let record = crate::jobs::store::mutate_job(&context, record.job_id, |record| {
         record.payload = JobPayload::Execution(spec.clone());
         record.created_by = owner;
         record.workspace_mode = WorkspaceMode::Existing;
@@ -1548,11 +1561,12 @@ async fn workspace_run_credential() {
 async fn crate_write_idempotent() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let (record, token, _attempt) = ready_with_intent(&storage).await;
+    let driver = context(storage.clone());
+    let (record, token, _attempt) = ready_with_intent(&driver).await;
     let job_id = record.job_id;
 
     put_crate_status(
-        &storage,
+        &driver,
         job_id,
         &aruna_core::structs::execution::job::RunCrateStatus::Written {
             resource: "already-there".to_string(),
@@ -1652,7 +1666,7 @@ fn carries_network_access() {
 
 /// Writes the receipted reservation and the node subject a fenced start
 /// compares against.
-async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, digest: [u8; 32]) {
+async fn store_site(context: &DriverContext, job_id: JobId, generation: u64, digest: [u8; 32]) {
     use aruna_core::compute::quota::JobReservationRecord;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{JOB_RESERVATION_KEYSPACE, NODE_SUBJECT_KEYSPACE};
@@ -1674,8 +1688,7 @@ async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, dig
         subject_generation: generation,
         subject_digest: digest,
     };
-    let _ = storage
-        .send_storage_effect(StorageEffect::Write {
+    let _ = context.storage_handle.send_storage_effect(StorageEffect::Write {
             key_space: JOB_RESERVATION_KEYSPACE.to_string(),
             key: reservation.execution_id.to_bytes().as_slice().into(),
             value: postcard::to_allocvec(&reservation).unwrap().into(),
@@ -1691,8 +1704,7 @@ async fn store_site(storage: &StorageHandle, job_id: JobId, generation: u64, dig
         local_to_controller: true,
     })
     .unwrap();
-    let _ = storage
-        .send_storage_effect(StorageEffect::Write {
+    let _ = context.storage_handle.send_storage_effect(StorageEffect::Write {
             key_space: NODE_SUBJECT_KEYSPACE.to_string(),
             key: NODE_SUBJECT_KEY.to_vec().into(),
             value: record.to_bytes().unwrap().into(),
@@ -1736,9 +1748,10 @@ async fn drifted_site_refuses() {
     // must refuse to start the accepted work, retryably.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
-    store_site(&storage, job_id, 99, [7u8; 32]).await;
+    store_site(&context, job_id, 99, [7u8; 32]).await;
 
     let Err(error) = resolve_backend(&ctx, &execution_spec(), job_id).await else {
         panic!("a drifted subject must refuse the start");
@@ -1753,16 +1766,17 @@ async fn drift_requeues_attempt() {
     // the site may return, or another target may take the work.
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
-    let (record, token, _) = ready_with_intent(&storage).await;
-    store_site(&storage, record.job_id, 99, [7u8; 32]).await;
+    let (record, token, _) = ready_with_intent(&context).await;
+    store_site(&context, record.job_id, 99, [7u8; 32]).await;
     let Err(error) = resolve_backend(&ctx, &execution_spec(), record.job_id).await else {
         panic!("a drifted subject must refuse the start");
     };
 
     pre_submit_failure(&ctx, record.job_id, token, &record, error, false).await;
 
-    let stored = read_job_record(&storage, record.job_id, None)
+    let stored = read_job_record(&context, record.job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1785,6 +1799,7 @@ async fn stored_site_starts() {
 
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let ctx = compute_context(storage.clone());
     let job_id = job_id();
     let subject = NodeSubjectRecord::seed(PlacementSubject {
@@ -1805,7 +1820,7 @@ async fn stored_site_starts() {
         .next()
         .unwrap();
     store_site(
-        &storage,
+        &context,
         job_id,
         capability.subject.generation,
         capability.subject_digest,
@@ -1822,7 +1837,7 @@ async fn stored_site_starts() {
 /// A claimed external execution exactly as `run_execution_job` receives it,
 /// with a context that resolves `backend`.
 async fn claimed_execution(
-    storage: &StorageHandle,
+    context: &DriverContext,
     backend: Arc<StubBackend>,
 ) -> (
     Arc<DriverContext>,
@@ -1830,7 +1845,7 @@ async fn claimed_execution(
     JobRecord,
     ulid::Ulid,
 ) {
-    let (context, net) = net_context(storage.clone()).await;
+    let (context, net) = net_context(context.storage_handle.clone()).await;
     let mut context = context;
     Arc::get_mut(&mut context).unwrap().compute_handle =
         Some(Arc::new(ExecutorRegistry::new().with_backend(backend)));
@@ -1845,8 +1860,8 @@ async fn claimed_execution(
         1,
         None,
     );
-    insert_job(storage, &record).await.unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(storage, job_id, node_id(7), 2).await.unwrap()
+    insert_job(context, &record).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = claim_job(context, job_id, node_id(7), 2).await.unwrap()
     else {
         panic!("claim failed");
     };
@@ -1856,11 +1871,11 @@ async fn claimed_execution(
 
 /// Rotate or release the claim so the running heartbeat's next renewal loses
 /// the token: a recorded intent rotates it, a still-staging job is released.
-async fn lose_claim(storage: &StorageHandle, job_id: JobId, token: ulid::Ulid) -> JobRecord {
-    handoff_external_attempt(storage, job_id, token, unix_timestamp_millis())
+async fn lose_claim(context: &DriverContext, job_id: JobId, token: ulid::Ulid) -> JobRecord {
+    handoff_external_attempt(context, job_id, token, unix_timestamp_millis())
         .await
         .unwrap();
-    let taken_over = read_job_record(storage, job_id, None)
+    let taken_over = read_job_record(context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1880,14 +1895,15 @@ async fn lose_claim(storage: &StorageHandle, job_id: JobId, token: ulid::Ulid) -
 async fn heartbeat_consumed_once() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Pending);
-    let (ctx, net, record, token) = claimed_execution(&storage, backend.clone()).await;
+    let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;
 
     let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
     backend.reconcile_started.notified().await;
     assert_eq!(backend.submits.lock().unwrap().len(), 1);
-    let taken_over = lose_claim(&storage, job_id, token).await;
+    let taken_over = lose_claim(&context, job_id, token).await;
 
     // The heartbeat notices the rotated token at its next real interval; the
     // claim-loss path must consume that completion exactly once.
@@ -1896,7 +1912,7 @@ async fn heartbeat_consumed_once() {
         .expect("the heartbeat completion must be consumed exactly once")
         .expect("the workflow task must not panic");
 
-    let after = read_job_record(&storage, job_id, None)
+    let after = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1917,14 +1933,15 @@ async fn heartbeat_consumed_once() {
 async fn recovery_wins_adoption() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Adopted);
     backend.logs_fail.store(true, Ordering::Relaxed);
-    let (ctx, net, record, _token) = claimed_execution(&storage, backend.clone()).await;
+    let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;
 
     Box::pin(run_execution_job(ctx, record, CancellationToken::new())).await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1944,21 +1961,22 @@ async fn recovery_wins_adoption() {
 async fn heartbeat_failure_stops() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::NotFound);
     backend.image_stall.store(true, Ordering::Relaxed);
-    let (ctx, net, record, token) = claimed_execution(&storage, backend.clone()).await;
+    let (ctx, net, record, token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;
 
     let run = tokio::spawn(run_execution_job(ctx, record, CancellationToken::new()));
     backend.image_started.notified().await;
-    let taken_over = lose_claim(&storage, job_id, token).await;
+    let taken_over = lose_claim(&context, job_id, token).await;
 
     tokio::time::timeout(Duration::from_secs(3 * JOB_HEARTBEAT_MS / 1_000), run)
         .await
         .expect("a lost claim ends the run")
         .expect("the workflow task must not panic");
 
-    let after = read_job_record(&storage, job_id, None)
+    let after = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
@@ -1974,15 +1992,16 @@ async fn heartbeat_failure_stops() {
 async fn cancellation_skips_adoption() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let context = crate::testing::test_context(storage.clone());
     let backend = StubBackend::new(StubReconcile::Pending);
-    let (ctx, net, record, _token) = claimed_execution(&storage, backend.clone()).await;
+    let (ctx, net, record, _token) = claimed_execution(&context, backend.clone()).await;
     let job_id = record.job_id;
     let cancel = CancellationToken::new();
     cancel.cancel();
 
     Box::pin(run_execution_job(ctx, record, cancel)).await;
 
-    let stored = read_job_record(&storage, job_id, None)
+    let stored = read_job_record(&context, job_id, None)
         .await
         .unwrap()
         .unwrap();
