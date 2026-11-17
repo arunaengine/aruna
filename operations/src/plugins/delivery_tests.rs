@@ -100,7 +100,7 @@ async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInsta
         .await
         .unwrap();
     let job = rows[0].job.unwrap();
-    let record = read_job_record(&blob.storage_handle, job, None).await;
+    let record = read_job_record(blob, job, None).await;
     let record = record.unwrap().unwrap();
     let JobPayload::PluginWork(spec) = record.payload.clone() else {
         panic!("a plugin copy runs as plugin work");
@@ -114,7 +114,7 @@ async fn run_copy(fixture: &Fixture, blob: &DriverContext, install: &PluginInsta
     let mut finished = record;
     finished.state = aruna_core::structs::execution::job::JobState::Succeeded;
     (finished.result, finished.finished_at_ms) = (Some(result), Some(1));
-    insert_job(&blob.storage_handle, &finished).await.unwrap();
+    insert_job(blob, &finished).await.unwrap();
     assert_eq!(settle_work(blob, 2).await.unwrap(), 1);
 }
 

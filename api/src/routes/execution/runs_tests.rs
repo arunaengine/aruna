@@ -53,8 +53,7 @@ async fn answers_directed_reads() {
     let status = RunCrateStatus::Written {
         resource: document_id.to_string(),
     };
-    let storage = &node.state.get_ctx().storage_handle;
-    put_crate_outcome(storage, run_id, &status, &link)
+    put_crate_outcome(&node.state.get_ctx(), run_id, &status, &link)
         .await
         .unwrap();
 

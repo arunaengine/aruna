@@ -48,7 +48,7 @@ fn matches(condition: Option<&ETagCondition>, entry: &ViewEntry) -> bool {
 
 impl ArunaS3Service {
     async fn view_record(&self, view: InputView) -> S3Result<(JobRecord, Vec<ViewEntry>)> {
-        let record = read_job_record(&self.state.storage_handle, view.job_id, None)
+        let record = read_job_record(&self.state, view.job_id, None)
             .await
             .map_err(|_| s3_error!(ServiceUnavailable, "The run could not be read"))?
             .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;

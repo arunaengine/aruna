@@ -56,11 +56,11 @@ async fn durable_rearm_loop(
         crate::metadata::prune_queue::restore_prune_timer(&context.storage_handle, &task_handle)
             .await;
         restore_notification_prune(&context, &task_handle).await;
-        restore_drain_timer(&context.storage_handle, &task_handle).await;
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_drain_timer(&context, &task_handle).await;
+        restore_prune_timer(&context, &task_handle).await;
         restore_mirror_timer(&context, &task_handle).await;
         crate::jobs::repository::link_queue::restore_link_timer(
-            &context.storage_handle,
+            &context,
             &task_handle,
         )
         .await;
@@ -331,7 +331,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        restore_prune_timer(&context.storage_handle, &task_handle).await;
+        restore_prune_timer(&context, &task_handle).await;
         if stopped() {
             return;
         }
@@ -746,7 +746,7 @@ impl OperationsTaskHandler {
 
         let reconciler = self.jobs_runtime.reconciler();
         let result = match drain_job_batch(
-            &self.context.storage_handle,
+            &self.context,
             owner_node_id,
             budget,
             reconciler.as_ref(),
@@ -773,7 +773,7 @@ impl OperationsTaskHandler {
                     continue;
                 };
                 if let Err(error) = release_job(
-                    &self.context.storage_handle,
+                    &self.context,
                     record.job_id,
                     token,
                     unix_timestamp_millis(),

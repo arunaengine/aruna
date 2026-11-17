@@ -713,7 +713,7 @@ async fn flush_keeps_page() {
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
     let job = record(token());
-    crate::jobs::store::query::insert_job(storage, &job)
+    crate::jobs::store::query::insert_job(&context, &job)
         .await
         .unwrap();
     let mut operation = PageImportOperation::new(PageImportInput {
@@ -730,10 +730,10 @@ async fn flush_keeps_page() {
         let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
         if commit {
             let progress = job.progress.clone();
-            flush_progress(storage, job.job_id, token(), progress, 2)
+            flush_progress(&context, job.job_id, token(), progress, 2)
                 .await
                 .unwrap();
-            renew_lease(storage, job.job_id, token(), 3, None)
+            renew_lease(&context, job.job_id, token(), 3, None)
                 .await
                 .unwrap();
         }
@@ -767,7 +767,7 @@ async fn bare_size_unchanged() {
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::query::insert_job(&context.storage_handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let bare = |content_length| PageEntry {
@@ -808,7 +808,7 @@ async fn bare_size_unchanged() {
     let mut later = record(token());
     later.job_id = job_id;
     (later.created_at_ms, later.updated_at_ms) = (started, started);
-    crate::jobs::store::query::insert_job(&context.storage_handle, &later)
+    crate::jobs::store::query::insert_job(&context, &later)
         .await
         .unwrap();
     let mut moved = connector.clone();
@@ -848,7 +848,7 @@ async fn replay_charges_once() {
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::query::insert_job(&context.storage_handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -967,7 +967,7 @@ async fn page_maintains_inventory() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::query::insert_job(handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -1038,7 +1038,7 @@ async fn page_needs_coordinator() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::query::insert_job(handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -1169,7 +1169,7 @@ async fn distributed_sizes_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::query::insert_job(handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1201,7 +1201,7 @@ async fn entry_sizes_measured() {
     let connector = bakrep_connector(context).await;
     let group_id = bucket().group_id;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::query::insert_job(handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1269,7 +1269,7 @@ async fn page_exchanges_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::query::insert_job(handle, &record(token()))
+    crate::jobs::store::query::insert_job(&context, &record(token()))
         .await
         .unwrap();
     for page in 0..4 {
