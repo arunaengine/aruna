@@ -41,6 +41,7 @@ pub mod settings;
 pub mod state;
 pub mod store;
 pub mod submit;
+pub mod summary;
 pub mod sweep;
 pub mod waiting;
 pub mod work;
