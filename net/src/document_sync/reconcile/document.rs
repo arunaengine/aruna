@@ -250,7 +250,7 @@ impl DocumentSyncService {
         let policy = policies.get(&topic_id);
         let events = (batch.events.into_iter())
             .map(|(event, actor, actor_seq)| BatchEvent {
-                publisher_allowed: !policy.is_some_and(|policy| !policy.allows(&actor, actor_seq)),
+                publisher_allowed: policy.is_none_or(|policy| policy.allows(&actor, actor_seq)),
                 event,
                 actor,
                 actor_seq,
