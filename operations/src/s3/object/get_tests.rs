@@ -8,9 +8,11 @@ use crate::driver::{DriverContext, drive};
 use crate::replication::bao_read::BaoReadError;
 use crate::replication::protocol::BaoReadRefusal;
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
-    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, promote_leased, routed_info, slice_blob,
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, MAX_AUTO_ADVANCES,
+    MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest,
+};
+use crate::s3::object::read::{
+    HolderFailures, RoutedRead, get_object_routed, promote_leased, routed_info, slice_blob,
 };
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
@@ -2541,7 +2543,7 @@ mod sealed {
     fn remote_lock_typed() {
         use crate::replication::bao_read::BaoReadError;
         use crate::replication::protocol::BaoReadRefusal;
-        use crate::s3::object::get::HolderFailures;
+        use crate::s3::object::read::HolderFailures;
 
         let mut failures = HolderFailures::default();
         failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));

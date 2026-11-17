@@ -49,9 +49,8 @@ use crate::driver::{DriverContext, drive, now_ms};
 use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectResult, HolderFailures, ObjectInfo, ObjectRangeRequest,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectResult, ObjectInfo, ObjectRangeRequest};
+use crate::s3::object::read::HolderFailures;
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 

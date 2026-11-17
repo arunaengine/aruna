@@ -7,9 +7,8 @@ use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
 use crate::s3::object::copy::{CopySourceConditions, evaluate_source_conditions};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, TokenRead, read_source,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
+use crate::s3::object::read::{TokenRead, read_source};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;

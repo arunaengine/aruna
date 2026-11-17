@@ -22,14 +22,13 @@ use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distri
 use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::complete_put;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
-};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, ObjectRangeRequest};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
+use aruna_operations::s3::object::read::get_object_routed;
 use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};

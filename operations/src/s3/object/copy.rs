@@ -12,13 +12,12 @@ use crate::driver::{
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::fence_store::FenceCheckOperation;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectResult, TokenRead, read_source, reference_archive,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, reference_archive};
 use crate::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::{TokenRead, read_source};
 use crate::staging::reference::{
     MaterializeReferenceError, ReferenceWrite, write_reference_version,
 };

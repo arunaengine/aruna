@@ -46,12 +46,11 @@ use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
-use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest, get_object_routed,
-};
+use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult, ObjectRangeRequest};
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use crate::s3::object::read::get_object_routed;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
