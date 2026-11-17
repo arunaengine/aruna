@@ -71,10 +71,9 @@ enum StoreState {
     Failed(WatchSubscriptionError),
 }
 
-/// Creates or deletes one watch subscription in one transaction with the realm's interest
-/// marker and, on the holder, the replication rows; it runs once more after a conflict. The
-/// output is whether the store changed: a create under the per-user cap always does, a delete
-/// only when the watch existed. A holder change schedules the sync outbox drain.
+/// Creates or deletes one watch in one transaction with the realm's interest marker and, on the
+/// holder, its replication rows, once more after a conflict. The output is whether the store
+/// changed: a create under the cap always, a delete only for an existing watch.
 #[derive(Debug, PartialEq)]
 pub struct StoreWatchOperation {
     change: Change,
