@@ -39,8 +39,7 @@ fn create() -> InboxRequest {
 
 #[test]
 fn refused_before_reads() {
-    let mut foreign =
-        ServeInboxOperation::new(peer_input(), user(9, 2), InboxRequest::ListWatches);
+    let mut foreign = ServeInboxOperation::new(peer_input(), user(9, 2), InboxRequest::ListWatches);
     assert!(rejected(foreign.first()).contains("foreign realm"));
     let many = HolderRead::Mark {
         ids: vec![Ulid::nil(); MARK_MAX_IDS + 1],
@@ -138,4 +137,75 @@ fn unexpected_results_fail() {
     let mut list = serving(InboxRequest::ListWatches);
     list.first().unwrap();
     assert!(list.next(IoResult::Done).is_err());
+}
+
+fn watch_event(realm_id: aruna_core::structs::identity::realm::RealmId) -> WatchEvent {
+    use aruna_core::structs::execution::notification_watch::WatchEventDetail;
+    WatchEvent {
+        event_id: Ulid::from_parts(3, 3),
+        realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path: "data/bucket/a.csv".to_string(),
+        actor: user(1, 2),
+        occurred_at_ms: 1,
+        detail: WatchEventDetail::DataUploaded {
+            group_id: Ulid::from_parts(5, 5),
+            node_id: crate::tests::locations::node_id(1),
+            bucket: "bucket".to_string(),
+            key: "a.csv".to_string(),
+            size_bytes: 9,
+        },
+    }
+}
+
+#[test]
+fn events_refused_before_reads() {
+    let mut empty = WatchEventsOperation::new(peer_input(), Vec::new());
+    assert_eq!(rejected(empty.first()), "empty batch");
+    let foreign = vec![watch_event(user(9, 2).realm_id)];
+    let mut foreign = WatchEventsOperation::new(peer_input(), foreign);
+    assert!(rejected(foreign.first()).contains("foreign realm"));
+}
+
+/// Dropped watches ask for an interest publish, then the new records' recipients are woken.
+#[test]
+fn events_mark_then_wake() {
+    let events = vec![watch_event(user(1, 2).realm_id)];
+    let mut operation = WatchEventsOperation::new(peer_input(), events);
+    operation.state = EventsState::Expand;
+    let outcome = ExpandOutcome {
+        inbox: aruna_core::structs::execution::notification::InboxWriteOutcome {
+            written: 1,
+            recipients: vec![user(1, 2)],
+            ..Default::default()
+        },
+        dropped: true,
+    };
+    let expanded = operation.next(child::<_, ExpandError>(Ok(outcome)));
+    assert!(matches!(expanded, Ok(Next::Call(IoCall::Child(_)))));
+    let marked = child::<bool, _>(Err(InterestError::Io(
+        aruna_core::calls::IoError::Unfinished,
+    )));
+    assert_eq!(
+        operation.next(marked),
+        Ok(Next::Call(IoCall::from(Effect::Net(NetEffect::WakeInbox(
+            vec![user(1, 2)]
+        )))))
+    );
+    let woken = IoResult::Event(Box::new(Event::Net(NetEvent::InboxWoken)));
+    assert_eq!(
+        operation.next(woken),
+        Ok(Next::Done(NotificationTransportMessage::WatchEventsAck {
+            written: 1
+        }))
+    );
+
+    let mut failed =
+        WatchEventsOperation::new(peer_input(), vec![watch_event(user(1, 2).realm_id)]);
+    failed.state = EventsState::Expand;
+    let conflict = child::<ExpandOutcome, _>(Err(ExpandError::Conflict));
+    assert_eq!(
+        rejected(failed.next(conflict)),
+        ExpandError::Conflict.to_string()
+    );
 }
