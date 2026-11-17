@@ -5,26 +5,35 @@
 
 use std::collections::VecDeque;
 
+use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
+use aruna_core::errors::ConversionError;
+use aruna_core::metrics::WatchMetricReason;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationKind;
 use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEvent, WatchEventKind, WatchEventMask, watch_path_matches,
+    WatchAuthorizationBinding, WatchEvent, WatchEventKind, WatchEventMask, WatchSubscription,
+    watch_path_matches,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
 use crate::auth::error::PolicyEnforcementError;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
+use crate::notifications::placement::filter_local_subscriptions;
+use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::paths::{
     WatchAuthorization, WatchAuthorizationDenial, event_permission_path,
     notification_permission_path, watch_permission_path,
 };
+use crate::notifications::watch::records::WatchSubscriptionError;
 
 const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
 const WATCH_LIST_OPERATION: &str = "notifications.list_watches";
@@ -35,6 +44,11 @@ pub enum WatchCheckError {
     /// The permission rules could not be evaluated; never a grant.
     #[error(transparent)]
     Authorization(#[from] AuthorizationError),
+    /// A watch of the listed owner could not be checked now.
+    #[error("{0}")]
+    Unavailable(String),
+    #[error(transparent)]
+    Listing(#[from] WatchSubscriptionError),
     #[error(transparent)]
     Io(#[from] IoError),
 }
@@ -371,6 +385,134 @@ impl Operation for WatchCheckOperation {
                 self.evaluated(loaded)
             }
         }
+    }
+}
+
+/// The watches a filter kept, whether it dropped any, and whether a check failed.
+#[derive(Debug, Default, PartialEq)]
+pub struct AuthorizedWatchSubscriptions {
+    pub subscriptions: Vec<WatchSubscription>,
+    pub dropped: bool,
+    pub check_failed: bool,
+}
+
+/// Checks watches one at a time as listing asks. For one owner, it lists the owner's watches
+/// first and keeps a denied one with only its deletion id, so the owner can still release quota;
+/// for a realm, it drops a denied watch and one whose check failed.
+#[derive(Debug, PartialEq)]
+pub struct WatchFilterOperation {
+    realm_id: RealmId,
+    /// The owner whose watches are listed and redacted; `None` filters given watches.
+    owner: Option<UserId>,
+    /// Waits for the owner's watch list.
+    listing: bool,
+    pending: VecDeque<WatchSubscription>,
+    current: Option<WatchSubscription>,
+    outcome: AuthorizedWatchSubscriptions,
+}
+
+type FilterTurn = Result<Next<AuthorizedWatchSubscriptions>, WatchCheckError>;
+
+impl WatchFilterOperation {
+    pub fn owner(owner: UserId) -> Self {
+        Self {
+            realm_id: owner.realm_id,
+            owner: Some(owner),
+            listing: true,
+            pending: VecDeque::new(),
+            current: None,
+            outcome: AuthorizedWatchSubscriptions::default(),
+        }
+    }
+
+    /// The watches of a realm this node holds; a watch held elsewhere is dropped as stale.
+    pub fn realm(
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+        subscriptions: Vec<WatchSubscription>,
+    ) -> Result<Self, ConversionError> {
+        let (held, stale) = filter_local_subscriptions(subscriptions, realm_config, local_node_id)?;
+        Ok(Self {
+            realm_id,
+            owner: None,
+            listing: false,
+            pending: held.into(),
+            current: None,
+            outcome: AuthorizedWatchSubscriptions {
+                dropped: stale,
+                ..AuthorizedWatchSubscriptions::default()
+            },
+        })
+    }
+
+    fn next_watch(&mut self) -> FilterTurn {
+        let Some(watch) = self.pending.pop_front() else {
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
+        };
+        let check = WatchCheckOperation::listing(
+            self.realm_id,
+            watch.owner,
+            &watch.path_prefix,
+            watch.event_mask,
+            &watch.authorization,
+        );
+        self.current = Some(watch);
+        Ok(Next::Call(IoCall::child(check)))
+    }
+
+    fn checked(&mut self, check: Result<WatchAuthorization, WatchCheckError>) -> FilterTurn {
+        let mut watch = self.current.take().ok_or(IoError::Unfinished)?;
+        match (self.owner.is_some(), check) {
+            (_, Ok(WatchAuthorization::Authorized)) => self.outcome.subscriptions.push(watch),
+            (true, Ok(WatchAuthorization::Denied(_))) => {
+                watch.path_prefix.clear();
+                watch.event_mask = WatchEventMask::empty();
+                watch.created_at_ms = 0;
+                self.outcome.subscriptions.push(watch);
+            }
+            (true, Ok(WatchAuthorization::Unavailable(error))) => {
+                return Err(WatchCheckError::Unavailable(error));
+            }
+            (true, Err(error)) => return Err(error),
+            (false, Ok(WatchAuthorization::Denied(_))) => self.outcome.dropped = true,
+            (false, Ok(WatchAuthorization::Unavailable(_)) | Err(_)) => {
+                self.outcome.dropped = true;
+                self.outcome.check_failed = true;
+                warn!(
+                    parent: None,
+                    reason = WatchMetricReason::AuthorizationUnavailable.as_str(),
+                    "Notification watch authorization check failed"
+                );
+            }
+        }
+        self.next_watch()
+    }
+}
+
+impl Operation for WatchFilterOperation {
+    type Output = AuthorizedWatchSubscriptions;
+    type Error = WatchCheckError;
+
+    fn first(&mut self) -> FilterTurn {
+        match self.owner {
+            Some(owner) => {
+                let list = ListWatchesOperation::new(WatchScope::Owner(owner));
+                Ok(Next::Call(IoCall::child(list)))
+            }
+            None => self.next_watch(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> FilterTurn {
+        if self.listing {
+            self.listing = false;
+            let listed = result.child::<WatchPage, WatchSubscriptionError>()??;
+            self.pending = listed.subscriptions.into();
+            return self.next_watch();
+        }
+        let check = result.child::<WatchAuthorization, WatchCheckError>()?;
+        self.checked(check)
     }
 }
 
