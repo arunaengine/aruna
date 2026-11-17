@@ -10,7 +10,7 @@ use crate::plugins::install::tests::Fixture;
 use crate::plugins::submit::start_copy;
 use crate::plugins::submit::tests::{ready, request, scope};
 use crate::plugins::work::tests::edit_work;
-use crate::plugins::work::{FinalState, WorkState, update_work};
+use crate::plugins::work::{FinalState, WorkState};
 
 fn output(node: NodeId, key: &str) -> OutputObject {
     OutputObject {

@@ -14,6 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::{FjallStorage, StorageHandle};
+use futures_util::TryStreamExt;
 use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");

@@ -166,8 +166,8 @@ impl Fixture {
 
     async fn deliver(&self, other: &Fixture, rows: &[(String, Vec<u8>)]) {
         for (key_space, key) in rows {
-            let read = crate::plugins::store::Txn::direct(&self.ctx).read(key_space, key);
-            let value = read.await.unwrap().unwrap();
+            let txn = crate::plugins::store::Txn::direct(&self.ctx);
+            let value = txn.read(key_space, key).await.unwrap().unwrap();
             other.write_row(key_space, key.clone(), value).await;
         }
     }

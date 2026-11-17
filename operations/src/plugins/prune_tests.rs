@@ -14,6 +14,7 @@ use crate::plugins::bound::tests::edit_config;
 use crate::plugins::install::tests::Fixture;
 use crate::plugins::rows::encode;
 use crate::plugins::store::Txn;
+use crate::plugins::worker::prune_audit;
 
 const DAY: u64 = 24 * 3600 * 1000;
 const NOW: u64 = 100 * DAY;

@@ -110,7 +110,7 @@ pub(crate) async fn dispatch_effect_until(
                 Some(handle) => (handle
                     .request_store_artifact(store.node_id, store.chunk)
                     .await)
-                    .map_err(|error| error.to_string()),
+                    .map_err(|error| format!("{error:?}")),
                 None => Err("no metadata transport on this node".to_string()),
             };
             Event::Net(NetEvent::ArtifactStored(stored))

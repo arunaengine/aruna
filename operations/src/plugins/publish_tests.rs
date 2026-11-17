@@ -257,10 +257,6 @@ async fn counts_current_managers() {
     assert_eq!(published(&ctx).await.len(), 1);
 }
 
-fn node(seed: u8) -> NodeId {
-    iroh::SecretKey::from_bytes(&[seed; 32]).public()
-}
-
 /// A finished window member with the answer `stored`.
 fn answered(index: usize, stored: Result<bool, String>) -> Event {
     let event = Event::Net(NetEvent::ArtifactStored(stored));

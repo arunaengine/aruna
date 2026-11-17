@@ -15,7 +15,7 @@ use crate::plugins::runs::{list_runs, prune_runs, save_run};
 use crate::plugins::submit::start_copy;
 use crate::plugins::submit::tests::{path, ready, request, scope};
 use crate::plugins::work::tests::edit_work;
-use crate::plugins::work::{FinalState, prune_work, read_work, summary_of, update_work};
+use crate::plugins::work::{FinalState, prune_work, read_work, summary_of};
 use crate::s3::object::copy::test::seed_bucket;
 
 /// An install whose version copies and has a `job_finished` trigger, with buckets `in` and `out`.
