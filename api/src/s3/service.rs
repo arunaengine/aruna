@@ -3059,7 +3059,7 @@ impl S3 for ArunaS3Service {
             })
             .collect::<Vec<_>>();
 
-        let mut stored = Vec::new();
+        let mut stored: Vec<SyncRelationship> = Vec::new();
         for relationship in &relationships {
             drive(
                 MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Reconcile),
