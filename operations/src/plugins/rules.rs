@@ -95,7 +95,6 @@ pub(crate) async fn edit_rules(
         readable: false,
         now_ms: unix_timestamp_millis(),
         write_ids: [(); 3].map(|_| Ulid::generate()),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), ctx).await?;
     Ok(true)
