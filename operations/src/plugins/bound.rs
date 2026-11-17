@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::install::{pick_version, read_manifest};
-use super::store::Txn;
-use crate::driver::DriverContext;
+use super::rows::read_rows;
+use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::node_kind;
 use crate::secrets::node::{record_key, value_entry};
 use crate::secrets::owner::{EntryReader, open_value};
@@ -111,8 +111,9 @@ pub async fn select(
 ) -> Result<Option<Selected>, ReleaseError> {
     if binding.scope == BoundScope::Node {
         let key = record_key(&binding.name);
-        let row = Txn::direct(ctx).read(NODE_SECRETS_KEYSPACE, &key).await;
+        let row = drive(read_rows(vec![(NODE_SECRETS_KEYSPACE, key)]), ctx).await;
         let row = row.map_err(|error| ReleaseError::Unavailable(error.to_string()))?;
+        let row = row.into_iter().next().flatten();
         let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
         return Ok(record.map(|record| Selected {
             kind: record.kind,
@@ -363,10 +364,10 @@ pub async fn node_secret_fits(
     name: &SecretName,
     kind: &SecretKind,
 ) -> Result<Option<String>, NodeCheckError> {
-    let row = Txn::direct(ctx)
-        .read(NODE_SECRETS_KEYSPACE, &record_key(name))
-        .await;
+    let read = vec![(NODE_SECRETS_KEYSPACE, record_key(name))];
+    let row = drive(read_rows(read), ctx).await;
     let row = row.map_err(|_| NodeCheckError::Unavailable)?;
+    let row = row.into_iter().next().flatten();
     let record = row.and_then(|bytes| postcard::from_bytes::<SecretRecord>(&bytes).ok());
     match record {
         None => Err(NodeCheckError::Missing),

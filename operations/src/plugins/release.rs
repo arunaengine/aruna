@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
-use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall, SecretBinding};
 use aruna_core::request_policy::PolicyRequest;
 use aruna_core::secrets::{
@@ -24,9 +23,9 @@ use super::account::{owned, read_user};
 pub use super::bound::{Refusal, ReleaseError, ReleaseKeys};
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
-use super::store::Txn;
+use super::rows::write_rows;
 use crate::auth::request_policy::PolicyEvaluator;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 /// What a run asks of the secret bound to one slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,15 +218,8 @@ impl Audit<'_> {
         };
         let record = AdminAuditRecord::for_use(self.install, secret, used);
         let unavailable = |error: String| ReleaseError::Unavailable(error);
-        let rows = (record
-            .entries()
-            .map_err(|error| unavailable(error.to_string()))?)
-        .into_iter()
-        .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-        .collect();
-        let written = Txn::direct(self.ctx)
-            .write(ADMIN_AUDIT_KEYSPACE, rows)
-            .await;
+        let rows = record.entries().map_err(|error| unavailable(error.to_string()))?;
+        let written = drive(write_rows(rows), self.ctx).await;
         written.map_err(|error| unavailable(error.to_string()))
     }
 

@@ -318,6 +318,31 @@ impl Scan {
     }
 }
 
+/// The values of these rows, read on their own.
+pub fn read_rows(reads: Vec<(&'static str, Vec<u8>)>) -> RowsOperation<ReadRows> {
+    RowsOperation::direct(ReadRows(Some(Ask::Read(reads))))
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ReadRows(Option<Ask>);
+
+impl Plan for ReadRows {
+    type Output = Vec<Option<Vec<u8>>>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        let read = self.0.take().ok_or_else(|| StoreError("read twice".into()))?;
+        Ok(Turn::Ask(read))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        match answer {
+            Answer::Values(values) => Ok(Turn::Finish(values)),
+            other => Err(unexpected(other)),
+        }
+    }
+}
+
 /// Every row a scan reads, each page on its own.
 pub fn scan_rows(scan: Scan) -> RowsOperation<ScanRows> {
     RowsOperation::direct(ScanRows(scan))

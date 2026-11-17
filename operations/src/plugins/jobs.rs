@@ -274,35 +274,6 @@ pub async fn retire_work(
     Ok(count)
 }
 
-/// At most `limit` works of an install after the work `after`, oldest first, and the id of the
-/// last one when more may follow.
-pub async fn list_work(
-    ctx: &DriverContext,
-    install_id: Ulid,
-    after: Option<Ulid>,
-    limit: usize,
-) -> Result<(Vec<WorkRow>, Option<Ulid>), StoreError> {
-    let txn = Txn::direct(ctx);
-    let prefix = [&[WORK_INDEX][..], &install_id.to_bytes()].concat();
-    let after = after.map(|work_id| index_key(install_id, work_id));
-    let (rows, next) = txn
-        .page(PLUGIN_WORK_KEYSPACE, &prefix, after, limit)
-        .await?;
-    // The cursor is the last index row read, whatever row it leads to.
-    let last = (rows.last()).and_then(|(index, _)| work_at(index));
-    let mut works = Vec::with_capacity(rows.len());
-    for (index, key) in rows {
-        let Some(value) = txn.read(PLUGIN_WORK_KEYSPACE, &key).await? else {
-            continue;
-        };
-        let row = decode::<WorkRow>(&value)?;
-        if index.ends_with(&row.work_id.to_bytes()) {
-            works.push(row);
-        }
-    }
-    Ok((works, next.and(last)))
-}
-
 fn fill(status: &mut JobStatus, summary: Summary) {
     status.message = summary.message;
     status.bytes = summary.bytes;
