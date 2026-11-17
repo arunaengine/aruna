@@ -4,13 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::{DocumentEvent, DocumentTarget};
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::register::{Admission, admit_write};
 use aruna_core::structs::SyncQuarantineIdentity;
 use aruna_core::structs::execution::setting::SettingChannel;
 use tracing::warn;
 
+use crate::document_sync::storage::storage_read_from;
 use crate::document_sync::{DocumentSyncService, SyncRejection, node_to_peer};
 use crate::error::{NetError, Result};
 
@@ -422,16 +421,9 @@ async fn stored_row(
     service: &DocumentSyncService,
     target: &DocumentTarget,
 ) -> Result<Option<Vec<u8>>> {
-    let read = StorageEffect::Read {
-        key_space: target.storage_keyspace().to_string(),
-        key: target.storage_key(),
-        txn_id: None,
-    };
-    match service.storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.map(|row| row.to_vec())),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(NetError::Dht(format!("unexpected setting read: {other:?}"))),
-    }
+    let key_space = target.storage_keyspace().to_string();
+    let row = storage_read_from(&service.storage, key_space, target.storage_key()).await?;
+    Ok(row.map(|row| row.to_vec()))
 }
 
 fn reject_shared_event(
