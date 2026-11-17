@@ -198,7 +198,7 @@ pub(super) fn lasting_read(error: &ReadSourceError) -> bool {
     match error {
         ReadSourceError::Resolve(error) => lasting_resolution(error),
         ReadSourceError::Staging(error) => lasting_source(error),
-        ReadSourceError::UnexpectedEvent { .. } | ReadSourceError::ReadSourceFailed => false,
+        ReadSourceError::Io(_) | ReadSourceError::UnexpectedEvent(_) => false,
     }
 }
 
