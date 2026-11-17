@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod counter_check;
 pub mod dashboard;
 pub mod heartbeat;
 pub mod holder_choice;
