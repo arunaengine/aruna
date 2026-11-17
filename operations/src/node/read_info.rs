@@ -194,7 +194,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn empty_set_reads_nothing() {
+    fn empty_reads_nothing() {
         let mut operation = ReadInfoOperation::new(Vec::new());
         check_trace(&mut operation, &[], vec![]);
         assert_eq!(operation.finalize(), Ok(BTreeMap::new()));

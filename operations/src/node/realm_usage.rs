@@ -566,7 +566,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn unknown_realm_counts_all() {
+    fn all_nodes_count() {
         // Without a realm config every node's snapshot counts, and a sum writes nothing.
         let mut operation = RealmUsageOperation::new(node(1), None, RealmUsageScope::Global);
         check_trace(

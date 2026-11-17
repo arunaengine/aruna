@@ -27,7 +27,7 @@ use ulid::Ulid;
 use crate::driver::DriverContext;
 use crate::metadata::projector::{project_create_events, project_logged_events};
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::usage_refresh::RefreshUsageOperation;
+use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
 

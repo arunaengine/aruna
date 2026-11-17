@@ -21,7 +21,7 @@ use crate::metadata::projector::{
     PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::usage_refresh::RefreshUsageOperation;
+use crate::node::summary_refresh::RefreshUsageOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;

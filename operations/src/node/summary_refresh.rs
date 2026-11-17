@@ -60,10 +60,9 @@ impl Stage {
     }
 }
 
-/// Refreshes the persisted realm summary for exactly the `NodeUsage` scopes a reconcile touched.
-/// A realm config change first clears the whole summary and marks the groups of local
-/// distributed buckets for a publish, since a new coordinator moves replica shares. Each step
-/// that fails is logged and skipped, so one failure never blocks the others.
+/// Refreshes the realm summary for the `NodeUsage` scopes a reconcile touched. A config change
+/// first clears the summary and marks local distributed bucket groups for a publish, since a
+/// new coordinator moves replica shares; a failed step is logged and skipped.
 #[derive(Debug, PartialEq)]
 pub struct RefreshUsageOperation {
     local_node_id: NodeId,
@@ -417,7 +416,7 @@ mod state_machine_tests {
     }
 
     #[test]
-    fn config_change_marks_groups() {
+    fn config_marks_groups() {
         let mut operation = config_changed();
         let summary = summary_key(GROUP);
         let deletes = vec![

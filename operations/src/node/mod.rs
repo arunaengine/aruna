@@ -1,4 +1,4 @@
-//! Groups node startup, info publishing, usage stats and dashboard signals.
+//! Groups node startup, the node info document, node usage publication and holder choice.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -12,6 +12,6 @@ pub mod read_info;
 pub mod realm_usage;
 mod rebuild_counts;
 pub mod startup;
+pub mod summary_refresh;
 pub mod usage_publish;
 pub mod usage_rebuild;
-pub mod usage_refresh;
