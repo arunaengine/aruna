@@ -54,7 +54,7 @@ pub enum ExportMetadataResult {
     },
     Raw {
         record: MetadataRegistryRecord,
-        raw: crate::metadata::raw_revision::MetadataRawView,
+        raw: crate::metadata::revision_read::MetadataRawView,
         dataset_digest: Option<[u8; 32]>,
     },
 }

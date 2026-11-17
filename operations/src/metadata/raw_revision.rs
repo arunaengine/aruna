@@ -14,7 +14,6 @@ use aruna_core::metadata::{
 use aruna_core::storage_entries::{event_log_key, raw_revision_key};
 use aruna_core::types::TxnId;
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
@@ -22,7 +21,7 @@ use crate::metadata::raw_events::{
     RAW_ENCODED_LIMIT, RawBaseIdentity, RawEventsOperation, RawLoadBudget, RawReadError,
     RawRevisionState, budget_error, validate_raw_entry,
 };
-use crate::metadata::revision_read::{RawStateOperation, RawViewOperation};
+use crate::metadata::revision_read::{MetadataRawView, RawStateOperation, RawViewOperation};
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
@@ -46,13 +45,6 @@ impl RawEventPlan {
         cache.loaded = true;
         cache.state = Some(self.state.clone());
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataRawView {
-    pub revision: MetadataRawRevision,
-    pub projection_state: MaterializationState,
-    pub projected_event_id: Option<Ulid>,
 }
 
 pub(crate) async fn load_raw_view(

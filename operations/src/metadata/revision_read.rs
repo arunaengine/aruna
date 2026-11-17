@@ -9,13 +9,14 @@ use aruna_core::keyspaces::{
     DOCUMENT_LIFECYCLE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, RAW_REVISION_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationStatusRecord, MetadataLifecycleRecord,
-    MetadataRawRevision, resolve_raw_revision,
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord,
+    MetadataLifecycleRecord, MetadataRawRevision, resolve_raw_revision,
 };
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{document_lifecycle_key, graph_lifecycle_key, raw_revision_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use ulid::Ulid;
 
@@ -29,6 +30,14 @@ pub type RawViewOutput = (
     Option<MaterializationStatusRecord>,
     Option<MetadataRawRevision>,
 );
+
+/// A document's raw revision with how far its projection has caught up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRawView {
+    pub revision: MetadataRawRevision,
+    pub projection_state: MaterializationState,
+    pub projected_event_id: Option<Ulid>,
+}
 
 #[derive(Debug, PartialEq)]
 enum ViewState {
