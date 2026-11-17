@@ -4,7 +4,7 @@
 
 use super::*;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::FjallStorage;
+use aruna_storage::{FjallStorage, StorageHandle};
 
 fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");

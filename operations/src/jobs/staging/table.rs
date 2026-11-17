@@ -25,8 +25,8 @@ use bytes::Bytes;
 use byteview::ByteView;
 use futures_util::StreamExt;
 
-use super::limiter::retried;
 use super::manifest::lasting_head;
+use super::retried;
 use super::walk::{
     PageFailure, StagedFile, access_rules, commit_rows, import_page, key_turns, own_ranges,
     record_failure, source_permission_path,

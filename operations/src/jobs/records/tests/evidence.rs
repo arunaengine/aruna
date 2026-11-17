@@ -454,3 +454,106 @@ fn refuses_partial_scan() {
         )))
     );
 }
+
+/// Answers every call of `operation` as an empty store would, after the realm config read,
+/// and returns its result and the rows it wrote.
+fn run_calls(
+    mut operation: AppendRecordOperation,
+    config: Vec<u8>,
+) -> (
+    Result<AppendOutcome, RecordStoreError>,
+    Vec<(String, Key, Value)>,
+) {
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::{Operation, TransactionMode};
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+        panic!("the realm config is read first");
+    };
+    assert!(matches!(
+        *effect,
+        Effect::Storage(StorageEffect::Read { txn_id: None, .. })
+    ));
+    let read = Event::Storage(StorageEvent::ReadResult {
+        key: Key::from([0u8].as_slice()),
+        value: Some(Value::from(config.as_slice())),
+    });
+    let mut turn = operation.next(IoResult::Event(Box::new(read)));
+    let mut written = Vec::new();
+    loop {
+        let result = match turn {
+            Ok(Next::Done(outcome)) => return (Ok(outcome), written),
+            Err(error) => return (Err(error), written),
+            Ok(Next::Call(IoCall::Read(reads))) => IoResult::Values(vec![None; reads.len()]),
+            Ok(Next::Call(IoCall::Page { .. })) => IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            },
+            Ok(Next::Call(IoCall::Write(rows))) => {
+                written.extend(rows);
+                IoResult::Done
+            }
+            Ok(Next::Call(IoCall::Delete(_))) => IoResult::Done,
+            Ok(other) => panic!("unexpected step {other:?}"),
+        };
+        turn = operation.next(result);
+    }
+}
+
+fn spec_append(family: &Family) -> AppendRecordOperation {
+    let record = family.sign(
+        &family.holder,
+        JobFamilyRecord::Spec(Box::new(family.spec())),
+    );
+    AppendRecordOperation::new(AppendRecordConfig {
+        realm_id: REALM,
+        local_node_id: family.holder.public(),
+        record: JobRecordFrame::new(record).expect("bounded record"),
+        local: None,
+        origin: RecordOrigin::Local,
+        now_ms: 3_000,
+    })
+}
+
+// A first spec of a family is admitted and written with its record row; every read runs
+// in the append's transaction after the realm config read outside it.
+#[test]
+fn admits_first_spec() {
+    let family = Family::new([28u8; 32]);
+    let config = family
+        .config
+        .to_bytes(&actor(family.holder.public()))
+        .expect("config encodes");
+    let (outcome, written) = run_calls(spec_append(&family), config);
+    let outcome = outcome.expect("the spec is admitted");
+    assert_eq!(outcome.admission, Admission::Authentic);
+    assert!(
+        written
+            .iter()
+            .any(|(space, _, _)| space == FAMILY_RECORD_KEYSPACE)
+    );
+}
+
+// A missing realm config or an unfit answer fails the append before it writes anything.
+#[test]
+fn refuses_without_config() {
+    use aruna_core::calls::IoResult;
+    use aruna_core::operation::Operation;
+    let family = Family::new([29u8; 32]);
+    let mut operation = spec_append(&family);
+    operation.first().expect("config read");
+    let missing = Event::Storage(StorageEvent::ReadResult {
+        key: Key::from([0u8].as_slice()),
+        value: None,
+    });
+    assert_eq!(
+        operation.next(IoResult::Event(Box::new(missing))),
+        Err(RecordStoreError::RealmConfigMissing)
+    );
+    let mut operation = spec_append(&family);
+    operation.first().expect("config read");
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Err(RecordStoreError::UnexpectedEvent { .. })
+    ));
+}

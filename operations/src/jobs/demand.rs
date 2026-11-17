@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, VecDeque};
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::quota::{
-    ComputeDemandSnapshot, DemandFamily, DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES,
-    MAX_DEMAND_GROUPS, ResourceTotals, bound_demand,
+    ComputeDemandSnapshot, DemandFamily, DemandGroup, MAX_DEMAND_FAMILIES, MAX_DEMAND_GROUPS,
+    ResourceTotals, bound_demand,
 };
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
@@ -20,15 +20,11 @@ use aruna_core::structs::execution::job::{
     EffectiveResources, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope,
     JobRecordKind, LogicalJobState, SubmissionId,
 };
-use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::node_info::AdvertisementEpoch;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 
-use crate::document_repository::GetConfigOperation;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::project::{
     FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily,
@@ -36,25 +32,6 @@ use crate::jobs::records::project::{
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
-
-/// Every reservation this node holds; [`HeldReservations::all`] is the operation behind it.
-pub(crate) async fn read_reservations(
-    ctx: &DriverContext,
-) -> Result<Vec<JobReservationRecord>, String> {
-    drive(HeldReservations::all(), ctx)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-/// Bounded logical admission demand this node observes; see [`DemandSnapshotOperation`].
-pub(crate) async fn demand_snapshot(
-    ctx: &DriverContext,
-    epoch: AdvertisementEpoch,
-) -> Result<ComputeDemandSnapshot, String> {
-    drive(DemandSnapshotOperation::new(epoch), ctx)
-        .await
-        .map_err(|error| error.to_string())
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DemandError {
@@ -288,25 +265,6 @@ fn projection_family(key: &Key) -> Result<JobFamilyId, DemandError> {
         submission_id: SubmissionId(submission_id),
         request_digest,
     })
-}
-
-/// Local nonterminal demand merged with the fresh heartbeats of the other sync-eligible members.
-/// The bool flags an understated view: a truncated snapshot or a member without a fresh heartbeat.
-pub async fn group_demand(
-    ctx: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    group_id: &aruna_core::types::GroupId,
-) -> Result<(ResourceTotals, bool), String> {
-    let config = drive(GetConfigOperation::new(realm_id), ctx)
-        .await
-        .map_err(|error| format!("failed to read realm config for node info: {error}"))?;
-    let members = config
-        .sync_eligible_nodes()
-        .map_err(|error| error.to_string())?;
-    let local = demand_snapshot(ctx, AdvertisementEpoch::default()).await?;
-    let fresh = ctx.fresh_heartbeats();
-    Ok(merge_view(local, &members, node_id, &fresh, group_id))
 }
 
 pub(crate) fn merge_view(

@@ -39,7 +39,7 @@ pub async fn restore_lifecycle_timers(
     .unwrap_or(false);
     let mut timers = vec![schedule_outbox_drain(OUTBOX_RETRY_AFTER)];
     if pending {
-        timers.push(crate::jobs::lifecycle::witness::schedule_witness_drain(
+        timers.push(crate::jobs::lifecycle::witness_arm::schedule_witness_drain(
             Duration::from_secs(1),
         ));
     }

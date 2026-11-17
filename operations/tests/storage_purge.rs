@@ -564,7 +564,7 @@ async fn purge_resumes_cleanly() {
     let acquire = AcquireFenceOperation::new(prefix_job_id, prefix_scope.clone());
     drive(acquire, &context.driver).await.unwrap();
     put_purge_checkpoint(
-        &context.driver.storage_handle,
+        &context.driver,
         prefix_job_id,
         prefix_job.claim_token,
         &StoragePurgeCheckpoint {
@@ -634,7 +634,7 @@ async fn purge_resumes_cleanly() {
         "retry after a lost terminal write is idempotent"
     );
     complete_job(
-        &context.driver.storage_handle,
+        &context.driver,
         prefix_job_id,
         prefix_job.claim_token,
         JobResultPayload::StoragePurge(resumed),
@@ -676,7 +676,7 @@ async fn purge_resumes_cleanly() {
     assert!(bucket_result.emptiness_proven);
     assert!(bucket_result.bucket_deleted);
     complete_job(
-        &context.driver.storage_handle,
+        &context.driver,
         bucket_job_id,
         bucket_job.claim_token,
         JobResultPayload::StoragePurge(bucket_result),
@@ -705,7 +705,7 @@ async fn claimed_job(
     let owner_node_id = spec.node_id;
     let created_by = spec.auth_context.user_id;
     insert_job(
-        &driver.storage_handle,
+        &driver,
         &JobRecord::new(
             job_id,
             JobPayload::StoragePurge(spec),
@@ -718,25 +718,17 @@ async fn claimed_job(
     )
     .await
     .unwrap();
-    let ClaimOutcome::Claimed(claimed) = claim_job(
-        &driver.storage_handle,
-        job_id,
-        owner_node_id,
-        unix_timestamp_millis(),
-    )
-    .await
-    .unwrap() else {
+    let ClaimOutcome::Claimed(claimed) =
+        claim_job(&driver, job_id, owner_node_id, unix_timestamp_millis())
+            .await
+            .unwrap()
+    else {
         panic!("new purge job was not claimed")
     };
     let claim_token = claimed.claim.as_ref().unwrap().claim_token;
-    let running = transition_to_running(
-        &driver.storage_handle,
-        job_id,
-        claim_token,
-        unix_timestamp_millis(),
-    )
-    .await
-    .unwrap();
+    let running = transition_to_running(&driver, job_id, claim_token, unix_timestamp_millis())
+        .await
+        .unwrap();
     JobContext {
         driver,
         job_id,
@@ -1067,9 +1059,7 @@ async fn cancelled_queue_releases() {
         1,
         None,
     );
-    insert_job(&context.driver.storage_handle, &record)
-        .await
-        .unwrap();
+    insert_job(&context.driver, &record).await.unwrap();
     let versions = list_linked(&context).await;
     let found = aruna_operations::blob::purge::storage_files(
         &context.driver,
@@ -1089,10 +1079,11 @@ async fn cancelled_queue_releases() {
     cancel_owned_job(&context.driver, &runtime, context.user_id, job_id)
         .await
         .unwrap();
-    let stored = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
-        .await
-        .unwrap()
-        .unwrap();
+    let stored =
+        aruna_operations::jobs::store::state::read_job_record(&context.driver, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
     assert!(stored.state.is_terminal());
     // The version still reads its file, so the release keeps it and the plan is settled.
     let backend = aruna_core::structs::storage::group_backend::GroupStorage {
@@ -1319,9 +1310,8 @@ async fn purge_keeps_released() {
 
     // The failed file purge ends, which drops its fence; a bucket purge then checks alike.
     let error = aruna_core::structs::execution::job::JobError::permanent("pinned");
-    let storage = &context.driver.storage_handle;
     fail_job(
-        storage,
+        &context.driver,
         job.job_id,
         job.claim_token,
         error,

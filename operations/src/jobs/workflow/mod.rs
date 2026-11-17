@@ -33,7 +33,7 @@ use super::store::attempt::{begin_external_running, transition_to_preparing, tra
 use super::store::state::{cancel_running_job, read_job_record, record_attempt_intent};
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::held::HeldReservations;
-use crate::jobs::lifecycle::updates::publish_progress;
+use crate::jobs::lifecycle::publish::publish_progress;
 use crate::placement::policy::LocalSubjectOperation;
 use finalize::{cleanup_and_crate, fail_and_crate, finalize_cancel};
 use prepare::{build_task_spec, job_bucket, prepare_task};

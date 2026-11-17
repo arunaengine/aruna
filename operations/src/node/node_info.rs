@@ -8,7 +8,7 @@ use aruna_core::NodeId;
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot,
-    MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
+    JobReservationRecord, MAX_UNRESOLVED_EXECUTIONS, ResourceTotals, availability,
 };
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
@@ -37,7 +37,8 @@ use ulid::Ulid;
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, drive_retry};
-use crate::jobs::demand::{demand_snapshot, read_reservations};
+use crate::jobs::demand::DemandSnapshotOperation;
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
 use crate::node::heartbeat::SendHeartbeatOperation;
 use crate::node::info_publish::PublishInfoOperation;
@@ -51,6 +52,23 @@ use aruna_core::node_state::DEPARTURE_KEY;
 use aruna_core::node_state::{DrainStateOperation, ReadInfoOperation, SetDrainOperation};
 use aruna_core::placement::{build_view, held_buckets};
 use aruna_core::structs::storage::usage::USAGE_GLOBAL_KEY;
+
+/// Every reservation this node holds; [`HeldReservations::all`] is the operation behind it.
+async fn read_reservations(ctx: &DriverContext) -> Result<Vec<JobReservationRecord>, String> {
+    drive(HeldReservations::all(), ctx)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Bounded logical admission demand this node observes; see [`DemandSnapshotOperation`].
+async fn demand_snapshot(
+    ctx: &DriverContext,
+    epoch: AdvertisementEpoch,
+) -> Result<ComputeDemandSnapshot, String> {
+    drive(DemandSnapshotOperation::new(epoch), ctx)
+        .await
+        .map_err(|error| error.to_string())
+}
 
 /// Assembles this node's info document from its executors, current
 /// placement-view labels, given urls, and local usage, then persists it under the
@@ -152,7 +170,7 @@ async fn reservation_snapshot(
 ) -> Result<ComputeReservationSnapshot, String> {
     // A pending terminal obligation is retried by its own task; it must never
     // stop this node from publishing its info document.
-    if let Err(error) = crate::jobs::lifecycle::updates::settle_terminals(ctx).await {
+    if let Err(error) = crate::jobs::lifecycle::publish::settle_terminals(ctx).await {
         warn!(error = %error, "Terminal job settlement failed during the node-info snapshot");
     }
     let mut reserved = ResourceTotals::default();
@@ -665,7 +683,8 @@ pub(crate) async fn restore_info_timer(task_handle: &TaskHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jobs::demand::{group_demand, merge_view};
+    use crate::jobs::demand::merge_view;
+    use crate::jobs::quota::group_demand;
     use crate::node::info_write::PUBLISH_OWED_KEY;
     use aruna_core::compute::quota::{
         DemandFamily, DemandGroup, JobReservationRecord, MAX_DEMAND_FAMILIES,

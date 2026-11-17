@@ -34,7 +34,8 @@ use super::executor::{
 };
 use super::reconcile::ExternalReconciler;
 use super::store::JobMutationError;
-use super::store::key_wait::{AwaitOutcome, park_job, satisfy_key_wait};
+use super::store::key_wait::{park_job, satisfy_key_wait};
+use super::store::park_wake::AwaitOutcome;
 use super::store::state::{
     ReleaseOutcome, RequeueOutcome, cancel_running_job, complete_job, defer_job, exhaust_job,
     fail_job, flush_progress, handoff_external_attempt, read_job_record, release_job, renew_lease,
@@ -1312,7 +1313,7 @@ mod tests {
         let token = claimed.claim.as_ref().unwrap().claim_token;
 
         run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             token,
             (CancellationToken::new(), None),
@@ -1354,7 +1355,7 @@ mod tests {
             .unwrap();
 
         run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             token,
             (CancellationToken::new(), None),
@@ -1379,7 +1380,7 @@ mod tests {
         let stale_token = claimed.claim.as_ref().unwrap().claim_token;
         let cancel = CancellationToken::new();
         let execution = tokio::spawn(run_job(
-            ctx,
+            ctx.clone(),
             claimed,
             stale_token,
             (cancel.clone(), None),
@@ -1589,7 +1590,7 @@ mod tests {
             "shutdown must wait for the active claim producer"
         );
 
-        runtime.spawn(ctx, claimed);
+        runtime.spawn(ctx.clone(), claimed);
         drop(producer);
         tokio::time::timeout(Duration::from_secs(30), shutdown)
             .await
