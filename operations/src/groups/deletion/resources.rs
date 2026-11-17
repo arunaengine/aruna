@@ -4,10 +4,10 @@
 
 use std::time::SystemTime;
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult};
 use aruna_core::keyspaces::*;
 use aruna_core::metadata::MetadataEventRecord;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::{JobFamilyRecord, JobRecordEnvelope};
 use aruna_core::structs::identity::group_delete::GroupDeletionError;
@@ -16,10 +16,10 @@ use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::GroupStorage;
 use aruna_core::structs::storage::routing::GroupStorageRouting;
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 
 const MAX_NAMED: usize = 5;
+const PAGE_ROWS: usize = 128;
 
 const TABLES: &[(&str, &str, bool)] = &[
     (METADATA_INDEX_KEYSPACE, "metadata documents", true),
@@ -42,18 +42,30 @@ const TABLES: &[(&str, &str, bool)] = &[
     ),
 ];
 
+/// Pages through every resource table and names what still belongs to the group.
 #[derive(Debug, PartialEq)]
 pub(super) struct EmptyCheck {
     group_id: GroupId,
     now: SystemTime,
     table: usize,
+    pages: PrefixPages,
+    /// Set while the event log rows of a pending projection page are read.
     pending: bool,
-    next: Option<Key>,
     /// Every kind of resource found so far; the check names them all.
     found: Vec<&'static str>,
     /// Names of the first blocking buckets, and whether more exist.
     buckets: Vec<String>,
     more: bool,
+}
+
+/// The pages of one table: the group's own rows, or the whole table where rows name the group.
+fn table_pages(table: usize, group_id: GroupId) -> PrefixPages {
+    let (space, _, scoped) = TABLES[table];
+    let prefix = match scoped {
+        true => group_id.to_bytes().to_vec(),
+        false => Vec::new(),
+    };
+    PrefixPages::new(space, prefix, PAGE_ROWS)
 }
 
 impl EmptyCheck {
@@ -62,140 +74,142 @@ impl EmptyCheck {
             group_id,
             now,
             table: 0,
+            pages: table_pages(0, group_id),
             pending: false,
-            next: None,
             found: Vec::new(),
             buckets: Vec::new(),
             more: false,
         }
     }
 
-    pub fn start(&self, txn_id: TxnId) -> Effects {
-        let (key_space, _, prefix) = TABLES[self.table];
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: prefix.then(|| self.group_id.to_bytes().into()),
-            start: self.next.clone().map(aruna_core::effects::IterStart::After),
-            limit: 128,
-            txn_id: Some(txn_id),
-        })]
+    /// The call for the next page of the current table.
+    pub fn call(&self) -> IoCall {
+        self.pages.call()
     }
 
-    pub fn step(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-    ) -> Result<Option<Effects>, GroupDeletionError> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(error.into());
-        }
-        let (space, reason, prefix) = TABLES[self.table];
-        if self.pending {
-            let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                return Err(GroupDeletionError::Unavailable(
-                    "invalid pending metadata read".into(),
-                ));
-            };
+    /// Takes the answer to the last call: the next call, `None` when the group is empty, or the
+    /// resources that block it.
+    pub fn take(&mut self, result: IoResult) -> Result<Option<IoCall>, GroupDeletionError> {
+        let (space, reason, scoped) = TABLES[self.table];
+        let stop = if self.pending {
             self.pending = false;
-            for (_, value) in values {
-                let value = value.ok_or_else(|| {
-                    GroupDeletionError::Unavailable("pending metadata event is missing".into())
-                })?;
-                let record: MetadataEventRecord = postcard::from_bytes(&value)
-                    .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
-                if record.record.group_id == self.group_id {
-                    self.found.push(reason);
-                    self.next = None;
-                    break;
-                }
-            }
+            self.pending_owned(result, reason)?
         } else {
-            let Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) = event
-            else {
-                return Err(GroupDeletionError::Unavailable(
-                    "invalid resource scan".into(),
-                ));
-            };
-            self.next = next_start_after;
-            if space == PENDING_PROJECTION_KEYSPACE && !values.is_empty() {
+            let rows = (self.pages.take(result))
+                .map_err(|_| GroupDeletionError::Unavailable("invalid resource scan".into()))?;
+            if space == PENDING_PROJECTION_KEYSPACE && !rows.is_empty() {
                 self.pending = true;
-                return Ok(Some(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: values
-                        .into_iter()
-                        .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
-                        .collect(),
-                    txn_id: Some(txn_id),
-                })]));
+                let reads = (rows.into_iter())
+                    .map(|(key, _)| (EVENT_LOG_KEYSPACE.to_string(), key))
+                    .collect();
+                return Ok(Some(IoCall::Read(reads)));
             }
-            for (key, value) in values {
-                let owned = match space {
-                    // A finished job only waits for its retention purge, so it does not block.
-                    JOB_KEYSPACE => {
-                        let record = JobRecord::from_bytes(&value)?;
-                        record.payload.owner_group() == Some(self.group_id)
-                            && !record.state.is_terminal()
-                    }
-                    FAMILY_RECORD_KEYSPACE => {
-                        let envelope: JobRecordEnvelope =
-                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
-                        matches!(envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
-                    }
-                    FAMILY_PENDING_KEYSPACE => {
-                        let pending: aruna_core::structs::execution::job::record_rows::PendingRecord =
-                            aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
-                        matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
-                    }
-                    S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,
-                    // A disabled `retain` backend keeps its bytes in tenant storage; the commit drops it.
-                    STORAGE_BACKEND_KEYSPACE => {
-                        let record = GroupStorage::from_bytes(&value)?;
-                        record.group_id == self.group_id
-                            && !(record.disabled && record.cleanup == CleanupStrategy::Retain)
-                    }
-                    USER_ACCESS_KEYSPACE => {
-                        let record = UserAccess::from_bytes(&value)?;
-                        record.group_id == self.group_id
-                            && record.revoked_at.is_none()
-                            && record.expiry > self.now
-                    }
-                    PLACEMENT_POLICY_KEYSPACE => {
-                        PlacementPolicyDocument::from_bytes(&value)?
-                            .policy
-                            .owner_group_id
-                            == Some(self.group_id)
-                    }
-                    STORAGE_ROUTING_KEYSPACE => GroupStorageRouting::from_bytes(&value)?
-                        .default_target
-                        .is_some(),
-                    _ => prefix,
-                };
-                if owned && space == S3_BUCKET_KEYSPACE {
-                    if self.buckets.is_empty() {
-                        self.found.push(reason);
-                    }
-                    if self.buckets.len() == MAX_NAMED {
-                        self.more = true;
-                        self.next = None;
-                        break;
-                    }
-                    self.buckets
-                        .push(String::from_utf8_lossy(&key).into_owned());
-                } else if owned {
-                    self.found.push(reason);
-                    self.next = None;
-                    break;
-                }
-            }
-        }
-        if self.next.is_none() {
+            self.scan(space, reason, scoped, rows)?
+        };
+        if stop || self.pages.done() {
             self.table += 1;
+            if self.table == TABLES.len() {
+                return self.outcome();
+            }
+            self.pages = table_pages(self.table, self.group_id);
         }
-        if self.table < TABLES.len() {
-            return Ok(Some(self.start(txn_id)));
+        Ok(Some(self.pages.call()))
+    }
+
+    /// Whether a pending metadata creation of the last page belongs to the group.
+    fn pending_owned(
+        &mut self,
+        result: IoResult,
+        reason: &'static str,
+    ) -> Result<bool, GroupDeletionError> {
+        let IoResult::Values(values) = result else {
+            return Err(GroupDeletionError::Unavailable(
+                "invalid pending metadata read".into(),
+            ));
+        };
+        for value in values {
+            let value = value.ok_or_else(|| {
+                GroupDeletionError::Unavailable("pending metadata event is missing".into())
+            })?;
+            let record: MetadataEventRecord = postcard::from_bytes(&value)
+                .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))?;
+            if record.record.group_id == self.group_id {
+                self.found.push(reason);
+                return Ok(true);
+            }
         }
+        Ok(false)
+    }
+
+    /// Records the group's resources in one page; true once the table needs no further page.
+    fn scan(
+        &mut self,
+        space: &str,
+        reason: &'static str,
+        scoped: bool,
+        rows: Vec<(Key, Value)>,
+    ) -> Result<bool, GroupDeletionError> {
+        for (key, value) in rows {
+            let owned = match space {
+                // A finished job only waits for its retention purge, so it does not block.
+                JOB_KEYSPACE => {
+                    let record = JobRecord::from_bytes(&value)?;
+                    record.payload.owner_group() == Some(self.group_id)
+                        && !record.state.is_terminal()
+                }
+                FAMILY_RECORD_KEYSPACE => {
+                    let envelope: JobRecordEnvelope =
+                        aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
+                    matches!(envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
+                }
+                FAMILY_PENDING_KEYSPACE => {
+                    let pending: aruna_core::structs::execution::job::record_rows::PendingRecord =
+                        aruna_core::structs::execution::job::record_rows::from_bytes(&value)?;
+                    matches!(pending.envelope.record, JobFamilyRecord::Spec(spec) if spec.group_id == self.group_id)
+                }
+                S3_BUCKET_KEYSPACE => BucketInfo::from_bytes(&value)?.group_id == self.group_id,
+                // A disabled `retain` backend keeps its bytes in tenant storage; the commit drops it.
+                STORAGE_BACKEND_KEYSPACE => {
+                    let record = GroupStorage::from_bytes(&value)?;
+                    record.group_id == self.group_id
+                        && !(record.disabled && record.cleanup == CleanupStrategy::Retain)
+                }
+                USER_ACCESS_KEYSPACE => {
+                    let record = UserAccess::from_bytes(&value)?;
+                    record.group_id == self.group_id
+                        && record.revoked_at.is_none()
+                        && record.expiry > self.now
+                }
+                PLACEMENT_POLICY_KEYSPACE => {
+                    PlacementPolicyDocument::from_bytes(&value)?
+                        .policy
+                        .owner_group_id
+                        == Some(self.group_id)
+                }
+                STORAGE_ROUTING_KEYSPACE => GroupStorageRouting::from_bytes(&value)?
+                    .default_target
+                    .is_some(),
+                _ => scoped,
+            };
+            if owned && space == S3_BUCKET_KEYSPACE {
+                if self.buckets.is_empty() {
+                    self.found.push(reason);
+                }
+                if self.buckets.len() == MAX_NAMED {
+                    self.more = true;
+                    return Ok(true);
+                }
+                self.buckets
+                    .push(String::from_utf8_lossy(&key).into_owned());
+            } else if owned {
+                self.found.push(reason);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn outcome(&self) -> Result<Option<IoCall>, GroupDeletionError> {
         if self.found.is_empty() {
             return Ok(None);
         }
@@ -237,7 +251,6 @@ mod tests {
     #[test]
     fn names_every_kind() {
         let group_id = ulid::Ulid::from_bytes([1u8; 16]);
-        let txn_id = TxnId::default();
         let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
         let mut result = Ok(None);
         for table in 0..TABLES.len() {
@@ -246,11 +259,10 @@ mod tests {
                 true => vec![(Key::from(vec![1]), vec![0].into())],
                 false => Vec::new(),
             };
-            let event = Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after: None,
+            result = check.take(IoResult::Page {
+                rows: values,
+                next: None,
             });
-            result = check.step(event, txn_id);
         }
         let Err(GroupDeletionError::NotEmpty { kinds, .. }) = result else {
             panic!("expected a non-empty group, got {result:?}");
@@ -275,14 +287,14 @@ mod tests {
         .into()
     }
 
-    fn page(rows: &[(&str, GroupId)], next: Option<&str>) -> Event {
-        Event::Storage(StorageEvent::IterResult {
-            values: rows
+    fn page(rows: &[(&str, GroupId)], next: Option<&str>) -> IoResult {
+        IoResult::Page {
+            rows: rows
                 .iter()
                 .map(|(name, group)| (Key::from(name.as_bytes().to_vec()), bucket(*group)))
                 .collect(),
-            next_start_after: next.map(|next| Key::from(next.as_bytes().to_vec())),
-        })
+            next: next.map(|next| Key::from(next.as_bytes().to_vec())),
+        }
     }
 
     fn run(
@@ -291,7 +303,6 @@ mod tests {
         paged: bool,
     ) -> (Vec<String>, bool) {
         let group_id = ulid::Ulid::from_bytes([1u8; 16]);
-        let txn_id = TxnId::default();
         let mut check = EmptyCheck::new(group_id, SystemTime::UNIX_EPOCH);
         let empty = || page(&[], None);
         let mut events = vec![empty(), empty(), empty(), empty()];
@@ -302,7 +313,7 @@ mod tests {
         events.extend((5..TABLES.len()).map(|_| empty()));
         let mut result = Ok(None);
         for event in events {
-            result = check.step(event, txn_id);
+            result = check.take(event);
         }
         let Err(GroupDeletionError::NotEmpty { buckets, more, .. }) = result else {
             panic!("expected a non-empty group, got {result:?}");
