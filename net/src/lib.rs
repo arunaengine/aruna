@@ -18,6 +18,7 @@ mod effect_handlers;
 pub mod error;
 mod eviction;
 mod heartbeat;
+pub mod job_control;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -1052,6 +1053,10 @@ impl Handle for NetHandle {
     )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
+            // The round trip needs this handle's streams, so it never reaches the effect actor.
+            Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
+                job_control::exchange(self, job.owner, job.request).await,
+            )),
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self

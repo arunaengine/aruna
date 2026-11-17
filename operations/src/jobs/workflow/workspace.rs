@@ -1528,7 +1528,7 @@ fn source_input_error(error: GetObjectError) -> JobError {
         &error,
         GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(_)))
     ) {
-        return JobError::retryable(format!("{LOCKED_INPUT}: {error}"));
+        return JobError::locked(format!("{LOCKED_INPUT}: {error}"));
     }
     let message = format!("input read failed: {error}");
     if get_input_retryable(&error) {
@@ -1953,7 +1953,7 @@ mod tests {
         ));
         let error = source_input_error(locked);
         assert_eq!(error.kind, JobErrorKind::Retryable);
-        assert!(error.message.starts_with(LOCKED_INPUT));
+        assert!(error.locked);
     }
 
     // Transient fjall faults now carry their source; classification must key on

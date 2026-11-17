@@ -651,7 +651,17 @@ impl OperationsTaskHandler {
     /// Replicates locally published job-family records to the other holders.
     /// The pass is bounded, so a large backlog re-arms instead of blocking.
     pub(super) async fn drain_family_outbox(&self) {
-        if drain_family_outbox(self.context.as_ref()).await {
+        let Some(net) = self.context.net_handle.as_ref() else {
+            return;
+        };
+        let drain = DrainOutboxOperation::new(*net.realm_id(), net.node_id());
+        let remaining = drive(drain, self.context.as_ref())
+            .await
+            .unwrap_or_else(|error| {
+                warn!(error = %error, "Job family outbox drain failed");
+                true
+            });
+        if remaining {
             self.reschedule_timer(TaskKey::DrainFamilyOutbox, OUTBOX_RETRY_AFTER)
                 .await;
         }

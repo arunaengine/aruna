@@ -207,10 +207,10 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
-        // Job-control and audit effects are executed by the operations runner,
-        // which holds the driver context; they never reach this handler.
+        // The net handle runs job-control round trips itself; the operations
+        // runner executes audit effects. Neither reaches this handler.
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
-            "job-control effect must be dispatched by the operations runner".to_string(),
+            "job-control effect must be sent through the net handle".to_string(),
         )),
         NetEffect::AuditPage(audit) => {
             NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))

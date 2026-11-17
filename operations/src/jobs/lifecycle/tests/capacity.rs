@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
@@ -15,13 +16,14 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::reservation::{
-    ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
-    ReserveExecutionOperation, fits, held_reservations, job_reservation,
+    MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
+    ReserveExecutionOperation, fits,
 };
 use crate::jobs::lifecycle::stage::read_targets;
 use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
-use crate::jobs::lifecycle::updates::chain_for;
 use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::jobs::store::iter_prefix_page;
 use crate::replication::protocol::BaoReadTarget;
@@ -125,7 +127,7 @@ async fn reserve(
 fn holds_static_ceilings() {
     // An unmeasured ceiling never filters; a measured one is exact and a zero
     // concurrency ceiling admits nothing at all.
-    let held = vec![ExecutionReservation {
+    let held = vec![JobReservationRecord {
         execution_id: Ulid::from_bytes([1u8; 16]),
         job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
         logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
@@ -155,7 +157,7 @@ async fn pages_reservations() {
     let writes = (0..=MAX_RESERVATION_SCAN)
         .map(|index| {
             let execution_id = Ulid::from(index as u128 + 1);
-            let reservation = ExecutionReservation {
+            let reservation = JobReservationRecord {
                 execution_id,
                 job_id: family.job_id,
                 logical_job_id: family.job_id,
@@ -181,7 +183,7 @@ async fn pages_reservations() {
         .await;
 
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -206,7 +208,7 @@ async fn reserves_exact_capacity() {
 
     assert_eq!(refused, LifecycleError::Capacity);
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -225,9 +227,10 @@ async fn persists_receipt_first() {
         .await
         .expect("offer is admitted");
 
-    let reservation = job_reservation(&ctx, spec.job_id)
+    let reservation = drive(HeldReservations::of_job(spec.job_id), &ctx)
         .await
         .expect("reservation scan")
+        .pop()
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(
@@ -294,9 +297,13 @@ async fn output_binds_receipt() {
         .await
         .expect("offer is admitted");
 
-    let chain = chain_for(&ctx, spec.job_id, execution_id)
-        .await
-        .expect("chain resolves");
+    let chain = drive(
+        ExecutionChainOperation::of_execution(spec.job_id, execution_id),
+        &ctx,
+    )
+    .await
+    .expect("chain read")
+    .expect("chain resolves");
     let receipt = family.receipt(&launch, 1);
     assert_eq!(chain.family, family.family());
     assert_eq!(chain.spec_digest, spec.spec_digest);

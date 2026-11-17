@@ -1,29 +1,14 @@
-//! Sends net effects through the net handle and runs the job control frame round trip.
+//! Sends net effects through the net handle and answers them when this node has none.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::document::DocumentSyncPublish;
-use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 
 use crate::driver::DriverContext;
-
-/// Executes a job-control request by opening the frame stream and reading the
-/// owner's reply; an unreachable owner is reported so the routing operation can
-/// map it to `Unavailable` (503). The artifact body path stays out of band.
-pub(super) async fn dispatch_job_control(
-    effect: JobControlEffect,
-    context: &DriverContext,
-) -> Event {
-    let JobControlEffect { owner, request } = effect;
-    let event = match crate::jobs::protocol::send_job_request(context, owner, request).await {
-        Ok(reply) => JobControlEvent::Response(Box::new(reply.response)),
-        Err(error) => JobControlEvent::Unavailable(error.to_string()),
-    };
-    Event::Net(NetEvent::JobControl(event))
-}
 
 pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> Event {
     if let Some(net_handle) = &context.net_handle {
@@ -36,6 +21,11 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                         targets: publication_targets(&documents),
                     },
                 ))
+            }
+            NetEffect::JobControl(_) => {
+                Event::Net(NetEvent::JobControl(JobControlEvent::Unavailable(
+                    "job owner unavailable: network handle unavailable".to_string(),
+                )))
             }
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }

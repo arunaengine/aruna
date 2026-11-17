@@ -16,9 +16,9 @@ use tracing::warn;
 
 use super::super::store::{put_job_entry, read_job_record};
 use super::workspace::mint_workspace_credential;
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::ids::session_of;
-use crate::jobs::lifecycle::reservation::job_reservation;
 
 /// Registers the interactive session of a session job. `None` is an ordinary
 /// run, or a node with no compute plane.
@@ -31,9 +31,10 @@ pub(super) async fn start_session(
     bucket: &str,
 ) -> Option<Arc<Session>> {
     let requested = session_of(spec)?;
-    let public_job_id = job_reservation(context, job_id)
+    let public_job_id = drive(HeldReservations::of_job(job_id), context)
         .await
         .ok()?
+        .first()
         .map_or(job_id, |reservation| reservation.logical_job_id);
     let registry = context.compute_handle.as_ref()?.sessions().clone();
     let net = context.net_handle.as_ref()?;

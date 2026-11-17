@@ -35,8 +35,8 @@ use crate::jobs::lifecycle::reservation::{ReserveExecutionOperation, reservation
 use crate::jobs::lifecycle::target::{
     CommitVerdict, RESERVE_ATTEMPTS, classify, commit_receipt, commit_with, local_capability,
 };
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::keys::record_key;
-use crate::jobs::records::load_kind_complete;
 use crate::jobs::records::rows::to_bytes;
 use crate::node::node_info::set_operator_drain;
 use crate::tests::records::{Family, REALM, context};
@@ -187,9 +187,12 @@ async fn recovers_durable_commit() {
     .await;
 
     let frame = decided.expect("offer is decided").expect("admitted");
-    let stored = load_kind_complete(driver, family.family(), JobRecordKind::Receipt)
-        .await
-        .expect("receipt read completes");
+    let stored = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+        driver,
+    )
+    .await
+    .expect("receipt read completes");
     assert_eq!(stored.len(), 1);
     assert_eq!(frame.envelope().digest(), stored[0].digest());
     assert_eq!(calls.load(Ordering::Relaxed), 1);

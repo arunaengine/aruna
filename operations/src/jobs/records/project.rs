@@ -15,7 +15,7 @@ use aruna_core::types::{Effects, Key, TxnId, Value};
 use smallvec::smallvec;
 use tracing::debug;
 
-use super::keys::{alias_family, alias_prefix, family_prefix, record_key};
+use super::keys::{MAX_ALIAS_FAMILIES, alias_family, alias_prefix, family_prefix, record_key};
 use super::reduce::reduce_family;
 use super::rows::{ProjectionCache, from_bytes, to_bytes};
 use super::{MAX_PROJECTION_RECORDS, RECORD_PAGE_SIZE, RecordStoreError};
@@ -23,9 +23,6 @@ use crate::jobs::store::{JobDeletes, JobWrites};
 
 /// Aliases one family may bridge into local job rows.
 const MAX_BRIDGED_ALIASES: usize = 64;
-/// Families one alias may resolve to. Two families claiming one id is an
-/// anomaly that stays visible instead of rebinding the first one.
-const MAX_ALIAS_FAMILIES: usize = 8;
 
 /// How a caller names the family to project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
