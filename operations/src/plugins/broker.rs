@@ -43,7 +43,9 @@ use super::creates::{Lookup, Step, claim_key, next_step, settle_key};
 use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
 use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
-use super::intents::{Begun, begin, clear_in, mark_unknown, settle_in, written};
+use super::intents::{
+    Begun, begin, intent_row_key, settled_row, unknown_row, written,
+};
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
 use super::marks::{is_marked, unmarked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
@@ -51,7 +53,7 @@ use super::outgoing::{node_keys, outgoing, request_context};
 use super::rate::take_call;
 use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
-use super::store::{StoreError, Txn, transact};
+use super::rows::{delete_rows, write_rows};
 use super::submit::{
     CopyRequest, DownloadRequest, UploadRequest, start_copy, start_download, start_upload,
 };
@@ -260,7 +262,7 @@ impl RunBroker {
                 .await?;
         }
         let run_id = self.scope.run.run_id;
-        let earlier = written(&self.ctx, run_id, &change.intent).await;
+        let earlier = drive(written(run_id, &change.intent), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -496,32 +498,46 @@ impl RunBroker {
         let run_id = self.scope.run.run_id;
         match outcome {
             Ok(reply) => {
-                let settle =
-                    async |txn: &Txn<'_>| settle_in(txn, run_id, intent, reply.clone()).await;
-                match transact(&self.ctx, settle).await {
+                let settled = settled_row(run_id, intent, reply.clone());
+                let written = match settled {
+                    Ok(row) => drive(write_rows(vec![row]), &self.ctx).await,
+                    Err(error) => Err(error),
+                };
+                match written {
                     Ok(()) => Ok(reply),
                     Err(error) => Err(self.unknown(intent, &error.0).await),
                 }
             }
             Err(Outcome::None(error)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
+                self.clear(intent).await?;
                 Err(error)
             }
             Err(Outcome::Maybe(reason)) => Err(self.unknown(intent, &reason).await),
         }
     }
 
+    /// Removes the intent of a call that ended without an effect, so it may be made again.
+    async fn clear(&self, intent: &Intent) -> Result<(), HostError> {
+        let clear = delete_rows(vec![intent_row_key(self.scope.run.run_id, intent)]);
+        (drive(clear, &self.ctx).await).map_err(|error| unavailable(error.0))
+    }
+
     async fn unknown(&self, intent: &Intent, reason: &str) -> HostError {
-        let _ = mark_unknown(&self.ctx, self.scope.run.run_id, intent, reason).await;
+        self.mark_unknown(intent, reason).await;
         HostError::new(ErrorKind::UnknownOutcome, reason)
+    }
+
+    /// Marks a call whose effect may have happened without a recorded reply; a failure leaves the
+    /// intent pending, which a later attempt reads as unknown as well.
+    async fn mark_unknown(&self, intent: &Intent, reason: &str) {
+        if let Ok(row) = unknown_row(self.scope.run.run_id, intent, reason) {
+            let _ = drive(write_rows(vec![row]), &self.ctx).await;
+        }
     }
 
     /// The intent's earlier outcome, or `None` when the effect may be dispatched now.
     async fn begun(&self, intent: &Intent) -> Result<Option<String>, HostError> {
-        let begun = begin(&self.ctx, self.scope.run.run_id, intent).await;
+        let begun = drive(begin(self.scope.run.run_id, intent.clone()), &self.ctx).await;
         match begun.map_err(|error| unavailable(error.0))? {
             Begun::Fresh => Ok(None),
             Begun::Settled(reply) => Ok(Some(reply)),
@@ -846,7 +862,7 @@ impl Broker for RunBroker {
         let (install, auth) = self.checked(Permission::MetadataWrite, path).await?;
         // A new call starts only from the copy it expects; an earlier attempt's intent decides.
         let run_id = self.scope.run.run_id;
-        let earlier = written(&self.ctx, run_id, &patch.intent).await;
+        let earlier = drive(written(run_id, &patch.intent), &self.ctx).await;
         if !earlier.map_err(|error| unavailable(error.0))? {
             same_revision(record.last_event_id, expected)?;
         }
@@ -1235,7 +1251,7 @@ impl Broker for RunBroker {
     async fn state_get(&self, _cx: &CallContext, key: &str) -> Result<Option<Entry>, HostError> {
         check_key(key)?;
         let install = self.admitted(None).await?;
-        let entry = read_state(&self.ctx, install.install_id, key).await;
+        let entry = drive(read_state(install.install_id, key), &self.ctx).await;
         entry.map_err(|error| unavailable(error.0))
     }
 
@@ -1248,16 +1264,14 @@ impl Broker for RunBroker {
                 .map_err(|_| unavailable("a stored reply is not a version"));
         }
         let run_id = self.scope.run.run_id;
-        match put_state(&self.ctx, run_id, install.install_id, &put).await {
+        let intent = put.intent.clone();
+        match drive(put_state(run_id, install.install_id, put), &self.ctx).await {
             Ok(version) => Ok(version),
             Err(PutError::Refused(message, kind)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &put.intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
+                self.clear(&intent).await?;
                 Err(HostError::new(kind, message))
             }
-            Err(PutError::Store(error)) => Err(self.unknown(&put.intent, &error.0).await),
+            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }
     }
 
@@ -1268,16 +1282,14 @@ impl Broker for RunBroker {
             return Ok(());
         }
         let run_id = self.scope.run.run_id;
-        match remove_state(&self.ctx, run_id, install.install_id, &remove).await {
+        let intent = remove.intent.clone();
+        match drive(remove_state(run_id, install.install_id, remove), &self.ctx).await {
             Ok(()) => Ok(()),
             Err(PutError::Refused(message, kind)) => {
-                let clear = async |txn: &Txn<'_>| clear_in(txn, run_id, &remove.intent).await;
-                transact::<(), StoreError>(&self.ctx, clear)
-                    .await
-                    .map_err(|error| unavailable(error.0))?;
+                self.clear(&intent).await?;
                 Err(HostError::new(kind, message))
             }
-            Err(PutError::Store(error)) => Err(self.unknown(&remove.intent, &error.0).await),
+            Err(PutError::Store(error)) => Err(self.unknown(&intent, &error.0).await),
         }
     }
 
@@ -1318,7 +1330,7 @@ impl Broker for RunBroker {
 
     async fn abandoned(&self, _cx: &CallContext, intent: &Intent) {
         let reason = "the call did not finish in time";
-        let _ = mark_unknown(&self.ctx, self.scope.run.run_id, intent, reason).await;
+        self.mark_unknown(intent, reason).await;
     }
 }
 
