@@ -11,8 +11,8 @@ use aruna_core::keyspaces::{
     PLUGIN_GAPS_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,
 };
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataEventPayload,
-    MetadataEventRecord,
+    GraphLifecycleRecord, MaterializationState, MaterializationStatusRecord, MetadataBatch,
+    MetadataEventPayload, MetadataEventRecord,
 };
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{
@@ -26,8 +26,12 @@ use ulid::Ulid;
 
 use super::matcher::Outbox;
 use super::receiver::lost_reason;
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use super::rows::{
+    Answer, Ask, Plan, RowsOperation, Scan, Turn, done, row as row_of, scan_rows, unexpected,
+    values,
+};
+use super::store::{Rows, StoreError, decode, encode};
+use crate::driver::{DriverContext, drive};
 use crate::metadata::projector::dot_applied;
 
 /// Forward rows of one install read for sending in one pass at most.
@@ -138,25 +142,24 @@ pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
     let mut batches: BTreeMap<NodeId, Requests> = BTreeMap::new();
     let open = |node: NodeId| lost_reason(config, node).is_none() && backoff.ready(node, now_ms);
     let mut after = None;
-    while let Some(install_id) = next_install(ctx, after).await? {
+    while let Some(install_id) = drive(next_install(after), ctx).await? {
         after = Some(install_id);
         let install = (config.installs.iter()).find(|i| i.install_id == install_id);
         let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
-            drop_rows(ctx, PLUGIN_OUTBOX_KEYSPACE, &install_id.to_bytes()).await?;
+            let prefix = install_id.to_bytes().to_vec();
+            drive(drop_rows(PLUGIN_OUTBOX_KEYSPACE, prefix), ctx).await?;
             continue;
         };
         let pending = open(install.receiver)
             .then(|| receiver_requests(&mut batches, install.receiver, bound));
         collect(ctx, install_id, now_ms, pending).await?;
     }
-    let gaps = Txn::direct(ctx)
-        .scan(PLUGIN_GAPS_KEYSPACE, &[SENDER_GAP])
-        .await?;
-    for (key, value) in gaps {
+    let gaps = Scan::new(PLUGIN_GAPS_KEYSPACE, vec![SENDER_GAP]);
+    for (key, value) in drive(scan_rows(gaps), ctx).await? {
         let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
         let install = (config.installs.iter()).find(|i| i.install_id == install_id);
         let Some(install) = install.filter(|i| i.state != InstallState::Removing) else {
-            drop_rows(ctx, PLUGIN_GAPS_KEYSPACE, &key).await?;
+            drive(drop_rows(PLUGIN_GAPS_KEYSPACE, key), ctx).await?;
             continue;
         };
         let row: GapRow = decode(&value)?;
@@ -174,7 +177,7 @@ pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
                 failed = true;
                 break;
             };
-            let (count, busy) = apply(ctx, &keys, decisions).await?;
+            let (count, busy) = drive(apply(&keys, decisions), ctx).await?;
             decided += count;
             if busy {
                 failed = true;
@@ -190,30 +193,86 @@ pub(crate) async fn send_bounded<F: Future<Output = Result<Decisions, String>>>(
 }
 
 /// The next install after `after` with forward rows on this node.
-async fn next_install(
-    ctx: &DriverContext,
-    after: Option<Ulid>,
-) -> Result<Option<Ulid>, StoreError> {
+fn next_install(after: Option<Ulid>) -> RowsOperation<NextInstall> {
     // A forward key is the install id, then 24 bytes of journal time and event id.
     let start = after.map(|id| [&id.to_bytes()[..], &[0xff; 24]].concat());
-    let (rows, _) = (Txn::direct(ctx))
-        .page(PLUGIN_OUTBOX_KEYSPACE, &[], start, 1)
-        .await?;
-    let first = rows
-        .first()
-        .and_then(|(key, _)| key.get(..16)?.try_into().ok());
-    Ok(first.map(Ulid::from_bytes))
+    RowsOperation::direct(NextInstall(start))
 }
 
-async fn drop_rows(ctx: &DriverContext, space: &str, prefix: &[u8]) -> Result<(), StoreError> {
-    let txn = Txn::direct(ctx);
-    loop {
-        let (rows, _) = txn.page(space, prefix, None, 1_000).await?;
-        if rows.is_empty() {
-            return Ok(());
+#[derive(Debug, PartialEq)]
+pub struct NextInstall(Option<Vec<u8>>);
+
+impl Plan for NextInstall {
+    type Output = Option<Ulid>;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(Ask::Page {
+            space: PLUGIN_OUTBOX_KEYSPACE,
+            prefix: Vec::new(),
+            after: self.0.take(),
+            limit: 1,
+        }))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        let Answer::Page(rows, _) = answer else {
+            return Err(unexpected(answer));
+        };
+        let first = (rows.first()).and_then(|(key, _)| key.get(..16)?.try_into().ok());
+        Ok(Turn::Finish(first.map(Ulid::from_bytes)))
+    }
+}
+
+/// Deletes every row below `prefix`, a page at a time.
+fn drop_rows(space: &'static str, prefix: Vec<u8>) -> RowsOperation<DropRows> {
+    RowsOperation::direct(DropRows {
+        space,
+        prefix,
+        deleting: false,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct DropRows {
+    space: &'static str,
+    prefix: Vec<u8>,
+    deleting: bool,
+}
+
+impl DropRows {
+    fn page(&self) -> Ask {
+        Ask::Page {
+            space: self.space,
+            prefix: self.prefix.clone(),
+            after: None,
+            limit: 1_000,
         }
-        txn.delete(space, rows.into_iter().map(|(key, _)| key).collect())
-            .await?;
+    }
+}
+
+impl Plan for DropRows {
+    type Output = ();
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<()>, StoreError> {
+        Ok(Turn::Ask(self.page()))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+        if std::mem::take(&mut self.deleting) {
+            done(answer)?;
+            return Ok(Turn::Ask(self.page()));
+        }
+        let Answer::Page(rows, _) = answer else {
+            return Err(unexpected(answer));
+        };
+        if rows.is_empty() {
+            return Ok(Turn::Finish(()));
+        }
+        self.deleting = true;
+        let keys = rows.into_iter().map(|(key, _)| (self.space, key));
+        Ok(Turn::Ask(Ask::Delete(keys.collect())))
     }
 }
 
@@ -225,42 +284,105 @@ async fn collect(
     now_ms: u64,
     mut pending: Option<&mut Requests>,
 ) -> Result<(), StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let prefix = install_id.to_bytes();
-        let (rows, _) = txn
-            .page(PLUGIN_OUTBOX_KEYSPACE, &prefix, None, BATCH)
-            .await?;
-        let (mut expired, mut outbox) = (Vec::new(), Outbox::new(now_ms));
-        for (key, value) in rows {
-            let row: ForwardRow = decode(&value)?;
-            let size = value.len();
-            if now_ms > row.queued_ms.saturating_add(SEND_EXPIRY_MS) {
-                let event = (row.event.kind, row.event.anchor_ms);
-                outbox
-                    .gap(txn, install_id, event, GapReason::Expired)
-                    .await?;
-                expired.push(key);
-            } else if let Some(requests) = pending.as_deref_mut()
-                && !unreadable(ctx, txn, &row).await?
-            {
-                let (batch, keys) = requests.room(size);
-                keys.insert((install_id, row.event.source.clone()), key);
-                batch.events.push(row);
+    let kept = drive(expire_rows(install_id, now_ms), ctx).await?;
+    let Some(requests) = pending.as_deref_mut() else {
+        return Ok(());
+    };
+    for (key, value) in kept {
+        let row: ForwardRow = decode(&value)?;
+        if unreadable(ctx, &row).await? {
+            continue;
+        }
+        let (batch, keys) = requests.room(value.len());
+        keys.insert((install_id, row.event.source.clone()), key);
+        batch.events.push(row);
+    }
+    Ok(())
+}
+
+/// Counts the install's first rows past their send expiry as gaps and deletes them in one
+/// transaction; answers the other rows.
+fn expire_rows(install_id: Ulid, now_ms: u64) -> RowsOperation<ExpireRows> {
+    RowsOperation::transaction(ExpireRows {
+        install_id,
+        now_ms,
+        phase: ExpirePhase::Reading,
+    })
+}
+
+#[derive(Debug, PartialEq)]
+pub struct ExpireRows {
+    install_id: Ulid,
+    now_ms: u64,
+    phase: ExpirePhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum ExpirePhase {
+    Reading,
+    Gaps(Box<Outbox>, Rows, Vec<(&'static str, Vec<u8>)>),
+    Writing(Rows, Vec<(&'static str, Vec<u8>)>),
+    Deleting(Rows),
+}
+
+impl Plan for ExpireRows {
+    type Output = Rows;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Rows>, StoreError> {
+        Ok(Turn::Ask(Ask::Page {
+            space: PLUGIN_OUTBOX_KEYSPACE,
+            prefix: self.install_id.to_bytes().to_vec(),
+            after: None,
+            limit: BATCH,
+        }))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Rows>, StoreError> {
+        match std::mem::replace(&mut self.phase, ExpirePhase::Deleting(Vec::new())) {
+            ExpirePhase::Reading => {
+                let Answer::Page(rows, _) = answer else {
+                    return Err(unexpected(answer));
+                };
+                let mut outbox = Outbox::new(self.now_ms, BTreeMap::new());
+                let (mut kept, mut expired) = (Vec::new(), Vec::new());
+                for (key, value) in rows {
+                    let row: ForwardRow = decode(&value)?;
+                    if self.now_ms > row.queued_ms.saturating_add(SEND_EXPIRY_MS) {
+                        let event = (row.event.kind, row.event.anchor_ms);
+                        outbox.gap(self.install_id, event, GapReason::Expired);
+                        expired.push((PLUGIN_OUTBOX_KEYSPACE, key));
+                    } else {
+                        kept.push((key, value));
+                    }
+                }
+                let ask = outbox.gap_ask();
+                self.phase = ExpirePhase::Gaps(Box::new(outbox), kept, expired);
+                Ok(Turn::Ask(ask))
+            }
+            ExpirePhase::Gaps(outbox, kept, expired) => {
+                let Answer::Values(values) = answer else {
+                    return Err(unexpected(answer));
+                };
+                self.phase = ExpirePhase::Writing(kept, expired);
+                Ok(Turn::Ask(Ask::Write(outbox.rows(values)?)))
+            }
+            ExpirePhase::Writing(kept, expired) => {
+                done(answer)?;
+                self.phase = ExpirePhase::Deleting(kept);
+                Ok(Turn::Ask(Ask::Delete(expired)))
+            }
+            ExpirePhase::Deleting(kept) => {
+                done(answer)?;
+                Ok(Turn::Finish(kept))
             }
         }
-        outbox.commit(txn).await?;
-        txn.delete(PLUGIN_OUTBOX_KEYSPACE, expired).await
-    })
-    .await
+    }
 }
 
 /// Whether a dataset event is not readable here yet: its own change is not materialized and the
 /// document is not deleted. A parked job keeps the row until its send expiry counts a gap.
-async fn unreadable(
-    ctx: &DriverContext,
-    txn: &Txn<'_>,
-    row: &ForwardRow,
-) -> Result<bool, StoreError> {
+async fn unreadable(ctx: &DriverContext, row: &ForwardRow) -> Result<bool, StoreError> {
     let event = &row.event;
     let parsed = (
         event.resource.parse::<Ulid>(),
@@ -269,88 +391,175 @@ async fn unreadable(
     let (Ok(document), Ok(event_id)) = parsed else {
         return Ok(false);
     };
-    let applied = match event.kind {
+    let facts = match event.kind {
         SourceKind::DataUploaded
         | SourceKind::SyncCompleted
         | SourceKind::SyncFailed
         | SourceKind::JobFinished => {
             return Ok(false);
         }
-        SourceKind::DatasetCreated => materialized(txn, document, |id| id >= event_id).await?,
-        SourceKind::DatasetUpdated => change_applied(ctx, txn, document, event_id).await?,
+        SourceKind::DatasetCreated | SourceKind::DatasetUpdated => {
+            let updated = event.kind == SourceKind::DatasetUpdated;
+            drive(dataset_facts(document, event_id, updated), ctx).await?
+        }
     };
-    if applied {
-        return Ok(false);
-    }
-    let key = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document));
-    let lifecycle = txn.read(GRAPH_LIFECYCLE_KEYSPACE, &key).await?;
-    let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
-    Ok(!lifecycle.is_some_and(|record| record.is_deleted()))
+    let applied = match (event.kind, facts.batch) {
+        (SourceKind::DatasetCreated, _) => facts.materialized(|id| id >= event_id),
+        (_, Some((graph_iri, batch))) => dot_applied(ctx, &graph_iri, &batch)
+            .await
+            .map_err(|error| StoreError(error.to_string()))?,
+        (_, None) => facts.logged && facts.materialized(|id| id == event_id),
+    };
+    Ok(!applied && !facts.deleted)
 }
 
-/// Whether the document's status is materialized at an event id that `covers` accepts.
-async fn materialized(
-    txn: &Txn<'_>,
-    document: Ulid,
-    covers: impl Fn(Ulid) -> bool,
-) -> Result<bool, StoreError> {
-    let key = materialization_status_key(document);
-    let status = txn.read(MATERIALIZATION_STATUS_KEYSPACE, &key).await?;
-    let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
-    Ok(status.is_some_and(|status| {
-        status.state == MaterializationState::Materialized && covers(status.event_id)
-    }))
+/// What this node holds about a dataset event: the document's status, the event's own record
+/// and whether the document is deleted.
+fn dataset_facts(document: Ulid, event_id: Ulid, updated: bool) -> RowsOperation<DatasetFacts> {
+    RowsOperation::direct(DatasetFacts {
+        document,
+        event_id,
+        updated,
+    })
 }
 
-/// Whether a change event was applied here: its batch dot is in the graph, or for a change
-/// without a batch the status names that very event. A newer status alone proves nothing.
-async fn change_applied(
-    ctx: &DriverContext,
-    txn: &Txn<'_>,
+#[derive(Debug, PartialEq)]
+pub struct DatasetFacts {
     document: Ulid,
     event_id: Ulid,
-) -> Result<bool, StoreError> {
-    let key = event_log_key(document, event_id);
-    let Some(bytes) = txn.read(EVENT_LOG_KEYSPACE, &key).await? else {
-        return Ok(false);
-    };
-    let record: MetadataEventRecord = decode(&bytes)?;
-    let MetadataEventPayload::ApplyBatch { batch, .. } = &record.payload else {
-        return materialized(txn, document, |id| id == event_id).await;
-    };
-    dot_applied(ctx, &record.record.graph_iri, batch)
-        .await
-        .map_err(|error| StoreError(error.to_string()))
+    /// Whether the event is a change, whose own record decides.
+    updated: bool,
+}
+
+/// The rows read for [`unreadable`].
+#[derive(Debug, Default, PartialEq)]
+struct Facts {
+    status: Option<MaterializationStatusRecord>,
+    /// Whether the event's record is in the event log.
+    logged: bool,
+    /// The graph and batch of a logged change that has one.
+    batch: Option<(String, MetadataBatch)>,
+    deleted: bool,
+}
+
+impl Facts {
+    /// Whether the document's status is materialized at an event id that `covers` accepts.
+    fn materialized(&self, covers: impl Fn(Ulid) -> bool) -> bool {
+        self.status.as_ref().is_some_and(|status| {
+            status.state == MaterializationState::Materialized && covers(status.event_id)
+        })
+    }
+}
+
+impl Plan for DatasetFacts {
+    type Output = Facts;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Facts>, StoreError> {
+        let graph = graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(self.document));
+        Ok(Turn::Ask(Ask::Read(vec![
+            (MATERIALIZATION_STATUS_KEYSPACE, materialization_status_key(self.document)),
+            (EVENT_LOG_KEYSPACE, event_log_key(self.document, self.event_id)),
+            (GRAPH_LIFECYCLE_KEYSPACE, graph),
+        ])))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Facts>, StoreError> {
+        let [status, logged, lifecycle] = values::<3>(answer)?;
+        let status = status.and_then(|bytes| decode::<MaterializationStatusRecord>(&bytes).ok());
+        let logged = logged.filter(|_| self.updated);
+        let record = (logged.as_ref())
+            .map(|bytes| decode::<MetadataEventRecord>(bytes))
+            .transpose()?;
+        let batch = record.and_then(|record| match record.payload {
+            MetadataEventPayload::ApplyBatch { batch, .. } => Some((record.record.graph_iri, batch)),
+            _ => None,
+        });
+        let lifecycle = lifecycle.and_then(|bytes| decode::<GraphLifecycleRecord>(&bytes).ok());
+        Ok(Turn::Finish(Facts {
+            status,
+            logged: logged.is_some(),
+            batch,
+            deleted: lifecycle.is_some_and(|record| record.is_deleted()),
+        }))
+    }
 }
 
 /// Deletes the decided rows and records the acknowledged gap sequences in one transaction;
 /// returns how many rows were decided and whether any was busy.
-async fn apply(
-    ctx: &DriverContext,
-    keys: &BTreeMap<(Ulid, String), Vec<u8>>,
-    decisions: Decisions,
-) -> Result<(usize, bool), StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        let busy = (decisions.events.iter()).any(|(.., outcome)| *outcome == Outcome::Busy);
-        let decided: Vec<Vec<u8>> = (decisions.events.into_iter())
-            .filter(|(.., outcome)| *outcome != Outcome::Busy)
-            .filter_map(|(install, source, _)| keys.get(&(install, source)).cloned())
-            .collect();
-        let count = decided.len();
-        txn.delete(PLUGIN_OUTBOX_KEYSPACE, decided).await?;
-        for (install_id, kind, reason, sequence) in decisions.gaps {
-            let key = gap_key(install_id, kind, reason);
-            let Some(bytes) = txn.read(PLUGIN_GAPS_KEYSPACE, &key).await? else {
-                continue;
-            };
-            let mut row: GapRow = decode(&bytes)?;
-            row.acked = row.acked.max(sequence.min(row.sequence));
-            txn.write(PLUGIN_GAPS_KEYSPACE, vec![(key, encode(&row)?)])
-                .await?;
-        }
-        Ok((count, busy))
+fn apply(keys: &BTreeMap<(Ulid, String), Vec<u8>>, decisions: Decisions) -> RowsOperation<Apply> {
+    let busy = (decisions.events.iter()).any(|(.., outcome)| *outcome == Outcome::Busy);
+    let decided: Vec<_> = (decisions.events.into_iter())
+        .filter(|(.., outcome)| *outcome != Outcome::Busy)
+        .filter_map(|(install, source, _)| keys.get(&(install, source)).cloned())
+        .map(|key| (PLUGIN_OUTBOX_KEYSPACE, key))
+        .collect();
+    let acked = (decisions.gaps.into_iter())
+        .map(|(install_id, kind, reason, sequence)| (gap_key(install_id, kind, reason), sequence))
+        .collect();
+    RowsOperation::transaction(Apply {
+        count: decided.len(),
+        busy,
+        decided: Some(decided),
+        acked,
+        phase: ApplyPhase::Deleting,
     })
-    .await
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Apply {
+    count: usize,
+    busy: bool,
+    decided: Option<Vec<(&'static str, Vec<u8>)>>,
+    acked: Vec<(Vec<u8>, u64)>,
+    phase: ApplyPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum ApplyPhase {
+    Deleting,
+    Reading,
+    Writing,
+}
+
+impl Plan for Apply {
+    type Output = (usize, bool);
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Turn<Self::Output>, StoreError> {
+        Ok(Turn::Ask(Ask::Delete(self.decided.take().unwrap_or_default())))
+    }
+
+    fn next(&mut self, answer: Answer) -> Result<Turn<Self::Output>, StoreError> {
+        match self.phase {
+            ApplyPhase::Deleting => {
+                done(answer)?;
+                self.phase = ApplyPhase::Reading;
+                let reads = (self.acked.iter()).map(|(key, _)| (PLUGIN_GAPS_KEYSPACE, key.clone()));
+                Ok(Turn::Ask(Ask::Read(reads.collect())))
+            }
+            ApplyPhase::Reading => {
+                let Answer::Values(values) = answer else {
+                    return Err(unexpected(answer));
+                };
+                let mut rows = Vec::new();
+                for ((key, sequence), value) in std::mem::take(&mut self.acked).into_iter().zip(values) {
+                    let Some(bytes) = value else {
+                        continue;
+                    };
+                    let mut row: GapRow = decode(&bytes)?;
+                    row.acked = row.acked.max(sequence.min(row.sequence));
+                    rows.push(row_of(PLUGIN_GAPS_KEYSPACE, key, encode(&row)?));
+                }
+                self.phase = ApplyPhase::Writing;
+                Ok(Turn::Ask(Ask::Write(rows)))
+            }
+            ApplyPhase::Writing => {
+                done(answer)?;
+                Ok(Turn::Finish((self.count, self.busy)))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

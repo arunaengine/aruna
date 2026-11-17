@@ -11,7 +11,7 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
+    EVENTS_QUEUED, MAX_ATTEMPTS, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
 };
 use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -41,12 +41,14 @@ use super::install::read_config;
 use super::intents::open_intent;
 use super::journal::prune_journal;
 use super::marks::sweep_marks;
-use super::matcher::match_pending;
+use super::journal::JOURNAL_PAGE;
+use super::matcher::{match_page, match_targets};
 use super::outbound::Outbound;
 use super::prune::{prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
-use super::replay::{plan_replays, run_replays};
+use super::replay::{plan_replays, replay_page, replay_scan};
+use super::rows::scan_rows;
 use super::runs::{RunError, prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
 use super::waiting::recheck_waiting;
@@ -160,10 +162,10 @@ impl Worker {
         if let Err(error) = plan_replays(&self.ctx, &config, self.local, now_ms, probe).await {
             warn!(%error, "Could not plan plugin event replays");
         }
-        if let Err(error) = match_pending(&self.ctx, &config, self.local, now_ms).await {
+        if let Err(error) = self.match_pending(&config, now_ms).await {
             warn!(%error, "Could not match plugin events to installs");
         }
-        if let Err(error) = run_replays(&self.ctx, now_ms).await {
+        if let Err(error) = run_replays(&self.ctx, now_ms, (JOURNAL_PAGE, usize::MAX)).await {
             warn!(%error, "Could not replay plugin events");
         }
         let mut backoff = self.backoff.lock().await;
@@ -222,6 +224,21 @@ impl Worker {
     }
 
     /// Delivers the ends of jobs whose starting run succeeded as `job_finished` runs.
+    /// Matches every pending journal row of this node, a page per transaction; returns how many
+    /// rows were read.
+    async fn match_pending(&self, config: &RealmConfigDocument, now_ms: u64) -> Result<usize, StoreError> {
+        let targets = match_targets(config, self.local);
+        let mut read = 0;
+        loop {
+            let page = match_page((&targets.0, targets.1), now_ms, EVENTS_QUEUED);
+            let count = drive(page, &self.ctx).await?;
+            read += count;
+            if count < JOURNAL_PAGE {
+                return Ok(read);
+            }
+        }
+    }
+
     async fn notify(&self, now_ms: u64) -> Result<usize, String> {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
@@ -568,6 +585,26 @@ fn retry(run: &mut PluginRun, message: String, now_ms: u64) {
     run.state = RunState::Queued;
     run.message = Some(message);
     run.due_ms = now_ms.saturating_add(backoff);
+}
+
+/// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
+/// returns the rows read.
+pub(crate) async fn run_replays(
+    ctx: &DriverContext,
+    now_ms: u64,
+    (page, pages): (usize, usize),
+) -> Result<usize, StoreError> {
+    let mut read = 0;
+    for (key, _) in drive(scan_rows(replay_scan()), ctx).await? {
+        for _ in 0..pages {
+            let (rows, ended) = drive(replay_page(key.clone(), now_ms, page), ctx).await?;
+            read += rows;
+            if ended {
+                break;
+            }
+        }
+    }
+    Ok(read)
 }
 
 /// Runs the worker until the node stops: it claims due runs every tick, then stops the guests.
