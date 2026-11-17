@@ -103,7 +103,10 @@ async fn release_guards(
         Event::Storage(StorageEvent::ReadResult { value, .. }) => {
             Ok(vec![(BUCKET_RELEASE_KEYSPACE.to_string(), key, value)])
         }
-        other => Err(PinnedError::Unchecked(format!("the release marker could not be read: {}", other.label()))),
+        other => Err(PinnedError::Unchecked(format!(
+            "the release marker could not be read: {}",
+            other.label()
+        ))),
     }
 }
 
