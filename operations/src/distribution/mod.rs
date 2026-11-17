@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod accept_delegation;
 pub mod admit;
 pub mod balance;
 pub mod change;

@@ -12,40 +12,16 @@ use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::storage::distribution::delegation::{
-    BodyTrailer, Delegation, DelegationError, MAX_VALID_SECS, Payload, SignedDelegation,
+    BodyTrailer, Delegation, DelegationError, Payload, SignedDelegation,
 };
 use aruna_core::types::GroupId;
-use thiserror::Error;
 use ulid::Ulid;
 
-use super::nonce::{NonceError, SpendNonceOperation};
+use super::accept_delegation::{AcceptDelegationOperation, DelegateError};
 use crate::driver::{DriverContext, drive};
-use crate::forward::authorize::is_sync_eligible;
-use crate::placement::process_placements::load_realm_config;
 
 /// How long an issued delegation is valid.
 const DELEGATION_SECS: u64 = 15;
-
-#[derive(Debug, Error, PartialEq)]
-pub enum DelegateError {
-    #[error(transparent)]
-    Delegation(#[from] DelegationError),
-    #[error("the delegation comes from a node that is not a realm infrastructure node")]
-    Issuer,
-    #[error("the delegation was already used")]
-    Replayed,
-    #[error("delegations need the realm transport and configuration")]
-    Unavailable,
-}
-
-impl From<NonceError> for DelegateError {
-    fn from(error: NonceError) -> Self {
-        match error {
-            NonceError::Replayed => DelegateError::Replayed,
-            NonceError::Unavailable => DelegateError::Unavailable,
-        }
-    }
-}
 
 /// What the issuing node verified about one request before it forwards it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,9 +93,7 @@ pub fn sign_body(
     Some(net.sign(&trailer.signing_bytes(nonce)))
 }
 
-/// Accepts a delegation for this node once: the issuer must be a configured realm
-/// infrastructure node, never a device. The caller still checks the request digest and the
-/// user's permissions on its own path.
+/// Accepts a delegation for this node once; see [`AcceptDelegationOperation`].
 pub async fn accept_delegation(
     context: &Arc<DriverContext>,
     signed: &SignedDelegation,
@@ -129,19 +103,7 @@ pub async fn accept_delegation(
         .net_handle
         .as_ref()
         .ok_or(DelegateError::Unavailable)?;
-    let realm_id = *net.realm_id();
-    let delegation = signed.verify(realm_id, net.node_id(), now)?.clone();
-    let config = load_realm_config(context, realm_id)
-        .await
-        .ok_or(DelegateError::Unavailable)?;
-    if !is_sync_eligible(&config, delegation.issuer) {
-        return Err(DelegateError::Issuer);
-    }
-    let expires = delegation.issued_at.saturating_add(2 * MAX_VALID_SECS);
-    drive(
-        SpendNonceOperation::new(delegation.nonce, expires, now),
-        context,
-    )
-    .await?;
-    Ok(delegation)
+    let accept =
+        AcceptDelegationOperation::new(signed.clone(), *net.realm_id(), net.node_id(), now);
+    drive(accept, context).await
 }
