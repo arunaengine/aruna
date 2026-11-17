@@ -8,11 +8,10 @@ use crate::auth::{
     require_realm_auth,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
 use crate::lookup::bucket_info;
 use crate::lookup::{RestForward, relay_json, rest_target};
-use crate::routes::execution::jobs::{
-    decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor, map_submit_error,
-};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::{
     ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
@@ -1120,10 +1119,10 @@ pub async fn get_staging_job(
         &state.get_ctx(),
         auth.user_id,
         job_id,
-        crate::routes::execution::jobs::forwarded_job_auth(bearer)?,
+        crate::jobs::forwarded_job_auth(bearer)?,
     )
     .await
-    .map_err(crate::routes::execution::jobs::map_job_route)?
+    .map_err(crate::jobs::map_job_route)?
     .filter(|(record, _)| staging_job_visible(record, &auth))
     .ok_or(ServerError::NotFound)?;
     Ok((

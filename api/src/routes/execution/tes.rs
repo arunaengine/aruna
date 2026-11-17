@@ -723,7 +723,7 @@ pub async fn create_task(
         };
     }
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
@@ -900,7 +900,7 @@ pub async fn get_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),
@@ -1184,7 +1184,7 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
             Some(aruna_operations::metadata::AuthToken::internal(
                 caller.auth.clone(),

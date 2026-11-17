@@ -5,7 +5,7 @@
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::{decode_cursor, encode_cursor};
+use crate::jobs::{decode_cursor, encode_cursor};
 use crate::server::state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::UserId;

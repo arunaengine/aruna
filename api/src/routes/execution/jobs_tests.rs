@@ -11,7 +11,6 @@ use crate::jobs::{
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
     ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
@@ -21,6 +20,7 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::execution::job::{
     CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
 };
+use aruna_core::structs::execution::job::{JobRecord, JobState};
 use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;

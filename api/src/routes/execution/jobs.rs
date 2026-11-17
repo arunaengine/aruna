@@ -9,12 +9,13 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, JobState, SYSTEM_ENTRY_PREFIX,
+    CompositionError, ExportReportRow, ImportReportRow, JobId, SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::device::compute::LocalExecutionError;
 use aruna_operations::federation::export::admit_grant;
+use aruna_operations::jobs::REPORT_MAX_ROWS;
 use aruna_operations::jobs::command::{
     CollisionPolicy as CommandCollisionPolicy, ExecutionInput, ExecutionOutput,
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
@@ -27,7 +28,6 @@ use aruna_operations::jobs::service::{
     read_report_routed, resolve_job_owner,
 };
 use aruna_operations::jobs::store::RunDelete;
-use aruna_operations::jobs::{JobRouteError, REPORT_MAX_ROWS};
 use aruna_operations::node::node_info::read_info_documents;
 use aruna_operations::s3::object::get::ObjectRangeRequest;
 use axum::body::Body;
@@ -53,7 +53,8 @@ use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{
     JobListResponse, JobStatusResponse, SubmitJobResponse, admit_execution, bind_output_routes,
-    family_response, job_status_response, job_urls, job_view_response,
+    decode_cursor, encode_cursor, family_response, forwarded_job_auth, job_status_response,
+    job_urls, job_view_response, map_job_route, parse_state,
 };
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
@@ -446,42 +447,6 @@ struct ReportCursor {
     last_key: Vec<u8>,
 }
 
-pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
-    match value {
-        "queued" => Ok(JobState::Queued),
-        "claimed" => Ok(JobState::Claimed),
-        "preparing" => Ok(JobState::Preparing),
-        "ready" => Ok(JobState::Ready),
-        "running" => Ok(JobState::Running),
-        "cancelling" => Ok(JobState::Cancelling),
-        "indeterminate" => Ok(JobState::Indeterminate),
-        "succeeded" => Ok(JobState::Succeeded),
-        "failed" => Ok(JobState::Failed),
-        "cancelled" => Ok(JobState::Cancelled),
-        "awaiting_key" => Ok(JobState::AwaitingKey),
-        _ => Err(ServerError::BadRequest),
-    }
-}
-
-pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
-    match cursor {
-        Some(cursor) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(cursor)
-                .map_err(|_| ServerError::BadRequest)?;
-            if bytes.len() != 24 {
-                return Err(ServerError::BadRequest);
-            }
-            Ok(Some(bytes))
-        }
-        None => Ok(None),
-    }
-}
-
-pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
-    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
-}
-
 fn decode_report_cursor(cursor: Option<&str>) -> ServerResult<Option<ReportCursor>> {
     cursor
         .map(|cursor| {
@@ -509,25 +474,6 @@ fn encode_report_cursor(
             .map_err(|error| ServerError::InternalError(error.into()))
         })
         .transpose()
-}
-
-pub(crate) fn forwarded_job_auth(
-    bearer: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
-    aruna_operations::metadata::api::forwarded_bearer(bearer.as_ref().map(ValidatedBearer::as_str))
-        .map_err(crate::metadata::map_api_error)
-}
-
-pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
-    match error {
-        JobRouteError::Unauthorized => ServerError::Unauthorized,
-        JobRouteError::Forbidden => ServerError::Forbidden,
-        JobRouteError::NotFound => ServerError::NotFound,
-        JobRouteError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
-        }
-        JobRouteError::Internal(error) => ServerError::InternalError(error.into()),
-    }
 }
 
 pub(crate) fn map_submit_error(

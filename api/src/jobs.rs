@@ -41,6 +41,8 @@ use aruna_core::structs::execution::job::KeyWait;
 use aruna_operations::driver::drive;
 use aruna_operations::jobs::lifecycle::FamilyReport;
 use aruna_operations::jobs::service::JobStatusView;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -1042,4 +1044,59 @@ pub(crate) fn bind_output_routes(
         .map_err(|error| JobRouteError::Internal(error.to_string()))?;
     result.insert("outputs".to_string(), outputs);
     Ok(())
+}
+
+pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {
+    match value {
+        "queued" => Ok(JobState::Queued),
+        "claimed" => Ok(JobState::Claimed),
+        "preparing" => Ok(JobState::Preparing),
+        "ready" => Ok(JobState::Ready),
+        "running" => Ok(JobState::Running),
+        "cancelling" => Ok(JobState::Cancelling),
+        "indeterminate" => Ok(JobState::Indeterminate),
+        "succeeded" => Ok(JobState::Succeeded),
+        "failed" => Ok(JobState::Failed),
+        "cancelled" => Ok(JobState::Cancelled),
+        "awaiting_key" => Ok(JobState::AwaitingKey),
+        _ => Err(ServerError::BadRequest),
+    }
+}
+
+pub(crate) fn decode_cursor(cursor: Option<&str>) -> ServerResult<Option<Vec<u8>>> {
+    match cursor {
+        Some(cursor) => {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(cursor)
+                .map_err(|_| ServerError::BadRequest)?;
+            if bytes.len() != 24 {
+                return Err(ServerError::BadRequest);
+            }
+            Ok(Some(bytes))
+        }
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn encode_cursor(cursor: Option<Vec<u8>>) -> Option<String> {
+    cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor))
+}
+
+pub(crate) fn forwarded_job_auth(
+    bearer: Option<ValidatedBearer>,
+) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+    aruna_operations::metadata::api::forwarded_bearer(bearer.as_ref().map(ValidatedBearer::as_str))
+        .map_err(crate::metadata::map_api_error)
+}
+
+pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {
+    match error {
+        JobRouteError::Unauthorized => ServerError::Unauthorized,
+        JobRouteError::Forbidden => ServerError::Forbidden,
+        JobRouteError::NotFound => ServerError::NotFound,
+        JobRouteError::Unavailable(_) => {
+            ServerError::ServiceUnavailableReason("job_read_unavailable".to_string())
+        }
+        JobRouteError::Internal(error) => ServerError::InternalError(error.into()),
+    }
 }
