@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use super::*;
+use crate::driver::{DriverContext, drive};
 use aruna_core::plugin_runs::{RunState, RunTrigger};
 use aruna_storage::FjallStorage;
 use tempfile::{TempDir, tempdir};
@@ -240,4 +240,76 @@ async fn resolved_expire() {
         Err(RunError::NotFound)
     );
     assert!(!drive(written(run.run_id, &intent), &ctx).await.unwrap());
+}
+
+/// A page answer of `count` queue rows.
+fn queue_page(count: usize) -> Answer {
+    let rows = (0..count).map(|seq| (vec![seq as u8], Vec::new())).collect();
+    Answer::Page(rows, None)
+}
+
+#[test]
+fn admission_bound() {
+    let install = Ulid::from_parts(1, 1);
+    let run = queued(install, 1);
+    let mut admission = Admission::new(run.clone());
+    let Ask::Page { space, prefix, .. } = admission.ask() else {
+        panic!("an admission counts the install's queue");
+    };
+    assert_eq!((space, prefix), (PLUGIN_QUEUE_KEYSPACE, install.to_bytes().to_vec()));
+    let rows = admission.take(queue_page(RUNS_QUEUED - 1)).unwrap().unwrap();
+    let keys: Vec<_> = rows.iter().map(|(space, key, _)| (space.clone(), key.to_vec())).collect();
+    assert_eq!(
+        keys,
+        [
+            (PLUGIN_QUEUE_KEYSPACE.to_string(), queue_key(install, run.run_id)),
+            (PLUGIN_RUNS_KEYSPACE.to_string(), run_key(install, run.run_id)),
+        ]
+    );
+    let mut full = Admission::new(run);
+    assert_eq!(full.take(queue_page(RUNS_QUEUED)), Err(RunError::Full(RUNS_QUEUED)));
+    assert!(full.take(Answer::Done).is_err());
+}
+
+#[test]
+fn resolve_decisions() {
+    use aruna_core::UserId;
+    use aruna_core::structs::identity::realm::RealmId;
+    let install = Ulid::from_parts(1, 1);
+    let mut waiting = queued(install, 1);
+    waiting.state = RunState::NeedsAttention;
+    let audit = AdminAuditRecord::new(
+        aruna_core::structs::identity::admin_audit::AdminAuditAction::PluginRunResolved,
+        UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1; 32])),
+        UserId::local(Ulid::from_parts(2, 3), RealmId::from_bytes([1; 32])),
+    );
+    let ids = (install, waiting.run_id);
+    let mut resolve = resolve_run(ids, false, &audit, 50).unwrap();
+    assert_eq!(resolve.start().len(), 1);
+    let mut plan = ResolveRun {
+        key: run_key(install, waiting.run_id),
+        done: false,
+        message: "a resolved it as not done".into(),
+        now_ms: 50,
+        audit: Vec::new(),
+        phase: ResolvePhase::Reading,
+    };
+    // A run that does not wait for a person is refused.
+    let running = Answer::Values(vec![Some(encode(&queued(install, 1)).unwrap())]);
+    assert_eq!(plan.next(running), Err(RunError::NotWaiting("queued")));
+    plan.phase = ResolvePhase::Reading;
+    assert_eq!(plan.next(Answer::Values(vec![None])), Err(RunError::NotFound));
+    plan.phase = ResolvePhase::Reading;
+    let stored = Answer::Values(vec![Some(encode(&waiting).unwrap())]);
+    assert!(matches!(plan.next(stored).unwrap(), Turn::Ask(Ask::Page { .. })));
+    let Turn::Ask(Ask::Write(rows)) = plan.next(Answer::Page(Vec::new(), None)).unwrap() else {
+        panic!("the resolved run is written");
+    };
+    let saved: PluginRun = decode(&rows[0].2).unwrap();
+    assert_eq!((saved.state, saved.finished_ms), (RunState::Failed, Some(50)));
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
+        panic!("an ended run leaves the queue");
+    };
+    assert_eq!(keys, [(PLUGIN_QUEUE_KEYSPACE, queue_key(install, waiting.run_id))]);
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(saved));
 }
