@@ -47,7 +47,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
     }
     if realms.is_empty() {
         // Markers are malformed; drop them so they cannot loop forever.
-        clear_consumed_markers(storage, observed_markers).await?;
+        clear_consumed_markers(ctx, observed_markers).await?;
         if more_markers {
             let _ = drive(InterestOperation::publish(), ctx).await;
         }
@@ -162,7 +162,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
 
     // Replication accepted the digests; only now consume the markers, and only
     // those a concurrent CRUD did not re-dirty in the meantime.
-    clear_consumed_markers(storage, observed_markers).await?;
+    clear_consumed_markers(ctx, observed_markers).await?;
     if more_markers {
         let _ = drive(InterestOperation::publish(), ctx).await;
     }
@@ -1082,7 +1082,7 @@ mod tests {
             other => panic!("unexpected write: {other:?}"),
         }
 
-        clear_consumed_markers(&ctx.storage_handle, observed)
+        clear_consumed_markers(&ctx, observed)
             .await
             .expect("clear runs");
 
