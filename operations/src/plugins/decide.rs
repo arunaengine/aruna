@@ -10,32 +10,20 @@ use aruna_core::keyspaces::{
     PLUGIN_GAPS_KEYSPACE, PLUGIN_QUEUE_KEYSPACE, PLUGIN_REPLAYS_KEYSPACE, PLUGIN_SEEN_KEYSPACE,
     PLUGIN_WAITING_KEYSPACE,
 };
-use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     DEDUP_RETENTION_MS, ForwardRow, GapReason, GapRow, PluginRun, RECEIVER_GAP, RUNS_QUEUED,
     SourceKind, WAITING_ROW, queue_key, reported_key,
 };
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::{ErrorKind, HostError};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::account::prerequisites_held;
-use super::artifacts::local_config;
-use super::check::{RunScope, check_call};
-use super::dispatch::event_run;
-use super::matcher::event_trigger;
 use super::replay::{COVERAGE_ROW, CoverageRow, row_key};
 use super::rows::{
     Answer, Ask, Plan, Row, Rows, RowsOperation, Scan, StoreError, Turn, decode, done, encode,
     row as row_of, unexpected, values,
 };
-use super::runs::{ADMISSIONS, Admission, RunError};
-use crate::driver::{DriverContext, drive};
-use crate::metadata::protocol::MetadataReadError;
-use crate::realm::mutate_placement::node_kind;
-use aruna_core::plugin_runs::{Decisions, EventBatch, Outcome};
+use super::runs::{Admission, RunError};
+use aruna_core::plugin_runs::Outcome;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,63 +59,8 @@ pub(crate) fn seen_key(install_id: Ulid, kind: SourceKind, source: &str) -> Vec<
     key
 }
 
-/// The receiver side of a forward from an infrastructure peer.
-pub(crate) async fn serve_events(
-    ctx: &DriverContext,
-    peer: NodeId,
-    batch: EventBatch,
-) -> Result<Decisions, MetadataReadError> {
-    let (config, local) = local_config(ctx).await?;
-    if !node_kind(&config, peer).is_some_and(|kind| kind.is_sync_eligible()) {
-        return Err(MetadataReadError::Forbidden);
-    }
-    let decided = decide_batch(ctx, &config, (local, peer), batch, unix_timestamp_millis());
-    decided.await.map_err(|_| MetadataReadError::Unavailable)
-}
-
-/// Decides each event of a batch from `sender` and keeps its newest gap reports.
-pub(crate) async fn decide_batch(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    (local, sender): (NodeId, NodeId),
-    batch: EventBatch,
-    now_ms: u64,
-) -> Result<Decisions, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
-    let mut decisions = Decisions::default();
-    for row in batch.events {
-        let outcome = decide(ctx, config, local, &row, now_ms).await?;
-        decisions
-            .events
-            .push((row.install_id, row.event.source, outcome));
-    }
-    decisions.gaps = drive(keep_reports(sender, batch.gaps), ctx).await?;
-    Ok(decisions)
-}
-
-/// One event's outcome. Busy writes nothing, so the sender keeps the row and sends it again.
-async fn decide(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    row: &ForwardRow,
-    now_ms: u64,
-) -> Result<Outcome, StoreError> {
-    if let Some(outcome) = drive(seen_outcome(row), ctx).await? {
-        return Ok(outcome);
-    }
-    // Its dedup record would be gone, so a run now could repeat one already made.
-    if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
-        let late = GapCount::new(local, row, GapReason::Late);
-        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
-        return Ok(Outcome::Expired);
-    }
-    let verdict = judge(ctx, config, local, row, now_ms).await?;
-    drive(decide_event(verdict, row, now_ms)?, ctx).await
-}
-
 /// The outcome an earlier decision recorded for the event.
-fn seen_outcome(row: &ForwardRow) -> RowsOperation<SeenOutcome> {
+pub(crate) fn seen_outcome(row: &ForwardRow) -> RowsOperation<SeenOutcome> {
     let seen = seen_key(row.install_id, row.event.kind, &row.event.source);
     RowsOperation::direct(SeenOutcome(seen))
 }
@@ -155,7 +88,7 @@ impl Plan for SeenOutcome {
 
 /// Counts an event that came too late in its own gap row.
 #[derive(Debug, PartialEq)]
-pub struct LateEvent(GapCount);
+pub struct LateEvent(pub(crate) GapCount);
 
 impl Plan for LateEvent {
     type Output = ();
@@ -401,52 +334,6 @@ pub(crate) fn seen_row(
     Ok(row_of(PLUGIN_SEEN_KEYSPACE, key, encode(&record)?))
 }
 
-/// Whether the local install record and its prerequisite writes are here, then the check.
-pub(crate) async fn judge(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    row: &ForwardRow,
-    now_ms: u64,
-) -> Result<Verdict, StoreError> {
-    let install = (config.installs.iter()).find(|i| i.install_id == row.install_id);
-    let Some(install) = install.filter(|install| install.revision >= row.revision) else {
-        return Ok(Verdict::Unready);
-    };
-    if !prerequisites_held(ctx, install).await.map_err(StoreError)? {
-        return Ok(Verdict::Unready);
-    }
-    Ok(
-        match trigger_check(ctx, config, local, install, row, now_ms).await {
-            Ok(run) => Verdict::Run(Box::new(run)),
-            Err(error) if error.kind == ErrorKind::Unavailable => Verdict::Unavailable,
-            Err(error) => Verdict::Denied(error.message),
-        },
-    )
-}
-
-/// Steps 0 to 4 for the event's path as a new run of the install would pass them.
-async fn trigger_check(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
-    install: &PluginInstall,
-    row: &ForwardRow,
-    now_ms: u64,
-) -> Result<PluginRun, HostError> {
-    let none = || HostError::new(ErrorKind::Denied, "the install has no trigger of this kind");
-    let run = event_run(config, install, &row.event, now_ms).ok_or_else(none)?;
-    let scope = RunScope {
-        realm_id: config.realm_id,
-        local,
-        run,
-    };
-    let needs = event_trigger(row.event.kind).needs();
-    let target = needs.map(|permission| (permission, row.event.path.as_str()));
-    check_call(ctx, &scope, target).await?;
-    Ok(scope.run)
-}
-
 /// A sub-plan that takes a queue slot for a waiting event, unless the install's queue is full.
 #[derive(Debug, PartialEq)]
 pub struct Hold {
@@ -504,7 +391,10 @@ impl Hold {
 }
 
 /// Keeps each report from `sender` that is newer than the one kept; answers the sequence kept.
-fn keep_reports(sender: NodeId, reports: Vec<(Ulid, GapRow)>) -> RowsOperation<KeepReports> {
+pub(crate) fn keep_reports(
+    sender: NodeId,
+    reports: Vec<(Ulid, GapRow)>,
+) -> RowsOperation<KeepReports> {
     RowsOperation::transaction(KeepReports {
         sender,
         reports,

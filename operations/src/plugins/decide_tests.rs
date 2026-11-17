@@ -15,6 +15,7 @@ use crate::plugins::matcher::tests::{config, journal};
 use crate::plugins::runs::tests::queued;
 use crate::plugins::runs::{admit, list_runs, save_run, unfinished};
 use crate::plugins::store::Txn;
+use crate::plugins::worker::decide_batch;
 use crate::plugins::worker::prune_runs;
 use crate::plugins::worker::tests::{created, installed, scoped, worker};
 use aruna_core::operation::Operation;

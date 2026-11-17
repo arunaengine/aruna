@@ -1213,7 +1213,7 @@ impl MetadataHandle {
                 (MetadataTransportMessage::ClockProbed { result }, None)
             }
             MetadataTransportMessage::ForwardEvents { batch } => {
-                let decided = crate::plugins::decide::serve_events(context, peer, batch);
+                let decided = crate::plugins::worker::serve_events(context, peer, batch);
                 let result = Box::pin(decided).await;
                 (MetadataTransportMessage::EventsDecided { result }, None)
             }

@@ -8,15 +8,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aruna_core::NodeId;
-use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
+use aruna_core::keyspaces::{
+    PLUGIN_REPLAYS_KEYSPACE, PLUGIN_WAITING_KEYSPACE, PLUGIN_WORK_KEYSPACE,
+};
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::{
-    EVENTS_QUEUED, PluginRun, RUNS_PARALLEL, RunState, RunTrigger, SourceEvent,
+    DEDUP_RETENTION_MS, EVENTS_QUEUED, ForwardRow, GapReason, PluginRun, RUNS_PARALLEL, RunState,
+    RunTrigger, SourceEvent, WAITING_EXPIRY_MS,
 };
 use aruna_core::shutdown::Shutdown;
-use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_plugins::broker::ErrorKind;
+use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::{Grant, Permission};
 use aruna_plugins::{
@@ -27,13 +30,18 @@ use tokio_util::task::TaskTracker;
 use tracing::warn;
 use ulid::Ulid;
 
+use super::account::prerequisites_held;
 use super::artifacts::fetch_artifact;
+use super::artifacts::local_config;
 use super::broker::{RunBroker, absent, short_path};
 use super::check::{RunScope, check_call};
 use super::cleanup::sweep_events;
-use super::clock::probe_clock;
-use super::decide::{decide_batch, prune_seen};
+use super::clock::{ClockReading, SKEW_MARGIN_MS, local_start, probe_clock};
+use super::decide::{
+    GapCount, LateEvent, Verdict, WaitingRow, decide_event, keep_reports, prune_seen, seen_outcome,
+};
 use super::dispatch::enqueue_timers;
+use super::dispatch::event_run;
 use super::finished::notify_work;
 use super::forward::{Backoff, send_outbox};
 use super::grants::{parse_grants, patterns_for};
@@ -42,7 +50,7 @@ use super::intents::open_intent;
 use super::jobs::{retire_work, settle_work};
 use super::journal::JOURNAL_PAGE;
 use super::journal::prune_journal;
-use super::lifecycle::match_targets;
+use super::lifecycle::{match_targets, targets};
 use super::marks::{MARK_ROW, Mark, MarkEnded};
 use super::matcher::event_trigger;
 use super::matcher::match_page;
@@ -50,14 +58,22 @@ use super::outbound::Outbound;
 use super::prune::{self, prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
-use super::replay::{plan_replays, replay_page, replay_scan};
-use super::rows::{StoreError, decode, page_rows, scan_rows};
-use super::runs::{
-    Ended, RunError, TICK, conclude, drop_run, expired_runs, read_run, save_run, unfinished,
+use super::replay::{
+    COVERAGE_ROW, CoverageRow, StartReplay, growth, replay_page, replay_rows, replay_scan, row_key,
 };
-use super::waiting::recheck_waiting;
+use super::rows::{
+    RowsOperation, Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows,
+    write_rows,
+};
+use super::runs::{
+    ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, expired_runs, read_run, save_run,
+    unfinished,
+};
+use super::waiting::SettleWaiting;
 use super::work::prune_work;
 use crate::driver::{DriverContext, drive};
+use crate::metadata::protocol::MetadataReadError;
+use crate::realm::mutate_placement::node_kind;
 use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::plugin_runs::{Decisions, EventBatch};
 
@@ -586,6 +602,192 @@ pub(crate) async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError
             None => return Ok(dropped),
         }
     }
+}
+
+/// The receiver side of a forward from an infrastructure peer.
+pub(crate) async fn serve_events(
+    ctx: &DriverContext,
+    peer: NodeId,
+    batch: EventBatch,
+) -> Result<Decisions, MetadataReadError> {
+    let (config, local) = local_config(ctx).await?;
+    if !node_kind(&config, peer).is_some_and(|kind| kind.is_sync_eligible()) {
+        return Err(MetadataReadError::Forbidden);
+    }
+    let decided = decide_batch(ctx, &config, (local, peer), batch, unix_timestamp_millis());
+    decided.await.map_err(|_| MetadataReadError::Unavailable)
+}
+
+/// Decides each event of a batch from `sender` and keeps its newest gap reports.
+pub(crate) async fn decide_batch(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    (local, sender): (NodeId, NodeId),
+    batch: EventBatch,
+    now_ms: u64,
+) -> Result<Decisions, StoreError> {
+    let _admitting = ADMISSIONS.lock().await;
+    let mut decisions = Decisions::default();
+    for row in batch.events {
+        let outcome = decide(ctx, config, local, &row, now_ms).await?;
+        decisions
+            .events
+            .push((row.install_id, row.event.source, outcome));
+    }
+    decisions.gaps = drive(keep_reports(sender, batch.gaps), ctx).await?;
+    Ok(decisions)
+}
+
+/// One event's outcome. Busy writes nothing, so the sender keeps the row and sends it again.
+async fn decide(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<Outcome, StoreError> {
+    if let Some(outcome) = drive(seen_outcome(row), ctx).await? {
+        return Ok(outcome);
+    }
+    // Its dedup record would be gone, so a run now could repeat one already made.
+    if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
+        let late = GapCount::new(local, row, GapReason::Late);
+        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
+        return Ok(Outcome::Expired);
+    }
+    let verdict = judge(ctx, config, local, row, now_ms).await?;
+    drive(decide_event(verdict, row, now_ms)?, ctx).await
+}
+
+/// Whether the local install record and its prerequisite writes are here, then the check.
+pub(crate) async fn judge(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<Verdict, StoreError> {
+    let install = (config.installs.iter()).find(|i| i.install_id == row.install_id);
+    let Some(install) = install.filter(|install| install.revision >= row.revision) else {
+        return Ok(Verdict::Unready);
+    };
+    if !prerequisites_held(ctx, install).await.map_err(StoreError)? {
+        return Ok(Verdict::Unready);
+    }
+    Ok(
+        match trigger_check(ctx, config, local, install, row, now_ms).await {
+            Ok(run) => Verdict::Run(Box::new(run)),
+            Err(error) if error.kind == ErrorKind::Unavailable => Verdict::Unavailable,
+            Err(error) => Verdict::Denied(error.message),
+        },
+    )
+}
+
+/// Steps 0 to 4 for the event's path as a new run of the install would pass them.
+async fn trigger_check(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    install: &PluginInstall,
+    row: &ForwardRow,
+    now_ms: u64,
+) -> Result<PluginRun, HostError> {
+    let none = || HostError::new(ErrorKind::Denied, "the install has no trigger of this kind");
+    let run = event_run(config, install, &row.event, now_ms).ok_or_else(none)?;
+    let scope = RunScope {
+        realm_id: config.realm_id,
+        local,
+        run,
+    };
+    let needs = event_trigger(row.event.kind).needs();
+    let target = needs.map(|permission| (permission, row.event.path.as_str()));
+    check_call(ctx, &scope, target).await?;
+    Ok(scope.run)
+}
+
+/// Decides each waiting event that is ready or expired; returns how many left the waiting set.
+pub(crate) async fn recheck_waiting(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+) -> Result<usize, StoreError> {
+    let _admitting = ADMISSIONS.lock().await;
+    let rows = drive(
+        scan_rows(Scan::new(PLUGIN_WAITING_KEYSPACE, Vec::new())),
+        ctx,
+    )
+    .await?;
+    let mut left = 0;
+    for (key, value) in rows {
+        let waiting: WaitingRow = decode(&value)?;
+        let expired = now_ms > waiting.received_ms.saturating_add(WAITING_EXPIRY_MS);
+        let verdict = match expired {
+            true => None,
+            false => match judge(ctx, config, local, &waiting.row, now_ms).await? {
+                Verdict::Unready | Verdict::Unavailable => continue,
+                verdict => Some(verdict),
+            },
+        };
+        let settle = SettleWaiting::new(key, waiting, verdict, (local, now_ms));
+        drive(RowsOperation::transaction(settle), ctx).await?;
+        left += 1;
+    }
+    Ok(left)
+}
+
+/// Starts a replay for each active install whose coverage grew here since its coverage row;
+/// `probe` reads another node's clock. Returns how many replays started.
+pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
+    ctx: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    now_ms: u64,
+    probe: impl Fn(NodeId) -> F,
+) -> Result<usize, StoreError> {
+    if matches!(node_kind(config, local), Some(RealmNodeKind::User { .. })) {
+        return Ok(0);
+    }
+    let mut started = 0;
+    for target in targets(config) {
+        let id = target.install_id;
+        let Some(install) = config.installs.iter().find(|i| i.install_id == id) else {
+            continue;
+        };
+        let (row, task) = drive(replay_rows(id), ctx).await?;
+        let next = CoverageRow {
+            revision: install.revision,
+            active_since_ms: install.active_since_ms,
+            coverage: target.coverage.clone(),
+            note: None,
+        };
+        if task.is_some_and(|task| task.next.revision == next.revision) {
+            continue;
+        }
+        let Some((old, boundary, by)) = growth(install, row.as_ref(), &target.coverage) else {
+            if row
+                .as_ref()
+                .is_some_and(|row| row.revision != next.revision)
+            {
+                let coverage = row_of(
+                    PLUGIN_REPLAYS_KEYSPACE,
+                    row_key(COVERAGE_ROW, id),
+                    encode(&next)?,
+                );
+                drive(write_rows(vec![coverage]), ctx).await?;
+            }
+            continue;
+        };
+        let start = match by {
+            Some(node) if node == local => Some(boundary.saturating_sub(SKEW_MARGIN_MS)),
+            Some(node) => local_start(boundary, probe(node).await),
+            None => None,
+        };
+        let replay = StartReplay::new(target, (next, old), (start, by), now_ms);
+        drive(RowsOperation::direct(replay), ctx).await?;
+        started += 1;
+    }
+    Ok(started)
 }
 
 /// Continues every replay, at most `pages` pages of `page` rows each, a page per transaction;
