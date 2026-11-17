@@ -257,4 +257,41 @@ mod tests {
         let resources: Vec<String> = kept.into_iter().map(|(_, row)| row.resource).collect();
         assert_eq!(resources, [created.record.document_id.to_string()]);
     }
+
+    #[test]
+    fn prune_stops_young() {
+        let mut plan = PruneJournal {
+            now_ms: 100,
+            cutoff: journal_key(JOURNAL_ROW, 50, Ulid::nil()),
+            phase: JournalPhase::Kept,
+            pruned: 0,
+        };
+        let old = journal_key(JOURNAL_ROW, 10, Ulid::from_parts(1, 1));
+        let young = journal_key(JOURNAL_ROW, 60, Ulid::from_parts(1, 2));
+        let page = vec![(old.clone(), Vec::new()), (young.clone(), Vec::new())];
+        let deleted = Ask::Delete(vec![(EVENT_JOURNAL_KEYSPACE, old)]);
+        assert_eq!(
+            plan.next(Answer::Page(page, None)).unwrap(),
+            Turn::Ask(deleted)
+        );
+        assert!(matches!(
+            plan.next(Answer::Done).unwrap(),
+            Turn::Ask(Ask::Page { .. })
+        ));
+        let page = vec![(young, Vec::new())];
+        assert!(matches!(
+            plan.next(Answer::Page(page, None)).unwrap(),
+            Turn::Ask(Ask::Page { .. })
+        ));
+        // A source row past the dedup horizon goes; a recent one stays.
+        let anchor = |at: u64| at.to_be_bytes().to_vec();
+        let sources = vec![(b"s1".to_vec(), anchor(1)), (b"s2".to_vec(), anchor(99))];
+        let next = plan.next(Answer::Page(sources, None)).unwrap();
+        let expected = if 100 > 1 + DEDUP_RETENTION_MS { 1 } else { 0 };
+        let Turn::Ask(Ask::Delete(keys)) = next else {
+            panic!("old source rows are deleted");
+        };
+        assert_eq!(keys.len(), expected);
+        assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1 + expected));
+    }
 }
