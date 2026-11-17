@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::MintPersistentSpec;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
@@ -17,7 +19,7 @@ use aruna_core::structs::execution::job::{
     WorkspaceMode, cleanup_job_id, pid_dedup_key, user_dedup_key,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::{JobOwnerError, RealmId};
+use aruna_core::structs::identity::realm::{JobOwnerError, RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::placement::record::{
     DEFAULT_SHARD_COUNT, FIRST_GRANTABLE_HANDLE, shard_for_subject,
@@ -53,6 +55,7 @@ use super::workflow::finalize::finalize_followups;
 use crate::auth::error::AuthorizeError;
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::store::query::{find_dedup_plan, list_job_entries, list_user_jobs};
@@ -81,12 +84,7 @@ pub(crate) async fn mint_local_job(
     let entropy = ulid::Ulid::generate().to_bytes();
     let subject = dedup_key.unwrap_or(&entropy);
     let Some(net_handle) = context.net_handle.as_ref() else {
-        let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE)
-            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-        let shard = shard_for_subject(subject, DEFAULT_SHARD_COUNT);
-        let bucket = BucketId::new(shard as u16)
-            .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
-        return Ok(mint_job_id(handle, bucket)?);
+        return mint_unplaced(subject);
     };
     if net_handle.node_id() != owner_node_id || *net_handle.realm_id() != realm_id {
         return Err(SubmitJobError::PlacementUnavailable(
@@ -97,6 +95,16 @@ pub(crate) async fn mint_local_job(
         SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
     })?;
     mint_configured_job(&config, owner_node_id, subject)
+}
+
+/// A job id for a node without a net transport, in the first grantable handle.
+fn mint_unplaced(subject: &[u8]) -> Result<JobId, SubmitJobError> {
+    let handle = PlacementHandle::new(FIRST_GRANTABLE_HANDLE)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    let shard = shard_for_subject(subject, DEFAULT_SHARD_COUNT);
+    let bucket = BucketId::new(shard as u16)
+        .map_err(|error| SubmitJobError::PlacementUnavailable(error.to_string()))?;
+    Ok(mint_job_id(handle, bucket)?)
 }
 
 /// The accepting node is the immutable owner: creation, listing, dedup,
@@ -206,7 +214,7 @@ pub(crate) fn validate_execution(
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_execution_job(
     context: &DriverContext,
-    mut spec: ExecutionSpec,
+    spec: ExecutionSpec,
     created_by: UserId,
     owner_node_id: NodeId,
     idempotency_key: Option<String>,
@@ -215,31 +223,125 @@ pub async fn submit_execution_job(
     retention_ms: u64,
     active_cap: Option<u32>,
 ) -> Result<SubmitJobResult, SubmitJobError> {
-    validate_execution(&mut spec, workspace_mode, workspace_bucket.as_deref())?;
-    let dedup_key = idempotency_key.map(|key| user_dedup_key(created_by, &key));
-    let job_id = mint_local_job(
-        context,
-        context.serving_realm(created_by.realm_id),
+    let submission = ExecutionSubmission {
+        spec,
+        created_by,
         owner_node_id,
-        dedup_key.as_deref(),
-    )
-    .await?;
-    submit_local_job(
-        context,
-        SubmitJobSpec {
-            payload: JobPayload::Execution(spec),
-            created_by,
-            owner_node_id,
+        idempotency_key,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        active_cap,
+        serving: context.node_and_realm(),
+        now_ms: unix_timestamp_millis(),
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
+}
+
+/// One execution job request, with the node that serves it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionSubmission {
+    pub spec: ExecutionSpec,
+    pub created_by: UserId,
+    pub owner_node_id: NodeId,
+    pub idempotency_key: Option<String>,
+    pub workspace_mode: WorkspaceMode,
+    pub workspace_bucket: Option<String>,
+    pub retention_ms: u64,
+    pub active_cap: Option<u32>,
+    /// This node and the realm it serves; `None` on a node without a net transport.
+    pub serving: Option<(NodeId, RealmId)>,
+    pub now_ms: u64,
+}
+
+/// Validates an execution request, mints its job id from the serving node's placement, and
+/// submits it as a child [`SubmitJobOperation`].
+#[derive(Debug, PartialEq)]
+pub struct SubmitExecutionOperation {
+    submission: ExecutionSubmission,
+    dedup_key: Option<Vec<u8>>,
+    /// The placement subject of a job without a dedup key.
+    entropy: [u8; 16],
+    minted: bool,
+}
+
+impl SubmitExecutionOperation {
+    pub fn new(submission: ExecutionSubmission) -> Self {
+        let dedup_key = submission
+            .idempotency_key
+            .as_ref()
+            .map(|key| user_dedup_key(submission.created_by, key));
+        Self {
+            submission,
             dedup_key,
-            now_ms: unix_timestamp_millis(),
-            retention_ms,
-            workspace_mode,
-            workspace_bucket,
-            active_cap,
-        },
-        job_id,
-    )
-    .await
+            entropy: ulid::Ulid::generate().to_bytes(),
+            minted: false,
+        }
+    }
+
+    fn subject(&self) -> &[u8] {
+        self.dedup_key.as_deref().unwrap_or(&self.entropy)
+    }
+
+    fn submit(&mut self, job_id: JobId) -> Result<Next<SubmitJobResult>, SubmitJobError> {
+        self.minted = true;
+        let submission = &self.submission;
+        let spec = SubmitJobSpec {
+            payload: JobPayload::Execution(submission.spec.clone()),
+            created_by: submission.created_by,
+            owner_node_id: submission.owner_node_id,
+            dedup_key: self.dedup_key.clone(),
+            now_ms: submission.now_ms,
+            retention_ms: submission.retention_ms,
+            workspace_mode: submission.workspace_mode,
+            workspace_bucket: submission.workspace_bucket.clone(),
+            active_cap: submission.active_cap,
+        };
+        Ok(Next::Call(IoCall::child(SubmitJobOperation::new(
+            spec, job_id,
+        ))))
+    }
+}
+
+impl Operation for SubmitExecutionOperation {
+    type Output = SubmitJobResult;
+    type Error = SubmitJobError;
+
+    fn first(&mut self) -> Result<Next<SubmitJobResult>, SubmitJobError> {
+        let submission = &mut self.submission;
+        validate_execution(
+            &mut submission.spec,
+            submission.workspace_mode,
+            submission.workspace_bucket.as_deref(),
+        )?;
+        let (serving, owner) = (submission.serving, submission.owner_node_id);
+        let Some((node_id, realm_id)) = serving else {
+            let job_id = mint_unplaced(self.subject())?;
+            return self.submit(job_id);
+        };
+        if node_id != owner {
+            return Err(SubmitJobError::PlacementUnavailable(
+                "job owner does not match the serving node".to_string(),
+            ));
+        }
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<SubmitJobResult>, SubmitJobError> {
+        if self.minted {
+            return Ok(Next::Done(
+                result.child::<SubmitJobResult, SubmitJobError>()??,
+            ));
+        }
+        let config = result
+            .child::<RealmConfigDocument, GetConfigError>()?
+            .map_err(|error| {
+                warn!(error = %error, "realm config unavailable; querying the local replica only");
+                SubmitJobError::PlacementUnavailable("realm config unavailable".to_string())
+            })?;
+        let job_id = mint_configured_job(&config, self.submission.owner_node_id, self.subject())?;
+        self.submit(job_id)
+    }
 }
 
 pub async fn submit_staging_job(
@@ -1627,6 +1729,56 @@ mod tests {
 
     fn node_id() -> NodeId {
         iroh::SecretKey::from_bytes(&[7u8; 32]).public()
+    }
+
+    fn submission(serving: Option<(NodeId, RealmId)>) -> ExecutionSubmission {
+        let realm_id = RealmId([1u8; 32]);
+        ExecutionSubmission {
+            spec: ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: Default::default(),
+                executor_constraint: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
+            },
+            created_by: UserId::new(Ulid::from_bytes([2u8; 16]), realm_id),
+            owner_node_id: node_id(),
+            idempotency_key: None,
+            workspace_mode: WorkspaceMode::None,
+            workspace_bucket: None,
+            retention_ms: 1,
+            active_cap: None,
+            serving,
+            now_ms: 1,
+        }
+    }
+
+    // An unplaced node submits at once; a placed node reads its realm config first and refuses
+    // to own a job for another node.
+    #[test]
+    fn mints_from_placement() {
+        let mut unplaced = SubmitExecutionOperation::new(submission(None));
+        assert!(matches!(unplaced.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let realm_id = RealmId([1u8; 32]);
+        let mut placed = SubmitExecutionOperation::new(submission(Some((node_id(), realm_id))));
+        assert!(matches!(placed.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let other = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let mut foreign = SubmitExecutionOperation::new(submission(Some((other, realm_id))));
+        assert!(matches!(
+            foreign.first(),
+            Err(SubmitJobError::PlacementUnavailable(_))
+        ));
     }
 
     #[tokio::test]
