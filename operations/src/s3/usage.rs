@@ -20,7 +20,7 @@ use aruna_core::structs::storage::usage::{
     usage_node_id,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
+use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::{BTreeMap, HashSet};
@@ -819,7 +819,7 @@ impl LoadCountersOperation {
     fn handle_global_read(&mut self, event: Event) -> Effects {
         match event {
             Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                self.finish(global_sum(values))
+                self.finish(global_sum(values.into_iter().map(|(_, value)| value)))
             }
             Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
             other => self.unexpected_event("storage batch read result", other),
@@ -881,20 +881,26 @@ pub(crate) fn counted(active_node_ids: Option<&HashSet<NodeId>>, node_id: Option
 
 /// One batch read of every global counter shard, inside `txn_id` when given.
 pub(crate) fn global_shard_read(txn_id: Option<TxnId>) -> StorageEffect {
-    let reads = global_shard_keys()
-        .into_iter()
-        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
-        .collect();
+    let reads = global_shard_rows();
     StorageEffect::BatchRead { reads, txn_id }
 }
 
+/// The rows of the node-wide counter shards.
+pub(crate) fn global_shard_rows() -> Vec<(KeySpace, Key)> {
+    (global_shard_keys().into_iter())
+        .map(|key| (USAGE_STATS_KEYSPACE.to_string(), Key::from(key)))
+        .collect()
+}
+
 /// The node-wide counters: the sum of the shard rows [`global_shard_read`] returned.
-pub(crate) fn global_sum<E>(values: Vec<(Key, Option<Value>)>) -> Result<UsageCounters, E>
+pub(crate) fn global_sum<E>(
+    values: impl IntoIterator<Item = Option<Value>>,
+) -> Result<UsageCounters, E>
 where
     E: From<ConversionError> + From<UsageCounterError>,
 {
     let mut total = UsageCounters::default();
-    for bytes in values.into_iter().filter_map(|(_, value)| value) {
+    for bytes in values.into_iter().flatten() {
         total.add(&UsageCounters::from_bytes(bytes.as_ref())?)?;
     }
     Ok(total)
