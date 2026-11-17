@@ -10,11 +10,12 @@ use aruna_core::structs::execution::job::{
 };
 use tracing::{debug, warn};
 
-use super::lifecycle::updates::chain_of_attempt;
-use super::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, RecordStoreError,
-};
-use super::store::{JobMutationError, persist_output_record, read_output_record};
+use super::lifecycle::chain::ExecutionChainOperation;
+use super::records::RecordStoreError;
+use super::records::admit::Admission;
+use super::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use super::store::JobMutationError;
+use super::store::state::{persist_output_record, read_output_record};
 use crate::driver::{DriverContext, drive};
 
 /// Build, sign, and make durable this execution's exact output record, then
@@ -37,7 +38,8 @@ pub async fn store_outputs(
         .map_err(|error| JobError::permanent(format!("output set is not canonical: {error}")))?;
     // A replay re-appends an idempotent record and a previously unavailable family
     // may resolve now; a receipted execution binds the real chain, else locals.
-    let chain = chain_of_attempt(context, record.job_id, control.execution_id).await;
+    let chain = ExecutionChainOperation::of_attempt(record.job_id, control.execution_id);
+    let chain = drive(chain, context).await.ok().flatten();
     let receipted = chain.is_some();
     if let Some(frame) = stored_record(context, record.job_id, control, &outputs, net.node_id())
         .await?
@@ -218,7 +220,8 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use super::super::store::{insert_job, read_attempt_control, reserve_output_commits};
+    use super::super::store::attempt::{read_attempt_control, reserve_output_commits};
+    use super::super::store::query::insert_job;
     use super::*;
 
     const TOKEN: Ulid = Ulid(0x5EA1);
@@ -311,7 +314,7 @@ mod tests {
         // The signed record must be readable back under the digest terminal
         // success will name, and a replay must not mint a second record.
         let (_dir, context, record, net) = fixture().await;
-        super::super::store::record_attempt_intent(
+        super::super::store::state::record_attempt_intent(
             &context.storage_handle,
             record.job_id,
             TOKEN,

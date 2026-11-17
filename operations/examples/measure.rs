@@ -51,8 +51,8 @@ use futures_util::StreamExt;
 use tempfile::TempDir;
 use tokio::time::{MissedTickBehavior, sleep};
 use topology::{
-    BoxError, TestNode, build_realm_nodes, init_logging, make_runtime, mixed_payload, node_targets,
-    run_writers, scaffold_payload, shutdown_nodes,
+    BoxError, TestNode, WriterSettings, build_realm_nodes, init_logging, make_runtime,
+    mixed_payload, node_targets, run_writers, scaffold_payload, shutdown_nodes,
 };
 use ulid::Ulid;
 
@@ -184,14 +184,16 @@ async fn measure_creates(seed: u8, writers: usize) -> Result<(), BoxError> {
     let per_writer = TOTAL_CREATES / writers;
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "measure",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "measure".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         writers,
         per_writer,
         &targets,
-        None,
-        mixed_payload,
     )
     .await;
     let seconds = started.elapsed().as_secs_f64();
@@ -211,14 +213,16 @@ async fn measure_spread() -> Result<(), BoxError> {
     let nodes = build_realm_nodes(&realm_id, REALM_NODES).await?;
     let targets = node_targets(&nodes);
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "spread",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "spread".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         SPREAD_WRITERS,
         SPREAD_DOCS,
         &targets,
-        None,
-        mixed_payload,
     )
     .await;
     let mut created = match created {
@@ -266,14 +270,16 @@ async fn converge_all(realm_id: RealmId, nodes: &[TestNode]) -> Result<(usize, f
     let targets = node_targets(nodes);
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        Ulid::generate(),
-        "drain",
+        &WriterSettings {
+            realm_id,
+            group_id: Ulid::generate(),
+            label: "drain".to_string(),
+            period: None,
+            payload: mixed_payload,
+        },
         DRAIN_WRITERS,
         DRAIN_DOCS,
         &targets,
-        None,
-        mixed_payload,
     )
     .await?;
     let pairs = pairs_of(&created);
@@ -307,14 +313,16 @@ async fn sample_tail(realm_id: RealmId, nodes: &[TestNode]) -> Result<(), BoxErr
     ));
     let started = Instant::now();
     let created = run_writers(
-        realm_id,
-        group_id,
-        "tail",
+        &WriterSettings {
+            realm_id,
+            group_id,
+            label: "tail".to_string(),
+            period: Some(TAIL_PERIOD),
+            payload: mixed_payload,
+        },
         TAIL_WRITERS,
         TAIL_DOCS,
         &targets,
-        Some(TAIL_PERIOD),
-        mixed_payload,
     )
     .await;
     let ingest_seconds = started.elapsed().as_secs_f64();

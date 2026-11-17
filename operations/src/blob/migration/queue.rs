@@ -59,7 +59,7 @@ pub(crate) async fn resume_transitions(
             .await
             .map_err(|e| e.to_string())?;
         let txn_id = transaction.id().ok_or("missing wake transaction")?;
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             TRANSITION_KEYSPACE,
             None,
@@ -127,7 +127,7 @@ pub async fn process_transitions(context: &DriverContext) -> Result<Option<Durat
     let mut soon = |after: Duration| next = Some(next.map_or(after, |next| next.min(after)));
     let mut after = None;
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             TRANSITION_QUEUE_KEYSPACE,
             None,
@@ -227,7 +227,7 @@ async fn advance(
         record.state = TransitionState::Running;
     }
     let prefix = VersionKey::bucket_prefix(bucket).map_err(|error| error.to_string())?;
-    let (versions, next) = crate::jobs::store::iter_prefix_page(
+    let (versions, next) = crate::jobs::store::query::iter_prefix_page(
         &context.storage_handle,
         BLOB_VERSIONS_KEYSPACE,
         Some(prefix.into()),
@@ -323,7 +323,7 @@ async fn settle(
     let mut after = None;
     let mut left = 0u64;
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             TRANSITION_CLEANUP_KEYSPACE,
             Some(prefix.clone()),
@@ -442,7 +442,7 @@ async fn pending_on_source(
     };
     let (mut after, mut count) = (None, 0u64);
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             PENDING_LOCATION_KEYSPACE,
             None,
@@ -545,7 +545,7 @@ async fn queued_deletes(
 ) -> Result<HashSet<Vec<u8>>, String> {
     let (mut after, mut queued) = (None, HashSet::new());
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             BLOB_CLEANUP_KEYSPACE,
             None,
@@ -693,7 +693,7 @@ async fn source_versions(
         .map_err(|e| e.to_string())?
         .into();
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             BLOB_VERSIONS_KEYSPACE,
             Some(prefix.clone()),
@@ -754,7 +754,7 @@ async fn envelopes_on_source(
         .into();
     let (mut after, mut count) = (None, 0);
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             ABE_VERSION_KEYSPACE,
             Some(prefix.clone()),
@@ -788,7 +788,7 @@ async fn envelopes_on_source(
     let prefix: Key = source.bucket_id.to_bytes().to_vec().into();
     let mut after = None;
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             ABE_COPY_KEYSPACE,
             Some(prefix.clone()),
@@ -819,7 +819,7 @@ async fn reclaim_uploads(
     };
     let (mut after, mut count) = (None, 0);
     loop {
-        let (rows, cursor) = crate::jobs::store::iter_prefix_page(
+        let (rows, cursor) = crate::jobs::store::query::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
             None,
@@ -1533,7 +1533,7 @@ mod tests {
             .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
             .await;
         let reclaimed = reclaim_uploads(storage, &record).await;
-        let (left, _) = crate::jobs::store::iter_prefix_page(
+        let (left, _) = crate::jobs::store::query::iter_prefix_page(
             storage,
             ABE_PENDING_KEYSPACE,
             None,

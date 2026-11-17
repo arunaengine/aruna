@@ -1,5 +1,5 @@
-//! Builds route test fixtures: temporary storage, driver context, state, seeded documents and
-//! requests sent through a route's router.
+//! Builds route test fixtures: temporary storage, state, seeded documents and requests sent
+//! through a route's router.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -32,18 +32,6 @@ pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
     (directory, storage)
-}
-
-pub(crate) fn test_context(storage: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
 }
 
 pub(crate) async fn test_state(

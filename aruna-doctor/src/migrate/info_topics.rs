@@ -4,10 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::explorer::ExplorerError;
-use aruna::identity::PersistedNodeState;
 use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
 use aruna_core::id::TopicId as DocumentTopic;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineUsage};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};

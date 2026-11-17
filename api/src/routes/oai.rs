@@ -9,7 +9,6 @@ use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa_axum::router::OpenApiRouter;
@@ -803,15 +802,11 @@ fn encode_token(until_ms: u64, cursor: Vec<u8>) -> String {
         prefix: METADATA_PREFIX.to_string(),
         cursor,
     };
-    let bytes = postcard::to_allocvec(&payload).expect("postcard token is infallible");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    aruna_core::cursor::encode_value(&payload).expect("postcard token is infallible")
 }
 
 fn decode_token(token: &str) -> Option<TokenPayload> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .ok()?;
-    postcard::from_bytes(&bytes).ok()
+    aruna_core::cursor::decode_value(token).ok()
 }
 
 #[cfg(test)]

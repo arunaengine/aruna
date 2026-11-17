@@ -688,7 +688,7 @@ impl AdminDocumentState {
         }
     }
 
-    pub(super) fn apply_node_value(
+    pub(super) fn apply_value(
         &mut self,
         event: &AdminDocumentEvent,
         path: String,
@@ -790,7 +790,7 @@ impl AdminDocumentState {
             },
         };
         let value = serde_json::to_string(&record).ok();
-        self.apply_node_value(event, node_history_path(node_id, event.event_id), value);
+        self.apply_value(event, node_history_path(node_id, event.event_id), value);
     }
 
     /// Every infrastructure membership interval the realm config has seen, also of removed

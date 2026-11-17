@@ -8,8 +8,8 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::types::Key;
+use aruna_tasks::shutdown::Shutdown;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};

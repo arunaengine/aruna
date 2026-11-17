@@ -30,7 +30,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::DriverContext;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::tasks::task_persistence::persist_task_effect;
 
 const SWEEP_PAGE_SIZE: usize = 128;

@@ -9,17 +9,18 @@ use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
 use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::shutdown::Shutdown;
 use aruna_graph::{GraphHandle, GraphOptions};
 use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
+use aruna_operations::node::counter_check::CounterCheckOperation;
 use aruna_operations::node::startup::RecoveryStatus;
 use aruna_operations::sync::incoming::initialize_net_holder;
 use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
 use aruna_storage::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
@@ -481,8 +482,7 @@ async fn fill(
         acquired.metrics.clone(),
         acquired.readiness.clone(),
         acquired.recovery.clone(),
-    )
-    .await;
+    );
     acquired.monitoring = Some(ops_state.clone());
     let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
     let bound = ops_listener.local_addr()?;
@@ -498,7 +498,8 @@ async fn fill(
 
     // A rebuild is the only local evidence that counters were not carried over. It runs in
     // the background; quota-limited writes are refused until it finishes.
-    acquired.usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
+    acquired.usage_counters_rebuilt =
+        drive(CounterCheckOperation::new(), driver_ctx.as_ref()).await?;
     if acquired.usage_counters_rebuilt {
         aruna_operations::node::usage_stats::spawn_usage_rebuild(
             driver_ctx.clone(),
@@ -554,7 +555,6 @@ async fn open_managed_keys(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::time::unix_timestamp_millis;
-    use aruna_operations::driver::drive;
     use aruna_operations::jobs::key_wake::wake_unlocked;
     use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
 
@@ -596,7 +596,6 @@ async fn record_restart_locks(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::driver::drive;
     use aruna_operations::s3::bucket::audit_retry::resume_records;
     use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
     use aruna_operations::s3::restart_notice::RestartNoticeOperation;
@@ -627,117 +626,6 @@ async fn record_restart_locks(
     Ok(())
 }
 
-/// Reports whether the usage counters need a rebuild: shards or bucket rows are missing, or
-/// an earlier rebuild was interrupted. It then writes the rebuild marker, so the counters count
-/// as incomplete at once, and leaves the rebuild itself to the caller's background task.
-async fn ensure_usage_counters(
-    driver_ctx: &DriverContext,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::{
-        USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, global_shard_keys,
-    };
-
-    let mut probe_keys = global_shard_keys();
-    probe_keys.push(USAGE_REBUILD_KEY.to_vec());
-    let event = driver_ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads: probe_keys
-                .iter()
-                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
-                .collect(),
-            txn_id: None,
-        })
-        .await;
-
-    match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            if values.len() != probe_keys.len() {
-                return Err(format!(
-                    "usage counter probe returned {} values for {} rows",
-                    values.len(),
-                    probe_keys.len()
-                )
-                .into());
-            }
-            let (marker, shards) = values.split_last().ok_or("usage counter probe is empty")?;
-            let shards_missing = shards.iter().any(|(_, value)| value.is_none());
-            if marker.1.is_some() || shards_missing || bucket_rows_missing(driver_ctx).await? {
-                // Missing group rows leave no complete counters for quota decisions.
-                if shards_missing {
-                    let forget = StorageEffect::Delete {
-                        key_space: USAGE_STATS_KEYSPACE.to_string(),
-                        key: USAGE_COMPLETE_KEY.to_vec().into(),
-                        txn_id: None,
-                    };
-                    let event = driver_ctx.storage_handle.send_storage_effect(forget).await;
-                    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
-                        return Err(format!("usage completion marker kept: {event:?}").into());
-                    }
-                }
-                let mark = StorageEffect::Write {
-                    key_space: USAGE_STATS_KEYSPACE.to_string(),
-                    key: USAGE_REBUILD_KEY.to_vec().into(),
-                    value: Vec::new().into(),
-                    txn_id: None,
-                };
-                match driver_ctx.storage_handle.send_storage_effect(mark).await {
-                    Event::Storage(StorageEvent::WriteResult { .. }) => return Ok(true),
-                    other => {
-                        return Err(format!("usage rebuild marker not written: {other:?}").into());
-                    }
-                }
-            }
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(format!("usage counter probe failed: {error}").into());
-        }
-        other => {
-            return Err(format!("usage counter probe received unexpected event: {other:?}").into());
-        }
-    }
-    Ok(false)
-}
-
-/// A first bucket without a counter row means bucket rows were never built.
-async fn bucket_rows_missing(
-    driver_ctx: &DriverContext,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::structs::storage::usage::usage_bucket_key;
-
-    let storage = &driver_ctx.storage_handle;
-    let first = StorageEffect::Iter {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: 1,
-        txn_id: None,
-    };
-    let bucket = match storage.send_storage_effect(first).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => match values.first() {
-            Some((bucket, _)) => bucket.to_vec(),
-            None => return Ok(false),
-        },
-        other => return Err(format!("bucket probe received unexpected event: {other:?}").into()),
-    };
-    let bucket = String::from_utf8(bucket)?;
-    let read = StorageEffect::Read {
-        key_space: USAGE_STATS_KEYSPACE.to_string(),
-        key: usage_bucket_key(&bucket).into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
-        other => Err(format!("bucket counter probe received unexpected event: {other:?}").into()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,6 +635,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
+    use aruna_operations::node::counter_check::CounterCheckError;
     use aruna_storage::StorageHandle;
     use std::thread;
     use tempfile::tempdir;
@@ -782,8 +671,11 @@ mod tests {
         value.map(|value| value.to_vec())
     }
 
+    async fn ensure_usage_counters(driver_ctx: &DriverContext) -> Result<bool, CounterCheckError> {
+        drive(CounterCheckOperation::new(), driver_ctx).await
+    }
+
     async fn rebuild(driver_ctx: &DriverContext) {
-        use aruna_operations::driver::drive;
         use aruna_operations::node::usage_stats::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
@@ -893,53 +785,6 @@ mod tests {
             Event::Storage(StorageEvent::ReadResult { value: Some(_), .. })
         ));
         assert!(!ensure_usage_counters(&driver_ctx).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn counters_return_errors() {
-        let (storage_handle, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
-                .recv()
-                .expect("usage counter ensure should probe storage");
-            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
-            response_tx.send(StorageEvent::Error {
-                error: StorageError::ReadError("boom".to_string()),
-            });
-        });
-        let driver_ctx = test_driver_ctx(storage_handle);
-
-        let error = ensure_usage_counters(&driver_ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("usage counter probe failed"));
-        assert!(error.contains("boom"), "storage cause missing: {error}");
-        worker.join().expect("storage responder should finish");
-    }
-
-    #[tokio::test]
-    async fn counters_reject_events() {
-        let (storage_handle, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
-                .recv()
-                .expect("usage counter ensure should probe storage");
-            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
-            response_tx.send(StorageEvent::SyncAllFinished);
-        });
-        let driver_ctx = test_driver_ctx(storage_handle);
-
-        let error = ensure_usage_counters(&driver_ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("usage counter probe received unexpected event"));
-        worker.join().expect("storage responder should finish");
     }
 
     // A failure with nothing fallible acquired still releases storage; later

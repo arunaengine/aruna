@@ -16,7 +16,6 @@ use aruna_core::document::{
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::metadata::MetadataEventRecord;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
@@ -24,8 +23,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::driver::DriverContext;
-use crate::metadata::projector::{project_create_events, project_logged_events};
-use crate::metadata::prune_queue::process_graph_tombstones;
+use crate::node::document_sync::apply_metadata;
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
@@ -1550,52 +1548,11 @@ pub(crate) async fn apply_restored_reconcile(
         }
     };
 
-    let tombstones = result.metadata_graph_tombstones.clone();
     refresh_usage_targets(context, node_id, &result.targets).await;
     refresh_target_interest(context, &result.targets).await;
     crate::notifications::email::config_applied(context, &result.targets).await;
-    project_restored_events(
-        context,
-        node_id,
-        result.targets,
-        result.metadata_create_events,
-    )
-    .await;
-    process_graph_tombstones(context, tombstones).await;
+    apply_metadata(context, Some(node_id), result, false).await;
     true
-}
-
-async fn project_restored_events(
-    context: &Arc<DriverContext>,
-    node_id: NodeId,
-    targets: Vec<DocumentTarget>,
-    metadata_create_events: Vec<MetadataEventRecord>,
-) {
-    if !metadata_create_events.is_empty() {
-        if let Err(error) =
-            project_create_events(context, metadata_create_events, Some(node_id)).await
-        {
-            warn!(error = ?error, "Failed to project restored metadata create events");
-        }
-        return;
-    }
-
-    let mut pairs = Vec::new();
-    for target in targets {
-        if let DocumentTarget::MetadataCreateEvent {
-            document_id,
-            event_id,
-        } = target
-        {
-            pairs.push((document_id, event_id));
-        }
-    }
-    if pairs.is_empty() {
-        return;
-    }
-    if let Err(error) = project_logged_events(context, pairs).await {
-        warn!(error = ?error, "Failed to project restored metadata create events from log");
-    }
 }
 
 async fn load_realm_config(context: &Arc<DriverContext>, realm_id: RealmId) -> RealmConfigLoad {

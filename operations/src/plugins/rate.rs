@@ -27,12 +27,12 @@ static BUCKETS: Buckets = LazyLock::new(Default::default);
 static HOOK_BUCKETS: Buckets = LazyLock::new(Default::default);
 
 /// Takes one call of `install_id` at `now`; `false` when the install is over its rate.
-pub fn take_call(install_id: Ulid, now: Instant) -> bool {
+pub(crate) fn take_call(install_id: Ulid, now: Instant) -> bool {
     take(&BUCKETS, install_id, now, (CALL_RATE, CALL_BURST))
 }
 
 /// Takes one webhook request of `install_id` at `now`; `false` when it is over its rate.
-pub fn take_hook(install_id: Ulid, now: Instant) -> bool {
+pub(crate) fn take_hook(install_id: Ulid, now: Instant) -> bool {
     let rate = (HOOKS_PER_MINUTE / 60.0, HOOKS_PER_MINUTE);
     take(&HOOK_BUCKETS, install_id, now, rate)
 }

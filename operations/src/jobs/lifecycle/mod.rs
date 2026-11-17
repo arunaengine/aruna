@@ -3,25 +3,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::Duration;
-
 use aruna_core::compute::quota::QuotaDenied;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::handle::Handle;
-use aruna_core::structs::execution::job::{JobId, JobRecordError};
-use aruna_core::structs::identity::realm::JobFamilyError;
-use aruna_core::task::TaskEvent;
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::structs::execution::job::{JobFamilyId, JobId, JobRecordError};
+use aruna_core::structs::identity::realm::{JobFamilyError, RealmConfigDocument, RealmId};
+use aruna_core::types::Value;
 use thiserror::Error;
-use tracing::warn;
 
 use super::records::RecordStoreError;
+use super::records::verify::FamilyView;
 
 pub mod admit;
+pub mod alias;
 pub mod cancel;
+pub mod chain;
+mod fetch;
+pub mod held;
 pub mod ids;
 pub mod ingress;
+pub mod offer;
 pub mod outbox;
 pub mod plan;
 pub mod report;
@@ -31,17 +31,6 @@ pub mod stage;
 pub mod target;
 pub mod updates;
 pub mod witness;
-
-pub use admit::{AdmitSubmissionConfig, AdmitSubmissionOperation, AdmittedSubmission};
-pub use ids::{RequestIdentity, SubmissionRequest};
-pub use ingress::{AcceptedSubmission, submit_external_job};
-pub use report::{
-    AuditPaging, AuditRange, FamilyReport, MAX_AUDIT_PAGE, PagingError, PlanEstimate,
-    audit_endpoints, family_audit, family_report,
-};
-
-/// Records of one submission an admission decision scans before it commits.
-pub const MAX_SUBMISSION_SCAN: usize = 512;
 
 /// Why one lifecycle round did not complete. An availability failure is never
 /// reported as a refusal of the request itself.
@@ -79,36 +68,35 @@ pub enum LifecycleError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl LifecycleError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+}
+
+/// The family view a realm config row gives; a missing row is `RealmConfigMissing`.
+fn stored_view(
+    value: Option<Value>,
+    realm_id: RealmId,
+    family: JobFamilyId,
+) -> Result<Option<FamilyView>, LifecycleError> {
+    let value = value.ok_or(LifecycleError::RealmConfigMissing)?;
+    let config = RealmConfigDocument::from_bytes(&value)?;
+    Ok(FamilyView::resolve(&config, realm_id, family))
 }
 
 #[cfg(test)]
 mod tests;
-
-/// Re-arms the replication and witness queues after a restart. Both queues are
-/// durable rows, so the timers only have to be brought back, never the work.
-pub async fn restore_lifecycle_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let pending = crate::jobs::store::iter_prefix_page(
-        storage,
-        aruna_core::keyspaces::WITNESS_DEADLINE_KEYSPACE,
-        None,
-        None,
-        1,
-        None,
-    )
-    .await
-    .map(|(rows, _)| !rows.is_empty())
-    .unwrap_or(false);
-    let mut timers = vec![outbox::schedule_outbox_drain(outbox::OUTBOX_RETRY_AFTER)];
-    if pending {
-        timers.push(witness::schedule_witness_drain(Duration::from_secs(1)));
-    }
-    for timer in timers {
-        if let aruna_core::events::Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(timer).await
-        {
-            warn!(message = %message, "Failed to restore a job lifecycle timer");
-        }
-    }
-}

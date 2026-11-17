@@ -11,13 +11,15 @@ use aruna_core::structs::execution::job::{
 };
 use tracing::warn;
 
-use super::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use super::verify::{EvidenceSet, FamilyView};
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
 
 /// Records one family may retain pending at once.
 pub const MAX_PENDING_RECORDS: usize = 64;
 /// Admission attempts one pending record may consume before it is dropped.
-pub const MAX_PENDING_ATTEMPTS: u32 = 32;
+const MAX_PENDING_ATTEMPTS: u32 = 32;
 
 /// What became of one candidate record.
 #[derive(Debug, Clone, PartialEq, Eq)]

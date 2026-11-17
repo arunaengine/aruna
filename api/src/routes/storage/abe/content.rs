@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::download::{self, AdmissionError};
-use crate::lookup::relay_stream;
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
+use crate::routes::storage::relay::relay_stream;
 use aruna_operations::s3::object::get::{
     GetObjectError, GetObjectInput, GetObjectOperation, read_object,
 };
@@ -63,13 +64,12 @@ fn read_error(error: GetObjectError) -> ServerError {
         (status = 503, body = ErrorResponse, description = "Download or storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn content(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Extension(object): Extension<ObjectKey>,
     Query(query): Query<VersionQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let private = object.0.map_err(|_| ServerError::BadRequest)?;
     let mut sent = HeaderMap::new();

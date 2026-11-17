@@ -3,30 +3,18 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::driver::drive;
 use crate::plugins::copies::read_local;
+use crate::plugins::runs::tests::opened;
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use std::collections::BTreeSet;
-use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
-
-fn context() -> (TempDir, DriverContext) {
-    let dir = tempdir().unwrap();
-    let ctx = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    (dir, ctx)
-}
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -127,7 +115,7 @@ async fn published(ctx: &DriverContext) -> Vec<PublishedPlugin> {
 
 #[tokio::test]
 async fn writes_entry_once() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(write_entry(&ctx, entry(&digest)).await, Ok(entry(&digest)));
@@ -147,14 +135,14 @@ async fn writes_entry_once() {
 
 #[tokio::test]
 async fn entry_refusals() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Server, 1, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
         Err(EntryError::NotManagementNode)
     );
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, false).await;
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
@@ -165,7 +153,7 @@ async fn entry_refusals() {
 
 #[tokio::test]
 async fn publishes_after_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, true).await;
     let plugin = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec())
@@ -194,7 +182,7 @@ async fn publishes_after_copies() {
 
 #[tokio::test]
 async fn too_few_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 2, true).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -216,7 +204,7 @@ async fn too_few_copies() {
 
 #[tokio::test]
 async fn refuses_before_storing() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, false).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -238,7 +226,7 @@ async fn refuses_before_storing() {
 #[tokio::test]
 async fn counts_current_managers() {
     // Managers 1, 10 and 11: a copy confirmed by a node that left the managers does not count.
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 2, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     let left = BTreeSet::from([node(1), node(99)]);
@@ -254,4 +242,78 @@ async fn counts_current_managers() {
     let remote = BTreeSet::from([node(1), node(10)]);
     assert!(write_copies(&ctx, entry(&digest), remote).await.is_ok());
     assert_eq!(published(&ctx).await.len(), 1);
+}
+
+/// A finished window member with the answer `stored`.
+fn answered(index: usize, stored: Result<bool, String>) -> Event {
+    let event = Event::Net(NetEvent::ArtifactStored(stored));
+    Event::Group(GroupEvent::Member {
+        index,
+        result: GroupResult::Done(Box::new(event)),
+    })
+}
+
+fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
+    let chunk = super::chunk_of("sha256:d", artifact, index);
+    Effect::Net(NetEffect::ArtifactStore(Box::new(ArtifactStore {
+        node_id,
+        chunk,
+    })))
+}
+
+#[test]
+fn copies_in_window() {
+    use crate::plugins::copies::CHUNK;
+    let artifact = vec![7u8; CHUNK + 1];
+    let (first, second) = (node(1), node(2));
+    let mut copy = copy_artifact(vec![first, second], "sha256:d".into(), artifact.clone());
+    let group = EffectGroup {
+        members: vec![sent(first, &artifact, 0), sent(second, &artifact, 0)],
+        limit: 2,
+        form: GroupForm::Window,
+    };
+    assert_eq!(copy.start().as_slice(), [Effect::Group(group)]);
+    // The first node goes on with its second chunk and completes; the second fails.
+    assert_eq!(
+        copy.step(answered(0, Ok(false))).as_slice(),
+        [sent(first, &artifact, 1)]
+    );
+    assert!(copy.step(answered(1, Err("down".into()))).is_empty());
+    assert!(copy.step(answered(2, Ok(true))).is_empty());
+    rejects_finalize(copy_artifact(vec![first], "sha256:d".into(), vec![1]));
+    assert!(!copy.is_complete());
+    copy.step(Event::Group(GroupEvent::Closed));
+    assert_eq!(copy.finalize(), Ok(BTreeSet::from([first])));
+}
+
+#[test]
+fn copy_refuses_events() {
+    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
+    copy.start();
+    let unknown = answered(5, Ok(true));
+    assert!(copy.step(unknown).is_empty());
+    assert!(copy.is_complete());
+    assert_eq!(
+        copy.finalize(),
+        Err(CopyError::Unexpected {
+            got: "GroupEvent::Member"
+        })
+    );
+    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
+    copy.start();
+    let refusals = rejects_events(
+        || {
+            let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1]);
+            copy.start();
+            copy
+        },
+        sample_events,
+        |_| false,
+    );
+    assert_eq!(refusals.len(), sample_events().len());
+    check_abort(&mut copy, &[]);
+    // Without peers nothing is sent and no node confirms.
+    let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1]);
+    assert!(alone.start().is_empty());
+    assert_eq!(alone.finalize(), Ok(BTreeSet::new()));
 }

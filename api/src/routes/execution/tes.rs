@@ -24,8 +24,9 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
 use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
 use aruna_operations::driver::drive;
-use aruna_operations::jobs::JobRouteError;
-use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
+use aruna_operations::jobs::lifecycle::ingress::submit_external_job;
+use aruna_operations::jobs::lifecycle::report::{FamilyReport, family_report};
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::jobs::service::{
     RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
 };
@@ -36,7 +37,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -1124,7 +1125,7 @@ pub async fn list_tasks(
         StatusCode::OK,
         TesTasksResponse {
             tasks,
-            next_page_token: next_cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor)),
+            next_page_token: next_cursor.map(aruna_core::cursor::encode),
         },
     )
 }
@@ -2182,8 +2183,7 @@ async fn ensure_group_write(
 fn decode_page_token(token: Option<&str>) -> Result<Option<Vec<u8>>, TesError> {
     match token {
         Some(token) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(token)
+            let bytes = aruna_core::cursor::decode(token)
                 .map_err(|_| TesError::bad_request("invalid page_token"))?;
             if bytes.len() != 24 {
                 return Err(TesError::bad_request("invalid page_token"));

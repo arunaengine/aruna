@@ -9,8 +9,8 @@ use std::sync::Arc;
 use crate::auth::parse_group_id;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::staging::map_resolution_error;
 use crate::server::state::ServerState;
-use aruna_core::errors::SourceResolutionError;
 use aruna_core::structs::execution::source_access::{
     ListCursor, ListRequest, ResolvedSourceAccess, SourceEntryKind,
 };
@@ -43,7 +43,6 @@ use aruna_operations::staging::list_source::{
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::time::timeout;
@@ -1095,13 +1094,12 @@ fn encode_cursor(cursor: &ListCursor) -> String {
         ListCursor::At(key) => format!("a{key}"),
         ListCursor::Offset(offset) => format!("o{offset}"),
     };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    aruna_core::cursor::encode(raw)
 }
 
 fn decode_cursor(cursor: &str) -> ServerResult<ListCursor> {
     let invalid = || ServerError::BadRequestReason("cursor is invalid".to_string());
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor)
+    let raw = aruna_core::cursor::decode(cursor)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .ok_or_else(invalid)?;
@@ -1266,15 +1264,6 @@ fn map_delete_error(error: DeleteSourceError) -> ServerError {
         DeleteSourceError::ReferencesPending => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        _ => ServerError::InternalError(error.into()),
-    }
-}
-
-fn map_resolution_error(error: SourceResolutionError) -> ServerError {
-    match error {
-        SourceResolutionError::NotFound => ServerError::NotFound,
-        SourceResolutionError::InvalidSourcePath
-        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
         _ => ServerError::InternalError(error.into()),
     }
 }

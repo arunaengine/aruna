@@ -9,7 +9,9 @@ use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
 use aruna_core::alpn::Alpn;
+use aruna_core::auth::valid_revocation_expiry;
 use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
+use aruna_core::deferred_topics::TOPICS_PER_DEPENDENCY;
 use aruna_core::document::{DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE,
@@ -18,12 +20,16 @@ use aruna_core::keyspaces::{
     USER_KEYSPACE,
 };
 use aruna_core::metadata::MetadataEventPayload;
-use aruna_core::reducer::CONFIG_STRATEGY_PATH;
+use aruna_core::reducer::{
+    CONFIG_DESCRIPTION_PATH, CONFIG_STRATEGY_PATH, METADATA_REPLICATION_PATH,
+    REVOCATIONS_PER_ORIGIN, USER_NAME_PATH, group_user_path, realm_user_path, user_attribute_path,
+};
 use aruna_core::storage_entries::{
     create_acceptance_key, event_log_key, metadata_document_key, metadata_registry_key,
     reducer_conflict_key, reducer_state_key, subject_index_key, subject_index_value,
 };
 use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::notification_watch::{WatchEventMask, WatchInterestDigest};
 use aruna_core::structs::identity::auth::{Actor, Permission, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -36,8 +42,12 @@ use aruna_core::structs::placement::record::{
     METADATA_HANDLE, NodePlacementEntry, PlacementBinding, PlacementOverride, PlacementRef,
     PlacementStrategy, StrategyBinding, band_start,
 };
+use aruna_core::structs::storage::usage::NodeUsageSnapshot;
 use aruna_core::structs::{QUARANTINE_MAX_RECORDS, SyncQuarantineFamily, SyncQuarantineRecord};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::sync_checks::{
+    validate_register_upsert, validate_setting_upsert, validate_watch_upsert,
+};
 use aruna_core::{MetaResourceId, StructuredId, UserId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;

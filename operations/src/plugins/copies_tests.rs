@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_storage::{FjallStorage, StorageHandle};
+use futures_util::TryStreamExt;
 use tempfile::{TempDir, tempdir};
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
@@ -128,7 +131,8 @@ async fn local(ctx: &DriverContext, digest: &str) -> Option<Vec<u8>> {
 }
 
 async fn rows(ctx: &DriverContext) -> usize {
-    let pages = scan_pages(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None);
+    let pages =
+        crate::storage_read::scan_pages(&ctx.storage_handle, PLUGIN_ARTIFACT_KEYSPACE, None);
     let pages: Vec<_> = pages.try_collect().await.unwrap();
     pages.iter().map(Vec::len).sum()
 }

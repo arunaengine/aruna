@@ -25,14 +25,14 @@ use tracing::warn;
 use super::admit::Admission;
 use super::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use super::audit::{AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-use super::load_kind_complete;
-use super::rows::PendingNeed;
+use super::family::LoadFamilyOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::{JobPageReply, MetadataTransportMessage};
 use crate::metadata::transport_message_kind;
 use crate::node::dashboard::notify_dashboard_change;
 use crate::placement::holds_placement;
 use crate::realm::load_config::load_realm_config;
+use aruna_core::structs::execution::job::record_rows::PendingNeed;
 
 /// Publishes one record to the family holders, or reads a bounded page back.
 pub async fn dispatch_record(context: &DriverContext, effect: JobRecordEffect) -> JobRecordEvent {
@@ -405,9 +405,12 @@ async fn accept_record(
                         ServeError::Unavailable
                     })?;
             }
-            let cancels = load_kind_complete(context.as_ref(), family, JobRecordKind::Cancel)
-                .await
-                .map_err(|_| ServeError::Unavailable)?;
+            let cancels = drive(
+                LoadFamilyOperation::kind(family, JobRecordKind::Cancel),
+                context.as_ref(),
+            )
+            .await
+            .map_err(|_| ServeError::Unavailable)?;
             // Admission may promote a pending cancel, and retries must reapply its side effect.
             if !cancels.is_empty() {
                 crate::jobs::lifecycle::cancel::cancel_local_runs(context.as_ref(), family).await;

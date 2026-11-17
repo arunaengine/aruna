@@ -41,14 +41,14 @@ use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::lookup::map_guard_error;
-use crate::lookup::{
-    self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
-};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::bucket::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, describe_bucket,
+};
+use crate::routes::storage::relay::{
+    self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
@@ -693,7 +693,7 @@ pub(crate) async fn version_answer(
             "the version is not on the node the read was directed at".to_string(),
         )),
         W3idIdentifier::VersionedObject(arn) => {
-            let path = lookup::query_path("/data/origin", &[("version", version)]);
+            let path = relay::query_path("/data/origin", &[("version", version)]);
             node_read(state, arn.node_id, &path, bearer.as_ref(), deadline)
                 .await
                 .map(Json)

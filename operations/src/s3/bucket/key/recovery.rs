@@ -16,7 +16,6 @@ use aruna_core::keyspaces::{
     KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
@@ -29,6 +28,7 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::holders::{KeyLookup, RecoveryState, resolve_holders};
 use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
 use aruna_core::{NodeId, UserId};
+use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

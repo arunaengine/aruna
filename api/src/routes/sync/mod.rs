@@ -31,13 +31,13 @@ use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeTarget,
 };
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
-    request_mirror_create, stage_mirror_delete, stage_mirror_reconcile, store_sync_status,
+    KickRepairOperation, MirrorRecordOperation, StoreStatusOperation, SyncMirrorIntent,
+    delete_sync_mirror, request_mirror_create,
 };
 use aruna_operations::sync::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, ListRelationshipsOperation,
-    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
-    create_sync_relationship, remove_outgoing_relationship,
+    CreateRelationshipOperation, DeleteRelationshipOperation, GetRelationshipOperation,
+    ListRelationshipsOperation, RemoveOutgoingOperation, StoreRelationshipOperation,
+    SyncRelationshipDirection, SyncRelationshipError,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -445,9 +445,12 @@ pub async fn create_sync(
         status: SyncStatusSnapshot::default(),
     };
     let context = state.get_ctx();
-    stage_mirror_reconcile(&context, &relationship)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    drive(
+        MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Reconcile),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -457,7 +460,7 @@ pub async fn create_sync(
     )
     .await
     {
-        kick_mirror_repair(&context).await;
+        let _ = drive(KickRepairOperation::new(), &context).await;
         return Err(error);
     }
 
@@ -473,14 +476,20 @@ pub async fn create_sync(
     if matches!(relationship.mode, SyncMode::Once | SyncMode::Reference)
         && let Err(error) = queue_relationship(&state, &auth, &relationship).await
     {
-        if stage_mirror_delete(&context, &relationship).await.is_ok() {
+        if drive(
+            MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
+            &context,
+        )
+        .await
+        .is_ok()
+        {
             let _ = delete_relationship(
                 &state,
                 relationship.clone(),
                 SyncRelationshipDirection::Outgoing,
             )
             .await;
-            kick_mirror_repair(&context).await;
+            let _ = drive(KickRepairOperation::new(), &context).await;
             if remove_mirror(&state, &relationship).await {
                 clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
             }
@@ -827,9 +836,12 @@ pub async fn update_sync(
     .await?
     .group_id;
     let context = state.get_ctx();
-    stage_mirror_reconcile(&context, &relationship)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    drive(
+        MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Reconcile),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     if let Err(error) = create_mirror(
         &state,
         &auth,
@@ -839,7 +851,7 @@ pub async fn update_sync(
     )
     .await
     {
-        kick_mirror_repair(&context).await;
+        let _ = drive(KickRepairOperation::new(), &context).await;
         return Err(error);
     }
     let updated = match store_relationship(
@@ -851,7 +863,7 @@ pub async fn update_sync(
     {
         Ok(updated) => updated,
         Err(error) => {
-            kick_mirror_repair(&context).await;
+            let _ = drive(KickRepairOperation::new(), &context).await;
             return Err(error);
         }
     };
@@ -921,13 +933,13 @@ pub async fn run_sync(
         relationship.status.last_error = None;
         relationship.status.counters.consecutive_failures = 0;
         let context = state.get_ctx();
-        if !store_sync_status(&context, &relationship)
+        if !drive(StoreStatusOperation::new(relationship.clone()), &context)
             .await
             .map_err(|error| ServerError::InternalError(error.into()))?
         {
             return Err(ServerError::NotFound);
         }
-        kick_mirror_repair(&context).await;
+        let _ = drive(KickRepairOperation::new(), &context).await;
     }
     let queued = queue_relationship(&state, &auth, &relationship).await?;
 
@@ -979,13 +991,16 @@ pub async fn delete_sync(
     ensure_sync_write(&state, &auth, &relationship, direction).await?;
 
     let context = state.get_ctx();
-    stage_mirror_delete(&context, &relationship)
-        .await
-        .map_err(|error| ServerError::InternalError(error.into()))?;
+    drive(
+        MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     match direction {
         // References retain a serving stub for target-held data; other modes are removed.
         SyncRelationshipDirection::Outgoing => {
-            remove_outgoing_relationship(&context, relationship.clone())
+            drive(RemoveOutgoingOperation::new(relationship.clone()), &context)
                 .await
                 .map_err(|error| ServerError::InternalError(error.into()))?;
         }
@@ -993,7 +1008,7 @@ pub async fn delete_sync(
             delete_relationship(&state, relationship.clone(), direction).await?;
         }
     }
-    kick_mirror_repair(&context).await;
+    let _ = drive(KickRepairOperation::new(), &context).await;
     if remove_mirror(&state, &relationship).await {
         clear_repair(&state, &relationship, SyncMirrorIntent::Delete).await;
     }
@@ -1142,18 +1157,28 @@ async fn create_mirror(
 /// already rolled back stays with repair: an ordinary delete could leave a detached stub.
 async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> ServerResult<()> {
     let context = state.get_ctx();
-    let error = match create_sync_relationship(&context, relationship.clone()).await {
+    let error = match drive(
+        CreateRelationshipOperation::new(relationship.clone()),
+        &context,
+    )
+    .await
+    {
         Ok(_) => return Ok(()),
         Err(SyncRelationshipError::RolledBack) => {
-            kick_mirror_repair(&context).await;
+            let _ = drive(KickRepairOperation::new(), &context).await;
             return Err(map_create_error(SyncRelationshipError::RolledBack));
         }
         Err(error) => map_create_error(error),
     };
-    if let Err(stage_error) = stage_mirror_delete(&context, relationship).await {
+    if let Err(stage_error) = drive(
+        MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
+        &context,
+    )
+    .await
+    {
         warn!(%stage_error, relationship_id = %relationship.id, "Failed to stage sync mirror rollback");
     }
-    kick_mirror_repair(&context).await;
+    let _ = drive(KickRepairOperation::new(), &context).await;
     if remove_mirror(state, relationship).await {
         clear_repair(state, relationship, SyncMirrorIntent::Delete).await;
     }
@@ -1176,9 +1201,14 @@ async fn clear_repair(
     expected: SyncMirrorIntent,
 ) {
     let context = state.get_ctx();
-    if let Err(error) = clear_mirror_repair(&context, relationship, expected).await {
+    if let Err(error) = drive(
+        MirrorRecordOperation::clear(relationship.clone(), expected),
+        &context,
+    )
+    .await
+    {
         warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
-        kick_mirror_repair(&context).await;
+        let _ = drive(KickRepairOperation::new(), &context).await;
     }
 }
 

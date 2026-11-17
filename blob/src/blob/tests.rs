@@ -10,7 +10,6 @@ use super::{
     control_plane::timeout_event,
     control_plane::{parse_replication_init, validate_init_ack, with_timeout},
 };
-use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::s3::{NativeMultipart, create_s3_client, make_bucket};
 use aruna_core::alpn::Alpn;
@@ -25,6 +24,7 @@ use aruna_core::keyspaces::{
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::Status;
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::identity::realm::RealmId;

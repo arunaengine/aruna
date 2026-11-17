@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
@@ -239,11 +241,10 @@ fn unexpected() -> ServerError {
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn request_key(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(body): Json<RequestBody>,
 ) -> ServerResult<(StatusCode, Json<RecordView>)> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let scope = match body.scope {
         ScopeView::Exact(v) => KeyScope::Exact(v),
         ScopeView::Subtree(v) => KeyScope::Subtree(v),
@@ -308,11 +309,10 @@ async fn request_writes(
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn open_requests(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(page): Query<PageQuery>,
 ) -> ServerResult<Json<RecordList>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     // A holder opening the list is an issuance run: a due raise happens before listing.
     if page.cursor.is_none() {
         epoch_run(&state, &auth, &bucket, false).await?;
@@ -354,11 +354,10 @@ pub async fn open_requests(
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn publish_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((bucket, request)): Path<(String, String)>,
     Json(body): Json<GrantBody>,
 ) -> ServerResult<Json<RecordView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     if body.context.len() > 128 * 1024 || body.ciphertext.len() > 128 * 1024 {
         return Err(ServerError::PayloadTooLarge("grant limit".into()));
     }
@@ -399,11 +398,10 @@ pub async fn publish_grant(
         (status = 404, body = ErrorResponse, description = "Bucket missing")), security(("bearer_auth" = [])))]
 pub async fn own_grants(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(page): Query<PageQuery>,
 ) -> ServerResult<Json<RecordList>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let KeyResult::Grants(grants, next) =
         execute(&state, auth, bucket, KeyAction::Grants(page.decode()?)).await?
     else {
@@ -437,10 +435,9 @@ pub async fn own_grants(
     security(("bearer_auth" = [])))]
 pub async fn raise_epoch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<EpochView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let epoch = epoch_run(&state, &auth, &bucket, true).await?;
     Ok(Json(EpochView { epoch }))
 }
@@ -473,11 +470,10 @@ pub async fn raise_epoch(
     security(("bearer_auth" = [])))]
 pub async fn rekey_subtree(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(body): Json<RekeyBody>,
 ) -> ServerResult<Json<RekeyView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let scope = KeyScope::Subtree(body.prefix.clone());
     scope.validate().map_err(|_| ServerError::BadRequest)?;
     raise_run(&state, &auth, &bucket, KeyAction::Rekey).await?;

@@ -349,7 +349,12 @@ fn ensure_local_context(value: &mut Value) -> Result<(), CrateValidationError> {
 fn map_validation_error(error: RoCrateError) -> CrateValidationError {
     match error {
         RoCrateError::Update(UpdateError::ValidationFailed(violations)) => {
-            CrateValidationError::Violations(violations.into_iter().map(Into::into).collect())
+            CrateValidationError::Violations(
+                violations
+                    .into_iter()
+                    .map(MetadataValidationViolation::from)
+                    .collect(),
+            )
         }
         // craqle reports version problems as errors; keep the structured code
         // the import and export contracts expose.

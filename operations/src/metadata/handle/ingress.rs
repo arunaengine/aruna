@@ -42,8 +42,8 @@ use crate::s3::object::search::SearchObjectsInput;
 use crate::s3::object::search_scan::search_local_objects;
 use crate::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
 use crate::sync::sync_relationship::{
-    DeleteRelationshipOperation, GetRelationshipOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection, SyncRelationshipError, remove_outgoing_relationship,
+    DeleteRelationshipOperation, GetRelationshipOperation, RemoveOutgoingOperation,
+    StoreRelationshipOperation, SyncRelationshipDirection, SyncRelationshipError,
 };
 use aruna_core::metadata::AuthToken;
 
@@ -267,7 +267,7 @@ async fn delete_mirror(
     // Retain the peer's readable reference records when detaching an outgoing mirror.
     let removed = match direction {
         SyncRelationshipDirection::Outgoing => {
-            remove_outgoing_relationship(context.as_ref(), stored).await
+            drive(RemoveOutgoingOperation::new(stored), context.as_ref()).await
         }
         SyncRelationshipDirection::Incoming => {
             drive(

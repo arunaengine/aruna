@@ -1218,6 +1218,7 @@ async fn schedule_materialization_drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::write_entries;
     use aruna_core::UserId;
     use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
     use aruna_core::metadata::{MetadataEventPayload, MetadataLifecycleRecord};
@@ -1319,19 +1320,6 @@ mod tests {
             config.ensure_node(*node, RealmNodeKind::Server);
         }
         config
-    }
-
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
-        }
     }
 
     async fn store_realm_config(storage: &StorageHandle, config: &RealmConfigDocument) {

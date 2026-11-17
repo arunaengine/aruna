@@ -17,7 +17,7 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 // Size one drain for several full topic batches; every grouped peer receives every topic.
-pub const OUTBOX_DRAIN_SIZE: usize = 4 * aruna_net::document_sync::BATCH_TOPIC_LIMIT;
+pub const OUTBOX_DRAIN_SIZE: usize = 4 * aruna_net::BATCH_TOPIC_LIMIT;
 pub(crate) const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
 const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
 const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";

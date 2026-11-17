@@ -6,9 +6,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use aruna_core::NodeId;
+use aruna_core::cursor;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
-use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,8 +55,7 @@ pub(crate) enum CursorEnvelopeError {
 
 impl<P: Serialize> SignedCursor<P> {
     pub(crate) fn encode(&self) -> Result<String, postcard::Error> {
-        let bytes = postcard::to_allocvec(self)?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        Ok(cursor::encode(postcard::to_allocvec(self)?))
     }
 
     pub(crate) fn build_signed(
@@ -100,11 +99,7 @@ impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
     where
         F: FnOnce(&Self) -> Result<(), CursorEnvelopeError>,
     {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| CursorEnvelopeError::Invalid)?;
-        let cursor: Self =
-            postcard::from_bytes(&bytes).map_err(|_| CursorEnvelopeError::Invalid)?;
+        let cursor: Self = cursor::decode_value(raw).map_err(|_| CursorEnvelopeError::Invalid)?;
         check(&cursor)?;
         let signer =
             NodeId::from_bytes(&cursor.signer).map_err(|_| CursorEnvelopeError::Invalid)?;

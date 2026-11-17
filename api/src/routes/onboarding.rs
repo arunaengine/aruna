@@ -896,7 +896,7 @@ fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticR
         .collect()
 }
 
-fn map_consume_error(error: ConsumeSecretError) -> ServerError {
+pub(crate) fn map_consume_error(error: ConsumeSecretError) -> ServerError {
     match error {
         ConsumeSecretError::NotFound
         | ConsumeSecretError::Expired
@@ -939,7 +939,7 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
     }
 }
 
-fn map_inspect_error(error: InspectSecretError) -> ServerError {
+pub(crate) fn map_inspect_error(error: InspectSecretError) -> ServerError {
     match error {
         InspectSecretError::NotFound
         | InspectSecretError::Expired

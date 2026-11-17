@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{BucketPage, BucketSearchHit, MetadataApiError, NodeId};
-use base64::Engine;
+use aruna_core::cursor;
 use serde::{Deserialize, Serialize};
 
 /// Scan position of one node: the last bucket it gave or its sealed scan position, and whether
@@ -51,10 +51,7 @@ pub(super) fn decode_cursor(raw: Option<&str>) -> Result<BucketCursor, MetadataA
     let Some(raw) = raw else {
         return Ok(BucketCursor::default());
     };
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(raw)
-        .map_err(|_| invalid())?;
-    let cursor: BucketCursor = postcard::from_bytes(&bytes).map_err(|_| invalid())?;
+    let cursor: BucketCursor = cursor::decode_value(raw).map_err(|_| invalid())?;
     if (cursor.positions.iter()).any(|entry| NodeId::from_bytes(&entry.node_id).is_err()) {
         return Err(invalid());
     }
@@ -66,8 +63,7 @@ pub(super) fn encode_cursor(cursor: &BucketCursor) -> Option<String> {
     if cursor.positions.iter().all(|entry| entry.done) {
         return None;
     }
-    let bytes = postcard::to_allocvec(cursor).ok()?;
-    Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    cursor::encode_value(cursor).ok()
 }
 
 /// Whether a node at `position` may still reach `bucket`: it is not done, and its position is

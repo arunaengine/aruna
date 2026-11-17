@@ -230,7 +230,10 @@ async fn assess_write(
             .map_err(|error| shacl_failure(error, None))?;
         return Ok(MetadataProfilePreview {
             status: not_profiled_status(document_id),
-            structural_violations: structural.into_iter().map(Into::into).collect(),
+            structural_violations: structural
+                .into_iter()
+                .map(MetadataValidationViolation::from)
+                .collect(),
         });
     };
     evaluate_tagged(context, document_id, scope, &requested_iri, jsonld).await

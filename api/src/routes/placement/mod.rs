@@ -7,8 +7,8 @@ use crate::auth::ValidatedBearer;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::{copy_miss, query_path, read_holders, relay_read};
 use crate::metadata::forwarded_auth_token;
+use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
@@ -19,7 +19,8 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
-use aruna_operations::driver::{drive, gate_context, now_ms};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_operations::driver::{drive, gate_context};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
@@ -681,7 +682,7 @@ async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> ServerResult<aruna_core::structs::placement::policy::PlacementSubject> {
-    let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
+    let gate = gate_context(&state.get_ctx(), realm_id, unix_timestamp_millis())
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
@@ -775,7 +776,7 @@ pub async fn create_placement_policy(
         },
         auth_context: auth,
         policy,
-        created_at_ms: now_ms(),
+        created_at_ms: unix_timestamp_millis(),
     };
     let document = create_policy_routed(
         &state.get_ctx(),
@@ -1058,7 +1059,7 @@ pub async fn put_bucket_placement(
             expected_generation: request.expected_generation,
             auth_context: auth,
             local_node_id: state.get_node_id(),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )
@@ -1250,10 +1251,16 @@ pub async fn mint_object_placement(
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
     // In a distributed bucket the coordinator of the key's range mints the successor.
-    let forward = crate::lookup::rest_target(&state, &info, &request.key, &headers);
+    let forward = crate::routes::storage::relay::rest_target(&state, &info, &request.key, &headers);
     if let Some(forward) = forward.await? {
         let path = format!("/data/buckets/{bucket}/placement/objects");
-        let relayed = crate::lookup::relay_json(&state, &forward, &path, bearer.as_ref(), &request);
+        let relayed = crate::routes::storage::relay::relay_json(
+            &state,
+            &forward,
+            &path,
+            bearer.as_ref(),
+            &request,
+        );
         return Ok(Json(relayed.await?.1));
     }
     let subject = local_subject(&state, auth.realm_id).await?;
@@ -1283,7 +1290,7 @@ pub async fn mint_object_placement(
                 target_refs: refs_from(request.policies)?,
                 subject,
                 created_at: SystemTime::now(),
-                now_ms: now_ms(),
+                now_ms: unix_timestamp_millis(),
             },
             mint_version(hint),
         ),
@@ -1405,7 +1412,7 @@ pub async fn run_bucket_placement(
 ) -> ServerResult<Json<BulkRunResponse>> {
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let info = bucket_info(&state, &bucket).await?;
-    crate::lookup::relayed_set(&info, &headers)?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
     Ulid::from_string(&request.operation_id).map_err(|_| ServerError::BadRequest)?;
     let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
     let answer = match info.distribution.as_ref().filter(|_| !relayed) {
@@ -1453,7 +1460,7 @@ async fn run_here(
             subject,
             start_after: decode_cursor(cursor)?,
             limit: request.limit.unwrap_or(BULK_DEFAULT_LIMIT),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
             created_at: SystemTime::now(),
         }),
         &state.get_ctx(),
@@ -1574,7 +1581,7 @@ pub async fn get_placement_coverage(
     )
     .await?;
     let info = bucket_info(&state, &bucket).await?;
-    crate::lookup::relayed_set(&info, &headers)?;
+    crate::routes::storage::relay::relayed_set(&info, &headers)?;
     let relayed = headers.contains_key(crate::routes::management_relay::RELAY_HOP_HEADER);
     let answer = match info.distribution.as_ref().filter(|_| !relayed) {
         Some(binding) => {
@@ -1885,7 +1892,7 @@ pub async fn resolve_placement_quarantine(
             auth_context: auth.clone(),
             realm_id: auth.realm_id,
             release,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )

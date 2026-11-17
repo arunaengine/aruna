@@ -29,7 +29,7 @@ use ulid::Ulid;
 use crate::blob::release::release_renamed;
 use crate::driver::{DriverContext, drive, now_ms};
 use crate::groups::backends::{backend_key, parse_read};
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
 
 pub const BLOB_CLEANUP_AFTER: Duration = Duration::from_secs(300);
@@ -86,7 +86,7 @@ async fn purge_ended(context: &DriverContext, job_id: Ulid) -> Option<bool> {
     let Ok(job_id) = job_id else {
         return Some(true);
     };
-    let record = crate::jobs::store::read_job_record(&context.storage_handle, job_id, None);
+    let record = crate::jobs::store::state::read_job_record(&context.storage_handle, job_id, None);
     match record.await {
         Ok(record) => Some(record.is_none_or(|record| record.is_settled())),
         Err(error) => {
@@ -761,7 +761,7 @@ mod tests {
     use super::{CLEANUP_PAGE_SIZE, process_cleanup_batch};
     use crate::blob::cleanup_rows::{MAX_CLEANUP_RETRIES, PendingCleanup};
     use crate::driver::DriverContext;
-    use crate::jobs::store::iter_prefix_page;
+    use crate::jobs::store::query::iter_prefix_page;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

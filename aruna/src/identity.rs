@@ -12,7 +12,6 @@ pub(crate) use enrollment::{
 pub use enrollment::{EnrollmentPlan, plan_enrollment};
 
 use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -22,13 +21,15 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPhase, OnboardingSecretError};
 use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::structs::identity::node_state::{
+    BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
-use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::string::FromUtf8Error;
 use thiserror::Error;
@@ -183,90 +184,6 @@ async fn listed_management(
         .nodes
         .iter()
         .any(|node| node.node_id == node_id && node.kind == RealmNodeKind::Management))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BootOrigin {
-    InitializedRealm,
-    Onboarded,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedNodeStatus {
-    PendingInitialization,
-    PendingOnboarding,
-    Complete,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PersistedNodeIdentity {
-    Management {
-        #[serde(rename = "realm_private_key_pem")]
-        realm_private_pem: String,
-    },
-    Server {
-        #[serde(rename = "issuer_private_key_pem")]
-        private_key_pem: String,
-        delegation_signature: String,
-    },
-    /// Owner-bound device. The owner is copied from the enrollment answer: a
-    /// device holds no realm state to read it back from before it has joined.
-    User { owner: UserId },
-}
-
-impl std::fmt::Debug for PersistedNodeIdentity {
-    /// Redacts private key material: this record may be printed in a diagnostic
-    /// path, and keys are not diagnostic output.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Management { .. } => f
-                .debug_struct("Management")
-                .field("realm_private_key_pem", &"<redacted>")
-                .finish(),
-            Self::Server { .. } => f
-                .debug_struct("Server")
-                .field("issuer_private_key_pem", &"<redacted>")
-                .field("delegation_signature", &"<redacted>")
-                .finish(),
-            Self::User { owner } => f.debug_struct("User").field("owner", owner).finish(),
-        }
-    }
-}
-
-impl PersistedNodeIdentity {
-    /// Owner of a device identity; `None` for infrastructure nodes.
-    pub fn owner(&self) -> Option<UserId> {
-        match self {
-            Self::User { owner } => Some(*owner),
-            Self::Management { .. } | Self::Server { .. } => None,
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PersistedNodeState {
-    pub boot_origin: BootOrigin,
-    pub status: PersistedNodeStatus,
-    pub realm_id: RealmId,
-    pub net_secret_key: [u8; 32],
-    pub onboarding_phase: Option<OnboardingPhase>,
-    pub onboarding_sync_ticket: Option<String>,
-    pub identity: PersistedNodeIdentity,
-}
-
-impl std::fmt::Debug for PersistedNodeState {
-    /// Redacts the network secret; the rest of the record is diagnostic.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PersistedNodeState")
-            .field("boot_origin", &self.boot_origin)
-            .field("status", &self.status)
-            .field("realm_id", &self.realm_id)
-            .field("net_secret_key", &"<redacted>")
-            .field("onboarding_phase", &self.onboarding_phase)
-            .field("onboarding_sync_ticket", &self.onboarding_sync_ticket)
-            .field("identity", &self.identity)
-            .finish()
-    }
 }
 
 pub(crate) fn node_capabilities(

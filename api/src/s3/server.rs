@@ -1653,7 +1653,7 @@ mod tests {
             })
             .get();
         assert_eq!(refused, 1);
-        assert!(metrics.render().await.contains(r#"op="local_limited""#));
+        assert!(metrics.render().contains(r#"op="local_limited""#));
 
         task.abort();
     }

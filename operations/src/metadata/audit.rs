@@ -10,6 +10,7 @@ use aruna_core::audit::{
     AUDIT_KEY_BYTES, AuditPageBatch, AuditPageEntry, AuditPageRequest, AuditPageResponse,
     MAX_AUDIT_PEERS, MAX_AUDIT_RECORDS, validate_page,
 };
+use aruna_core::cursor;
 use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
@@ -19,8 +20,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
 use aruna_core::types::{Effects, GroupId, Key, Value};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use tokio::sync::Semaphore;
@@ -89,7 +88,7 @@ fn encode_cursor(
     document_id: Option<Ulid>,
     key: Vec<u8>,
 ) -> String {
-    let bytes = postcard::to_allocvec(&AuditCursor {
+    cursor::encode_value(&AuditCursor {
         version: AUDIT_CURSOR_VERSION,
         realm_id,
         config_digest,
@@ -97,8 +96,7 @@ fn encode_cursor(
         document_id,
         key,
     })
-    .unwrap_or_default();
-    URL_SAFE_NO_PAD.encode(bytes)
+    .unwrap_or_default()
 }
 
 pub(super) fn decode_cursor(
@@ -111,9 +109,7 @@ pub(super) fn decode_cursor(
     if cursor.len() > AUDIT_CURSOR_CHARS {
         return Err(ListAuditError::InvalidCursor);
     }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|_| ListAuditError::InvalidCursor)?;
+    let bytes = cursor::decode(cursor).map_err(|_| ListAuditError::InvalidCursor)?;
     if bytes.len() > AUDIT_CURSOR_BYTES {
         return Err(ListAuditError::InvalidCursor);
     }

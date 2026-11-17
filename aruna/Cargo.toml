@@ -22,6 +22,7 @@ slurm = ["aruna-compute/slurm"]
 [dependencies]
 # Aruna modules
 aruna-api = { workspace = true }
+aruna-wire = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }

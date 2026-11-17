@@ -7,14 +7,13 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect, NetEffect};
-use aruna_core::events::{Event, LaunchDecline, LaunchOfferEvent, NetEvent};
+use aruna_core::effects::{Effect, JobRecordFrame, LaunchFrame, LaunchOfferEffect};
+use aruna_core::events::{Event, LaunchDecline};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DEADLINE_INDEX_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::scheduling::{ExecutionPlan, MAX_PLAN_CANDIDATES};
 use aruna_core::structs::execution::job::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKind, LaunchIntent, LogicalJobSpec,
@@ -23,36 +22,35 @@ use aruna_core::structs::execution::job::{
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::policy::PlacementDecision;
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId};
+use aruna_core::types::{Key, TxnId};
 use aruna_net::NetHandle;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use tracing::{debug, info, warn};
 use ulid::Ulid;
 
 use super::LifecycleError;
+use super::offer::{OfferLaunchOperation, OfferOutcome};
 use super::plan::build_plan;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::rows::{from_bytes, to_bytes};
 use crate::jobs::records::verify::FamilyView;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
-    load_kind_complete,
-};
-use crate::jobs::store::{batch_delete, iter_prefix_page};
+use crate::jobs::store::query::{batch_delete, iter_prefix_page};
 use crate::realm::load_config::load_realm_config;
+use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
 /// Domain of the stable witness order.
-pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
+const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
 /// Families one drain pass considers.
-pub const WITNESS_DRAIN_BATCH: usize = 64;
+const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Wall-clock budget of one launch offer.
-pub const OFFER_DEADLINE: Duration = Duration::from_secs(30);
+const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
-pub const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
+const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
 const DEADLINE_KEY_BYTES: usize = 8 + 64;
 
@@ -185,9 +183,12 @@ pub async fn arm_family(context: &DriverContext, family: JobFamilyId, now_ms: u6
 /// lowest order key, which every holder reduces the same way. An unreadable
 /// claim set leaves the order to the digest alone.
 async fn admitting_node(context: &DriverContext, family: JobFamilyId) -> Option<NodeId> {
-    let records = load_kind_complete(context, family, JobRecordKind::Claim)
-        .await
-        .ok()?;
+    let records = drive(
+        LoadFamilyOperation::kind(family, JobRecordKind::Claim),
+        context,
+    )
+    .await
+    .ok()?;
     records
         .iter()
         .filter_map(|envelope| match &envelope.record {
@@ -433,7 +434,7 @@ pub enum RoundOutcome {
 
 /// One witness round: suppression, budget, plan, launch, offer. Every step
 /// reads only replicated records plus this node's own view.
-pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) -> RoundOutcome {
+async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64) -> RoundOutcome {
     let Some(net) = context.net_handle.as_ref() else {
         return RoundOutcome::Done;
     };
@@ -452,7 +453,7 @@ pub async fn run_round(context: &DriverContext, family: JobFamilyId, now_ms: u64
     }
     // An incomplete family read is undecided evidence: a suppression, cancel or
     // earlier launch may be in the unloaded part, so no budget and no offer.
-    let records = match load_family_complete(context, family).await {
+    let records = match drive(LoadFamilyOperation::family(family), context).await {
         Ok(records) => records,
         Err(error) => {
             warn!(error = %error, "Job family read is incomplete; witness round deferred");
@@ -1096,7 +1097,7 @@ async fn start_txn(context: &DriverContext) -> Result<TxnId, LifecycleError> {
         other => Err(LifecycleError::UnexpectedEvent {
             state: "start transaction".to_string(),
             expected: "transaction started",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1112,7 +1113,7 @@ async fn commit_txn(context: &DriverContext, txn_id: TxnId) -> Result<(), Lifecy
         other => Err(LifecycleError::UnexpectedEvent {
             state: "commit transaction".to_string(),
             expected: "transaction committed",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1146,7 +1147,7 @@ async fn read_row_txn<T: for<'a> Deserialize<'a>>(
         other => Err(LifecycleError::UnexpectedEvent {
             state: "read".to_string(),
             expected: "read result",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1185,7 +1186,7 @@ async fn write_row_txn<T: Serialize>(
         other => Err(LifecycleError::UnexpectedEvent {
             state: "write".to_string(),
             expected: "write result",
-            got: format!("{other:?}"),
+            got: other.label(),
         }),
     }
 }
@@ -1197,91 +1198,4 @@ async fn write_row<T: Serialize>(
     row: &T,
 ) -> Result<(), LifecycleError> {
     write_row_txn(context, key_space, key, row, None).await
-}
-
-/// What a target answered to one offer.
-#[derive(Debug, PartialEq)]
-pub enum OfferOutcome {
-    Accepted(JobRecordFrame),
-    Declined(LaunchDecline),
-    /// The target never answered; it may still have accepted the launch.
-    Unavailable,
-}
-
-/// Offers one durable launch to its target and returns the answer verbatim.
-#[derive(Debug, PartialEq)]
-pub struct OfferLaunchOperation {
-    effect: Option<LaunchOfferEffect>,
-    outcome: Option<Result<OfferOutcome, LifecycleError>>,
-    sent: bool,
-}
-
-impl OfferLaunchOperation {
-    pub fn new(effect: LaunchOfferEffect) -> Self {
-        Self {
-            effect: Some(effect),
-            outcome: None,
-            sent: false,
-        }
-    }
-}
-
-impl Operation for OfferLaunchOperation {
-    type Output = OfferOutcome;
-    type Error = LifecycleError;
-
-    fn start(&mut self) -> Effects {
-        let Some(effect) = self.effect.take() else {
-            self.outcome = Some(Err(LifecycleError::NotFinished));
-            return smallvec![];
-        };
-        self.sent = true;
-        smallvec![Effect::Net(NetEffect::LaunchOffer(Box::new(effect)))]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if !self.sent {
-            self.outcome = Some(Err(LifecycleError::UnexpectedEvent {
-                state: "Settled".to_string(),
-                expected: "no further event",
-                got: format!("{event:?}"),
-            }));
-            return smallvec![];
-        }
-        self.outcome = Some(match event {
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Accepted { receipt, .. })) => {
-                match JobRecordFrame::new(receipt.into_inner()) {
-                    Ok(frame) => Ok(OfferOutcome::Accepted(frame)),
-                    Err(error) => Err(LifecycleError::Store(error.into())),
-                }
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Declined { target, reason })) => {
-                debug!(peer = %target, reason = ?reason, "Execution target declined a launch");
-                Ok(OfferOutcome::Declined(reason))
-            }
-            Event::Net(NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(message))) => {
-                debug!(message, "Execution target did not answer the offer");
-                Ok(OfferOutcome::Unavailable)
-            }
-            other => Err(LifecycleError::UnexpectedEvent {
-                state: "Offer".to_string(),
-                expected: "launch offer result",
-                got: format!("{other:?}"),
-            }),
-        });
-        self.sent = false;
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.outcome.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(LifecycleError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
 }

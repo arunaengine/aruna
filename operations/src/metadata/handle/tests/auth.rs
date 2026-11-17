@@ -9,6 +9,7 @@ use crate::auth::bearer_token::decode_bearer_token;
 use crate::auth::bearer_token::validate_bearer_token;
 use crate::metadata::handle::peer_auth::{bucket_search_auth, search_reader_auth};
 use crate::metadata::protocol::MetadataReadError;
+use crate::testing::sign_token;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
@@ -138,16 +139,6 @@ pub(super) fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
         via: None,
         auth_time: None,
     }
-}
-
-pub(super) fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
-    let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
-    )
-    .unwrap()
 }
 
 #[tokio::test]

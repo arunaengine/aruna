@@ -2,11 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 use aruna_operations::forward::routing::is_user_origin;
 use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
@@ -167,12 +168,11 @@ forwards the read under the caller's own token and every peer re-checks that sam
 )]
 pub async fn list_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&query.group_id)?;
     let document_id = query
         .document_id

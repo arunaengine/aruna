@@ -7,7 +7,7 @@ use super::queue::{BlobJobRecord, BlobQueueError, REPLICATION_POLL_AFTER, schedu
 use super::version_replication::ReplicateScopeTarget;
 use crate::driver::DriverContext;
 use crate::jobs::runtime::key_unlocked;
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::store::query::iter_prefix_page;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -419,6 +419,7 @@ mod tests {
     use crate::replication::protocol::ReplicationMode;
     use crate::replication::queue::{blob_job_key, next_blob_timer};
     use crate::replication::version_replication::{ReplicateScopeInput, ReplicateScopeTarget};
+    use crate::testing::test_context;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::BlobEffect;
@@ -430,18 +431,6 @@ mod tests {
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
     use std::time::SystemTime;
     use tempfile::TempDir;
-
-    fn context(storage: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     /// A node with a blob adapter, so key states are real.
     async fn keyed_context() -> (TempDir, DriverContext) {
@@ -466,7 +455,7 @@ mod tests {
         let blob = aruna_blob::blob::BlobHandler::new(config, storage.clone(), net.clone())
             .await
             .unwrap();
-        let mut context = context(storage);
+        let mut context = test_context(storage);
         context.net_handle = Some(net);
         context.blob_handle = Some(blob);
         (dir, context)
@@ -682,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn parking_fences_rotation() {
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = context(storage.clone());
+        let context = test_context(storage.clone());
         let old = BucketKeyRef::new(Ulid::from_parts(11, 11), 1);
         source(&context, old).await;
         let record = job(Ulid::from_parts(12, 12));
@@ -726,7 +715,7 @@ mod tests {
         // A locked source parks the job without an attempt; the unlock makes it due again.
         let dir = tempfile::tempdir().unwrap();
         let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = context(storage.clone());
+        let context = test_context(storage.clone());
         let relationship = Ulid::from_parts(5, 5);
         let mut record = job(relationship);
         record.attempts = 2;
@@ -761,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn plain_archive_waits() {
         let (_dir, storage) = crate::tests::s3::test_storage();
-        let context = context(storage.clone());
+        let context = test_context(storage.clone());
         let key = BucketKeyRef::new(Ulid::from_parts(13, 13), 1);
         let mut location = source(&context, key).await;
         location.format = StoredFormat::default();
@@ -1105,8 +1094,9 @@ mod tests {
 
         for (failed_page, job_count) in [(1, WAIT_PAGE + 1), (2, WAIT_PAGE + 1), (2, WAIT_PAGE)] {
             let dir = tempfile::tempdir().unwrap();
-            let mut context =
-                context(aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap());
+            let mut context = test_context(
+                aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
+            );
             let tasks = aruna_tasks::TaskHandle::new();
             let (scheduled, mut drains) = tokio::sync::mpsc::unbounded_channel();
             tasks

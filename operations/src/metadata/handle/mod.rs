@@ -230,7 +230,7 @@ impl MetadataHandleOptions {
 }
 
 struct MetadataInner {
-    git: std::sync::OnceLock<Arc<aruna_blob::git::GitStore>>,
+    git: std::sync::OnceLock<aruna_blob::git::GitStore>,
     storage_handle: StorageHandle,
     auth_validation: AuthValidationState,
     net_handle: Option<NetHandle>,
@@ -520,15 +520,13 @@ impl MetadataHandle {
         &self.inner.sync_pulls
     }
 
-    pub fn install_git(
-        &self,
-        store: Arc<aruna_blob::git::GitStore>,
-    ) -> Arc<aruna_blob::git::GitStore> {
-        self.inner.git.get_or_init(|| store).clone()
+    /// Installs the Git store once; a later install keeps the first store.
+    pub fn install_git(&self, store: aruna_blob::git::GitStore) {
+        self.inner.git.get_or_init(|| store);
     }
 
-    pub fn git(&self) -> Option<&aruna_blob::git::GitStore> {
-        self.inner.git.get().map(Arc::as_ref)
+    pub(crate) fn git(&self) -> Option<&aruna_blob::git::GitStore> {
+        self.inner.git.get()
     }
 
     pub fn cache_registry_record(&self, record: MetadataRegistryRecord) {

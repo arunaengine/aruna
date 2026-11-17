@@ -11,13 +11,11 @@ use aruna_core::structs::execution::job::{
 use aruna_core::types::Value;
 
 use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
-    load_kind_complete,
-};
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::tests::records::{Family, REALM, context};
+use aruna_core::structs::execution::job::record_keys::record_key;
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
@@ -102,12 +100,15 @@ async fn reads_kind_only() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (_spec, receipt) = seed(&ctx, &family).await;
 
-    let all = load_family_complete(&ctx, family.family())
+    let all = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family reads completely");
-    let receipts = load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt)
-        .await
-        .expect("receipts read completely");
+    let receipts = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+        &ctx,
+    )
+    .await
+    .expect("receipts read completely");
     assert_eq!(all.len(), 5);
     assert_eq!(receipts.len(), 1);
     assert!(matches!(
@@ -118,8 +119,8 @@ async fn reads_kind_only() {
 
 #[tokio::test]
 async fn resolves_session_alias() {
-    use crate::jobs::JobRouteError;
     use crate::jobs::lifecycle::routing::session_job;
+    use crate::jobs::route::JobRouteError;
     use crate::jobs::service::read_owned_job;
 
     let family = Family::new([7u8; 32]);
@@ -151,7 +152,7 @@ async fn resolves_session_alias() {
     physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
-    crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
+    crate::jobs::store::query::insert_job(&ctx.storage_handle, &physical)
         .await
         .unwrap();
     let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {
@@ -208,24 +209,36 @@ async fn undecodable_blocks_chain() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (spec, receipt) = seed(&ctx, &family).await;
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
-            .await
-            .is_some()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_some()
     );
 
     poison(&ctx, &family).await;
 
     assert!(matches!(
-        load_family_complete(&ctx, family.family()).await,
+        drive(LoadFamilyOperation::family(family.family()), &ctx).await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(matches!(
-        load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt).await,
+        drive(
+            LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+            &ctx
+        )
+        .await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
-            .await
-            .is_none()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_none()
     );
 }

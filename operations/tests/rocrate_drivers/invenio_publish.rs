@@ -13,7 +13,8 @@ use aruna_core::metadata::ProfileValidationSeverity;
 use aruna_core::repository::{LinkFailure, LinkPatch, LinkReview, LinkStatus, RepositoryLink};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_operations::jobs::repository::link_queue::{current_event, start_push};
-use aruna_operations::jobs::repository::links::{LinkChange, LinkError, change_link};
+use aruna_operations::jobs::repository::link_store::change_link;
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::remote_state;
 use aruna_operations::metadata::raw_revision::load_raw_revision;
 
@@ -131,7 +132,7 @@ async fn busy_reservation_retries() -> Result<(), Box<dyn std::error::Error>> {
         .active_job
         .ok_or("no push")?;
     let storage = &fixture.context.storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await?
         .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
@@ -166,7 +167,7 @@ async fn cancelled_push_recorded() -> Result<(), Box<dyn std::error::Error>> {
     let started = current(&fixture, &link).await.0;
     let job_id = started.active_job.ok_or("no push")?;
     let storage = &fixture.context.storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = aruna_operations::jobs::store::state::read_job_record(storage, job_id, None)
         .await?
         .ok_or("push job missing")?;
     let JobPayload::ExportRoCrate(spec) = record.payload.clone() else {
@@ -375,7 +376,7 @@ async fn community_reviews_first() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(accepted.remote.record_id.as_deref(), Some("1"));
     // The review published outside a push, so accepting it registers the record's identifiers.
     let key = format!("identifiers/{}/1", link.link_id);
-    let queued = aruna_operations::jobs::store::find_dedup_plan(
+    let queued = aruna_operations::jobs::store::query::find_dedup_plan(
         &fixture.context.storage_handle,
         link.created_by,
         key.as_bytes(),
@@ -489,7 +490,7 @@ async fn removal_cancels_push() -> Result<(), Box<dyn std::error::Error>> {
     let running = current(&fixture, &link).await.0;
     let job_id = running.active_job.ok_or("no push")?;
     change_link(fixture.context.as_ref(), &running, LinkChange::Delete).await?;
-    let record = aruna_operations::jobs::store::read_job_record(
+    let record = aruna_operations::jobs::store::state::read_job_record(
         &fixture.context.storage_handle,
         job_id,
         None,

@@ -17,13 +17,15 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
+use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
-use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
-use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::store::iter_prefix_page;
+use crate::jobs::lifecycle::ingress::submit_external_job;
+use crate::jobs::lifecycle::routing::family_status;
+use crate::jobs::store::query::iter_prefix_page;
 use crate::jobs::submit::SubmitJobError;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
 use aruna_core::metadata::AuthToken;
@@ -107,7 +109,10 @@ async fn rejects_stale_quota() {
         error,
         LifecycleError::Storage(StorageError::TransactionConflict)
     );
-    assert_eq!(family_of_alias(&ctx, family.job_id).await, Ok(None));
+    assert_eq!(
+        drive(AliasFamilyOperation::new(family.job_id), &ctx).await,
+        Ok(None)
+    );
 }
 
 #[tokio::test]
@@ -122,10 +127,10 @@ async fn admits_local_claim() {
     assert!(created);
     assert_eq!(job_id, family.job_id);
     assert_eq!(
-        family_of_alias(&ctx, job_id).await,
+        drive(AliasFamilyOperation::new(job_id), &ctx).await,
         Ok(Some(family.family()))
     );
-    let record = crate::jobs::store::read_job_record(&ctx.storage_handle, job_id, None)
+    let record = crate::jobs::store::state::read_job_record(&ctx.storage_handle, job_id, None)
         .await
         .expect("logical row read")
         .expect("logical row exists");
@@ -159,7 +164,11 @@ async fn replays_matching_claim() {
     assert!(!created);
     assert_eq!(second, first);
     assert_eq!(
-        family_of_alias(&ctx, JobId::from_bytes([4u8; 16])).await,
+        drive(
+            AliasFamilyOperation::new(JobId::from_bytes([4u8; 16])),
+            &ctx
+        )
+        .await,
         Ok(None)
     );
 }
@@ -184,7 +193,7 @@ async fn reports_key_conflict() {
         }
     );
     assert_eq!(
-        family_of_alias(&ctx, first).await,
+        drive(AliasFamilyOperation::new(first), &ctx).await,
         Ok(Some(family.family()))
     );
 }
@@ -255,7 +264,7 @@ async fn answers_by_alias() {
     };
     assert!(matches!(
         family_status(&ctx, &stranger, family.job_id).await,
-        Some(Err(crate::jobs::JobRouteError::NotFound))
+        Some(Err(crate::jobs::route::JobRouteError::NotFound))
     ));
 }
 

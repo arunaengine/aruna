@@ -21,11 +21,13 @@ use aruna_core::structs::storage::blob::BlobTimeoutConfig;
 use aruna_net::{DiscoveryMethod, IrohRuntimeConfig, RelayMethod, parse_endpoint_config};
 
 use crate::identity::{
-    BootOrigin, EnrollmentPlan, IdentityError, IdentityStore, PersistedNodeState,
-    PersistedNodeStatus, bootstrap_node_state, onboarding_realm_endpoints, plan_enrollment,
-    refresh_onboarding_bootstrap,
+    EnrollmentPlan, IdentityError, IdentityStore, bootstrap_node_state, onboarding_realm_endpoints,
+    plan_enrollment, refresh_onboarding_bootstrap,
 };
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
+use aruna_core::structs::identity::node_state::{
+    BootOrigin, PersistedNodeState, PersistedNodeStatus,
+};
 use aruna_graph::MetadataSearchStorage;
 use aruna_storage::{FjallPersistPolicy, FjallStorage, StorageHandle, errors::StorageLibError};
 use byteview::ByteView;
@@ -749,13 +751,13 @@ mod tests {
         SetupError, normalize_root, outermost_roots, resolve_settings, validate_s3_profile,
         validate_wipe_roots,
     };
-    use crate::identity::{
-        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
-        onboarding_realm_endpoints, persist_node_state,
-    };
+    use crate::identity::{onboarding_realm_endpoints, persist_node_state};
     use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::node_state::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+    };
     use aruna_core::structs::identity::realm::{
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         StaticRealmEndpoint,

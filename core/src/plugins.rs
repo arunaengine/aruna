@@ -4,7 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use ulid::Ulid;
+
 use crate::UserId;
+use crate::compute::SecretBytes;
+use crate::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
 
 /// Largest artifact a realm admin may publish; nodes copy and fetch it in chunks.
 pub const MAX_ARTIFACT: usize = 64 << 20;
@@ -83,6 +87,101 @@ pub fn valid_name(name: &str) -> bool {
 pub fn valid_version(version: &str) -> bool {
     (1..=MAX_NAME).contains(&version.len())
         && (version.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-+.".contains(&b))
+}
+
+/// Artifact bytes in a node message; Debug prints only their length.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArtifactBytes({} bytes)", self.0.len())
+    }
+}
+
+/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub digest: String,
+    pub index: u32,
+    pub total: u64,
+    pub bytes: ArtifactBytes,
+}
+
+/// Sends one artifact chunk to the management node `node_id`, which keeps it toward its copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStore {
+    pub node_id: crate::NodeId,
+    pub chunk: Chunk,
+}
+
+/// The step of the use check that refused a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    Peer,
+    Binding,
+    Entry,
+    Rule,
+    Authority,
+    Policy,
+}
+
+impl Refusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::Binding => "binding",
+            Self::Entry => "entry",
+            Self::Rule => "rule",
+            Self::Authority => "authority",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("the use of the secret was refused at the {} check", .0.as_str())]
+    Refused(Refusal),
+    #[error("the secret cannot be released now: {0}")]
+    Unavailable(String),
+}
+
+/// Why a node binding does not fit its slot on the install's receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum NodeCheckError {
+    #[error("the receiver has no node secret of this name")]
+    Missing,
+    #[error("the node secret has another kind than the slot")]
+    OtherKind,
+    #[error("only a server node of the realm may ask")]
+    Forbidden,
+    #[error("the receiver did not answer")]
+    Unavailable,
+}
+
+/// What a run asks of the secret bound to one slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    pub install_id: Ulid,
+    pub slot: String,
+    pub delivery: Delivery,
+    /// The method and URL of the outgoing request, for `inject`.
+    pub target: Option<(String, String)>,
+    /// The value write id the receiver holds already; its fields are not sent again.
+    pub held: Option<Ulid>,
+    pub run_id: Option<Ulid>,
+}
+
+/// A released secret; `fields` is absent when the receiver holds this value already.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Released {
+    pub kind: SecretKind,
+    pub settings: SecretSettings,
+    pub exposure: ResponseExposure,
+    pub value_id: Ulid,
+    pub fields: Option<SecretBytes>,
 }
 
 #[cfg(test)]

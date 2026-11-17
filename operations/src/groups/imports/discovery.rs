@@ -10,7 +10,8 @@ use crate::driver::{DriverContext, drive};
 use crate::groups::backends::parse_read;
 use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::fence::{parse_group_record, read_group_record};
-use crate::jobs::backend_import::{BlobRequest, listed_intents};
+use crate::jobs::backend_import::listed_intents;
+use crate::jobs::blob_request::BlobRequest;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -570,7 +571,8 @@ mod tests {
 
     #[tokio::test]
     async fn checks_bucket_access() {
-        use crate::tests::s3::{test_context, test_storage};
+        use crate::testing::test_context;
+        use crate::tests::s3::test_storage;
         use aruna_core::structs::identity::realm::RealmId;
         use aruna_core::structs::storage::blob::object_permission_path;
         let (_directory, storage) = test_storage();

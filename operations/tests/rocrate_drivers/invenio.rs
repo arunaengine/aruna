@@ -103,7 +103,7 @@ fn record(id: &str, published: bool) -> Value {
 
 fn file(key: &str, bytes: &[u8], committed: bool) -> Value {
     let md5 = hex::encode(
-        aruna_blob::hash::Hasher::new_with_bytes(bytes)
+        aruna_core::structs::checksum::Hasher::new_with_bytes(bytes)
             .finalize()
             .md5,
     );

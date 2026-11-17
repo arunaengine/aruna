@@ -13,11 +13,12 @@ mod construction;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
-pub mod document_sync;
+pub(crate) mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
 mod heartbeat;
+pub mod job_control;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -63,7 +64,9 @@ pub use config::{
 };
 pub use connection_pool::{Monitor, PoolCounts};
 pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
+pub use document_sync::{
+    BATCH_TOPIC_LIMIT, DocumentSyncService, PendingEviction, ShardGenesisProbe,
+};
 pub use error::{NetError, Result};
 pub use heartbeat::HeartbeatSlot;
 pub use streams::StreamsService;
@@ -1052,6 +1055,10 @@ impl Handle for NetHandle {
     )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
+            // The round trip needs this handle's streams, so it never reaches the effect actor.
+            Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
+                job_control::exchange(self, job.owner, job.request).await,
+            )),
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self
@@ -1090,6 +1097,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
         Effect::Net(NetEffect::Release(_)) => "release",
+        Effect::Net(NetEffect::ArtifactStore(_)) => "artifact_store",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",
@@ -1100,6 +1108,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Search() => "search",
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

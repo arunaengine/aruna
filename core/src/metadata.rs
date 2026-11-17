@@ -310,6 +310,16 @@ pub struct MetadataEventRecord {
     pub occurred_at_ms: u64,
 }
 
+impl MetadataEventRecord {
+    /// Whether the event creates its document (a scaffold or an initial RO-Crate).
+    pub fn is_create(&self) -> bool {
+        matches!(
+            self.payload,
+            MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataRawRevision {
     /// The displayed revision: the last render that passed profile validation.
@@ -947,6 +957,22 @@ pub struct MetadataDeleteRecord {
     pub deleted_after_id: Ulid,
 }
 
+impl MetadataDeleteRecord {
+    /// Whether this delete tombstones the document `document_id` of `group_id`.
+    pub fn deletes_document(&self, group_id: GroupId, document_id: Ulid) -> bool {
+        self.tombstone.is_deleted()
+            && self.tombstone.group_id == group_id
+            && self.tombstone.document_id == document_id
+    }
+
+    /// Whether this delete covers `record`: the same document and graph, and not older.
+    pub fn covers_graph(&self, record: &GraphLifecycleRecord) -> bool {
+        self.deletes_document(record.group_id, record.document_id)
+            && self.tombstone.graph_iri == record.graph_iri
+            && self.tombstone.updated_at_ms >= record.updated_at_ms
+    }
+}
+
 /// CRDT actor used when materializing `event_id` into the local graph store,
 /// identical on every holder so replayed materializations dedupe exactly.
 pub fn deterministic_materialization_actor(event_id: Ulid) -> [u8; 32] {
@@ -1543,6 +1569,28 @@ pub enum MetadataError {
     /// A batch depends on events this replica has not merged yet; it applies once they arrive.
     #[error("metadata causal dependencies missing: {0}")]
     MissingDependencies(String),
+}
+
+impl MetadataError {
+    /// A missing graph is a durable registry row whose materialization has not
+    /// caught up, which the read API already reports as service unavailable. Only a
+    /// rejected document stays permanent.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::ProfileValidation(findings) => {
+                !findings.is_empty()
+                    && findings.iter().all(|finding| {
+                        matches!(
+                            finding.code.as_str(),
+                            "profile_unavailable" | "validator_unavailable"
+                        )
+                    })
+            }
+            Self::Validation(_) | Self::InvalidInput(_) | Self::InvalidEffect => false,
+            Self::Storage(error) => error.is_transient(),
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

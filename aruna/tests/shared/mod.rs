@@ -722,8 +722,9 @@ pub(crate) async fn spawn_keyed_joiner(
 /// Stores a pending server identity with a chosen node key and a delegation the seed's realm key
 /// signs. Startup then refreshes the enrollment with it, as after a restart during onboarding.
 async fn store_pending_joiner(dir: &TempDir, seed: &SeedNode, net_key: [u8; 32]) -> TestResult<()> {
-    use aruna::identity::{
-        BootOrigin, IdentityStore, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+    use aruna::identity::IdentityStore;
+    use aruna_core::structs::identity::node_state::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
     use base64::Engine;
     use ed25519_dalek::Signer;
@@ -852,7 +853,7 @@ async fn spawn_seed_at(
             realm_id,
             net.node_id(),
             SubjectScanMode::Revalidate(ManagedCopyQuarantine::Rejoin),
-            aruna_operations::driver::now_ms(),
+            aruna_core::time::unix_timestamp_millis(),
         )
         .await
         .map_err(std::io::Error::other)?;
@@ -1121,7 +1122,7 @@ async fn initialize_context(
         compute_handle: compute,
     });
     initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
         task_handle,
@@ -1201,7 +1202,7 @@ async fn spawn_ops_server(
     metrics: Arc<NodeMetrics>,
 ) -> TestResult<(String, Readiness, JoinHandle<()>)> {
     let readiness = Readiness::new();
-    let ops_state = MonitoringState::new(context, metrics, readiness.clone()).await;
+    let ops_state = MonitoringState::new(context, metrics, readiness.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let task = tokio::spawn(async move {

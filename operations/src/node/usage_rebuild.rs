@@ -24,7 +24,6 @@ use aruna_core::keyspaces::{
     prefix_upper_bound,
 };
 use aruna_core::operation::Operation;
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
@@ -34,6 +33,7 @@ use aruna_core::structs::storage::usage::{
     RebuildProgress, USAGE_PROGRESS_KEY, UsageCounterError, UsageCounters,
 };
 use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_tasks::shutdown::Shutdown;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{info, warn};

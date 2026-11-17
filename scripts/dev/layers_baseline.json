@@ -1,17 +1,11 @@
 {
   "clean_domains": [],
   "crate_allow": {
-    "aruna-api": [
-      "aruna-blob",
-      "aruna-compute",
-      "aruna-plugins",
-      "aruna-tasks"
-    ],
     "aruna-doctor": [
       "aruna",
-      "aruna-api",
       "aruna-net",
-      "aruna-tasks"
+      "aruna-tasks",
+      "aruna-wire"
     ],
     "aruna-operations": [
       "aruna-blob",

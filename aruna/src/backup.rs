@@ -5,28 +5,20 @@
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
-use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter, consistent_snapshots};
+use aruna_storage::snapshot::{
+    BACKUP_SOCKET, GIT_KEYSPACE, PREFIXES, SnapshotError, SnapshotStats, SnapshotWriter,
+    consistent_snapshots,
+};
 use tracing::warn;
 #[cfg(unix)]
 use {
-    aruna_core::shutdown::Shutdown,
     aruna_operations::driver::DriverContext,
+    aruna_tasks::shutdown::Shutdown,
     std::io::BufWriter,
     std::os::unix::fs::{FileTypeExt, PermissionsExt},
     tokio::net::UnixListener,
     tracing::info,
 };
-
-/// File name of the backup socket in the node's storage directory.
-pub const BACKUP_SOCKET: &str = "backup.sock";
-/// Keyspace name prefixes of the node, document sync and metadata stores in a backup.
-pub const MAIN_PREFIX: &str = "main/";
-pub const SYNC_PREFIX: &str = "document-sync/";
-pub const METADATA_PREFIX: &str = "craqle/";
-/// Pseudo keyspace holding the Git repositories: relative path to file bytes, `/` ends a directory.
-pub const GIT_KEYSPACE: &str = "git";
-/// The store prefixes in stream order: node, document sync, metadata.
-pub const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
 
 /// The stores one backup covers.
 #[derive(Clone)]

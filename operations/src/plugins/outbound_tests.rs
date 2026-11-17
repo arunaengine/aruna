@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::{Arc, Mutex};
 
 use aruna_core::plugin_installs::PluginInstall;
@@ -60,12 +61,12 @@ pub(crate) async fn probe(
         by: fixture.actor.user_id,
         input: input.to_string(),
     };
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     let worker = worker(fixture);
     worker.use_outbound(outbound);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    read_run(&fixture.ctx, install.install_id, run.run_id)
+    drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap()
 }
@@ -308,11 +309,11 @@ async fn probe_with(
         by: fixture.actor.user_id,
         input: input.to_string(),
     };
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     worker.use_outbound(outbound);
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    read_run(&fixture.ctx, install.install_id, run.run_id)
+    drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap()
 }
@@ -346,10 +347,10 @@ async fn narrowed_rules_refuse() {
         .await
         .unwrap();
     (run.state, run.output, run.finished_ms) = (RunState::Queued, None, None);
-    admit(&fixture.ctx, &run).await.unwrap();
+    drive(admit(run.clone()), &fixture.ctx).await.unwrap();
     worker.claim(unix_timestamp_millis()).await.unwrap();
     worker.settle().await;
-    run = read_run(&fixture.ctx, install.install_id, run.run_id)
+    run = drive(read_run(install.install_id, run.run_id), &fixture.ctx)
         .await
         .unwrap();
     assert_eq!(run.state, RunState::Failed);

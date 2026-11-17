@@ -1,4 +1,4 @@
-//! Node-local rows of plugin runs: reads, pages and transactions that commit all or nothing.
+//! An async transaction over plugin rows, kept for the replication queue until it moves to plans.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -6,14 +6,8 @@ use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::types::TxnId;
 
+use super::rows::{Rows, StoreError};
 use crate::driver::DriverContext;
-
-/// A storage failure, with the event that was not expected.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("plugin run storage failed: {0}")]
-pub struct StoreError(pub String);
-
-pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 /// One open storage transaction; `transact` commits or aborts it.
 pub struct Txn<'a> {
@@ -22,7 +16,7 @@ pub struct Txn<'a> {
 }
 
 /// Runs `body` in one transaction and commits it, or aborts it when `body` fails.
-pub async fn transact<T, E: From<StoreError>>(
+pub(crate) async fn transact<T, E: From<StoreError>>(
     ctx: &DriverContext,
     body: impl AsyncFnOnce(&Txn<'_>) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -146,13 +140,8 @@ impl<'a> Txn<'a> {
 }
 
 fn failed(event: Event) -> StoreError {
-    StoreError(format!("{event:?}"))
-}
-
-pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
-    postcard::to_allocvec(value).map_err(|error| StoreError(error.to_string()))
-}
-
-pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
-    postcard::from_bytes(bytes).map_err(|error| StoreError(error.to_string()))
+    match event {
+        Event::Storage(StorageEvent::Error { error }) => StoreError(error.to_string()),
+        other => StoreError(format!("unexpected {}", other.label())),
+    }
 }

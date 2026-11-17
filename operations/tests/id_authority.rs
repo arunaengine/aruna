@@ -20,7 +20,8 @@ use aruna_core::structs::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::jobs::service::{read_job_routed, submit_mint_pid};
-use aruna_operations::jobs::store::{find_dedup_job, read_job_record};
+use aruna_operations::jobs::store::query::find_dedup_job;
+use aruna_operations::jobs::store::state::read_job_record;
 use aruna_operations::jobs::submit::{SubmitJobError, SubmitJobResult};
 use aruna_operations::metadata::PersistentIdResolution;
 use aruna_operations::metadata::api::MetadataApiError;

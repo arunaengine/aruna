@@ -237,10 +237,10 @@ pub(crate) fn classify_root_summary(
 
 #[cfg(test)]
 mod tests {
+    use crate::testing::write_entries;
     use std::sync::Arc;
 
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::Event;
     use aruna_core::metadata::{
         ApplyRoCrateRequest, GraphLifecycleRecord, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
@@ -344,19 +344,6 @@ mod tests {
             updated_at_ms: 1,
             establishing_event_id: Ulid::nil(),
             last_event_id: Ulid::nil(),
-        }
-    }
-
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
         }
     }
 

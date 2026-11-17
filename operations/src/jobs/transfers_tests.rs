@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::driver::drive;
 use std::sync::atomic::AtomicUsize;
 
 use aruna_core::structs::checksum::ChecksumAlgorithm;
@@ -15,7 +16,7 @@ use crate::driver::DriverContext;
 use crate::jobs::plugin_work::run_plugin_work;
 use crate::jobs::plugin_work::tests::job_context;
 use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve_marked};
+use crate::plugins::work::{Identity, RequestContext, WorkKind, reserve};
 use crate::s3::object::copy::test::{seed_bucket, with_blob};
 use crate::s3::object::get::{GetObjectInput, GetObjectOperation};
 
@@ -91,9 +92,12 @@ async fn reserved(
         ordinal: 0,
     };
     let marked = marked.then_some(("in", "reads.fq"));
-    let (row, _) = reserve_marked(&fixture.ctx, (install, &identity), row, marked)
-        .await
-        .unwrap();
+    let (row, _) = drive(
+        reserve((install, &identity), row, marked).unwrap(),
+        &fixture.ctx,
+    )
+    .await
+    .unwrap();
     let action = PluginWorkAction::Download {
         target,
         version_id: row.version_id.unwrap(),
@@ -310,7 +314,8 @@ async fn narrowed_rule() {
     assert_eq!(kind, JobErrorKind::Permanent);
     assert_eq!(message, "this connection does not expose its whole answer");
     // The released token is in no row the work keeps.
-    let kept = crate::plugins::work::read_work(&fixture.ctx, install.install_id, row.work_id);
+    let kept = crate::plugins::work::read_work(install.install_id, row.work_id);
+    let kept = drive(kept, &fixture.ctx);
     let kept = kept.await.unwrap().unwrap();
     assert!(!format!("{kept:?}").contains(TOKEN));
 }
@@ -319,7 +324,8 @@ async fn narrowed_rule() {
 async fn sweep_during_download() {
     // A sweep while the answer is still on its way keeps the mark of the version not yet
     // written; once written, the version keeps it too.
-    use crate::plugins::marks::{is_marked, sweep_marks};
+    use crate::plugins::marks::is_marked;
+    use crate::plugins::worker::sweep_marks;
     let fixture = Fixture::new().await;
     let install = downloader(&fixture).await;
     let (_root, blob) = ready(&fixture, &install).await;
@@ -340,6 +346,6 @@ async fn sweep_during_download() {
     };
     assert_eq!(version_id, row.version_id);
     assert_eq!(sweep_marks(&blob).await, Ok(0), "the version exists");
-    assert!(is_marked(&blob, version).await.unwrap());
+    assert!(drive(is_marked(version).unwrap(), &blob).await.unwrap());
     assert_eq!(stored(&blob, &fixture, &install).await, BODY);
 }

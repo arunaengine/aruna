@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::jobs::store::find_dedup_plan;
+use crate::jobs::store::query::find_dedup_plan;
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, deliver_events_remote, deliver_remote, list_remote,
     list_watches_remote, mark_read_remote, send_notification_request, unread_count_remote,

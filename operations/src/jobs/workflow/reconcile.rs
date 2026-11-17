@@ -17,10 +17,11 @@ use tracing::{info, warn};
 
 use super::super::reconcile::ExternalReconciler;
 use super::super::runtime::JobsRuntime;
-use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, begin_external_running, handoff_external_attempt,
-    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
+use super::super::store::attempt::{
+    AdoptOutcome, adopt_external_attempt, begin_external_running, record_attempt_started,
+    record_attempt_tombstone,
 };
+use super::super::store::state::{handoff_external_attempt, read_job_record, release_job};
 use super::DEFAULT_WALLTIME;
 use super::finalize::{fail_and_crate, finalize_attempt, finalize_cancel};
 use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
@@ -538,7 +539,8 @@ fn holder(context: &DriverContext) -> aruna_core::id::NodeId {
 mod tests {
     use super::*;
     use crate::jobs::JOB_MAX_ATTEMPTS;
-    use crate::jobs::store::{insert_job, record_attempt_intent};
+    use crate::jobs::store::query::insert_job;
+    use crate::jobs::store::state::record_attempt_intent;
     use crate::tests::workflow::{execution_spec, node_id};
     use aruna_compute::ExecutorRegistry;
     use aruna_core::UserId;

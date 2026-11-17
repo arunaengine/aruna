@@ -19,7 +19,7 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use aruna_operations::s3::bucket::get::GetBucketOperation;
 use aruna_operations::sync::mirror_repair::{
-    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
+    KickRepairOperation, MirrorRecordOperation, SyncMirrorIntent, delete_sync_mirror,
     request_mirror_create,
 };
 use aruna_operations::sync::sync_relationship::{
@@ -375,9 +375,14 @@ impl ArunaS3Service {
         relationship: &SyncRelationship,
         expected: SyncMirrorIntent,
     ) {
-        if let Err(error) = clear_mirror_repair(&self.state, relationship, expected).await {
+        if let Err(error) = drive(
+            MirrorRecordOperation::clear(relationship.clone(), expected),
+            &self.state,
+        )
+        .await
+        {
             warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
-            kick_mirror_repair(&self.state).await;
+            let _ = drive(KickRepairOperation::new(), &self.state).await;
         }
     }
 
