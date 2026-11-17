@@ -21,8 +21,8 @@ use crate::notifications::watch::store::StoreWatchOperation;
 enum RemoveState {
     #[default]
     Config,
-    Store(Box<StoreWatchOperation>),
-    Publish(Box<InterestOperation>),
+    Store,
+    Publish,
 }
 
 /// Deletes the watch for a sync-eligible peer when this node holds the owner's inbox, writes
@@ -55,48 +55,9 @@ impl RemoveWatchOperation {
         }
         let replication =
             watch_delete_replication(input.local, self.owner, self.watch_id, input.now_ms);
-        let mut store = StoreWatchOperation::delete(self.owner, self.watch_id, Some(replication));
-        let turn = store.first();
-        self.stored(store, turn)
-    }
-
-    /// Follows the store; a failed store is a rejection.
-    fn stored(
-        &mut self,
-        store: StoreWatchOperation,
-        turn: Result<Next<bool>, WatchSubscriptionError>,
-    ) -> AnswerTurn {
-        match turn {
-            Ok(Next::Call(call)) => {
-                self.state = RemoveState::Store(Box::new(store));
-                Ok(Next::Call(call))
-            }
-            Ok(Next::Wait) => {
-                self.state = RemoveState::Store(Box::new(store));
-                Ok(Next::Wait)
-            }
-            Ok(Next::Done(_)) => {
-                let mut publish = InterestOperation::publish();
-                let turn = publish.first();
-                self.published(publish, turn.map_err(|_| ()))
-            }
-            Err(error) => reject(error.to_string()),
-        }
-    }
-
-    /// Follows the publish request; the watch is deleted whatever it answers.
-    fn published(
-        &mut self,
-        publish: InterestOperation,
-        turn: Result<Next<bool>, ()>,
-    ) -> AnswerTurn {
-        match turn {
-            Ok(Next::Call(call)) => {
-                self.state = RemoveState::Publish(Box::new(publish));
-                Ok(Next::Call(call))
-            }
-            _ => Ok(Next::Done(NotificationTransportMessage::WatchDeleted)),
-        }
+        let store = StoreWatchOperation::delete(self.owner, self.watch_id, Some(replication));
+        self.state = RemoveState::Store;
+        Ok(Next::Call(IoCall::child(store)))
     }
 }
 
@@ -125,14 +86,16 @@ impl Operation for RemoveWatchOperation {
                 let value = values.into_iter().flatten().next();
                 self.checked(value.as_deref())
             }
-            (RemoveState::Store(mut store), result) => {
-                let turn = store.next(result);
-                self.stored(*store, turn)
+            // A failed store is a rejection.
+            (RemoveState::Store, result) => {
+                if let Err(error) = result.child::<bool, WatchSubscriptionError>()? {
+                    return reject(error.to_string());
+                }
+                self.state = RemoveState::Publish;
+                Ok(Next::Call(IoCall::child(InterestOperation::publish())))
             }
-            (RemoveState::Publish(mut publish), result) => {
-                let turn = publish.next(result).map_err(|_| ());
-                self.published(*publish, turn)
-            }
+            // The watch is deleted whatever the publish request answers.
+            (RemoveState::Publish, _) => Ok(Next::Done(NotificationTransportMessage::WatchDeleted)),
             (RemoveState::Config, other) => Err(unexpected("IoResult::Values", &other).into()),
         }
     }
@@ -141,10 +104,10 @@ impl Operation for RemoveWatchOperation {
 #[cfg(test)]
 mod call_tests {
     use super::*;
+    use crate::notifications::watch::digest::InterestError;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::user;
-    use aruna_core::events::{Event, SubOperationEvent};
-    use aruna_core::task::{TaskEvent, TaskKey};
+    use aruna_core::calls::ChildOutcome;
 
     fn input() -> DeliverInput {
         DeliverInput {
@@ -193,20 +156,24 @@ mod call_tests {
     #[test]
     fn stored_then_published() {
         let mut operation = remove();
-        let store = StoreWatchOperation::delete(user(1, 2), Ulid::from_parts(5, 5), None);
-        operation.state = RemoveState::Store(Box::new(store));
-        let stored = Event::SubOperation(SubOperationEvent::WatchStored { result: Ok(false) });
+        operation.state = RemoveState::Store;
+        let stored = IoResult::Child(ChildOutcome::new(Ok::<_, WatchSubscriptionError>(false)));
         assert!(matches!(
-            operation.next(IoResult::Event(stored)),
-            Ok(Next::Call(IoCall::Effect(_)))
+            operation.next(stored),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        let scheduled = Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::PublishWatchInterest,
-            after: std::time::Duration::from_secs(2),
-        });
+        let published = IoResult::Child(ChildOutcome::new(Ok::<_, InterestError>(true)));
         assert_eq!(
-            operation.next(IoResult::Event(scheduled)),
+            operation.next(published),
             Ok(Next::Done(NotificationTransportMessage::WatchDeleted))
+        );
+        let mut failed = remove();
+        failed.state = RemoveState::Store;
+        let refused = Err::<bool, _>(WatchSubscriptionError::CapExceeded);
+        let refused = failed.next(IoResult::Child(ChildOutcome::new(refused)));
+        assert_eq!(
+            rejected(refused),
+            WatchSubscriptionError::CapExceeded.to_string()
         );
     }
 }
