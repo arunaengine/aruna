@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::any::{Any, type_name};
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::time::Duration;
 
 use smallvec::smallvec;
+use tracing::warn;
 
 use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
 use crate::errors::StorageError;
@@ -171,6 +173,12 @@ pub enum Next<T> {
     Done(T),
     /// Only after a window member: add no member and wait for the next result.
     Wait,
+    /// The outcome, then `calls` made in order after the commit, outside any transaction.
+    /// Their answers and failures never change the outcome; failures are logged.
+    Then {
+        output: T,
+        calls: Vec<IoCall>,
+    },
 }
 
 /// An I/O failure the runner reports into the operation's error type.
@@ -212,7 +220,14 @@ enum State<O, E> {
     /// Waits for the transaction that this storage call needs.
     Starting(IoCall),
     Waiting(Wait),
-    Committing(O),
+    /// Waits for the commit; the calls run after it.
+    Committing(O, Vec<IoCall>),
+    /// The committed outcome while the calls after the commit run.
+    After {
+        output: O,
+        calls: VecDeque<IoCall>,
+        wait: Wait,
+    },
     Finished(Result<O, E>),
 }
 
@@ -295,7 +310,8 @@ impl<P: Operation> CallRun<P> {
         loop {
             let call = match turn {
                 Err(error) => return self.fail(error),
-                Ok(Next::Done(output)) => return self.finish(output),
+                Ok(Next::Done(output)) => return self.finish(output, Vec::new()),
+                Ok(Next::Then { output, calls }) => return self.finish(output, calls),
                 Ok(Next::Wait) => {
                     let got = "Next::Wait outside a window";
                     return self.fail(unexpected("a call or an outcome", got));
@@ -338,23 +354,42 @@ impl<P: Operation> CallRun<P> {
         }
     }
 
-    fn finish(&mut self, output: P::Output) -> Effects {
+    fn finish(&mut self, output: P::Output, calls: Vec<IoCall>) -> Effects {
         match self.txn_id {
             Some(txn_id) => {
-                self.state = State::Committing(output);
+                self.state = State::Committing(output, calls);
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
             }
-            None => {
-                self.state = State::Finished(Ok(output));
-                smallvec![]
+            None => self.after(output, calls.into()),
+        }
+    }
+
+    /// Makes the next call after the commit; a refused call is logged and skipped.
+    fn after(&mut self, output: P::Output, mut calls: VecDeque<IoCall>) -> Effects {
+        while let Some(call) = calls.pop_front() {
+            if empty_result(&call).is_some() {
+                continue;
+            }
+            match call_effect(call, None) {
+                Ok((wait, effect)) => {
+                    self.state = State::After {
+                        output,
+                        calls,
+                        wait,
+                    };
+                    return smallvec![effect];
+                }
+                Err(error) => warn!(%error, "A call after the commit was refused"),
             }
         }
+        self.state = State::Finished(Ok(output));
+        smallvec![]
     }
 
     /// Ends with `error`: aborts an open transaction unless its commit was sent, then sends the
     /// operation's cleanup calls outside any transaction.
     fn fail(&mut self, error: impl Into<P::Error>) -> Effects {
-        let committing = matches!(self.state, State::Committing(_));
+        let committing = matches!(self.state, State::Committing(..));
         self.state = State::Finished(Err(error.into()));
         let mut effects = match committing {
             true => {
@@ -394,20 +429,42 @@ impl<P: Operation> EffectOperation for CallRun<P> {
                 other => self.deliver(Wait::Window, other),
             },
             State::Waiting(wait) => self.deliver(wait, event),
-            State::Committing(output) => match event {
+            State::Committing(output, calls) => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { txn_id })
                     if Some(txn_id) == self.txn_id =>
                 {
                     self.txn_id = None;
-                    self.state = State::Finished(Ok(output));
-                    smallvec![]
+                    self.after(output, calls.into())
                 }
                 other => {
                     // The commit was sent: the runner owns its outcome, so no abort follows.
-                    self.state = State::Committing(output);
+                    self.state = State::Committing(output, calls);
                     self.fail(failure("StorageEvent::TransactionCommitted", other))
                 }
             },
+            State::After {
+                output,
+                calls,
+                wait: Wait::Window,
+            } if matches!(event, Event::Group(GroupEvent::Member { .. })) => {
+                let wait = Wait::Window;
+                self.state = State::After {
+                    output,
+                    calls,
+                    wait,
+                };
+                smallvec![]
+            }
+            State::After {
+                output,
+                calls,
+                wait,
+            } => {
+                if let Err(error) = answer(wait, event) {
+                    warn!(%error, "A call after the commit failed");
+                }
+                self.after(output, calls)
+            }
             State::Created | State::Finished(_) => {
                 let late = unexpected("no event", event.label());
                 self.state = State::Finished(Err(late.into()));
@@ -423,13 +480,21 @@ impl<P: Operation> EffectOperation for CallRun<P> {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         match self.state {
             State::Finished(result) => result,
+            State::After { output, .. } => Ok(output),
             _ => Err(IoError::Unfinished.into()),
         }
     }
 
     fn abort(&mut self) -> Effects {
-        match self.state {
-            State::Committing(_) | State::Finished(_) => smallvec![],
+        match std::mem::replace(&mut self.state, State::Created) {
+            State::After { output, .. } => {
+                self.state = State::Finished(Ok(output));
+                smallvec![]
+            }
+            state @ (State::Committing(..) | State::Finished(_)) => {
+                self.state = state;
+                smallvec![]
+            }
             _ => self.fail(IoError::Aborted),
         }
     }
