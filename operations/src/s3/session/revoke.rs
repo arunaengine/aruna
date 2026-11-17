@@ -4,15 +4,11 @@
 
 use super::{S3SessionError, decode_index, encode_index, expiry_key, owner_key};
 use aruna_core::UserId;
-use aruna_core::effects::abort_effects;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{S3_SESSION_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::s3_session::S3Session;
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
-use ulid::Ulid;
+use aruna_core::types::{Key, Value};
 
 #[derive(Debug, PartialEq)]
 pub struct RevokeS3Config {
@@ -21,17 +17,12 @@ pub struct RevokeS3Config {
     pub issued_by: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RevokeSessionState {
-    Init,
-    StartTransaction,
-    ReadSession,
-    ReadIndex,
-    WriteIndex,
-    DeleteRows,
-    CommitTransaction,
-    Finish,
-    Error,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RevokePhase {
+    Session,
+    Index,
+    Write,
+    Delete,
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,9 +30,7 @@ pub struct RevokeS3Operation {
     config: RevokeS3Config,
     owner_key: Option<Key>,
     deletes: Vec<(String, Key)>,
-    txn_id: Option<Ulid>,
-    state: RevokeSessionState,
-    output: Result<(), S3SessionError>,
+    phase: RevokePhase,
 }
 
 impl RevokeS3Operation {
@@ -50,207 +39,150 @@ impl RevokeS3Operation {
             config,
             owner_key: None,
             deletes: Vec::new(),
-            txn_id: None,
-            state: RevokeSessionState::Init,
-            output: Err(S3SessionError::NotFinished),
+            phase: RevokePhase::Session,
         }
     }
 
-    fn fail(&mut self, error: S3SessionError) -> Effects {
-        self.state = RevokeSessionState::Error;
-        self.output = Err(error);
-        self.abort()
-    }
-
-    fn start_revoke(&mut self) -> Effects {
-        if !matches!(self.state, RevokeSessionState::Init) {
-            return self.fail(S3SessionError::Failed);
-        }
-        if !S3Session::valid_access_key(&self.config.access_key) {
-            return self.fail(S3SessionError::InvalidAccessKey);
-        }
-        self.state = RevokeSessionState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
-    }
-
-    fn transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionStarted");
-        };
-        self.txn_id = Some(txn_id);
-        self.state = RevokeSessionState::ReadSession;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_SESSION_KEYSPACE.to_string(),
-            key: self.config.access_key.as_bytes().into(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn session_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event, "StorageEvent::ReadResult");
-        };
-        let Some(value) = value else {
-            return self.fail(S3SessionError::NotFound);
-        };
-        let session = match S3Session::from_bytes(value.as_ref()) {
-            Ok(session) => session,
-            Err(error) => return self.fail(error.into()),
-        };
+    /// Checks the caller owns the session and reads its owner index next.
+    fn session_read(&mut self, value: Option<Value>) -> Result<Next<()>, S3SessionError> {
+        let value = value.ok_or(S3SessionError::NotFound)?;
+        let session = S3Session::from_bytes(value.as_ref())?;
         if session.access_key != self.config.access_key {
-            return self.fail(S3SessionError::IndexInconsistent);
+            return Err(S3SessionError::IndexInconsistent);
         }
         if session.user_identity != self.config.user_identity {
-            return self.fail(S3SessionError::WrongOwner);
+            return Err(S3SessionError::WrongOwner);
         }
         if session.issued_by != self.config.issued_by {
-            return self.fail(S3SessionError::WrongIssuer);
+            return Err(S3SessionError::WrongIssuer);
         }
-        let expiry_key = match expiry_key(session.expiry, &session.access_key) {
-            Ok(key) => key,
-            Err(error) => return self.fail(error),
-        };
+        let expiry = expiry_key(session.expiry, &session.access_key)?;
         self.deletes = vec![
             (
                 S3_SESSION_KEYSPACE.to_string(),
                 session.access_key.as_bytes().into(),
             ),
-            (SESSION_EXPIRY_KEYSPACE.to_string(), expiry_key),
+            (SESSION_EXPIRY_KEYSPACE.to_string(), expiry),
         ];
-        let owner_key = owner_key(session.user_identity, session.group_id);
-        self.owner_key = Some(owner_key.clone());
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = RevokeSessionState::ReadIndex;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: SESSION_OWNER_KEYSPACE.to_string(),
-            key: owner_key,
-            txn_id: Some(txn_id),
-        })]
+        let owner = owner_key(session.user_identity, session.group_id);
+        self.owner_key = Some(owner.clone());
+        self.phase = RevokePhase::Index;
+        Ok(Next::Call(IoCall::Read(vec![(
+            SESSION_OWNER_KEYSPACE.to_string(),
+            owner,
+        )])))
     }
 
-    fn index_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected(event, "StorageEvent::ReadResult");
-        };
-        let mut index = match decode_index(value.as_ref()) {
-            Ok(index) => index,
-            Err(error) => return self.fail(error),
-        };
+    /// Drops the session from its owner index: the last one deletes the index row.
+    fn index_read(&mut self, value: Option<Value>) -> Result<Next<()>, S3SessionError> {
+        let mut index = decode_index(value.as_ref())?;
         index.remove(&self.config.access_key);
-        let (Some(owner_key), Some(txn_id)) = (self.owner_key.clone(), self.txn_id) else {
-            return self.fail(S3SessionError::Failed);
-        };
+        let owner = self.owner_key.clone().ok_or(S3SessionError::Failed)?;
         if index.is_empty() {
             self.deletes
-                .push((SESSION_OWNER_KEYSPACE.to_string(), owner_key));
-            return self.delete_rows();
+                .push((SESSION_OWNER_KEYSPACE.to_string(), owner));
+            return Ok(self.delete());
         }
-        let index_bytes = match encode_index(&index) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error),
-        };
-        self.state = RevokeSessionState::WriteIndex;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: SESSION_OWNER_KEYSPACE.to_string(),
-            key: owner_key,
-            value: index_bytes,
-            txn_id: Some(txn_id),
-        })]
+        self.phase = RevokePhase::Write;
+        let row = (
+            SESSION_OWNER_KEYSPACE.to_string(),
+            owner,
+            encode_index(&index)?,
+        );
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 
-    fn index_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::WriteResult");
-        };
-        self.delete_rows()
-    }
-
-    fn delete_rows(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = RevokeSessionState::DeleteRows;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn rows_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::BatchDeleteResult");
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(S3SessionError::Failed);
-        };
-        self.state = RevokeSessionState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected(event, "StorageEvent::TransactionCommitted");
-        };
-        self.txn_id = None;
-        self.output = Ok(());
-        self.state = RevokeSessionState::Finish;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, received: Event, expected: &'static str) -> Effects {
-        self.fail(S3SessionError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            received: received.label(),
-        })
+    fn delete(&mut self) -> Next<()> {
+        self.phase = RevokePhase::Delete;
+        Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes)))
     }
 }
 
-impl EffectOperation for RevokeS3Operation {
+impl Operation for RevokeS3Operation {
     type Output = ();
     type Error = S3SessionError;
 
-    fn start(&mut self) -> Effects {
-        self.start_revoke()
+    fn first(&mut self) -> Result<Next<()>, S3SessionError> {
+        if !S3Session::valid_access_key(&self.config.access_key) {
+            return Err(S3SessionError::InvalidAccessKey);
+        }
+        let key = self.config.access_key.as_bytes().into();
+        Ok(Next::Call(IoCall::Read(vec![(
+            S3_SESSION_KEYSPACE.to_string(),
+            key,
+        )])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.fail(error.clone().into());
-        }
-        match self.state {
-            RevokeSessionState::StartTransaction => self.transaction_started(event),
-            RevokeSessionState::ReadSession => self.session_read(event),
-            RevokeSessionState::ReadIndex => self.index_read(event),
-            RevokeSessionState::WriteIndex => self.index_written(event),
-            RevokeSessionState::DeleteRows => self.rows_deleted(event),
-            RevokeSessionState::CommitTransaction => self.transaction_committed(event),
-            RevokeSessionState::Init | RevokeSessionState::Finish | RevokeSessionState::Error => {
-                self.unexpected(event, "valid session operation event")
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, S3SessionError> {
+        match self.phase {
+            RevokePhase::Session => self.session_read(result.value()?),
+            RevokePhase::Index => self.index_read(result.value()?),
+            RevokePhase::Write => {
+                result.done()?;
+                Ok(self.delete())
+            }
+            RevokePhase::Delete => {
+                result.done()?;
+                Ok(Next::Done(()))
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            RevokeSessionState::Finish | RevokeSessionState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-    }
-
-    fn abort(&mut self) -> Effects {
-        abort_effects(&mut self.txn_id)
+    fn transaction(&self) -> bool {
+        true
     }
 
     fn expected_error(error: &Self::Error) -> bool {
         error.expected()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::identity::realm::RealmId;
+    use ulid::Ulid;
+
+    fn config(access_key: &str) -> RevokeS3Config {
+        RevokeS3Config {
+            access_key: access_key.to_string(),
+            user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId::from_bytes([1; 32])),
+            issued_by: [1; 32],
+        }
+    }
+
+    fn valid_key() -> String {
+        S3Session::build_access_key("01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap()
+    }
+
+    #[test]
+    fn reads_session_first() {
+        let key = valid_key();
+        let mut operation = RevokeS3Operation::new(config(&key));
+        let read = vec![(S3_SESSION_KEYSPACE.to_string(), key.as_bytes().into())];
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+        assert!(operation.transaction());
+        let missing = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(S3SessionError::NotFound));
+    }
+
+    #[test]
+    fn last_session_drops_index() {
+        let key = valid_key();
+        let mut operation = RevokeS3Operation::new(config(&key));
+        let owner: Key = b"owner".to_vec().into();
+        let session: Key = key.as_bytes().into();
+        operation.owner_key = Some(owner.clone());
+        operation.deletes = vec![(S3_SESSION_KEYSPACE.to_string(), session.clone())];
+        operation.phase = RevokePhase::Index;
+        let deletes = vec![
+            (S3_SESSION_KEYSPACE.to_string(), session),
+            (SESSION_OWNER_KEYSPACE.to_string(), owner),
+        ];
+        let empty = operation.next(IoResult::Values(vec![None]));
+        assert_eq!(empty, Ok(Next::Call(IoCall::Delete(deletes))));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+        let mut invalid = RevokeS3Operation::new(config("bad"));
+        assert_eq!(invalid.first(), Err(S3SessionError::InvalidAccessKey));
     }
 }
