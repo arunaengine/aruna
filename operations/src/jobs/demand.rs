@@ -12,9 +12,7 @@ use aruna_core::compute::quota::{
     MAX_DEMAND_GROUPS, ResourceTotals, bound_demand,
 };
 use aruna_core::heartbeat::HeldHeartbeat;
-use aruna_core::keyspaces::{
-    FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE,
-};
+use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::structs::execution::job::record_rows::{ProjectionCache, from_bytes};
