@@ -61,7 +61,7 @@ fn retrying(cursor: &[u8]) -> WatchExpandOperation {
 }
 
 #[test]
-fn empty_and_oversized_batches() {
+fn edge_batches() {
     let config = RealmConfigDocument::new(REALM, Vec::new(), 3);
     let mut empty = WatchExpandOperation::new(REALM, config.clone(), node(), Vec::new(), None);
     assert_eq!(empty.first(), Ok(Next::Done(ExpandOutcome::default())));

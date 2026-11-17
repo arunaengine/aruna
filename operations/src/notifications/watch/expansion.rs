@@ -1,6 +1,5 @@
-//! Expands watch events into inbox records in one write transaction: one page of the realm's
-//! watches, their authorization, the inbox upsert, the retry row of the next page and the marker
-//! that asks for a new interest publish.
+//! Expands watch events into inbox records in one write transaction: a page of watches, their
+//! authorization, the inbox upsert, the retry row of the next page and the interest marker.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
