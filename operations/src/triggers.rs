@@ -15,7 +15,6 @@ use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::TaskKey;
 use aruna_core::types::Effects;
-use serde::Serialize;
 use thiserror::Error;
 
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
@@ -150,6 +149,11 @@ pub struct PeerInput<'a> {
 #[error("{0}")]
 pub struct PeerFailure(pub String);
 
+/// A peer operation produces the answer frame body the shell writes back.
+pub trait PeerRun: Operation + Sized {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure>;
+}
+
 impl From<IoError> for PeerFailure {
     fn from(error: IoError) -> Self {
         Self(error.to_string())
@@ -199,17 +203,35 @@ pub fn peer_operation(input: PeerInput<'_>) -> Option<PeerOperation> {
     }
 }
 
-/// The answer frame body of a finished peer operation, or its failure.
-fn peer_turn<T: Serialize, E: Display>(
-    turn: Result<Next<T>, E>,
+/// The answer frame of a notification peer request; an error closes the stream.
+fn notification_answer<E: Display>(
+    result: Result<NotificationTransportMessage, E>,
+) -> Result<Vec<u8>, PeerFailure> {
+    let answer = result.map_err(|error| PeerFailure(error.to_string()))?;
+    postcard::to_allocvec(&answer).map_err(|error| PeerFailure(error.to_string()))
+}
+
+impl PeerRun for DeliverBatchOperation {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+        notification_answer(result)
+    }
+}
+
+impl PeerRun for RemoveWatchOperation {
+    fn answer(result: Result<Self::Output, Self::Error>) -> Result<Vec<u8>, PeerFailure> {
+        notification_answer(result)
+    }
+}
+
+/// The next call of a peer operation, or its answer frame body.
+fn peer_turn<O: PeerRun>(
+    turn: Result<Next<O::Output>, O::Error>,
 ) -> Result<Next<Vec<u8>>, PeerFailure> {
     match turn {
         Ok(Next::Call(call)) => Ok(Next::Call(call)),
         Ok(Next::Wait) => Ok(Next::Wait),
-        Ok(Next::Done(answer)) => postcard::to_allocvec(&answer)
-            .map(Next::Done)
-            .map_err(|error| PeerFailure(error.to_string())),
-        Err(error) => Err(PeerFailure(error.to_string())),
+        Ok(Next::Done(output)) => O::answer(Ok(output)).map(Next::Done),
+        Err(error) => O::answer(Err(error)).map(Next::Done),
     }
 }
 
@@ -219,15 +241,23 @@ impl Operation for PeerOperation {
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            PeerOperation::DeliverNotifications(operation) => peer_turn(operation.first()),
-            PeerOperation::RemoveWatch(operation) => peer_turn(operation.first()),
+            PeerOperation::DeliverNotifications(operation) => {
+                peer_turn::<DeliverBatchOperation>(operation.first())
+            }
+            PeerOperation::RemoveWatch(operation) => {
+                peer_turn::<RemoveWatchOperation>(operation.first())
+            }
         }
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
         match self {
-            PeerOperation::DeliverNotifications(operation) => peer_turn(operation.next(result)),
-            PeerOperation::RemoveWatch(operation) => peer_turn(operation.next(result)),
+            PeerOperation::DeliverNotifications(operation) => {
+                peer_turn::<DeliverBatchOperation>(operation.next(result))
+            }
+            PeerOperation::RemoveWatch(operation) => {
+                peer_turn::<RemoveWatchOperation>(operation.next(result))
+            }
         }
     }
 
