@@ -14,8 +14,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Storage rows read per index page.
-const INDEX_SCAN_BATCH: usize = 256;
+use crate::metadata::timestamp_sweep::INDEX_SCAN_BATCH;
 
 /// One page of registry records ordered by `updated_at_ms`, plus stale index
 /// keys the caller may sweep.
@@ -245,5 +244,217 @@ impl Operation for UpdatedPageOperation {
     // Every read runs outside a transaction, so nothing is left to clean up.
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+    use crate::metadata::timestamp_sweep::state_machine_tests::{
+        document, first_start, page, reads_effect, record_bytes, records, scan_effect,
+    };
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+
+    fn record(document_id: Ulid, updated_at_ms: u64) -> MetadataRegistryRecord {
+        postcard::from_bytes(&record_bytes(document_id, updated_at_ms)).expect("record decodes")
+    }
+
+    fn whole_window() -> UpdatedPageOperation {
+        UpdatedPageOperation::new(0, u64::MAX, None, 10)
+    }
+
+    #[test]
+    fn pages_in_window() {
+        // A moved record leaves a stale key, and a key past the window ends the page.
+        let (current, moved, late) = (document(1), document(2), document(3));
+        let keys = [
+            updated_index_key(10, current),
+            updated_index_key(20, moved),
+            updated_index_key(30, late),
+        ];
+        let mut operation = UpdatedPageOperation::new(0, 25, None, 10);
+        check_trace(
+            &mut operation,
+            &[scan_effect(first_start())],
+            vec![
+                (page(&keys, None), vec![reads_effect(&[current, moved])]),
+                (
+                    records(vec![
+                        Some(record_bytes(current, 10)),
+                        Some(record_bytes(moved, 99)),
+                    ]),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok(UpdatedRecordsPage {
+                records: vec![record(current, 10)],
+                next_after: None,
+                stale_keys: vec![keys[1].clone()],
+            })
+        );
+    }
+
+    #[test]
+    fn limit_keeps_cursor() {
+        // A full page stops at the last listed key, after the given cursor.
+        let keys = [
+            updated_index_key(10, document(1)),
+            updated_index_key(11, document(2)),
+            updated_index_key(12, document(3)),
+        ];
+        let mut operation = UpdatedPageOperation::new(0, u64::MAX, Some(keys[0].clone()), 1);
+        check_trace(
+            &mut operation,
+            &[scan_effect(IterStart::After(keys[0].clone()))],
+            vec![
+                (
+                    page(&keys[1..], Some(keys[2].clone())),
+                    vec![reads_effect(&[document(2), document(3)])],
+                ),
+                (
+                    records(vec![
+                        Some(record_bytes(document(2), 11)),
+                        Some(record_bytes(document(3), 12)),
+                    ]),
+                    vec![],
+                ),
+            ],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok(UpdatedRecordsPage {
+                records: vec![record(document(2), 11)],
+                next_after: Some(keys[1].clone()),
+                stale_keys: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn scans_next_page() {
+        // A short page continues the scan until the index ends.
+        let key = updated_index_key(10, document(1));
+        let mut operation = whole_window();
+        check_trace(
+            &mut operation,
+            &[scan_effect(first_start())],
+            vec![
+                (
+                    page(std::slice::from_ref(&key), Some(key.clone())),
+                    vec![reads_effect(&[document(1)])],
+                ),
+                (
+                    records(vec![None]),
+                    vec![scan_effect(IterStart::After(key.clone()))],
+                ),
+                (page(&[], None), vec![]),
+            ],
+        );
+        assert_eq!(
+            operation.finalize(),
+            Ok(UpdatedRecordsPage {
+                records: Vec::new(),
+                next_after: None,
+                stale_keys: vec![key],
+            })
+        );
+    }
+
+    #[test]
+    fn storage_errors_fail() {
+        let key = updated_index_key(10, document(1));
+        let error = || {
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::Timeout,
+            })
+        };
+        let mut at_scan = whole_window();
+        at_scan.start();
+        let mut at_reads = whole_window();
+        at_reads.start();
+        at_reads.step(page(std::slice::from_ref(&key), None));
+        for mut operation in [at_scan, at_reads] {
+            assert!(operation.step(error()).is_empty());
+            assert_eq!(
+                operation.finalize(),
+                Err(UpdatedPageError::Storage(StorageError::Timeout))
+            );
+        }
+    }
+
+    #[test]
+    fn broken_rows_fail() {
+        let mut bad_key = whole_window();
+        bad_key.start();
+        bad_key.step(page(&[vec![1u8].into()], None));
+        assert!(matches!(
+            bad_key.finalize(),
+            Err(UpdatedPageError::Conversion(_))
+        ));
+
+        let key = updated_index_key(10, document(1));
+        let mut bad_record = whole_window();
+        bad_record.start();
+        bad_record.step(page(std::slice::from_ref(&key), None));
+        bad_record.step(records(vec![Some(vec![0xff].into())]));
+        assert!(matches!(
+            bad_record.finalize(),
+            Err(UpdatedPageError::Conversion(_))
+        ));
+
+        let mut short = whole_window();
+        short.start();
+        short.step(page(std::slice::from_ref(&key), None));
+        short.step(records(Vec::new()));
+        assert!(matches!(
+            short.finalize(),
+            Err(UpdatedPageError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_other_events() {
+        let scanning = || {
+            let mut operation = whole_window();
+            operation.start();
+            operation
+        };
+        let accepted = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::IterResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (_, effects, error) in rejects_events(scanning, sample_events, accepted) {
+            assert!(effects.is_empty());
+            assert!(matches!(error, UpdatedPageError::UnexpectedEvent { .. }));
+        }
+        let mut idle = whole_window();
+        idle.step(page(&[], None));
+        assert!(matches!(
+            idle.finalize(),
+            Err(UpdatedPageError::UnexpectedEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn abort_cleans_nothing() {
+        let mut operation = whole_window();
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+    }
+
+    #[test]
+    fn finalize_needs_result() {
+        rejects_finalize(whole_window());
+        let mut scanning = whole_window();
+        scanning.start();
+        rejects_finalize(scanning);
     }
 }

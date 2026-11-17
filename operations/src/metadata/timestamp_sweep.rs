@@ -17,7 +17,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 /// Storage rows read per index page.
-const INDEX_SCAN_BATCH: usize = 256;
+pub(crate) const INDEX_SCAN_BATCH: usize = 256;
 /// Index keys validated by one default sweep pass.
 pub const SWEEP_SCAN_LIMIT: usize = 4_096;
 /// Stale keys per delete batch.
@@ -323,7 +323,7 @@ impl Operation for TimestampSweepOperation {
 }
 
 #[cfg(test)]
-mod state_machine_tests {
+pub(crate) mod state_machine_tests {
     use super::*;
     use aruna_core::operation_check::{
         check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
@@ -331,11 +331,11 @@ mod state_machine_tests {
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
 
-    fn document(seed: u8) -> Ulid {
+    pub(crate) fn document(seed: u8) -> Ulid {
         Ulid::from_bytes([seed; 16])
     }
 
-    fn record_bytes(document_id: Ulid, updated_at_ms: u64) -> Value {
+    pub(crate) fn record_bytes(document_id: Ulid, updated_at_ms: u64) -> Value {
         let record = MetadataRegistryRecord {
             realm_id: RealmId([1; 32]),
             group_id: Ulid::from_bytes([2; 16]),
@@ -359,7 +359,7 @@ mod state_machine_tests {
             .into()
     }
 
-    fn scan_effect(start: IterStart) -> Effect {
+    pub(crate) fn scan_effect(start: IterStart) -> Effect {
         Effect::Storage(StorageEffect::Iter {
             key_space: UPDATED_INDEX_KEYSPACE.to_string(),
             prefix: None,
@@ -369,7 +369,7 @@ mod state_machine_tests {
         })
     }
 
-    fn reads_effect(documents: &[Ulid]) -> Effect {
+    pub(crate) fn reads_effect(documents: &[Ulid]) -> Effect {
         Effect::Storage(StorageEffect::BatchRead {
             reads: documents
                 .iter()
@@ -394,7 +394,7 @@ mod state_machine_tests {
         })
     }
 
-    fn page(keys: &[Key], next: Option<Key>) -> Event {
+    pub(crate) fn page(keys: &[Key], next: Option<Key>) -> Event {
         Event::Storage(StorageEvent::IterResult {
             values: keys
                 .iter()
@@ -404,7 +404,7 @@ mod state_machine_tests {
         })
     }
 
-    fn records(values: Vec<Option<Value>>) -> Event {
+    pub(crate) fn records(values: Vec<Option<Value>>) -> Event {
         Event::Storage(StorageEvent::BatchReadResult {
             values: values
                 .into_iter()
@@ -419,7 +419,7 @@ mod state_machine_tests {
         })
     }
 
-    fn first_start() -> IterStart {
+    pub(crate) fn first_start() -> IterStart {
         IterStart::At(updated_index_key(0, Ulid::nil()))
     }
 
