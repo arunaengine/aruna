@@ -25,11 +25,10 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, VersionKey,
 };
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, SealPlan, UnlockStatus,
+    BucketKeyRecord, BucketKeyRef, KeyState, KeyTicket, UnlockStatus,
 };
-use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::transition::{
-    EncryptionTransition, TransitionKind, TransitionState, TransitionTarget, cleanup_prefix,
+    EncryptionTransition, TransitionState, cleanup_prefix,
 };
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, TxnId, Value};
@@ -157,35 +156,6 @@ pub async fn process_transitions(context: &DriverContext) -> Result<Option<Durat
             None => return Ok(next),
         }
     }
-}
-
-/// The rows that start converting a bucket's plain copies after encryption is enabled. The
-/// enabling transaction writes them with its settings, then wakes `TaskKey::MigrateCompression`.
-pub fn encrypt_rows(
-    bucket: &str,
-    settings: &BucketEncryption,
-    record: &BucketKeyRecord,
-    compression: Compression,
-    now_ms: u64,
-) -> Result<Vec<(String, Key, Value)>, ConversionError> {
-    let plan = SealPlan::capture(settings, record).map_err(ConversionError::from)?;
-    let target = TransitionTarget { compression, plan };
-    let generation = settings.storage_generation;
-    let kind = TransitionKind::Encrypt;
-    let transition = EncryptionTransition::new(kind, None, target, generation, now_ms);
-    let key: Key = bucket.as_bytes().to_vec().into();
-    Ok(vec![
-        (
-            TRANSITION_KEYSPACE.to_string(),
-            key.clone(),
-            transition.to_bytes()?.into(),
-        ),
-        (
-            TRANSITION_QUEUE_KEYSPACE.to_string(),
-            key,
-            Vec::new().into(),
-        ),
-    ])
 }
 
 async fn read_record(
@@ -942,7 +912,10 @@ async fn retire_source(
 mod tests {
     use super::*;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::structs::storage::encryption::{BucketEncryption, SealPlan};
+    use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use aruna_core::structs::storage::transition::{TransitionKind, TransitionTarget};
     use std::time::SystemTime;
     use ulid::Ulid;
 

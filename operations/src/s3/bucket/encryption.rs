@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::migration::queue::encrypt_rows;
 use crate::groups::imports::LinkScan;
 use crate::s3::bucket::key::rows::{
     SettingsError, audit_row, authority_read, copy_targets, full_scan, generation_rows,
@@ -652,6 +651,36 @@ impl Operation for EnableEncryptionOperation {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             })
     }
+}
+
+/// The rows that start converting a bucket's plain copies after encryption is enabled. The
+/// enabling transaction writes them with its settings, then wakes `TaskKey::MigrateCompression`.
+fn encrypt_rows(
+    bucket: &str,
+    settings: &BucketEncryption,
+    record: &BucketKeyRecord,
+    compression: Compression,
+    now_ms: u64,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    let plan = aruna_core::structs::storage::encryption::SealPlan::capture(settings, record)
+        .map_err(ConversionError::from)?;
+    let target = aruna_core::structs::storage::transition::TransitionTarget { compression, plan };
+    let generation = settings.storage_generation;
+    let kind = aruna_core::structs::storage::transition::TransitionKind::Encrypt;
+    let transition = EncryptionTransition::new(kind, None, target, generation, now_ms);
+    let key: Key = bucket.as_bytes().to_vec().into();
+    Ok(vec![
+        (
+            aruna_core::keyspaces::TRANSITION_KEYSPACE.to_string(),
+            key.clone(),
+            transition.to_bytes()?.into(),
+        ),
+        (
+            aruna_core::keyspaces::TRANSITION_QUEUE_KEYSPACE.to_string(),
+            key,
+            Vec::new().into(),
+        ),
+    ])
 }
 
 #[cfg(test)]
