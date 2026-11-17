@@ -21,7 +21,7 @@ use crate::metadata::projector::{
     PROJECTION_RETRY_AFTER, project_create_events, project_logged_events, schedule_projection_drain,
 };
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::usage_publish::refresh_usage_targets;
+use crate::node::usage_refresh::RefreshUsageOperation;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
@@ -980,7 +980,11 @@ async fn reconcile_inbound_topics(
             warn!(%error, "Registry publication was not moved up");
         }
     }
-    refresh_usage_targets(context, net_handle.node_id(), &targets.targets).await;
+    let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
+    let refresh = RefreshUsageOperation::new(node_id, realm_id, &targets.targets, Ulid::generate());
+    if let Err(error) = drive(refresh, context).await {
+        warn!(%error, "Realm usage refresh stopped after a document sync");
+    }
     crate::notifications::email::config_applied(context, &targets.targets).await;
     // An installed record may name a member this node bootstraps.
     wake_bootstrap(context).await;

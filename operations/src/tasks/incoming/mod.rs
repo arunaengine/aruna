@@ -86,7 +86,8 @@ use crate::metadata::projector::{
 use crate::metadata::prune_queue::{
     GRAPH_POLL_AFTER, GRAPH_RETRY_AFTER, process_graph_tombstones, prune_jobs_exist,
 };
-use crate::node::usage_publish::{refresh_usage_targets, restore_usage_timer};
+use crate::node::usage_publish::restore_usage_timer;
+use crate::node::usage_refresh::RefreshUsageOperation;
 use crate::notifications::client::deliver_remote;
 use crate::notifications::inbox::upsert_with_report;
 use crate::notifications::outbox::{

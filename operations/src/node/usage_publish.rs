@@ -494,97 +494,6 @@ pub(super) async fn clear_consumed_markers(
     }
 }
 
-async fn clear_usage_cache(ctx: &DriverContext) -> Result<(), String> {
-    let mut deletes = vec![(
-        NODE_STATS_KEYSPACE.to_string(),
-        Key::from(SUMMARY_GLOBAL_KEY.to_vec()),
-    )];
-    let summary_prefix = Some(Key::from(SUMMARY_GROUP_PREFIX.to_vec()));
-    let mut pages = pin!(scan_pages(
-        &ctx.storage_handle,
-        NODE_STATS_KEYSPACE,
-        summary_prefix
-    ));
-    while let Some(page) = pages.try_next().await? {
-        deletes.extend(
-            page.into_iter()
-                .map(|(key, _)| (NODE_STATS_KEYSPACE.to_string(), key)),
-        );
-    }
-    match ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected summary cache delete event: {other:?}")),
-    }
-}
-
-/// Refreshes the persisted realm usage sum cache for exactly the `NodeUsage` scopes
-/// touched by a document-sync reconcile. Shared by all reconcile handlers so remote
-/// snapshots update the realm aggregate on every path.
-pub async fn refresh_usage_targets(
-    ctx: &DriverContext,
-    local_node_id: NodeId,
-    targets: &[DocumentTarget],
-) {
-    let mut include_global = false;
-    let mut groups = BTreeSet::new();
-    let mut realm_config_changed = false;
-    for target in targets {
-        match target {
-            DocumentTarget::NodeUsage { group_id, .. } => match group_id {
-                Some(group_id) => {
-                    groups.insert(*group_id);
-                }
-                None => include_global = true,
-            },
-            DocumentTarget::RealmConfig { .. } => {
-                realm_config_changed = true;
-            }
-            _ => {}
-        }
-    }
-    if realm_config_changed && let Err(error) = clear_usage_cache(ctx).await {
-        warn!(error = %error, "Failed to clear realm usage summary after realm config change");
-    }
-    // Distribution records arrive as realm config targets; a new coordinator moves replica shares.
-    if realm_config_changed && let Err(error) = dirty_bound_groups(ctx).await {
-        warn!(error = %error, "Failed to mark distributed bucket groups for a usage publish");
-    }
-    if !include_global && groups.is_empty() {
-        return;
-    }
-    let groups = groups.into_iter().collect();
-    if let Err(error) = recompute_summary(ctx, local_node_id, include_global, groups).await {
-        warn!(error = %error, "Failed to refresh realm usage summary after document sync reconciliation");
-    }
-}
-
-/// Marks the groups of local distributed buckets and the global for the next publish, which
-/// recomputes their replica shares, and schedules it.
-async fn dirty_bound_groups(ctx: &DriverContext) -> Result<(), String> {
-    let mut groups = BTreeSet::new();
-    let mut pages = pin!(scan_pages(&ctx.storage_handle, S3_BUCKET_KEYSPACE, None));
-    while let Some(page) = pages.try_next().await? {
-        for (_, value) in page {
-            let info = BucketInfo::from_bytes(value.as_ref()).map_err(|e| e.to_string())?;
-            if info.distribution.is_some() {
-                groups.insert(info.group_id);
-            }
-        }
-    }
-    if groups.is_empty() {
-        return Ok(());
-    }
-    mark_dirty(ctx, groups).await
-}
-
 /// Schedules the publish that consumes committed dirty markers.
 pub(crate) async fn wake_publish(ctx: &DriverContext) {
     if let Some(task_handle) = ctx.task_handle.as_ref() {
@@ -598,7 +507,7 @@ pub(crate) async fn mark_dirty(
     groups: impl IntoIterator<Item = GroupId>,
 ) -> Result<(), String> {
     let write = StorageEffect::BatchWrite {
-        writes: dirty_rows(groups),
+        writes: dirty_rows(groups, ulid::Ulid::generate()),
         txn_id: None,
     };
     match ctx.storage_handle.send_storage_effect(write).await {

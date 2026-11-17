@@ -856,9 +856,13 @@ pub fn schedule_snapshot_publish() -> Effect {
     })
 }
 
-/// Rows marking `groups` and the global for the next publish, for a caller's transaction.
-pub(crate) fn dirty_rows(groups: impl IntoIterator<Item = GroupId>) -> Vec<(String, Key, Value)> {
-    let generation = Value::from(ulid::Ulid::generate().to_bytes().to_vec());
+/// Rows marking `groups` and the global for the next publish under `generation`, for a
+/// caller's transaction. A publish clears a marker only while it keeps that generation.
+pub(crate) fn dirty_rows(
+    groups: impl IntoIterator<Item = GroupId>,
+    generation: ulid::Ulid,
+) -> Vec<(String, Key, Value)> {
+    let generation = Value::from(generation.to_bytes().to_vec());
     let marker = |key: Vec<u8>| {
         (
             NODE_STATS_KEYSPACE.to_string(),
@@ -884,8 +888,8 @@ mod tests {
     use crate::node::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
     use crate::node::usage_publish::{
         clear_consumed_markers, publish_refresh_snapshots, publish_usage_snapshots,
-        refresh_usage_targets,
     };
+    use crate::node::usage_refresh::RefreshUsageOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -2057,7 +2061,8 @@ mod tests {
         let target = DocumentTarget::RealmConfig {
             realm_id: RealmId([4; 32]),
         };
-        refresh_usage_targets(&ctx, node(1), &[target]).await;
+        let refresh = RefreshUsageOperation::new(node(1), None, &[target], Ulid::from_parts(1, 1));
+        drive(refresh, &ctx).await.unwrap();
 
         assert!(read_node_stat(&ctx, dirty_group_key(bound)).await.is_some());
         assert!(read_node_stat(&ctx, dirty_group_key(plain)).await.is_none());
@@ -2726,23 +2731,20 @@ mod tests {
         )
         .await;
 
-        refresh_usage_targets(
-            &ctx,
-            local,
-            &[
-                DocumentTarget::NodeUsage {
-                    realm_id: RealmId::from_bytes([9u8; 32]),
-                    node_id: remote,
-                    group_id: None,
-                },
-                DocumentTarget::NodeUsage {
-                    realm_id: RealmId::from_bytes([9u8; 32]),
-                    node_id: remote,
-                    group_id: Some(group_id),
-                },
-            ],
-        )
-        .await;
+        let targets = [
+            DocumentTarget::NodeUsage {
+                realm_id: RealmId::from_bytes([9u8; 32]),
+                node_id: remote,
+                group_id: None,
+            },
+            DocumentTarget::NodeUsage {
+                realm_id: RealmId::from_bytes([9u8; 32]),
+                node_id: remote,
+                group_id: Some(group_id),
+            },
+        ];
+        let refresh = RefreshUsageOperation::new(local, None, &targets, Ulid::from_parts(1, 1));
+        drive(refresh, &ctx).await.unwrap();
 
         // The summed cache was materialized for both touched scopes.
         assert_eq!(

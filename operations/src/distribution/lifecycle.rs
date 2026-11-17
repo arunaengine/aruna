@@ -909,7 +909,7 @@ async fn unbind(
     storage.send_storage_effect(write).await;
     // The released bucket is ordinary now: its group's published replica share must go.
     let markers = StorageEffect::BatchWrite {
-        writes: dirty_rows([info.group_id]),
+        writes: dirty_rows([info.group_id], Ulid::generate()),
         txn_id: Some(txn_id),
     };
     storage.send_storage_effect(markers).await;

@@ -22,11 +22,12 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::time::unix_timestamp_millis;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::metadata::projector::{project_create_events, project_logged_events};
 use crate::metadata::prune_queue::process_graph_tombstones;
-use crate::node::usage_publish::refresh_usage_targets;
+use crate::node::usage_refresh::RefreshUsageOperation;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::{draining_former_holders, resolve_shard_holders};
 
@@ -1551,7 +1552,11 @@ pub(crate) async fn apply_restored_reconcile(
     };
 
     let tombstones = result.metadata_graph_tombstones.clone();
-    refresh_usage_targets(context, node_id, &result.targets).await;
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let refresh = RefreshUsageOperation::new(node_id, realm_id, &result.targets, Ulid::generate());
+    if let Err(error) = crate::driver::drive(refresh, context.as_ref()).await {
+        warn!(%error, "Realm usage refresh stopped after the shard restore");
+    }
     refresh_target_interest(context, &result.targets).await;
     crate::notifications::email::config_applied(context, &result.targets).await;
     project_restored_events(

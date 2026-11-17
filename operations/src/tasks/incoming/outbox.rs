@@ -1158,12 +1158,13 @@ impl OperationsTaskHandler {
                 let mut refresh_targets = targets.clone();
                 refresh_targets.extend(requested_targets);
                 if let Some(net_handle) = self.context.net_handle.as_ref() {
-                    refresh_usage_targets(
-                        self.context.as_ref(),
-                        net_handle.node_id(),
-                        &refresh_targets,
-                    )
-                    .await;
+                    let (node_id, realm_id) = (net_handle.node_id(), Some(*net_handle.realm_id()));
+                    let generation = ulid::Ulid::generate();
+                    let refresh =
+                        RefreshUsageOperation::new(node_id, realm_id, &refresh_targets, generation);
+                    if let Err(error) = drive(refresh, self.context.as_ref()).await {
+                        warn!(%error, "Realm usage refresh stopped after an outbox drain");
+                    }
                 }
                 refresh_target_interest(self.context.as_ref(), &refresh_targets).await;
                 crate::notifications::email::config_applied(self.context.as_ref(), &targets).await;

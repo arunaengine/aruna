@@ -500,7 +500,7 @@ async fn stage_debit(
         });
         // The share moves without the group counters, so the group is published again.
         effects.push(StorageEffect::BatchWrite {
-            writes: dirty_rows([target.group_id]),
+            writes: dirty_rows([target.group_id], Ulid::generate()),
             txn_id: Some(txn_id),
         });
     }
