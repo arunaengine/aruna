@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::drive;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -17,7 +16,7 @@ use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent, version_key};
+use aruna_core::structs::storage::backend_import::{RenameRequest, WriteIntent};
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, BucketInfo, ResolvedBackend, VersionKey,
 };
@@ -32,7 +31,7 @@ use ulid::Ulid;
 use super::batch::Stop;
 use super::{
     Earlier, MigrateOutcome, MigrateVersionError, MigrateVersionOperation, RULE_PAGE, place,
-    same_bytes, stays,
+    same_bytes,
 };
 use super::{batch, broken, check};
 use crate::blob::records::blob_location_read;

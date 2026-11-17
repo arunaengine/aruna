@@ -38,7 +38,7 @@ use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::unlocked::{drop_mismatch, reject_archive};
-use crate::distribution::held::{HeldElsewhere, PullRequest};
+use crate::distribution::held::PullRequest;
 use crate::distribution::pull::{pinned_blob, pull_through};
 use crate::distribution::source_keep::keep_first;
 use crate::distribution::source_plan::SourceKeep;

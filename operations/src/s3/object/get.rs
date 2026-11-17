@@ -8,9 +8,6 @@ use crate::distribution::held::{
     HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };
 use crate::distribution::inventory::{StagedCall, outside_answer};
-use crate::driver::{DriverContext, drive};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::protocol::BaoReadRefusal;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, check_copy_values, copy_check_call, location_from_value,
@@ -26,7 +23,6 @@ use std::ops::Range;
 use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::SharedSecret;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,

@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
