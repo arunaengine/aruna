@@ -20,7 +20,10 @@ use ulid::Ulid;
 
 use crate::driver::DriverContext;
 use crate::node::document_sync::apply_metadata;
-use crate::node::recovery::{RecoveryError, RecoveryOutcome, RecoveryStatus};
+use crate::node::recovery::{
+    PhaseOutcome, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass, RecoveryRotation,
+    RecoveryStatus, apply_recovery_pass,
+};
 use crate::node::restore_plan::{
     RestoreKind, RestoreRange, RestoreShardSummary, RestoreUnit, RestoreUnitOutcome,
     ShardRestoreCursor, ShardRestorePass, bind_restore_plan, plan_shard_groups, restore_range,
@@ -190,160 +193,6 @@ async fn finish_recovery_step(
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct RecoveryPass {
-    unresolved_topics: BTreeSet<::irokle::TopicId>,
-    unvisited_topics: usize,
-    error: Option<RecoveryError>,
-    /// Unvisited units are local work, not a peer problem: retry at once.
-    more_local_work: bool,
-    plan_changed: bool,
-    units_processed: usize,
-    topics_completed: usize,
-    phase_progress: bool,
-    /// False when the pass could not enumerate outstanding work.
-    enumerated: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RecoveryFailure {
-    unresolved_topics: BTreeSet<::irokle::TopicId>,
-    error: Option<RecoveryError>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RecoveryBaseline {
-    fewest_topics: usize,
-    error_cleared: bool,
-}
-
-impl RecoveryBaseline {
-    fn new(failure: &RecoveryFailure) -> Self {
-        Self {
-            fewest_topics: failure.unresolved_topics.len(),
-            error_cleared: failure.error.is_none(),
-        }
-    }
-
-    fn note_failure(&mut self, failure: &RecoveryFailure) -> bool {
-        let topics = failure.unresolved_topics.len();
-        let improved =
-            topics < self.fewest_topics || !self.error_cleared && failure.error.is_none();
-        self.fewest_topics = self.fewest_topics.min(topics);
-        self.error_cleared |= failure.error.is_none();
-        improved
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct RecoveryRotation {
-    unresolved_topics: BTreeSet<::irokle::TopicId>,
-    error: Option<RecoveryError>,
-}
-
-impl RecoveryRotation {
-    fn merge(&mut self, pass: &RecoveryPass) {
-        self.unresolved_topics
-            .extend(pass.unresolved_topics.iter().copied());
-        self.error = RecoveryError::merge(self.error, pass.error);
-    }
-
-    fn remaining_topics(&self, unvisited_topics: usize) -> u64 {
-        self.unresolved_topics
-            .len()
-            .saturating_add(unvisited_topics) as u64
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RecoveryDecision {
-    ContinueLocal {
-        progress: bool,
-        topics_remaining: u64,
-        error: Option<RecoveryError>,
-    },
-    Converged,
-    Retry {
-        failure: RecoveryFailure,
-        progress: bool,
-        /// False when the pass never measured outstanding work, so the
-        /// published remaining count must keep its last enumerated value.
-        enumerated: bool,
-    },
-}
-
-fn apply_recovery_pass(
-    rotation: &mut RecoveryRotation,
-    recovery_baseline: &mut Option<RecoveryBaseline>,
-    first_rotation: &mut bool,
-    pass: &RecoveryPass,
-) -> RecoveryDecision {
-    if pass.plan_changed {
-        *rotation = RecoveryRotation::default();
-        *recovery_baseline = None;
-        *first_rotation = true;
-    }
-    rotation.merge(pass);
-    let topics_remaining = rotation.remaining_topics(pass.unvisited_topics);
-    let pass_progress = pass.phase_progress || *first_rotation && pass.topics_completed > 0;
-    if pass.more_local_work {
-        return RecoveryDecision::ContinueLocal {
-            progress: pass_progress,
-            topics_remaining,
-            error: rotation.error,
-        };
-    }
-    // A pass that failed to enumerate work observed nothing: keep the
-    // rotation and baseline, and retry without claiming progress.
-    if !pass.enumerated {
-        return RecoveryDecision::Retry {
-            failure: RecoveryFailure {
-                unresolved_topics: rotation.unresolved_topics.clone(),
-                error: rotation.error,
-            },
-            progress: false,
-            enumerated: false,
-        };
-    }
-
-    let failure = RecoveryFailure {
-        unresolved_topics: rotation.unresolved_topics.clone(),
-        error: rotation.error,
-    };
-    if failure.unresolved_topics.is_empty() && failure.error.is_none() {
-        return RecoveryDecision::Converged;
-    }
-
-    let improved = match recovery_baseline {
-        Some(baseline) => baseline.note_failure(&failure),
-        None => {
-            *recovery_baseline = Some(RecoveryBaseline::new(&failure));
-            false
-        }
-    };
-    let progress = pass_progress || improved;
-    *rotation = RecoveryRotation::default();
-    *first_rotation = false;
-    RecoveryDecision::Retry {
-        failure,
-        progress,
-        enumerated: true,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct PhaseOutcome {
-    progress: bool,
-    error: Option<RecoveryError>,
-}
-
-impl RecoveryPass {
-    fn merge_phase(&mut self, outcome: PhaseOutcome) {
-        self.phase_progress |= outcome.progress;
-        self.error = RecoveryError::merge(self.error, outcome.error);
-    }
-}
-
 async fn recovery_pass(
     context: &Arc<DriverContext>,
     config: &RecoveryConfig,
@@ -361,7 +210,6 @@ async fn recovery_pass(
     pass.unvisited_topics = restore.unvisited_topics;
     pass.error = restore.error;
     pass.plan_changed = restore.plan_changed;
-    pass.units_processed = restore.units_processed;
     pass.topics_completed = restore.topics_completed;
     pass.enumerated = restore.enumerated;
     if pass.plan_changed {
@@ -1802,99 +1650,6 @@ mod tests {
         stop_node(local).await;
     }
 
-    #[test]
-    fn remaining_topics_exact() {
-        let first = ::irokle::TopicId::from_bytes([3; 32]);
-        let second = ::irokle::TopicId::from_bytes([4; 32]);
-        let mut rotation = RecoveryRotation::default();
-        rotation.merge(&RecoveryPass {
-            unresolved_topics: BTreeSet::from([first, second]),
-            ..RecoveryPass::default()
-        });
-        rotation.merge(&RecoveryPass {
-            unresolved_topics: BTreeSet::from([first]),
-            ..RecoveryPass::default()
-        });
-        assert_eq!(rotation.remaining_topics(5), 7);
-    }
-
-    #[test]
-    fn baseline_is_monotonic() {
-        let first = ::irokle::TopicId::from_bytes([5; 32]);
-        let second = ::irokle::TopicId::from_bytes([6; 32]);
-        let failure = |topics| RecoveryFailure {
-            unresolved_topics: topics,
-            error: Some(RecoveryError::PeerUnavailable),
-        };
-        let mut baseline = RecoveryBaseline::new(&failure(BTreeSet::from([first])));
-
-        assert!(!baseline.note_failure(&failure(BTreeSet::from([first]))));
-        assert!(!baseline.note_failure(&failure(BTreeSet::from([first, second]))));
-        assert!(baseline.note_failure(&failure(BTreeSet::new())));
-        assert!(!baseline.note_failure(&failure(BTreeSet::from([first]))));
-
-        let cleared = RecoveryFailure {
-            unresolved_topics: BTreeSet::from([first]),
-            error: None,
-        };
-        assert!(baseline.note_failure(&cleared));
-        assert!(!baseline.note_failure(&cleared));
-    }
-
-    #[test]
-    fn storage_fail_stalls() {
-        // A pass that could not enumerate work must not claim progress or
-        // wipe the baseline, so the stall signal survives storage hiccups.
-        let topic = ::irokle::TopicId::from_bytes([8; 32]);
-        let mut rotation = RecoveryRotation::default();
-        let mut baseline = None;
-        let mut first_rotation = true;
-        let stalled = RecoveryPass {
-            unresolved_topics: BTreeSet::from([topic]),
-            error: Some(RecoveryError::PeerUnavailable),
-            enumerated: true,
-            ..RecoveryPass::default()
-        };
-        let seeded =
-            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &stalled);
-        assert!(matches!(
-            seeded,
-            RecoveryDecision::Retry {
-                progress: false,
-                ..
-            }
-        ));
-
-        let blind = RecoveryPass {
-            error: Some(RecoveryError::Storage),
-            ..RecoveryPass::default()
-        };
-        let decision =
-            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &blind);
-        assert_eq!(
-            decision,
-            RecoveryDecision::Retry {
-                failure: RecoveryFailure {
-                    unresolved_topics: BTreeSet::new(),
-                    error: Some(RecoveryError::Storage),
-                },
-                progress: false,
-                enumerated: false,
-            }
-        );
-
-        let repeat =
-            apply_recovery_pass(&mut rotation, &mut baseline, &mut first_rotation, &stalled);
-        assert!(matches!(
-            repeat,
-            RecoveryDecision::Retry {
-                progress: false,
-                enumerated: true,
-                ..
-            }
-        ));
-    }
-
     #[tokio::test]
     async fn restore_stops_cancelled() {
         let dir = tempdir().expect("tempdir must open");
@@ -1988,62 +1743,6 @@ mod tests {
         assert!(pass.wrapped);
         assert!(!pass.enumerated);
         assert_eq!(cursor, bound);
-    }
-
-    #[test]
-    fn rotation_keeps_failure() {
-        let first = ::irokle::TopicId::from_bytes([1; 32]);
-        let mut rotation = RecoveryRotation::default();
-        rotation.merge(&RecoveryPass {
-            unresolved_topics: BTreeSet::from([first]),
-            error: Some(RecoveryError::PeerUnavailable),
-            more_local_work: true,
-            ..RecoveryPass::default()
-        });
-        rotation.merge(&RecoveryPass::default());
-
-        assert_eq!(rotation.unresolved_topics, BTreeSet::from([first]));
-        assert_eq!(rotation.error, Some(RecoveryError::PeerUnavailable));
-    }
-
-    #[test]
-    fn recovery_tracks_passes() {
-        let status = RecoveryStatus::new();
-        assert_eq!(status.snapshot().state, RecoveryState::Pending);
-        assert_eq!(status.snapshot().last_progress_timestamp, 0);
-
-        status.begin_pass();
-        let started = status.snapshot();
-        assert_eq!(started.state, RecoveryState::Running);
-        assert!(started.last_progress_timestamp > 0);
-
-        status.set_remaining(5);
-        let unchanged = status.snapshot();
-        assert_eq!(unchanged.topics_remaining, 5);
-        assert_eq!(
-            unchanged.last_progress_timestamp,
-            started.last_progress_timestamp
-        );
-
-        status.note_progress(4);
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot.topics_remaining, 4);
-        assert!(snapshot.last_progress_timestamp > 0);
-
-        status.finish_pass(
-            RecoveryOutcome::Partial,
-            Some(RecoveryError::PeerUnavailable),
-        );
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot.state, RecoveryState::Degraded);
-        assert_eq!(snapshot.last_error, Some(RecoveryError::PeerUnavailable));
-        assert_eq!(status.pass_total(RecoveryOutcome::Partial), 1);
-
-        status.finish_pass(RecoveryOutcome::Success, None);
-        let snapshot = status.snapshot();
-        assert_eq!(snapshot.state, RecoveryState::Converged);
-        assert_eq!(snapshot.last_error, None);
-        assert_eq!(status.pass_total(RecoveryOutcome::Success), 1);
     }
 
     #[tokio::test]
