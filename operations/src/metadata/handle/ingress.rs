@@ -285,9 +285,22 @@ async fn delete_mirror(
 impl MetadataHandle {
     async fn graph_request(
         &self,
+        context: &DriverContext,
         peer: NodeId,
         message: MetadataTransportMessage,
     ) -> MetadataTransportMessage {
+        let Some(graph) = context.graph_handle.as_ref() else {
+            return match message {
+                MetadataTransportMessage::QueryGraphs { .. } => {
+                    MetadataTransportMessage::QueryResults {
+                        result: Err(MetadataReadError::Unavailable),
+                    }
+                }
+                _ => MetadataTransportMessage::SearchResults {
+                    result: Err(MetadataReadError::Unavailable),
+                },
+            };
+        };
         match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_token,
@@ -299,6 +312,7 @@ impl MetadataHandle {
                         Ok(auth_context) => {
                             match query_local_graphs(
                                 self.inner.clone(),
+                                graph,
                                 auth_context,
                                 graph_iris,
                                 sparql,
@@ -329,6 +343,7 @@ impl MetadataHandle {
                     match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
                             self.inner.clone(),
+                            graph,
                             auth_context,
                             graph_iris,
                             query,
@@ -365,6 +380,7 @@ impl MetadataHandle {
                     match self.authorize_read_peer(peer, auth_token, false).await {
                         Ok(auth_context) => match search_local_graphs(
                             self.inner.clone(),
+                            graph,
                             auth_context,
                             graph_iris,
                             query,
@@ -1023,45 +1039,28 @@ impl MetadataHandle {
         }
     }
 
-    #[tracing::instrument(
-        name = "metadata.remote.inbound",
-        level = "debug",
-        skip(self, stream),
-        fields(
-            peer = ?peer,
-            request = field::Empty,
-            response = field::Empty,
-            read_ms = field::Empty,
-            process_ms = field::Empty,
-            drain_ms = field::Empty,
-            write_ms = field::Empty,
-            elapsed_ms = field::Empty,
-        )
-    )]
-    pub async fn handle_inbound_stream(
+    /// Reads one request frame from an inbound metadata stream under the shared frame budget.
+    pub(crate) async fn read_request(
+        &self,
+        stream: &mut BiStream,
+    ) -> Result<(MetadataTransportMessage, tokio::sync::OwnedSemaphorePermit), MetadataError> {
+        read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await
+    }
+
+    /// Answers one metadata request from `peer`; requests of other domains are rejected.
+    pub(crate) async fn answer_request(
         &self,
         context: &Arc<DriverContext>,
-        mut stream: BiStream,
         peer: NodeId,
         metadata_bytes: u64,
-    ) -> Result<(), MetadataError> {
-        let total_started = Instant::now();
-        let audit_deadline = tokio::time::Instant::now()
-            + Duration::from_secs(super::super::audit::AUDIT_DEADLINE_SECS);
-        let read_started = Instant::now();
-        let (message, frame_budget) =
-            read_budget(&mut stream.1, &self.inner.inbound_frame_bytes).await?;
-        let is_audit = matches!(&message, MetadataTransportMessage::ForwardAuditPage { .. });
-        let span = Span::current();
-        record_elapsed_ms(&span, "read_ms", read_started);
-        span.record("request", transport_message_kind(&message));
-
-        let process_started = Instant::now();
-        let (response, response_body) = match message {
+        audit_deadline: tokio::time::Instant,
+        message: MetadataTransportMessage,
+    ) -> (MetadataTransportMessage, Option<Vec<u8>>) {
+        match message {
             message @ (MetadataTransportMessage::QueryGraphs { .. }
             | MetadataTransportMessage::SearchGraphs { .. }
             | MetadataTransportMessage::FilteredSearchGraphs { .. }) => {
-                (self.graph_request(peer, message).await, None)
+                (self.graph_request(context, peer, message).await, None)
             }
             message @ MetadataTransportMessage::ReferencePreflight { .. } => {
                 (self.preflight_request(context, peer, message).await, None)
@@ -1159,99 +1158,6 @@ impl MetadataHandle {
                 };
                 (MetadataTransportMessage::SetPreviewResults { result }, None)
             }
-            MetadataTransportMessage::StagingSpec {
-                transfer_id,
-                job_id,
-            } => {
-                let job = (transfer_id, job_id);
-                let spec = crate::distribution::imports::staging_spec(context, peer, job);
-                let result = spec.await.map(Box::new);
-                (MetadataTransportMessage::StagingSpecResult { result }, None)
-            }
-            MetadataTransportMessage::ReferencePage { page } => {
-                let answer = Box::pin(crate::replication::page::deliver::serve_page(
-                    context, peer, *page,
-                ));
-                let answer = answer.await;
-                (
-                    MetadataTransportMessage::ReferencePageAnswer { answer },
-                    None,
-                )
-            }
-            MetadataTransportMessage::HandRealmKey { key } => {
-                let stored = crate::realm::promote_node::serve_realm_key(context, peer, key);
-                let result = Box::pin(stored).await;
-                (MetadataTransportMessage::RealmKeyStored { result }, None)
-            }
-            MetadataTransportMessage::RealmSecret { entry, revision } => {
-                let request = aruna_core::realm_vault::RealmSecretRef { entry, revision };
-                let key = self.realm_vault_key();
-                let served =
-                    crate::realm_vault::serve_realm_secret(context, key.as_deref(), peer, request);
-                let result = Box::pin(served).await;
-                (MetadataTransportMessage::RealmSecretResult { result }, None)
-            }
-            MetadataTransportMessage::OpenSetting { target, bytes } => {
-                let key = self.realm_seal_key();
-                let served =
-                    crate::realm_vault::serve_open(context, key.as_deref(), peer, target, bytes);
-                let result = Box::pin(served).await;
-                (MetadataTransportMessage::OpenSettingResult { result }, None)
-            }
-            MetadataTransportMessage::StoreArtifact { chunk } => {
-                let stored = crate::plugins::artifacts::serve_store(context, peer, chunk);
-                let result = Box::pin(stored).await;
-                (MetadataTransportMessage::ArtifactStored { result }, None)
-            }
-            MetadataTransportMessage::FetchArtifact { digest, index } => {
-                let fetched = crate::plugins::artifacts::serve_fetch(context, peer, digest, index);
-                let result = Box::pin(fetched).await;
-                (MetadataTransportMessage::FetchedArtifact { result }, None)
-            }
-            MetadataTransportMessage::ProbeClock => {
-                let result = Box::pin(crate::plugins::clock::serve_clock(context, peer)).await;
-                (MetadataTransportMessage::ClockProbed { result }, None)
-            }
-            MetadataTransportMessage::ForwardEvents { batch } => {
-                let decided = crate::plugins::decide::serve_events(context, peer, batch);
-                let result = Box::pin(decided).await;
-                (MetadataTransportMessage::EventsDecided { result }, None)
-            }
-            MetadataTransportMessage::ReleaseSecret { request } => {
-                let keys = crate::plugins::release::ReleaseKeys {
-                    seal: self.realm_seal_key(),
-                    vault: self.realm_vault_key(),
-                };
-                let released = crate::plugins::release::serve_release(context, keys, peer, request);
-                let result = Box::pin(released).await;
-                (MetadataTransportMessage::SecretReleased { result }, None)
-            }
-            MetadataTransportMessage::CheckNodeSecret { name, kind } => {
-                let checked = crate::plugins::bound::serve_node_check(context, peer, name, kind);
-                let result = Box::pin(checked).await;
-                (MetadataTransportMessage::NodeSecretChecked { result }, None)
-            }
-            MetadataTransportMessage::PromotionCheck => {
-                let ready = crate::realm::promote_node::serve_promotion_check(context, peer);
-                let result = Box::pin(ready).await;
-                (MetadataTransportMessage::PromotionReady { result }, None)
-            }
-            MetadataTransportMessage::ResolveJobInputs {
-                auth_token,
-                request,
-            } => {
-                let resolved = crate::jobs::lifecycle::ingress::serve_input_resolve(
-                    context, peer, auth_token, *request,
-                );
-                let result = Box::pin(resolved).await;
-                (MetadataTransportMessage::ResolvedJobInputs { result }, None)
-            }
-            MetadataTransportMessage::JobInputPage { submission, digest } => {
-                let page =
-                    crate::jobs::records::pages::serve_page(context, peer, submission, digest);
-                let page = Box::pin(page).await;
-                (MetadataTransportMessage::InputPageResult { page }, None)
-            }
             message @ (MetadataTransportMessage::CreateSyncMirror { .. }
             | MetadataTransportMessage::DeleteSyncMirror { .. }) => {
                 (self.mirror_request(context, peer, message).await, None)
@@ -1305,49 +1211,49 @@ impl MetadataHandle {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string()),
                 None,
             ),
-        };
-        record_elapsed_ms(&span, "process_ms", process_started);
-
-        let drain_started = Instant::now();
-        let drain_result = if is_audit {
-            drain_stream_at(&mut stream.1, audit_deadline).await
-        } else {
-            drain_request_stream(&mut stream).await
-        };
-        if let Err(error) = drain_result {
-            if is_audit {
-                close_stream_at(&mut stream, audit_deadline);
-            }
-            return Err(error);
         }
-        record_elapsed_ms(&span, "drain_ms", drain_started);
-
-        let write_started = Instant::now();
-        let response_written = if is_audit {
-            write_message_at(&mut stream, &response, audit_deadline)
-                .await
-                .is_ok()
-        } else {
-            write_transport_message(&mut stream, &response)
-                .await
-                .is_ok()
-        };
-        if response_written && let Some(body) = response_body {
-            if is_audit {
-                let _ = write_body_at(&mut stream, &body, audit_deadline).await;
-            } else {
-                let _ = write_stream_body(&mut stream, &body).await;
-            }
-        }
-        record_elapsed_ms(&span, "write_ms", write_started);
-        if is_audit {
-            close_stream_at(&mut stream, audit_deadline);
-        } else {
-            close_stream(&mut stream).await;
-        }
-        drop(frame_budget);
-        record_elapsed_ms(&span, "elapsed_ms", total_started);
-        span.record("response", transport_message_kind(&response));
-        Ok(())
     }
+}
+
+/// Drains the request, writes the answer and closes the stream. An audit answer keeps
+/// the audit deadline for every step.
+pub(crate) async fn write_answer(
+    mut stream: BiStream,
+    audit_deadline: Option<tokio::time::Instant>,
+    response: &MetadataTransportMessage,
+    response_body: Option<Vec<u8>>,
+) -> Result<(), MetadataError> {
+    let span = Span::current();
+    let drain_started = Instant::now();
+    let drain_result = match audit_deadline {
+        Some(deadline) => drain_stream_at(&mut stream.1, deadline).await,
+        None => drain_request_stream(&mut stream).await,
+    };
+    if let Err(error) = drain_result {
+        if let Some(deadline) = audit_deadline {
+            close_stream_at(&mut stream, deadline);
+        }
+        return Err(error);
+    }
+    record_elapsed_ms(&span, "drain_ms", drain_started);
+
+    let write_started = Instant::now();
+    let response_written = match audit_deadline {
+        Some(deadline) => write_message_at(&mut stream, response, deadline)
+            .await
+            .is_ok(),
+        None => write_transport_message(&mut stream, response).await.is_ok(),
+    };
+    if response_written && let Some(body) = response_body {
+        let _ = match audit_deadline {
+            Some(deadline) => write_body_at(&mut stream, &body, deadline).await,
+            None => write_stream_body(&mut stream, &body).await,
+        };
+    }
+    record_elapsed_ms(&span, "write_ms", write_started);
+    match audit_deadline {
+        Some(deadline) => close_stream_at(&mut stream, deadline),
+        None => close_stream(&mut stream).await,
+    }
+    Ok(())
 }
