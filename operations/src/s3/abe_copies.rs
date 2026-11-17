@@ -4,7 +4,7 @@
 
 use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
-use crate::s3::object::put::abe::{abe_reads, envelope_rows, parse_abe};
+use crate::s3::object::put::abe::{abe_reads, envelope_rows, keyed, parse_abe};
 use crate::s3::usage::QuotaGate;
 use crate::s3::usage::RowChange;
 use crate::s3::usage::UsageCounterUpdate;
@@ -62,13 +62,6 @@ enum State {
 }
 
 type Step = Result<Next<CopyOutcome>, AbeError>;
-
-/// The values of a read as the keyed rows `parse_abe` takes.
-fn keyed(values: &[Option<Value>]) -> Vec<(Key, Option<Value>)> {
-    (values.iter())
-        .map(|value| (Key::from(Vec::new()), value.clone()))
-        .collect()
-}
 
 /// Envelopes one pending copy with the current epoch under the publication fence, in one
 /// transaction.

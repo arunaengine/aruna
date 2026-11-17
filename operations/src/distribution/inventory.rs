@@ -146,7 +146,7 @@ impl StagedCall {
 
 /// The answer of an outside read: a child outcome when a host ran it with [`StagedCall::into_call`],
 /// or the plain answer when a driver ran it itself.
-fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
+pub(crate) fn outside_answer(result: IoResult) -> Result<IoResult, IoError> {
     match result {
         IoResult::Child(_) => result.child::<IoResult, IoError>()?,
         other => Ok(other),

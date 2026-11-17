@@ -103,6 +103,13 @@ pub(crate) fn abe_reads(key: BucketKeyRef) -> Vec<(String, Key)> {
     ]
 }
 
+/// The values of a read as the keyed rows `parse_abe` takes.
+pub(crate) fn keyed(values: &[Option<Value>]) -> Vec<(Key, Option<Value>)> {
+    (values.iter())
+        .map(|value| (Key::from(Vec::new()), value.clone()))
+        .collect()
+}
+
 /// Parses the answer to `abe_reads(key)`; the parameters must belong to `key`.
 pub(crate) fn parse_abe(
     values: &[(Key, Option<Value>)],
