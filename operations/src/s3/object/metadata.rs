@@ -325,7 +325,7 @@ impl Operation for QueueRefreshOperation {
                 self.schedule_drain()
             }
             (_, other) => self.fail(ReferenceRefreshError::UnexpectedEvent(
-                other.label().to_string(),
+                Event::Storage(other).label().to_string(),
             )),
         }
     }
@@ -711,7 +711,7 @@ async fn first_due(
             next_start_after,
         } => Ok((values, next_start_after.is_some())),
         other => Err(ReferenceRefreshError::UnexpectedEvent(
-            other.label().to_string(),
+            Event::Storage(other).label().to_string(),
         )),
     }
 }
@@ -793,7 +793,7 @@ async fn read_job(
             Ok(value.map(|value| postcard::from_bytes(&value)))
         }
         other => Err(ReferenceRefreshError::UnexpectedEvent(
-            other.label().to_string(),
+            Event::Storage(other).label().to_string(),
         )),
     }
 }
@@ -806,7 +806,7 @@ async fn delete_rows(
     match send(storage, StorageEffect::BatchDelete { deletes, txn_id }).await? {
         StorageEvent::BatchDeleteResult { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(
-            other.label().to_string(),
+            Event::Storage(other).label().to_string(),
         )),
     }
 }
@@ -822,7 +822,7 @@ async fn settle_job(
         StorageEvent::TransactionStarted { txn_id } => txn_id,
         other => {
             return Err(ReferenceRefreshError::UnexpectedEvent(
-                other.label().to_string(),
+                Event::Storage(other).label().to_string(),
             ));
         }
     };
@@ -844,7 +844,7 @@ async fn settle_job(
         let writes = job_entries(next)?;
         match send(storage, StorageEffect::BatchWrite { writes, txn_id: Some(txn_id) }).await? {
             StorageEvent::BatchWriteResult { .. } => Ok(()),
-            other => Err(ReferenceRefreshError::UnexpectedEvent(other.label().to_string())),
+            other => Err(ReferenceRefreshError::UnexpectedEvent(Event::Storage(other).label().to_string())),
         }
     }
     .await;
@@ -858,7 +858,7 @@ async fn settle_job(
     match send(storage, effect).await? {
         StorageEvent::TransactionCommitted { .. } => Ok(()),
         other => Err(ReferenceRefreshError::UnexpectedEvent(
-            other.label().to_string(),
+            Event::Storage(other).label().to_string(),
         )),
     }
 }

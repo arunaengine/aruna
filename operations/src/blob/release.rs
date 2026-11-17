@@ -643,7 +643,7 @@ async fn send(context: &DriverContext, effect: StorageEffect) -> Event {
 fn storage(effect: Effect) -> Result<StorageEffect, String> {
     match effect {
         Effect::Storage(effect) => Ok(effect),
-        other => Err(format!("not a storage effect: {}", other.label())),
+        _ => Err("not a storage effect".to_string()),
     }
 }
 
