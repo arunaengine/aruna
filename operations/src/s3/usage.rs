@@ -212,6 +212,33 @@ pub fn count_upload(bucket: &str, uploads: i128, txn_id: TxnId) -> Effect {
     })
 }
 
+/// Commits one counter update in its own transaction, as a writer's commit would.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct ApplyUsage(pub(crate) UsageCounterUpdate);
+
+#[cfg(test)]
+impl aruna_core::operation::Operation for ApplyUsage {
+    type Output = ();
+    type Error = UsageUpdateError;
+
+    fn first(&mut self) -> Result<aruna_core::calls::Next<()>, UsageUpdateError> {
+        let call = self.0.start_calls().into_call();
+        Ok(aruna_core::calls::Next::Call(call))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<aruna_core::calls::Next<()>, UsageUpdateError> {
+        Ok(match self.0.step_calls(result)? {
+            Some(call) => aruna_core::calls::Next::Call(call.into_call()),
+            None => aruna_core::calls::Next::Done(()),
+        })
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
+    }
+}
+
 /// Counts `uploads` more or fewer open uploads of `bucket` when the transaction commits.
 pub fn upload_count(bucket: &str, uploads: i128) -> IoCall {
     let delta = BucketDelta {

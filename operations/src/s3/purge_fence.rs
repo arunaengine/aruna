@@ -59,10 +59,17 @@ pub fn check_write_fence(event: Event, bucket: &str, key: &str) -> Result<(), Pu
         Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
         event => return Err(PurgeFenceError::Unexpected(event.label().to_string())),
     };
+    check_fence_row(value.as_deref(), bucket, key)
+}
+
+/// Checks the fence row of [`fence_key`] that a write to `key` read.
+pub fn check_fence_row(
+    value: Option<&[u8]>,
+    bucket: &str,
+    key: &str,
+) -> Result<(), PurgeFenceError> {
     let fence = value
-        .map(|value| {
-            StoragePurgeFence::from_bytes(value.as_ref()).map_err(|_| PurgeFenceError::Invalid)
-        })
+        .map(|value| StoragePurgeFence::from_bytes(value).map_err(|_| PurgeFenceError::Invalid))
         .transpose()?;
     check_decoded_fence(fence.as_ref(), bucket, key)
 }
