@@ -5,62 +5,71 @@
 use std::collections::BTreeMap;
 
 use crate::NodeId;
+use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::compute::quota::ComputeDepartureReport;
 use crate::effects::{Effect, StorageEffect};
 use crate::errors::StorageError;
 use crate::events::{Event, StorageEvent};
 use crate::keyspaces::{COMPUTE_DEPARTURE_KEYSPACE, NODE_INFO_KEYSPACE};
-use crate::operation::EffectOperation;
+use crate::operation::{EffectOperation, Operation};
 use crate::structs::storage::node_info::{NodeInfoDocument, node_info_key};
-use crate::types::{Effects, Key, Value};
+use crate::types::{Effects, Key, KeySpace, Value};
 use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum NodeInfoError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error("a node info document is unreadable: {0}")]
     Decode(String),
     #[error("a node info document breaks its bounds: {0}")]
     Invalid(String),
-    #[error("unexpected event for the node info read")]
-    UnexpectedEvent,
-    #[error("the node info read has not finished")]
-    Unfinished,
+}
+
+/// The info document rows of `node_ids`, in this order.
+fn info_reads(node_ids: impl Iterator<Item = NodeId>) -> Vec<(KeySpace, Key)> {
+    node_ids
+        .map(|node_id| {
+            (
+                NODE_INFO_KEYSPACE.to_string(),
+                Key::from(node_info_key(node_id)),
+            )
+        })
+        .collect()
 }
 
 /// The info documents of `node_ids` that exist, keyed by node id.
 #[derive(Debug, PartialEq)]
 pub struct ReadInfoOperation {
     node_ids: Vec<NodeId>,
-    started: bool,
-    result: Option<Result<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>>,
 }
 
 impl ReadInfoOperation {
     pub fn new(node_ids: Vec<NodeId>) -> Self {
-        Self {
-            node_ids,
-            started: false,
-            result: None,
-        }
+        Self { node_ids }
+    }
+}
+
+impl Operation for ReadInfoOperation {
+    type Output = BTreeMap<NodeId, NodeInfoDocument>;
+    type Error = NodeInfoError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, NodeInfoError> {
+        let reads = info_reads(self.node_ids.iter().copied());
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn decide(&self, event: Event) -> Result<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError> {
-        if !self.started {
-            return Err(NodeInfoError::UnexpectedEvent);
-        }
-        let values = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            _ => return Err(NodeInfoError::UnexpectedEvent),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeInfoError> {
+        let IoResult::Values(values) = result else {
+            return Err(IoError::Unexpected {
+                expected: "IoResult::Values",
+                got: "another result",
+            }
+            .into());
         };
-        if values.len() != self.node_ids.len() {
-            return Err(NodeInfoError::UnexpectedEvent);
-        }
         let mut documents = BTreeMap::new();
-        for (node_id, (_, value)) in self.node_ids.iter().zip(values) {
+        for (node_id, value) in self.node_ids.iter().zip(values) {
             let Some(bytes) = value else {
                 continue;
             };
@@ -68,54 +77,7 @@ impl ReadInfoOperation {
                 .map_err(|error| NodeInfoError::Decode(error.to_string()))?;
             documents.insert(*node_id, document);
         }
-        Ok(documents)
-    }
-}
-
-impl EffectOperation for ReadInfoOperation {
-    type Output = BTreeMap<NodeId, NodeInfoDocument>;
-    type Error = NodeInfoError;
-
-    fn start(&mut self) -> Effects {
-        self.started = true;
-        if self.node_ids.is_empty() {
-            self.result = Some(Ok(BTreeMap::new()));
-            return smallvec![];
-        }
-        let reads = self
-            .node_ids
-            .iter()
-            .map(|node_id| {
-                (
-                    NODE_INFO_KEYSPACE.to_string(),
-                    Key::from(node_info_key(*node_id)),
-                )
-            })
-            .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        self.result = Some(match self.result {
-            Some(_) => Err(NodeInfoError::UnexpectedEvent),
-            None => self.decide(event),
-        });
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(NodeInfoError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(Next::Done(documents))
     }
 }
 
@@ -124,25 +86,19 @@ impl EffectOperation for ReadInfoOperation {
 #[derive(Debug, PartialEq)]
 pub struct InstallInfoOperation {
     documents: Vec<NodeInfoDocument>,
-    writing: bool,
-    result: Option<Result<(), NodeInfoError>>,
 }
 
 impl InstallInfoOperation {
     pub fn new(documents: Vec<NodeInfoDocument>) -> Self {
-        Self {
-            documents,
-            writing: false,
-            result: None,
-        }
+        Self { documents }
     }
 
-    fn writes(&self, values: Vec<(Key, Option<Value>)>) -> Result<Effects, NodeInfoError> {
-        if values.len() != self.documents.len() {
-            return Err(NodeInfoError::UnexpectedEvent);
-        }
+    fn writes(
+        &self,
+        values: Vec<Option<Value>>,
+    ) -> Result<Vec<(KeySpace, Key, Value)>, NodeInfoError> {
         let mut writes = Vec::new();
-        for (document, (_, stored)) in self.documents.iter().zip(values) {
+        for (document, stored) in self.documents.iter().zip(values) {
             let stored = stored
                 .map(|bytes| postcard::from_bytes::<NodeInfoDocument>(bytes.as_ref()))
                 .transpose()
@@ -157,81 +113,35 @@ impl InstallInfoOperation {
             let key = Key::from(node_info_key(document.node_id));
             writes.push((NODE_INFO_KEYSPACE.to_string(), key, Value::from(row)));
         }
-        if writes.is_empty() {
-            return Ok(smallvec![]);
-        }
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })])
+        Ok(writes)
     }
 }
 
-impl EffectOperation for InstallInfoOperation {
+impl Operation for InstallInfoOperation {
     type Output = ();
     type Error = NodeInfoError;
 
-    fn start(&mut self) -> Effects {
-        if self.documents.is_empty() {
-            self.result = Some(Ok(()));
-            return smallvec![];
-        }
-        let reads = (self.documents.iter())
-            .map(|document| {
-                let key = Key::from(node_info_key(document.node_id));
-                (NODE_INFO_KEYSPACE.to_string(), key)
-            })
-            .collect();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<()>, NodeInfoError> {
+        let reads = info_reads(self.documents.iter().map(|document| document.node_id));
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.result.is_some() {
-            self.result = Some(Err(NodeInfoError::UnexpectedEvent));
-            return smallvec![];
-        }
-        let outcome = match (self.writing, event) {
-            (false, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                match self.writes(values) {
-                    Ok(effects) if effects.is_empty() => Some(Ok(())),
-                    Ok(effects) => {
-                        self.writing = true;
-                        return effects;
-                    }
-                    Err(error) => Some(Err(error)),
-                }
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, NodeInfoError> {
+        match result {
+            IoResult::Values(values) => Ok(Next::Call(IoCall::Write(self.writes(values)?))),
+            IoResult::Done => Ok(Next::Done(())),
+            _ => Err(IoError::Unexpected {
+                expected: "IoResult::Values or IoResult::Done",
+                got: "another result",
             }
-            (true, Event::Storage(StorageEvent::BatchWriteResult { .. })) => Some(Ok(())),
-            (_, Event::Storage(StorageEvent::Error { error })) => Some(Err(error.into())),
-            _ => Some(Err(NodeInfoError::UnexpectedEvent)),
-        };
-        self.result = outcome;
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(NodeInfoError::Unfinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+            .into()),
+        }
     }
 }
 
 #[cfg(test)]
 mod info_tests {
-    use crate::operation_check::{
-        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
-    };
     use crate::structs::storage::node_info::{NodeUrls, NodeUtilization};
-    use crate::types::Value;
 
     use super::*;
 
@@ -265,98 +175,41 @@ mod info_tests {
         }
     }
 
-    fn reads(node_ids: &[NodeId]) -> Effect {
-        Effect::Storage(StorageEffect::BatchRead {
-            reads: node_ids
-                .iter()
-                .map(|node_id| {
-                    (
-                        NODE_INFO_KEYSPACE.to_string(),
-                        Key::from(node_info_key(*node_id)),
-                    )
-                })
-                .collect(),
-            txn_id: None,
-        })
+    fn reads(node_ids: &[NodeId]) -> Next<BTreeMap<NodeId, NodeInfoDocument>> {
+        Next::Call(IoCall::Read(info_reads(node_ids.iter().copied())))
     }
 
-    fn answer(values: Vec<Option<Vec<u8>>>) -> Event {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: values
-                .into_iter()
-                .map(|value| (Key::from(Vec::new()), value.map(Value::from)))
-                .collect(),
-        })
+    fn row(document: &NodeInfoDocument) -> Option<Value> {
+        Some(Value::from(postcard::to_allocvec(document).unwrap()))
+    }
+
+    fn garbled() -> Option<Value> {
+        Some(Value::from(vec![0xff; 3]))
     }
 
     #[test]
     fn keeps_existing_documents() {
-        let stored = postcard::to_allocvec(&document(node(2))).unwrap();
         let mut operation = ReadInfoOperation::new(vec![node(1), node(2)]);
-        check_trace(
-            &mut operation,
-            &[reads(&[node(1), node(2)])],
-            vec![(answer(vec![None, Some(stored)]), vec![])],
-        );
-        let documents = operation.finalize().unwrap();
-        assert_eq!(documents, BTreeMap::from([(node(2), document(node(2)))]));
+        assert_eq!(operation.first(), Ok(reads(&[node(1), node(2)])));
+        let answer = IoResult::Values(vec![None, row(&document(node(2)))]);
+        let documents = BTreeMap::from([(node(2), document(node(2)))]);
+        assert_eq!(operation.next(answer), Ok(Next::Done(documents)));
+        let mut empty = ReadInfoOperation::new(Vec::new());
+        assert_eq!(empty.first(), Ok(Next::Call(IoCall::Read(Vec::new()))));
+        let done = empty.next(IoResult::Values(Vec::new()));
+        assert_eq!(done, Ok(Next::Done(BTreeMap::new())));
     }
 
     #[test]
-    fn empty_reads_nothing() {
-        let mut operation = ReadInfoOperation::new(Vec::new());
-        check_trace(&mut operation, &[], vec![]);
-        assert_eq!(operation.finalize(), Ok(BTreeMap::new()));
-    }
-
-    #[test]
-    fn failures_end_read() {
-        let mut failed = ReadInfoOperation::new(vec![node(1)]);
-        failed.start();
-        failed.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::Timeout,
-        }));
-        assert_eq!(failed.finalize(), Err(StorageError::Timeout.into()));
-
-        let mut garbled = ReadInfoOperation::new(vec![node(1)]);
-        garbled.start();
-        garbled.step(answer(vec![Some(vec![0xff; 3])]));
-        assert!(matches!(garbled.finalize(), Err(NodeInfoError::Decode(_))));
-
-        let mut short = ReadInfoOperation::new(vec![node(1), node(2)]);
-        short.start();
-        short.step(answer(vec![None]));
-        assert_eq!(short.finalize(), Err(NodeInfoError::UnexpectedEvent));
-    }
-
-    #[test]
-    fn rejects_stray_events() {
-        let started = || {
-            let mut operation = ReadInfoOperation::new(vec![node(1)]);
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::Error { .. }));
-        for (label, effects, error) in rejects_events(started, sample_events, expected) {
-            assert!(effects.is_empty(), "{label} emitted effects");
-            assert_eq!(error, NodeInfoError::UnexpectedEvent, "{label}");
-        }
-        let fresh = || ReadInfoOperation::new(vec![node(1)]);
-        let refused = rejects_events(fresh, sample_events, |_| false);
-        assert_eq!(refused.len(), sample_events().len());
-        let mut answered = started();
-        answered.step(answer(vec![None]));
-        answered.step(answer(vec![None]));
-        assert_eq!(answered.finalize(), Err(NodeInfoError::UnexpectedEvent));
-    }
-
-    #[test]
-    fn abort_and_finalize() {
-        let mut operation = ReadInfoOperation::new(vec![node(1)]);
-        check_abort(&mut operation, &[]);
-        operation.start();
-        check_abort(&mut operation, &[]);
-        rejects_finalize(operation);
+    fn refuses_bad_answers() {
+        let mut garbled_row = ReadInfoOperation::new(vec![node(1)]);
+        let answer = garbled_row.next(IoResult::Values(vec![garbled()]));
+        assert!(matches!(answer, Err(NodeInfoError::Decode(_))));
+        let mut wrong = ReadInfoOperation::new(vec![node(1)]);
+        assert!(matches!(
+            wrong.next(IoResult::Done),
+            Err(NodeInfoError::Io(_))
+        ));
     }
 
     #[test]
@@ -365,57 +218,30 @@ mod info_tests {
         let mut stale = changed.clone();
         stale.updated_at_ms = 7;
         let mut operation = InstallInfoOperation::new(vec![same.clone(), changed.clone()]);
-        let stored = vec![
-            Some(postcard::to_allocvec(&same).unwrap()),
-            Some(postcard::to_allocvec(&stale).unwrap()),
-        ];
-        let write = Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![(
-                NODE_INFO_KEYSPACE.to_string(),
-                Key::from(node_info_key(node(2))),
-                Value::from(changed.to_bytes().unwrap()),
-            )],
-            txn_id: None,
-        });
-        let written = Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        });
-        check_trace(
-            &mut operation,
-            &[reads(&[node(1), node(2)])],
-            vec![(answer(stored), vec![write]), (written, vec![])],
+        let first = operation.first().unwrap();
+        assert_eq!(
+            first,
+            Next::Call(IoCall::Read(info_reads([node(1), node(2)].into_iter())))
         );
-        assert_eq!(operation.finalize(), Ok(()));
+        let write = vec![(
+            NODE_INFO_KEYSPACE.to_string(),
+            Key::from(node_info_key(node(2))),
+            Value::from(changed.to_bytes().unwrap()),
+        )];
+        let answer = IoResult::Values(vec![row(&same), row(&stale)]);
+        assert_eq!(operation.next(answer), Ok(Next::Call(IoCall::Write(write))));
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
         // Stored rows that match write nothing; an unreadable row stops the install.
         let mut unchanged = InstallInfoOperation::new(vec![same.clone()]);
-        unchanged.start();
-        let row = Some(postcard::to_allocvec(&same).unwrap());
-        assert!(unchanged.step(answer(vec![row])).is_empty());
-        assert_eq!(unchanged.finalize(), Ok(()));
-        let mut garbled = InstallInfoOperation::new(vec![same]);
-        garbled.start();
-        garbled.step(answer(vec![Some(vec![0xff; 3])]));
-        assert!(matches!(garbled.finalize(), Err(NodeInfoError::Decode(_))));
-    }
-
-    #[test]
-    fn install_rejects_stray() {
-        let started = || {
-            let mut operation = InstallInfoOperation::new(vec![document(node(1))]);
-            operation.start();
-            operation
-        };
-        let expected = |event: &Event| matches!(event, Event::Storage(StorageEvent::Error { .. }));
-        for (label, effects, error) in rejects_events(started, sample_events, expected) {
-            assert!(effects.is_empty(), "{label}");
-            assert_eq!(error, NodeInfoError::UnexpectedEvent, "{label}");
-        }
-        let mut open = started();
-        check_abort(&mut open, &[]);
-        rejects_finalize(open);
-        let mut empty = InstallInfoOperation::new(Vec::new());
-        assert!(empty.start().is_empty());
-        assert_eq!(empty.finalize(), Ok(()));
+        let answer = unchanged.next(IoResult::Values(vec![row(&same)]));
+        assert_eq!(answer, Ok(Next::Call(IoCall::Write(Vec::new()))));
+        let mut stopped = InstallInfoOperation::new(vec![same]);
+        let answer = stopped.next(IoResult::Values(vec![garbled()]));
+        assert!(matches!(answer, Err(NodeInfoError::Decode(_))));
+        assert!(matches!(
+            stopped.next(IoResult::Woke),
+            Err(NodeInfoError::Io(_))
+        ));
     }
 }
 
