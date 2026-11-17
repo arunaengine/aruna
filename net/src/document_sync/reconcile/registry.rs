@@ -32,7 +32,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
     record: MetadataRegistryRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<MetadataPlacementOutcome<()>> {
-    if !registry_identity_valid(&record) {
+    if !record.identity_valid() {
         return Ok(MetadataPlacementOutcome::Rejected);
     }
     let mut base_entries =
@@ -153,7 +153,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         };
         if existing
             .as_ref()
-            .is_some_and(|existing| !registry_identity_matches(existing, &record))
+            .is_some_and(|existing| !existing.same_identity(&record))
         {
             let _ = storage
                 .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
@@ -162,7 +162,7 @@ pub(in crate::document_sync) async fn store_registry_upsert(
         }
         if let Some(existing) = existing
             .as_ref()
-            .filter(|existing| delete_present || registry_is_stale(existing, &record))
+            .filter(|existing| delete_present || record.freshness() <= existing.freshness())
         {
             let repairs = match registry_sidecar_repairs(storage, existing, txn_id).await {
                 Ok(repairs) => repairs,
@@ -714,8 +714,7 @@ pub(in crate::document_sync) async fn current_lifecycle_entries(
                 acceptance_to_write = Some(event);
             }
         } else if accepted.as_ref().is_none_or(|accepted| {
-            !event_is_create(accepted)
-                || !registry_identity_matches(&accepted.record, &event.record)
+            !event_is_create(accepted) || !accepted.record.same_identity(&event.record)
         }) {
             return Ok(None);
         }
@@ -790,44 +789,8 @@ pub(in crate::document_sync) async fn lifecycle_stale_txn(
     Ok(incoming.current <= local.current)
 }
 
-pub(in crate::document_sync) fn registry_is_stale(
-    existing: &MetadataRegistryRecord,
-    incoming: &MetadataRegistryRecord,
-) -> bool {
-    metadata_registry_freshness(incoming) <= metadata_registry_freshness(existing)
-}
-
-pub(in crate::document_sync) fn registry_identity_matches(
-    existing: &MetadataRegistryRecord,
-    incoming: &MetadataRegistryRecord,
-) -> bool {
-    existing.realm_id == incoming.realm_id
-        && existing.group_id == incoming.group_id
-        && existing.document_id == incoming.document_id
-        && existing.document_path == incoming.document_path
-        && existing.graph_iri == incoming.graph_iri
-        && existing.permission_path == incoming.permission_path
-        && existing.placement == incoming.placement
-        && existing.created_at_ms == incoming.created_at_ms
-        && existing.establishing_event_id == incoming.establishing_event_id
-}
-
-pub(in crate::document_sync) fn registry_identity_valid(record: &MetadataRegistryRecord) -> bool {
-    let normalized_path = MetadataRegistryRecord::normalize_document_path(&record.document_path);
-    record.establishing_event_id != Ulid::nil()
-        && record.document_path == normalized_path
-        && record.graph_iri == MetadataRegistryRecord::graph_iri_for(record.document_id)
-        && record.permission_path
-            == MetadataRegistryRecord::permission_path_for(
-                &record.realm_id,
-                record.group_id,
-                &normalized_path,
-                record.document_id,
-            )
-}
-
 pub(in crate::document_sync) fn validate_metadata_event(event: &MetadataEventRecord) -> Result<()> {
-    if !registry_identity_valid(&event.record)
+    if !event.record.identity_valid()
         || event.record.last_event_id != event.event_id
         || event_is_create(event) && event.record.establishing_event_id != event.event_id
     {
@@ -851,7 +814,7 @@ pub(in crate::document_sync) fn same_create_event(
     incoming: &MetadataEventRecord,
 ) -> bool {
     accepted.event_id == incoming.event_id
-        && registry_identity_matches(&accepted.record, &incoming.record)
+        && accepted.record.same_identity(&incoming.record)
         && accepted.record.public == incoming.record.public
         && accepted.record.updated_at_ms == incoming.record.updated_at_ms
         && accepted.record.last_event_id == incoming.record.last_event_id
@@ -859,12 +822,6 @@ pub(in crate::document_sync) fn same_create_event(
         && accepted.node_id == incoming.node_id
         && accepted.payload == incoming.payload
         && accepted.occurred_at_ms == incoming.occurred_at_ms
-}
-
-pub(in crate::document_sync) fn metadata_registry_freshness(
-    record: &MetadataRegistryRecord,
-) -> (u64, Ulid) {
-    (record.updated_at_ms, record.last_event_id)
 }
 
 pub(in crate::document_sync) async fn registry_sidecar_repairs(

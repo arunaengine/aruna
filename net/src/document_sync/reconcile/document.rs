@@ -33,8 +33,8 @@ use super::cursor::{
     applied_cursor_clock, applied_cursor_value, deferred_topics_key, topic_cursor_key,
 };
 use super::registry::{
-    create_fence_txn, event_is_create, lifecycle_stale_txn, registry_identity_matches,
-    same_create_event, transaction_placement_fence, validate_metadata_event,
+    create_fence_txn, event_is_create, lifecycle_stale_txn, same_create_event,
+    transaction_placement_fence, validate_metadata_event,
 };
 use super::{dependency_available, register_deferred_topic, remove_deferred_topic};
 
@@ -579,9 +579,10 @@ impl DocumentSyncService {
                 );
                 deferred_cursor_topics.insert(apply.identity.topic);
                 continue;
-            } else if accepted_create.as_ref().is_some_and(|accepted| {
-                !registry_identity_matches(&accepted.record, &apply.record.record)
-            }) {
+            } else if accepted_create
+                .as_ref()
+                .is_some_and(|accepted| !accepted.record.same_identity(&apply.record.record))
+            {
                 warn!(
                     topic_id = %apply.identity.topic,
                     %document_id,
