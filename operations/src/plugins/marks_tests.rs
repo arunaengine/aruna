@@ -92,3 +92,36 @@ async fn sweep_awaits_work() {
             .unwrap()
     );
 }
+
+#[test]
+fn mark_work_ended() {
+    let mark = Mark {
+        install_id: Ulid::from_parts(1, 1),
+        work_id: Ulid::from_parts(2, 2),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let mut plan = MarkEnded {
+        lookup: WorkLookup::new(mark.install_id, mark.work_id),
+        key: Some(b"mark".to_vec()),
+        deleted: false,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Read(_))));
+    // A gone work row ends the mark, which goes in the same transaction.
+    let delete = Ask::Delete(vec![(PLUGIN_WORK_KEYSPACE, b"mark".to_vec())]);
+    assert_eq!(
+        plan.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Ask(delete)
+    );
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(true));
+    let mut check = MarkEnded {
+        lookup: WorkLookup::new(mark.install_id, mark.work_id),
+        key: None,
+        deleted: false,
+    };
+    assert_eq!(
+        check.next(Answer::Values(vec![None])).unwrap(),
+        Turn::Finish(true)
+    );
+}

@@ -15,6 +15,7 @@ use crate::plugins::store::Txn;
 use crate::plugins::worker::match_journal;
 use crate::plugins::worker::tests::{created, installed, scoped, synced};
 use aruna_core::plugin_runs::EVENTS_QUEUED;
+use aruna_core::plugin_runs::journal_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 
 /// Journals `event` on this node as a committing transaction would.
@@ -327,5 +328,47 @@ fn counting_pages() {
     assert_eq!(
         counting.counted(),
         BTreeMap::from([(first, 1), (second, 0)])
+    );
+}
+
+#[test]
+fn user_pending_dropped() {
+    let mut plan = MatchPage {
+        targets: Vec::new(),
+        keep: false,
+        now_ms: 9,
+        bound: 2,
+        phase: MatchPhase::Reading,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let event = plain_event(5);
+    let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
+    let rows = vec![(pending.clone(), event.to_bytes().unwrap())];
+    // A user node keeps no journal: nothing to count, no gap to read.
+    assert_eq!(
+        plan.next(Answer::Page(rows, None)).unwrap(),
+        Turn::Ask(Ask::Read(Vec::new()))
+    );
+    let Turn::Ask(Ask::Write(written)) = plan.next(Answer::Values(Vec::new())).unwrap() else {
+        panic!("the page writes no forward row");
+    };
+    assert!(written.is_empty());
+    let Turn::Ask(Ask::Delete(keys)) = plan.next(Answer::Done).unwrap() else {
+        panic!("the pending, kept and source rows go");
+    };
+    assert_eq!(keys.len(), 3);
+    assert_eq!(keys[0], (EVENT_JOURNAL_KEYSPACE, pending));
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+    // An empty page reads nothing more.
+    let mut empty = MatchPage {
+        targets: Vec::new(),
+        keep: true,
+        now_ms: 9,
+        bound: 2,
+        phase: MatchPhase::Reading,
+    };
+    assert_eq!(
+        empty.next(Answer::Page(Vec::new(), None)).unwrap(),
+        Turn::Finish(0)
     );
 }
