@@ -16,6 +16,7 @@ pub mod placement;
 pub mod protocol;
 pub mod prune;
 pub mod routing;
+pub mod send;
 pub mod settings;
 #[cfg(test)]
 mod tests;
