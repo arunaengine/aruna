@@ -711,7 +711,7 @@ mod tests {
     // Each queued connector gets its own page, one after another, and a full queue read
     // reports remaining work even when every page empties its connector.
     #[test]
-    fn pages_run_in_order() {
+    fn pages_run_ordered() {
         let mut operation = PruneReferencesOperation::new();
         let rows: Vec<_> = (1..=PRUNE_CONNECTORS as u8).map(queued_row).collect();
         check_trace(

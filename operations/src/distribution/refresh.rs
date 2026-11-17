@@ -716,7 +716,7 @@ mod tests {
 
     // A failed record page keeps the cursor the pass began at.
     #[test]
-    fn failed_page_keeps_cursor() {
+    fn failure_keeps_cursor() {
         let mut operation = pass(RefreshCursor {
             record: Some(vec![1]),
             sweep: Some((Ulid::nil(), "a".to_string())),
