@@ -90,6 +90,13 @@ pub enum TaskKey {
     MaintainRanges,
 }
 
+impl TaskKey {
+    /// The row key of this timer in the persisted timer keyspace.
+    pub fn storage_key(&self) -> Result<crate::types::Key, crate::errors::ConversionError> {
+        Ok(postcard::to_allocvec(self)?.into())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistedTaskTimer {
     pub key: TaskKey,

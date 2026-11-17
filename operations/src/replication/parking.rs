@@ -7,8 +7,8 @@ use aruna_core::structs::storage::replication_queue::BlobJobRecord;
 
 use super::queue::{BlobQueueError, schedule_blob_drain};
 use std::collections::VecDeque;
+use std::time::Duration;
 
-use super::drain::REPLICATION_POLL_AFTER;
 use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -29,6 +29,8 @@ use std::collections::BTreeSet;
 use tracing::warn;
 use ulid::Ulid;
 
+/// How long a job that no longer waits for a key, and an idle drain, wait before the next look.
+pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 /// Due time of a parked job: the drain never runs it and never times a wake for it.
 pub(crate) const PARKED_DUE: u64 = u64::MAX;
 const WAIT_PAGE: usize = 256;

@@ -638,12 +638,27 @@ mod tests {
     use tracing::info;
 
     use super::super::drain::{
-        BlobJobOutcome, REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor,
-        blob_jobs_exist, job_source_auth, load_source_authorization, mark_failure, mark_progress,
-        mark_success, process_blob_batch, read_job_relationships, read_relationships,
-        read_replication_cursor, reschedule_blob_job, retire_job, scan_due_jobs,
-        store_relationship, write_blob_job,
+        REPLICATION_CURSOR_KEY, ReplicationScanCursor, advance_replication_cursor, blob_jobs_exist,
+        job_source_auth, load_source_authorization, mark_failure, mark_progress, mark_success,
+        process_blob_batch, read_job_relationships, read_relationships, read_replication_cursor,
+        reschedule_blob_job, scan_due_jobs, store_relationship, write_blob_job,
     };
+    use super::super::retire::{BlobJobOutcome, RetireJobOperation};
+
+    /// Retires through the operation at the current time, as the drain does.
+    async fn retire_job(
+        context: &DriverContext,
+        key: Vec<u8>,
+        job: &BlobJobRecord,
+        outcome: &BlobJobOutcome,
+    ) -> Result<(), BlobQueueError> {
+        let now_ms = unix_timestamp_millis();
+        drive(
+            RetireJobOperation::new(key, job.clone(), outcome, now_ms),
+            context,
+        )
+        .await
+    }
     use super::super::obligations::{
         OBLIGATION_BATCH_SIZE, REPLICATION_JOB_LIMIT, REPLICATION_RELATIONSHIP_LIMIT,
         delete_live_obligation, process_live_obligations, read_relationships_limit,

@@ -42,15 +42,15 @@ use super::members::{bound_record, member_publication};
 use super::obligations::{REPLICATION_PAGE_SIZE, live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
-use super::parking::{PARKED_DUE, ParkJobOperation};
+use super::parking::{PARKED_DUE, ParkJobOperation, REPLICATION_POLL_AFTER};
 use super::plaintext::{HolderCheckOperation, job_consent};
 use super::queue::BlobQueueError;
+use super::retire::{BlobJobOutcome, RetireJobOperation};
 use super::version_replication::{
     ReplicateScopeError, ReplicateScopeOperation, SourceAuthorization, SourceAuthorizationError,
 };
 use crate::driver::{DriverContext, drive, gate_context, now_ms, quota_marked_routing};
 use crate::notifications::watch::emit::emit_watch_event;
-use crate::plugins::store::{Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
@@ -66,8 +66,6 @@ const REPLICATION_BATCH_SIZE: usize = 64;
 const STATS_PAGE_SIZE: usize = 256;
 
 pub(super) const REPLICATION_CURSOR_KEY: &[u8] = b"blob_replication_cursor";
-
-pub const REPLICATION_POLL_AFTER: Duration = Duration::from_secs(5);
 
 pub const REPLICATION_RETRY_AFTER: Duration = Duration::from_secs(1);
 
@@ -95,18 +93,6 @@ pub(super) struct ReplicationScanCursor {
     after: Option<Vec<u8>>,
     #[serde(rename = "next_due_at_ms")]
     next_due_ms: Option<u64>,
-}
-
-/// How a processed job ends. The first three retire it; only `Completed` and `Failed` report.
-pub(super) enum BlobJobOutcome {
-    /// The run copied or confirmed every version.
-    Completed,
-    /// A permanent failure; a member publication retries instead.
-    Failed,
-    /// Nothing to report: the relationship was not enabled or is gone, or nothing was owed.
-    Retired,
-    /// The job waits, parked, for one of these locked source keys.
-    AwaitingKey(Vec<BucketKeyRef>),
 }
 
 pub async fn restore_blob_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
@@ -276,7 +262,9 @@ pub(crate) async fn drain_batch(
         });
         match process_blob_job(context, &job, relationship, &mut relationships).await {
             Ok(outcome @ (BlobJobOutcome::Completed | BlobJobOutcome::Retired)) => {
-                retire_job(context, job_key, &job, &outcome).await?;
+                let retire =
+                    RetireJobOperation::new(job_key, job, &outcome, unix_timestamp_millis());
+                drive(retire, context).await?;
                 succeeded = succeeded.saturating_add(1);
             }
             // A member job ends only once delivered or no longer owed: a bootstrap counts a
@@ -289,7 +277,9 @@ pub(crate) async fn drain_batch(
                 failed = failed.saturating_add(1);
             }
             Ok(outcome @ BlobJobOutcome::Failed) => {
-                retire_job(context, job_key, &job, &outcome).await?;
+                let retire =
+                    RetireJobOperation::new(job_key, job, &outcome, unix_timestamp_millis());
+                drive(retire, context).await?;
                 failed = failed.saturating_add(1);
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
@@ -1191,81 +1181,6 @@ pub(super) async fn write_blob_job(
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
     }
-}
-
-/// Retires a processed job in one transaction: its row goes only while it still holds this job,
-/// so an enqueue that wrote the row again during the run keeps its own run. The plugin event of
-/// a completed or failed sync job joins the same transaction.
-pub(super) async fn retire_job(
-    context: &DriverContext,
-    key: Vec<u8>,
-    job: &BlobJobRecord,
-    outcome: &BlobJobOutcome,
-) -> Result<(), BlobQueueError> {
-    transact(context, async |txn: &Txn<'_>| {
-        let stored = txn.read(REPLICATION_JOB_KEYSPACE, &key).await?;
-        let stored = stored.and_then(|value| BlobJobRecord::from_bytes(&value).ok());
-        if stored.is_some_and(|stored| stored.job_id == job.job_id) {
-            txn.delete(REPLICATION_JOB_KEYSPACE, vec![key.clone()])
-                .await?;
-        }
-        if let Some(event) = sync_event(txn, job, outcome).await? {
-            let rows = (journal_entries(&event)?.into_iter())
-                .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-                .collect();
-            txn.write(EVENT_JOURNAL_KEYSPACE, rows).await?;
-        }
-        Ok::<_, BlobQueueError>(())
-    })
-    .await
-}
-
-/// The plugin event of a retired sync job, from the relationship and bucket rows its transaction
-/// reads: a completed job while the relationship exists and is not detached, a failed one only
-/// while it is enabled (a stopped one reports through its status), neither without the bucket.
-async fn sync_event(
-    txn: &Txn<'_>,
-    job: &BlobJobRecord,
-    outcome: &BlobJobOutcome,
-) -> Result<Option<SourceEvent>, BlobQueueError> {
-    let kind = match outcome {
-        BlobJobOutcome::Completed => SourceKind::SyncCompleted,
-        BlobJobOutcome::Failed => SourceKind::SyncFailed,
-        BlobJobOutcome::Retired | BlobJobOutcome::AwaitingKey(_) => return Ok(None),
-    };
-    let (Some(relationship_id), bucket) = (job.relationship_id, &job.input.bucket) else {
-        return Ok(None);
-    };
-    let key = sync_relationship_key(bucket, relationship_id);
-    let Some(value) = txn.read(RELATIONSHIP_OUT_KEYSPACE, &key).await? else {
-        return Ok(None);
-    };
-    let relationship = SyncRelationship::from_bytes(&value)?;
-    let reports = match kind {
-        SourceKind::SyncCompleted => relationship.state != SyncState::Detached,
-        _ => relationship.state == SyncState::Enabled,
-    };
-    let Some(info) = txn.read(S3_BUCKET_KEYSPACE, bucket.as_bytes()).await? else {
-        return Ok(None);
-    };
-    if !reports {
-        return Ok(None);
-    }
-    let group_id = BucketInfo::from_bytes(&info)?.group_id;
-    let object = match &job.input.target {
-        ReplicateScopeTarget::Version { key, .. } | ReplicateScopeTarget::Object { key } => key,
-        ReplicateScopeTarget::Prefix(prefix) => prefix,
-        ReplicateScopeTarget::Bucket => "",
-    };
-    let source = &relationship.source;
-    let path = object_permission_path(source.realm_id, group_id, source.node_id, bucket, object);
-    Ok(Some(SourceEvent::sync_job(
-        kind,
-        (group_id, path),
-        (relationship.id, relationship.created_by),
-        (source.node_id, job.job_id),
-        unix_timestamp_millis(),
-    )))
 }
 
 async fn delete_blob_job(storage: &StorageHandle, key: Vec<u8>) -> Result<(), BlobQueueError> {

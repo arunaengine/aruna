@@ -18,8 +18,6 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::tasks::task_persistence::task_storage_key;
-
 /// Writes of an audit record inside its operation before the record moves to a retry timer.
 pub(crate) const AUDIT_ATTEMPTS: u32 = 3;
 /// How long a record that could not be stored waits before its next write.
@@ -47,8 +45,6 @@ const TIMER_PAGE: usize = 256;
 pub enum AuditError {
     #[error("not an audit record timer")]
     NotAuditTimer,
-    #[error("the retry timer has no storage key: {0}")]
-    TimerKey(String),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
@@ -97,7 +93,7 @@ impl StoreAuditOperation {
         let TaskKey::RecordAudit { record } = key else {
             return Err(AuditError::NotAuditTimer);
         };
-        let timer = task_storage_key(key).map_err(AuditError::TimerKey)?;
+        let timer = key.storage_key()?;
         Ok((record.key().into(), record.to_bytes()?, timer))
     }
 
@@ -474,7 +470,7 @@ mod tests {
                 run.abort();
             }
             let finished = run.await.is_ok();
-            let row = task_storage_key(&key).unwrap().to_vec();
+            let row = key.storage_key().unwrap().to_vec();
             let kept = stored(&storage_handle, TASK_TIMER_KEYSPACE, row).await;
             let written = stored(&storage_handle, BUCKET_AUDIT_KEYSPACE, record.key()).await;
             // Never both and never neither: the row goes only with the stored record.
@@ -551,7 +547,7 @@ mod tests {
         });
         let delete = Effect::Storage(StorageEffect::Delete {
             key_space: TASK_TIMER_KEYSPACE.to_string(),
-            key: task_storage_key(&key).unwrap(),
+            key: key.storage_key().unwrap(),
             txn_id: Some(txn()),
         });
         let commit = Effect::Storage(StorageEffect::CommitTransaction { txn_id: txn() });

@@ -227,10 +227,8 @@ async fn delete_timer_key(storage: &StorageHandle, key: ByteView) {
     }
 }
 
-pub(crate) fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
-    postcard::to_allocvec(key)
-        .map(ByteView::from)
-        .map_err(|error| error.to_string())
+fn task_storage_key(key: &TaskKey) -> Result<ByteView, String> {
+    key.storage_key().map_err(|error| error.to_string())
 }
 
 fn due_at_millis(after: Duration) -> Result<u64, String> {
