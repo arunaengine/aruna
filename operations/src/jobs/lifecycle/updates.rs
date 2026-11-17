@@ -29,7 +29,7 @@ use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
 use super::outbox::schedule_outbox_drain;
 use super::reservation::ReleaseExecutionOperation;
-use super::witness::ArmFamilyOperation;
+use super::witness_arm::ArmFamilyOperation;
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{

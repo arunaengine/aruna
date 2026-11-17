@@ -6,7 +6,8 @@ use aruna_core::structs::execution::job::{JobErrorKind, JobFamilyRecord, Physica
 use std::collections::BTreeSet;
 
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::jobs::lifecycle::witness::{suppressed, witness_rank};
+use crate::jobs::lifecycle::witness::suppressed;
+use crate::jobs::lifecycle::witness_arm::witness_rank;
 use crate::replication::bao_read::BaoReadError;
 use crate::tests::records::{Family, node};
 

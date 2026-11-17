@@ -33,6 +33,7 @@ pub mod stage;
 pub mod target;
 pub mod updates;
 pub mod witness;
+pub mod witness_arm;
 
 /// Why one lifecycle round did not complete. An availability failure is never
 /// reported as a refusal of the request itself.
