@@ -279,3 +279,7 @@ impl Operation for RetireJobOperation {
         abort_effects(&mut self.txn_id)
     }
 }
+
+#[cfg(test)]
+#[path = "retire_tests.rs"]
+mod tests;
