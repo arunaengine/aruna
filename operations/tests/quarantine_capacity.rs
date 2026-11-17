@@ -19,10 +19,10 @@ use aruna_core::structs::{
 };
 use aruna_core::types::Value;
 use aruna_net::document_sync::DocumentSyncService;
-use aruna_operations::driver::DriverContext;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::sync::sync_quarantine::{
-    QuarantinePageRequest, acknowledge_quarantine_row, list_quarantine_records,
-    prune_quarantine_records, read_quarantine_record, read_quarantine_usage,
+    AcknowledgeQuarantineOperation, ListQuarantineOperation, PruneQuarantineOperation,
+    QuarantinePage, QuarantinePageRequest, ReadQuarantineOperation,
 };
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
@@ -147,6 +147,12 @@ fn node_info_bytes(node_id: aruna_core::NodeId) -> Vec<u8> {
     .expect("node info serializes")
 }
 
+async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> QuarantinePage {
+    drive(ListQuarantineOperation::new(request), ctx)
+        .await
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capacity_blocks_releases() {
     let storage_dir = tempfile::tempdir().expect("storage dir");
@@ -182,7 +188,7 @@ async fn capacity_blocks_releases() {
     let local_node = iroh::SecretKey::from_bytes(&[31; 32]).public();
 
     let seeded = fill_store(&storage).await;
-    assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), seeded);
+    assert_eq!(list(&ctx, QuarantinePageRequest::default()).await.usage, seeded);
 
     // A node info document that claims another node is a permanent reject.
     let target = DocumentTarget::NodeInfo {
@@ -228,14 +234,12 @@ async fn capacity_blocks_releases() {
     reset_cursor(&storage, topic_id.as_bytes()).await;
     service.reconcile_documents_event().await;
     assert!(
-        list_quarantine_records(&ctx, topic_page())
-            .await
-            .unwrap()
+        list(&ctx, topic_page()).await
             .records
             .is_empty(),
         "a full store must not write evidence"
     );
-    assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), seeded);
+    assert_eq!(list(&ctx, QuarantinePageRequest::default()).await.usage, seeded);
 
     // Reclaim one slot: only acknowledged rows are prunable.
     let seeded_page = || QuarantinePageRequest {
@@ -243,22 +247,22 @@ async fn capacity_blocks_releases() {
         topic: Some(vec![7u8; 32]),
         limit: Some(1),
     };
-    let page = list_quarantine_records(&ctx, seeded_page()).await.unwrap();
+    let page = list(&ctx, seeded_page()).await;
     let oldest = page.records.first().expect("seeded evidence").storage_key();
-    let pruned = prune_quarantine_records(&ctx, seeded_page()).await.unwrap();
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx).await.unwrap();
     assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
-    acknowledge_quarantine_row(&ctx, &oldest)
+    drive(AcknowledgeQuarantineOperation::new(oldest), &ctx)
         .await
         .unwrap()
         .expect("row is acknowledged");
-    let pruned = prune_quarantine_records(&ctx, seeded_page()).await.unwrap();
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx).await.unwrap();
     assert_eq!(pruned.pruned, 1);
     assert_eq!(pruned.usage.records, QUARANTINE_MAX_RECORDS - 1);
 
     // The event was never applied and its cursor never advanced, so the next
     // reconcile redelivers it and the reclaimed slot takes the evidence.
     service.reconcile_documents_event().await;
-    let redelivered = list_quarantine_records(&ctx, topic_page()).await.unwrap();
+    let redelivered = list(&ctx, topic_page()).await;
     let record = redelivered
         .records
         .first()
@@ -268,14 +272,14 @@ async fn capacity_blocks_releases() {
     assert!(record.reason.starts_with("invalid node info document:"));
     assert_eq!(record.target(), Some(&target));
     assert_eq!(
-        read_quarantine_record(&ctx, &record.storage_key())
+        drive(ReadQuarantineOperation::new(record.storage_key()), &ctx)
             .await
             .unwrap()
             .as_ref(),
         Some(record)
     );
     assert_eq!(
-        read_quarantine_usage(&ctx).await.unwrap().records,
+        list(&ctx, QuarantinePageRequest::default()).await.usage.records,
         QUARANTINE_MAX_RECORDS
     );
     assert!(

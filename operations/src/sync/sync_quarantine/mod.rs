@@ -115,6 +115,7 @@ fn unexpected(expected: &'static str, event: Event) -> QuarantineAdminError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::{DriverContext, drive};
     use aruna_core::NodeId;
     use aruna_core::document::{
         DocumentChange, DocumentChangeKind, DocumentEvent, DocumentSyncRevision, DocumentTarget,
@@ -123,8 +124,10 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::{
         SyncQuarantineCapacity, SyncQuarantineEvidence, SyncQuarantineIdentity,
-        SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
+        SyncQuarantineInput, build_quarantine_entries, quarantine_row_entry,
+        quarantine_usage_entry,
     };
+    use aruna_core::types::{Key, Value};
     use aruna_storage::storage;
     use ulid::Ulid;
 
@@ -167,31 +170,90 @@ mod tests {
         SyncQuarantineIdentity::from_parts([7; 32], [8; 32], u64::from(index) + 1)
     }
 
+    fn input(index: u8, reason: &str) -> SyncQuarantineInput<'_> {
+        SyncQuarantineInput {
+            identity: identity(index),
+            evidence: SyncQuarantineEvidence::from_event(&event(index)),
+            reason,
+            quarantined_at_ms: 42,
+            replaced_bytes: None,
+        }
+    }
+
+    /// One quarantine row for operation tests.
+    pub(super) fn record(index: u8, acknowledged: bool) -> SyncQuarantineRecord {
+        let write = build_quarantine_entries(
+            input(index, "invalid"),
+            SyncQuarantineUsage::default(),
+            SyncQuarantineCapacity::default(),
+        )
+        .unwrap();
+        let mut record = write.record;
+        record.acknowledged = acknowledged;
+        record
+    }
+
+    pub(super) fn record_bytes(record: &SyncQuarantineRecord) -> Value {
+        quarantine_row_entry(record).unwrap().2
+    }
+
+    pub(super) fn usage_bytes(usage: SyncQuarantineUsage) -> Value {
+        quarantine_usage_entry(usage).unwrap().2
+    }
+
+    async fn write_rows(ctx: &DriverContext, writes: Vec<(String, Key, Value)>) {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn stored_usage(ctx: &DriverContext) -> SyncQuarantineUsage {
+        list(ctx, QuarantinePageRequest::default()).await.usage
+    }
+
+    async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> QuarantinePage {
+        drive(ListQuarantineOperation::new(request), ctx)
+            .await
+            .unwrap()
+    }
+
+    async fn read(ctx: &DriverContext, index: u8) -> Option<SyncQuarantineRecord> {
+        drive(ReadQuarantineOperation::new(row_key(index)), ctx)
+            .await
+            .unwrap()
+    }
+
+    async fn acknowledge(ctx: &DriverContext, index: u8) -> Option<SyncQuarantineRecord> {
+        drive(AcknowledgeQuarantineOperation::new(row_key(index)), ctx)
+            .await
+            .unwrap()
+    }
+
+    async fn prune(ctx: &DriverContext, request: QuarantinePageRequest) -> QuarantinePruneResult {
+        drive(PruneQuarantineOperation::new(request), ctx)
+            .await
+            .unwrap()
+    }
+
     async fn seed_rows(ctx: &DriverContext, count: u8) -> SyncQuarantineUsage {
         let mut usage = SyncQuarantineUsage::default();
         for index in 0..count {
             let write = build_quarantine_entries(
-                SyncQuarantineInput {
-                    identity: identity(index),
-                    evidence: SyncQuarantineEvidence::from_event(&event(index)),
-                    reason: "invalid",
-                    quarantined_at_ms: 42,
-                    replaced_bytes: None,
-                },
+                input(index, "invalid"),
                 usage,
                 SyncQuarantineCapacity::default(),
             )
             .unwrap();
             usage = write.usage;
-            let txn_id = start_txn(&ctx.storage_handle).await.unwrap();
-            write_batch(
-                &ctx.storage_handle,
-                vec![write.row, quarantine_usage_entry(usage).unwrap()],
-                txn_id,
-            )
-            .await
-            .unwrap();
-            commit_txn(&ctx.storage_handle, txn_id).await.unwrap();
+            write_rows(ctx, vec![write.row, quarantine_usage_entry(usage).unwrap()]).await;
         }
         usage
     }
@@ -204,7 +266,7 @@ mod tests {
     async fn list_pages_records() {
         let (ctx, _dir) = context();
         let usage = seed_rows(&ctx, 5).await;
-        let first = list_quarantine_records(
+        let first = list(
             &ctx,
             QuarantinePageRequest {
                 topic: None,
@@ -212,13 +274,12 @@ mod tests {
                 limit: Some(2),
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(first.records.len(), 2);
         assert_eq!(first.usage, usage);
         assert_eq!(first.usage.records, 5);
 
-        let second = list_quarantine_records(
+        let second = list(
             &ctx,
             QuarantinePageRequest {
                 topic: None,
@@ -226,8 +287,7 @@ mod tests {
                 limit: Some(2),
             },
         )
-        .await
-        .unwrap();
+        .await;
         assert_eq!(second.records.len(), 2);
         assert_ne!(second.records[0].event_id(), first.records[0].event_id());
     }
@@ -236,151 +296,37 @@ mod tests {
     async fn inspect_reads_record() {
         let (ctx, _dir) = context();
         seed_rows(&ctx, 2).await;
-        let record = read_quarantine_record(&ctx, &row_key(1))
-            .await
-            .unwrap()
-            .unwrap();
+        let record = read(&ctx, 1).await.unwrap();
         assert_eq!(record.decoded_event().unwrap(), event(1));
-        assert!(
-            read_quarantine_record(&ctx, &row_key(9))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(read(&ctx, 9).await.is_none());
     }
 
     #[tokio::test]
     async fn acknowledge_is_idempotent() {
         let (ctx, _dir) = context();
         let usage = seed_rows(&ctx, 2).await;
-        assert!(
-            acknowledge_quarantine_row(&ctx, &row_key(0))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            acknowledge_quarantine_row(&ctx, &row_key(0))
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            acknowledge_quarantine_row(&ctx, &row_key(9))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        let stored = read_quarantine_record(&ctx, &row_key(0))
-            .await
-            .unwrap()
-            .unwrap();
+        assert!(acknowledge(&ctx, 0).await.is_some());
+        assert!(acknowledge(&ctx, 0).await.is_some());
+        assert!(acknowledge(&ctx, 9).await.is_none());
+        let stored = read(&ctx, 0).await.unwrap();
         assert!(stored.acknowledged);
-        assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), usage);
+        assert_eq!(stored_usage(&ctx).await, usage);
     }
 
     #[tokio::test]
     async fn prune_skips_unacknowledged() {
         let (ctx, _dir) = context();
         let usage = seed_rows(&ctx, 3).await;
-        acknowledge_quarantine_row(&ctx, &row_key(1)).await.unwrap();
+        acknowledge(&ctx, 1).await;
 
-        let result = prune_quarantine_records(&ctx, QuarantinePageRequest::default())
-            .await
-            .unwrap();
+        let result = prune(&ctx, QuarantinePageRequest::default()).await;
         assert_eq!(result.pruned, 1);
         assert_eq!(result.scanned, 3);
         assert_eq!(result.usage.records, 2);
         assert!(result.usage.bytes < usage.bytes);
-        assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), result.usage);
-        assert!(
-            read_quarantine_record(&ctx, &row_key(1))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            read_quarantine_record(&ctx, &row_key(0))
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    /// A redelivery between scan and delete replaces the selected row with
-    /// unacknowledged evidence; prune re-reads every candidate, so that evidence is
-    /// neither deleted nor accounted from the scan's stale value.
-    #[tokio::test]
-    async fn prune_revalidates_candidates() {
-        let (ctx, _dir) = context();
-        seed_rows(&ctx, 2).await;
-        acknowledge_quarantine_row(&ctx, &row_key(0)).await.unwrap();
-
-        let storage = &ctx.storage_handle;
-        let (values, _) = iter_page(storage, &QuarantinePageRequest::default(), 50)
-            .await
-            .unwrap();
-        let mut candidates = Vec::new();
-        for (key, value) in values {
-            if SyncQuarantineRecord::from_bytes(value.as_ref())
-                .unwrap()
-                .acknowledged
-            {
-                candidates.push(key);
-            }
-        }
-        assert_eq!(candidates.len(), 1);
-
-        // The same operation is rejected again and replaces its own row with
-        // longer, unacknowledged evidence.
-        let write = build_quarantine_entries(
-            SyncQuarantineInput {
-                identity: identity(0),
-                evidence: SyncQuarantineEvidence::from_event(&event(0)),
-                reason: "redelivered with a much longer explanation",
-                quarantined_at_ms: 99,
-                replaced_bytes: Some(
-                    read_row_value(storage, &row_key(0), None)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .len() as u64,
-                ),
-            },
-            read_usage_row(storage, None).await.unwrap(),
-            SyncQuarantineCapacity::default(),
-        )
-        .unwrap();
-        let txn_id = start_txn(storage).await.unwrap();
-        write_batch(
-            storage,
-            vec![write.row, quarantine_usage_entry(write.usage).unwrap()],
-            txn_id,
-        )
-        .await
-        .unwrap();
-        commit_txn(storage, txn_id).await.unwrap();
-
-        let txn_id = start_txn(storage).await.unwrap();
-        let (pruned, usage) = prune_in_txn(storage, candidates, txn_id).await.unwrap();
-        abort_txn(storage, txn_id).await;
-        assert_eq!(pruned, 0);
-        assert_eq!(usage, write.usage);
-
-        let stored = read_quarantine_record(&ctx, &row_key(0))
-            .await
-            .unwrap()
-            .expect("redelivered evidence survives");
-        assert!(!stored.acknowledged);
-        assert_eq!(stored.reason, "redelivered with a much longer explanation");
-        assert_eq!(read_quarantine_usage(&ctx).await.unwrap(), write.usage);
-        assert_eq!(
-            prune_quarantine_records(&ctx, QuarantinePageRequest::default())
-                .await
-                .unwrap()
-                .pruned,
-            0
-        );
+        assert_eq!(stored_usage(&ctx).await, result.usage);
+        assert!(read(&ctx, 1).await.is_none());
+        assert!(read(&ctx, 0).await.is_some());
     }
 
     #[tokio::test]
@@ -388,15 +334,13 @@ mod tests {
         let (ctx, _dir) = context();
         seed_rows(&ctx, 4).await;
         for index in 0..4u8 {
-            acknowledge_quarantine_row(&ctx, &row_key(index))
-                .await
-                .unwrap();
+            acknowledge(&ctx, index).await;
         }
 
         let mut cursor = None;
         let mut pruned = 0;
         loop {
-            let result = prune_quarantine_records(
+            let result = prune(
                 &ctx,
                 QuarantinePageRequest {
                     topic: None,
@@ -404,8 +348,7 @@ mod tests {
                     limit: Some(1),
                 },
             )
-            .await
-            .unwrap();
+            .await;
             assert!(result.scanned <= 1);
             pruned += result.pruned;
             cursor = result.next_start_after;
@@ -414,10 +357,7 @@ mod tests {
             }
         }
         assert_eq!(pruned, 4);
-        assert_eq!(
-            read_quarantine_usage(&ctx).await.unwrap(),
-            SyncQuarantineUsage::default()
-        );
+        assert_eq!(stored_usage(&ctx).await, SyncQuarantineUsage::default());
     }
 
     #[tokio::test]
@@ -445,10 +385,8 @@ mod tests {
             aruna_core::structs::SyncQuarantineError::AtCapacity { .. }
         ));
 
-        acknowledge_quarantine_row(&ctx, &row_key(0)).await.unwrap();
-        let reclaimed = prune_quarantine_records(&ctx, QuarantinePageRequest::default())
-            .await
-            .unwrap();
+        acknowledge(&ctx, 0).await;
+        let reclaimed = prune(&ctx, QuarantinePageRequest::default()).await;
         assert!(
             build_quarantine_entries(
                 SyncQuarantineInput {
