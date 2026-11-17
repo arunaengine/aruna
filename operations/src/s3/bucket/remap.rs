@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::linked::JobStep;
+use super::job_pages::JobStep;
 use super::rename::{JOB_CHANGED, RenameError, RenameInput, RenameKeysOperation, check_target};
 use crate::auth::request_authorization::BucketAccess;
 use crate::driver::{DriverContext, drive};

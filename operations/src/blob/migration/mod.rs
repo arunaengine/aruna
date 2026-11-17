@@ -1658,7 +1658,7 @@ async fn rename_access(
     if !valid.await.map_err(|error| error.to_string())? {
         return Ok(None);
     }
-    let admin = crate::s3::bucket::linked::still_admin(context, &request.auth, routing.group_id);
+    let admin = crate::s3::bucket::job_pages::still_admin(context, &request.auth, routing.group_id);
     if !admin.await? {
         return Ok(None);
     }
@@ -1797,7 +1797,7 @@ pub async fn process_migrations(
         soon(after);
     }
     // So do the re-mapping and duplicate cleanup jobs of buckets.
-    if !resumed && let Some(after) = crate::s3::bucket::linked::process_linked(context).await? {
+    if !resumed && let Some(after) = crate::s3::bucket::job_pages::process_linked(context).await? {
         soon(after);
     }
     // Queued buckets after this page, or before it when the run resumed mid-queue.

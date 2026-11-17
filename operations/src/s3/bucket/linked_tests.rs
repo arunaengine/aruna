@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
 use crate::driver::drive;
+use crate::s3::bucket::job_pages::process_linked;
 use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup,
 };
