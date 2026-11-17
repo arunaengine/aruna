@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::abe::copies::copy_row;
-use crate::blob::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
+use crate::s3::abe_copies::copy_row;
+use aruna_core::managed_copy::{CopyRegistration, ManagedCopyError, register_effect};
 use crate::blob::records::{
     HeadAliasContext, add_index_effect, blob_location_read, build_transition_effects,
     release_row_effect, write_location_effect, write_version_effect,

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     CopyRequest, ManagedCopyError, serve_reads, split_serve_reads, validate_registration,
 };
 use aruna_core::effects::{Effect, StorageEffect};

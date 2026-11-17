@@ -6,7 +6,7 @@ use crate::auth::permission_rules::{
     PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
 };
 use crate::auth::request_policy::{PolicyEvaluator, PolicyRequestExtras, policy_request_with};
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::blob::records::blob_location_read;
@@ -625,7 +625,7 @@ impl Operation for ReplicateScopeOperation {
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateObjectError {
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     #[error(transparent)]
     RoutingFailed(#[from] RoutingError),
     #[error("could not load the group's routing inputs: {0}")]

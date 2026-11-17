@@ -20,8 +20,8 @@ use aruna_core::structs::storage::abe_access::{
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
 use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
-use aruna_operations::abe::copies::complete_copies;
-use aruna_operations::abe::rekey::rekey_page;
+use aruna_operations::s3::abe_copies::complete_copies;
+use aruna_operations::s3::abe_rekey::rekey_page;
 use aruna_operations::abe::{
     KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
 };

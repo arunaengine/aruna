@@ -10,7 +10,7 @@ pub mod queue;
 pub mod rewrite;
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::managed_copy::{ManagedCopyError, check_serveable, read_effect};
+use aruna_core::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::routing::{BucketRules, SnapshotOperation};

@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
+use aruna_core::managed_copy::{ManagedCopyError, ManagedCopyRemoval};
 use crate::blob::records::{
     HeadAliasContext, blob_location_read, build_transition_effects, delete_index_effect,
     delete_version_effect, owner_delete_effect, owners_scan_effect, pending_location_read,

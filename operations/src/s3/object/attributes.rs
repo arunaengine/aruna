@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::blob::managed_copy::{ManagedCopyError, serve_reads};
+use aruna_core::managed_copy::{ManagedCopyError, serve_reads};
 use crate::blob::records::{blob_location_read, pending_location_read};
 use crate::s3::object::lookup::{
     ExpectedNode, LookupError, begin_copy_check, finish_copy_check, finish_pending_check,

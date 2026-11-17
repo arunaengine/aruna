@@ -1592,7 +1592,7 @@ mod tests {
             archive: aruna_core::structs::storage::blob::ArchiveKey::of(&pending(Some(source))),
         };
         let version = VersionKey::new("b", "copy", Ulid::generate());
-        let copy_row = crate::abe::copies::copy_row(source.bucket_id, &version).unwrap();
+        let copy_row = crate::s3::abe_copies::copy_row(source.bucket_id, &version).unwrap();
         let value = copy.to_bytes().unwrap();
         put(&context, ABE_COPY_KEYSPACE, copy_row.clone(), value).await;
         let storage = &context.storage_handle;

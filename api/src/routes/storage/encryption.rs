@@ -1253,7 +1253,7 @@ mod tests {
 
     #[test]
     fn reports_abe_state() {
-        use aruna_operations::abe::rekey::RekeyProgress;
+        use aruna_operations::s3::abe_rekey::RekeyProgress;
         let mut abe = snapshot();
         abe.abe = Some(AbeSnapshot {
             epoch: 4,

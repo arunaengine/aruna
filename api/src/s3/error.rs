@@ -10,7 +10,7 @@ use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
-use aruna_operations::blob::managed_copy::ManagedCopyError;
+use aruna_core::managed_copy::ManagedCopyError;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::inventory::InventoryError;
 use aruna_operations::groups::routing::RoutingInputsError;

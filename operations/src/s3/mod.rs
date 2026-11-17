@@ -3,6 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+pub mod abe_copies;
+pub mod abe_rekey;
 pub mod access;
 pub mod bucket;
 pub mod fence_store;

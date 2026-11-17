@@ -26,7 +26,7 @@ use aruna_core::types::{GroupId, Key, Value};
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::abe::copies::copy_version;
+use crate::s3::abe_copies::copy_version;
 use crate::node::usage_rebuild::RebuildStatsError;
 use crate::node::usage_stats::StoredDelta;
 

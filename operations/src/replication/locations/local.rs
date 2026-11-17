@@ -5,7 +5,7 @@
 use super::LocationSummaryError;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     CopyRequest, read_effect, registration_for, serve_reads, split_reads,
 };
 use crate::blob::records::blob_location_read;

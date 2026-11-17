@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::abe::copies::copy_row;
+use crate::s3::abe_copies::copy_row;
 use crate::node::usage_stats::{RowChange, StoredDelta};
 use crate::s3::bucket::key::rows::Row;
 use crate::s3::object::put::abe::{abe_reads, envelope_write, parse_abe};

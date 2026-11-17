@@ -200,7 +200,7 @@ async fn fixture(ctx: &DriverContext) -> u64 {
     write(ctx, ABE_VERSION_KEYSPACE, row, envelope).await;
 
     let copy_key = version(ctx, "beta", "copy.bin", materialized(hash)).await;
-    let copy = crate::abe::copies::copy_row(Ulid::generate(), &copy_key).unwrap();
+    let copy = crate::s3::abe_copies::copy_row(Ulid::generate(), &copy_key).unwrap();
     write(ctx, ABE_COPY_KEYSPACE, copy, vec![3; 70]).await;
     for index in 0..MARKERS {
         let marker = BlobVersion::deleted(now, Default::default());

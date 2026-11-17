@@ -1488,7 +1488,7 @@ async fn removes_pending_copy() {
         let location = seed_pending(&storage_handle, &[version_id]).await;
         let version = VersionKey::new("bucket", "sealed", version_id);
         let bucket_id = location.format.bucket_key().unwrap().bucket_id;
-        let version = crate::abe::copies::copy_row(bucket_id, &version).unwrap();
+        let version = crate::s3::abe_copies::copy_row(bucket_id, &version).unwrap();
         let settings = BucketEncryption {
             mode,
             bucket_id: Some(bucket_id),

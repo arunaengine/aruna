@@ -4,7 +4,7 @@
 
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
-use crate::blob::managed_copy::ManagedCopyError;
+use aruna_core::managed_copy::ManagedCopyError;
 use crate::blob::promote::{
     PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
 };

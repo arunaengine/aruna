@@ -582,7 +582,7 @@ fn envelope_mapping_rebound() {
 
 #[test]
 fn governed_alias_registration() {
-    use crate::blob::managed_copy::{CopyRequest, validate_registration};
+    use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::{ManagedCopyKey, ManagedCopyState};
 
     let mut operation = hashed_operation();

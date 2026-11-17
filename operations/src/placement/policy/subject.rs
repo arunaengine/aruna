@@ -21,7 +21,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     COPY_PAGE_LIMIT, ManagedCopyError, ManagedCopyPage, scan_effect, transition_effect,
 };
 use crate::driver::{DriverContext, drive};

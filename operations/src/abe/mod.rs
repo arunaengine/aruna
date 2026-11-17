@@ -2,13 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod copies;
 mod enumerate;
 pub mod envelope;
 mod epoch;
 mod member;
 mod reissue;
-pub mod rekey;
 mod requests;
 mod snapshot;
 

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     CopyRegistration, CopyRequest, ManagedCopyError, register_effect, serve_reads,
     split_serve_reads, validate_registration,
 };

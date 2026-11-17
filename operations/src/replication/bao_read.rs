@@ -43,7 +43,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::blob::managed_copy::{
+use aruna_core::managed_copy::{
     CopyRequest, serve_reads, split_serve_reads, validate_registration,
 };
 use crate::driver::{DriverContext, drive};
@@ -91,7 +91,7 @@ pub enum BaoReadError {
     #[error("bao read did not finish")]
     NotFinished,
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     /// The requester must resolve these rules and ask again.
     #[error("the destination has not resolved every required placement policy")]
     PolicyRequired { refs: Vec<PlacementPolicyRef> },

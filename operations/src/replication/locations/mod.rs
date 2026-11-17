@@ -18,7 +18,7 @@ pub use remote::RemoteLocationOperation;
 #[derive(Debug, Error, PartialEq)]
 pub enum LocationSummaryError {
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
