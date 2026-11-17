@@ -24,8 +24,8 @@ use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
 use aruna_plugins::permission::{Grant, Permission};
 use aruna_plugins::{
-    CancellationToken, FailureKind, Field, Invocation, InvokeError, Runtime, Trigger, WatchEvent,
-    WebhookDelivery, WebhookRequest,
+    CancellationToken, Field, Invocation, Runtime, Trigger, WatchEvent, WebhookDelivery,
+    WebhookRequest,
 };
 use tokio_util::task::TaskTracker;
 use tracing::warn;
@@ -70,7 +70,7 @@ use super::rows::{
     write_rows,
 };
 use super::runs::{
-    ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, expired_runs, read_run, save_run,
+    ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, ended, expired_runs, read_run, save_run,
     unfinished,
 };
 use super::waiting::SettleWaiting;
@@ -446,24 +446,6 @@ impl Worker {
     }
 }
 
-/// How an invocation ended. A runtime without a free slot never entered the guest, so the run
-/// waits without using an attempt.
-fn ended(invoked: Result<Option<String>, InvokeError>, stopping: bool) -> Ended {
-    match invoked {
-        Ok(output) => Ended::Output(output),
-        Err(InvokeError::Guest(failure)) => match failure.kind {
-            FailureKind::Permanent | FailureKind::InvalidInput => Ended::Failed(failure.message),
-            FailureKind::Retryable => Ended::Retry(failure.message),
-        },
-        Err(InvokeError::Cancelled) if stopping => Ended::Stopped,
-        Err(InvokeError::Cancelled) => Ended::Cancelled("the run was cancelled".into()),
-        Err(error @ (InvokeError::Overloaded | InvokeError::Closed)) => {
-            Ended::Busy(error.to_string())
-        }
-        Err(error) => Ended::Failed(error.to_string()),
-    }
-}
-
 /// The handler call of a run: its saved invocation and the install's grants. An event's object on
 /// this node is named by its short `bucket/key` path; `path` keeps the permission path.
 fn invocation(
@@ -517,8 +499,6 @@ fn invocation(
     }
 }
 
-/// Ends or queues a run after an attempt. Its intents decide first: one pending or unknown
-/// makes it need attention, and unreadable intents keep it queued without using an attempt.
 /// The attempt's end with every value handed to the code removed from the text the run keeps.
 fn scrub_ended(broker: &RunBroker, ended: Ended) -> Ended {
     match ended {
