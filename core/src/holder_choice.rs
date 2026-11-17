@@ -197,27 +197,26 @@ impl Operation for HolderChoiceOperation {
             now_ms: self.now_ms,
         };
         let effect = Effect::Net(NetEffect::Heartbeat(Box::new(holders)));
-        Ok(Next::Call(IoCall::Effect(effect)))
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, HolderChoiceError> {
         match (self.facts.take(), result) {
-            (
-                None,
-                IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(facts)))),
-            ) => {
-                let reads = self.reads(&facts);
-                self.facts = Some(facts);
-                Ok(Next::Call(reads))
-            }
-            // Without a network no holder is a candidate.
-            (None, IoResult::Event(Event::Net(NetEvent::Error(_)))) => Ok(Next::Done(Vec::new())),
+            (None, IoResult::Event(event)) => match *event {
+                Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Holders(facts))) => {
+                    let reads = self.reads(&facts);
+                    self.facts = Some(facts);
+                    Ok(Next::Call(reads))
+                }
+                // Without a network no holder is a candidate.
+                Event::Net(NetEvent::Error(_)) => Ok(Next::Done(Vec::new())),
+                event => Err(IoError::Unexpected {
+                    expected: "HeartbeatEvent::Holders",
+                    got: event.label(),
+                }
+                .into()),
+            },
             (Some(facts), IoResult::Values(values)) => Ok(Next::Done(self.choose(&facts, values))),
-            (None, IoResult::Event(event)) => Err(IoError::Unexpected {
-                expected: "HeartbeatEvent::Holders",
-                got: event.label(),
-            }
-            .into()),
             _ => Err(IoError::Unexpected {
                 expected: "the holder facts or the documents",
                 got: "another result",

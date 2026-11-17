@@ -34,14 +34,10 @@ type Turn = Result<Next<()>, HeartbeatError>;
 
 fn heartbeat_call(effect: HeartbeatEffect) -> Turn {
     let effect = Effect::Net(NetEffect::Heartbeat(Box::new(effect)));
-    Ok(Next::Call(IoCall::Effect(effect)))
+    Ok(Next::Call(IoCall::Effect(Box::new(effect))))
 }
 
-fn unexpected(result: IoResult) -> HeartbeatError {
-    let got = match &result {
-        IoResult::Event(event) => event.label(),
-        _ => "another result",
-    };
+fn unexpected(got: &'static str) -> HeartbeatError {
     let expected = "a heartbeat event";
     IoError::Unexpected { expected, got }.into()
 }
@@ -109,16 +105,17 @@ impl Operation for SendHeartbeatOperation {
         };
         let length = (bytes.len() as u32).to_be_bytes();
         self.frame = Value::from([length.as_slice(), &bytes].concat());
-        heartbeat_call(HeartbeatEffect::Record(heartbeat))
+        heartbeat_call(HeartbeatEffect::Record(Box::new(heartbeat)))
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
         match result {
-            IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Peers(peers)))) => {
-                self.push(peers)
-            }
-            // Without a net handle there is nobody to send to.
-            IoResult::Event(Event::Net(NetEvent::Error(_))) => Ok(Next::Done(())),
+            IoResult::Event(event) => match *event {
+                Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Peers(peers))) => self.push(peers),
+                // Without a net handle there is nobody to send to.
+                Event::Net(NetEvent::Error(_)) => Ok(Next::Done(())),
+                event => Err(unexpected(event.label())),
+            },
             IoResult::Group(GroupEvent::Finished { results }) => {
                 for result in results {
                     match result {
@@ -137,7 +134,7 @@ impl Operation for SendHeartbeatOperation {
                 }
                 Ok(Next::Done(()))
             }
-            result => Err(unexpected(result)),
+            _ => Err(unexpected("another result")),
         }
     }
 }
@@ -184,14 +181,17 @@ impl Operation for ReceiveHeartbeatOperation {
 
     fn next(&mut self, result: IoResult) -> Turn {
         let peer = self.peer;
-        match result {
-            IoResult::Event(Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Stored(stored)))) => {
+        let IoResult::Event(event) = result else {
+            return Err(unexpected("another result"));
+        };
+        match *event {
+            Event::Net(NetEvent::Heartbeat(HeartbeatEvent::Stored(stored))) => {
                 if !stored {
                     debug!(%peer, "Heartbeat not stored: not newer, too frequent or not a sync peer");
                 }
                 Ok(Next::Done(()))
             }
-            result => Err(unexpected(result)),
+            event => Err(unexpected(event.label())),
         }
     }
 }
@@ -331,7 +331,7 @@ mod tests {
     }
 
     fn answer(event: HeartbeatEvent) -> IoResult {
-        IoResult::Event(Event::Net(NetEvent::Heartbeat(event)))
+        IoResult::Event(Box::new(Event::Net(NetEvent::Heartbeat(event))))
     }
 
     fn frame(heartbeat: &NodeHeartbeat) -> Value {
@@ -347,7 +347,7 @@ mod tests {
         let mut operation = SendHeartbeatOperation::new(sent.clone());
         assert_eq!(
             operation.first(),
-            heartbeat_call(HeartbeatEffect::Record(sent.clone()))
+            heartbeat_call(HeartbeatEffect::Record(Box::new(sent.clone())))
         );
         let pushes = [node(3), node(1), node(2)]
             .into_iter()
@@ -386,7 +386,7 @@ mod tests {
         let closed = Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed));
         for result in [
             answer(HeartbeatEvent::Peers(Vec::new())),
-            IoResult::Event(closed),
+            IoResult::Event(Box::new(closed)),
         ] {
             let mut operation = SendHeartbeatOperation::new(beat(1));
             operation.first().unwrap();

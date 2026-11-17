@@ -142,9 +142,12 @@ impl Operation for PublishInfoOperation {
 
     fn next(&mut self, result: IoResult) -> Turn {
         let synced = |result: &IoResult| match result {
-            IoResult::Event(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result,
-            })) => Some(result.clone()),
+            IoResult::Event(event) => match event.as_ref() {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
+                    Some(result.clone())
+                }
+                _ => None,
+            },
             _ => None,
         };
         match (&self.phase, synced(&result), result) {
@@ -236,9 +239,9 @@ mod state_machine_tests {
     }
 
     fn synced(result: Result<(), String>) -> IoResult {
-        IoResult::Event(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-            result,
-        }))
+        IoResult::Event(Box::new(Event::SubOperation(
+            SubOperationEvent::DocumentSyncResult { result },
+        )))
     }
 
     fn settle(published: u64) -> Turn {

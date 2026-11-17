@@ -46,7 +46,7 @@ type Turn = Result<Next<()>, RefreshUsageError>;
 
 /// A storage step whose failure the refresh logs and skips, so it sees the error event itself.
 fn best_effort(effect: StorageEffect) -> Turn {
-    Ok(Next::Call(IoCall::Effect(Effect::Storage(effect))))
+    Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(effect)))))
 }
 
 /// The realm summary sum's outcome as the event its parent receives.
@@ -238,7 +238,7 @@ impl Operation for RefreshUsageOperation {
             }
             .into());
         };
-        match (std::mem::replace(&mut self.stage, Stage::Idle), event) {
+        match (std::mem::replace(&mut self.stage, Stage::Idle), *event) {
             (Stage::ClearScan(deletes), Event::Storage(event)) => self.scan_summary(deletes, event),
             (Stage::ClearDelete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
                 self.begin_buckets()
@@ -249,7 +249,7 @@ impl Operation for RefreshUsageOperation {
             (Stage::BucketScan(groups), Event::Storage(event)) => self.scan_buckets(groups, event),
             (Stage::MarkWrite, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
                 self.stage = Stage::Wake;
-                Ok(Next::Call(IoCall::Effect(schedule_snapshot_publish())))
+                Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))))
             }
             (Stage::MarkWrite, Event::Storage(StorageEvent::Error { error })) => {
                 self.mark_failed(&error)
@@ -314,7 +314,7 @@ mod state_machine_tests {
     }
 
     fn storage(event: StorageEvent) -> IoResult {
-        IoResult::Event(Event::Storage(event))
+        IoResult::Event(Box::new(Event::Storage(event)))
     }
 
     fn page(values: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
@@ -391,14 +391,14 @@ mod state_machine_tests {
             RefreshUsageOperation::bucket_page(None)
         );
         assert_eq!(operation.next(page(buckets, None)), marks);
-        let wake = Ok(Next::Call(IoCall::Effect(schedule_snapshot_publish())));
+        let wake = Ok(Next::Call(IoCall::Effect(Box::new(schedule_snapshot_publish()))));
         assert_eq!(operation.next(written()), wake);
         let scheduled = TaskEvent::TimerScheduled {
             key: TaskKey::PublishUsageSnapshots,
             after: std::time::Duration::from_secs(2),
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Task(scheduled))),
+            operation.next(IoResult::Event(Box::new(Event::Task(scheduled)))),
             done()
         );
     }
@@ -416,12 +416,12 @@ mod state_machine_tests {
         let child = IoCall::Child(boxed_suboperation(summary, summed));
         assert_eq!(operation.first(), Ok(Next::Call(child)));
         let finished = summed(Ok(Vec::new()));
-        assert_eq!(operation.next(IoResult::Event(finished)), done());
+        assert_eq!(operation.next(IoResult::Event(Box::new(finished))), done());
         // A failed sum is only logged.
         let mut failing = RefreshUsageOperation::new(node(1), None, &targets, GENERATION);
         failing.first().unwrap();
         let failed = summed(Err(IoError::Conflict.into()));
-        assert_eq!(failing.next(IoResult::Event(failed)), done());
+        assert_eq!(failing.next(IoResult::Event(Box::new(failed))), done());
 
         // Targets that touch no usage scope and no config refresh nothing.
         let other = DocumentTarget::NodeInfo {
@@ -467,7 +467,7 @@ mod state_machine_tests {
             message: "no task handle".to_string(),
         };
         assert_eq!(
-            operation.next(IoResult::Event(Event::Task(refused))),
+            operation.next(IoResult::Event(Box::new(Event::Task(refused)))),
             done()
         );
     }
