@@ -6,6 +6,14 @@
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::operation::Operation;
+use aruna_core::types::{Effects, TxnId};
+use smallvec::smallvec;
+use tracing::warn;
+
 use super::*;
 
 /// Prefix of a registration: key reference, waiting node, job.
@@ -56,100 +64,344 @@ pub struct OwedWake {
     pub auth: AuthContext,
 }
 
-/// Records that `waiter` parks `job_id` on `key` for `auth`. The caller checks the registry
-/// afterwards and answers "already available" when the key is unlocked, so no unlock is missed.
-pub async fn register_remote_wait(
-    storage: &StorageHandle,
-    key: BucketKeyRef,
-    waiter: NodeId,
-    job_id: JobId,
-    auth: &AuthContext,
-) -> Result<(), String> {
-    let row = registration_key(key, waiter, job_id);
-    let value = postcard::to_allocvec(auth).map_err(|error| error.to_string())?;
-    batch_write(
-        storage,
-        vec![(KEY_WAIT_KEYSPACE.to_string(), row, ByteView::from(value))],
-        None,
-    )
-    .await
+/// Writes or drops one wait row: a registration, or an owed wake its waiter acknowledged.
+#[derive(Debug, PartialEq)]
+pub struct WaitRowOperation {
+    effect: Option<StorageEffect>,
+    outcome: Option<Result<(), JobMutationError>>,
+}
+
+impl WaitRowOperation {
+    /// Records that `waiter` parks `job_id` on `key` for `auth`. The caller checks the registry
+    /// afterwards and answers "already available" when the key is unlocked, so no unlock is missed.
+    pub fn register(key: BucketKeyRef, waiter: NodeId, job_id: JobId, auth: &AuthContext) -> Self {
+        let row = registration_key(key, waiter, job_id);
+        match postcard::to_allocvec(auth) {
+            Ok(value) => Self::new(StorageEffect::BatchWrite {
+                writes: vec![(KEY_WAIT_KEYSPACE.to_string(), row, ByteView::from(value))],
+                txn_id: None,
+            }),
+            Err(error) => Self {
+                effect: None,
+                outcome: Some(Err(JobMutationError::Storage(error.to_string()))),
+            },
+        }
+    }
+
+    /// Drops an owed wake once the waiting node acknowledged it.
+    pub fn acknowledge(waiter: NodeId, job_id: JobId, key: BucketKeyRef) -> Self {
+        let row = delivery_key(waiter, job_id, key);
+        Self::new(StorageEffect::BatchDelete {
+            deletes: vec![(KEY_WAIT_KEYSPACE.to_string(), row)],
+            txn_id: None,
+        })
+    }
+
+    fn new(effect: StorageEffect) -> Self {
+        Self {
+            effect: Some(effect),
+            outcome: None,
+        }
+    }
+}
+
+impl Operation for WaitRowOperation {
+    type Output = ();
+    type Error = JobMutationError;
+
+    fn start(&mut self) -> Effects {
+        match self.effect.take() {
+            Some(effect) => smallvec![Effect::Storage(effect)],
+            None => smallvec![],
+        }
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.outcome = Some(match event {
+            _ if self.outcome.is_some() => Err(unexpected(&event)),
+            Event::Storage(
+                StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
+            ) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => {
+                Err(JobMutationError::Storage(error.to_string()))
+            }
+            other => Err(unexpected(&other)),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.outcome.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.outcome.unwrap_or(Err(not_finished()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
 }
 
 /// Turns one page of registrations on `key` into owed wakes, atomically per page.
 /// Reports whether a further page may exist.
-pub async fn queue_remote_wakes(
-    storage: &StorageHandle,
+#[derive(Debug, PartialEq)]
+pub struct QueueWakesOperation {
     key: BucketKeyRef,
-) -> Result<bool, JobMutationError> {
-    let prefix = ByteView::from([&[REMOTE_PREFIX][..], &key.key()].concat());
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_write_txn(storage)
-            .await
-            .map_err(JobMutationError::Storage)?;
-        let page = iter_prefix_page(
-            storage,
-            KEY_WAIT_KEYSPACE,
-            Some(prefix.clone()),
-            None,
-            WAKE_PAGE,
-            Some(txn_id),
-        )
-        .await;
-        let rows = match page {
-            Ok((rows, _)) => rows,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(JobMutationError::Storage(error));
-            }
-        };
+    phase: QueuePhase,
+    full: bool,
+    /// The registrations a page clears once its owed wakes are written.
+    pending: JobDeletes,
+    outcome: Option<Result<bool, JobMutationError>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueuePhase {
+    Init,
+    Begin,
+    Page(TxnId),
+    Write(TxnId),
+    Delete(TxnId),
+    Commit(TxnId),
+    Abort,
+    Done,
+}
+
+impl QueueWakesOperation {
+    pub fn new(key: BucketKeyRef) -> Self {
+        Self {
+            key,
+            phase: QueuePhase::Init,
+            full: false,
+            pending: Vec::new(),
+            outcome: None,
+        }
+    }
+
+    fn prefix(&self) -> Key {
+        ByteView::from([&[REMOTE_PREFIX][..], &self.key.key()].concat())
+    }
+
+    fn finish(&mut self, outcome: Result<bool, JobMutationError>) -> Effects {
+        self.outcome = Some(outcome);
+        self.phase = QueuePhase::Done;
+        smallvec![]
+    }
+
+    /// Ends the page with `error`, aborting its open transaction first.
+    fn fail(&mut self, txn_id: TxnId, error: JobMutationError) -> Effects {
+        self.outcome = Some(Err(error));
+        self.phase = QueuePhase::Abort;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    /// The owed wakes and cleared registrations of one page of registration rows.
+    fn rewrite(&self, rows: &[(Key, Value)]) -> (JobWrites, JobDeletes) {
+        let prefix = self.prefix();
         let mut writes = Vec::new();
         let mut deletes = Vec::new();
-        for (row, value) in &rows {
-            let rest = &row[prefix.len()..];
+        for (row, value) in rows {
+            let rest = &row[prefix.len().min(row.len())..];
             let parsed = rest.split_first_chunk::<32>().and_then(|(node, job)| {
                 let job: [u8; 16] = job.try_into().ok()?;
                 Some((NodeId::from_bytes(node).ok()?, JobId::from_bytes(job)))
             });
             if let Some((waiter, job_id)) = parsed {
-                let owed = delivery_key(waiter, job_id, key);
+                let owed = delivery_key(waiter, job_id, self.key);
                 writes.push((KEY_WAIT_KEYSPACE.to_string(), owed, value.clone()));
             }
             deletes.push((KEY_WAIT_KEYSPACE.to_string(), row.clone()));
         }
-        let written = match batch_write(storage, writes, Some(txn_id)).await {
-            Ok(()) => batch_delete(storage, deletes, Some(txn_id)).await,
-            Err(error) => Err(error),
-        };
-        if let Err(error) = written {
-            abort_txn(storage, txn_id).await;
-            return Err(JobMutationError::Storage(error));
+        (writes, deletes)
+    }
+
+    /// The next write of the page, skipping an empty batch as the old helper did.
+    fn write_or_commit(
+        &mut self,
+        txn_id: TxnId,
+        writes: JobWrites,
+        deletes: JobDeletes,
+    ) -> Effects {
+        if !writes.is_empty() {
+            self.phase = QueuePhase::Write(txn_id);
+            self.pending = deletes;
+            return smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(txn_id),
+            })];
         }
-        match commit_write(storage, txn_id, attempt, "remote wake exhausted retries").await? {
-            CommitStep::Committed => return Ok(rows.len() == WAKE_PAGE),
-            CommitStep::Retry => continue,
+        self.delete_or_commit(txn_id, deletes)
+    }
+
+    fn delete_or_commit(&mut self, txn_id: TxnId, deletes: JobDeletes) -> Effects {
+        if !deletes.is_empty() {
+            self.phase = QueuePhase::Delete(txn_id);
+            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })];
+        }
+        self.phase = QueuePhase::Commit(txn_id);
+        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+}
+
+impl Operation for QueueWakesOperation {
+    type Output = bool;
+    type Error = JobMutationError;
+
+    fn start(&mut self) -> Effects {
+        self.phase = QueuePhase::Begin;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (self.phase, event) {
+            (QueuePhase::Begin, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
+                self.phase = QueuePhase::Page(txn_id);
+                smallvec![Effect::Storage(StorageEffect::Iter {
+                    key_space: KEY_WAIT_KEYSPACE.to_string(),
+                    prefix: Some(self.prefix()),
+                    start: None,
+                    limit: WAKE_PAGE,
+                    txn_id: Some(txn_id),
+                })]
+            }
+            (QueuePhase::Page(txn_id), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+                self.full = values.len() == WAKE_PAGE;
+                let (writes, deletes) = self.rewrite(&values);
+                self.write_or_commit(txn_id, writes, deletes)
+            }
+            (QueuePhase::Write(txn_id), Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
+                let deletes = std::mem::take(&mut self.pending);
+                self.delete_or_commit(txn_id, deletes)
+            }
+            (
+                QueuePhase::Delete(txn_id),
+                Event::Storage(StorageEvent::BatchDeleteResult { .. }),
+            ) => {
+                self.phase = QueuePhase::Commit(txn_id);
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (QueuePhase::Commit(_), Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
+                let full = self.full;
+                self.finish(Ok(full))
+            }
+            (QueuePhase::Commit(_), Event::Storage(StorageEvent::Error { error })) => {
+                let error = match error {
+                    StorageError::TransactionConflict => JobMutationError::Conflict,
+                    error => JobMutationError::Storage(error.to_string()),
+                };
+                self.finish(Err(error))
+            }
+            (QueuePhase::Begin, Event::Storage(StorageEvent::Error { error })) => {
+                self.finish(Err(JobMutationError::Storage(error.to_string())))
+            }
+            (
+                QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id),
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.fail(txn_id, JobMutationError::Storage(error.to_string())),
+            (QueuePhase::Abort, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
+                self.phase = QueuePhase::Done;
+                smallvec![]
+            }
+            (QueuePhase::Abort, Event::Storage(StorageEvent::Error { error })) => {
+                warn!(error = %error, "Failed to abort the remote wake transaction");
+                self.phase = QueuePhase::Done;
+                smallvec![]
+            }
+            (
+                QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id),
+                other,
+            ) => self.fail(txn_id, unexpected(&other)),
+            (_, other) => self.finish(Err(unexpected(&other))),
         }
     }
-    Err(JobMutationError::Storage(
-        "remote wake exhausted retries".to_string(),
-    ))
+
+    fn is_complete(&self) -> bool {
+        self.phase == QueuePhase::Done
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.outcome.unwrap_or(Err(not_finished()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.phase {
+            QueuePhase::Page(txn_id) | QueuePhase::Write(txn_id) | QueuePhase::Delete(txn_id) => {
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            _ => smallvec![],
+        }
+    }
+
+    fn is_conflict(error: &Self::Error) -> bool {
+        matches!(error, JobMutationError::Conflict)
+    }
 }
 
 /// One page of owed wakes after `start_after`, and the cursor of the next page when this one
 /// is full. Undecodable rows are skipped but still advance the cursor.
-pub async fn owed_wakes(
-    storage: &StorageHandle,
+#[derive(Debug, PartialEq)]
+pub struct OwedWakesOperation {
     start_after: Option<Key>,
-) -> Result<(Vec<OwedWake>, Option<Key>), String> {
-    let prefix = ByteView::from(vec![DELIVERY_PREFIX]);
-    let (rows, _) = iter_prefix_page(
-        storage,
-        KEY_WAIT_KEYSPACE,
-        Some(prefix),
-        start_after,
-        WAKE_PAGE,
-        None,
-    )
-    .await?;
+    started: bool,
+    outcome: Option<Result<(Vec<OwedWake>, Option<Key>), JobMutationError>>,
+}
+
+impl OwedWakesOperation {
+    pub fn new(start_after: Option<Key>) -> Self {
+        Self {
+            start_after,
+            started: false,
+            outcome: None,
+        }
+    }
+}
+
+impl Operation for OwedWakesOperation {
+    type Output = (Vec<OwedWake>, Option<Key>);
+    type Error = JobMutationError;
+
+    fn start(&mut self) -> Effects {
+        self.started = true;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: KEY_WAIT_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(vec![DELIVERY_PREFIX])),
+            start: self.start_after.take().map(IterStart::After),
+            limit: WAKE_PAGE,
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.outcome = Some(match event {
+            _ if !self.started || self.outcome.is_some() => Err(unexpected(&event)),
+            Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(owed_page(&values)),
+            Event::Storage(StorageEvent::Error { error }) => {
+                Err(JobMutationError::Storage(error.to_string()))
+            }
+            other => Err(unexpected(&other)),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.outcome.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.outcome.unwrap_or(Err(not_finished()))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+fn owed_page(rows: &[(Key, Value)]) -> (Vec<OwedWake>, Option<Key>) {
     let next = (rows.len() == WAKE_PAGE)
         .then(|| rows.last().map(|(row, _)| row.clone()))
         .flatten();
@@ -166,63 +418,17 @@ pub async fn owed_wakes(
             })
         })
         .collect();
-    Ok((owed, next))
+    (owed, next)
 }
 
-/// Drops an owed wake once the waiting node acknowledged it.
-pub async fn ack_wake(
-    storage: &StorageHandle,
-    waiter: NodeId,
-    job_id: JobId,
-    key: BucketKeyRef,
-) -> Result<(), String> {
-    let row = delivery_key(waiter, job_id, key);
-    batch_delete(storage, vec![(KEY_WAIT_KEYSPACE.to_string(), row)], None).await
+fn unexpected(event: &Event) -> JobMutationError {
+    JobMutationError::Storage(format!("unexpected storage event: {}", event.label()))
+}
+
+fn not_finished() -> JobMutationError {
+    JobMutationError::Storage("remote wait operation did not finish".to_string())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::FjallStorage;
-
-    #[tokio::test]
-    async fn wake_until_acknowledged() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let waiter = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let key = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 1);
-        let other = BucketKeyRef::new(Ulid::from_bytes([8; 16]), 2);
-        let job_id = JobId::from_bytes([5; 16]);
-        let auth = AuthContext {
-            user_id: aruna_core::UserId::new(Ulid::from_bytes([2; 16]), RealmId([1; 32])),
-            realm_id: RealmId([1; 32]),
-            path_restrictions: None,
-            session: None,
-        };
-        register_remote_wait(&storage, key, waiter, job_id, &auth)
-            .await
-            .unwrap();
-        register_remote_wait(&storage, other, waiter, job_id, &auth)
-            .await
-            .unwrap();
-
-        assert!(!queue_remote_wakes(&storage, key).await.unwrap());
-        let owed = OwedWake {
-            waiter,
-            job_id,
-            key,
-            auth,
-        };
-        assert_eq!(
-            owed_wakes(&storage, None).await.unwrap(),
-            (vec![owed], None)
-        );
-        // A repeated unlock finds nothing left to queue for this key.
-        assert!(!queue_remote_wakes(&storage, key).await.unwrap());
-        assert_eq!(owed_wakes(&storage, None).await.unwrap().0.len(), 1);
-
-        ack_wake(&storage, waiter, job_id, key).await.unwrap();
-        assert!(owed_wakes(&storage, None).await.unwrap().0.is_empty());
-    }
-}
+#[path = "remote_wait_tests.rs"]
+mod state_machine_tests;

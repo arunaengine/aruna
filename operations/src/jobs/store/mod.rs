@@ -103,7 +103,7 @@ pub fn decode_job_record(bytes: &[u8]) -> Result<JobRecord, ConversionError> {
     JobRecord::from_bytes(bytes)
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, PartialEq, Error)]
 pub enum JobMutationError {
     #[error("job not found")]
     NotFound,
@@ -129,6 +129,9 @@ pub enum JobMutationError {
     OutputsUnproven(#[from] JobRecordError),
     #[error("{0}")]
     Storage(String),
+    /// The write transaction lost to a concurrent one; a fresh run may succeed.
+    #[error("job storage transaction conflicted")]
+    Conflict,
 }
 
 /// Schedule-index key by state: queued -> due/, claimed/running -> lease/, settled -> prune/.
