@@ -5,8 +5,7 @@
 use crate::audit::AuditPageBatch;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::effects::{
-    FetchCursor, FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, ReceiptFrame,
-    encoded_len,
+    FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, encoded_len,
 };
 use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
 use crate::key_index::IndexEvent;
@@ -494,8 +493,6 @@ pub enum NetEvent {
     JobControl(JobControlEvent),
     AuditPages(AuditPageBatch),
     PolicyFetch(PolicyFetchEvent),
-    JobRecord(JobRecordEvent),
-    LaunchOffer(LaunchOfferEvent),
     PolicySign(PolicySignEvent),
     VaultFetch(VaultFetchEvent),
     VaultSign(VaultSignEvent),
@@ -641,33 +638,6 @@ impl TryFrom<Vec<JobRecordFrame>> for JobRecordPage {
     }
 }
 
-/// Reply to a [`crate::effects::JobRecordEffect`]. Each holder is authenticated
-/// by the transport peer; records keep their own publisher inside the envelope,
-/// so relaying a record never makes a holder its author.
-#[derive(Debug, PartialEq)]
-pub enum JobRecordEvent {
-    /// One current holder durably accepted the immutable record.
-    Published {
-        holder: NodeId,
-    },
-    /// Several current holders durably accepted the immutable record in one
-    /// fan-out. The publisher keeps any holders absent from this list queued.
-    PublishedMany {
-        holders: Vec<NodeId>,
-    },
-    Rejected {
-        holder: NodeId,
-        reason: JobRecordRejection,
-    },
-    /// At most the requested page of records, oldest key first.
-    Fetched {
-        holder: NodeId,
-        records: JobRecordPage,
-        next_cursor: Option<FetchCursor>,
-    },
-    Unavailable(String),
-}
-
 /// Why a holder refused an append-only job record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobRecordRejection {
@@ -679,24 +649,6 @@ pub enum JobRecordRejection {
     Unauthorized,
     /// The record failed contract validation, such as budget or chain rules.
     Invalid,
-}
-
-/// Reply to a [`crate::effects::LaunchOfferEffect`]. The receipt arrives in the
-/// target's own signed envelope, so the scheduler replicates it with its author.
-#[derive(Debug, PartialEq)]
-pub enum LaunchOfferEvent {
-    Accepted {
-        target: NodeId,
-        /// Bounded and kind-checked: an acceptance is refused before the
-        /// scheduler replicates it, exactly like the offer it answers.
-        receipt: Box<ReceiptFrame>,
-    },
-    Declined {
-        target: NodeId,
-        reason: LaunchDecline,
-    },
-    /// The target was unreachable; it may still have accepted the launch.
-    Unavailable(String),
 }
 
 /// The placement detail one decline may carry. Decoding rejects an oversized
@@ -954,8 +906,6 @@ impl Event {
                     JobControl,
                     AuditPages,
                     PolicyFetch,
-                    JobRecord,
-                    LaunchOffer,
                     PolicySign,
                     VaultFetch,
                     VaultSign,

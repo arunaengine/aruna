@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::UserId;
 use crate::alpn::Alpn;
 use crate::audit::AuditPageRequest;
-use crate::compute::{ExecutionTargetId, SharedSecret};
+use crate::compute::SharedSecret;
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
@@ -17,12 +17,11 @@ use crate::node_vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::WriteGuard;
-use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
+use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind};
 use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess, SourceMetadata};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
-use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::backend_import::PlainPath;
 use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
@@ -746,8 +745,6 @@ pub enum NetEffect {
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
     AuditPage(Box<AuditPageEffect>),
-    JobRecord(Box<JobRecordEffect>),
-    LaunchOffer(Box<LaunchOfferEffect>),
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
@@ -1042,42 +1039,6 @@ pub struct VaultFetchEffect {
     pub holders: HolderList<MAX_FETCH_HOLDERS>,
     pub user_id: UserId,
     pub query: VaultQuery,
-    pub deadline: Duration,
-}
-
-/// Replication of the append-only job-family records: publish one immutable
-/// record to the family holders, or read a bounded page back from them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobRecordEffect {
-    Publish {
-        realm_id: RealmId,
-        /// Family placement derived from the submission id, never from an alias.
-        placement: PlacementRef,
-        holders: HolderList<MAX_RECORD_HOLDERS>,
-        record: Box<JobRecordFrame>,
-        deadline: Duration,
-    },
-    Fetch {
-        realm_id: RealmId,
-        placement: PlacementRef,
-        holders: HolderList<MAX_RECORD_HOLDERS>,
-        submission_id: SubmissionId,
-        /// `None` reads every request family under this submission.
-        request_digest: Option<[u8; 32]>,
-        /// Opaque holder cursor returned by the previous page.
-        cursor: Option<FetchCursor>,
-        limit: PageLimit,
-        deadline: Duration,
-    },
-}
-
-/// One scheduler's launch offer to an execution target. It carries no caller
-/// token: the target verifies the signed launch and fetches the stored spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchOfferEffect {
-    pub realm_id: RealmId,
-    pub target: ExecutionTargetId,
-    pub launch: Box<LaunchFrame>,
     pub deadline: Duration,
 }
 
