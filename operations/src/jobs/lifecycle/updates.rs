@@ -3,19 +3,41 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::quota::JobReservationRecord;
+use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
+use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::JOB_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::execution::job::{
+    ExecutionClaim, ExecutionUpdate, JobErrorKind, JobFamilyRecord, JobId, JobRecord,
+    JobRecordBody, JobRecordEnvelope, JobRecordKind, JobResultPayload, JobState,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, job_record_key,
 };
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
 use tracing::{debug, warn};
+use ulid::Ulid;
 
+use super::LifecycleError;
 use super::chain::{ExecutionChain, ExecutionChainOperation, receipt_in};
 use super::held::HeldReservations;
+use super::outbox::schedule_outbox_drain;
 use super::reservation::ReleaseExecutionOperation;
+use super::witness::ArmFamilyOperation;
 use crate::driver::{DriverContext, drive};
+use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{
+    AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
+};
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 
 /// Spacing between retries of a terminal publication that stayed pending.
 pub const SETTLE_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -47,6 +69,29 @@ fn chain_tip(updates: &[&ExecutionUpdate], root: [u8; 32]) -> Option<(u64, [u8; 
     Some((next, previous))
 }
 
+/// What one publication did: whether its obligation is met, and whether it stored a new
+/// record, which the dashboard shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Publication {
+    pub done: bool,
+    pub changed: bool,
+}
+
+impl Publication {
+    const PENDING: Self = Self {
+        done: false,
+        changed: false,
+    };
+    const DONE: Self = Self {
+        done: true,
+        changed: false,
+    };
+}
+
+/// This node and the realm it serves, or `None` without a net transport.
+type Serving = Option<(NodeId, RealmId)>;
+
+/// Publishes one state of the local execution; see [`PublishStateOperation`].
 pub async fn publish_state(
     context: &DriverContext,
     chain: &ExecutionChain,
@@ -54,6 +99,13 @@ pub async fn publish_state(
     result: Option<PhysicalExecutionResult>,
     observed_at_ms: u64,
 ) -> bool {
+    let operation = PublishStateOperation::new(
+        *chain,
+        (state, result, observed_at_ms),
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    published(context, drive(operation, context).await)
 }
 
 /// Publishes a non-terminal state of a receipted execution. A job with no
@@ -69,14 +121,510 @@ pub async fn publish_progress(
     publish_state(context, &chain, state, None, unix_timestamp_millis()).await;
 }
 
+/// Publishes the terminal state of a receipted execution and releases its reservation; see
+/// [`PublishTerminalOperation`].
 pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bool {
+    let operation = PublishTerminalOperation::new(
+        record.clone(),
+        context.node_and_realm(),
+        unix_timestamp_millis(),
+    );
+    published(context, drive(operation, context).await)
 }
 
 /// Retries terminal publication and capacity release for every durable local
 /// terminal execution that still has a reservation. `true` means at least one
 /// obligation stayed pending, so the caller must run this again.
 pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
+    let operation =
+        SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
+    let settled = drive(operation, context)
+        .await
+        .map_err(|error| error.to_string())?;
+    if settled.changed {
+        context.notify_dashboard_change();
+    }
+    Ok(!settled.done)
+}
+
+/// Whether a publication met its obligation; a new record also refreshes the dashboard.
+fn published(context: &DriverContext, outcome: Result<Publication, LifecycleError>) -> bool {
+    match outcome {
+        Ok(publication) => {
+            if publication.changed {
+                context.notify_dashboard_change();
+            }
+            publication.done
         }
+        Err(error) => {
+            warn!(error = %error, "Execution publication failed");
+            false
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum PublishState {
+    Receipts,
+    Updates,
+    Sign,
+    Append,
+}
+
+type PublishStep = Result<Next<Publication>, LifecycleError>;
+
+/// Publishes one state of the local execution. The sequence and the previous
+/// digest are derived from the records already stored, so a replay of the same
+/// state is idempotent and a lost publication never breaks the chain. Only the
+/// receipted executor publishes; it signs the update through `NetEffect::ExecutionSign`.
+#[derive(Debug, PartialEq)]
+pub struct PublishStateOperation {
+    chain: ExecutionChain,
+    state: PhysicalExecutionState,
+    result: Option<PhysicalExecutionResult>,
+    observed_at_ms: u64,
+    serving: Serving,
+    now_ms: u64,
+    root: [u8; 32],
+    stage: PublishState,
+}
+
+impl PublishStateOperation {
+    pub fn new(
+        chain: ExecutionChain,
+        (state, result, observed_at_ms): (
+            PhysicalExecutionState,
+            Option<PhysicalExecutionResult>,
+            u64,
+        ),
+        serving: Serving,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            chain,
+            state,
+            result,
+            observed_at_ms,
+            serving,
+            now_ms,
+            root: [0; 32],
+            stage: PublishState::Receipts,
+        }
+    }
+
+    fn pending(&self, reason: &'static str) -> PublishStep {
+        let chain = &self.chain;
+        warn!(job_id = %chain.job_id, execution_id = %chain.execution_id, "{reason}");
+        Ok(Next::Done(Publication::PENDING))
+    }
+
+    /// The chain is extended only from evidence proven complete: the receipt
+    /// that authorized it, plus every stored update of this execution.
+    fn receipts(&mut self, result: IoResult) -> PublishStep {
+        let records = result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()?;
+        let records = records
+            .inspect_err(|error| warn!(error = %error, "Execution receipt read is incomplete"))
+            .ok();
+        let receipt = records.and_then(|records| receipt_in(&records, self.chain.execution_id));
+        let Some(receipt) = receipt else {
+            return self.pending("Execution receipt is no longer readable; publication deferred");
+        };
+        let Ok(root) = receipt.digest() else {
+            return self.pending("Execution receipt digest failed");
+        };
+        self.root = root;
+        self.stage = PublishState::Updates;
+        let updates = LoadFamilyOperation::kind(self.chain.family, JobRecordKind::Update);
+        Ok(Next::Call(IoCall::child(updates)))
+    }
+
+    /// Asks this node to sign the next update of the chain, unless the state is stored already.
+    fn sign(&mut self, result: IoResult, (local, realm_id): (NodeId, RealmId)) -> PublishStep {
+        let records = match result.child::<Vec<JobRecordEnvelope>, FamilyReadError>()? {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(error = %error, "Execution update read is incomplete; publication deferred");
+                return Ok(Next::Done(Publication::PENDING));
+            }
+        };
+        let chain = self.chain;
+        let mine: Vec<&ExecutionUpdate> = records
+            .iter()
+            .filter_map(|envelope| match &envelope.record {
+                JobFamilyRecord::Update(update) if update.execution_id == chain.execution_id => {
+                    Some(update.as_ref())
+                }
+                _ => None,
+            })
+            .collect();
+        if mine.iter().any(|update| update.state == self.state) {
+            return Ok(Next::Done(Publication::DONE));
+        }
+        let Some((sequence, previous)) = chain_tip(&mine, self.root) else {
+            return self.pending("Execution update chain is not contiguous");
+        };
+        let update = ExecutionUpdate {
+            execution_id: chain.execution_id,
+            submission_id: chain.family.submission_id,
+            request_digest: chain.family.request_digest,
+            executor_node_id: local,
+            sequence,
+            previous_digest: previous,
+            state: self.state,
+            observed_at_ms: self.observed_at_ms,
+            result: self.result.take(),
+        };
+        self.stage = PublishState::Sign;
+        let claim = ExecutionClaim {
+            realm_id,
+            record: JobFamilyRecord::Update(Box::new(update)),
+            publisher: local,
+        };
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Net(
+            NetEffect::ExecutionSign(Box::new(claim)),
+        )))))
+    }
+
+    fn append(&mut self, result: IoResult, (local, realm_id): (NodeId, RealmId)) -> PublishStep {
+        let IoResult::Event(event) = result else {
+            return Err(IoError::Unexpected {
+                expected: "Event::Net(NetEvent::ExecutionSign)",
+                got: result.label(),
+            }
+            .into());
+        };
+        let envelope = match *event {
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => envelope,
+            Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(reason))) => {
+                warn!(reason = %reason, "Execution update signing failed");
+                return Ok(Next::Done(Publication::PENDING));
+            }
+            other => {
+                return Err(IoError::Unexpected {
+                    expected: "Event::Net(NetEvent::ExecutionSign)",
+                    got: other.label(),
+                }
+                .into());
+            }
+        };
+        let Ok(frame) = JobRecordFrame::new(*envelope) else {
+            return self.pending("Execution update exceeds the record bounds");
+        };
+        self.stage = PublishState::Append;
+        Ok(Next::Call(IoCall::child(AppendRecordOperation::new(
+            AppendRecordConfig {
+                realm_id,
+                local_node_id: local,
+                record: frame,
+                local: None,
+                origin: RecordOrigin::Local,
+                now_ms: self.now_ms,
+            },
+        ))))
+    }
+
+    fn appended(&mut self, result: IoResult, (local, realm_id): (NodeId, RealmId)) -> PublishStep {
+        let chain = self.chain;
+        let outcome = match result.child::<AppendOutcome, RecordStoreError>()? {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                warn!(
+                    job_id = %chain.job_id,
+                    execution_id = %chain.execution_id,
+                    error = %error,
+                    "Execution update append failed"
+                );
+                return Ok(Next::Done(Publication::PENDING));
+            }
+        };
+        if !matches!(
+            outcome.admission,
+            Admission::Authentic | Admission::Duplicate
+        ) {
+            warn!(
+                job_id = %chain.job_id,
+                execution_id = %chain.execution_id,
+                admission = ?outcome.admission,
+                "Execution update was not admitted"
+            );
+            return Ok(Next::Done(Publication::PENDING));
+        }
+        debug!(state = self.state.name(), "Execution update published");
+        let mut calls = Vec::new();
+        // An infrastructure error ends this execution without deciding the
+        // job, so the family must be planned again from here too.
+        if self.state == PhysicalExecutionState::Error {
+            let arm = ArmFamilyOperation::new(chain.family, local, realm_id, self.now_ms);
+            calls.push(IoCall::child(arm));
+        }
+        calls.push(IoCall::Effect(Box::new(schedule_outbox_drain(
+            Duration::ZERO,
+        ))));
+        // A duplicate is a retry of a stored state; only a new record is a change.
+        let output = Publication {
+            done: true,
+            changed: matches!(outcome.admission, Admission::Authentic),
+        };
+        Ok(Next::Then { output, calls })
+    }
+}
+
+impl Operation for PublishStateOperation {
+    type Output = Publication;
+    type Error = LifecycleError;
+
+    fn first(&mut self) -> PublishStep {
+        let Some((local, _)) = self.serving else {
+            return self.pending("Execution update needs a net handle; publication abandoned");
+        };
+        if self.chain.executor_node_id != local {
+            return self.pending("Only the receipted executor may publish this execution");
+        }
+        let receipts = LoadFamilyOperation::kind(self.chain.family, JobRecordKind::Receipt);
+        Ok(Next::Call(IoCall::child(receipts)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishStep {
+        let Some(serving) = self.serving else {
+            return Ok(Next::Done(Publication::PENDING));
+        };
+        match self.stage {
+            PublishState::Receipts => self.receipts(result),
+            PublishState::Updates => self.sign(result, serving),
+            PublishState::Sign => self.append(result, serving),
+            PublishState::Append => self.appended(result, serving),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum TerminalState {
+    Held,
+    Chain,
+    Publish(Ulid),
+    Release(bool),
+}
+
+/// Publishes the terminal state of a receipted execution and releases its
+/// reservation. Success names the digest of the output record stored before it,
+/// so a success can never be projected without its exact outputs.
+#[derive(Debug, PartialEq)]
+pub struct PublishTerminalOperation {
+    record: JobRecord,
+    serving: Serving,
+    now_ms: u64,
+    stage: TerminalState,
+}
+
+impl PublishTerminalOperation {
+    pub fn new(record: JobRecord, serving: Serving, now_ms: u64) -> Self {
+        Self {
+            record,
+            serving,
+            now_ms,
+            stage: TerminalState::Held,
+        }
+    }
+
+    fn deferred(&self, reason: &'static str) -> PublishStep {
+        warn!(job_id = %self.record.job_id, "{reason}");
+        Ok(Next::Done(Publication::PENDING))
+    }
+
+    fn chain(&mut self, result: IoResult) -> PublishStep {
+        let held = match result.child::<Vec<JobReservationRecord>, LifecycleError>()? {
+            Ok(held) => held,
+            Err(error) => {
+                warn!(
+                    job_id = %self.record.job_id,
+                    error = %error,
+                    "Execution reservation read failed; terminal publication deferred"
+                );
+                return Ok(Next::Done(Publication::PENDING));
+            }
+        };
+        // No reservation is a purely local execution: it owes nothing here.
+        let Some(reservation) = held.into_iter().next() else {
+            return Ok(Next::Done(Publication::DONE));
+        };
+        self.stage = TerminalState::Chain;
+        let chain = ExecutionChainOperation::of_execution(
+            reservation.logical_job_id,
+            reservation.execution_id,
+        );
+        Ok(Next::Call(IoCall::child(chain)))
+    }
+
+    fn publish(&mut self, result: IoResult, state: PhysicalExecutionState) -> PublishStep {
+        let Ok(Some(chain)) = result.child::<Option<ExecutionChain>, LifecycleError>()? else {
+            return self.deferred("Terminal publication deferred: the receipt chain is unresolved");
+        };
+        let payload = self.record.result.as_ref();
+        let (stdout, stderr) = log_tails(payload);
+        let result = PhysicalExecutionResult {
+            exit_code: exit_code(payload),
+            output_digest: output_digest(payload),
+            message: self
+                .record
+                .last_error
+                .as_ref()
+                .and_then(|error| ResultMessage::new(error.message.clone()).ok()),
+            stdout,
+            stderr,
+        };
+        let observed_at_ms = self
+            .record
+            .finished_at_ms
+            .unwrap_or(self.record.updated_at_ms);
+        self.stage = TerminalState::Publish(chain.execution_id);
+        Ok(Next::Call(IoCall::child(PublishStateOperation::new(
+            chain,
+            (state, Some(result), observed_at_ms),
+            self.serving,
+            self.now_ms,
+        ))))
+    }
+}
+
+impl Operation for PublishTerminalOperation {
+    type Output = Publication;
+    type Error = LifecycleError;
+
+    fn first(&mut self) -> PublishStep {
+        if terminal_state(&self.record).is_none() {
+            return Ok(Next::Done(Publication::DONE));
+        }
+        Ok(Next::Call(IoCall::child(HeldReservations::of_job(
+            self.record.job_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishStep {
+        let Some(state) = terminal_state(&self.record) else {
+            return Ok(Next::Done(Publication::DONE));
+        };
+        match self.stage {
+            TerminalState::Held => self.chain(result),
+            TerminalState::Chain => self.publish(result, state),
+            TerminalState::Publish(execution_id) => {
+                let publication = result
+                    .child::<Publication, LifecycleError>()?
+                    .unwrap_or(Publication::PENDING);
+                if !publication.done {
+                    return Ok(Next::Done(publication));
+                }
+                self.stage = TerminalState::Release(publication.changed);
+                let release = ReleaseExecutionOperation::new(execution_id);
+                Ok(Next::Call(IoCall::child(release)))
+            }
+            TerminalState::Release(changed) => {
+                if let Err(error) = result.child::<bool, LifecycleError>()? {
+                    warn!(error = %error, "Execution reservation release failed");
+                    return Ok(Next::Done(Publication {
+                        done: false,
+                        changed,
+                    }));
+                }
+                Ok(Next::Done(Publication {
+                    done: true,
+                    changed,
+                }))
+            }
+        }
+    }
+}
+
+/// Retries terminal publication and capacity release for every durable local
+/// terminal execution that still has a reservation. A result that is not `done` means at
+/// least one obligation stayed pending, so the caller must run it again.
+#[derive(Debug, PartialEq)]
+pub struct SettleTerminalsOperation {
+    serving: Serving,
+    now_ms: u64,
+    held: VecDeque<JobReservationRecord>,
+    current: Option<JobReservationRecord>,
+    settled: Publication,
+    publishing: bool,
+}
+
+impl SettleTerminalsOperation {
+    pub fn new(serving: Serving, now_ms: u64) -> Self {
+        Self {
+            serving,
+            now_ms,
+            held: VecDeque::new(),
+            current: None,
+            settled: Publication::DONE,
+            publishing: false,
+        }
+    }
+
+    /// Reads the job of the next held reservation, or ends once none is left.
+    fn read_next(&mut self) -> PublishStep {
+        let Some(reservation) = self.held.pop_front() else {
+            return Ok(Next::Done(self.settled));
+        };
+        let row = (JOB_KEYSPACE.to_string(), job_record_key(reservation.job_id));
+        self.current = Some(reservation);
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn settle(&mut self, result: IoResult) -> PublishStep {
+        let [value] = values::<1>(result)?;
+        let record = value.and_then(|value| match JobRecord::from_bytes(&value) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                warn!(error = %error, "Malformed job record retained");
+                None
+            }
+        });
+        let Some(record) = record.filter(JobRecord::is_settled) else {
+            return self.read_next();
+        };
+        self.publishing = true;
+        let publish = PublishTerminalOperation::new(record, self.serving, self.now_ms);
+        Ok(Next::Call(IoCall::child(publish)))
+    }
+
+    fn published(&mut self, result: IoResult) -> PublishStep {
+        self.publishing = false;
+        let publication = result
+            .child::<Publication, LifecycleError>()?
+            .unwrap_or(Publication::PENDING);
+        self.settled.changed |= publication.changed;
+        if !publication.done {
+            if let Some(reservation) = &self.current {
+                warn!(
+                    job_id = %reservation.job_id,
+                    execution_id = %reservation.execution_id,
+                    "Terminal obligation remains pending; the reservation stays held"
+                );
+            }
+            self.settled.done = false;
+        }
+        self.read_next()
+    }
+}
+
+impl Operation for SettleTerminalsOperation {
+    type Output = Publication;
+    type Error = LifecycleError;
+
+    fn first(&mut self) -> PublishStep {
+        Ok(Next::Call(IoCall::child(HeldReservations::all())))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishStep {
+        if self.publishing {
+            return self.published(result);
+        }
+        if self.current.is_some() {
+            return self.settle(result);
+        }
+        self.held = result
+            .child::<Vec<JobReservationRecord>, LifecycleError>()??
+            .into();
+        self.read_next()
     }
 }
 
