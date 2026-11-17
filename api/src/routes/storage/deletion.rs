@@ -34,7 +34,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::RealmAuth;
-use crate::auth::{ValidatedBearer, permission_granted, require_realm_auth};
+use crate::auth::{ValidatedBearer, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
@@ -925,11 +925,10 @@ fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
 )]
 pub async fn control_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
-    let auth = require_realm_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
     let record =

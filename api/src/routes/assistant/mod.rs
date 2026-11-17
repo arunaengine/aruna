@@ -19,12 +19,11 @@ use chats::{
 };
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
     AssistantProviderStatus, CENTRAL_PROVIDER_ID,
@@ -39,7 +38,7 @@ use axum::body::to_bytes;
 use axum::extract::Request;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::{Extension, Json};
+use axum::Json;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -415,10 +414,9 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn list_providers(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListProvidersResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let providers = drive(ListProviderOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_store_error)?
@@ -484,11 +482,10 @@ refused. The provider is registered for the calling user alone.
 )]
 pub async fn create_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let request: CreateProviderRequest = parse_json(request).await?;
     let kind = parse_provider_kind(&request.kind)?;
     if kind == AssistantProviderKind::Chatgpt {
@@ -584,12 +581,11 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn patch_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let request: PatchProviderRequest = parse_json(request).await?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     let expected = provider.clone();
@@ -653,11 +649,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn delete_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         DeleteProviderOperation::new(provider_id, auth.user_id),
         &state.get_ctx(),
@@ -707,11 +702,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn get_models(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderModelsResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     if provider_id == CENTRAL_PROVIDER_ID {
         let models = central::central_models(&state, &auth).await?;
         return Ok((StatusCode::OK, Json(ProviderModelsResponse { models })));
@@ -756,11 +750,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn test_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderTestResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let result = if provider.kind == AssistantProviderKind::Chatgpt {
         chatgpt::fresh_provider(&state, provider).await.map(|_| ())

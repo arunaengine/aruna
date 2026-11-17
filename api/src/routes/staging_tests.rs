@@ -395,7 +395,7 @@ async fn batch_rejects_cap() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -421,7 +421,7 @@ async fn batch_rejects_node() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: Some(other_node.to_string()),
@@ -509,7 +509,7 @@ async fn batch_sync_unimplemented() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -1207,7 +1207,7 @@ mod distributed {
         blocking.table = table("{url|basename}");
         let refused = stage_batch(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Json(blocking),
         )
         .await;
@@ -1220,7 +1220,7 @@ mod distributed {
         let run = |request: StageBatchRequest| {
             stage_batch(
                 State(node.state.clone()),
-                Extension(Some(node.owner.clone())),
+                RealmAuth(node.owner.clone()),
                 Json(request),
             )
         };

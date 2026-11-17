@@ -3,10 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::RealmAuth;
-use crate::auth::{
-    ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
-    require_realm_auth,
-};
+use crate::auth::{ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
 use crate::lookup::bucket_info;
@@ -461,12 +458,11 @@ route, and sending `prefixes` additionally requires READ on the group's data pat
 )]
 pub async fn stage_batch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<StageBatchRequest>,
 ) -> ServerResult<(StatusCode, Json<StageBatchResponse>)> {
     const BATCH_LIMIT: usize = 1000;
 
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&request.group_id)?;
     let connector_id = parse_connector_id(&request.connector_id)?;
     if request.strategy == ApiStagingStrategy::Sync {

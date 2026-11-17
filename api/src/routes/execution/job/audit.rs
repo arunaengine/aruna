@@ -8,19 +8,18 @@ use std::sync::Arc;
 
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::lifecycle::{
     AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::JobOutputResponse;
 use crate::jobs::hex32;
@@ -311,11 +310,10 @@ surface never confirms that somebody else's job exists.
 )]
 pub async fn get_job_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
-    let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;

@@ -558,11 +558,11 @@ async fn shows_purge_pause() {
     // A restricted token steers no purge of storage files.
     let mut restricted = fixture.auth.clone();
     restricted.path_restrictions = Some(Vec::new());
-    let refused = control_purge(state(), Extension(Some(restricted)), path("pause")).await;
+    let refused = control_purge(state(), RealmAuth(restricted), path("pause")).await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let Json(paused) = control_purge(
         state(),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         path("pause"),
     )
     .await
@@ -573,7 +573,7 @@ async fn shows_purge_pause() {
     assert!(shown.paused && shown.delete_storage_files);
     let Json(resumed) = control_purge(
         state(),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         path("resume"),
     )
     .await

@@ -248,7 +248,7 @@ async fn lists_readable_buckets() {
     let list = |auth: AuthContext| {
         list_group_buckets(
             State(test.state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Path(test.group_id.to_string()),
             axum::extract::Query(BucketPageQuery {
                 limit: Some(1),
@@ -340,7 +340,7 @@ async fn lists_bucket_jobs() {
         };
         let listed = list_group_buckets(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Path(test.group_id.to_string()),
             axum::extract::Query(query),
         );
@@ -432,7 +432,7 @@ async fn lists_unrouted_import() {
     };
     let listed = list_group_buckets(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         axum::extract::Query(query),
     );
