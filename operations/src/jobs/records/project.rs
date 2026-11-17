@@ -350,6 +350,10 @@ impl Operation for ProjectFamilyOperation {
     type Output = ProjectedFamily;
     type Error = RecordStoreError;
 
+    fn is_conflict(error: &Self::Error) -> bool {
+        error.is_conflict()
+    }
+
     fn start(&mut self) -> Effects {
         match self.config.family {
             FamilyRef::Family(_) => self.read_cache(),
