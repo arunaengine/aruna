@@ -3,17 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod cleanup;
-pub mod cleanup_rows;
-pub mod hidden;
+pub(crate) mod cleanup_rows;
+pub(crate) mod hidden;
 pub mod holders;
 pub mod managed_copy;
 pub mod migration;
-pub mod pending_reclaim;
+pub(crate) mod pending_reclaim;
 pub mod permission_paths;
-pub mod promote;
+pub(crate) mod promote;
 pub mod purge;
 pub mod reclaim;
 pub mod records;
-pub mod release;
+pub(crate) mod release;
 pub(crate) mod trail;
 pub mod unify;

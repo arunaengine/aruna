@@ -19,7 +19,7 @@ pub mod put;
 mod refresh_mint;
 mod refresh_observe;
 pub mod search;
-pub mod search_scan;
+pub(crate) mod search_scan;
 pub mod source;
 pub mod versions;
 pub mod visible;

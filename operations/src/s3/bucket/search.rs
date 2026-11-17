@@ -157,7 +157,8 @@ impl SearchBucketsOperation {
     const SCAN_LIMIT: usize = 1_000;
     const MAX_SCAN_ROWS: usize = 1_024;
 
-    pub fn new(input: SearchBucketsInput) -> Self {
+    #[cfg(test)]
+    fn new(input: SearchBucketsInput) -> Self {
         Self::with_budget(input, Self::MAX_SCAN_ROWS)
     }
 

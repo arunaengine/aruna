@@ -536,6 +536,7 @@ impl IncomingVersionOperation {
     /// Replaces the clock the enqueue phase samples. Production keeps the
     /// default; tests fix it so a long apply can prove the candidate carries
     /// the enqueue time rather than the construction time.
+    #[cfg(test)]
     pub fn with_clock(mut self, clock: fn() -> SystemTime) -> Self {
         self.clock = EnqueueClock(clock);
         self
