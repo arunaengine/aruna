@@ -32,7 +32,7 @@ fn backoff(attempt: u32, seed: u64) -> Duration {
 
 /// Runs one source request as a child and, for a table import, runs it again after a
 /// transient error until it answers or the attempts run out.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub(super) struct Retried<I, O: Operation> {
     input: I,
     build: fn(I) -> O,
@@ -41,6 +41,17 @@ pub(super) struct Retried<I, O: Operation> {
     attempt: u32,
     seed: u64,
     waiting: bool,
+}
+
+/// Two retries are equal when they stand at the same place; the functions are not compared.
+impl<I: PartialEq, O: Operation> PartialEq for Retried<I, O> {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+            && self.table == other.table
+            && self.attempt == other.attempt
+            && self.seed == other.seed
+            && self.waiting == other.waiting
+    }
 }
 
 impl<I: Clone, O: Operation> Retried<I, O> {
