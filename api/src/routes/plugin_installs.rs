@@ -15,13 +15,12 @@ use aruna_core::types::GroupId;
 use aruna_operations::plugins::account::plugin_account;
 use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
-    InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
-    read_manifest,
+    InstallError, InstallRequest, Summary, install_plugin, installed_summary, pick_version,
+    prepare_install, prepared_summary, read_config, read_manifest,
 };
 use aruna_operations::plugins::lifecycle::remove_install;
 use aruna_operations::plugins::receiver::lost_reason;
 use aruna_operations::plugins::records::RecordError;
-use aruna_operations::plugins::summary::{self, Summary};
 use aruna_operations::users::service_account::group_admin_path;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -302,7 +301,7 @@ pub async fn install(
         let prepared = prepare_install(&ctx, &auth, state.get_realm_id(), &request)
             .await
             .map_err(map_error)?;
-        let summary = InstallSummary::from(summary::prepared(&prepared));
+        let summary = InstallSummary::from(prepared_summary(&prepared));
         return Ok(Json(summary).into_response());
     }
     let installed = install_plugin(&ctx, &actor(&state, &auth), &auth, &request)
@@ -508,7 +507,7 @@ pub(crate) async fn view(state: &ServerState, install: PluginInstall) -> ServerR
 }
 
 fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView {
-    let summary = InstallSummary::from(summary::installed(config, &install));
+    let summary = InstallSummary::from(installed_summary(config, &install));
     // A lost receiver blocks the install here; its stored state stays as it is.
     let lost = lost_reason(config, install.receiver);
     let webhook = (summary.triggers.iter().any(|kind| kind == "webhook"))
