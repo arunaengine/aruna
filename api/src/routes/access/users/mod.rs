@@ -56,6 +56,7 @@ use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
@@ -85,25 +86,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(vault::router())
         .merge(keys::router())
         .merge(merge::router())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserRequest {
-    pub onboarding_secret: Option<String>,
-    /// Create a new account although an account with this email or name exists.
-    #[serde(default)]
-    pub create_new: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserResponse {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GetTokenResponse {
-    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

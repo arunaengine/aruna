@@ -4,12 +4,10 @@
 
 use crate::error::CliError;
 use crate::info::{default_info_url, fetch_info_url, resolve_token};
-use aruna_api::routes::info::{
-    InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
-};
 use aruna_core::alpn::Alpn;
 use aruna_core::telemetry::duration_ms;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
+use aruna_wire::info::{InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use serde::Serialize;
@@ -410,12 +408,12 @@ fn iroh_check_error(step: &'static str, message: impl std::fmt::Display) -> CliE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_api::routes::info::{
-        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
-    };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
+    use aruna_wire::info::{
+        InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeStatus, ServicesStatus,
+    };
     use tempfile::{TempDir, tempdir};
 
     fn test_info_response(endpoint_addr: Option<EndpointAddr>) -> InfoResponse {

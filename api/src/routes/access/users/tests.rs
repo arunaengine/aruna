@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse, enrollment_status};
+use super::enrollment_status;
 use crate::auth::{OidcValidator, handle_token};
 use crate::auth::{RealmAuth, TokenAuth};
 use crate::routes::access::sessions::{CreateSessionRequest, CreateSessionResponse};
@@ -40,6 +40,7 @@ use aruna_operations::tasks::incoming::start_task_queues;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::Json;
 use axum::Router;
 use axum::extract::State;

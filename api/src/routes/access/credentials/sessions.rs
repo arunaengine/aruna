@@ -19,6 +19,10 @@ use aruna_operations::s3::session::{
     CreateS3Config, CreateS3Operation, GetS3Operation, ListSessionsOperation, RefreshS3Config,
     RefreshS3Operation, RevokeS3Config, RevokeS3Operation, S3SessionCredentials, S3SessionError,
 };
+use aruna_wire::session::{
+    S3SessionRequest, S3SessionsResponse, SessionGroupResponse, SessionIssuerResponse,
+    SessionRestrictionResponse, SessionSummaryResponse, SessionTokenResponse,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -35,62 +39,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(create_s3_session, list_s3_sessions))
         .routes(routes!(refresh_s3_session))
         .routes(routes!(revoke_s3_session))
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = CreateS3SessionRequest)]
-pub struct S3SessionRequest {
-    pub group_id: String,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = S3SessionGroupResponse)]
-pub struct SessionGroupResponse {
-    pub id: String,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = S3SessionIssuerResponse)]
-pub struct SessionIssuerResponse {
-    pub node_id: String,
-    pub s3_endpoint: Option<String>,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = S3SessionRestrictionResponse)]
-pub struct SessionRestrictionResponse {
-    pub pattern: String,
-    pub permission: String,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = S3SessionResponse)]
-pub struct SessionTokenResponse {
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: String,
-    pub expires_at: String,
-    pub group: SessionGroupResponse,
-    pub restrictions: Vec<SessionRestrictionResponse>,
-    pub issuer_node: SessionIssuerResponse,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = S3SessionSummaryResponse)]
-pub struct SessionSummaryResponse {
-    pub access_key_id: String,
-    pub created_at: Option<String>,
-    pub expires_at: String,
-    pub last_used_at: Option<String>,
-    pub group: SessionGroupResponse,
-    pub restrictions: Vec<SessionRestrictionResponse>,
-    pub issuer_node: SessionIssuerResponse,
-}
-
-#[derive(Clone, Deserialize, Serialize, ToSchema)]
-#[schema(as = ListS3SessionsResponse)]
-pub struct S3SessionsResponse {
-    pub sessions: Vec<SessionSummaryResponse>,
 }
 
 #[utoipa::path(

@@ -4,7 +4,6 @@
 
 use crate::error::CliError;
 use aruna::config::load;
-use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use aruna_api::server::state::load_persisted_state;
 use aruna_core::UserId;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
@@ -27,6 +26,7 @@ use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_tasks::TaskHandle;
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use async_trait::async_trait;
 use jsonwebtoken::dangerous::insecure_decode;
 use rand::Rng;

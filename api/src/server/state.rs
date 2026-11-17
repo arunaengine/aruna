@@ -35,6 +35,7 @@ use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
 use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_wire::info::PortalStatus;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
@@ -221,33 +222,6 @@ pub struct ServerState {
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PortalStatus {
-    pub installed: bool,
-    pub mode: String,
-    pub version: Option<String>,
-    pub source: Option<String>,
-    pub url: Option<String>,
-    pub checksum: Option<String>,
-    pub fetched_at: Option<String>,
-    pub last_error: Option<String>,
-}
-
-impl Default for PortalStatus {
-    fn default() -> Self {
-        Self {
-            installed: false,
-            mode: "disabled".to_string(),
-            version: None,
-            source: None,
-            url: None,
-            checksum: None,
-            fetched_at: None,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]

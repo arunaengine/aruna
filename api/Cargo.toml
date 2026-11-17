@@ -17,6 +17,7 @@ zeroize = { workspace = true }
 # Aruna modules
 aruna-core = { workspace = true }
 aruna-operations = { workspace = true }
+aruna-wire = { workspace = true }
 
 # General
 ahash = { workspace = true }
