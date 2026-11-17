@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use aruna_core::NodeId;
 use aruna_core::structs::execution::job::{
-    CompositionError, ExportReportRow, ImportReportRow, JobId, JobRecord, JobState, KeyWait,
-    SYSTEM_ENTRY_PREFIX,
+    CompositionError, ExportReportRow, ImportReportRow, JobId, JobState, SYSTEM_ENTRY_PREFIX,
 };
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
@@ -21,9 +20,9 @@ use aruna_operations::jobs::command::{
     ExecutionTarget as CommandExecutionTarget, InputMode as CommandInputMode, SessionMountSpec,
     SubmitExecutionCommand, WorkspaceMode as CommandWorkspaceMode, WorkspaceSpec,
 };
-use aruna_operations::jobs::lifecycle::{FamilyReport, family_report};
+use aruna_operations::jobs::lifecycle::family_report;
 use aruna_operations::jobs::service::{
-    ArtifactLookup, JobKind, JobReportLookup, JobStatusView, OwnedArtifact, RoutedCancelOutcome,
+    ArtifactLookup, JobKind, JobReportLookup, OwnedArtifact, RoutedCancelOutcome,
     cancel_job_routed, delete_owned_run, list_owned_jobs, read_artifact_routed, read_job_routed,
     read_report_routed, resolve_job_owner,
 };
@@ -53,8 +52,8 @@ use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{
-    JobCandidateResponse, JobExecutionResponse, JobFamilyResponse, JobInputResponse,
-    JobOutputResponse, JobPlacementResponse, SubmitJobResponse, admit_execution, hex32, job_urls,
+    JobListResponse, JobStatusResponse, SubmitJobResponse, admit_execution, bind_output_routes,
+    family_response, job_status_response, job_urls, job_view_response,
 };
 use crate::rate_limit::LocalKey;
 use crate::server::state::{RestInterfaceRuntime, ServerState};
@@ -445,228 +444,6 @@ struct ReportCursor {
     job_id: JobId,
     report_digest: [u8; 32],
     last_key: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobProgressResponse {
-    pub current: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub total: Option<u64>,
-    pub unit: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobErrorResponse {
-    pub message: String,
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobStatusResponse {
-    pub job_id: String,
-    pub kind: String,
-    pub state: String,
-    pub attempts: u32,
-    pub cancel_requested: bool,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
-    pub progress: JobProgressResponse,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JobErrorResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_bucket: Option<String>,
-    pub workspace_mode: String,
-    /// This node spent its attempts without a job-specific verdict: no further
-    /// automatic attempt runs here and the outcome is not a proven failure.
-    #[serde(default)]
-    pub locally_exhausted: bool,
-    /// Present for a notebook session: the catalog runtime it runs, for example
-    /// `python-notebook`. Absent for every other job.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_runtime: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub run_crate: Option<serde_json::Value>,
-    /// Present only for a distributed external job, whose truth is the
-    /// replicated family rather than this node's own row.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub family: Option<JobFamilyResponse>,
-    /// Present while `awaiting_key`: the locked bucket keys the job waits for, as
-    /// `{node_id, bucket, group_id?}` objects.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub awaiting_keys: Vec<serde_json::Value>,
-    /// Api url of the node that owns an owner-routed job, as its submission named it.
-    /// Absent for a distributed execution job and when this node does not know the url.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_node_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct JobListResponse {
-    pub jobs: Vec<JobStatusResponse>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub next_cursor: Option<String>,
-}
-
-pub(crate) fn rfc3339(ms: u64) -> String {
-    chrono::DateTime::from_timestamp_millis(ms as i64)
-        .map(|dt| dt.to_rfc3339())
-        .unwrap_or_default()
-}
-
-pub(crate) fn job_status_response(record: &JobRecord) -> JobStatusResponse {
-    job_view_response(&JobStatusView::from(record))
-}
-
-pub(crate) fn job_view_response(job: &JobStatusView) -> JobStatusResponse {
-    JobStatusResponse {
-        job_id: job.job_id.to_string(),
-        kind: job.kind.name().to_string(),
-        state: job.state.name().to_string(),
-        attempts: job.attempts,
-        cancel_requested: job.cancel_requested,
-        created_at: rfc3339(job.created_at_ms),
-        updated_at: rfc3339(job.updated_at_ms),
-        finished_at: job.finished_at_ms.map(rfc3339),
-        progress: JobProgressResponse {
-            current: job.progress.current,
-            total: job.progress.total,
-            unit: job.progress.unit.clone(),
-        },
-        error: job.last_error.as_ref().map(|error| JobErrorResponse {
-            message: error.message.clone(),
-            kind: error.kind.name().to_string(),
-        }),
-        result: job.result.clone(),
-        workspace_bucket: job.workspace_bucket.clone(),
-        workspace_mode: job.workspace_mode.name().to_string(),
-        locally_exhausted: job.locally_exhausted,
-        session_runtime: job.session_runtime.clone(),
-        run_crate: None,
-        family: None,
-        awaiting_keys: job
-            .awaiting_keys
-            .iter()
-            .map(KeyWait::to_public_json)
-            .collect(),
-        owner_node_url: None,
-    }
-}
-
-pub(crate) fn output_response(
-    output: &aruna_core::structs::execution::job::OutputObject,
-    endpoint_url: Option<&String>,
-) -> JobOutputResponse {
-    JobOutputResponse {
-        bucket: output.bucket.clone(),
-        version_id: output.version_id.to_string(),
-        execution_id: output.execution_id.to_string(),
-        container_path: output.container_path.clone(),
-        size: output.size,
-        content_type: aruna_core::structs::storage::blob::key_content_type(&output.key).to_string(),
-        key: output.key.clone(),
-        digest: output.digest.clone(),
-        endpoint_url: endpoint_url.cloned(),
-    }
-}
-
-/// Projects the reduced family. Node ids of the executions and of the placement
-/// are disclosed, because a caller needs them to tell one run from another.
-pub(crate) fn family_response(report: &FamilyReport) -> JobFamilyResponse {
-    // A missing endpoint only leaves that output unaddressable; the succeeded
-    // family stays readable on any responder.
-    let outputs = report
-        .outputs
-        .iter()
-        .map(|output| output_response(output, report.output_endpoints.get(&output.node_id)))
-        .collect::<Vec<_>>();
-    JobFamilyResponse {
-        submission_id: hex32(&report.submission_id.0),
-        request_digest: hex32(&report.request_digest),
-        canonical_job_id: report.canonical_job_id.to_string(),
-        aliases: report.aliases.iter().map(JobId::to_string).collect(),
-        alias_count: report.aliases.len() as u32,
-        conflict_count: report.conflicts,
-        logical_state: report.state.name().to_string(),
-        canonical_execution_id: report
-            .canonical_execution_id
-            .map(|execution| execution.to_string()),
-        executions: report.executions,
-        execution_list: report
-            .execution_list
-            .iter()
-            .map(|execution| JobExecutionResponse {
-                execution_id: execution.execution_id.to_string(),
-                executor_node_id: execution.executor_node_id.to_string(),
-                state: execution.state.name().to_string(),
-                started_at_ms: execution.started_at_ms,
-                observed_at_ms: execution.observed_at_ms,
-                canonical: report.canonical_execution_id == Some(execution.execution_id),
-            })
-            .collect(),
-        duplicate_successes: report.duplicate_successes,
-        outputs,
-        revision: report.revision,
-        projection_digest: hex32(&report.digest),
-        responder_node_id: report.responder.map(|node| node.to_string()),
-        partial: report.partial,
-        locally_exhausted: report.locally_exhausted,
-        cancel_requested: report.cancel_requested,
-        placement: report.plan.as_ref().map(|plan| JobPlacementResponse {
-            executor_kind: plan
-                .target
-                .as_ref()
-                .map(|target| target.executor_kind.clone()),
-            target_node_id: plan
-                .target
-                .as_ref()
-                .map(|target| target.node_id.to_string()),
-            scheduler_node_id: plan.scheduler_node_id.map(|node| node.to_string()),
-            estimated_transfer_bytes: plan.estimated_transfer_bytes,
-            estimated_transfer_ms: plan.estimated_transfer_ms,
-            alternatives: plan.alternatives,
-            rejected: plan.rejected,
-            omitted: plan.omitted,
-            stored_at_ms: plan.stored_at_ms,
-            inputs: plan
-                .inputs
-                .iter()
-                .map(|input| JobInputResponse {
-                    destination_key: input.destination_key.clone(),
-                    bytes: input.bytes,
-                    source_node_id: input.source_node_id.map(|node| node.to_string()),
-                    transfer_ms: input.transfer_ms,
-                })
-                .collect(),
-            candidates: plan
-                .candidates
-                .iter()
-                .map(|candidate| JobCandidateResponse {
-                    node_id: candidate.node_id.to_string(),
-                    executor_kind: candidate.executor_kind.clone(),
-                    verdict: candidate.verdict.name().to_string(),
-                    rank: candidate.rank,
-                    reason: candidate.reason.clone(),
-                })
-                .collect(),
-        }),
-    }
-}
-
-pub(crate) fn bind_output_routes(
-    result: &mut Option<serde_json::Value>,
-    outputs: &[JobOutputResponse],
-) -> Result<(), JobRouteError> {
-    let Some(serde_json::Value::Object(result)) = result else {
-        return Ok(());
-    };
-    let outputs = serde_json::to_value(outputs)
-        .map_err(|error| JobRouteError::Internal(error.to_string()))?;
-    result.insert("outputs".to_string(), outputs);
-    Ok(())
 }
 
 pub(crate) fn parse_state(value: &str) -> ServerResult<JobState> {

@@ -4,7 +4,7 @@
 
 use crate::auth::permission_granted;
 use crate::error::{ServerError, ServerResult};
-use crate::routes::execution::jobs::{JobProgressResponse, rfc3339};
+use crate::jobs::{JobProgressResponse, rfc3339};
 use crate::routes::info::{InfoAccess, info_access};
 use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};

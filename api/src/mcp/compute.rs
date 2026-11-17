@@ -654,9 +654,9 @@ impl McpServer {
                 let report = report
                     .map_err(crate::routes::jobs::map_job_route)
                     .map_err(job_error)?;
-                let mut response = crate::routes::jobs::job_view_response(&report.job);
-                let family = crate::routes::jobs::family_response(&report);
-                crate::routes::jobs::bind_output_routes(&mut response.result, &family.outputs)
+                let mut response = crate::jobs::job_view_response(&report.job);
+                let family = crate::jobs::family_response(&report);
+                crate::jobs::bind_output_routes(&mut response.result, &family.outputs)
                     .map_err(crate::routes::jobs::map_job_route)
                     .map_err(server_error)?;
                 response.family = Some(family);
@@ -672,7 +672,7 @@ impl McpServer {
                 .await
                 .map_err(crate::routes::jobs::map_job_route)
                 .map_err(job_error)?;
-                let mut response = crate::routes::jobs::job_view_response(&routed.job);
+                let mut response = crate::jobs::job_view_response(&routed.job);
                 response.run_crate = routed.run_crate;
                 response
             };
@@ -713,7 +713,7 @@ impl McpServer {
                     .iter()
                     .map(|output| {
                         (
-                            crate::routes::jobs::output_response(
+                            crate::jobs::output_response(
                                 output,
                                 report.output_endpoints.get(&output.node_id),
                             ),
@@ -721,7 +721,7 @@ impl McpServer {
                         )
                     })
                     .collect::<Vec<_>>();
-                (crate::routes::jobs::job_view_response(&report.job), outputs)
+                (crate::jobs::job_view_response(&report.job), outputs)
             } else {
                 let routed = read_job_routed(
                     &self.state.get_ctx(),
@@ -733,7 +733,7 @@ impl McpServer {
                 .await
                 .map_err(crate::routes::jobs::map_job_route)
                 .map_err(job_error)?;
-                let view = crate::routes::jobs::job_view_response(&routed.job);
+                let view = crate::jobs::job_view_response(&routed.job);
                 let outputs = result_outputs(view.result.as_ref())?
                     .into_iter()
                     .map(|output| (output, None))
@@ -801,10 +801,10 @@ impl McpServer {
         )
         .await
         .map_err(internal_error)?;
-        let response = crate::routes::jobs::JobListResponse {
+        let response = crate::jobs::JobListResponse {
             jobs: records
                 .iter()
-                .map(crate::routes::jobs::job_status_response)
+                .map(crate::jobs::job_status_response)
                 .collect(),
             next_cursor: crate::routes::jobs::encode_cursor(next_cursor),
         };
@@ -852,7 +852,7 @@ impl McpServer {
             }
             RoutedCancelOutcome::AlreadyTerminal(job) | RoutedCancelOutcome::Requested(job) => job,
         };
-        let response = crate::routes::jobs::job_view_response(&job);
+        let response = crate::jobs::job_view_response(&job);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))

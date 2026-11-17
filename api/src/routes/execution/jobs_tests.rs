@@ -11,6 +11,7 @@ use crate::jobs::{
 use aruna_core::UserId;
 use aruna_core::id::NodeId;
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::execution::job::JobRecord;
 use aruna_core::structs::execution::job::{
     ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
     ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
@@ -31,6 +32,7 @@ use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
+use aruna_operations::jobs::lifecycle::FamilyReport;
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::jobs::store::{
     ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
