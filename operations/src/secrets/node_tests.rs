@@ -19,7 +19,18 @@ fn change(change: SecretChange, write: u8) -> NodeSecretOperation {
 }
 
 fn storage(event: StorageEvent) -> IoResult {
-    IoResult::Event(Event::Storage(event))
+    IoResult::Event(Box::new(Event::Storage(event)))
+}
+
+/// The storage effect a step passes through.
+fn passed(next: &Next<Option<SecretRecord>>) -> &StorageEffect {
+    match next {
+        Next::Call(IoCall::Effect(effect)) => match effect.as_ref() {
+            Effect::Storage(storage) => storage,
+            other => panic!("expected a storage effect, got {other:?}"),
+        },
+        other => panic!("expected a passed-through effect, got {other:?}"),
+    }
 }
 
 /// Starts the operation and answers the record read with `stored` and no realm roles.
@@ -69,12 +80,7 @@ fn create_writes_record() {
     let spaces: Vec<_> = writes.iter().map(|(space, ..)| space.as_str()).collect();
     assert_eq!(spaces, [ADMIN_AUDIT_KEYSPACE, NODE_SECRETS_KEYSPACE]);
     let next = operation.next(IoResult::Done).unwrap();
-    let Next::Call(IoCall::Effect(Effect::Storage(StorageEffect::VaultWrite {
-        entry,
-        txn_id,
-        ..
-    }))) = &next
-    else {
+    let StorageEffect::VaultWrite { entry, txn_id, .. } = passed(&next) else {
         panic!("expected the vault write, got {next:?}");
     };
     assert_eq!(
@@ -103,9 +109,7 @@ fn rotate_replaces_value() {
     let next = read(&mut operation, Some(&current)).unwrap();
     assert!(matches!(next, Next::Call(IoCall::Write(_))));
     let next = operation.next(IoResult::Done).unwrap();
-    let Next::Call(IoCall::Effect(Effect::Storage(StorageEffect::VaultWrite { entry, .. }))) =
-        &next
-    else {
+    let StorageEffect::VaultWrite { entry, .. } = passed(&next) else {
         panic!("expected the new value, got {next:?}");
     };
     assert_eq!(*entry, value_entry(Ulid::from_bytes([11; 16])));
@@ -113,9 +117,7 @@ fn rotate_replaces_value() {
     let next = operation
         .next(storage(StorageEvent::WriteResult { key }))
         .unwrap();
-    let Next::Call(IoCall::Effect(Effect::Storage(StorageEffect::VaultDelete { entry, .. }))) =
-        &next
-    else {
+    let StorageEffect::VaultDelete { entry, .. } = passed(&next) else {
         panic!("expected the old value removal, got {next:?}");
     };
     assert_eq!(*entry, value_entry(current.value_id));
@@ -140,12 +142,7 @@ fn delete_removes_both() {
     let next = operation.next(IoResult::Done).unwrap();
     assert!(matches!(next, Next::Call(IoCall::Write(_))));
     let next = operation.next(IoResult::Done).unwrap();
-    assert!(matches!(
-        next,
-        Next::Call(IoCall::Effect(Effect::Storage(
-            StorageEffect::VaultDelete { .. }
-        )))
-    ));
+    assert!(matches!(passed(&next), StorageEffect::VaultDelete { .. }));
     let key = ByteView::from(value_entry(current.value_id).key());
     let done = operation.next(storage(StorageEvent::DeleteResult { key }));
     assert_eq!(done, Ok(Next::Done(None)));

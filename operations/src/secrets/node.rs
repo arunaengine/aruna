@@ -86,9 +86,16 @@ pub(super) fn unexpected_iter(event: &Event) -> IoError {
 /// Checks the answer to a queued write: a row write or delete, or a vault write or delete.
 pub(super) fn written(result: IoResult) -> Result<(), IoError> {
     match result {
-        IoResult::Event(Event::Storage(
-            StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. },
-        )) => Ok(()),
+        IoResult::Event(event)
+            if matches!(
+                *event,
+                Event::Storage(
+                    StorageEvent::WriteResult { .. } | StorageEvent::DeleteResult { .. }
+                )
+            ) =>
+        {
+            Ok(())
+        }
         other => rows::done(other),
     }
 }
@@ -149,11 +156,11 @@ impl NodeSecretOperation {
         self.queue.push_back(IoCall::Write(audit));
         if let (Some(info), Some(fields)) = (&applied.info, &applied.value) {
             let sealed = write_secret(value_entry(info.value_id), fields.encode()?, None);
-            self.queue.push_back(IoCall::Effect(sealed));
+            self.queue.push_back(IoCall::Effect(Box::new(sealed)));
         }
         if let Some(retired) = applied.retired {
             let removal = delete_secret(value_entry(retired), None);
-            self.queue.push_back(IoCall::Effect(removal));
+            self.queue.push_back(IoCall::Effect(Box::new(removal)));
         }
         self.result = Some(applied.info);
         Ok(())
@@ -243,7 +250,7 @@ impl Operation for NodeSecretsOperation {
     type Error = NodeSecretError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, NodeSecretError> {
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
             StorageEffect::Iter {
                 key_space: NODE_SECRETS_KEYSPACE.to_string(),
                 prefix: None,
@@ -251,7 +258,7 @@ impl Operation for NodeSecretsOperation {
                 limit: self.limit + 1,
                 txn_id: None,
             },
-        ))))
+        )))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, NodeSecretError> {

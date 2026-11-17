@@ -49,7 +49,7 @@ pub fn page(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), IoErro
 /// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
 pub fn event(result: IoResult) -> Result<crate::events::Event, IoError> {
     match result {
-        IoResult::Event(event) => Ok(event),
+        IoResult::Event(event) => Ok(*event),
         other => Err(unexpected("IoResult::Event", &other)),
     }
 }

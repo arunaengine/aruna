@@ -110,7 +110,10 @@ fn effects_join_transaction() {
         entry,
         txn_id: None,
     };
-    let mut operation = run(script(vec![IoCall::Effect(storage(delete))]), true);
+    let mut operation = run(
+        script(vec![IoCall::Effect(Box::new(storage(delete)))]),
+        true,
+    );
     let start = storage(StorageEffect::StartTransaction { read: false });
     assert_eq!(operation.start().as_slice(), &[start]);
     let joined = StorageEffect::VaultDelete {
@@ -161,7 +164,7 @@ fn storage_refusal_fails() {
         key: key("a"),
         txn_id: None,
     };
-    let mut operation = run(script(vec![IoCall::Effect(storage(read))]), false);
+    let mut operation = run(script(vec![IoCall::Effect(Box::new(storage(read)))]), false);
     operation.start();
     let error = StorageError::ReadError("disk".to_string());
     let refused = Event::Storage(StorageEvent::Error {
@@ -250,10 +253,12 @@ fn passes_other_calls() {
     let id = ulid::Ulid::from(3u128);
     let child = boxed_suboperation(script(Vec::new()), |_| Event::Delayed);
     let calls = vec![
-        IoCall::Effect(Effect::Task(TaskEffect::CancelTimer {
+        IoCall::Effect(Box::new(Effect::Task(TaskEffect::CancelTimer {
             key: TaskKey::DrainSyncOutbox,
-        })),
-        IoCall::Effect(Effect::Blob(BlobEffect::ReleaseReservation { id })),
+        }))),
+        IoCall::Effect(Box::new(Effect::Blob(BlobEffect::ReleaseReservation {
+            id,
+        }))),
         IoCall::Child(child),
         IoCall::Group(EffectGroup {
             members: vec![Effect::Delay(Duration::from_secs(1))],
@@ -276,9 +281,9 @@ fn passes_other_calls() {
     assert_eq!(operation.step(Event::Group(finished())).len(), 1);
     assert!(operation.step(Event::Delayed).is_empty());
     let expected = vec![
-        IoResult::Event(cancelled()),
-        IoResult::Event(blob()),
-        IoResult::Event(child()),
+        IoResult::Event(Box::new(cancelled())),
+        IoResult::Event(Box::new(blob())),
+        IoResult::Event(Box::new(child())),
         IoResult::Group(finished()),
         IoResult::Woke,
     ];
@@ -350,7 +355,10 @@ fn refuses_wrong_event() {
     let task = TaskEffect::CancelTimer {
         key: TaskKey::DrainSyncOutbox,
     };
-    let mut operation = run(script(vec![IoCall::Effect(Effect::Task(task))]), false);
+    let mut operation = run(
+        script(vec![IoCall::Effect(Box::new(Effect::Task(task)))]),
+        false,
+    );
     operation.start();
     let id = ulid::Ulid::from(4u128);
     operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
@@ -377,7 +385,7 @@ fn refuses_late_event() {
 #[test]
 fn refuses_control_effect() {
     let start = storage(StorageEffect::StartTransaction { read: false });
-    let mut operation = run(script(vec![IoCall::Effect(start)]), false);
+    let mut operation = run(script(vec![IoCall::Effect(Box::new(start))]), false);
     assert!(operation.start().is_empty());
     let refused = IoError::Unexpected {
         expected: "an effect without its own call",

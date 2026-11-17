@@ -33,7 +33,7 @@ pub enum IoCall {
     Sync,
     /// A net, blob, metadata, task, staging source, local file or other storage effect, answered
     /// by the event of the same family. Transaction control effects are refused.
-    Effect(Effect),
+    Effect(Box<Effect>),
     /// A child operation, answered by the event its result maps to.
     Child(Box<dyn SubOperation>),
     /// Independent effects run at the same time. An all-at-once group is answered once; a
@@ -55,7 +55,7 @@ pub enum IoResult {
     /// A write, delete or sync finished.
     Done,
     /// The event that answered an `IoCall::Effect` or an `IoCall::Child`.
-    Event(Event),
+    Event(Box<Event>),
     Group(GroupEvent),
     /// The delay passed.
     Woke,
@@ -441,9 +441,9 @@ fn answer(wait: Wait, event: Event) -> Result<IoResult, IoError> {
             Err(failure("a storage event", event))
         }
         (Wait::Family(family), event) if event_family(&event) == Some(family) => {
-            Ok(IoResult::Event(event))
+            Ok(IoResult::Event(Box::new(event)))
         }
-        (Wait::Child, event) => Ok(IoResult::Event(event)),
+        (Wait::Child, event) => Ok(IoResult::Event(Box::new(event))),
         (Wait::Group, Event::Group(finished @ GroupEvent::Finished { .. }))
         | (Wait::Window, Event::Group(finished @ GroupEvent::Closed)) => {
             Ok(IoResult::Group(finished))
@@ -468,7 +468,10 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
 fn in_storage(call: &mut IoCall) -> bool {
     match call {
         IoCall::Read(_) | IoCall::Page { .. } | IoCall::Write(_) | IoCall::Delete(_) => true,
-        IoCall::Effect(Effect::Storage(effect)) => effect.txn_slot().is_some_and(|slot| slot.is_none()),
+        IoCall::Effect(effect) => match effect.as_mut() {
+            Effect::Storage(storage) => storage.txn_slot().is_some_and(|slot| slot.is_none()),
+            _ => false,
+        },
         _ => false,
     }
 }
@@ -501,13 +504,13 @@ fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), Io
         ),
         IoCall::Sync => (Wait::Synced, StorageEffect::SyncAll),
         IoCall::Effect(mut effect) => {
-            if let Effect::Storage(storage) = &mut effect
+            if let Effect::Storage(storage) = effect.as_mut()
                 && let Some(slot) = storage.txn_slot()
                 && slot.is_none()
             {
                 *slot = txn_id;
             }
-            return Ok((Wait::Family(effect_family(&effect)?), effect));
+            return Ok((Wait::Family(effect_family(&effect)?), *effect));
         }
         IoCall::Child(child) => return Ok((Wait::Child, Effect::SubOperation(child))),
         IoCall::Group(group) => {
