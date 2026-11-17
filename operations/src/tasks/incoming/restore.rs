@@ -43,11 +43,7 @@ async fn durable_rearm_loop(
         restore_publish_timer(&context.storage_handle, &task_handle).await;
         restore_sync_timers(&context, &task_handle).await;
         restore_usage_timer(&context.storage_handle, &task_handle).await;
-        crate::notifications::watch::interest::restore_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
+        restore_watch_interest(&context, &task_handle).await;
         crate::node::node_info::restore_info_timer(&context.storage_handle, &task_handle).await;
         restore_notification_outbox(&context, &task_handle, None).await;
         restore_projection_timer(&context.storage_handle, &task_handle).await;
@@ -98,6 +94,17 @@ async fn restore_notification_outbox(
         }
         Ok(_) => {}
         Err(error) => warn!(%error, "Failed to restore notification outbox timer"),
+    }
+}
+
+/// Requests the watch interest publish when a dirty marker is left over.
+async fn restore_watch_interest(context: &DriverContext, task_handle: &TaskHandle) {
+    let context = DriverContext {
+        task_handle: Some(task_handle.clone()),
+        ..context.clone()
+    };
+    if let Err(error) = drive(InterestOperation::restore(), &context).await {
+        warn!(%error, "Failed to restore watch interest publish timer");
     }
 }
 
@@ -266,11 +273,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        crate::notifications::watch::interest::restore_publish_timer(
-            &context.storage_handle,
-            &task_handle,
-        )
-        .await;
+        restore_watch_interest(&context, &task_handle).await;
         if stopped() {
             return;
         }

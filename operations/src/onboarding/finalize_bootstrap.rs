@@ -22,7 +22,7 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use crate::notifications::watch::interest::mark_interest_dirty;
+use crate::notifications::watch::digest::InterestOperation;
 use crate::onboarding::consume_secret::{
     ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
 };
@@ -217,7 +217,7 @@ async fn ensure_realm_node(
     for _ in 0..NODE_UPDATE_RETRIES {
         match ensure_node_once(input, mode, context).await {
             Ok(()) => {
-                if let Err(error) = mark_interest_dirty(context, input.realm_id).await {
+                if let Err(error) = drive(InterestOperation::mark(input.realm_id), context).await {
                     warn!(%error, "Failed to rebuild watch placement after onboarding realm change");
                 }
                 return Ok(());

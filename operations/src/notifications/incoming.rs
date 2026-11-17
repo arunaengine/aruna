@@ -31,8 +31,8 @@ use crate::triggers::{PeerInput, peer_operation};
 use crate::notifications::watch::authorization::{
     authorize_forwarded_watch, list_authorized_subscriptions,
 };
+use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
@@ -211,7 +211,7 @@ async fn build_response(
             .await
             {
                 Ok(subscription) => {
-                    schedule_interest_publish(context).await;
+                    let _ = drive(InterestOperation::publish(), context).await;
                     NotificationTransportMessage::WatchCreated { subscription }
                 }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
@@ -232,7 +232,7 @@ async fn build_response(
             .await
             {
                 Ok(()) => {
-                    schedule_interest_publish(context).await;
+                    let _ = drive(InterestOperation::publish(), context).await;
                     NotificationTransportMessage::WatchDeleted
                 }
                 Err(error) => NotificationTransportMessage::Reject(error.to_string()),
@@ -256,7 +256,8 @@ async fn build_response(
                 .await
             {
                 Ok((outcome, found_stale)) => {
-                    if found_stale && let Err(error) = mark_interest_dirty(context, realm_id).await
+                    if found_stale
+                        && let Err(error) = drive(InterestOperation::mark(realm_id), context).await
                     {
                         warn!(%error, "Failed to retract dropped watch interest after delivery");
                     }

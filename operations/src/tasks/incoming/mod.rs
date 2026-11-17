@@ -87,7 +87,7 @@ use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::{refresh_usage_targets, restore_usage_timer};
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use crate::notifications::prune::RestorePruneOperation;
-use crate::notifications::watch::digest::WATCH_PUBLISH_DEBOUNCE;
+use crate::notifications::watch::digest::{InterestOperation, WATCH_PUBLISH_DEBOUNCE};
 use crate::notifications::watch::interest::{rebuild_interest_table, refresh_target_interest};
 use crate::placement::policy::observe_placement;
 use crate::placement::process_placements::{PlacementReconcileStatus, process_shard_placements};

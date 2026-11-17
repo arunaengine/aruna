@@ -26,8 +26,8 @@ use crate::notifications::protocol::{
 };
 use crate::notifications::routing::route_watch_event;
 use crate::notifications::watch::authorization::{authorize_watch_event, evaluate_watch_delivery};
+use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::digest::dirty_marker_write;
-use crate::notifications::watch::interest::{mark_interest_dirty, schedule_interest_publish};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::paths::WatchAuthorization;
 
@@ -182,7 +182,7 @@ async fn expand_events_once(
     {
         Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
             if queue_changed && next.is_some() {
-                schedule_interest_publish(context).await;
+                let _ = drive(InterestOperation::publish(), context).await;
             }
             Ok((outcome, dropped))
         }
@@ -342,7 +342,7 @@ pub async fn drain_watch_events(
 }
 
 async fn defer_retry(context: &DriverContext, realm_id: RealmId, error: String) -> String {
-    if let Err(marker) = mark_interest_dirty(context, realm_id).await {
+    if let Err(marker) = drive(InterestOperation::mark(realm_id), context).await {
         warn!(%realm_id, %marker, "Failed to retain watch retry marker");
         return format!("{error}; failed to retain retry marker: {marker}");
     }

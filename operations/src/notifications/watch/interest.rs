@@ -10,7 +10,6 @@ use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::structs::execution::notification_watch::{
     WATCH_DIRTY_PREFIX, WatchInterestDigest, WatchInterestEntry, WatchInterestTable,
@@ -18,19 +17,15 @@ use aruna_core::structs::execution::notification_watch::{
     interest_pending_key, interest_realm_id, interest_realm_prefix,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::task::TaskEvent;
 use aruna_core::types::{Key, KeySpace, Value};
 use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
 use futures_util::TryStreamExt;
 use tracing::warn;
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::DIRTY_REALM_CAP;
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
-use crate::notifications::watch::digest::{
-    catchall_digest, digest_over, dirty_marker_write, schedule_publish_effect,
-};
+use crate::notifications::watch::digest::{InterestOperation, catchall_digest, digest_over};
 use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
@@ -38,93 +33,6 @@ use crate::realm::get_config::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 
-/// Ensures this node has a document to announce when joining the shared
-/// realm-scoped watch-interest topic. Existing digests may contain live watches
-/// and are therefore never overwritten. Returns whether one was created.
-pub async fn ensure_interest_digest(
-    storage: &StorageHandle,
-    realm_id: RealmId,
-    node_id: NodeId,
-) -> Result<bool, String> {
-    let key = Key::from(interest_node_key(realm_id, node_id));
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => Ok(false),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            let digest = WatchInterestDigest {
-                node_id,
-                entries: Vec::new(),
-            };
-            match storage
-                .send_storage_effect(StorageEffect::Write {
-                    key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-                    key,
-                    value: Value::from(digest.to_bytes().map_err(|error| error.to_string())?),
-                    txn_id: None,
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::WriteResult { .. }) => Ok(true),
-                Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-                other => Err(format!(
-                    "unexpected local watch interest digest write result: {other:?}"
-                )),
-            }
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected local watch interest digest read result: {other:?}"
-        )),
-    }
-}
-
-/// Sends the debounced publish schedule from a CRUD call site. Best-effort: when
-/// no task handle is wired the durable marker survives and the periodic re-arm
-/// loop picks it up.
-pub async fn schedule_interest_publish(context: &DriverContext) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    if let Event::Task(TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(schedule_publish_effect()).await
-    {
-        warn!(message = %message, "Failed to schedule watch interest publish");
-    }
-}
-
-/// Durably requests a digest rebuild after a stale subscription is observed.
-pub async fn mark_interest_dirty(context: &DriverContext, realm_id: RealmId) -> Result<(), String> {
-    let (key_space, key, value) = dirty_marker_write(realm_id);
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space,
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {
-            schedule_interest_publish(context).await;
-            Ok(())
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected watch interest dirty marker write result: {other:?}"
-        )),
-    }
-}
-
-/// Rebuilds each dirty realm's digest (union of subscribed path prefixes) and syncs
-/// it, publishing empties so stale interest drops. Markers clear only after replication
-/// accepts with the generation unchanged, so failures and racing writes still retry.
 pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Result<bool, String> {
     let storage = &ctx.storage_handle;
     let (observed_markers, more_markers) = read_dirty_markers(storage).await?;
@@ -142,7 +50,7 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
         // Markers are malformed; drop them so they cannot loop forever.
         clear_consumed_markers(storage, observed_markers).await?;
         if more_markers {
-            schedule_interest_publish(ctx).await;
+            let _ = drive(InterestOperation::publish(), ctx).await;
         }
         return Ok(false);
     }
@@ -249,14 +157,15 @@ pub async fn publish_watch_interest(ctx: &DriverContext, node_id: NodeId) -> Res
     // Preserve a retry generation when a permission lookup failed. The current
     // fail-closed digest still retracts stale positive interest immediately.
     for realm_id in authorization_retries {
-        mark_interest_dirty(ctx, realm_id).await?;
+        let marked = drive(InterestOperation::mark(realm_id), ctx).await;
+        marked.map_err(|error| error.to_string())?;
     }
 
     // Replication accepted the digests; only now consume the markers, and only
     // those a concurrent CRUD did not re-dirty in the meantime.
     clear_consumed_markers(storage, observed_markers).await?;
     if more_markers {
-        schedule_interest_publish(ctx).await;
+        let _ = drive(InterestOperation::publish(), ctx).await;
     }
 
     Ok(published)
@@ -427,36 +336,6 @@ async fn clear_consumed_markers(
     }
 }
 
-/// Re-arms the debounced publish task when dirty markers survived a restart.
-pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let has_markers = match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: WATCH_INTEREST_KEYSPACE.to_string(),
-            prefix: Some(Key::from(WATCH_DIRTY_PREFIX.to_vec())),
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan watch interest dirty markers");
-            return;
-        }
-        other => {
-            warn!(event = ?other, "Unexpected event while scanning watch interest dirty markers");
-            return;
-        }
-    };
-    if has_markers
-        && let Event::Task(TaskEvent::Error { message, .. }) =
-            task_handle.send_effect(schedule_publish_effect()).await
-    {
-        warn!(message = %message, "Failed to restore watch interest publish timer");
-    }
-}
-
 /// Rebuilds the full in-memory watch-interest table from the replicated digests
 /// in local storage. Digests whose embedded node id disagrees with their key are
 /// skipped defensively, and empty digests contribute nothing.
@@ -546,7 +425,7 @@ pub async fn refresh_target_interest(ctx: &DriverContext, targets: &[DocumentTar
         }
     }
     for realm_id in dirty_realms {
-        if let Err(error) = mark_interest_dirty(ctx, realm_id).await {
+        if let Err(error) = drive(InterestOperation::mark(realm_id), ctx).await {
             warn!(%realm_id, %error, "Failed to schedule watch interest rebuild after document reconciliation");
         }
     }
@@ -629,6 +508,7 @@ async fn sync_eligible_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notifications::watch::digest::dirty_marker_write;
     use aruna_core::UserId;
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::execution::notification_watch::{
@@ -1058,7 +938,7 @@ mod tests {
             .unwrap();
         assert!(read_pending(&ctx, realm_id).await.is_none());
 
-        mark_interest_dirty(&ctx, realm_id)
+        drive(InterestOperation::mark(realm_id), &ctx)
             .await
             .expect("mark dirty");
         assert!(

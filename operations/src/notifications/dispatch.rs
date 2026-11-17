@@ -30,7 +30,7 @@ use crate::notifications::unread::{SCAN_MAX_ROWS, UNREAD_COUNT_CAP};
 use crate::notifications::watch::authorization::{
     authorize_notification, list_authorized_subscriptions,
 };
-use crate::notifications::watch::interest::schedule_interest_publish;
+use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::paths::WatchAuthorization;
 use crate::notifications::watch::records::{
     WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
@@ -387,7 +387,7 @@ pub async fn create_for_user(
             WatchSubscriptionError::AuthorizationUnavailable(_) => WatchDispatchError::Unavailable,
             other => WatchDispatchError::Internal(other.to_string()),
         })?;
-        schedule_interest_publish(context).await;
+        let _ = drive(InterestOperation::publish(), context).await;
         subscription
     } else {
         let net_handle = context
@@ -452,7 +452,7 @@ pub async fn delete_for_user(
         )
         .await
         .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
-        schedule_interest_publish(context).await;
+        let _ = drive(InterestOperation::publish(), context).await;
     } else {
         let net_handle = context
             .net_handle

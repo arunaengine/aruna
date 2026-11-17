@@ -14,8 +14,8 @@ use ulid::Ulid;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::client::deliver_events_remote;
 use crate::notifications::placement::filter_local_subscriptions;
+use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
-use crate::notifications::watch::interest::mark_interest_dirty;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
 use crate::realm::get_config::GetConfigOperation;
@@ -72,7 +72,8 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
                         net_handle.notify_inbox_activity(recipient);
                     }
                     if dropped
-                        && let Err(error) = mark_interest_dirty(context, event.realm_id).await
+                        && let Err(error) =
+                            drive(InterestOperation::mark(event.realm_id), context).await
                     {
                         warn!(%error, "Failed to retract dropped local watch interest");
                     }
@@ -152,7 +153,8 @@ async fn include_local_holder(
     }) {
         holders.push(local_node_id);
     }
-    if found_stale && let Err(error) = mark_interest_dirty(context, event.realm_id).await {
+    if found_stale && let Err(error) = drive(InterestOperation::mark(event.realm_id), context).await
+    {
         warn!(%error, "Failed to mark stale watch interest dirty while emitting event");
     }
     Ok(realm_config)
