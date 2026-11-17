@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::runs::tests::opened;
 use crate::driver::drive;
 use crate::plugins::copies::read_local;
 use aruna_core::NodeId;
@@ -11,23 +12,9 @@ use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation_check::{check_abort, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
 use std::collections::BTreeSet;
-use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
-
-fn context() -> (TempDir, DriverContext) {
-    let dir = tempdir().unwrap();
-    let ctx = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    (dir, ctx)
-}
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -128,7 +115,7 @@ async fn published(ctx: &DriverContext) -> Vec<PublishedPlugin> {
 
 #[tokio::test]
 async fn writes_entry_once() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(write_entry(&ctx, entry(&digest)).await, Ok(entry(&digest)));
@@ -148,14 +135,14 @@ async fn writes_entry_once() {
 
 #[tokio::test]
 async fn entry_refusals() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Server, 1, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
         Err(EntryError::NotManagementNode)
     );
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, false).await;
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
@@ -166,7 +153,7 @@ async fn entry_refusals() {
 
 #[tokio::test]
 async fn publishes_after_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, true).await;
     let plugin = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec())
@@ -195,7 +182,7 @@ async fn publishes_after_copies() {
 
 #[tokio::test]
 async fn too_few_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 2, true).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -217,7 +204,7 @@ async fn too_few_copies() {
 
 #[tokio::test]
 async fn refuses_before_storing() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, false).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -239,7 +226,7 @@ async fn refuses_before_storing() {
 #[tokio::test]
 async fn counts_current_managers() {
     // Managers 1, 10 and 11: a copy confirmed by a node that left the managers does not count.
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 2, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     let left = BTreeSet::from([node(1), node(99)]);
