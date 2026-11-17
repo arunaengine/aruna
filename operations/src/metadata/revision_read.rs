@@ -1,4 +1,4 @@
-//! Loads a document's raw revision: lifecycle checks, the merged state, then the event log.
+//! Loads a document's raw revision and its stored raw state.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -223,6 +223,67 @@ impl Operation for RawViewOperation {
     }
 
     // Every read is untransacted or runs in the caller's transaction.
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
+/// Reads a document's stored raw state outside any transaction.
+#[derive(Debug, PartialEq)]
+pub struct RawStateOperation {
+    document_id: Ulid,
+    reading: bool,
+    output: Option<Result<Option<RawRevisionState>, RawReadError>>,
+}
+
+impl RawStateOperation {
+    pub(crate) fn new(document_id: Ulid) -> Self {
+        Self {
+            document_id,
+            reading: false,
+            output: None,
+        }
+    }
+}
+
+impl Operation for RawStateOperation {
+    type Output = Option<RawRevisionState>;
+    type Error = RawReadError;
+
+    fn start(&mut self) -> Effects {
+        self.reading = true;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: RAW_REVISION_KEYSPACE.to_string(),
+            key: raw_revision_key(self.document_id),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let output = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) if self.reading => value
+                .map(|value| postcard::from_bytes::<RawRevisionState>(&value))
+                .transpose()
+                .map_err(|error| ConversionError::from(error).into()),
+            Event::Storage(StorageEvent::Error { error }) if self.reading => Err(error.into()),
+            other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
+        };
+        self.reading = false;
+        self.output = Some(output);
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.output.is_some()
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        self.output.unwrap_or(Err(RawReadError::UnexpectedEvent(
+            "the raw state read did not finish".to_string(),
+        )))
+    }
+
+    // One untransacted read leaves nothing to clean up.
     fn abort(&mut self) -> Effects {
         smallvec![]
     }

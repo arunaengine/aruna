@@ -22,7 +22,7 @@ use crate::metadata::raw_events::{
     RAW_ENCODED_LIMIT, RawBaseIdentity, RawEventsOperation, RawLoadBudget, RawReadError,
     RawRevisionState, budget_error, validate_raw_entry,
 };
-use crate::metadata::revision_read::RawViewOperation;
+use crate::metadata::revision_read::{RawStateOperation, RawViewOperation};
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
@@ -98,7 +98,7 @@ pub(crate) async fn load_raw_digest(
     context: &DriverContext,
     document_id: Ulid,
 ) -> Result<Option<[u8; 32]>, RawReadError> {
-    Ok(read_raw_state(context, document_id, None)
+    Ok(drive(RawStateOperation::new(document_id), context)
         .await?
         .and_then(|state| state.revision)
         .and_then(|revision| revision.dataset_digest))
@@ -110,7 +110,7 @@ pub(crate) async fn prepare_raw_event(
     cache: &mut RawStateCache,
 ) -> Result<RawEventPlan, RawReadError> {
     if !cache.loaded {
-        cache.state = read_raw_state(context, event.record.document_id, None).await?;
+        cache.state = drive(RawStateOperation::new(event.record.document_id), context).await?;
         cache.loaded = true;
     }
     let (state, rebuild) = match cache.state.as_ref() {
@@ -178,7 +178,7 @@ pub(crate) async fn prepare_merged_event(
     cache: &mut RawStateCache,
 ) -> Result<RawEventPlan, RawReadError> {
     if !cache.loaded {
-        cache.state = read_raw_state(context, event.record.document_id, None).await?;
+        cache.state = drive(RawStateOperation::new(event.record.document_id), context).await?;
         cache.loaded = true;
     }
     let previous = cache.state.clone().unwrap_or(RawRevisionState {
@@ -396,31 +396,6 @@ fn event_matches_state(event: &MetadataEventRecord, state: &RawRevisionState) ->
         | MetadataEventPayload::UpsertContextualEntity { .. }
         | MetadataEventPayload::ApplyBatch { .. }
         | MetadataEventPayload::Checkpoint { .. } => true,
-    }
-}
-
-async fn read_raw_state(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<RawRevisionState>, RawReadError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: RAW_REVISION_KEYSPACE.to_string(),
-            key: raw_revision_key(document_id),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&value).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(other.label().to_string())),
     }
 }
 
