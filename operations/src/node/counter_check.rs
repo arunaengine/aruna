@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_missing_bucket_row() {
+    fn marks_missing_row() {
         let (mut operation, effects) = probed(false, true);
         assert!(matches!(
             effects.as_slice(),

@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_answer_before_start() {
+    fn refuses_early_answer() {
         let mut operation = touch();
         operation.step(Event::Session(Box::new(SessionAnswer::Done)));
         assert_eq!(operation.finalize(), Err(SessionCallError::Unexpected));
