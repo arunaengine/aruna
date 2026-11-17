@@ -2,13 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{MergeError, MergeUsersConfig, MergeUsersOperation, plan};
+use super::{
+    MergeError, MergeOutcome, MergeState, MergeUsersConfig, MergeUsersOperation, Phase, plan,
+};
+use crate::auth::revoke_token::RevokeTokenError;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::storage_entries::subject_index_value;
@@ -18,8 +22,7 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
-use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::types::{Effects, TxnId, Value};
+use aruna_core::types::{TxnId, Value};
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
 };
@@ -91,7 +94,12 @@ fn bytes(user: &User) -> Option<Value> {
     Some(user.to_bytes(&actor(user.user_id)).unwrap().into())
 }
 
-fn read(values: Vec<Option<Value>>) -> Event {
+fn read(values: Vec<Option<Value>>) -> IoResult {
+    IoResult::Values(values)
+}
+
+/// A batch read answer for the handoff, which still runs on effects.
+fn batch_read(values: Vec<Option<Value>>) -> Event {
     Event::Storage(StorageEvent::BatchReadResult {
         values: values
             .into_iter()
@@ -113,10 +121,12 @@ fn roles(list: Vec<Role>) -> HashMap<Ulid, Role> {
     list.into_iter().map(|role| (role.role_id, role)).collect()
 }
 
-fn writes(effects: &Effects) -> Vec<(String, ByteView, ByteView)> {
-    match effects.first() {
-        Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) => writes.clone(),
-        other => panic!("expected a batch write, got {other:?}"),
+type Turn = Result<Next<MergeOutcome>, MergeError>;
+
+fn writes(turn: &Turn) -> Vec<(String, ByteView, ByteView)> {
+    match turn {
+        Ok(Next::Call(IoCall::Write(writes))) => writes.clone(),
+        _ => panic!("expected a batch write"),
     }
 }
 
@@ -351,14 +361,12 @@ fn stale_login_refused() {
     let mut stale = config(id(1), id(2));
     stale.survivor_login = Some(NOW - 600);
     let mut operation = MergeUsersOperation::new(stale);
-    assert!(operation.start().is_empty());
-    assert_eq!(operation.finalize(), Err(MergeError::StaleLogin));
+    assert_eq!(operation.first().err(), Some(MergeError::StaleLogin));
 
     let mut other = config(id(1), id(2));
     other.merged.realm_id = RealmId([3u8; 32]);
     let mut operation = MergeUsersOperation::new(other);
-    operation.start();
-    assert_eq!(operation.finalize(), Err(MergeError::OtherRealm));
+    assert_eq!(operation.first().err(), Some(MergeError::OtherRealm));
 }
 
 #[test]
@@ -366,62 +374,90 @@ fn cut_token_refused() {
     let mut cut = config(id(1), id(2));
     cut.merged_live = false;
     let mut operation = MergeUsersOperation::new(cut);
-    operation.start();
-    operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
-    assert_eq!(operation.finalize(), Err(MergeError::TokenInvalid));
+    operation.first().unwrap();
+    let accounts = read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]);
+    assert_eq!(
+        operation.next(accounts).err(),
+        Some(MergeError::TokenInvalid)
+    );
+}
+
+/// The answer of a vault read.
+fn vault(result: Result<Vec<[u8; 32]>, String>) -> IoResult {
+    IoResult::Event(Box::new(Event::SubOperation(
+        SubOperationEvent::VaultHeld { result },
+    )))
 }
 
 /// A merge whose accounts hold vaults with the given payload digests, after both vault reads.
-fn vaults(merged: [u8; 32], survivor: [u8; 32]) -> (MergeUsersOperation, Effects) {
+fn vaults(merged: [u8; 32], survivor: [u8; 32]) -> (MergeUsersOperation, Turn) {
     let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
-    operation.start();
-    let effects = operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
-    assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-    let effects = operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(vec![merged]),
-    }));
-    assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-    let effects = operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(vec![[9u8; 32], survivor]),
-    }));
-    (operation, effects)
+    operation.first().unwrap();
+    let turn = operation.next(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(vault(Ok(vec![merged])));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = operation.next(vault(Ok(vec![[9u8; 32], survivor])));
+    (operation, turn)
 }
 
 #[test]
 fn held_vault_refused() {
-    let (operation, _) = vaults([1u8; 32], [2u8; 32]);
-    assert_eq!(operation.finalize(), Err(MergeError::VaultPresent));
+    let (_, turn) = vaults([1u8; 32], [2u8; 32]);
+    assert_eq!(turn.err(), Some(MergeError::VaultPresent));
 }
 
 #[test]
 fn copied_vault_accepted() {
     // The portal copied the sealed vault unchanged to the survivor, so the merge goes on.
-    let (operation, effects) = vaults([1u8; 32], [1u8; 32]);
-    assert!(matches!(
-        effects.first(),
-        Some(Effect::Storage(StorageEffect::StartTransaction { .. }))
-    ));
-    assert!(!operation.is_complete());
+    let (operation, turn) = vaults([1u8; 32], [1u8; 32]);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, MergeState::Transaction);
+}
+
+/// The merge transaction of a merge with `config`, before its first call.
+fn writer(config: MergeUsersConfig) -> MergeUsersOperation {
+    MergeUsersOperation {
+        phase: Phase::Write,
+        ..MergeUsersOperation::new(config)
+    }
+}
+
+/// Answers the cutoff folded into the merge transaction, with `realm` as the realm config.
+fn cut_off(operation: &mut MergeUsersOperation, realm: Option<Value>) -> Turn {
+    let mut config = Some(read(vec![realm, None]));
+    let mut turn = operation.first();
+    while operation.state == MergeState::JoinedCutoff {
+        let result = match turn {
+            Ok(Next::Call(IoCall::Read(_))) => config.take().expect("one config read"),
+            Ok(Next::Call(IoCall::Page { .. })) => IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            },
+            Ok(Next::Call(IoCall::Write(_) | IoCall::Delete(_))) => IoResult::Done,
+            other => return other,
+        };
+        turn = operation.next(result);
+    }
+    turn
 }
 
 #[test]
 fn failed_cutoff_aborts() {
+    // Without the realm config the cutoff fails, and its error aborts the merge transaction.
+    let mut operation = writer(config(id(1), id(2)));
+    let failed = cut_off(&mut operation, None);
+    assert!(matches!(failed, Err(MergeError::Cutoff(_))));
+
     let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
-    operation.start();
-    operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
-    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(Vec::new()),
-    }));
-    let txn_id = TxnId::generate();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    let cleanup = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-        result: Err("capacity".to_string()),
-    }));
-    assert!(matches!(
-        cleanup.first(),
-        Some(Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })) if *aborted == txn_id
-    ));
-    assert!(matches!(operation.finalize(), Err(MergeError::Cutoff(_))));
+    operation.first().unwrap();
+    operation
+        .next(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]))
+        .unwrap();
+    operation.next(vault(Ok(Vec::new()))).unwrap();
+    let error = || MergeError::Cutoff("capacity".to_string());
+    let failed = IoResult::Child(ChildOutcome::new(Err::<MergeOutcome, _>(error())));
+    assert_eq!(operation.next(failed).err(), Some(error()));
 }
 
 /// The config reducer state naming `pinned` as merge coordinator, if any.
@@ -446,26 +482,16 @@ fn only_coordinator_merges() {
     realm.ensure_node(node(), RealmNodeKind::Management);
     realm.ensure_node(other, RealmNodeKind::Management);
     for pinned in [Some(other), None] {
-        let mut operation = MergeUsersOperation::new(config(id(1), id(2)));
-        operation.start();
-        operation.step(read(vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))]));
-        operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-            result: Ok(Vec::new()),
-        }));
-        let txn_id = TxnId::generate();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-            result: Ok(()),
-        }));
-        let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
+        let realm_bytes: Option<Value> = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
+        let mut operation = writer(config(id(1), id(2)));
+        let reads = cut_off(&mut operation, realm_bytes.clone());
+        assert!(matches!(reads, Ok(Next::Call(IoCall::Read(_)))));
         let mut values = vec![bytes(&user(1, &[])), bytes(&user(2, &["s"]))];
         values.extend([None, None, None, None, realm_bytes, pin(pinned), None, None]);
-        let cleanup = operation.step(read(values));
-        assert!(matches!(
-            cleanup.first(),
-            Some(Effect::Storage(StorageEffect::AbortTransaction { .. }))
-        ));
-        assert_eq!(operation.finalize(), Err(MergeError::NotCoordinator));
+        assert_eq!(
+            operation.next(read(values)).err(),
+            Some(MergeError::NotCoordinator)
+        );
     }
 }
 
@@ -508,13 +534,14 @@ fn repeat_cuts_off() {
     repeat.merged_live = false;
     repeat.merged_login = None;
     let mut operation = MergeUsersOperation::new(repeat);
-    operation.start();
-    let effects = operation.step(read(vec![bytes(&user(1, &["s"])), bytes(&merged)]));
-    assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-    operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-        result: Ok(()),
-    }));
-    let outcome = operation.finalize().unwrap();
+    operation.first().unwrap();
+    let turn = operation.next(read(vec![bytes(&user(1, &["s"])), bytes(&merged)]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
+    let cutoff = IoResult::Child(ChildOutcome::new(Ok::<_, RevokeTokenError>(realm)));
+    let Ok(Next::Done(outcome)) = operation.next(cutoff) else {
+        panic!("expected the repeat outcome");
+    };
     assert!(outcome.repeated);
     assert_eq!(outcome.subjects, 0);
 }
@@ -546,26 +573,21 @@ fn merge_moves_everything() {
         roles: roles(vec![admin.clone()]),
         policies: Vec::new(),
     };
-    let txn_id = TxnId::generate();
+    let realm_bytes: Option<Value> = Some(realm.to_bytes(&actor(a)).unwrap().into());
 
     let mut operation = MergeUsersOperation::new(config(a, b));
-    operation.start();
-    operation.step(read(vec![bytes(&survivor), bytes(&merged)]));
-    operation.step(Event::SubOperation(SubOperationEvent::VaultHeld {
-        result: Ok(Vec::new()),
-    }));
+    operation.first().unwrap();
+    operation
+        .next(read(vec![bytes(&survivor), bytes(&merged)]))
+        .unwrap();
+    let write = operation.next(vault(Ok(Vec::new())));
+    assert!(matches!(write, Ok(Next::Call(IoCall::Child(_)))));
+
     // The cutoff is written first, inside the merge transaction.
-    let cutoff = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-    assert!(matches!(cutoff.first(), Some(Effect::SubOperation(_))));
-    let reads = operation.step(Event::SubOperation(SubOperationEvent::TokenRevoked {
-        result: Ok(()),
-    }));
-    assert!(matches!(
-        reads.first(),
-        Some(Effect::Storage(StorageEffect::BatchRead { txn_id: Some(read_txn), .. })) if *read_txn == txn_id
-    ));
-    let realm_bytes = Some(realm.to_bytes(&actor(a)).unwrap().into());
-    let scan = operation.step(read(vec![
+    let mut operation = writer(config(a, b));
+    let reads = cut_off(&mut operation, realm_bytes.clone());
+    assert!(matches!(reads, Ok(Next::Call(IoCall::Read(_)))));
+    let scan = operation.next(read(vec![
         bytes(&survivor),
         bytes(&merged),
         None,
@@ -578,18 +600,20 @@ fn merge_moves_everything() {
         None,
     ]));
     assert!(matches!(
-        scan.first(),
-        Some(Effect::Storage(StorageEffect::Iter { key_space, .. })) if key_space == AUTH_KEYSPACE
+        scan,
+        Ok(Next::Call(IoCall::Page { space, .. })) if space == AUTH_KEYSPACE
     ));
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![(
-            ByteView::from(group_id.to_bytes().to_vec()),
-            group.to_bytes(&actor(b)).unwrap().into(),
-        )],
-        next_start_after: None,
-    }));
+    operation
+        .next(IoResult::Page {
+            rows: vec![(
+                ByteView::from(group_id.to_bytes().to_vec()),
+                group.to_bytes(&actor(b)).unwrap().into(),
+            )],
+            next: None,
+        })
+        .unwrap();
     // Group state, the secondary's row, state and revision, then the subject's claims and index.
-    let staged = operation.step(read(vec![
+    let staged = operation.next(read(vec![
         None,
         bytes(&secondary),
         None,
@@ -664,36 +688,28 @@ fn merge_moves_everything() {
         .expect("the role grant is queued");
     assert_eq!(grant.actor.user_id, b);
 
-    let mut effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    while let Some(Effect::Storage(
-        StorageEffect::BatchDelete { .. } | StorageEffect::BatchRead { .. },
-    )) = effects.first()
-    {
-        effects = match effects.first() {
-            Some(Effect::Storage(StorageEffect::BatchDelete { .. })) => {
-                operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-                    entries: Vec::new(),
-                }))
-            }
-            _ => operation.step(read(Vec::new())),
+    let mut turn = operation.next(IoResult::Done);
+    // Stale deletes and the fence read come before the epoch marks of the encrypted buckets.
+    loop {
+        turn = match turn {
+            Ok(Next::Call(IoCall::Delete(_) | IoCall::Write(_))) => operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Read(_))) => operation.next(read(Vec::new())),
+            Ok(Next::Call(IoCall::Page { .. })) => operation.next(IoResult::Page {
+                rows: Vec::new(),
+                next: None,
+            }),
+            other => break other,
         };
     }
-    assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
-    operation.step(Event::SubOperation(SubOperationEvent::EpochsMarked {
-        result: Ok(()),
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    // Nothing runs after the commit that a crash could lose.
-    let after = operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainSyncOutbox,
-        after: Duration::ZERO,
-    }));
-    assert!(after.is_empty());
-    let outcome = operation.finalize().unwrap();
+    // Only the drain timer runs after the commit, and a lost one leaves the outbox retryable.
+    let Ok(Next::Then {
+        output: outcome,
+        calls,
+    }) = turn
+    else {
+        panic!("expected the outcome with the drain wake");
+    };
+    assert_eq!(calls.len(), 1);
     assert_eq!(
         (
             outcome.subjects,
@@ -736,7 +752,7 @@ fn hand_off_in(
     let txn_id = TxnId::generate();
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
     let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
-    let effects = operation.step(read(vec![realm_bytes, pin(pinned)]));
+    let effects = operation.step(batch_read(vec![realm_bytes, pin(pinned)]));
     let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first() else {
         return operation.finalize().map(|()| None);
     };
