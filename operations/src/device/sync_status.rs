@@ -9,25 +9,25 @@ use std::time::Duration;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
+use aruna_core::keyspaces::{DEVICE_INTAKE_KEYSPACE, SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
 use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::GroupId;
 use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::driver::{DriverContext, drive};
 
 use super::drain::claim_state;
-use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
+use super::publish_queue::{PUBLISH_PAGE_SIZE, PublishEntry, PublishState};
 use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state};
 use super::replica_store::list_replicas;
+use super::scan_rows::ScanRowsOperation;
 use super::sync::folders::{list_folders, list_transfers};
 use super::sync::outbox::requeue_uploads;
-use super::sync::repository::scan_folder;
-use super::sync::rows::scan_page;
+use super::sync::repository::{SYNC_PAGE_SIZE, folder_prefix};
 use super::sync_note::{DeviceSyncState, read_state, sync_state_key};
 
 /// One selected document in the Sync view.
@@ -276,23 +276,11 @@ async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState)
 }
 
 pub(crate) async fn read_publish_entries(context: &Arc<DriverContext>) -> Vec<PublishEntry> {
-    let mut entries = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(context, scan_publish_queue(cursor, None)).await
-        else {
-            return entries;
-        };
-        entries.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| PublishEntry::from_bytes(&bytes).ok()),
-        );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return entries,
-        }
-    }
+    let scan = ScanRowsOperation::new(DEVICE_INTAKE_KEYSPACE, None, PUBLISH_PAGE_SIZE);
+    let rows = drive(scan, context).await.unwrap_or_default();
+    rows.iter()
+        .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok())
+        .collect()
 }
 
 async fn read_datasets(context: &Arc<DriverContext>) -> Vec<DatasetRow> {
@@ -313,27 +301,12 @@ async fn read_datasets(context: &Arc<DriverContext>) -> Vec<DatasetRow> {
 }
 
 async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBase> {
-    let mut bases = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(
-            context,
-            scan_folder(SYNC_BASE_KEYSPACE, folder_id, cursor, None),
-        )
-        .await
-        else {
-            return bases;
-        };
-        bases.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| SyncBase::from_bytes(&bytes).ok()),
-        );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return bases,
-        }
-    }
+    let prefix = Some(folder_prefix(folder_id));
+    let scan = ScanRowsOperation::new(SYNC_BASE_KEYSPACE, prefix, SYNC_PAGE_SIZE);
+    let rows = drive(scan, context).await.unwrap_or_default();
+    rows.iter()
+        .filter_map(|bytes| SyncBase::from_bytes(bytes).ok())
+        .collect()
 }
 
 #[cfg(test)]

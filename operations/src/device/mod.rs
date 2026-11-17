@@ -21,6 +21,7 @@ pub mod remove_node;
 pub mod replica;
 pub mod replica_store;
 pub mod retry;
+pub mod scan_rows;
 pub mod selection;
 pub mod sync;
 pub mod sync_note;
