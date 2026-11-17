@@ -265,3 +265,229 @@ impl Operation for PublishInfoOperation {
     }
 }
 
+#[cfg(test)]
+mod state_machine_tests {
+    use aruna_core::operation_check::{
+        check_abort, check_trace, rejects_events, rejects_finalize, sample_events,
+    };
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use ulid::Ulid;
+
+    use super::*;
+
+    const REALM: RealmId = RealmId([3; 32]);
+    const TXN: TxnId = Ulid::from_parts(5, 5);
+
+    fn node() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1; 32]).public()
+    }
+
+    fn config(kind: RealmNodeKind) -> Value {
+        let mut config = RealmConfigDocument::default_for_realm(REALM, Vec::new());
+        config.ensure_node(node(), kind);
+        Value::from(postcard::to_allocvec(&config).unwrap())
+    }
+
+    fn device() -> RealmNodeKind {
+        RealmNodeKind::User {
+            owner: aruna_core::UserId::new(Ulid::from_parts(2, 2), REALM),
+        }
+    }
+
+    fn storage(event: StorageEvent) -> Event {
+        Event::Storage(event)
+    }
+
+    fn first_read() -> Effect {
+        let config = DocumentTarget::RealmConfig { realm_id: REALM };
+        Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (COMPUTE_DEPARTURE_KEYSPACE.to_string(), owed_key()),
+                (config.storage_keyspace().to_string(), config.storage_key()),
+            ],
+            txn_id: None,
+        })
+    }
+
+    fn read(owed: Option<u64>, config: Option<Value>) -> Event {
+        let owed = owed.map(|owed| Value::from(owed.to_be_bytes().to_vec()));
+        storage(StorageEvent::BatchReadResult {
+            values: vec![(owed_key(), owed), (Key::from(Vec::new()), config)],
+        })
+    }
+
+    fn synced(result: Result<(), String>) -> Event {
+        Event::SubOperation(SubOperationEvent::DocumentSyncResult { result })
+    }
+
+    fn begin() -> Effect {
+        Effect::Storage(StorageEffect::StartTransaction { read: false })
+    }
+
+    fn reread() -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: owed_key(),
+            txn_id: Some(TXN),
+        })
+    }
+
+    fn current(owed: Option<u64>) -> Event {
+        storage(StorageEvent::ReadResult {
+            key: owed_key(),
+            value: owed.map(|owed| Value::from(owed.to_be_bytes().to_vec())),
+        })
+    }
+
+    fn commit() -> Effect {
+        Effect::Storage(StorageEffect::CommitTransaction { txn_id: TXN })
+    }
+
+    fn committed() -> Event {
+        storage(StorageEvent::TransactionCommitted { txn_id: TXN })
+    }
+
+    /// A publication that replicated and now settles revision 4 in the transaction.
+    fn settling() -> PublishInfoOperation {
+        let mut operation = PublishInfoOperation::new(REALM, node(), false);
+        operation.start();
+        operation.step(read(Some(4), Some(config(RealmNodeKind::Server))));
+        operation.step(synced(Ok(())));
+        operation.step(storage(StorageEvent::TransactionStarted { txn_id: TXN }));
+        operation
+    }
+
+    #[test]
+    fn replicates_then_settles() {
+        let mut operation = PublishInfoOperation::new(REALM, node(), false);
+        assert_eq!(operation.start().to_vec(), vec![first_read()]);
+        let effects = operation.step(read(Some(4), Some(config(RealmNodeKind::Server))));
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        assert_eq!(operation.step(synced(Ok(()))).to_vec(), vec![begin()]);
+        let started = storage(StorageEvent::TransactionStarted { txn_id: TXN });
+        assert_eq!(operation.step(started).to_vec(), vec![reread()]);
+        let delete = Effect::Storage(StorageEffect::Delete {
+            key_space: COMPUTE_DEPARTURE_KEYSPACE.to_string(),
+            key: owed_key(),
+            txn_id: Some(TXN),
+        });
+        let mut operation = settling();
+        assert_eq!(operation.step(current(Some(4))).to_vec(), vec![delete]);
+        let deleted = storage(StorageEvent::DeleteResult { key: owed_key() });
+        assert_eq!(operation.step(deleted).to_vec(), vec![commit()]);
+        assert!(operation.step(committed()).is_empty());
+        assert_eq!(operation.finalize(), Ok(()));
+
+        // A revision committed meanwhile stays owed: nothing is deleted.
+        let mut newer = settling();
+        assert_eq!(newer.step(current(Some(5))).to_vec(), vec![commit()]);
+        newer.step(committed());
+        assert_eq!(newer.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn skips_without_work() {
+        // Only an owed revision publishes on a heartbeat.
+        let mut heartbeat = PublishInfoOperation::new(REALM, node(), true);
+        check_trace(
+            &mut heartbeat,
+            &[first_read()],
+            vec![(read(None, Some(config(RealmNodeKind::Server))), vec![])],
+        );
+        assert_eq!(heartbeat.finalize(), Ok(()));
+
+        // A device replicates nothing and only settles what it owed.
+        let mut local = PublishInfoOperation::new(REALM, node(), false);
+        check_trace(
+            &mut local,
+            &[first_read()],
+            vec![
+                (read(Some(2), Some(config(device()))), vec![begin()]),
+                (
+                    storage(StorageEvent::TransactionStarted { txn_id: TXN }),
+                    vec![reread()],
+                ),
+            ],
+        );
+        let mut nothing = PublishInfoOperation::new(REALM, node(), false);
+        nothing.start();
+        assert!(nothing.step(read(None, Some(config(device())))).is_empty());
+        assert_eq!(nothing.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn failures_end_publication() {
+        let mut missing = PublishInfoOperation::new(REALM, node(), false);
+        missing.start();
+        missing.step(read(Some(1), None));
+        assert_eq!(missing.finalize(), Err(PublishInfoError::ConfigMissing));
+
+        let mut refused = PublishInfoOperation::new(REALM, node(), false);
+        refused.start();
+        refused.step(read(Some(1), Some(config(RealmNodeKind::Server))));
+        assert!(refused.step(synced(Err("offline".to_string()))).is_empty());
+        let error = PublishInfoError::Replication("offline".to_string());
+        assert_eq!(refused.finalize(), Err(error));
+
+        let rollback = Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN });
+        let mut failed = settling();
+        let timeout = storage(StorageEvent::Error {
+            error: StorageError::Timeout,
+        });
+        assert_eq!(failed.step(timeout).to_vec(), vec![rollback]);
+        assert_eq!(failed.finalize(), Err(StorageError::Timeout.into()));
+
+        // A conflicting settle keeps the newer revision owed and still succeeds.
+        let mut racing = settling();
+        racing.step(current(Some(4)));
+        racing.step(storage(StorageEvent::DeleteResult { key: owed_key() }));
+        racing.step(storage(StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        }));
+        assert_eq!(racing.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_stray_events() {
+        let reading = || {
+            let mut operation = PublishInfoOperation::new(REALM, node(), false);
+            operation.start();
+            operation
+        };
+        let batch = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::BatchReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(reading, sample_events, batch) {
+            assert!(effects.is_empty(), "{label} emitted effects");
+            assert!(matches!(error, PublishInfoError::UnexpectedEvent(_)), "{label}");
+        }
+        let rollback = Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN });
+        let reread = |event: &Event| {
+            matches!(
+                event,
+                Event::Storage(StorageEvent::ReadResult { .. } | StorageEvent::Error { .. })
+            )
+        };
+        for (label, effects, error) in rejects_events(settling, sample_events, reread) {
+            assert_eq!(effects.to_vec(), vec![rollback.clone()], "{label}");
+            assert!(matches!(error, PublishInfoError::UnexpectedEvent(_)), "{label}");
+        }
+        let fresh = || PublishInfoOperation::new(REALM, node(), false);
+        assert_eq!(rejects_events(fresh, sample_events, |_| false).len(), sample_events().len());
+    }
+
+    #[test]
+    fn abort_releases_settle() {
+        let mut operation = PublishInfoOperation::new(REALM, node(), false);
+        check_abort(&mut operation, &[]);
+        operation.start();
+        check_abort(&mut operation, &[]);
+        let mut open = settling();
+        let rollback = Effect::Storage(StorageEffect::AbortTransaction { txn_id: TXN });
+        check_abort(&mut open, &[rollback]);
+        rejects_finalize(open);
+    }
+}
