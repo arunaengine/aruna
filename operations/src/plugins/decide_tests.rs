@@ -391,3 +391,37 @@ fn gap_counts_once() {
     assert_eq!((row.count, row.earliest_ms), (1, 5));
     assert_eq!(gap.take(Answer::Done).unwrap(), None);
 }
+
+#[test]
+fn seen_records_expire() {
+    let mut plan = PruneSeen {
+        now_ms: DEDUP_RETENTION_MS + 10,
+        after: None,
+        deleting: None,
+        pruned: 0,
+    };
+    assert!(matches!(plan.first().unwrap(), Turn::Ask(Ask::Page { .. })));
+    let seen = |anchor_ms| {
+        let record = SeenRow {
+            outcome: Outcome::Queued,
+            anchor_ms,
+            decided_ms: anchor_ms,
+        };
+        encode(&record).unwrap()
+    };
+    let page = vec![(b"old".to_vec(), seen(1)), (b"new".to_vec(), seen(20))];
+    let next = plan
+        .next(Answer::Page(page, Some(b"new".to_vec())))
+        .unwrap();
+    let deleted = Ask::Delete(vec![(PLUGIN_SEEN_KEYSPACE, b"old".to_vec())]);
+    assert_eq!(next, Turn::Ask(deleted));
+    let Turn::Ask(Ask::Page { after, .. }) = plan.next(Answer::Done).unwrap() else {
+        panic!("the next page follows");
+    };
+    assert_eq!(after, Some(b"new".to_vec()));
+    assert_eq!(
+        plan.next(Answer::Page(Vec::new(), None)).unwrap(),
+        Turn::Ask(Ask::Delete(Vec::new()))
+    );
+    assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(1));
+}

@@ -441,3 +441,33 @@ fn drop_deletes_intents() {
     assert_eq!(keys.len(), 1);
     assert_eq!(plan.next(Answer::Done).unwrap(), Turn::Finish(()));
 }
+
+#[test]
+fn expired_runs_listed() {
+    let install = Ulid::from_parts(1, 1);
+    let mut ended = queued(install, 1);
+    ended.finish(RunState::Succeeded, None, 1);
+    let mut waiting = queued(install, 2);
+    waiting.finish(RunState::NeedsAttention, None, 1);
+    let mut plan = ExpiredRuns {
+        now_ms: 1 + RUN_RETENTION_MS,
+        phase: ExpiredPhase::Runs(Scan::new(PLUGIN_RUNS_KEYSPACE, vec![RUN_ROW])),
+        prunable: Vec::new(),
+    };
+    plan.first().unwrap();
+    let rows = vec![
+        (b"r1".to_vec(), encode(&ended).unwrap()),
+        (b"r2".to_vec(), encode(&waiting).unwrap()),
+    ];
+    // The work rows hold no completion, so the ended run's intents are read next.
+    assert!(matches!(
+        plan.next(Answer::Page(rows, None)).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    assert!(matches!(
+        plan.next(Answer::Page(Vec::new(), None)).unwrap(),
+        Turn::Ask(Ask::Page { .. })
+    ));
+    let done = plan.next(Answer::Page(Vec::new(), None)).unwrap();
+    assert_eq!(done, Turn::Finish(vec![(install, ended.run_id)]));
+}
