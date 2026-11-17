@@ -775,7 +775,6 @@ dependencies = [
  "spareval",
  "spargebra",
  "sysinfo",
- "tantivy",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -877,6 +876,7 @@ dependencies = [
  "crossfire",
  "fjall",
  "hex",
+ "tantivy",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -891,7 +891,9 @@ dependencies = [
  "aruna-core",
  "async-trait",
  "iroh",
+ "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
