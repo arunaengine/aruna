@@ -24,6 +24,7 @@ pub mod identifier_lookup;
 mod iri_index;
 pub mod list_documents;
 pub mod materialization_queue;
+pub(crate) mod object_version;
 pub mod persistent_id;
 pub mod profile;
 pub mod projector;

@@ -10,13 +10,9 @@ use std::collections::{BTreeMap, HashMap};
 use aruna_core::NodeId;
 use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
-};
+use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
-};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::{CONTENT_URL, ObjectLocation, text_values};
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
 use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
@@ -26,6 +22,7 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::object_version::ObjectVersionOperation;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 
 /// At most this many entities are looked at per save.
@@ -106,17 +103,13 @@ pub async fn normalize_entries(
         if !bound {
             continue;
         }
-        let version_id = match version {
-            Some(version_id) => Some(version_id),
-            None => read_head(context, &bucket, &key).await?,
-        };
-        let Some(version_id) = version_id else {
+        let object = drive(ObjectVersionOperation::new(&bucket, &key, version), context)
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some(version_id) = object.version_id else {
             continue;
         };
-        if read_version(context, &bucket, &key, version_id)
-            .await?
-            .is_none_or(|version| version.is_deleted())
-        {
+        if object.version.is_none_or(|version| version.is_deleted()) {
             continue;
         }
         let global = GlobalId::Version {
@@ -234,37 +227,6 @@ async fn member_version(
     let entry = IndexEntry::from_bytes(&entry).map_err(|error| error.to_string())?;
     let position = Position::decode(&entry.position).map_err(|error| error.to_string())?;
     Ok(Some((bucket.to_string(), position.key)))
-}
-
-async fn read_head(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<Ulid>, String> {
-    let head = BlobHeadKey::new(bucket, key)
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    read_row(context, BLOB_HEAD_KEYSPACE, head)
-        .await?
-        .map(|value| CurrentVersionPointer::from_bytes(&value).map(|pointer| pointer.version_id))
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
-async fn read_version(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-) -> Result<Option<BlobVersion>, String> {
-    let row = VersionKey::new(bucket, key, version_id)
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    read_row(context, BLOB_VERSIONS_KEYSPACE, row)
-        .await?
-        .map(|value| BlobVersion::from_bytes(&value))
-        .transpose()
-        .map_err(|error| error.to_string())
 }
 
 async fn read_row(
