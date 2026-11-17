@@ -924,6 +924,7 @@ impl Operation for AwaitingJobsOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
+    use crate::jobs::runtime::key_unlocked;
     use aruna_storage::StorageHandle;
 
     /// Parks through the operation at the current time, as the drain does.

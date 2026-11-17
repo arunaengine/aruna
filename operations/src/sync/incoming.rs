@@ -658,7 +658,9 @@ async fn run_sync_maintenance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replication::protocol::LocationSummaryRequest;
+    use crate::replication::protocol::{
+        LocationSummaryRequest, VersionReplicationManifest, VersionReplicationMessage,
+    };
     use aruna_blob::blob::BlobHandler;
     use aruna_core::UserId;
     use aruna_core::events::StorageEvent;
@@ -668,9 +670,12 @@ mod tests {
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::PathRestriction;
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::replication::ReplicationItemKind;
     use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
     use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -680,6 +685,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
     use tokio::sync::mpsc;
+    use ulid::Ulid;
 
     #[derive(Debug)]
     struct StreamCapture(mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>);
