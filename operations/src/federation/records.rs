@@ -487,7 +487,11 @@ mod tests {
             entries: Vec::new(),
         }));
         let conflict = StorageError::TransactionConflict;
-        assert!(operation.step(Event::Storage(StorageEvent::Error { error: conflict })).is_empty());
+        assert!(
+            operation
+                .step(Event::Storage(StorageEvent::Error { error: conflict }))
+                .is_empty()
+        );
         let error = operation.finalize().unwrap_err();
         assert!(RecordOperation::is_conflict(&error));
         // The runner's retry runs a fresh change, which rereads the record.

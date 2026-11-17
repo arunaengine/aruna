@@ -318,7 +318,10 @@ async fn signal_snapshot_retry(
             Ok(())
         }
         other => {
-            warn!(event = other.label(), "Unexpected usage snapshot retry schedule result");
+            warn!(
+                event = other.label(),
+                "Unexpected usage snapshot retry schedule result"
+            );
             Ok(())
         }
     }
@@ -522,7 +525,10 @@ pub(crate) async fn restore_usage_timer(storage: &StorageHandle, task_handle: &T
             return;
         }
         other => {
-            warn!(event = other.label(), "Unexpected event while scanning node usage dirty markers");
+            warn!(
+                event = other.label(),
+                "Unexpected event while scanning node usage dirty markers"
+            );
             return;
         }
     };

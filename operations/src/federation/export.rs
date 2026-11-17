@@ -154,7 +154,10 @@ async fn unlocked(context: &DriverContext, key: BucketKeyRef) -> Result<bool, Gr
         Event::Blob(BlobEvent::KeyStatus { generations }) => Ok(generations
             .iter()
             .any(|status| status.key == key && status.active)),
-        other => Err(GrantError::Storage(format!("key status failed: {}", other.label()))),
+        other => Err(GrantError::Storage(format!(
+            "key status failed: {}",
+            other.label()
+        ))),
     }
 }
 
@@ -343,7 +346,10 @@ impl IssueGrantOperation {
 
     fn decide(&self, event: Event) -> Result<(bool, GrantRecord), GrantError> {
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return Err(GrantError::Storage(format!("unexpected event {}", event.label())));
+            return Err(GrantError::Storage(format!(
+                "unexpected event {}",
+                event.label()
+            )));
         };
         let [(_, record), (_, checkpoint)] = values.as_slice() else {
             return Err(GrantError::Storage("unexpected read result".to_string()));

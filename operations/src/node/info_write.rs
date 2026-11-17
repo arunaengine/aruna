@@ -658,7 +658,9 @@ mod state_machine_tests {
         let error = operation.finalize().unwrap_err();
         assert_eq!(error, InfoWriteError::Conflict);
         assert!(InfoWriteOperation::is_conflict(&error));
-        assert!(!InfoWriteOperation::is_conflict(&InfoWriteError::SeedConflict));
+        assert!(!InfoWriteOperation::is_conflict(
+            &InfoWriteError::SeedConflict
+        ));
     }
 
     #[test]
