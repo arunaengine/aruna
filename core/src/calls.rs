@@ -14,7 +14,7 @@ use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, a
 use crate::errors::StorageError;
 use crate::events::{Event, GroupEvent, StorageEvent};
 use crate::operation::{
-    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation,
+    AfterConflict, EffectOperation, HoldScope, Operation, Runnable, SubOperation, TransactionMode,
     boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
@@ -51,7 +51,7 @@ pub enum IoCall {
     /// A wake after this long on the runner's clock.
     Delay(Duration),
     /// Adds usage deltas to the latest stored counters when the operation's transaction
-    /// commits; needs `transaction()`. Answered by `Done`.
+    /// commits; needs `TransactionMode::Write`. Answered by `Done`.
     AddUsage {
         space: KeySpace,
         deltas: Vec<(Key, UsageDelta)>,
@@ -205,12 +205,12 @@ pub enum IoError {
 }
 
 /// The runner's machine for an [`Operation`]: it makes each call, checks every event, runs the
-/// storage calls in one write transaction when the operation asks for one, commits its outcome
+/// storage calls in the operation's transaction mode, commits its outcome
 /// and aborts on an error.
 #[derive(Debug)]
 pub(crate) struct CallRun<P: Operation> {
     operation: P,
-    transaction: bool,
+    mode: TransactionMode,
     txn_id: Option<TxnId>,
     state: State<P::Output, P::Error>,
 }
@@ -291,7 +291,7 @@ impl Wait {
 impl<P: Operation> PartialEq for CallRun<P> {
     fn eq(&self, other: &Self) -> bool {
         self.operation == other.operation
-            && self.transaction == other.transaction
+            && self.mode == other.mode
             && self.txn_id == other.txn_id
             && std::mem::discriminant(&self.state) == std::mem::discriminant(&other.state)
     }
@@ -300,7 +300,7 @@ impl<P: Operation> PartialEq for CallRun<P> {
 impl<P: Operation> CallRun<P> {
     pub(crate) fn new(operation: P) -> Self {
         Self {
-            transaction: operation.transaction(),
+            mode: operation.transaction(),
             operation,
             txn_id: None,
             state: State::Created,
@@ -323,17 +323,24 @@ impl<P: Operation> CallRun<P> {
                 turn = self.operation.next(result);
                 continue;
             }
-            if self.transaction && self.txn_id.is_none() && in_storage(&call) {
+            if self.txn_id.is_none() && in_mode(&call, self.mode) {
                 self.state = State::Starting(call);
-                let start = StorageEffect::StartTransaction { read: false };
+                let read = self.mode == TransactionMode::ReadSnapshot;
+                let start = StorageEffect::StartTransaction { read };
                 return smallvec![Effect::Storage(start)];
             }
             return self.request(call);
         }
     }
 
+    /// The transaction a call runs in: the open one when the call joins the mode, else none.
+    fn txn_for(&self, call: &IoCall) -> Option<TxnId> {
+        self.txn_id.filter(|_| in_mode(call, self.mode))
+    }
+
     fn request(&mut self, call: IoCall) -> Effects {
-        match call_effect(call, self.txn_id) {
+        let txn_id = self.txn_for(&call);
+        match call_effect(call, txn_id) {
             Ok((wait, effect)) => {
                 self.state = State::Waiting(wait);
                 smallvec![effect]
@@ -347,10 +354,13 @@ impl<P: Operation> CallRun<P> {
         self.state = State::Waiting(Wait::Window);
         match self.operation.next(IoResult::Group(event)) {
             Ok(Next::Wait) => smallvec![],
-            Ok(Next::Call(call)) => match call_effect(call, self.txn_id) {
-                Ok((_, effect)) => smallvec![effect],
-                Err(error) => self.fail(error),
-            },
+            Ok(Next::Call(call)) => {
+                let txn_id = self.txn_for(&call);
+                match call_effect(call, txn_id) {
+                    Ok((_, effect)) => smallvec![effect],
+                    Err(error) => self.fail(error),
+                }
+            }
             turn => self.advance(turn),
         }
     }
@@ -600,17 +610,21 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Whether the call runs in the operation's transaction.
-fn in_storage(call: &IoCall) -> bool {
-    matches!(
-        call,
-        IoCall::Read(_)
-            | IoCall::Page { .. }
-            | IoCall::Write(_)
-            | IoCall::Delete(_)
-            | IoCall::AddUsage { .. }
-            | IoCall::AddCounters { .. }
-    )
+/// Whether the call runs in the operation's transaction of `mode`.
+fn in_mode(call: &IoCall, mode: TransactionMode) -> bool {
+    match mode {
+        TransactionMode::None => false,
+        TransactionMode::Write => matches!(
+            call,
+            IoCall::Read(_)
+                | IoCall::Page { .. }
+                | IoCall::Write(_)
+                | IoCall::Delete(_)
+                | IoCall::AddUsage { .. }
+                | IoCall::AddCounters { .. }
+        ),
+        TransactionMode::ReadSnapshot => matches!(call, IoCall::Read(_) | IoCall::Page { .. }),
+    }
 }
 
 fn call_effect(call: IoCall, txn_id: Option<TxnId>) -> Result<(Wait, Effect), IoError> {

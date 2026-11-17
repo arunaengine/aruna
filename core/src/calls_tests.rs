@@ -19,7 +19,7 @@ struct Script {
     seen: Vec<IoResult>,
     on_member: Option<IoCall>,
     scope: Option<HoldScope>,
-    transaction: bool,
+    mode: TransactionMode,
     then: Vec<IoCall>,
     cleanup: Vec<IoCall>,
 }
@@ -58,8 +58,8 @@ impl Operation for Script {
         self.scope
     }
 
-    fn transaction(&self) -> bool {
-        self.transaction
+    fn transaction(&self) -> TransactionMode {
+        self.mode
     }
 
     fn abort(&mut self) -> Vec<IoCall> {
@@ -73,15 +73,17 @@ fn script(calls: Vec<IoCall>) -> Script {
         seen: Vec::new(),
         on_member: None,
         scope: None,
-        transaction: false,
+        mode: TransactionMode::None,
         then: Vec::new(),
         cleanup: Vec::new(),
     }
 }
 
-/// The runner's machine for `script`, in one transaction or not.
+/// The runner's machine for `script`, in one write transaction or not.
 fn run(mut script: Script, transaction: bool) -> CallRun<Script> {
-    script.transaction = transaction;
+    if transaction {
+        script.mode = TransactionMode::Write;
+    }
     CallRun::new(script)
 }
 
@@ -138,6 +140,79 @@ fn transaction_commits_outcome() {
         operation.finalize(),
         Ok(vec![IoResult::Values(vec![None]), IoResult::Done])
     );
+}
+
+#[test]
+fn snapshot_reads_only() {
+    let write = vec![("rows".to_string(), key("b"), key("1"))];
+    let page = IoCall::Page {
+        space: "rows".to_string(),
+        prefix: key("p/"),
+        after: None,
+        limit: 10,
+    };
+    let mut procedure = script(vec![read_a(), IoCall::Write(write.clone()), page]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    let start = storage(StorageEffect::StartTransaction { read: true });
+    assert_eq!(operation.start().as_slice(), &[start]);
+    let read = StorageEffect::BatchRead {
+        reads: vec![("rows".to_string(), key("a"))],
+        txn_id: Some(txn()),
+    };
+    assert_eq!(operation.step(started()).as_slice(), &[storage(read)]);
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let write = StorageEffect::BatchWrite {
+        writes: write,
+        txn_id: None,
+    };
+    assert_eq!(
+        effects.as_slice(),
+        &[storage(write)],
+        "writes run on their own"
+    );
+    let written = StorageEvent::BatchWriteResult {
+        entries: Vec::new(),
+    };
+    let iter = StorageEffect::Iter {
+        key_space: "rows".to_string(),
+        prefix: Some(key("p/")),
+        start: None,
+        limit: 10,
+        txn_id: Some(txn()),
+    };
+    assert_eq!(
+        operation.step(Event::Storage(written)).as_slice(),
+        &[storage(iter)]
+    );
+    let page = StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: None,
+    };
+    let commit = StorageEffect::CommitTransaction { txn_id: txn() };
+    assert_eq!(
+        operation.step(Event::Storage(page)).as_slice(),
+        &[storage(commit)]
+    );
+    let committed = StorageEvent::TransactionCommitted { txn_id: txn() };
+    assert!(operation.step(Event::Storage(committed)).is_empty());
+    assert!(matches!(operation.finalize(), Ok(seen) if seen.len() == 3));
+
+    // Counter additions need a write transaction.
+    let counters = IoCall::AddCounters {
+        space: "counters".to_string(),
+        deltas: Vec::new(),
+    };
+    let mut procedure = script(vec![counters]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    assert!(operation.start().is_empty());
+    let refused = IoError::Unexpected {
+        expected: "a transaction",
+        got: "IoCall::AddCounters",
+    };
+    assert_eq!(operation.finalize(), Err(refused));
 }
 
 #[test]

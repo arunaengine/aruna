@@ -28,9 +28,9 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     /// The next call after `result`, or the outcome.
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error>;
 
-    /// Whether the storage calls run in one write transaction; otherwise each runs on its own.
-    fn transaction(&self) -> bool {
-        false
+    /// How the runner groups the storage calls; by default each runs on its own.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 
     /// Cleanup calls the runner sends once when the run ends in an error before its commit is
@@ -80,6 +80,19 @@ pub trait Operation: Send + std::fmt::Debug + PartialEq {
     {
         AfterConflict::rerun_within(attempt, Self::conflict_retries())
     }
+}
+
+/// How the runner groups an operation's storage calls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransactionMode {
+    /// Each storage call runs on its own.
+    #[default]
+    None,
+    /// Every storage call runs in one write transaction, committed with the outcome and aborted
+    /// on an error.
+    Write,
+    /// Reads and pages run in one read-only snapshot; writes, deletes and syncs run on their own.
+    ReadSnapshot,
 }
 
 /// What the conflict retry does after a run lost a transaction conflict.
