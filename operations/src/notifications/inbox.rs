@@ -2,6 +2,248 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+
+use aruna_core::UserId;
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
+use aruna_core::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
+    notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
+};
+use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use smallvec::smallvec;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum InboxError {
+    #[error("notification inbox upsert conflicted")]
+    Conflict,
+    #[error("notification inbox upsert conflicted twice")]
+    ConflictedTwice,
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error("stored notification record: {0}")]
+    Decode(String),
+    #[error("notification record could not be encoded: {0}")]
+    Encode(String),
+    #[error("notification transient count for recipient {0} exceeds cap {TRANSIENT_USER_CAP}")]
+    TransientCap(UserId),
+    #[error("unexpected event in {state}: {got}")]
+    UnexpectedEvent { state: &'static str, got: String },
+    #[error("the notification inbox upsert did not finish")]
+    NotFinished,
+}
+
+impl From<StorageError> for InboxError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::TransactionConflict => InboxError::Conflict,
+            error => InboxError::Storage(error),
+        }
+    }
+}
+
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxWriteOutcome {
+    pub written: usize,
+    pub recipients: Vec<UserId>,
+    pub purged: usize,
+    pub cutoffs: usize,
+    /// Batch records the inbox holds after the write, new or already present, never discarded.
+    pub held: Vec<NotificationRecord>,
+}
+
+/// One paged scan of a recipient's inbox: the purge it serves, or the transient count.
+#[derive(Debug, PartialEq)]
+struct InboxScan {
+    recipient: UserId,
+    next: Option<Key>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum UpsertState {
+    #[default]
+    Init,
+    Start,
+    /// Reads the deletion time of each notice's bucket.
+    ReadCutoffs {
+        checked: Vec<usize>,
+    },
+    /// Scans the inbox of `purges[at]` for the notices its bucket deletion removes.
+    Purge {
+        at: usize,
+        scan: InboxScan,
+    },
+    /// Reads the stored deletion times the purges may raise.
+    ReadTimes {
+        times: Vec<(Key, u64)>,
+    },
+    WriteTimes,
+    DeleteRows,
+    ReadExisting,
+    /// Counts the stored transient notices of `counts[at]`.
+    Count {
+        at: usize,
+        seen: usize,
+        scan: InboxScan,
+    },
+    WriteRows,
+    Commit,
+    Abort,
+    /// Aborts the conflicted transaction before the one more run.
+    Retry,
+    Done,
+    Failed(InboxError),
+}
+
+impl UpsertState {
+    fn name(&self) -> &'static str {
+        match self {
+            UpsertState::Init => "init",
+            UpsertState::Start => "start",
+            UpsertState::ReadCutoffs { .. } => "read cutoffs",
+            UpsertState::Purge { .. } => "purge scan",
+            UpsertState::ReadTimes { .. } => "read deletion times",
+            UpsertState::WriteTimes => "write deletion times",
+            UpsertState::DeleteRows => "delete purged rows",
+            UpsertState::ReadExisting => "read existing rows",
+            UpsertState::Count { .. } => "count transient rows",
+            UpsertState::WriteRows => "write rows",
+            UpsertState::Commit => "commit",
+            UpsertState::Abort => "abort",
+            UpsertState::Retry => "retry",
+            UpsertState::Done => "done",
+            UpsertState::Failed(_) => "failed",
+        }
+    }
+}
+
+/// Idempotent holder-local upsert: existing primary keys are skipped inside the write
+/// transaction, so a duplicate never clobbers a concurrent mark-read's `read_at_ms`. A bucket
+/// deletion is never stored: it removes the notices about its bucket and keeps its time, so a
+/// notice from before it that arrives late is dropped too. An upsert in its own transaction
+/// runs once more after a conflict.
+#[derive(Debug, PartialEq)]
+pub struct UpsertInboxOperation {
+    records: Vec<NotificationRecord>,
+    /// The caller's transaction; `None` when the operation opens and ends its own.
+    outer_txn: Option<TxnId>,
+    txn_id: Option<TxnId>,
+    retried: bool,
+    state: UpsertState,
+    kept: Vec<usize>,
+    purges: Vec<usize>,
+    deletes: Vec<(KeySpace, Key)>,
+    times: BTreeMap<Key, u64>,
+    writes: Vec<(KeySpace, Key, Value)>,
+    counts: Vec<(UserId, usize)>,
+    outcome: InboxWriteOutcome,
+}
+
+impl UpsertInboxOperation {
+    pub fn new(records: Vec<NotificationRecord>) -> Self {
+        Self::build(records, None)
+    }
+
+    /// Upserts inside the caller's open transaction; the caller commits and retries.
+    pub fn within(records: Vec<NotificationRecord>, txn_id: TxnId) -> Self {
+        Self::build(records, Some(txn_id))
+    }
+
+    fn build(records: Vec<NotificationRecord>, outer_txn: Option<TxnId>) -> Self {
+        Self {
+            records,
+            outer_txn,
+            txn_id: outer_txn,
+            retried: false,
+            state: UpsertState::Init,
+            kept: Vec::new(),
+            purges: Vec::new(),
+            deletes: Vec::new(),
+            times: BTreeMap::new(),
+            writes: Vec::new(),
+            counts: Vec::new(),
+            outcome: InboxWriteOutcome::default(),
+        }
+    }
+
+    fn txn(&self) -> TxnId {
+        self.txn_id.unwrap_or_default()
+    }
+
+    fn owned_txn(&self) -> Option<TxnId> {
+        self.txn_id.filter(|_| self.outer_txn.is_none())
+    }
+
+    fn begin(&mut self) -> Effects {
+        self.kept.clear();
+        self.purges.clear();
+        self.deletes.clear();
+        self.times.clear();
+        self.writes.clear();
+        self.counts.clear();
+        self.outcome = InboxWriteOutcome::default();
+        match self.outer_txn {
+            Some(_) => self.read_cutoffs(),
+            None => {
+                self.txn_id = None;
+                self.state = UpsertState::Start;
+                smallvec![Effect::Storage(StorageEffect::StartTransaction { read: false })]
+            }
+        }
+    }
+
+    fn fail(&mut self, error: InboxError) -> Effects {
+        if error == InboxError::Conflict && self.outer_txn.is_none() && !self.retried {
+            self.retried = true;
+            let abort = self.abort_txn();
+            if abort.is_empty() {
+                return self.begin();
+            }
+            self.state = UpsertState::Retry;
+            return abort;
+        }
+        let error = match error {
+            InboxError::Conflict if self.outer_txn.is_none() => InboxError::ConflictedTwice,
+            error => error,
+        };
+        let abort = self.abort_txn();
+        self.state = UpsertState::Failed(error);
+        abort
+    }
+
+    fn abort_txn(&mut self) -> Effects {
+        match self.owned_txn() {
+            Some(txn_id) => {
+                self.txn_id = None;
+                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            }
+            None => smallvec![],
+        }
+    }
+
+    fn unexpected(&mut self, state: UpsertState, event: Event) -> Effects {
+        self.state = state;
+        let error = match event {
+            Event::Storage(StorageEvent::Error { error }) => error.into(),
+            other => InboxError::UnexpectedEvent {
+                state: self.state.name(),
+                got: format!("{other:?}"),
+            },
+        };
+        self.fail(error)
+    }
+
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
