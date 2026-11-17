@@ -1429,17 +1429,7 @@ pub(crate) async fn persist_checkpoint<T: Serialize>(
 pub(super) fn map_crate_error(error: craqle::RoCrateError) -> ExportFailure {
     match error {
         craqle::RoCrateError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
-            ExportFailure::Validation(
-                violations
-                    .into_iter()
-                    .map(|violation| MetadataValidationViolation {
-                        code: violation.code.to_string(),
-                        message: violation.message,
-                        pointer: violation.pointer,
-                        entity_id: violation.entity_id,
-                    })
-                    .collect(),
-            )
+            ExportFailure::Validation(violations.into_iter().map(Into::into).collect())
         }
         error => ExportFailure::Permanent(error.to_string()),
     }

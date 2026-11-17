@@ -7,7 +7,7 @@ use aruna_core::entity_patch::craqle_patch_request;
 use aruna_core::metadata::{
     MetadataBatch, MetadataBatchSource, MetadataCrateRequest, MetadataDot, MetadataError,
     MetadataGraphPolicy, MetadataQuadOp, MetadataRequestDurability, MetadataRoCratePage,
-    MetadataValidationViolation, UpsertEntityRequest,
+    UpsertEntityRequest,
 };
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleFjallPersistMode, CraqleNode,
@@ -112,17 +112,7 @@ fn transient_kind(kind: craqle::CraqleErrorKind) -> bool {
 }
 
 fn metadata_violations(violations: Vec<craqle::CrateViolation>) -> MetadataError {
-    MetadataError::Validation(
-        violations
-            .into_iter()
-            .map(|violation| MetadataValidationViolation {
-                code: violation.code.to_string(),
-                message: violation.message,
-                pointer: violation.pointer,
-                entity_id: violation.entity_id,
-            })
-            .collect(),
-    )
+    MetadataError::Validation(violations.into_iter().map(Into::into).collect())
 }
 
 pub(crate) fn craqle_create_request(request: MetadataCrateRequest) -> CreateCrateRequest {
