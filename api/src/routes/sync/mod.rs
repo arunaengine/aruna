@@ -21,7 +21,7 @@ use aruna_core::structs::{
 };
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{drive, drive_retry};
 use aruna_operations::replication::parking::AwaitingJobsOperation;
 use aruna_operations::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
@@ -1156,9 +1156,10 @@ async fn create_mirror(
 /// already rolled back stays with repair: an ordinary delete could leave a detached stub.
 async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> ServerResult<()> {
     let context = state.get_ctx();
-    let error = match drive(
-        CreateRelationshipOperation::new(relationship.clone()),
+    let error = match drive_retry(
+        || CreateRelationshipOperation::new(relationship.clone()),
         &context,
+        &relationship.id.to_bytes(),
     )
     .await
     {

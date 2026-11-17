@@ -12,12 +12,12 @@ pub use list::ListQuarantineOperation;
 pub use prune::PruneQuarantineOperation;
 pub use read::ReadQuarantineOperation;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{QUARANTINE_USAGE_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
+use aruna_core::rows::read_row;
 use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
-use aruna_core::types::{TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -30,10 +30,18 @@ pub enum QuarantineAdminError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("unexpected storage event: expected {expected}, got {got}")]
-    Unexpected { expected: &'static str, got: String },
-    #[error("quarantine operation did not finish")]
-    Unfinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for QuarantineAdminError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -61,54 +69,45 @@ pub struct QuarantinePruneResult {
 }
 
 /// One bounded page of rows in key order (`topic || actor || actor_seq`).
-fn iter_effect(request: &QuarantinePageRequest) -> Effect {
+fn page_call(request: &QuarantinePageRequest) -> IoCall {
     let limit = request
         .limit
         .unwrap_or(QUARANTINE_PAGE_DEFAULT)
         .clamp(1, QUARANTINE_PAGE_MAX);
-    Effect::Storage(StorageEffect::Iter {
-        key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
-        prefix: request.topic.as_deref().map(ByteView::from),
-        start: request
-            .start_after
-            .as_deref()
-            .map(|key| IterStart::After(ByteView::from(key))),
+    IoCall::Page {
+        space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+        prefix: ByteView::from(request.topic.clone().unwrap_or_default()),
+        after: request.start_after.as_deref().map(ByteView::from),
         limit,
-        txn_id: None,
-    })
+    }
 }
 
-fn usage_read(txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: QUARANTINE_USAGE_KEYSPACE.to_string(),
-        key: ByteView::from(QUARANTINE_USAGE_KEY),
-        txn_id,
-    })
+/// The rows of the page that answered [`page_call`] and the key to continue after.
+fn page_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Vec<u8>>), IoError> {
+    match result {
+        IoResult::Page { rows, next } => Ok((rows, next.map(|key| key.as_ref().to_vec()))),
+        other => Err(IoError::Unexpected {
+            expected: "IoResult::Page",
+            got: other.label(),
+        }),
+    }
 }
 
-fn row_read(key: &[u8], txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
-        key: ByteView::from(key),
-        txn_id,
-    })
+fn usage_read() -> IoCall {
+    read_row(
+        QUARANTINE_USAGE_KEYSPACE,
+        ByteView::from(QUARANTINE_USAGE_KEY),
+    )
+}
+
+fn row_read(key: &[u8]) -> IoCall {
+    read_row(SYNC_QUARANTINE_KEYSPACE, ByteView::from(key))
 }
 
 fn decode_usage(value: Option<Value>) -> Result<SyncQuarantineUsage, QuarantineAdminError> {
     match value {
         Some(bytes) => Ok(SyncQuarantineUsage::from_bytes(bytes.as_ref())?),
         None => Ok(SyncQuarantineUsage::default()),
-    }
-}
-
-/// The error for an event a phase did not expect; storage errors keep their kind.
-fn unexpected(expected: &'static str, event: Event) -> QuarantineAdminError {
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => error.into(),
-        got => QuarantineAdminError::Unexpected {
-            expected,
-            got: format!("{got:?}"),
-        },
     }
 }
 

@@ -18,12 +18,12 @@ pub use list::ListRelationshipsOperation;
 pub use remove::RemoveOutgoingOperation;
 pub use store::StoreRelationshipOperation;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::keyspaces::{RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use thiserror::Error;
 
@@ -63,14 +63,17 @@ pub enum SyncRelationshipError {
     Duplicate,
     #[error("sync relationship creation was rolled back")]
     RolledBack,
-    #[error("unexpected event in state {state}: expected {expected}, got {received:?}")]
-    UnexpectedEvent {
-        state: &'static str,
-        expected: &'static str,
-        received: Event,
-    },
-    #[error("sync relationship operation did not finish")]
-    NotFinished,
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for SyncRelationshipError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 fn same_create_identity(left: &SyncRelationship, right: &SyncRelationship) -> bool {
@@ -90,19 +93,36 @@ fn storage_key(
     )))
 }
 
-fn iter_effect(
+/// The pages of relationships of `direction`, of one bucket or of all.
+fn pages(direction: SyncRelationshipDirection, bucket: Option<&str>) -> PrefixPages {
+    let prefix = ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default());
+    PrefixPages::new(direction.keyspace(), prefix, RELATIONSHIP_PAGE_SIZE)
+}
+
+/// Writes `relationship` in the keyspace of `direction`.
+fn write_call(
     direction: SyncRelationshipDirection,
-    bucket: Option<&str>,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: direction.keyspace().to_string(),
-        prefix: bucket.map(sync_relationship_prefix).map(ByteView::from),
-        start: start_after.map(IterStart::After),
-        limit: RELATIONSHIP_PAGE_SIZE,
-        txn_id,
-    })
+    relationship: &SyncRelationship,
+) -> Result<IoCall, ConversionError> {
+    let row = (
+        direction.keyspace().to_string(),
+        storage_key(direction, relationship)?,
+        ByteView::from(relationship.to_bytes()?),
+    );
+    Ok(IoCall::Write(vec![row]))
+}
+
+/// Deletes `relationship` from the keyspace of `direction`.
+fn delete_call(
+    direction: SyncRelationshipDirection,
+    relationship: &SyncRelationship,
+) -> Result<IoCall, ConversionError> {
+    relationship.validate()?;
+    let row = (
+        direction.keyspace().to_string(),
+        storage_key(direction, relationship)?,
+    );
+    Ok(IoCall::Delete(vec![row]))
 }
 
 fn parse_values(
