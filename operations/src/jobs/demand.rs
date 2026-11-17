@@ -237,7 +237,7 @@ pub async fn group_demand(
 ) -> Result<(ResourceTotals, bool), String> {
     let config = drive(GetConfigOperation::new(realm_id), ctx)
         .await
-        .map_err(|error| format!("failed to read realm config for the demand view: {error}"))?;
+        .map_err(|error| format!("failed to read realm config for node info: {error}"))?;
     let members = config
         .sync_eligible_nodes()
         .map_err(|error| error.to_string())?;
