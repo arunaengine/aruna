@@ -38,9 +38,6 @@ pub use report::{
     audit_endpoints, family_audit, family_report,
 };
 
-/// Records of one submission an admission decision scans before it commits.
-pub const MAX_SUBMISSION_SCAN: usize = 512;
-
 /// Why one lifecycle round did not complete. An availability failure is never
 /// reported as a refusal of the request itself.
 #[derive(Debug, PartialEq, Error)]
