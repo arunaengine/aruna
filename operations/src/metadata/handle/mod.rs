@@ -48,9 +48,10 @@ use super::profile::shacl::{
 use super::query_cache::MetadataQueryCache;
 use super::summary_cache::summary_cache;
 use crate::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
-    realm_token_revoked, realm_user_cutoff,
+    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
+    realm_user_cutoff,
 };
+use crate::auth::error::ArunaBearerError;
 use crate::distribution::key_index::RangeIndexes;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};

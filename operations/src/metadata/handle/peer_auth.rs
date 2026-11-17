@@ -16,9 +16,9 @@ use serde::de::DeserializeOwned;
 
 use super::{MetadataHandle, RevocationBlindValidation, WritePeerError};
 use crate::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token, realm_user_cutoff,
-    validate_bearer_token,
+    ArunaValidationState, decode_bearer_token, realm_user_cutoff, validate_bearer_token,
 };
+use crate::auth::error::ArunaBearerError;
 use crate::driver::DriverContext;
 use crate::metadata::contact::PeerContacts;
 use crate::metadata::protocol::{AuthToken, MetadataReadError};

@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask, RemapPlan};
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::auth::bearer_token::token_grant;
+use aruna_operations::auth::error::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
 use aruna_operations::driver::drive;

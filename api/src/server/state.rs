@@ -22,9 +22,10 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
-    realm_token_revoked, realm_user_cutoff,
+    ArunaValidationState, IssuerKeyCache, realm_linked_owner, realm_token_revoked,
+    realm_user_cutoff,
 };
+use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::device::wipe::DeviceWipe;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};

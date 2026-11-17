@@ -13,10 +13,9 @@ use aruna_core::onboarding::{
 };
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token,
-};
+use aruna_operations::auth::bearer_token::{ArunaValidationState, decode_bearer_token};
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};

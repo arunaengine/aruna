@@ -1121,7 +1121,7 @@ mod global {
 
     #[tokio::test]
     async fn redeems_own_tickets() {
-        use aruna_operations::auth::bearer_token::token_grant;
+        use aruna_operations::auth::error::token_grant;
         let node = node_state().await;
         distribute(&node.state, node.group_id, BUCKET).await;
         let id = stored(&node).await;

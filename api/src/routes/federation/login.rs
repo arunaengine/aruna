@@ -346,9 +346,8 @@ mod tests {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
-    use aruna_operations::auth::bearer_token::{
-        ArunaBearerError, ArunaValidationState, validate_bearer_claims,
-    };
+    use aruna_operations::auth::bearer_token::{ArunaValidationState, validate_bearer_claims};
+    use aruna_operations::auth::error::ArunaBearerError;
     use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use axum::response::IntoResponse;

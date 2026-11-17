@@ -9,9 +9,8 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token,
-};
+use aruna_operations::auth::bearer_token::{ArunaValidationState, decode_bearer_token};
+use aruna_operations::auth::error::ArunaBearerError;
 use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::driver::drive;

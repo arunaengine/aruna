@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::error::ArunaBearerError;
 use aruna_core::UserId;
 use aruna_core::auth::{REVOCATION_GRACE_SECS, bearer_token_hash, valid_token_lifetime};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
@@ -24,12 +24,10 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use lru::LruCache;
-use std::array::TryFromSliceError;
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::warn;
 
@@ -72,36 +70,6 @@ pub trait ArunaValidationState: Sync {
     }
 }
 
-#[derive(Debug, Error)]
-pub enum ArunaBearerError {
-    #[error("Realm is not trusted")]
-    RealmNotTrusted,
-    #[error("Token is revoked")]
-    TokenRevoked,
-    #[error("Invalid issuer key")]
-    InvalidIssuerKey,
-    #[error("Token expired")]
-    Expired,
-    #[error("Token lifetime exceeds the revocable maximum")]
-    LifetimeTooLong,
-    #[error("Revocation state is unavailable")]
-    RevocationUnavailable,
-    #[error("Invalid server token")]
-    InvalidServerToken,
-    #[error(transparent)]
-    AuthContextConversion(#[from] ConversionError),
-    #[error(transparent)]
-    PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
-    #[error(transparent)]
-    FromSliceError(#[from] TryFromSliceError),
-    #[error(transparent)]
-    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
-    #[error(transparent)]
-    JwtError(#[from] jsonwebtoken::errors::Error),
-    #[error(transparent)]
-    Base64Error(#[from] base64::DecodeError),
-}
-
 /// Whether the realm's replicated revocation set denies this token hash. This
 /// is the realm-wide authority; a node-local list is only a fast path. A realm
 /// without a config document denies; a failed read is reported as unavailable.
@@ -134,22 +102,6 @@ pub async fn realm_token_revoked(
             Err(ArunaBearerError::RevocationUnavailable)
         }
     }
-}
-
-/// The non-secret identity of a token the request already validated, for work that runs as its
-/// caller later.
-pub fn token_grant(token: &str) -> Result<TokenGrant, ArunaBearerError> {
-    let claims = insecure_decode::<TokenClaims>(token)?.claims;
-    let issuer =
-        RealmId::from_base64(&claims.iss).map_err(|_| ArunaBearerError::InvalidIssuerKey)?;
-    let via = claims.via.as_deref().map(UserId::from_string).transpose()?;
-    Ok(TokenGrant {
-        token_hash: bearer_token_hash(token),
-        issuer,
-        issued_at_secs: claims.iat,
-        expires_at_secs: claims.exp,
-        via,
-    })
 }
 
 /// Whether a token still authorizes `user_id`, as the request checks did: not expired, not

@@ -18,7 +18,7 @@ use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
 use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::auth::bearer_token::token_grant;
+use aruna_operations::auth::error::token_grant;
 use aruna_operations::blob::permission_paths::{ResolvePathsError, ResolvePathsOperation};
 use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
 use aruna_operations::distribution::ticket::{

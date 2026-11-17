@@ -6,7 +6,7 @@ use std::array::TryFromSliceError;
 
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::metadata::{MetadataValidationViolation, ProfileValidationFinding};
-use aruna_operations::auth::bearer_token::ArunaBearerError;
+use aruna_operations::auth::error::ArunaBearerError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
