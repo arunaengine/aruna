@@ -10,13 +10,14 @@ use aruna_core::audit::{
     AUDIT_KEY_BYTES, AuditPageBatch, AuditPageEntry, AuditPageRequest, AuditPageResponse,
     MAX_AUDIT_PEERS, MAX_AUDIT_RECORDS, validate_page,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::cursor;
 use aruna_core::effects::{AuditPageEffect, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::METADATA_AUDIT_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::EffectOperation;
+use aruna_core::operation::{EffectOperation, Operation};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditRecord;
 use aruna_core::types::{Effects, GroupId, Key, Value};
@@ -25,6 +26,7 @@ use smallvec::smallvec;
 use tokio::sync::Semaphore;
 use ulid::Ulid;
 
+use super::call_results::page_rows;
 use super::protocol::MetadataReadError;
 use crate::driver::{DriverContext, drive_until};
 use aruna_core::placement::selector::select_top_peers;
@@ -71,6 +73,12 @@ pub enum ListAuditError {
     InvalidCursor,
     #[error("audit read failed: {0}")]
     Storage(String),
+}
+
+impl From<IoError> for ListAuditError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -127,14 +135,19 @@ pub(super) fn decode_cursor(
     {
         return Err(ListAuditError::InvalidCursor);
     }
+    if !cursor.key.starts_with(&audit_prefix(group_id, document_id)) {
+        return Err(ListAuditError::InvalidCursor);
+    }
+    Ok(cursor.key)
+}
+
+/// The audit rows of a group, or of one document in it.
+fn audit_prefix(group_id: GroupId, document_id: Option<Ulid>) -> Vec<u8> {
     let mut prefix = group_id.to_bytes().to_vec();
     if let Some(document_id) = document_id {
         prefix.extend_from_slice(&document_id.to_bytes());
     }
-    if !cursor.key.starts_with(&prefix) {
-        return Err(ListAuditError::InvalidCursor);
-    }
-    Ok(cursor.key)
+    prefix
 }
 
 fn audit_iter_effect(
@@ -143,13 +156,9 @@ fn audit_iter_effect(
     start_after: &Option<Vec<u8>>,
     limit: usize,
 ) -> Effect {
-    let mut prefix = group_id.to_bytes().to_vec();
-    if let Some(document_id) = document_id {
-        prefix.extend_from_slice(&document_id.to_bytes());
-    }
     Effect::Storage(StorageEffect::Iter {
         key_space: METADATA_AUDIT_KEYSPACE.to_string(),
-        prefix: Some(prefix.into()),
+        prefix: Some(audit_prefix(group_id, document_id).into()),
         start: start_after.clone().map(|key| IterStart::After(key.into())),
         limit,
         txn_id: None,
@@ -178,9 +187,8 @@ fn parse_audit_page(
     Ok(page)
 }
 
-/// One node's local audit page as a sans-I/O operation: it emits a single
-/// keyspace scan and returns the raw page. The serving node runs it to answer a
-/// peer, and the aggregator reuses the same scan for its own local page.
+/// One node's local audit page as a sans-I/O operation: it reads one page of the audit
+/// keyspace and returns it raw. The serving node runs it to answer a peer.
 #[derive(Debug, PartialEq)]
 pub struct LocalPageOperation {
     realm_id: RealmId,
@@ -188,8 +196,6 @@ pub struct LocalPageOperation {
     document_id: Option<Ulid>,
     start_after: Option<Vec<u8>>,
     limit: usize,
-    done: bool,
-    output: Option<Result<AuditPageResponse, ListAuditError>>,
 }
 
 impl LocalPageOperation {
@@ -207,8 +213,6 @@ impl LocalPageOperation {
             document_id,
             start_after,
             limit,
-            done: false,
-            output: None,
         }
     }
 
@@ -225,57 +229,22 @@ impl LocalPageOperation {
     }
 }
 
-impl EffectOperation for LocalPageOperation {
+impl Operation for LocalPageOperation {
     type Output = AuditPageResponse;
     type Error = ListAuditError;
 
-    fn start(&mut self) -> Effects {
-        smallvec![audit_iter_effect(
-            self.group_id,
-            self.document_id,
-            &self.start_after,
-            self.limit
-        )]
+    fn first(&mut self) -> Result<Next<AuditPageResponse>, ListAuditError> {
+        Ok(Next::Call(IoCall::Page {
+            space: METADATA_AUDIT_KEYSPACE.to_string(),
+            prefix: audit_prefix(self.group_id, self.document_id).into(),
+            after: self.start_after.clone().map(Key::from),
+            limit: self.limit,
+        }))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.done {
-            self.output = Some(Err(ListAuditError::Storage(
-                "audit event after completion".to_string(),
-            )));
-            return smallvec![];
-        }
-        self.output = Some(match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => parse_audit_page(values, next_start_after, &self.request()),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(ListAuditError::Storage(error.to_string()))
-            }
-            other => Err(ListAuditError::Storage(format!(
-                "unexpected audit event {}",
-                other.label()
-            ))),
-        });
-        self.done = true;
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.done
-    }
-
-    fn finalize(self) -> Result<AuditPageResponse, ListAuditError> {
-        self.output.unwrap_or_else(|| {
-            Err(ListAuditError::Storage(
-                "audit page did not complete".to_string(),
-            ))
-        })
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<AuditPageResponse>, ListAuditError> {
+        let (values, next) = page_rows(result)?;
+        Ok(Next::Done(parse_audit_page(values, next, &self.request())?))
     }
 }
 
@@ -645,9 +614,10 @@ mod tests {
     use super::{
         AUDIT_CURSOR_CHARS, AUDIT_DEADLINE_SECS, AUDIT_INBOUND_ADMISSION, AUDIT_INBOUND_LIMIT,
         AUDIT_OUTBOUND_ADMISSION, AUDIT_OUTBOUND_LIMIT, AUDIT_PAGE_LIMIT, AuditPageEntry,
-        AuditPageResponse, Effect, EffectOperation, Event, ListAuditError, ListAuditOperation,
-        ListAuditRequest, LocalPageOperation, MAX_AUDIT_PEERS, NetEffect, NetEvent, StorageEvent,
-        audit_scope, decode_cursor, encode_cursor, select_peers,
+        AuditPageResponse, Effect, EffectOperation, Event, IoCall, IoResult, Key, ListAuditError,
+        ListAuditOperation, ListAuditRequest, LocalPageOperation, MAX_AUDIT_PEERS,
+        METADATA_AUDIT_KEYSPACE, NetEffect, NetEvent, Next, Operation, StorageEvent, audit_scope,
+        decode_cursor, encode_cursor, select_peers,
     };
     use crate::driver::DriverContext;
     use crate::driver::drive_until;
@@ -655,6 +625,7 @@ mod tests {
     use crate::metadata::protocol::MetadataReadError;
     use crate::metadata::repository::{metadata_audit_key, write_audit_effect};
     use aruna_core::UserId;
+    use aruna_core::audit::AUDIT_KEY_BYTES;
     use aruna_core::audit::{AuditPageBatch, AuditPageRequest};
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
@@ -1682,5 +1653,42 @@ mod tests {
         .await
         .unwrap();
         assert!(foreign.records.is_empty());
+    }
+
+    #[test]
+    fn local_page_calls() {
+        let realm_id = RealmId([3u8; 32]);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let document_id = Ulid::from_bytes([5u8; 16]);
+        let after = Some(vec![7u8; AUDIT_KEY_BYTES]);
+        let mut operation =
+            LocalPageOperation::new(realm_id, group_id, Some(document_id), after.clone(), 0);
+        let mut prefix = group_id.to_bytes().to_vec();
+        prefix.extend_from_slice(&document_id.to_bytes());
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page {
+                space: METADATA_AUDIT_KEYSPACE.to_string(),
+                prefix: prefix.into(),
+                after: after.map(Key::from),
+                limit: 1,
+            }))
+        );
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        let Ok(Next::Done(page)) = operation.next(empty) else {
+            panic!("expected the page");
+        };
+        assert!(page.records.is_empty() && page.next_start_after.is_none());
+        let broken = IoResult::Page {
+            rows: vec![(vec![1u8].into(), vec![0xff].into())],
+            next: None,
+        };
+        assert!(matches!(
+            operation.next(broken),
+            Err(ListAuditError::Storage(_))
+        ));
     }
 }
