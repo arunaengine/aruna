@@ -27,7 +27,7 @@ use crate::plugins::broker::local_object;
 use crate::plugins::broker::unmarked;
 use crate::plugins::check::{check_identity, copy_grants};
 use crate::plugins::install::read_config;
-use crate::plugins::outgoing::node_keys;
+use crate::plugins::release::node_keys;
 use crate::plugins::work::{WorkRow, read_work};
 
 use super::transfers::{Download, Upload, download_work, upload_work};

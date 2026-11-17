@@ -25,6 +25,16 @@ use super::rows::write_rows;
 use crate::auth::request_policy::PolicyEvaluator;
 use crate::driver::{DriverContext, drive};
 
+/// The realm keys this node releases group and realm secrets with, if it holds them.
+pub(crate) fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
+    (ctx.metadata_handle.as_ref())
+        .map(|handle| ReleaseKeys {
+            seal: handle.realm_seal_key(),
+            vault: handle.realm_vault_key(),
+        })
+        .unwrap_or_default()
+}
+
 pub(crate) fn delivery_name(delivery: Delivery) -> &'static str {
     match delivery {
         Delivery::Inject => "inject",

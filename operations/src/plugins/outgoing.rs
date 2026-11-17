@@ -3,24 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::injection::{OutgoingRequest, inject_secret};
-use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields, header_name};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::injection::OutgoingRequest;
+use aruna_core::secrets::header_name;
 use aruna_plugins::broker::{ErrorKind, HostError};
 use aruna_plugins::connection::{Method, relative_path};
 use aruna_plugins::manifest::Manifest;
 use serde_json::Value;
-use ulid::Ulid;
 use url::Url;
 
-use super::held::ask_release;
-use super::release::ReleaseKeys;
-use super::unavailable;
 use super::work::RequestContext;
-use crate::driver::DriverContext;
-use aruna_core::plugins::{ReleaseError, ReleaseRequest};
 
 /// Query or header pairs by name and value.
 type Pairs<'a> = &'a [(String, String)];
@@ -81,45 +72,6 @@ pub fn outgoing(
         headers,
     };
     Ok((outgoing, connection.auth.clone()))
-}
-
-/// The realm keys this node releases group and realm secrets with, if it holds them.
-pub(crate) fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
-    (ctx.metadata_handle.as_ref())
-        .map(|handle| ReleaseKeys {
-            seal: handle.realm_seal_key(),
-            vault: handle.realm_vault_key(),
-        })
-        .unwrap_or_default()
-}
-
-/// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
-/// to `outgoing`; answers the exposure the rule allows now and the fields it added.
-pub(crate) async fn release_into(
-    ctx: &DriverContext,
-    (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
-    (install, slot, run_id): (&PluginInstall, &str, Ulid),
-    outgoing: &mut OutgoingRequest,
-) -> Result<(ResponseExposure, SecretFields), HostError> {
-    let request = ReleaseRequest {
-        install_id: install.install_id,
-        slot: slot.to_string(),
-        delivery: Delivery::Inject,
-        target: Some((outgoing.method.clone(), outgoing.url.to_string())),
-        held: None,
-        run_id: Some(run_id),
-    };
-    let released = ask_release(ctx, config, (local, keys), request).await;
-    let mut released = released.map_err(|error| match error {
-        ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
-        ReleaseError::Unavailable(why) => unavailable(why),
-    })?;
-    let bytes = released.fields.take();
-    let bytes = bytes.ok_or_else(|| unavailable("the release answered no value"))?;
-    let fields = SecretFields::decode(&bytes).map_err(|error| unavailable(error.to_string()))?;
-    let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
-    injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
-    Ok((released.exposure, fields))
 }
 
 fn method_named(name: &str) -> Option<Method> {

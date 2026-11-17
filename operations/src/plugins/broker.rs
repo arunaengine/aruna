@@ -48,9 +48,10 @@ use super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row, wri
 use super::jobs::{cancel_job, job_outputs, job_row, job_status};
 use super::marks::{MARKED, is_marked};
 use super::outbound::{Answer, Egress, Outbound, SendError};
-use super::outgoing::{node_keys, outgoing, request_context};
+use super::outgoing::{outgoing, request_context};
 use super::rate::take_call;
 use super::release::ReleaseKeys;
+use super::release::node_keys;
 use super::rows::{delete_rows, write_rows};
 use super::state::{PutError, check_key, put_state, read_state, remove_state};
 use super::submit::{

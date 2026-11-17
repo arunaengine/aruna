@@ -7,13 +7,16 @@ use std::collections::BTreeMap;
 
 use aruna_core::NodeId;
 use aruna_core::compute::SecretBytes;
-use aruna_core::plugin_installs::BoundScope;
-use aruna_core::secrets::SecretFields;
+use aruna_core::injection::{OutgoingRequest, inject_secret};
+use aruna_core::plugin_installs::{BoundScope, PluginInstall};
+use aruna_core::secrets::{Delivery, ResponseExposure, SecretFields};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_plugins::broker::{ErrorKind, HostError};
 use ulid::Ulid;
 
 use super::artifacts::managers;
 use super::release::{ReleaseKeys, release};
+use super::unavailable;
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::is_management;
 use aruna_core::plugins::{ReleaseError, ReleaseRequest, Released};
@@ -81,6 +84,35 @@ pub(crate) async fn ask_release(
         }
     }
     Err(last)
+}
+
+/// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
+/// to `outgoing`; answers the exposure the rule allows now and the fields it added.
+pub(crate) async fn release_into(
+    ctx: &DriverContext,
+    (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
+    (install, slot, run_id): (&PluginInstall, &str, Ulid),
+    outgoing: &mut OutgoingRequest,
+) -> Result<(ResponseExposure, SecretFields), HostError> {
+    let request = ReleaseRequest {
+        install_id: install.install_id,
+        slot: slot.to_string(),
+        delivery: Delivery::Inject,
+        target: Some((outgoing.method.clone(), outgoing.url.to_string())),
+        held: None,
+        run_id: Some(run_id),
+    };
+    let released = ask_release(ctx, config, (local, keys), request).await;
+    let mut released = released.map_err(|error| match error {
+        ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
+        ReleaseError::Unavailable(why) => unavailable(why),
+    })?;
+    let bytes = released.fields.take();
+    let bytes = bytes.ok_or_else(|| unavailable("the release answered no value"))?;
+    let fields = SecretFields::decode(&bytes).map_err(|error| unavailable(error.to_string()))?;
+    let injected = inject_secret(&released.kind, &released.settings, &fields, outgoing);
+    injected.map_err(|error| HostError::new(ErrorKind::Denied, error.to_string()))?;
+    Ok((released.exposure, fields))
 }
 
 #[cfg(test)]
