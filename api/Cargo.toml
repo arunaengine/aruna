@@ -16,11 +16,7 @@ autotests = false
 zeroize = { workspace = true }
 # Aruna modules
 aruna-core = { workspace = true }
-aruna-blob = { workspace = true }
-aruna-compute = { workspace = true, default-features = false }
 aruna-operations = { workspace = true }
-aruna-plugins = { workspace = true }
-aruna-tasks = { workspace = true }
 
 # General
 ahash = { workspace = true }
@@ -82,6 +78,9 @@ hyper-util = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
+aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+aruna-tasks = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 aruna-net = { workspace = true }
 tracing-subscriber = { workspace = true }

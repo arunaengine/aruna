@@ -70,7 +70,8 @@ use crate::s3::util::{
     parse_completed_part, parse_copy_source, parse_part_number, parse_source_range,
     parse_version_id, reject_sse, sse_header, stored_encrypted, validate_object_key,
 };
-use aruna_compute::session::TouchedObject;
+use aruna_core::compute::session::{SessionRequest, TouchedObject};
+use aruna_operations::jobs::session::SessionOperation;
 use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
@@ -231,23 +232,18 @@ impl ArunaS3Service {
 
     /// Attributes one authorized request made with a session's own credential
     /// to its job. Every other credential is ignored.
-    fn record_touch(&self, access_key: &str, bucket: &str, key: &str, operation: &str) {
+    async fn record_touch(&self, access_key: &str, bucket: &str, key: &str, operation: &str) {
         let Some(job_id) = credential_job_id(access_key) else {
             return;
         };
-        let Some(session) = self
-            .state
-            .compute_handle
-            .as_ref()
-            .and_then(|registry| registry.sessions().get(&job_id.to_string()))
-        else {
-            return;
-        };
-        session.record_touched(TouchedObject {
+        let touched = TouchedObject {
             bucket: bucket.to_string(),
             key: key.to_string(),
             operation: operation.to_string(),
-        });
+        };
+        let request = SessionRequest::RecordTouched(touched);
+        // Without a live session there is nothing to attribute the request to.
+        let _ = drive(SessionOperation::new(job_id.to_string(), request), &self.state).await;
     }
 }
 
@@ -1165,7 +1161,8 @@ impl S3 for ArunaS3Service {
             &replication_bucket,
             &replication_key,
             "write",
-        );
+        )
+        .await;
 
         self.put_object_response(
             &checksum_request,
@@ -2170,7 +2167,8 @@ impl S3 for ArunaS3Service {
             &response_bucket,
             &response_key,
             "read",
-        );
+        )
+        .await;
 
         let version_id = result.version_id;
         let resolved_range = result.resolved_range.clone();
