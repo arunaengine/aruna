@@ -53,6 +53,8 @@ pub enum Event {
     Search(),
     Stream(),
     Group(GroupEvent),
+    /// Answers `Effect::Delay` once its time passed.
+    Delayed,
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -941,6 +943,7 @@ impl Event {
                     Closed
                 }
             ),
+            Event::Delayed => "Event::Delayed",
             Event::Search() => "Event::Search",
             Event::Stream() => "Event::Stream",
         }

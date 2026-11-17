@@ -135,6 +135,10 @@ pub(crate) async fn dispatch_effect_until(
             );
             Event::Stream()
         }
+        Effect::Delay(after) => {
+            tokio::time::sleep(after).await;
+            Event::Delayed
+        }
         // The effect loop runs groups itself; a group never reaches a single dispatch.
         Effect::Group(group) => {
             warn!(depth, "Effect group reached a single dispatch");
@@ -174,5 +178,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Search() => "search",
         Effect::Stream() => "stream",
         Effect::Group(_) => "group",
+        Effect::Delay(_) => "delay",
     }
 }

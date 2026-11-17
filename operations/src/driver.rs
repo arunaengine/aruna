@@ -3208,4 +3208,53 @@ mod test {
         assert!(reconcile_free(&context));
     }
 
+    /// Asks the runner to wake it after `after` and completes on the wake.
+    #[derive(Debug, PartialEq)]
+    struct Sleeper {
+        after: Duration,
+        woke: bool,
+    }
+
+    impl Operation for Sleeper {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Delay(self.after)]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.woke = matches!(event, Event::Delayed);
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.woke
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            if self.woke { Ok(()) } else { Err(()) }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delay_wakes_operation() {
+        let context = bare_context();
+        let after = Duration::from_secs(30);
+        let started = Instant::now();
+        let sleeper = Sleeper { after, woke: false };
+        assert_eq!(drive(sleeper, &context).await, Ok(()));
+        assert_eq!(started.elapsed(), after);
+
+        // A run deadline before the wake cuts the delay off like any other effect.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(10);
+        let sleeper = Sleeper { after, woke: false };
+        assert_eq!(drive_until(sleeper, &context, deadline).await, Err(()));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
 }

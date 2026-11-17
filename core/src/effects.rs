@@ -54,6 +54,9 @@ pub enum Effect {
     Stream(),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
+    /// Wakes the operation with `Event::Delayed` after this long on the runner's clock; never
+    /// persisted. A run deadline that passes first cuts it off like any other effect.
+    Delay(Duration),
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
