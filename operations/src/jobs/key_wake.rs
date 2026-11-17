@@ -598,7 +598,10 @@ mod tests {
 
     #[tokio::test]
     async fn lock_after_precheck() {
+        use crate::jobs::lifecycle::stage::stage_error;
         use crate::jobs::store::read_key_waits;
+        use crate::replication::bao_read::BaoReadError;
+        use crate::replication::protocol::BaoReadRefusal;
         use aruna_core::structs::execution::job::JobError;
 
         // The input copy is not converted yet; the locked bucket key still parks the job.
@@ -641,8 +644,12 @@ mod tests {
         // Any other preparation failure stays with the caller.
         let other = JobError::retryable("input read failed: offline");
         assert!(!park_on_lock(&context, &claimed, token, node, &other).await);
+        // Text that only looks like a lock never decides the parking.
+        let text = JobError::retryable(format!("{LOCKED_INPUT}: bucket is locked"));
+        assert!(!park_on_lock(&context, &claimed, token, node, &text).await);
         // The precheck passed, then the key locked before the input was admitted.
-        let locked = JobError::retryable(format!("{LOCKED_INPUT}: bucket is locked"));
+        let refusal = BaoReadRefusal::BucketLocked(Ulid::from_bytes([8; 16]));
+        let locked = stage_error("sealed", "in", Some(BaoReadError::Refused(refusal)));
         assert!(park_on_lock(&context, &claimed, token, node, &locked).await);
 
         let parked = read_job_record(storage, job_id, None)
