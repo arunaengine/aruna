@@ -490,3 +490,289 @@ impl Operation for ResetUpload {
         TransactionMode::Write
     }
 }
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::structs::storage::multipart::BackendUpload;
+
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    fn input() -> AbortUploadInput {
+        AbortUploadInput {
+            bucket: "bucket".to_string(),
+            key: "object".to_string(),
+            upload_id: Ulid::from_bytes([1u8; 16]),
+            now_ms: 1_000,
+        }
+    }
+
+    fn record() -> MultipartUpload {
+        let input = input();
+        MultipartUpload {
+            upload_id: input.upload_id,
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            bucket: input.bucket,
+            key: input.key,
+            group_id: Ulid::from_bytes([2u8; 16]),
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Aborting,
+            checksum_hint: None,
+            metadata: HashMap::new(),
+            placement_policies: Vec::new(),
+            subject_generation: 0,
+            completing_since_ms: None,
+            backend_upload: None,
+            encryption: None,
+        }
+    }
+
+    /// An abort whose mark transaction answers with `marked`.
+    fn marked(
+        marked: Result<MultipartUpload, AbortUploadError>,
+    ) -> (AbortUploadOperation, Turn<()>) {
+        let mut operation = AbortUploadOperation::new(input());
+        operation.first().unwrap();
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(marked)));
+        (operation, turn)
+    }
+
+    fn part() -> MultipartPart {
+        MultipartPart {
+            part_number: 1,
+            location: part_location(),
+            created_at: SystemTime::UNIX_EPOCH,
+            backend_etag: None,
+            piece: None,
+        }
+    }
+
+    #[test]
+    fn resume_spares_completion() {
+        let mut record = record();
+        record.status = MultipartUploadStatus::Completing;
+        record.completing_since_ms = Some(input().now_ms);
+        let operation = AbortUploadOperation::new(input()).resuming_abort();
+        let mut mark = MarkAborting {
+            input: input(),
+            check: operation.check(),
+            record: None,
+        };
+        mark.first().unwrap();
+
+        let read = IoResult::Values(vec![Some(record.to_bytes().unwrap().into())]);
+        let turn = mark.next(read);
+
+        assert_eq!(turn.err(), Some(AbortUploadError::CompletionInProgress));
+    }
+
+    #[test]
+    fn aborts_provider_first() {
+        // The provider parts go before any record, and a failed provider abort reopens the upload.
+        for (answer, aborted) in [
+            (BlobEvent::UploadAborted, true),
+            (
+                BlobEvent::Error(BlobError::DeleteError("unreachable".to_string())),
+                false,
+            ),
+        ] {
+            let mut record = record();
+            record.backend_upload = Some(BackendUpload {
+                location: part_location(),
+                upload_id: "provider".to_string(),
+                record_id: Ulid::from_bytes([9u8; 16]),
+            });
+            let (mut operation, turn) = marked(Ok(record));
+            let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+                panic!("expected the provider abort")
+            };
+            assert!(matches!(
+                *effect,
+                Effect::Blob(BlobEffect::AbortUpload { .. })
+            ));
+
+            let turn = operation.next(IoResult::Event(Box::new(Event::Blob(answer))));
+            match aborted {
+                true => assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. })))),
+                false => {
+                    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+                    assert_eq!(operation.state, AbortUploadState::ResetUpload);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_mark_resets() {
+        let failed = Err(AbortUploadError::StorageError(StorageError::CommitFailed));
+        let (mut operation, turn) = marked(failed);
+
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.state, AbortUploadState::ResetUpload);
+        assert_eq!(
+            operation.cleanup.take_error(),
+            Some(AbortUploadError::StorageError(StorageError::CommitFailed))
+        );
+    }
+
+    #[test]
+    fn conflict_mark_aborts() {
+        let conflict = AbortUploadError::StorageError(StorageError::TransactionConflict);
+        let (_, turn) = marked(Err(conflict));
+
+        assert_eq!(
+            turn.err(),
+            Some(AbortUploadError::StorageError(
+                StorageError::TransactionConflict
+            ))
+        );
+    }
+
+    #[test]
+    fn committed_mark_continues() {
+        let (operation, turn) = marked(Ok(record()));
+
+        assert!(matches!(
+            turn,
+            Ok(Next::Call(IoCall::Page { space, .. })) if space == UPLOAD_PART_KEYSPACE
+        ));
+        assert_eq!(operation.state, AbortUploadState::ReadUploadParts);
+    }
+
+    #[test]
+    fn deleted_frees_parts() {
+        // The part blobs go only after the delete transaction committed.
+        let (mut operation, _) = marked(Ok(record()));
+        let rows = vec![(Vec::new().into(), part().to_bytes().unwrap().into())];
+        let turn = operation.next(IoResult::Page { rows, next: None });
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(
+            Ok::<(), AbortUploadError>(()),
+        )));
+
+        let Ok(Next::Then { calls, .. }) = turn else {
+            panic!("expected the blob deletes")
+        };
+        let location = part_location();
+        let delete = IoCall::from(Effect::Blob(BlobEffect::Delete { location }));
+        assert_eq!(calls, [delete]);
+    }
+
+    #[test]
+    fn queues_cleanup_commit() {
+        let location = part_location();
+        let mut delete = DeleteRecords::new(input(), vec![part()]);
+        delete.step = DeleteStep::DeleteRecords;
+
+        let deleted = StorageEvent::BatchDeleteResult {
+            entries: Vec::new(),
+        };
+        let turn = delete.next(IoResult::Event(Box::new(Event::Storage(deleted))));
+
+        let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+            panic!("expected cleanup records")
+        };
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].0, BLOB_CLEANUP_KEYSPACE);
+        assert_eq!(
+            BlobCleanupWork::from_bytes(writes[0].2.as_ref()).unwrap(),
+            BlobCleanupWork::DeleteBlob { location }
+        );
+        assert!(matches!(delete.next(IoResult::Done), Ok(Next::Done(()))));
+    }
+
+    #[test]
+    fn counts_found_record() {
+        // Only a delete that still finds the record in its transaction counts the upload closed.
+        for found in [true, false] {
+            let mut delete = DeleteRecords::new(input(), Vec::new());
+            let turn = delete.first();
+            assert!(matches!(
+                turn,
+                Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == UPLOAD_KEYSPACE
+            ));
+            let value = found.then(|| vec![1u8].into());
+            let mut turn = delete.next(IoResult::Values(vec![value]));
+            if found {
+                assert!(matches!(
+                    &turn,
+                    Ok(Next::Call(IoCall::Read(reads))) if reads[0].0 == S3_BUCKET_KEYSPACE
+                ));
+                turn = delete.next(IoResult::Values(vec![None]));
+                let Ok(Next::Call(IoCall::AddUsage { buckets, .. })) = &turn else {
+                    panic!("expected the upload count, got {turn:?}")
+                };
+                let uploads: Vec<_> = buckets
+                    .iter()
+                    .map(|(_, delta)| delta.open_uploads)
+                    .collect();
+                assert_eq!(uploads, [-1]);
+                turn = delete.next(IoResult::Done);
+            }
+            let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+                panic!("expected the record delete")
+            };
+            assert!(matches!(
+                *effect,
+                Effect::Storage(StorageEffect::BatchDelete { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn delete_batches_records() {
+        // The abort removes every part row, the upload record and its pending envelope in one
+        // batch inside the delete transaction.
+        let mut delete = DeleteRecords::new(input(), vec![part()]);
+
+        let turn = delete.delete_records();
+
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("expected upload records delete")
+        };
+        let Effect::Storage(StorageEffect::BatchDelete { deletes, txn_id }) = *effect else {
+            panic!("expected upload records delete")
+        };
+        assert_eq!(txn_id, None);
+        assert_eq!(deletes.len(), 3);
+        let upload_key = input().upload_key();
+        for keyspace in [UPLOAD_KEYSPACE, aruna_core::keyspaces::ABE_PENDING_KEYSPACE] {
+            assert!(deletes.iter().any(|(key_space, key)| {
+                key_space == keyspace && key.as_ref() == upload_key.as_slice()
+            }));
+        }
+        let part_key = MultipartPartKey::new(input().upload_id, 1)
+            .to_bytes()
+            .unwrap();
+        assert!(deletes.iter().any(|(key_space, key)| {
+            key_space == UPLOAD_PART_KEYSPACE && key.as_ref() == part_key.as_slice()
+        }));
+    }
+
+    fn part_location() -> BackendLocation {
+        BackendLocation {
+            backend: BackendRef::node_default(),
+            storage_class: None,
+            root: "root".to_string(),
+            storage_bucket: "parts".to_string(),
+            backend_path: "upload/part".to_string(),
+            ulid: Ulid::from_bytes([4u8; 16]),
+            format: StoredFormat::default(),
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 4,
+            hashes: HashMap::new(),
+        }
+    }
+}
