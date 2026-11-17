@@ -17,7 +17,7 @@ use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::interest::refresh_target_interest;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::replication::bootstrap::wake_bootstrap;
+use crate::replication::catch_up::wake_bootstrap;
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_outbox_effect,
 };

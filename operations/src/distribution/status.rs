@@ -27,7 +27,7 @@ use crate::distribution::index_feed::{IndexProgress, range_progress};
 use crate::driver::{DriverContext, drive};
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
-use crate::replication::bootstrap::read_cursor;
+use crate::replication::catch_up::read_cursor;
 use crate::replication::members::{CopyLag, CopyLagOperation};
 
 #[derive(Debug, Error, PartialEq)]

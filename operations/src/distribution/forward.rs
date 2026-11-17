@@ -33,7 +33,7 @@ use crate::forward::transport::reject;
 use crate::metadata::device_pull::{authorize_peer, authorize_pull};
 use crate::metadata::protocol::{AuthToken, MetadataTransportMessage};
 use crate::placement::process_placements::load_realm_config;
-use crate::replication::bootstrap::wake_bootstrap;
+use crate::replication::catch_up::wake_bootstrap;
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use crate::s3::bucket::dataset::{DescriptionError, dataset_description};
 use crate::s3::bucket::delete::DeleteBucketOperation;

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use ulid::Ulid;
 
-use super::bootstrap::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
+use super::catch_up::{BOOTSTRAP_POLL, bootstrap_waiting, process_bootstrap};
 use super::members::{BoundRecordOperation, member_publication};
 use super::obligations::{live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
