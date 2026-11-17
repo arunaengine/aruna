@@ -106,6 +106,16 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
                 net_handle.retract_local_interest(watch_id);
             }
         }
+        NetEffect::ReplaceInterest(table) => {
+            if let Some(net_handle) = net_handle {
+                net_handle.replace_watch_interest(*table);
+            }
+        }
+        NetEffect::UpdateRealmInterest { realm_id, nodes } => {
+            if let Some(net_handle) = net_handle {
+                net_handle.update_realm_interest(realm_id, nodes);
+            }
+        }
         other => return Err(other),
     }
     Ok(Event::Net(NetEvent::Recorded))

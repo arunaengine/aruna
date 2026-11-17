@@ -511,7 +511,7 @@ pub enum NetEvent {
     InboxWoken,
     Heartbeat(crate::heartbeat::HeartbeatEvent),
     MetadataAnswer(Box<MetadataAnswer>),
-    /// The local net state took a suppression, an interest registration or a retraction.
+    /// The local net state took a watch metric or a watch interest change.
     Recorded,
 }
 

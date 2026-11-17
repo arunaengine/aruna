@@ -257,7 +257,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         | NetEffect::Heartbeat(_)
         | NetEffect::RecordSuppression(_)
         | NetEffect::RegisterInterest { .. }
-        | NetEffect::RetractInterest(_) => {
+        | NetEffect::RetractInterest(_)
+        | NetEffect::ReplaceInterest(_)
+        | NetEffect::UpdateRealmInterest { .. } => {
             NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
         }
     }
@@ -575,6 +577,8 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::RecordSuppression(_) => "record_suppression",
         NetEffect::RegisterInterest { .. } => "register_interest",
         NetEffect::RetractInterest(_) => "retract_interest",
+        NetEffect::ReplaceInterest(_) => "replace_interest",
+        NetEffect::UpdateRealmInterest { .. } => "update_realm_interest",
     }
 }
 
