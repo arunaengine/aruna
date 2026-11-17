@@ -43,7 +43,7 @@ use crate::driver::{
     quota_marked_routing, routing_snapshot,
 };
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::jobs::source_read::{READ_OPERATION, SourceReadError, authorize_read};
+use crate::jobs::source_read::{SourceReadError, authorize_read};
 use crate::jobs::store::reserve_output_commits;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
@@ -71,6 +71,7 @@ use crate::staging::native_source::{body_stream, granted_read};
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::origin::SourcePin;
+use aruna_core::structs::storage::read_grant::READ_OPERATION;
 use tracing::warn;
 
 /// Credential lifetime past the walltime so a slow finalize still authorizes.

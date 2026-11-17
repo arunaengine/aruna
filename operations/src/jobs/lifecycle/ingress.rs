@@ -48,9 +48,7 @@ use crate::jobs::records::rows::ProjectionCache;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::jobs::service::{mint_local_job, validate_execution};
-use crate::jobs::source_read::{
-    HEAD_OPERATION, READ_OPERATION, SourceReadError, authorize_read, issue_grant, public_read,
-};
+use crate::jobs::source_read::{SourceReadError, authorize_read, issue_grant, public_read};
 use crate::jobs::submit::SubmitJobError;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::MetadataTransportMessage;
@@ -59,6 +57,7 @@ use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::metadata::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery, release_members};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
