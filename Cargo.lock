@@ -757,7 +757,6 @@ dependencies = [
  "iroh",
  "irokle",
  "jsonwebtoken",
- "lettre",
  "lru",
  "md5",
  "opentelemetry",

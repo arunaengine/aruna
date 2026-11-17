@@ -11,7 +11,7 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::outbound::{HttpPost, MailRequest, OutboundEffect, OutboundError, OutboundEvent};
 
 pub use backoff::Backoffs;
-pub use mail::{MailBuilder, MailSender, SmtpMailer};
+pub use mail::{MailBuilder, MailSender, SmtpMailer, valid_address};
 use mail::{MailProfiles, smtp_builder};
 
 /// The outbound backend: one screened HTTP client, the mail sender of the current realm email

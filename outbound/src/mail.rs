@@ -88,6 +88,11 @@ fn status(error: &lettre::transport::smtp::Error) -> String {
     }
 }
 
+/// Whether `address` is one mail address a sender can send to.
+pub fn valid_address(address: &str) -> bool {
+    address.parse::<lettre::Address>().is_ok()
+}
+
 /// Builds the sender of one profile; tests swap in a fake one.
 pub type MailBuilder =
     Arc<dyn Fn(&SmtpSettings) -> Result<Arc<dyn MailSender>, String> + Send + Sync>;

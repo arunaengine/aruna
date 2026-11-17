@@ -25,7 +25,6 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_outbound::Backoffs;
-use lettre::Address;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -125,7 +124,7 @@ pub async fn set_email(
         return Err(EmailError::InvalidCategories);
     }
     let address = address.trim().to_string();
-    if !verified(ctx, owner, &address).await? || address.parse::<Address>().is_err() {
+    if !verified(ctx, owner, &address).await? || !aruna_outbound::valid_address(&address) {
         return Err(EmailError::NotVerified);
     }
     let address = Some(SecretBytes::new(address.into_bytes()));

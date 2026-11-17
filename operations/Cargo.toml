@@ -46,7 +46,6 @@ http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
-lettre = { workspace = true }
 lru = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }
