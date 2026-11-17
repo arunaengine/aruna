@@ -26,6 +26,7 @@ use aruna_operations::auth::bearer_token::{
     realm_token_revoked, realm_user_cutoff,
 };
 use aruna_operations::device::wipe::DeviceWipe;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::jobs::runtime::JobsRuntime;
 use aruna_operations::onboarding::issue_ticket::{
@@ -34,7 +35,6 @@ use aruna_operations::onboarding::issue_ticket::{
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::document_repository::GetConfigOperation;
 use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;

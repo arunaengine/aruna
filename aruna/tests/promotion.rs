@@ -10,8 +10,8 @@ use aruna::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_operations::driver::drive;
 use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::driver::drive;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{

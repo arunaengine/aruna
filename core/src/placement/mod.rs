@@ -1085,12 +1085,12 @@ mod pure_tests {
                 created_at_ms: 1,
             },
         );
-        transition.completed.push(
-            crate::structs::placement::transition::BucketCompletion {
+        transition
+            .completed
+            .push(crate::structs::placement::transition::BucketCompletion {
                 bucket: 7,
                 completed_at_ms: 100,
-            },
-        );
+            });
         transition
             .drained
             .push(crate::structs::placement::transition::BucketDrain {

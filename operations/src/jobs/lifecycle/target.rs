@@ -44,8 +44,6 @@ use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
 use crate::auth::request_authorization::authorize;
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::driver::{DriverContext, drive};
-use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::records::pages::{planned_inputs, with_inputs};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
@@ -56,8 +54,10 @@ use crate::jobs::records::{
 use crate::jobs::service::mint_local_job;
 use crate::metadata::api::load_realm_config;
 use crate::node::node_info::{read_info_document, read_operator_drain};
+use crate::placement::policy::GateOperation;
 use crate::placement::policy::{ResolvePolicyConfig, ResolvePolicyOperation};
 use aruna_core::placement::resolve_shard_holders;
+use aruna_core::time::unix_timestamp_millis;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -130,7 +130,12 @@ pub async fn admit_launch(
     };
     // A node that stopped admitting governed data declines every new execution
     // target categorically, whatever the offered work references.
-    match drive(GateOperation::new(realm_id, unix_timestamp_millis()), context.as_ref()).await {
+    match drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        context.as_ref(),
+    )
+    .await
+    {
         Ok(Some(gate)) if !gate.admitting => return Some(Err(LaunchDecline::Draining)),
         Err(_) => return None,
         Ok(_) => {}

@@ -26,10 +26,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetGroupConfig {
@@ -296,7 +296,10 @@ impl SetGroupOperation {
             return self.fail(SetGroupError::MissingTransaction);
         };
         self.state = SetGroupState::CommitTransaction { document };
-        smallvec![crate::auth::epoch_due::mark_due(Some(self.config.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(
+            Some(self.config.group_id),
+            txn_id
+        )]
     }
 
     fn fail(&mut self, error: SetGroupError) -> Effects {
@@ -404,67 +407,75 @@ impl Operation for SetGroupOperation {
                 let document = document.clone();
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetGroupError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetGroupState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(SetGroupError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = SetGroupState::DeleteAdminConflicts { document };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(document)
                     }
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("storage batch write result", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             }
-            },
             SetGroupState::DeleteAdminConflicts { document } => {
                 let document = document.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(document)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             }
-            },
             SetGroupState::ReadBucketFence { document } => {
                 let document = document.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if self.fence.admits(&values) {
-                        self.emit_commit(document)
-                    } else {
-                        self.fail(SetGroupError::PlacementFenced)
+                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                        if self.fence.admits(&values) {
+                            self.emit_commit(document)
+                        } else {
+                            self.fail(SetGroupError::PlacementFenced)
+                        }
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("bucket fence read result", format!("{other:?}"))
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
             }
-            },
             SetGroupState::CommitTransaction { document } => {
                 let document = document.clone();
                 match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetGroupState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    if error == StorageError::TransactionConflict
-                        && self.conflicts < super::CONFLICT_RETRIES
-                    {
-                        return self.restart_after_conflict();
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.state = SetGroupState::ScheduleSyncDrain { document };
+                        smallvec![schedule_drain_effect()]
                     }
-                    self.fail(error.into())
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        if error == StorageError::TransactionConflict
+                            && self.conflicts < super::CONFLICT_RETRIES
+                        {
+                            return self.restart_after_conflict();
+                        }
+                        self.fail(error.into())
+                    }
+                    other => {
+                        self.unexpected_event("transaction commit result", format!("{other:?}"))
+                    }
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             }
-            },
             SetGroupState::ScheduleSyncDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = SetGroupState::Finish;
@@ -518,9 +529,9 @@ fn apply_reducer_policies(
 #[cfg(test)]
 mod tests {
     use super::{SetGroupConfig, SetGroupError, SetGroupOperation, SetGroupState};
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::errors::{AuthorizationError, StorageError};

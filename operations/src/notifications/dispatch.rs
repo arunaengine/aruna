@@ -16,6 +16,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 use ulid::Ulid;
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
     create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
@@ -35,7 +36,6 @@ use crate::notifications::watch::subscriptions::{
     WATCH_CAP_REACHED, WATCH_SUBSCRIPTION_UNAUTHORIZED, WATCH_SUBSCRIPTION_UNAVAILABLE,
     WatchSubscriptionError, create_holder_watch, delete_holder_watch,
 };
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Outcome of serving a user's inbox read op through the resolved holder.
 /// Keeps holder resolution and net orchestration out of the REST layer so the

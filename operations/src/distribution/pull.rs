@@ -46,13 +46,13 @@ use super::keep::{
 };
 use crate::connectors::resolver::NATIVE_SET_ID;
 use crate::driver::{DriverContext, drive};
-use aruna_core::time::unix_timestamp_millis;
 use crate::node::holder_choice::{avoid_holder, candidates, choose_holder};
 use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
 use crate::s3::object::get::{
     GetObjectError, GetObjectResult, HolderFailures, ObjectInfo, ObjectRangeRequest,
 };
+use aruna_core::time::unix_timestamp_millis;
 
 type Blob = BackendStream<Result<Bytes, StreamError>>;
 
@@ -380,9 +380,11 @@ async fn member_of(
         }
     }
     // Holders that failed lately or have no fresh heartbeat are asked only when no other is.
-    let fresh: Vec<NodeId> = (candidates(context, &holders, unix_timestamp_millis()).await.into_iter())
-        .map(|candidate| candidate.node_id)
-        .collect();
+    let fresh: Vec<NodeId> = (candidates(context, &holders, unix_timestamp_millis())
+        .await
+        .into_iter())
+    .map(|candidate| candidate.node_id)
+    .collect();
     if !fresh.is_empty() {
         holders.retain(|holder| fresh.contains(holder));
     }

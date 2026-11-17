@@ -129,11 +129,25 @@ pub async fn download_work(
         Arc::new(AtomicBool::new(false)),
     );
     let counted = counted(response, download.max_bytes, &pulled, (&over, &broken));
-    let routing = match drive(SnapshotOperation::new(&node_routing(&ctx.driver), install.group_id, BucketRules::Named(&bucket.to_string())), &ctx.driver).await {
+    let routing = match drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            install.group_id,
+            BucketRules::Named(&bucket.to_string()),
+        ),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(routing) => routing,
         Err(error) => return retryable(error.to_string()),
     };
-    let gate = match drive(GateOperation::new(spec.realm_id, unix_timestamp_millis()), &ctx.driver).await {
+    let gate = match drive(
+        GateOperation::new(spec.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    {
         Ok(gate) => gate,
         Err(error) => return retryable(error.to_string()),
     };

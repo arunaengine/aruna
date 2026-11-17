@@ -19,8 +19,8 @@ use smallvec::smallvec;
 
 use super::coordinator::{authorize, load_group, request_node, visible};
 use super::resources::EmptyCheck;
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::is_sync_eligible;
 
 #[derive(Debug, PartialEq)]
@@ -187,7 +187,8 @@ pub async fn check_group(
         return Err(GroupDeletionError::Unauthorized);
     }
     let config = drive(GetConfigOperation::new(auth.realm_id), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     let (group, record) = load_group(context, group_id).await?;
     authorize(context, &auth, group_id, record.as_ref(), group.is_some()).await?;

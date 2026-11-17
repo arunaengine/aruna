@@ -83,6 +83,7 @@ use aruna_core::structs::storage::multipart::COMPLETION_DEADLINE_MS;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::check_permissions::{
     CheckPermissionsConfig, CheckPermissionsOperation,
 };
@@ -91,7 +92,6 @@ use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::{DriverContext, drive, drive_until, node_routing};
 use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
 use aruna_operations::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::delete::DeleteBucketOperation;
@@ -1109,14 +1109,37 @@ impl S3 for ArunaS3Service {
         let copied = forward::copy_context(&req.extensions, &req.headers)?;
         let create_only = (req.input.if_none_match.as_ref()).is_some_and(|tag| tag.is_any());
         let routing = match bucket_info.as_ref() {
-            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
-            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&replication_bucket.to_string())), &self.state).await,
+            Some(info) => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        (info).group_id,
+                        BucketRules::of(info),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
+            None => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        group_id,
+                        BucketRules::Named(&replication_bucket.to_string()),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
         }
         .map_err(routing_inputs_error)?;
         let input = convert_input(req.input)?;
-        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
-            .await
-            .map_err(gate_context_error)?;
+        let gate = drive(
+            GateOperation::new(self.realm_id, unix_timestamp_millis()),
+            &self.state,
+        )
+        .await
+        .map_err(gate_context_error)?;
         let mut operation = PutObjectOperation::new(PutObjectConfig {
             user_id: user_access.user_identity,
             group_id,
@@ -1454,13 +1477,36 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let routing = match bucket_info.as_ref() {
-            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
-            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&req.input.bucket.to_string())), &self.state).await,
+            Some(info) => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        (info).group_id,
+                        BucketRules::of(info),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
+            None => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        group_id,
+                        BucketRules::Named(&req.input.bucket.to_string()),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
         }
         .map_err(routing_inputs_error)?;
-        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
-            .await
-            .map_err(gate_context_error)?;
+        let gate = drive(
+            GateOperation::new(self.realm_id, unix_timestamp_millis()),
+            &self.state,
+        )
+        .await
+        .map_err(gate_context_error)?;
         let mut operation = CreateMultipartOperation::new(CMPI {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
@@ -1879,12 +1925,35 @@ impl S3 for ArunaS3Service {
             .unwrap_or_default();
         validate_part_count(&checksum_request, completed_parts.len())?;
 
-        let gate = drive(GateOperation::new(self.realm_id, unix_timestamp_millis()), &self.state)
-            .await
-            .map_err(gate_context_error)?;
+        let gate = drive(
+            GateOperation::new(self.realm_id, unix_timestamp_millis()),
+            &self.state,
+        )
+        .await
+        .map_err(gate_context_error)?;
         let routing = match bucket_info.as_ref() {
-            Some(info) => drive(SnapshotOperation::new(&node_routing(&self.state), (info).group_id, BucketRules::of(info)), &self.state).await,
-            None => drive(SnapshotOperation::new(&node_routing(&self.state), group_id, BucketRules::Named(&req.input.bucket.to_string())), &self.state).await,
+            Some(info) => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        (info).group_id,
+                        BucketRules::of(info),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
+            None => {
+                drive(
+                    SnapshotOperation::new(
+                        &node_routing(&self.state),
+                        group_id,
+                        BucketRules::Named(&req.input.bucket.to_string()),
+                    ),
+                    &self.state,
+                )
+                .await
+            }
         }
         .map_err(routing_inputs_error)?;
         let checksum_type = parse_checksum_type(&checksum_request.checksum_type);

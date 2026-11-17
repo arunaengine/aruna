@@ -54,10 +54,10 @@ use crate::metadata::repository::{
     StorageReadError, create_materialization_entries, create_outbox_entries, parse_lifecycle_read,
     parse_status_read, read_document_registry, read_lifecycle_effect, read_status_effect,
 };
-use aruna_core::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::schedule_drain_effect;
 use crate::sync::shard_placement::sort_node_ids;
 use crate::tasks::task_persistence::persist_task_effect;
+use aruna_core::placement::{registry_placement, resolve_shard_holders};
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
 const PROJECTION_PAGE_SIZE: usize = 256;

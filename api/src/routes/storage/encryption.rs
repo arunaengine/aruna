@@ -23,10 +23,10 @@ use aruna_core::structs::storage::holders::{
 };
 use aruna_core::structs::storage::key_audit::AuditAction;
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionState};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
@@ -929,7 +929,11 @@ pub(crate) async fn change_bucket(
         };
         // The change is committed either way; a failed install only leaves the key locked.
         let node_id = state.get_node_id();
-        let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), unix_timestamp_millis());
+        let install = InstallKeyOperation::new(install).audited(
+            node_id,
+            Some(caller),
+            unix_timestamp_millis(),
+        );
         let origin = (state.get_realm_id(), node_id);
         if let Err(error) =
             install_and_wake(&context, install, origin, state.rocrate_limits()).await
@@ -1007,7 +1011,8 @@ pub(crate) async fn enable_bucket(
         max: enabled.settings.max_unlock_ms.map(Duration::from_millis),
     };
     // The bucket is encrypted either way; a failed install only leaves it locked.
-    let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), unix_timestamp_millis());
+    let install =
+        InstallKeyOperation::new(install).audited(node_id, Some(caller), unix_timestamp_millis());
     if let Err(error) = install_and_wake(context, install, (realm_id, node_id), limits).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }

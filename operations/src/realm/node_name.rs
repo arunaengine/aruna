@@ -29,11 +29,11 @@ use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 /// Whose authority names the node. An owner reaches only its own devices; a
 /// realm admin reaches every realm node.
@@ -396,23 +396,25 @@ impl Operation for NodeNameOperation {
             } => {
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(NodeNameError::MissingTransaction);
-                    };
-                    if stale_conflict_deletes.is_empty() {
-                        return self.emit_commit();
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(NodeNameError::MissingTransaction);
+                        };
+                        if stale_conflict_deletes.is_empty() {
+                            return self.emit_commit();
+                        }
+                        self.state = NodeNameState::DeleteConflicts;
+                        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                            deletes: stale_conflict_deletes,
+                            txn_id: Some(txn_id),
+                        })]
                     }
-                    self.state = NodeNameState::DeleteConflicts;
-                    smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                        deletes: stale_conflict_deletes,
-                        txn_id: Some(txn_id),
-                    })]
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("storage batch write result", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             }
-            },
             NodeNameState::DeleteConflicts => match event {
                 Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),

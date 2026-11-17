@@ -31,11 +31,11 @@ use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::subject_index::rewrite_subjects;
+use aruna_core::placement::target_placement_ref;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolveOidcInput {
     pub actor: Actor,
@@ -520,7 +520,7 @@ impl Operation for ResolveOidcOperation {
             ResolveOidcState::ReadSubjectIndex { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.accept_subject(event, txn_id)
-            },
+            }
             ResolveOidcState::WriteDocumentRevision { txn_id, user } => {
                 let txn_id = txn_id.clone();
                 let user = user.clone();
@@ -534,11 +534,11 @@ impl Operation for ResolveOidcOperation {
             ResolveOidcState::ReadExistingUser { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.accept_existing(event, txn_id)
-            },
+            }
             ResolveOidcState::ScanUsers { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.accept_users(event, txn_id)
-            },
+            }
             ResolveOidcState::ReadBucketFence {
                 txn_id,
                 user,
@@ -548,7 +548,7 @@ impl Operation for ResolveOidcOperation {
                 let user = user.clone();
                 let announce = announce.clone();
                 self.handle_bucket_fence(event, txn_id, user, announce)
-            },
+            }
             ResolveOidcState::CommitTransaction { user, announce } => {
                 let user = user.clone();
                 let announce = announce.clone();

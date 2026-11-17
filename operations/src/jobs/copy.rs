@@ -11,8 +11,8 @@ use aruna_core::structs::execution::job::{CopyJobSpec, JobError, JobResultPayloa
 use aruna_core::structs::storage::blob::BucketInfo;
 
 use super::executor::{JobContext, JobRunOutcome};
-use crate::driver::drive;
 use crate::document_repository::GetConfigOperation;
+use crate::driver::drive;
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions, copy_object_tracked,

@@ -34,11 +34,11 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
+use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::execution::notification::ResourceEvent;
 use aruna_core::structs::identity::auth::Permission;
 
@@ -626,7 +626,10 @@ impl AddRoleOperation {
                 .values()
                 .any(|p| *p == Permission::DENY)
         {
-            return smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(
+                Some(self.input.group_id),
+                txn_id
+            )];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -897,7 +900,7 @@ impl Operation for AddRoleOperation {
             AddRoleState::GetGroup { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_get_group(event, txn_id)
-            },
+            }
             AddRoleState::GetAdminState { txn_id, group } => {
                 let txn_id = txn_id.clone();
                 let group = group.clone();
@@ -917,14 +920,14 @@ impl Operation for AddRoleOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let new_members = new_members.clone();
                 self.handle_conflict_deletes(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            )
-            },
+                    event,
+                    txn_id,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::ReadBucketFence {
                 txn_id,
                 group,
@@ -938,14 +941,14 @@ impl Operation for AddRoleOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let new_members = new_members.clone();
                 self.handle_bucket_fence(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            )
-            },
+                    event,
+                    txn_id,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::CommitTransaction {
                 group,
                 auth_doc,
@@ -958,13 +961,13 @@ impl Operation for AddRoleOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let new_members = new_members.clone();
                 self.handle_commit_transaction(
-                event,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                new_members,
-            )
-            },
+                    event,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    new_members,
+                )
+            }
             AddRoleState::ScheduleDocumentDrain {
                 group,
                 auth_doc,
@@ -974,7 +977,7 @@ impl Operation for AddRoleOperation {
                 let auth_doc = auth_doc.clone();
                 let new_members = new_members.clone();
                 self.handle_drain_schedule(event, group, auth_doc, new_members)
-            },
+            }
             AddRoleState::AnnounceGroupDoc {
                 group,
                 auth_doc,
@@ -984,7 +987,7 @@ impl Operation for AddRoleOperation {
                 let auth_doc = auth_doc.clone();
                 let new_members = new_members.clone();
                 self.handle_group_announce(event, group, auth_doc, new_members)
-            },
+            }
             AddRoleState::AnnounceAuthDoc {
                 group,
                 auth_doc,
@@ -994,7 +997,7 @@ impl Operation for AddRoleOperation {
                 let auth_doc = auth_doc.clone();
                 let new_members = new_members.clone();
                 self.handle_auth_announce(event, group, auth_doc, new_members)
-            },
+            }
             AddRoleState::EmitNotifications { group, auth_doc } => {
                 let group = group.clone();
                 let auth_doc = auth_doc.clone();

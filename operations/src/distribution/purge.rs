@@ -37,12 +37,12 @@ use super::imports::drop_resume;
 use super::inventory::{Walk, route};
 use super::pull::drop_copy;
 use crate::driver::{DriverContext, drive};
-use aruna_core::time::unix_timestamp_millis;
 use crate::node::usage_stats::{dirty_rows, mark_dirty, wake_publish};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+use aruna_core::time::unix_timestamp_millis;
 
 /// Inventory rows one page purges at most.
 const PAGE_ROWS: usize = 64;

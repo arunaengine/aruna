@@ -11,17 +11,17 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::linked_job::{LinkedJob, LinkedState, LinkedTask, RemapPlan};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::bearer_token::token_grant;
 use aruna_operations::auth::request_authorization::BucketAccess;
 use aruna_operations::blob::unify;
 use aruna_operations::driver::drive;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::s3::imports::discovery::bucket_access;
-use aruna_operations::s3::imports::last_run;
 use aruna_operations::s3::bucket::linked::{
     BucketJob, BucketJobOperation, LinkedAction, LinkedError, read_bucket_job, rename_total,
 };
 use aruna_operations::s3::bucket::remap::{self, RemapScope};
+use aruna_operations::s3::imports::discovery::bucket_access;
+use aruna_operations::s3::imports::last_run;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -727,7 +727,12 @@ pub async fn control_job(
         "abort" => LinkedAction::Abort,
         _ => return Err(ServerError::BadRequestMessage("unknown action".to_string())),
     };
-    let operation = BucketJobOperation::new(rule.bucket.clone(), rule.group_id, action, unix_timestamp_millis());
+    let operation = BucketJobOperation::new(
+        rule.bucket.clone(),
+        rule.group_id,
+        action,
+        unix_timestamp_millis(),
+    );
     let context = state.get_ctx();
     let job = drive(operation, &context).await.map_err(job_error)?;
     Ok(Json(shown(&context, &rule.bucket, job).await?))

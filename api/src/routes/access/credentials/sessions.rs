@@ -13,8 +13,8 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_operations::driver::drive;
 use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::driver::drive;
 use aruna_operations::s3::session::{
     CreateS3Config, CreateS3Operation, GetS3Operation, ListSessionsOperation, RefreshS3Config,
     RefreshS3Operation, RevokeS3Config, RevokeS3Operation, S3SessionCredentials, S3SessionError,

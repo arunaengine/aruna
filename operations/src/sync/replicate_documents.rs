@@ -17,12 +17,12 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::document_repository::read_effect;
-use aruna_core::placement::{document_class, plan_target_placement};
 use crate::sync::announce::AnnounceTopicOperation;
 use crate::sync::shard_placement::{
     delete_placement_effect, new_placement, placement_satisfied, schedule_retry_effect,
     write_placement_effect,
 };
+use aruna_core::placement::{document_class, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicateDocumentsConfig {

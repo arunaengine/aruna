@@ -121,18 +121,14 @@ async fn opens_caches_refetches() {
 
     // Other nodes fetch once, then answer from the node vault cache.
     for _ in 0..2 {
-        let read = secret_from(&ctx, &config, reference, fetch)
-            .await
-            .unwrap();
+        let read = secret_from(&ctx, &config, reference, fetch).await.unwrap();
         assert_eq!(read.expose(), SECRET);
     }
     assert_eq!(fetches.load(Ordering::SeqCst), 1);
 
     // A rotation misses the cache and fetches again.
     let (rotated, newer) = realm_config(3);
-    secret_from(&ctx, &rotated, newer, fetch)
-        .await
-        .unwrap();
+    secret_from(&ctx, &rotated, newer, fetch).await.unwrap();
     assert_eq!(fetches.load(Ordering::SeqCst), 2);
 
     // A reference ahead of the replicated config waits for replication.
@@ -145,9 +141,7 @@ async fn prunes_stale_rows() {
     let (_dir, ctx) = context();
     let (config, reference) = realm_config(2);
     let fetch = || async { Ok(SecretBytes::new(SECRET.to_vec())) };
-    secret_from(&ctx, &config, reference, fetch)
-        .await
-        .unwrap();
+    secret_from(&ctx, &config, reference, fetch).await.unwrap();
     assert_eq!(prune_secret_cache(&ctx, &config).await, Ok(0));
 
     let (rotated, _) = realm_config(3);

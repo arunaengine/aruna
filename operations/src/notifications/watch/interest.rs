@@ -29,6 +29,7 @@ use futures_util::TryStreamExt;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::notifications::protocol::{DIRTY_REALM_CAP, INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP};
 use crate::notifications::watch::authorization::filter_authorized_subscriptions;
@@ -36,7 +37,6 @@ use crate::notifications::watch::expand::drain_watch_events;
 use crate::notifications::watch::subscriptions::{
     WatchSubscriptionError, list_realm_subscriptions,
 };
-use crate::document_repository::GetConfigOperation;
 use crate::storage_read::scan_pages;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
 

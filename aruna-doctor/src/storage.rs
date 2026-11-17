@@ -216,8 +216,8 @@ mod tests {
     use aruna_core::structs::storage::format::Compression;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::driver::{DriverContext, drive, node_routing};
-    use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
     use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::s3::access::create::{
@@ -405,9 +405,16 @@ mod tests {
             .unwrap();
 
             let data = b"tiny snapshot object";
-            let routing = drive(SnapshotOperation::new(&node_routing(context.as_ref()), group.0.group_id, BucketRules::Named(&bucket_name.to_string())), context.as_ref())
-                .await
-                .unwrap();
+            let routing = drive(
+                SnapshotOperation::new(
+                    &node_routing(context.as_ref()),
+                    group.0.group_id,
+                    BucketRules::Named(&bucket_name.to_string()),
+                ),
+                context.as_ref(),
+            )
+            .await
+            .unwrap();
             let upload = drive(
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,

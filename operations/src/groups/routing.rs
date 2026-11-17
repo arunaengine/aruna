@@ -107,7 +107,11 @@ impl SnapshotOperation {
             return self.finish(Err(RoutingInputsError::Incomplete));
         };
         let mut inputs = GroupInputsOperation::new(snapshot.group_id);
-        self.snapshot = Some(snapshot.with_bucket_rules(rules).with_compression(compression));
+        self.snapshot = Some(
+            snapshot
+                .with_bucket_rules(rules)
+                .with_compression(compression),
+        );
         let effects = inputs.start();
         self.state = SnapshotState::Group(inputs);
         effects
@@ -152,11 +156,8 @@ impl SnapshotOperation {
 
     fn finish(&mut self, result: Result<(), RoutingInputsError>) -> Effects {
         self.state = SnapshotState::Done;
-        self.output = Some(result.and_then(|()| {
-            self.snapshot
-                .take()
-                .ok_or(RoutingInputsError::Incomplete)
-        }));
+        self.output =
+            Some(result.and_then(|()| self.snapshot.take().ok_or(RoutingInputsError::Incomplete)));
         smallvec![]
     }
 }
@@ -167,13 +168,13 @@ impl Operation for SnapshotOperation {
 
     fn start(&mut self) -> Effects {
         match std::mem::replace(&mut self.state, SnapshotState::Bucket) {
-            SnapshotState::Init(BucketRules::Named(bucket)) => smallvec![Effect::Storage(
-                StorageEffect::Read {
+            SnapshotState::Init(BucketRules::Named(bucket)) => {
+                smallvec![Effect::Storage(StorageEffect::Read {
                     key_space: S3_BUCKET_KEYSPACE.to_string(),
                     key: bucket.into_bytes().into(),
                     txn_id: None,
-                }
-            )],
+                })]
+            }
             SnapshotState::Init(BucketRules::Known { rules, compression }) => {
                 self.rules(rules, compression)
             }
@@ -253,10 +254,12 @@ impl Operation for QuotaOperation {
             self.output = Some(Err(RoutingInputsError::Incomplete));
             return smallvec![];
         };
-        self.output = Some(match full_catalog(routing.catalog.clone(), &self.quotas, event) {
-            Ok(catalog) => Ok(NodeRouting { catalog, ..routing }),
-            Err(error) => Err(RoutingInputsError::BackendUsage(error)),
-        });
+        self.output = Some(
+            match full_catalog(routing.catalog.clone(), &self.quotas, event) {
+                Ok(catalog) => Ok(NodeRouting { catalog, ..routing }),
+                Err(error) => Err(RoutingInputsError::BackendUsage(error)),
+            },
+        );
         smallvec![]
     }
 

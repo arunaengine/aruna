@@ -7,9 +7,9 @@ use crate::topology;
 use std::collections::BTreeMap;
 
 use aruna_core::StructuredId;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_operations::metadata::create_document::mint_local_document;
-use aruna_core::placement::resolve_shard_holders;
 
 use crate::topology::document_present;
 use topology::{TestResult, Topology, wait_until};

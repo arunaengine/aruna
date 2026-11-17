@@ -27,8 +27,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePolicyConfig {
@@ -407,33 +407,33 @@ impl Operation for CreatePolicyOperation {
             CreatePolicyState::ReadFence { pending } => {
                 let pending = pending.clone();
                 match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if !fence::admits(value.as_ref(), pending.generation) {
-                        return self.fail(CreatePolicyError::PlacementFenced);
+                    Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                        if !fence::admits(value.as_ref(), pending.generation) {
+                            return self.fail(CreatePolicyError::PlacementFenced);
+                        }
+                        self.emit_sign(pending)
                     }
-                    self.emit_sign(pending)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => self.unexpected_event("placement fence read", format!("{other:?}")),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("placement fence read", format!("{other:?}")),
             }
-            },
             CreatePolicyState::Sign { pending } => {
                 let pending = pending.clone();
                 match event {
-                Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
-                    match self.bind_publication(*pending, *publication) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
+                    Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
+                        match self.bind_publication(*pending, *publication) {
+                            Ok(effects) => effects,
+                            Err(error) => self.fail(error),
+                        }
+                    }
+                    Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
+                        self.fail(CreatePolicyError::PublicationUnavailable(reason))
+                    }
+                    other => {
+                        self.unexpected_event("policy publication signature", format!("{other:?}"))
                     }
                 }
-                Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
-                    self.fail(CreatePolicyError::PublicationUnavailable(reason))
-                }
-                other => {
-                    self.unexpected_event("policy publication signature", format!("{other:?}"))
-                }
             }
-            },
             CreatePolicyState::Write => match event {
                 Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.emit_commit(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),

@@ -43,15 +43,15 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::managed_copy::{
-    CopyRequest, serve_reads, split_serve_reads, validate_registration,
-};
 use crate::driver::{DriverContext, drive};
 use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
 use crate::placement::policy::{
     GateContext, PolicyGateError, PolicyGateOperation, gate_decision, union_refs, write_gate,
 };
+use aruna_core::managed_copy::{
+    CopyRequest, serve_reads, split_serve_reads, validate_registration,
+};
+use aruna_core::time::unix_timestamp_millis;
 
 use super::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget, VersionReplicationMessage};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -370,7 +370,12 @@ pub async fn managed_read(
     }
     // An admission stop is not decided here: `write_gate` below refuses once
     // the source has taught the refs that make this read a governed one.
-    let destination = match drive(GateOperation::new(request.realm_id, unix_timestamp_millis()), context).await {
+    let destination = match drive(
+        GateOperation::new(request.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    {
         Ok(destination) => destination,
         Err(_) => return Err(BaoReadError::NoDestination),
     };

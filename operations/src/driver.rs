@@ -24,7 +24,6 @@ use tracing::{Instrument, debug, debug_span, error, trace, warn};
 use crate::effect_adapters;
 use crate::metadata::MetadataHandle;
 
-
 /// Node-local routing inputs for a caller assembling an operation config.
 /// Pure in-memory state: operations never fetch this from inside a step.
 pub fn node_routing(context: &DriverContext) -> NodeRouting {

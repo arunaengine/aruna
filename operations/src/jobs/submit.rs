@@ -35,8 +35,8 @@ use tracing::warn;
 
 use super::import::{UploadClaimError, claim_upload, upload_key};
 use super::store::{decode_job_record, dedup_index_key, job_insert_entries};
-use crate::s3::imports::cron::is_running;
 use crate::harvest::repository::source_key;
+use crate::s3::imports::cron::is_running;
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {

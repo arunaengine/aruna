@@ -118,10 +118,10 @@ impl WriteFence {
 
 #[cfg(test)]
 mod tests {
-    use crate::placement::process_transitions::close;
     use crate::effects::StorageEffect;
     use crate::events::Event;
     use crate::events::StorageEvent;
+    use crate::placement::process_transitions::close;
     use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;

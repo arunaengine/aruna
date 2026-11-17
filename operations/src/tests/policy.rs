@@ -35,11 +35,13 @@ pub(crate) fn fetch_requests(effects: Effects) -> (Vec<NodeId>, MetadataTranspor
     while let Some(Effect::Net(NetEffect::MetadataRequest(request))) = next.into_iter().next() {
         asked.get_or_insert_with(|| decode_message(&request.frame).expect("request decodes"));
         holders.push(request.peer);
-        next = fetch.step(Event::Net(NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
-            peer: request.peer,
-            elapsed: std::time::Duration::ZERO,
-            result: Err(PeerRequestError::Failed("test".to_string())),
-        }))));
+        next = fetch.step(Event::Net(NetEvent::MetadataAnswer(Box::new(
+            MetadataAnswer {
+                peer: request.peer,
+                elapsed: std::time::Duration::ZERO,
+                result: Err(PeerRequestError::Failed("test".to_string())),
+            },
+        ))));
     }
     (holders, asked.expect("the fetch asked a holder"))
 }

@@ -422,12 +422,12 @@ fn copy_skips_content() {
 async fn governed_copy_registered() {
     // A governed source copies like a plain write: gated, stored with the bucket default and
     // the source refs, and registered on this node.
-    use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use crate::driver::drive;
     use crate::placement::policy::GateOperation;
     use crate::s3::object::copy::test::{admits, full_context, seed_bucket};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+    use aruna_core::managed_copy::{CopyRequest, validate_registration};
     use aruna_core::structs::storage::blob::ManagedCopyKey;
 
     let (_temp, context) = full_context().await;

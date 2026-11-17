@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{GitError, records};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
-use crate::document_repository::GetConfigOperation;
 use crate::replication::bao_read::{BaoReadOutput, managed_read};
 use crate::replication::protocol::{BaoReadRequest, BaoReadTarget};
 use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
@@ -28,6 +27,7 @@ use aruna_core::structs::storage::dataset_location::default_bucket;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::time::unix_timestamp_millis;
 use bytes::Bytes;
 use futures_util::StreamExt;
 use std::time::{Duration, UNIX_EPOCH};
@@ -125,12 +125,22 @@ pub async fn put(
 ) -> Result<StoredObject, GitError> {
     let node = local(context)?;
     let group_id = bucket.group_id;
-    let routing = drive(SnapshotOperation::new(&node_routing(context), bucket.group_id, BucketRules::of(&bucket)), context)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
-    let gate = drive(GateOperation::new(auth.realm_id, unix_timestamp_millis()), context)
-        .await
-        .map_err(|_| GitError::Unavailable)?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(context),
+            bucket.group_id,
+            BucketRules::of(&bucket),
+        ),
+        context,
+    )
+    .await
+    .map_err(|_| GitError::Unavailable)?;
+    let gate = drive(
+        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    .map_err(|_| GitError::Unavailable)?;
     let quota = drive(GetConfigOperation::new(auth.realm_id), context)
         .await
         .map_err(|_| GitError::Unavailable)?

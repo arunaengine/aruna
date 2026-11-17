@@ -4,7 +4,6 @@
 
 use crate::driver::{DriverContext, drive};
 use crate::placement::policy::{GateContextError, GateOperation};
-use aruna_core::time::unix_timestamp_millis;
 use crate::placement::policy::{PolicyGateError, gate_decision, union_refs, write_gate};
 use crate::s3::fence_store::ensure_write_allowed;
 use crate::s3::multipart::part_upload::{UploadPartError, UploadPartInput, UploadPartOperation};
@@ -21,6 +20,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
 use aruna_core::structs::storage::blob::BackendLocation;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::{NodeId, UserId};
 use std::time::SystemTime;
@@ -205,7 +205,11 @@ async fn gate_part(
     refs: &[PlacementPolicyRef],
     group_id: GroupId,
 ) -> Result<(), PartCopyError> {
-    let destination = drive(GateOperation::new(realm_id, unix_timestamp_millis()), context).await?;
+    let destination = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let Some(gate) =
         write_gate(destination.as_ref(), refs, Some(group_id)).map_err(UploadPartError::from)?
     else {
@@ -358,7 +362,6 @@ mod test {
     use super::*;
     use crate::driver::drive;
     use crate::placement::policy::GateOperation;
-    use aruna_core::time::unix_timestamp_millis;
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use crate::tests::policy::{seed_gate, subject};
     use aruna_blob::blob::BlobHandler;
@@ -374,6 +377,7 @@ mod test {
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
     use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_core::time::unix_timestamp_millis;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;

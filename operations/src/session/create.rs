@@ -437,11 +437,11 @@ impl Operation for CreateSessionOperation {
             CreateSessionState::ReadSessions { index } => {
                 let index = index.clone();
                 self.handle_sessions(event, index)
-            },
+            }
             CreateSessionState::DeleteStale { index } => {
                 let index = index.clone();
                 self.handle_deleted(event, index)
-            },
+            }
             CreateSessionState::WriteSession => self.handle_written(event),
             CreateSessionState::CommitTransaction => self.handle_committed(event),
             CreateSessionState::Finish | CreateSessionState::Error => smallvec![],

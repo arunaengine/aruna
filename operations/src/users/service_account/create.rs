@@ -27,11 +27,11 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::oidc_user::initial_sync_change;
+use aruna_core::placement::target_placement_ref;
 
 const MAX_NAME_LEN: usize = 256;
 
@@ -349,7 +349,7 @@ impl Operation for CreateServiceOperation {
             CreateServiceState::ReadConfig { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_config(event, txn_id)
-            },
+            }
             CreateServiceState::WriteUser { txn_id, user } => {
                 let txn_id = txn_id.clone();
                 let user = user.clone();
@@ -363,11 +363,11 @@ impl Operation for CreateServiceOperation {
             CreateServiceState::Commit { user } => {
                 let user = user.clone();
                 self.handle_committed(event, user)
-            },
+            }
             CreateServiceState::ScheduleDrain { user } => {
                 let user = user.clone();
                 self.handle_drain(event, user)
-            },
+            }
             CreateServiceState::Init => self.unexpected("no event before start", event),
             CreateServiceState::Finish | CreateServiceState::Error => smallvec![],
         }

@@ -32,8 +32,8 @@ use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::repository::{metadata_audit_key, read_document_registry};
-use aruna_core::placement::resolve_shard_holders;
 use crate::sync::outbox_record::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use aruna_core::placement::resolve_shard_holders;
 
 /// Storage conflicts are optimistic and short-lived; a caller that exhausts these
 /// gets a retryable error rather than a lost transition.
@@ -611,7 +611,8 @@ async fn fence_admits(
     let Some(route) = route.as_ref().filter(|route| route.generation > 0) else {
         return Ok(true);
     };
-    let (key_space, key) = aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
+    let (key_space, key) =
+        aruna_core::placement::fence::fence_read(&route.realm_id, &route.placement);
     match ctx
         .storage_handle
         .send_storage_effect(StorageEffect::Read {

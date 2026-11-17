@@ -598,7 +598,9 @@ pub async fn create_link(
     let context = state.get_ctx();
     let holds = crate::lookup::origin_holds(&state, document_id)
         .await
-        .ok_or_else(|| ServerError::ServiceUnavailableReason("dataset placement unavailable".into()))?;
+        .ok_or_else(|| {
+            ServerError::ServiceUnavailableReason("dataset placement unavailable".into())
+        })?;
     if !holds {
         return Err(ServerError::Conflict(
             "create the link on a node that holds this dataset".into(),

@@ -39,8 +39,8 @@ use crate::metadata::create_document::resolve_metadata_id;
 use crate::metadata::get_document::load_document_record;
 use crate::metadata::raw_revision::load_raw_revision;
 use crate::metadata::repository::{parse_registry_read, read_document_registry};
-use aruna_core::placement::holds_placement;
 use crate::tasks::queue_backoff::{due_after, min_due_at};
+use aruna_core::placement::holds_placement;
 
 const QUEUE_PAGE: usize = 256;
 /// How often a check waits for a running push before it looks again.

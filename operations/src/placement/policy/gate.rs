@@ -833,7 +833,9 @@ mod gate_tests {
     use super::*;
     use aruna_core::errors::StorageError;
     use aruna_core::events::StorageEvent;
-    use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
+    use aruna_core::operation_check::{
+        check_trace, rejects_events, rejects_finalize, sample_events,
+    };
 
     fn subject_read() -> Effect {
         Effect::Storage(StorageEffect::Read {
@@ -873,15 +875,26 @@ mod gate_tests {
         // A blocked node still reports its subject; only the gate stops a governed write.
         let mut operation = GateOperation::new(realm(), 7);
         let bytes = record(true).to_bytes().unwrap();
-        check_trace(&mut operation, &[subject_read()], vec![(stored(Some(bytes)), vec![])]);
-        let gate = operation.finalize().unwrap().expect("subject is advertised");
+        check_trace(
+            &mut operation,
+            &[subject_read()],
+            vec![(stored(Some(bytes)), vec![])],
+        );
+        let gate = operation
+            .finalize()
+            .unwrap()
+            .expect("subject is advertised");
         assert!(!gate.admitting);
         assert_eq!((gate.realm_id, gate.now_ms), (realm(), 7));
         assert_eq!(gate.subject, record(true).subject);
 
         let mut open = GateOperation::new(realm(), 7);
         let bytes = record(false).to_bytes().unwrap();
-        check_trace(&mut open, &[subject_read()], vec![(stored(Some(bytes)), vec![])]);
+        check_trace(
+            &mut open,
+            &[subject_read()],
+            vec![(stored(Some(bytes)), vec![])],
+        );
         assert!(open.finalize().unwrap().unwrap().admitting);
     }
 
@@ -889,7 +902,11 @@ mod gate_tests {
     fn missing_subject_none() {
         // A node that never advertised a subject has no gate at all.
         let mut operation = GateOperation::new(realm(), 0);
-        check_trace(&mut operation, &[subject_read()], vec![(stored(None), vec![])]);
+        check_trace(
+            &mut operation,
+            &[subject_read()],
+            vec![(stored(None), vec![])],
+        );
         assert_eq!(operation.finalize(), Ok(None));
     }
 

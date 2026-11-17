@@ -9,7 +9,7 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{STORAGE_ROUTING_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, STORAGE_ROUTING_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::operation_check::{check_trace, rejects_events, rejects_finalize, sample_events};
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo, ResolvedBackend};
@@ -72,7 +72,9 @@ fn answer(effect: &Effect, rows: &Rows) -> Event {
 fn run<O: Operation>(mut operation: O, rows: &Rows) -> Result<O::Output, O::Error> {
     let mut effects = operation.start().into_vec();
     while !operation.is_complete() {
-        let effect = effects.pop().expect("a running operation waits on one effect");
+        let effect = effects
+            .pop()
+            .expect("a running operation waits on one effect");
         assert!(effects.is_empty(), "one read at a time");
         effects = operation.step(answer(&effect, rows)).into_vec();
     }
@@ -106,7 +108,10 @@ fn with_default(rows: &mut Rows, group_id: GroupId, target: RoutingTarget) {
         updated_at: SystemTime::UNIX_EPOCH,
         updated_by: UserId::default(),
     };
-    let key = (STORAGE_ROUTING_KEYSPACE.to_string(), group_id.to_bytes().to_vec());
+    let key = (
+        STORAGE_ROUTING_KEYSPACE.to_string(),
+        group_id.to_bytes().to_vec(),
+    );
     rows.insert(key, record.to_bytes().unwrap());
 }
 
@@ -245,11 +250,7 @@ fn snapshot_effects_order() {
     let usage = usage_read(&[("cold".to_string(), 10)]);
     steps.last_mut().unwrap().1 = vec![usage.clone()];
     steps.push((answer(&usage, &rows), Vec::new()));
-    check_trace(
-        &mut operation,
-        &[read(S3_BUCKET_KEYSPACE, b"b")],
-        steps,
-    );
+    check_trace(&mut operation, &[read(S3_BUCKET_KEYSPACE, b"b")], steps);
     assert!(operation.is_complete());
     assert!(operation.finalize().is_ok());
 }
@@ -306,7 +307,10 @@ fn failures_end_operations() {
     ));
 
     let mut rows = Rows::new();
-    rows.insert((S3_BUCKET_KEYSPACE.to_string(), b"b".to_vec()), vec![0xff; 8]);
+    rows.insert(
+        (S3_BUCKET_KEYSPACE.to_string(), b"b".to_vec()),
+        vec![0xff; 8],
+    );
     let corrupt = SnapshotOperation::new(&NodeRouting::default(), Ulid::nil(), named());
     assert!(matches!(
         run(corrupt, &rows),
@@ -315,10 +319,14 @@ fn failures_end_operations() {
 
     let mut quota = QuotaOperation::new(capped(10));
     quota.start();
-    quota.step(Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }));
+    quota.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: Vec::new(),
+    }));
     assert_eq!(
         quota.finalize(),
-        Err(RoutingInputsError::BackendUsage(RecordReadError::Unexpected))
+        Err(RoutingInputsError::BackendUsage(
+            RecordReadError::Unexpected
+        ))
     );
     let shards = usage_backend_keys(&BackendRef::Node("cold".to_string())).len();
     assert!(shards > 0);
@@ -332,7 +340,9 @@ fn rejects_unexpected_events() {
     for (label, effects, _) in rejects_events(make, sample_events, |_| false) {
         assert!(effects.is_empty(), "{label} emitted effects");
     }
-    for (label, effects, _) in rejects_events(|| QuotaOperation::new(capped(1)), sample_events, |_| false) {
+    for (label, effects, _) in
+        rejects_events(|| QuotaOperation::new(capped(1)), sample_events, |_| false)
+    {
         assert!(effects.is_empty(), "{label} emitted effects");
     }
     let make = || UsageOperation::new(BackendRef::node_default());
@@ -341,7 +351,9 @@ fn rejects_unexpected_events() {
     }
     // A started snapshot waiting on its bucket read refuses a batch result.
     let mut operation = make_started();
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values: Vec::new() }));
+    operation.step(Event::Storage(StorageEvent::BatchReadResult {
+        values: Vec::new(),
+    }));
     assert!(operation.finalize().is_err());
 }
 

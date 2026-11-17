@@ -22,9 +22,9 @@ use super::copies::{
     Assembled, Chunk, chunk_count, chunk_fits, has_local, read_chunk, read_local, reserve,
     store_chunk, store_local, sweep_copies,
 };
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
 /// How often a node sweeps its copies, and a management node repairs missing copies and the

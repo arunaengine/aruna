@@ -13,8 +13,8 @@ use aruna_operations::auth::bearer_token::{
     ArunaBearerError, ArunaValidationState, decode_bearer_token,
 };
 use aruna_operations::auth::request_authorization::AuthorizeError;
-use aruna_operations::driver::drive;
 use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_operations::driver::drive;
 use axum::Extension;
 use axum::extract::{FromRequestParts, Request};
 use axum::middleware::Next;

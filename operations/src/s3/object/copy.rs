@@ -8,7 +8,6 @@ use crate::distribution::pull::record_only;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::placement::policy::{GateContextError, GateOperation};
-use aruna_core::time::unix_timestamp_millis;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::fence_store::ensure_write_allowed;
 use crate::s3::object::copy::sealed::{SealedCopyError, SealedCopyInput, SealedCopyOperation};
@@ -42,6 +41,7 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::resolve_backend;
+use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -379,7 +379,15 @@ async fn copy_inner(
     let mut metadata = input.metadata.unwrap_or(source.metadata);
     // A copy is never a release, even of a release crate.
     strip_release_keys(&mut metadata);
-    let routing = drive(SnapshotOperation::new(&node_routing(context), input.group_id, BucketRules::Named(&input.dest_bucket.to_string())), context).await?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(context),
+            input.group_id,
+            BucketRules::Named(&input.dest_bucket.to_string()),
+        ),
+        context,
+    )
+    .await?;
     // Bytes the destination's backend already holds in the destination's encoding
     // are adopted, not streamed; another encoding gets its own copy. A key under a
     // backend import folder streams, so its file appears at the folder's path.
@@ -410,7 +418,11 @@ async fn copy_inner(
         .as_ref()
         .map(SourceMetadata::enforced_checksums)
         .unwrap_or_default();
-    let gate = drive(GateOperation::new(input.realm_id, unix_timestamp_millis()), context).await?;
+    let gate = drive(
+        GateOperation::new(input.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await?;
     let origin = copy_origin(
         context,
         (input.realm_id, input.node_id),
@@ -530,7 +542,12 @@ async fn sealed_copy(
         quota_ceiling: input.quota_ceiling,
         job_id: input.job_id,
     });
-    let operation = match drive(GateOperation::new(input.realm_id, unix_timestamp_millis()), context).await? {
+    let operation = match drive(
+        GateOperation::new(input.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await?
+    {
         Some(gate) => operation.with_gate(gate),
         None => operation,
     };

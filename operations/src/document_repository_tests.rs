@@ -14,7 +14,6 @@ use aruna_tasks::TaskHandle;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-
 #[test]
 fn incomplete_finalize_errors() {
     // A deadline can finalize an operation that never reached a terminal
@@ -26,12 +25,10 @@ fn incomplete_finalize_errors() {
     assert_eq!(operation.finalize(), Err(GetConfigError::NotFinished));
 }
 
-
 #[tokio::test]
 pub async fn test_get_group() {
     let random_path = tempdir().unwrap();
-    let storage_handle =
-        storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -95,8 +92,7 @@ fn terminal_rejects_event() {
         assert!(
             matches!(
                 error,
-                GetGroupError::UnexpectedEvent { .. }
-                    | GetGroupError::StorageError(_)
+                GetGroupError::UnexpectedEvent { .. } | GetGroupError::StorageError(_)
             ),
             "{error:?}"
         );

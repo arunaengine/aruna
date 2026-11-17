@@ -18,6 +18,7 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::routing::origin_holds_document;
 use aruna_operations::forward::transport::MetadataWriteError;
@@ -47,7 +48,6 @@ use aruna_operations::metadata::get_document::{
     GetDocumentError, GetDocumentOperation, load_document_record,
 };
 use aruna_operations::metadata::update_document::UpdateDocumentMutation;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::sync::shard_placement::sort_node_ids;
 use std::cell::RefCell;
 use ulid::Ulid;

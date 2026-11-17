@@ -43,6 +43,7 @@ use super::super::store::{
     read_launch_record, read_run_link,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::forward::transport::MetadataWriteError;
 use crate::metadata::AuthToken;
@@ -52,7 +53,6 @@ use crate::metadata::create_document::{
 use crate::metadata::forward::route_metadata_create;
 use crate::metadata::get_document::load_document_record;
 use crate::notifications::watch::emit::emit_metadata_created;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use crate::replication::protocol::LocationSummaryRequest;

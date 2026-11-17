@@ -17,9 +17,9 @@ use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
 };
+use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use aruna_operations::driver::drive;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use aruna_operations::s3::object::get::{GetObjectInput, get_object_routed};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -963,8 +963,12 @@ async fn notify_owner(
         key: key.to_string(),
         size_bytes: size,
     };
-    let record =
-        NotificationRecord::new(link.created_by, NotificationClass::Direct, kind, unix_timestamp_millis());
+    let record = NotificationRecord::new(
+        link.created_by,
+        NotificationClass::Direct,
+        kind,
+        unix_timestamp_millis(),
+    );
     let operation = EmitNotificationsOperation::new(EmitNotificationsInput {
         records: vec![record],
     });

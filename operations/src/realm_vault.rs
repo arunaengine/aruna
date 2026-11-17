@@ -21,10 +21,10 @@ use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::metadata::protocol::MetadataReadError;
 use crate::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
-use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::{is_management, node_kind};
 
 /// Cache rows read per page while pruning.
@@ -203,7 +203,10 @@ fn setting_error(error: RealmVaultError) -> MetadataReadError {
 }
 
 /// Asks the storage backend, which holds the realm keys on a management node, to open `sealed`.
-async fn open_sealed(ctx: &DriverContext, sealed: RealmSealed) -> Result<SecretBytes, RealmVaultError> {
+async fn open_sealed(
+    ctx: &DriverContext,
+    sealed: RealmSealed,
+) -> Result<SecretBytes, RealmVaultError> {
     let effect = StorageEffect::RealmOpen(Box::new(sealed));
     match ctx.storage_handle.send_storage_effect(effect).await {
         Event::Storage(StorageEvent::RealmOpened { result }) => result,

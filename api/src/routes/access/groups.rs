@@ -24,6 +24,8 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
 use aruna_operations::device::realm_documents::install_group_docs;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::location::{check_default, group_default};
@@ -33,7 +35,6 @@ use aruna_operations::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
 use aruna_operations::groups::forward::{ForwardGroupError, forward_group_create};
-use aruna_operations::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_operations::groups::remove_member::{
     RemoveFromError, RemoveFromInput, RemoveFromOperation,
@@ -46,7 +47,6 @@ use aruna_operations::groups::update_group::{
 };
 use aruna_operations::metadata::api::forwarded_bearer;
 use aruna_operations::metadata::stats::count_group_purpose;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_operations::s3::object::pages::ListRequest;

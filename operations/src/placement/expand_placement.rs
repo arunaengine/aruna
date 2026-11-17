@@ -9,12 +9,12 @@ use aruna_core::structs::placement::transition::{CandidatePlacementMap, Transiti
 use aruna_core::time::unix_timestamp_millis;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use aruna_core::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };
+use aruna_core::placement::transition::{TransitionRequest, expansion_buckets, plan_transition};
 
 /// Publishes the realm's first candidate map and initializes every strategy's
 /// activations through the reducer; this must run before a second node registers,

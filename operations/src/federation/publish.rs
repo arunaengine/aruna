@@ -31,10 +31,10 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::federation::totals::realm_totals;
 use crate::metadata::stats::{count_realm_documents, count_realm_groups};
-use crate::document_repository::GetConfigOperation;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// How often the reporting node renews its registration.

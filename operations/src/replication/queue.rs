@@ -56,13 +56,13 @@ use super::version_replication::{
 };
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::QuotaOperation;
-use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
 use crate::notifications::watch::emit::emit_watch_event;
+use crate::placement::policy::GateOperation;
 use crate::plugins::store::{StoreError, Txn, transact};
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::sync::mirror_repair::{kick_mirror_repair, store_sync_status};
 use crate::tasks::queue_backoff::{due_after, min_due_at, retry_delay_ms};
+use aruna_core::time::unix_timestamp_millis;
 
 const REPLICATION_PAGE_SIZE: usize = 512;
 const REPLICATION_BATCH_SIZE: usize = 64;
@@ -1567,7 +1567,12 @@ async fn process_blob_job(
     };
     // Reference materialization writes real bytes on this node, so the job
     // carries this node's destination details; a node mid-transition refuses.
-    let gate = match drive(GateOperation::new(job.input.auth_context.realm_id, unix_timestamp_millis()), context).await {
+    let gate = match drive(
+        GateOperation::new(job.input.auth_context.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    {
         Ok(gate) => gate,
         Err(error) => return Err(error.to_string()),
     };

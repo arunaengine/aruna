@@ -40,11 +40,11 @@ use crate::metadata::repository::{
     parse_registry_read, read_registry_effect, write_audit_effect, write_graph_lifecycle,
     write_lifecycle_revision,
 };
-use aruna_core::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::{
     new_identified_record, schedule_drain_effect, write_transaction_effect,
 };
 use crate::tasks::queue_backoff::conflict_backoff;
+use aruna_core::placement::{registry_placement, resolve_shard_holders};
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteDocumentOperation {

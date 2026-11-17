@@ -20,8 +20,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::write::{AppendVaultConfig, AppendVaultError, AppendVaultOperation, VaultAppended};
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{is_sync_eligible, peer_acts_for};
 use crate::forward::routing::forward_to_holders;
 use crate::forward::transport::MetadataWriteError;
@@ -176,7 +176,8 @@ async fn vault_caller(
         })?;
     let realm_id = *net_handle.realm_id();
     let config = drive(GetConfigOperation::new(realm_id), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if auth.realm_id != realm_id
         || auth.path_restrictions.is_some()
@@ -210,7 +211,8 @@ async fn local_records(
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
     let config = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     let (target, key_space, limit) = match query {
         VaultQuery::Heads { auth_token } => {

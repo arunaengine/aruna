@@ -45,9 +45,9 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
             NetEffect::PolicySign(_) => Event::Net(NetEvent::PolicySign(
                 PolicySignEvent::Unavailable(NO_TRANSPORT.to_string()),
             )),
-            NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(VaultSignEvent::Unavailable(
-                NO_TRANSPORT.to_string(),
-            ))),
+            NetEffect::VaultSign(_) => Event::Net(NetEvent::VaultSign(
+                VaultSignEvent::Unavailable(NO_TRANSPORT.to_string()),
+            )),
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }

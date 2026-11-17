@@ -116,7 +116,9 @@ pub(super) fn resolve_publish_placement(
         return current;
     }
     match config {
-        Some(config) => aruna_core::placement::target_placement_ref(config, target, Default::default()),
+        Some(config) => {
+            aruna_core::placement::target_placement_ref(config, target, Default::default())
+        }
         None => aruna_core::structs::placement::record::PlacementRef::NIL,
     }
 }
@@ -682,7 +684,9 @@ impl OperationsTaskHandler {
             }
             let mut bootstrap_peers = record.peers.clone();
             if let Some(config) = config {
-                for holder in aruna_core::placement::resolve_shard_holders(config, &record.placement) {
+                for holder in
+                    aruna_core::placement::resolve_shard_holders(config, &record.placement)
+                {
                     if !bootstrap_peers.contains(&holder) {
                         bootstrap_peers.push(holder);
                     }
@@ -725,7 +729,8 @@ impl OperationsTaskHandler {
                     continue;
                 }
                 let members =
-                    aruna_core::placement::bucket_membership(config, &record.placement, now_ms).members;
+                    aruna_core::placement::bucket_membership(config, &record.placement, now_ms)
+                        .members;
                 if !members.is_empty() {
                     record.peers = members;
                 }

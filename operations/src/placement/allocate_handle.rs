@@ -24,8 +24,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use crate::document_repository::GetConfigError;
+use crate::driver::DriverContext;
 use crate::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
 };

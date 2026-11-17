@@ -11,9 +11,9 @@ use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
 use aruna_core::types::GroupId;
 use thiserror::Error;
 
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::auth::enforcement::PolicyEnforcementError;
 use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 

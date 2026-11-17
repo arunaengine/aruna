@@ -11,8 +11,8 @@ use aruna_core::audit::AuditPageBatch;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
-    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    MetadataAnswer, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
+    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, MetadataAnswer,
+    NetEvent, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
 use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
 use aruna_core::structs::identity::realm::RealmId;

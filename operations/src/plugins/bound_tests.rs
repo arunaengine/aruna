@@ -12,12 +12,12 @@ use ed25519_dalek::SigningKey;
 use serde_json::json;
 
 use super::*;
-use aruna_core::realm_vault::RealmKeys;
 use crate::driver::drive;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
 use crate::plugins::install::{pick_version, read_config, read_manifest};
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+use aruna_core::realm_vault::RealmKeys;
 
 pub(crate) const TOKEN: &str = "canary-release-4f1e";
 pub(crate) const ORIGIN: &str = "https://api.example.org";

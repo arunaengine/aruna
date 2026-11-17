@@ -129,7 +129,15 @@ pub async fn receive(
         body: body.to_vec(),
     };
     let ids = (state.get_realm_id(), install_id);
-    match admit_hook(&ctx, state.get_node_id(), ids, request, unix_timestamp_millis()).await {
+    match admit_hook(
+        &ctx,
+        state.get_node_id(),
+        ids,
+        request,
+        unix_timestamp_millis(),
+    )
+    .await
+    {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(HookError::Elsewhere(receiver)) => {
             let path = match query {

@@ -19,13 +19,13 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::driver::DriverContext;
-use aruna_core::placement::{bucket_membership, resolve_shard_holders};
 use crate::shard::assemble_shard_manifest;
 use crate::shard::client::{SHARD_IO_TIMEOUT, close_stream};
 use crate::shard::protocol::{
     MAX_RESPONSE_SIZE, ManifestPagePlan, ShardTransportMessage, ShardTransportResponse,
     plan_manifest_pages, read_shard_request, write_manifest_pages, write_shard_response,
 };
+use aruna_core::placement::{bucket_membership, resolve_shard_holders};
 
 enum PreparedShardResponse {
     Message(ShardTransportResponse),

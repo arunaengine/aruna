@@ -24,10 +24,10 @@ use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content,
 use aruna_operations::distribution::ticket::{
     RedeemError, TicketInput, issue_ticket, redeem_ticket,
 };
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{drive, drive_until};
 use aruna_operations::node::holder_choice::{avoid_holder, choose_holder};
 use aruna_operations::node::node_info::read_info_documents;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::replication::locations::{LocationSummaryError, RemoteLocationOperation};
 use aruna_operations::replication::protocol::LocationSummaryRequest;
 use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};

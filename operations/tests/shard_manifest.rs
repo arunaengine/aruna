@@ -5,6 +5,7 @@
 use aruna_core::StructuredId;
 use aruna_core::UserId;
 use aruna_core::document::{DocumentTarget, ShardManifest};
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
@@ -12,7 +13,6 @@ use aruna_operations::driver::drive;
 use aruna_operations::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_local_document,
 };
-use aruna_core::placement::resolve_shard_holders;
 use aruna_operations::shard::assemble_shard_manifest;
 use ulid::Ulid;
 

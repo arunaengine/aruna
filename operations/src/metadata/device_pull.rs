@@ -27,16 +27,16 @@ use futures_util::StreamExt;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
+use crate::auth::enforcement::PolicyEnforcementError;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
-use crate::auth::enforcement::PolicyEnforcementError;
 use crate::distribution::guard::GuardError;
 use crate::distribution::routing::local_fence;
 use crate::distribution::routing::{bound_view, route_write};
 use crate::distribution::versions::{InventoryVersionsInput, InventoryVersionsOperation};
 use crate::driver::{DriverContext, drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::forward::authorize::peer_acts_for;
+use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::metadata::handle::WritePeerError;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::placement::process_placements::load_realm_config;
@@ -513,9 +513,16 @@ async fn commit_pull(
             return Err(read_refusal(&error));
         }
     };
-    let routing = drive(SnapshotOperation::new(&node_routing(context), bucket.group_id, BucketRules::Named(&request.target_bucket.to_string())), context)
-        .await
-        .map_err(|_| SyncRefusal::Unavailable)?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(context),
+            bucket.group_id,
+            BucketRules::Named(&request.target_bucket.to_string()),
+        ),
+        context,
+    )
+    .await
+    .map_err(|_| SyncRefusal::Unavailable)?;
     let quota = load_realm_config(context, auth.realm_id)
         .await
         .and_then(|config| config.quota.effective_group_ceiling(&bucket.group_id));

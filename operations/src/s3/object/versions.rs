@@ -26,8 +26,8 @@ use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::managed_copy::{CopyRequest, validate_registration};
 use crate::s3::listing::{PrefixTracker, common_prefix_of, split_after_marker};
+use aruna_core::managed_copy::{CopyRequest, validate_registration};
 
 /// Whether this node still holds a serveable registration for one governed
 /// copy. A listing never fails on the answer; it only stops describing bytes.

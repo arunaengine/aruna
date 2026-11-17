@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
 use crate::document_repository::GetConfigOperation;
+use crate::driver::DriverContext;
 use crate::driver::drive;
 use crate::forward::authorize::authorize_forwarded_caller;
 use crate::forward::authorize::authorize_write;
@@ -19,9 +19,9 @@ use crate::metadata::api::MetadataApiError;
 use crate::metadata::protocol::AuthToken;
 use crate::metadata::protocol::MetadataTransportMessage;
 use crate::metadata::protocol::WriteAuthError;
-use aruna_core::placement::selector::select_top_peers;
 use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
+use aruna_core::placement::selector::select_top_peers;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;

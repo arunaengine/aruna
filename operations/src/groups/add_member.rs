@@ -32,11 +32,11 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserInput {
@@ -508,7 +508,10 @@ impl AddUserOperation {
             newly_added,
         };
         if deny {
-            return smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)];
+            return smallvec![crate::auth::epoch_due::mark_due(
+                Some(self.input.group_id),
+                txn_id
+            )];
         }
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -729,7 +732,7 @@ impl Operation for AddUserOperation {
             AddUserState::ReadAdminState { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_auth_read(event, txn_id)
-            },
+            }
             AddUserState::WriteAdminState {
                 txn_id,
                 auth_doc,
@@ -743,14 +746,14 @@ impl Operation for AddUserOperation {
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 let newly_added = newly_added.clone();
                 self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-                newly_added,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    stale_conflict_deletes,
+                    newly_added,
+                )
+            }
             AddUserState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
@@ -762,13 +765,13 @@ impl Operation for AddUserOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let newly_added = newly_added.clone();
                 self.handle_conflict_deletes(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                newly_added,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    newly_added,
+                )
+            }
             AddUserState::ReadBucketFence {
                 txn_id,
                 auth_doc,
@@ -791,7 +794,7 @@ impl Operation for AddUserOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let newly_added = newly_added.clone();
                 self.handle_commit_transaction(event, auth_doc, admin_outbox_written, newly_added)
-            },
+            }
             AddUserState::ScheduleDocumentDrain {
                 auth_doc,
                 newly_added,
@@ -799,7 +802,7 @@ impl Operation for AddUserOperation {
                 let auth_doc = auth_doc.clone();
                 let newly_added = newly_added.clone();
                 self.handle_drain_schedule(event, auth_doc, newly_added)
-            },
+            }
             AddUserState::AnnounceAuthDoc {
                 auth_doc,
                 newly_added,
@@ -807,7 +810,7 @@ impl Operation for AddUserOperation {
                 let auth_doc = auth_doc.clone();
                 let newly_added = newly_added.clone();
                 self.handle_auth_announce(event, auth_doc, newly_added)
-            },
+            }
             AddUserState::EmitNotifications { auth_doc } => {
                 let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)

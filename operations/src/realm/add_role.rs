@@ -573,7 +573,7 @@ impl Operation for RealmRoleOperation {
             RealmRoleState::GetAdminState { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_auth_read(event, txn_id)
-            },
+            }
             RealmRoleState::WriteAuthState {
                 txn_id,
                 auth_doc,
@@ -585,13 +585,13 @@ impl Operation for RealmRoleOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let conflict_delete_keys = conflict_delete_keys.clone();
                 self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    conflict_delete_keys,
+                )
+            }
             RealmRoleState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
@@ -601,7 +601,7 @@ impl Operation for RealmRoleOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written)
-            },
+            }
             RealmRoleState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
@@ -610,7 +610,7 @@ impl Operation for RealmRoleOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_commit_transaction(event, auth_doc, admin_outbox_written)
-            },
+            }
             RealmRoleState::ScheduleDocumentDrain { auth_doc } => {
                 let auth_doc = auth_doc.clone();
                 self.schedule_outbox_drain(event, auth_doc)

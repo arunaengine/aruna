@@ -22,16 +22,16 @@ use byteview::ByteView;
 use tracing::{debug, warn};
 
 use crate::driver::{DriverContext, drive};
-use aruna_core::placement::fence::{fence_read, stored_generation};
-use aruna_core::placement::transition::{
-    TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
-};
 use crate::realm::mutate_placement::{
     CONFLICT_ATTEMPTS, MutatePlacementConfig, MutatePlacementError, MutatePlacementOperation,
     RealmPlacementMutation, drive_placement_mutation, is_management,
 };
 use crate::shard::verify::converge_with_barrier;
 use crate::shard::{assemble_shard_manifest, frontier_root};
+use aruna_core::placement::fence::{fence_read, stored_generation};
+use aruna_core::placement::transition::{
+    TransitionRequest, expansion_buckets, holders_in_map, plan_transition,
+};
 
 /// Runs every transition step the local node owns. Returns whether a step is
 /// still outstanding, so the caller re-arms the placement retry.
@@ -837,10 +837,10 @@ pub async fn close(
 
 #[cfg(test)]
 mod tests {
-    use aruna_core::placement::fence;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use aruna_core::placement::fence;
     use aruna_core::reducer::{AdminDocumentState, overlay_placement};
     use std::path::Path;
 

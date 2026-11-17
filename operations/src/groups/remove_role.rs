@@ -29,10 +29,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::auth::Permission;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -534,7 +534,10 @@ impl RemoveGroupOperation {
             auth_doc,
             admin_outbox_written,
         };
-        smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(
+            Some(self.input.group_id),
+            txn_id
+        )]
     }
 
     fn handle_commit_transaction(
@@ -672,7 +675,7 @@ impl Operation for RemoveGroupOperation {
             RemoveGroupState::GetGroup { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_get_group(event, txn_id)
-            },
+            }
             RemoveGroupState::GetAdminState { txn_id, group } => {
                 let txn_id = txn_id.clone();
                 let group = group.clone();
@@ -691,14 +694,14 @@ impl Operation for RemoveGroupOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let conflict_delete_keys = conflict_delete_keys.clone();
                 self.handle_document_write(
-                event,
-                txn_id,
-                group,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-            )
-            },
+                    event,
+                    txn_id,
+                    group,
+                    auth_doc,
+                    admin_outbox_written,
+                    conflict_delete_keys,
+                )
+            }
             RemoveGroupState::DeleteAdminConflicts {
                 txn_id,
                 group,
@@ -710,7 +713,7 @@ impl Operation for RemoveGroupOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_conflict_deletes(event, txn_id, group, auth_doc, admin_outbox_written)
-            },
+            }
             RemoveGroupState::ReadBucketFence {
                 txn_id,
                 group,
@@ -722,7 +725,7 @@ impl Operation for RemoveGroupOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_bucket_fence(event, txn_id, group, auth_doc, admin_outbox_written)
-            },
+            }
             RemoveGroupState::CommitTransaction {
                 group,
                 auth_doc,
@@ -733,7 +736,7 @@ impl Operation for RemoveGroupOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written)
-            },
+            }
             RemoveGroupState::ScheduleDocumentDrain { group, auth_doc } => {
                 let group = group.clone();
                 let auth_doc = auth_doc.clone();

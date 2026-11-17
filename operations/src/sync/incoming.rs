@@ -6,15 +6,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
 use crate::auth::permission_rules::GroupPermissionRules;
 use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::auth::enforcement::{PolicyEnforcementError, PolicyEvaluator};
 use crate::blob::permission_paths::ResolvePathsOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
 use crate::groups::routing::QuotaOperation;
-use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
 use crate::jobs::runtime::JobsRuntime;
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
@@ -25,8 +24,8 @@ use crate::node::dashboard::{notify_dashboard_change, targets_change_dashboard};
 use crate::node::usage_stats::refresh_usage_targets;
 use crate::notifications::watch::emit::emit_watch_event;
 use crate::notifications::watch::interest::refresh_target_interest;
+use crate::placement::policy::GateOperation;
 use crate::placement::process_placements::reconcile_shard_topics;
-use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::replication::bao_read::IncomingBaoOperation;
 use crate::replication::bootstrap::wake_bootstrap;
@@ -60,6 +59,7 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
+use aruna_core::time::unix_timestamp_millis;
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
@@ -171,7 +171,12 @@ impl OperationsInboundHandler {
         let watch_manifest = manifest.clone();
         // Only a materialized item can place a blob, so only it reads the caps.
         let routing = if manifest.kind == ReplicationItemKind::Materialized {
-            match drive(QuotaOperation::new(node_routing(self.context.as_ref())), self.context.as_ref()).await {
+            match drive(
+                QuotaOperation::new(node_routing(self.context.as_ref())),
+                self.context.as_ref(),
+            )
+            .await
+            {
                 Ok(routing) => routing,
                 Err(error) => {
                     error!(
@@ -200,7 +205,12 @@ impl OperationsInboundHandler {
                     return;
                 }
             };
-        let gate = match drive(GateOperation::new(realm_id, unix_timestamp_millis()), self.context.as_ref()).await {
+        let gate = match drive(
+            GateOperation::new(realm_id, unix_timestamp_millis()),
+            self.context.as_ref(),
+        )
+        .await
+        {
             Ok(gate) => gate,
             Err(error) => {
                 error!(

@@ -192,12 +192,7 @@ async fn node_secrets_local() {
     // A management node never serves another node's secret.
     let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
     hold_keys(&fixture.ctx);
-    let served = release(
-        &fixture.ctx,
-        (&config, elsewhere, receiver),
-        &asked,
-    )
-    .await;
+    let served = release(&fixture.ctx, (&config, elsewhere, receiver), &asked).await;
     assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
 }
 

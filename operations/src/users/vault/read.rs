@@ -23,7 +23,9 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::placement::{PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets};
+use aruna_core::placement::{
+    PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets,
+};
 
 use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
@@ -566,7 +568,11 @@ mod tests {
         (fetch, holders)
     }
 
-    fn answer(peer: NodeId, seconds: u64, result: Result<VaultRecords, MetadataReadError>) -> Event {
+    fn answer(
+        peer: NodeId,
+        seconds: u64,
+        result: Result<VaultRecords, MetadataReadError>,
+    ) -> Event {
         let message = MetadataTransportMessage::FetchedVaultRecords { result };
         let frame = crate::metadata::protocol::encode_message(&message).unwrap();
         reply(peer, seconds, Ok(frame))
@@ -607,7 +613,11 @@ mod tests {
         let next = fetch.step(timed_out(holders[0]));
         assert_eq!(timeout_of(&next), Duration::from_secs(5));
         let keys = VaultRecords::Keys(vec![key_record(node(2))]);
-        assert!(fetch.step(answer(holders[1], 1, Ok(keys.clone()))).is_empty());
+        assert!(
+            fetch
+                .step(answer(holders[1], 1, Ok(keys.clone())))
+                .is_empty()
+        );
         assert_eq!(
             fetch.finalize(),
             Event::Net(NetEvent::VaultFetch(VaultFetchEvent::Fetched {
@@ -632,10 +642,16 @@ mod tests {
                 VaultFetchEvent::NotFound,
             ),
             (
-                vec![Some(timed_out(node(1))), Some(answer(node(2), 1, forbidden()))],
+                vec![
+                    Some(timed_out(node(1))),
+                    Some(answer(node(2), 1, forbidden())),
+                ],
                 VaultFetchEvent::Denied,
             ),
-            (vec![Some(answer(node(1), 1, forbidden())), None], VaultFetchEvent::Denied),
+            (
+                vec![Some(answer(node(1), 1, forbidden())), None],
+                VaultFetchEvent::Denied,
+            ),
         ];
         for (events, expected) in cases {
             let (mut fetch, _) = vault_fetch();

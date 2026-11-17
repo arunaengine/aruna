@@ -44,24 +44,24 @@ use ulid::Ulid;
 use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_state, read_state};
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive, node_routing};
+use crate::groups::backends::query::GetBackendOperation;
 use crate::groups::routing::{BucketRules, SnapshotOperation};
 use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
-use crate::groups::backends::query::GetBackendOperation;
+use crate::placement::policy::{GateContext, PolicyGateError};
+use crate::replication::queue::complete_put;
+use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::imports::discovery::read_discovery;
 use crate::s3::imports::shared::{self, SharedRule, claim_file, read_shared, taken_paths};
 use crate::s3::imports::{read_earlier, read_import};
-use crate::placement::policy::{GateContext, PolicyGateError};
-use crate::document_repository::GetConfigOperation;
-use crate::replication::queue::complete_put;
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::object::delete::{DeleteObjectError, DeleteObjectInput, DeleteObjectOperation};
 use crate::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, RuleScan, Trail,
     intent_keys, trail_ranges,
 };
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::time::unix_timestamp_millis;
 
 const LIST_PAGE: usize = 500;
 
@@ -338,17 +338,27 @@ async fn prepare(ctx: &JobContext, spec: &BackendImportSpec) -> Result<ImportRun
     if !allowed {
         return Err(permanent("the importing user may not write to the bucket"));
     }
-    let routing = drive(SnapshotOperation::new(&node_routing(&ctx.driver), rule.group_id, BucketRules::Named(&rule.bucket.to_string())), &ctx.driver)
-        .await
-        .map_err(retryable)?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            rule.group_id,
+            BucketRules::Named(&rule.bucket.to_string()),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(retryable)?;
     let quota = drive(GetConfigOperation::new(realm_id), &ctx.driver)
         .await
         .map_err(retryable)?
         .quota
         .effective_group_ceiling(&rule.group_id);
-    let gate = drive(GateOperation::new(realm_id, unix_timestamp_millis()), &ctx.driver)
-        .await
-        .map_err(retryable)?;
+    let gate = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(retryable)?;
     let discovery = read_discovery(&ctx.driver, rule.group_id, rule.import_id)
         .await
         .map_err(retryable)?;

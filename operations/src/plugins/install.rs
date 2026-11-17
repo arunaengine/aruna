@@ -36,11 +36,11 @@ use super::receiver::pick_receiver;
 use super::records::{InstallEntryConfig, InstallEntryOperation, RecordError};
 use super::rules::{ensure_rules, retire_rules};
 use super::settings::{SettingError, check_settings};
+use crate::auth::enforcement::enforce_policies;
 use crate::auth::permission_rules::permission_rules;
 use crate::auth::request_policy::{PolicyRequestExtras, policy_request_with};
-use crate::auth::enforcement::enforce_policies;
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::realm::mutate_placement::is_management;
 use crate::users::service_account::check::{ServiceCheckConfig, ServiceCheckOperation};
 

@@ -20,13 +20,13 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::node::startup::apply_restored_reconcile;
-use aruna_core::placement::resolve_shard_holders;
 use crate::shard::client::fetch_shard_manifest;
 use crate::shard::{assemble_shard_manifest, manifest_entry_digest};
 use crate::sync::shard_placement::{placement_key, placement_prefix};
+use aruna_core::placement::resolve_shard_holders;
 
 /// Page size for scanning persisted shard verification markers.
 const SHARD_PAGE_SIZE: usize = 256;

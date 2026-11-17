@@ -3,9 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
-use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use crate::driver::{DriverContext, drive};
 use aruna_core::request_policy::{
     CompiledPolicySet, PolicyCompileError, PolicyDecision, PolicyRequest, PolicySession,
     RequestPolicy, policy_set_hash,

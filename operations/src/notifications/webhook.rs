@@ -24,6 +24,7 @@ use aruna_core::time::unix_timestamp_millis;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
@@ -33,7 +34,6 @@ use crate::notifications::settings::{
     Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, delivery_setting, local_setting,
     managers, write_setting,
 };
-use crate::document_repository::GetConfigOperation;
 
 /// Total time one delivery attempt may take; the job runtime retries a timed out attempt.
 const DELIVERY_DEADLINE: Duration = Duration::from_secs(30);

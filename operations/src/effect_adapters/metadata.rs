@@ -23,13 +23,21 @@ pub(super) async fn dispatch_metadata(effect: MetadataEffect, context: &DriverCo
 }
 
 /// Sends one encoded request and reports the answer with the time it took.
-pub(super) async fn dispatch_request(effect: MetadataRequestEffect, context: &DriverContext) -> Event {
+pub(super) async fn dispatch_request(
+    effect: MetadataRequestEffect,
+    context: &DriverContext,
+) -> Event {
     let started = Instant::now();
     let result = match &context.metadata_handle {
         None => Err(PeerRequestError::Failed(
             "metadata transport unavailable".to_string(),
         )),
-        Some(handle) => match timeout(effect.timeout, handle.request_frame(effect.peer, &effect.frame)).await {
+        Some(handle) => match timeout(
+            effect.timeout,
+            handle.request_frame(effect.peer, &effect.frame),
+        )
+        .await
+        {
             Ok(Ok(answer)) => Ok(answer),
             Ok(Err(error)) => Err(PeerRequestError::Failed(error.to_string())),
             Err(_) => Err(PeerRequestError::TimedOut),

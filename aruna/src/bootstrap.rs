@@ -12,15 +12,15 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE}
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
 };
+use aruna_core::placement::target_placement_ref;
 use aruna_core::{DocumentEffect, NodeId, UserId};
 use aruna_operations::device::realm_documents::fetch_from_peers;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::notifications::watch::interest::{
     ensure_interest_digest, mark_interest_dirty,
 };
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_core::placement::target_placement_ref;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };

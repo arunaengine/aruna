@@ -246,7 +246,6 @@ pub struct MetadataHandleOptions {
 }
 
 impl MetadataHandleOptions {
-
     pub fn with_search_storage(mut self, search_storage: MetadataSearchStorage) -> Self {
         self.search_storage = search_storage;
         self

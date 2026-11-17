@@ -626,9 +626,7 @@ pub(crate) async fn ensure_record_readable(
             )
             .await
             .and_then(|evaluator| evaluator.evaluate(&request)),
-            None => {
-                crate::auth::enforcement::enforce_policies(context, realm_id, &request).await
-            }
+            None => crate::auth::enforcement::enforce_policies(context, realm_id, &request).await,
         };
         return result.map_err(|_| MetadataApiError::NotFound);
     }

@@ -474,7 +474,10 @@ mod tests {
         let record = RealmVaultRecord {
             entry,
             revision,
-            sealed: keys.vault.seal(&realm_id, entry, revision, &secret).unwrap(),
+            sealed: keys
+                .vault
+                .seal(&realm_id, entry, revision, &secret)
+                .unwrap(),
         };
         let owner = UserId::local(Ulid::from_bytes([7; 16]), realm_id);
         let id = Ulid::from_bytes([9; 16]);

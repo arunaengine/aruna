@@ -38,6 +38,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::executor::{JobContext, JobRunOutcome};
 use crate::jobs::service::{find_dedup_job, mint_local_job, submit_local_job};
@@ -46,7 +47,6 @@ use crate::notifications::settings::{
     BACKOFF_START_MS, Backoffs, Delivery, MetadataPeers, SettingError, SettingPeers, SettingWinner,
     delivery_setting, local_setting, managers, write_setting,
 };
-use crate::document_repository::GetConfigOperation;
 use crate::realm_vault::{prune_secret_cache, read_realm_secret};
 use crate::storage_read::{StorageReadError, parse_storage_read};
 

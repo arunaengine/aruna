@@ -8,8 +8,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::auth::enforcement::{PolicyEnforcementError, enforce_policies};
+use aruna_operations::auth::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_operations::driver::drive;
 use aruna_operations::groups::join_request::{
     GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,

@@ -26,10 +26,10 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 pub const MAX_NAME_LEN: usize = 256;
 
@@ -431,68 +431,76 @@ impl Operation for UpdateGroupOperation {
                 let group = group.clone();
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(UpdateGroupError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = UpdateGroupState::DeleteAdminConflicts { group };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
+                    Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
+                        let Some(txn_id) = self.txn_id else {
+                            return self.fail(UpdateGroupError::MissingTransaction);
+                        };
+                        if !stale_conflict_deletes.is_empty() {
+                            self.state = UpdateGroupState::DeleteAdminConflicts { group };
+                            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
+                                deletes: stale_conflict_deletes,
+                                txn_id: Some(txn_id),
+                            })];
+                        }
+                        self.emit_commit_transaction(group)
                     }
-                    self.emit_commit_transaction(group)
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("storage batch write result", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
             }
-            },
             UpdateGroupState::DeleteAdminConflicts { group } => {
                 let group = group.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(group)
+                    Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                        self.emit_commit_transaction(group)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("storage batch delete result", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
             }
-            },
             UpdateGroupState::ReadBucketFence { group } => {
                 let group = group.clone();
                 match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if self.fence.admits(&values) {
-                        self.emit_commit(group)
-                    } else {
-                        self.fail(UpdateGroupError::PlacementFenced)
+                    Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                        if self.fence.admits(&values) {
+                            self.emit_commit(group)
+                        } else {
+                            self.fail(UpdateGroupError::PlacementFenced)
+                        }
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                    other => {
+                        self.unexpected_event("bucket fence read result", format!("{other:?}"))
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
             }
-            },
             UpdateGroupState::CommitTransaction { group } => {
                 let group = group.clone();
                 match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.output = Some(Ok(group.clone()));
-                    self.state = UpdateGroupState::ScheduleOutboxDrain { group };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    if error == StorageError::TransactionConflict
-                        && self.conflicts < super::CONFLICT_RETRIES
-                    {
-                        return self.restart_after_conflict();
+                    Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                        self.txn_id = None;
+                        self.output = Some(Ok(group.clone()));
+                        self.state = UpdateGroupState::ScheduleOutboxDrain { group };
+                        smallvec![schedule_drain_effect()]
                     }
-                    self.fail(error.into())
+                    Event::Storage(StorageEvent::Error { error }) => {
+                        self.txn_id = None;
+                        if error == StorageError::TransactionConflict
+                            && self.conflicts < super::CONFLICT_RETRIES
+                        {
+                            return self.restart_after_conflict();
+                        }
+                        self.fail(error.into())
+                    }
+                    other => {
+                        self.unexpected_event("transaction commit result", format!("{other:?}"))
+                    }
                 }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             }
-            },
             UpdateGroupState::ScheduleOutboxDrain { .. } => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     self.state = UpdateGroupState::Finish;

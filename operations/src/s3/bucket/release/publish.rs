@@ -41,13 +41,12 @@ use crate::auth::request_authorization::{AuthorizeError, authorize};
 use crate::auth::request_policy::PolicyRequestExtras;
 use crate::distribution::routing::local_fence;
 use crate::distribution::status::read_view;
-use crate::driver::{DriverContext, drive, node_routing};
-use crate::groups::routing::{BucketRules, SnapshotOperation};
-use crate::placement::policy::GateOperation;
-use aruna_core::time::unix_timestamp_millis;
-use crate::forward::authorize::is_sync_eligible;
-use crate::metadata::protocol::{AuthToken, MetadataReadError};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive, node_routing};
+use crate::forward::authorize::is_sync_eligible;
+use crate::groups::routing::{BucketRules, SnapshotOperation};
+use crate::metadata::protocol::{AuthToken, MetadataReadError};
+use crate::placement::policy::GateOperation;
 use crate::replication::queue::complete_put;
 use crate::s3::bucket::get::GetBucketOperation;
 use crate::s3::object::get::{
@@ -56,6 +55,7 @@ use crate::s3::object::get::{
 use crate::s3::object::list::{ListBucketInput, ListBucketOperation};
 use crate::s3::object::origin::{OriginError, read_origin};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
+use aruna_core::time::unix_timestamp_millis;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
@@ -549,12 +549,22 @@ async fn put_crate(
     let realm = drive(GetConfigOperation::new(scope.realm_id), context)
         .await
         .map_err(|error| failed(&error))?;
-    let routing = drive(SnapshotOperation::new(&node_routing(context), (scope.info).group_id, BucketRules::of(scope.info)), context)
-        .await
-        .map_err(|error| failed(&error))?;
-    let gate = drive(GateOperation::new(scope.realm_id, unix_timestamp_millis()), context)
-        .await
-        .map_err(|error| failed(&error))?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(context),
+            (scope.info).group_id,
+            BucketRules::of(scope.info),
+        ),
+        context,
+    )
+    .await
+    .map_err(|error| failed(&error))?;
+    let gate = drive(
+        GateOperation::new(scope.realm_id, unix_timestamp_millis()),
+        context,
+    )
+    .await
+    .map_err(|error| failed(&error))?;
     let size = bytes.len() as u64;
     let body = futures_util::stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(bytes))]);
     let tags = HashMap::from([

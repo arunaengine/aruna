@@ -19,6 +19,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::driver::{DriverContext, drive};
 use crate::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
 use crate::notifications::routing::{RoutingContext, route_resource_event};
@@ -35,7 +36,6 @@ use crate::onboarding::reserve_secret::{
 use crate::placement::expand_placement::{ensure_activated_map, expand_realm_placement};
 use crate::placement::process_placements::reconcile_shard_topics;
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::mutate_placement::{MutatePlacementError, RealmPlacementMutation};
 use crate::realm::read_authorization::ReadAuthorizationOperation;
 
@@ -375,12 +375,12 @@ mod tests {
         BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
         emit_onboarded_notification, onboarding_node_kind, onboarding_sync_topics,
     };
+    use crate::document_repository::{GetConfigError, GetConfigOperation};
     use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
     use crate::onboarding::reserve_secret::ReserveSecretError;
     use crate::onboarding::secret_state::secret_state_key;
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::document_repository::{GetConfigError, GetConfigOperation};
     use aruna_core::NodeId;
     use aruna_core::UserId;
     use aruna_core::document::DocumentTarget;

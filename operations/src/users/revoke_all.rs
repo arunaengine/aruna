@@ -12,9 +12,9 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::auth::check_permissions::authorization_event;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::auth::revoke_token::RevokeTokenOperation;
-use crate::auth::check_permissions::authorization_event;
 use crate::auth::revoke_token::owner_cutoff;
 
 #[derive(Clone, Debug, PartialEq)]

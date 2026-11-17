@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::driver::drive;
 use crate::document_repository::GetGroupConfig;
 use crate::document_repository::GetGroupOperation;
+use crate::driver::DriverContext;
+use crate::driver::drive;
 use crate::groups::list_groups::ListGroupOperation;
 use crate::metadata::api::MetadataApiError;
 use crate::metadata::api::ensure_record_readable;

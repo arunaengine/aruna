@@ -19,6 +19,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::{MetaResourceId, StructuredId};
 use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::forward::transport::MetadataWriteError;
 use aruna_operations::git::snapshot::unreadable_file;
@@ -32,7 +33,6 @@ use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDoc
 use aruna_operations::metadata::forward::{CreateAuthorizedError, create_metadata_authorized};
 use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
-use aruna_operations::document_repository::GetConfigOperation;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;

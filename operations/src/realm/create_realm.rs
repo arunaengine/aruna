@@ -29,10 +29,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {

@@ -15,6 +15,7 @@ use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
+use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
@@ -26,9 +27,10 @@ use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::driver::drive;
-use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::federation::totals::data_totals;
+use aruna_operations::groups::routing::UsageOperation;
 use aruna_operations::metadata::PeerContacts;
 use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
 use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
@@ -37,8 +39,6 @@ use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, Rea
 use aruna_operations::placement::allocate_handle::{
     HandleAllocationError, provision_metadata_binding,
 };
-use aruna_core::placement::transition::transition_health;
-use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
@@ -2528,12 +2528,15 @@ async fn backend_statuses(
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
     for backend in backends {
-        let used_bytes = drive(UsageOperation::new(BackendRef::Node(backend.name.clone())), &context)
-            .await
-            .inspect_err(
-                |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
-            )
-            .ok();
+        let used_bytes = drive(
+            UsageOperation::new(BackendRef::Node(backend.name.clone())),
+            &context,
+        )
+        .await
+        .inspect_err(
+            |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
+        )
+        .ok();
         statuses.push(BackendStatus {
             name: backend.name,
             backend: backend.backend_type.to_string(),

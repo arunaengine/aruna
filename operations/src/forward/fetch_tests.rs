@@ -35,11 +35,13 @@ fn fetch(budget: Budget) -> HolderFetchOperation<String> {
 }
 
 fn asked(peer: NodeId, timeout: Duration) -> Effect {
-    Effect::Net(NetEffect::MetadataRequest(Box::new(MetadataRequestEffect {
-        peer,
-        frame: encode_message(&request()).unwrap(),
-        timeout,
-    })))
+    Effect::Net(NetEffect::MetadataRequest(Box::new(
+        MetadataRequestEffect {
+            peer,
+            frame: encode_message(&request()).unwrap(),
+            timeout,
+        },
+    )))
 }
 
 fn answer(peer: NodeId, seconds: u64, text: &str) -> Event {
@@ -89,7 +91,11 @@ fn misses_are_not_found() {
     let mut operation = fetch(Budget::Shared);
     operation.start();
     operation.step(answer(node(1), 1, "missing"));
-    operation.step(reply(node(2), 1, Err(PeerRequestError::Failed("down".into()))));
+    operation.step(reply(
+        node(2),
+        1,
+        Err(PeerRequestError::Failed("down".into())),
+    ));
     operation.step(answer(node(3), 1, "missing"));
     assert_eq!(operation.finalize(), Ok(Fetched::NotFound));
 
@@ -118,7 +124,11 @@ fn budgets_spend_deadline() {
     // A shared budget ends on a timeout; a split budget gives each holder its share and moves on.
     let mut shared = fetch(Budget::Shared);
     shared.start();
-    assert!(shared.step(reply(node(1), 9, Err(PeerRequestError::TimedOut))).is_empty());
+    assert!(
+        shared
+            .step(reply(node(1), 9, Err(PeerRequestError::TimedOut)))
+            .is_empty()
+    );
     assert_eq!(
         shared.finalize(),
         Ok(Fetched::Unavailable("no test holder answered".to_string()))
@@ -152,8 +162,12 @@ fn budgets_spend_deadline() {
 #[test]
 fn no_holders_unavailable() {
     // Without holders the fetch ends at start without a request.
-    let mut operation =
-        HolderFetchOperation::<String>::new(&[], &request(), Duration::from_secs(1), Budget::Shared);
+    let mut operation = HolderFetchOperation::<String>::new(
+        &[],
+        &request(),
+        Duration::from_secs(1),
+        Budget::Shared,
+    );
     assert!(operation.start().is_empty());
     assert!(operation.is_complete());
     assert!(matches!(operation.finalize(), Ok(Fetched::Unavailable(_))));

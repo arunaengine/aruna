@@ -552,7 +552,7 @@ impl Operation for AssignRolesOperation {
             AssignRolesState::ReadAdminState { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_auth_read(event, txn_id)
-            },
+            }
             AssignRolesState::WriteAdminState {
                 txn_id,
                 auth_doc,
@@ -564,13 +564,13 @@ impl Operation for AssignRolesOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                stale_conflict_deletes,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    stale_conflict_deletes,
+                )
+            }
             AssignRolesState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
@@ -580,7 +580,7 @@ impl Operation for AssignRolesOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written)
-            },
+            }
             AssignRolesState::CommitTransaction {
                 auth_doc,
                 admin_outbox_written,
@@ -589,7 +589,7 @@ impl Operation for AssignRolesOperation {
                 let auth_doc = auth_doc.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_commit_transaction(event, auth_doc, admin_outbox_written)
-            },
+            }
             AssignRolesState::ScheduleDocumentDrain { auth_doc } => {
                 let auth_doc = auth_doc.clone();
                 self.schedule_outbox_drain(event, auth_doc)

@@ -11,8 +11,8 @@ use aruna_core::structs::identity::group_delete::{
     GroupDeleteAction, GroupDeletePhase, GroupDeleteProof, GroupDeletionError,
 };
 
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::forward::authorize::{ForwardAuthError, authorize_forwarded_caller, is_sync_eligible};
 use crate::metadata::protocol::MetadataTransportMessage;
 
@@ -67,7 +67,8 @@ pub(super) async fn apply_control(
         .as_ref()
         .ok_or_else(|| GroupDeletionError::Unavailable("network handle is missing".into()))?;
     let config = drive(GetConfigOperation::new(*net.realm_id()), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or_else(|| GroupDeletionError::Unavailable("realm configuration is missing".into()))?;
     if !is_sync_eligible(&config, peer) {
         return Err(GroupDeletionError::Unauthorized);

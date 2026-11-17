@@ -21,9 +21,9 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use tempfile::tempdir;
 
 use super::*;
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use aruna_core::placement::transition::{TransitionRequest, plan_transition};
-use crate::document_repository::GetConfigOperation;
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };

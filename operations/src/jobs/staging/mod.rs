@@ -32,8 +32,8 @@ use self::walk::{
 use super::executor::{JobContext, JobRunOutcome};
 use super::store::{put_job_rows, read_state};
 use crate::connectors::get_connector::{GetSourceInput, GetSourceOperation};
-use crate::driver::drive;
 use crate::document_repository::GetConfigOperation;
+use crate::driver::drive;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::staging::reference::{MaterializeReferenceInput, stage_reference_blob};

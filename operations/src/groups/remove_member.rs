@@ -32,10 +32,10 @@ use thiserror::Error;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::notifications::emit::emit_notifications_effect;
 use crate::notifications::routing::{RoutingContext, route_resource_event};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoveFromInput {
@@ -510,7 +510,10 @@ impl RemoveFromOperation {
             admin_outbox_written,
             was_member,
         };
-        smallvec![crate::auth::epoch_due::mark_due(Some(self.input.group_id), txn_id)]
+        smallvec![crate::auth::epoch_due::mark_due(
+            Some(self.input.group_id),
+            txn_id
+        )]
     }
 
     fn handle_commit_transaction(
@@ -701,7 +704,7 @@ impl Operation for RemoveFromOperation {
             RemoveFromState::ReadAdminState { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.handle_auth_read(event, txn_id)
-            },
+            }
             RemoveFromState::WriteAdminState {
                 txn_id,
                 auth_doc,
@@ -715,14 +718,14 @@ impl Operation for RemoveFromOperation {
                 let conflict_delete_keys = conflict_delete_keys.clone();
                 let was_member = was_member.clone();
                 self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-                was_member,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    conflict_delete_keys,
+                    was_member,
+                )
+            }
             RemoveFromState::DeleteAdminConflicts {
                 txn_id,
                 auth_doc,
@@ -734,13 +737,13 @@ impl Operation for RemoveFromOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let was_member = was_member.clone();
                 self.handle_conflict_deletes(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                was_member,
-            )
-            },
+                    event,
+                    txn_id,
+                    auth_doc,
+                    admin_outbox_written,
+                    was_member,
+                )
+            }
             RemoveFromState::ReadBucketFence {
                 txn_id,
                 auth_doc,
@@ -763,7 +766,7 @@ impl Operation for RemoveFromOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let was_member = was_member.clone();
                 self.handle_commit_transaction(event, auth_doc, admin_outbox_written, was_member)
-            },
+            }
             RemoveFromState::ScheduleDocumentDrain {
                 auth_doc,
                 was_member,
@@ -771,7 +774,7 @@ impl Operation for RemoveFromOperation {
                 let auth_doc = auth_doc.clone();
                 let was_member = was_member.clone();
                 self.handle_drain_schedule(event, auth_doc, was_member)
-            },
+            }
             RemoveFromState::EmitNotifications { auth_doc } => {
                 let auth_doc = auth_doc.clone();
                 self.handle_emit_notifications(auth_doc)
@@ -912,10 +915,10 @@ pub mod test {
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::remove_member::{
         RemoveFromError, RemoveFromInput, RemoveFromOperation, RemoveFromState,
     };

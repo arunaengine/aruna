@@ -43,12 +43,12 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_core::placement::target_placement_ref;
 use crate::sync::outbox_record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::sync::replicate_documents::replicate_documents_effect;
 use crate::users::merge::{Coordinator, coordinator};
+use aruna_core::placement::target_placement_ref;
 
 const MAX_USER_LEN: usize = 256;
 
@@ -781,7 +781,7 @@ impl Operation for UpdateUserOperation {
             UpdateUserState::ReadStateRevision { txn_id } => {
                 let txn_id = txn_id.clone();
                 self.accept_admin_state(event, txn_id)
-            },
+            }
             UpdateUserState::WriteStateRevision {
                 txn_id,
                 user,
@@ -793,13 +793,13 @@ impl Operation for UpdateUserOperation {
                 let admin_outbox_written = admin_outbox_written.clone();
                 let stale_conflict_deletes = stale_conflict_deletes.clone();
                 self.handle_write_user(
-                event,
-                txn_id,
-                user,
-                admin_outbox_written,
-                stale_conflict_deletes,
-            )
-            },
+                    event,
+                    txn_id,
+                    user,
+                    admin_outbox_written,
+                    stale_conflict_deletes,
+                )
+            }
             UpdateUserState::DeleteAdminConflicts {
                 txn_id,
                 user,
@@ -809,7 +809,7 @@ impl Operation for UpdateUserOperation {
                 let user = user.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.accept_conflict_delete(event, txn_id, user, admin_outbox_written)
-            },
+            }
             UpdateUserState::ReadBucketFence {
                 txn_id,
                 user,
@@ -819,7 +819,7 @@ impl Operation for UpdateUserOperation {
                 let user = user.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_bucket_fence(event, txn_id, user, admin_outbox_written)
-            },
+            }
             UpdateUserState::CommitTransaction {
                 user,
                 admin_outbox_written,
@@ -828,7 +828,7 @@ impl Operation for UpdateUserOperation {
                 let user = user.clone();
                 let admin_outbox_written = admin_outbox_written.clone();
                 self.handle_commit_transaction(event, user, admin_outbox_written)
-            },
+            }
             UpdateUserState::ScheduleDocumentDrain { user } => {
                 let user = user.clone();
                 self.schedule_outbox_drain(event, user)
@@ -836,7 +836,7 @@ impl Operation for UpdateUserOperation {
             UpdateUserState::AnnounceUser { user } => {
                 let user = user.clone();
                 self.handle_announce_user(event, user)
-            },
+            }
             UpdateUserState::Init | UpdateUserState::Finish | UpdateUserState::Error => {
                 let got = format!("{event:?}");
                 self.unexpected_event("no event", got)

@@ -43,15 +43,15 @@ use aruna_tasks::TaskHandle;
 use tracing::{info, warn};
 use ulid::Ulid;
 
+use crate::document_repository::GetConfigOperation;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::records::keys::kind_prefix;
 use crate::jobs::records::rows::{ProjectionCache, from_bytes};
 use crate::jobs::records::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation};
 use crate::metadata::repository::{FILL_PAGE_SIZE, parse_registry_iter};
-use aruna_core::placement::{build_view, held_buckets};
-use crate::document_repository::GetConfigOperation;
 use crate::realm::mutate_placement::node_kind;
 use crate::sync::replicate_documents::{ReplicateDocumentsConfig, ReplicateDocumentsOperation};
+use aruna_core::placement::{build_view, held_buckets};
 
 /// Rows one snapshot scan reads per page.
 const SNAPSHOT_PAGE_SIZE: usize = 128;
@@ -941,9 +941,7 @@ async fn local_storage_bytes(ctx: &DriverContext) -> Result<u64, String> {
 
 /// The bytes this node's backends may store, from their quotas.
 fn storage_capacity(ctx: &DriverContext) -> Option<u64> {
-    crate::driver::node_routing(ctx)
-        .catalog
-        .capacity()
+    crate::driver::node_routing(ctx).catalog.capacity()
 }
 
 /// Counts documents this node holds, degrading to `None` with a warning so a

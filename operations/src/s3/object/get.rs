@@ -4,7 +4,6 @@
 
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
-use aruna_core::managed_copy::ManagedCopyError;
 use crate::blob::promote::{
     PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
 };
@@ -42,6 +41,7 @@ use aruna_core::keyspaces::{
     ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
+use aruna_core::managed_copy::ManagedCopyError;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_MD5;

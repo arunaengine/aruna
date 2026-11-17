@@ -417,31 +417,33 @@ impl Operation for ReadPolicyOperation {
             ReadPolicyState::Fetch { asked } => {
                 let asked = asked.clone();
                 match event {
-                Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
-                    PolicyFetchEvent::Fetched {
-                        publisher,
-                        document,
-                    } => self.accept_fetched(asked, publisher, *document),
-                    PolicyFetchEvent::NotFound => self.finish(Err(ReadPolicyError::NotFound {
-                        policy_id: self.config.policy_ref.policy_id,
-                    })),
-                    PolicyFetchEvent::Unavailable(reason) => {
-                        self.finish(Err(ReadPolicyError::Unavailable(reason)))
-                    }
-                },
-                other => self.unexpected_event("policy fetch result", format!("{other:?}")),
+                    Event::Net(NetEvent::PolicyFetch(fetched)) => match fetched {
+                        PolicyFetchEvent::Fetched {
+                            publisher,
+                            document,
+                        } => self.accept_fetched(asked, publisher, *document),
+                        PolicyFetchEvent::NotFound => self.finish(Err(ReadPolicyError::NotFound {
+                            policy_id: self.config.policy_ref.policy_id,
+                        })),
+                        PolicyFetchEvent::Unavailable(reason) => {
+                            self.finish(Err(ReadPolicyError::Unavailable(reason)))
+                        }
+                    },
+                    other => self.unexpected_event("policy fetch result", format!("{other:?}")),
+                }
             }
-            },
             ReadPolicyState::ReadGroupAuth { pending } => {
                 let pending = pending.clone();
                 match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    self.handle_group_auth(*pending, value)
+                    Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                        self.handle_group_auth(*pending, value)
+                    }
+                    Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
+                    other => {
+                        self.unexpected_event("group authorization read", format!("{other:?}"))
+                    }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.finish(Err(error.into())),
-                other => self.unexpected_event("group authorization read", format!("{other:?}")),
             }
-            },
             ReadPolicyState::Init | ReadPolicyState::Finish | ReadPolicyState::Error => {
                 smallvec![]
             }
@@ -652,7 +654,8 @@ mod pure_tests {
         let placement = config
             .policy_placement(policy.policy().policy_id)
             .expect("policy bucket resolves");
-        let expected = aruna_core::placement::read_holder_sets(&config, &placement).expect("holders");
+        let expected =
+            aruna_core::placement::read_holder_sets(&config, &placement).expect("holders");
         assert_eq!(holders.as_slice(), expected.as_slice());
 
         operation.step(answered(expected[0], &policy));

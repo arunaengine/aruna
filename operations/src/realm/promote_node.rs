@@ -22,8 +22,8 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use thiserror::Error;
 
-use crate::driver::{DriverContext, drive};
 use crate::document_repository::GetConfigOperation;
+use crate::driver::{DriverContext, drive};
 use crate::metadata::handle::{MetadataRequestDelivery, MetadataRequestError};
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, RealmKeyPem};
 use crate::metadata::{MetadataHandle, transport_message_kind};
@@ -81,7 +81,8 @@ pub async fn promote_node(
 ) -> Result<bool, PromoteNodeError> {
     let deadline = Instant::now() + CALL_BUDGET;
     let document = drive(GetConfigOperation::new(config.actor.realm_id), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or(PromoteNodeError::ConfigMissing)?;
     check_target(&document, config.actor.node_id, config.node_id)?;
     let pem = config
@@ -227,7 +228,8 @@ pub(crate) async fn serve_realm_key(
         .ok_or(MetadataReadError::Unavailable)?;
     let realm_id = *net_handle.realm_id();
     let document = drive(GetConfigOperation::new(realm_id), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     check_handoff(&document, peer, net_handle.node_id(), realm_id, &key)?;
     let write = StorageEffect::Write {
@@ -252,7 +254,8 @@ pub(crate) async fn serve_promotion_check(
         .as_ref()
         .ok_or(MetadataReadError::Unavailable)?;
     let document = drive(GetConfigOperation::new(*net_handle.realm_id()), context)
-        .await.ok()
+        .await
+        .ok()
         .ok_or(MetadataReadError::Unavailable)?;
     if !is_management(&document, peer) {
         return Err(MetadataReadError::Forbidden);

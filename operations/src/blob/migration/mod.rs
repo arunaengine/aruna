@@ -10,7 +10,6 @@ pub mod queue;
 pub mod rewrite;
 
 use crate::blob::cleanup_rows::schedule_cleanup_effect;
-use aruna_core::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use crate::blob::records::{blob_location_read, read_version_effect};
 use crate::groups::backends::{BackendFenceError, check_fence, fence_backend};
 use crate::groups::routing::{BucketRules, SnapshotOperation};
@@ -32,6 +31,7 @@ use aruna_core::keyspaces::{
     MIGRATION_AHEAD_KEYSPACE, MOVE_HANDOVER_KEYSPACE, RENAME_MOVE_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
 };
+use aruna_core::managed_copy::{ManagedCopyError, check_serveable, read_effect};
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::storage::backend_import::{
@@ -1670,8 +1670,8 @@ async fn rename_access(
 fn granted<T>(
     loaded: Result<T, crate::auth::request_authorization::AuthorizeError>,
 ) -> Result<Option<T>, String> {
-    use crate::auth::request_authorization::AuthorizeError;
     use crate::auth::enforcement::PolicyEnforcementError;
+    use crate::auth::request_authorization::AuthorizeError;
     match loaded {
         Ok(access) => Ok(Some(access)),
         Err(AuthorizeError::PermissionDenied)
@@ -2545,7 +2545,15 @@ pub async fn move_routing(
     let Some(info) = info.map_err(|error| error.to_string())? else {
         return Ok(None);
     };
-    let snapshot = crate::driver::drive(SnapshotOperation::new(&crate::driver::node_routing(context), info.group_id, BucketRules::of(&info)), context).await;
+    let snapshot = crate::driver::drive(
+        SnapshotOperation::new(
+            &crate::driver::node_routing(context),
+            info.group_id,
+            BucketRules::of(&info),
+        ),
+        context,
+    )
+    .await;
     snapshot.map(Some).map_err(|error| error.to_string())
 }
 
@@ -2667,8 +2675,8 @@ mod tests {
 
     #[test]
     fn retries_unavailable_policy() {
-        use crate::auth::request_authorization::AuthorizeError;
         use crate::auth::enforcement::PolicyEnforcementError;
+        use crate::auth::request_authorization::AuthorizeError;
         let unavailable = PolicyEnforcementError::Unavailable("down".to_string());
         assert!(granted::<()>(Err(AuthorizeError::Policy(unavailable))).is_err());
         let denied = PolicyEnforcementError::Denied {

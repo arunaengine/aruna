@@ -2,11 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::{DriverContext, drive};
 use crate::driver::node_routing;
+use crate::driver::{DriverContext, drive};
 use crate::groups::backends::query::GetBackendOperation;
-use crate::s3::bucket::bucket_jobs::{ActiveJob, active_job};
 use crate::groups::storage_routing::GroupInputsOperation;
+use crate::s3::bucket::bucket_jobs::{ActiveJob, active_job};
 use crate::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
