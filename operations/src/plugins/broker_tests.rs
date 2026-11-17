@@ -1033,7 +1033,7 @@ async fn object_references() {
 async fn superseded_merge_journaled() {
     // A merge older than the materialized status whose change is not applied yet is still
     // journaled as an update once; the sender holds it until its own dot is applied.
-    use crate::metadata::projector::project_create_event;
+    use crate::metadata::projector::project_create_events;
     use crate::metadata::record_reads::load_document_record;
     use aruna_core::events::Event;
     use aruna_core::metadata::{
@@ -1083,7 +1083,7 @@ async fn superseded_merge_journaled() {
         occurred_at_ms: older,
     };
     let local = Some(fixture.actor.node_id);
-    project_create_event(&broker.ctx, event.clone(), local)
+    project_create_events(&broker.ctx, vec![event.clone()], local)
         .await
         .unwrap();
     let source = source_key(&format!("dataset_updated/{}", event.event_id));

@@ -372,17 +372,6 @@ async fn read_create_event(
     Ok(event)
 }
 
-#[cfg(test)]
-pub(crate) async fn project_create_event(
-    context: &DriverContext,
-    event: MetadataEventRecord,
-    local_node_id: Option<NodeId>,
-) -> Result<(), MetadataProjectionError> {
-    project_create_events(context, vec![event], local_node_id)
-        .await
-        .map(|_| ())
-}
-
 pub async fn project_create_events(
     context: &DriverContext,
     events: Vec<MetadataEventRecord>,
@@ -1233,6 +1222,16 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::mpsc;
+
+    async fn project_create_event(
+        context: &DriverContext,
+        event: MetadataEventRecord,
+        local_node_id: Option<NodeId>,
+    ) -> Result<(), MetadataProjectionError> {
+        project_create_events(context, vec![event], local_node_id)
+            .await
+            .map(|_| ())
+    }
 
     struct RecordingTaskHandler {
         seen: mpsc::Sender<TaskKey>,

@@ -765,32 +765,6 @@ impl Operation for EnqueueTimer {
     }
 }
 
-/// The timer row of an install, if its timer ran before.
-#[cfg(test)]
-pub(crate) fn read_timer(install_id: Ulid) -> ReadTimer {
-    ReadTimer(timer_key(install_id))
-}
-
-#[derive(Debug, PartialEq)]
-pub struct ReadTimer(Vec<u8>);
-
-impl Operation for ReadTimer {
-    type Output = Option<TimerRow>;
-    type Error = StoreError;
-
-    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
-        Ok(Next::Call(read_call(vec![(
-            PLUGIN_RUNS_KEYSPACE,
-            self.0.clone(),
-        )])))
-    }
-
-    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
-        let [found] = values::<1>(answer)?;
-        Ok(Next::Done(found.map(|bytes| decode(&bytes)).transpose()?))
-    }
-}
-
 #[cfg(test)]
 #[path = "runs_tests.rs"]
 pub(crate) mod tests;
