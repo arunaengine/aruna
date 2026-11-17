@@ -8,8 +8,10 @@ mod consortium;
 mod reader;
 pub(crate) mod rewrite;
 pub mod upload;
+pub mod upload_store;
 
-use upload::{UploadClaimError, claim_rocrate_upload, delete_rocrate_upload};
+use upload::UploadClaimError;
+use upload_store::{claim_rocrate_upload, delete_rocrate_upload};
 
 use crate::jobs::export::archive::persist_checkpoint;
 use std::collections::{BTreeSet, HashMap};

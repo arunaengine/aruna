@@ -31,7 +31,7 @@ use aruna_core::transfer::{MAX_TRANSFER_SECS, import_key, intent_digest};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::driver::DriverContext;
 use aruna_operations::federation::import::{bound_upload, read_import};
-use aruna_operations::jobs::import::upload::{
+use aruna_operations::jobs::import::upload_store::{
     claim_rocrate_upload, delete_rocrate_upload, load_rocrate_upload, write_rocrate_upload,
 };
 use aruna_operations::jobs::runtime::JobsRuntime;

@@ -1893,7 +1893,7 @@ mod tests {
         upload.blake3 = blake3;
         upload.size = size;
         upload.claimed_by = Some(job_id);
-        crate::jobs::import::upload::write_rocrate_upload(&storage, &upload)
+        crate::jobs::import::upload_store::write_rocrate_upload(&storage, &upload)
             .await
             .unwrap();
         let checkpoint_value =
@@ -1947,7 +1947,7 @@ mod tests {
         let (rows, _) = list_job_entries(&storage, job_id, None, 10).await.unwrap();
         assert!(rows.is_empty(), "panic must not write a failure report");
         assert_eq!(
-            crate::jobs::import::upload::read_rocrate_upload(&storage, upload.upload_id)
+            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload.upload_id)
                 .await
                 .unwrap(),
             Some(upload)

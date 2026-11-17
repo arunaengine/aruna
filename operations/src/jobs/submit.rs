@@ -1019,7 +1019,7 @@ mod tests {
         import.source = ImportRoCrateSource::Upload { upload_id };
         let record =
             crate::jobs::import::upload::tests::upload_record(spec.created_by, upload_id, expires);
-        crate::jobs::import::upload::write_rocrate_upload(storage, &record)
+        crate::jobs::import::upload_store::write_rocrate_upload(storage, &record)
             .await
             .unwrap();
         upload_id
@@ -1337,10 +1337,11 @@ mod tests {
         let mut first = rocrate_spec(4, Some(b"first".to_vec()));
         let upload_id = seed_upload(&storage, &mut first, 3, 2_000).await;
         let created = drive(operation(first.clone()), &ctx).await.unwrap();
-        let stored = crate::jobs::import::upload::read_rocrate_upload(&storage, upload_id).await;
+        let stored =
+            crate::jobs::import::upload_store::read_rocrate_upload(&storage, upload_id).await;
         assert_eq!(stored.unwrap().unwrap().claimed_by, Some(created.job_id));
         let owner = first.created_by;
-        let reclaimed = crate::jobs::import::upload::claim_rocrate_upload(
+        let reclaimed = crate::jobs::import::upload_store::claim_rocrate_upload(
             &storage,
             upload_id,
             owner,

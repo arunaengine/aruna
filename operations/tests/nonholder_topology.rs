@@ -300,7 +300,7 @@ async fn seed_upload(node: &TestNode, owner: aruna_core::UserId, seed: u8) -> Te
         claimed_by: None,
     };
     let storage = &node.context.storage_handle;
-    aruna_operations::jobs::import::upload::write_rocrate_upload(storage, &record).await?;
+    aruna_operations::jobs::import::upload_store::write_rocrate_upload(storage, &record).await?;
     Ok(())
 }
 
