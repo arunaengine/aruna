@@ -40,7 +40,7 @@ impl ScanRepairsOperation {
             now_ms: 0,
             scan: RepairScan::default(),
             due: Vec::new(),
-            pages: PrefixPages::new(MIRROR_REPAIR_KEYSPACE, Vec::new(), REPAIR_PAGE_SIZE),
+            pages: PrefixPages::new(MIRROR_REPAIR_KEYSPACE, Vec::<u8>::new(), REPAIR_PAGE_SIZE),
             dropping: false,
         }
     }
