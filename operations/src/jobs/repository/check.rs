@@ -46,7 +46,7 @@ pub struct RequirementCheck {
 }
 
 /// The most findings a check returns.
-pub const MAX_CHECK_FINDINGS: usize = 100;
+const MAX_CHECK_FINDINGS: usize = 100;
 
 /// Checks the dataset's current crate against the connector's repository.
 pub async fn check_requirements(

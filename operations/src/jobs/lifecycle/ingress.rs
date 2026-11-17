@@ -62,7 +62,7 @@ use aruna_core::structs::storage::read_grant::{HEAD_OPERATION, READ_OPERATION};
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.
-pub const LAUNCHES_PER_WITNESS: u32 = 3;
+const LAUNCHES_PER_WITNESS: u32 = 3;
 
 /// What the caller learns about an accepted submission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

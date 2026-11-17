@@ -42,15 +42,15 @@ use crate::metadata::api::load_realm_config;
 use aruna_core::structs::execution::job::record_rows::{from_bytes, to_bytes};
 
 /// Domain of the stable witness order.
-pub const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
+const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";
 /// Families one drain pass considers.
-pub const WITNESS_DRAIN_BATCH: usize = 64;
+const WITNESS_DRAIN_BATCH: usize = 64;
 /// Spacing between drain passes while deadlines remain.
 pub const WITNESS_RETRY_AFTER: Duration = Duration::from_secs(1);
 /// Wall-clock budget of one launch offer.
-pub const OFFER_DEADLINE: Duration = Duration::from_secs(30);
+const OFFER_DEADLINE: Duration = Duration::from_secs(30);
 /// Declined targets one explain row retains.
-pub const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
+const MAX_DECLINED_TARGETS: usize = MAX_PLAN_CANDIDATES;
 
 const DEADLINE_KEY_BYTES: usize = 8 + 64;
 

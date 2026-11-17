@@ -31,12 +31,12 @@ use aruna_core::structs::execution::job::record_rows::{OutboxEntry, from_bytes, 
 /// Records one drain pass delivers before it re-arms.
 pub const OUTBOX_DRAIN_BATCH: usize = 32;
 /// Wall-clock budget of one record publish.
-pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
+const PUBLISH_DEADLINE: Duration = Duration::from_secs(10);
 /// Spacing between drain passes while entries remain undeliverable.
 pub const OUTBOX_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// Definitive refusals one record is offered through before it is dropped.
 /// Unreachable holders never count: only a holder's own refusal does.
-pub const MAX_PUBLISH_REJECTIONS: u32 = 16;
+const MAX_PUBLISH_REJECTIONS: u32 = 16;
 
 /// Kicks the outbox drain without persisting a timer of its own.
 pub fn schedule_outbox_drain(after: Duration) -> Effect {

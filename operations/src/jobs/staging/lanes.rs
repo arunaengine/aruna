@@ -24,7 +24,7 @@ use crate::staging::page::rows::MAX_ERROR_SAMPLE;
 
 /// Lanes one job walks at the same time. Each lane holds at most one listed page ahead, so a
 /// job holds a bounded number of pages whatever the source holds.
-pub(super) const LANE_LIMIT: usize = 4;
+const LANE_LIMIT: usize = 4;
 /// Slots per spec prefix: lane `slot` walks part `slot % PARTS` of prefix `slot / PARTS`.
 const PARTS: u64 = LANE_LIMIT as u64;
 /// One-key listings that split one prefix, whatever its key space looks like.

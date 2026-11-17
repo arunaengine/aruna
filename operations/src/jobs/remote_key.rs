@@ -37,7 +37,7 @@ use crate::jobs::store::state::read_job_record;
 use crate::tasks::task_persistence::persist_task_effect;
 
 /// Targets one registration may name; more is refused rather than scanned.
-pub const MAX_AWAITED: usize = 1024;
+const MAX_AWAITED: usize = 1024;
 
 /// Key node: registers `job_id` of `peer` on the locked keys of `targets`, then answers only
 /// the keys still locked. A key unlocked in between is either seen here or wakes the job later.
