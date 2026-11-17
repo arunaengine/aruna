@@ -62,7 +62,7 @@ pub enum ResolveUsersError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
     #[error("resolve users did not finish")]
     NotFinished,
@@ -97,7 +97,7 @@ impl ResolveUsersOperation {
         Ok(event)
     }
 
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: &'static str) -> Effects {
         self.fail(ResolveUsersError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
@@ -122,7 +122,7 @@ impl ResolveUsersOperation {
     }
 
     fn handle_resolve(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };
@@ -177,7 +177,7 @@ impl ResolveUsersOperation {
 
     /// Shows each merged account as its primary, which always is the root of the merge.
     fn handle_primaries(&mut self, event: Event, mut users: Vec<ResolvedUser>) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event("Event::Storage(StorageEvent::BatchReadResult)", got);
         };

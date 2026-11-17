@@ -150,7 +150,7 @@ pub enum RemoveGroupError {
     UnexpectedEvent {
         state: RemoveGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -173,7 +173,7 @@ impl RemoveGroupOperation {
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
                 RemoveGroupState::Auth,
@@ -203,7 +203,7 @@ impl RemoveGroupOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 RemoveGroupState::StartTransaction,
@@ -228,7 +228,7 @@ impl RemoveGroupOperation {
     }
 
     fn handle_get_group(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -273,7 +273,7 @@ impl RemoveGroupOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId, group: Group) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -427,7 +427,7 @@ impl RemoveGroupOperation {
         admin_outbox_written: bool,
         conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -463,7 +463,7 @@ impl RemoveGroupOperation {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -507,7 +507,7 @@ impl RemoveGroupOperation {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -544,7 +544,7 @@ impl RemoveGroupOperation {
         auth_doc: GroupAuthorizationDocument,
         admin_outbox_written: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -578,7 +578,7 @@ impl RemoveGroupOperation {
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }
@@ -598,7 +598,7 @@ impl RemoveGroupOperation {
         &mut self,
         state: RemoveGroupState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(

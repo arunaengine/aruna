@@ -145,7 +145,7 @@ pub enum AddUserError {
     UnexpectedEvent {
         state: AddUserState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
@@ -161,7 +161,7 @@ impl AddUserOperation {
     }
 
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
                 AddUserState::StartTransaction,
@@ -185,7 +185,7 @@ impl AddUserOperation {
     }
 
     fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
                 AddUserState::Auth,
@@ -239,7 +239,7 @@ impl AddUserOperation {
     }
 
     fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -396,7 +396,7 @@ impl AddUserOperation {
         stale_conflict_deletes: Vec<(KeySpace, Key)>,
         newly_added: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -429,7 +429,7 @@ impl AddUserOperation {
         admin_outbox_written: bool,
         newly_added: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -473,7 +473,7 @@ impl AddUserOperation {
         admin_outbox_written: bool,
         newly_added: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -520,7 +520,7 @@ impl AddUserOperation {
         admin_outbox_written: bool,
         newly_added: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -553,7 +553,7 @@ impl AddUserOperation {
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }
@@ -583,7 +583,7 @@ impl AddUserOperation {
         auth_doc: GroupAuthorizationDocument,
         newly_added: bool,
     ) -> Effects {
-        let got = format!("{event:?}");
+        let got = event.label();
         let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
@@ -649,7 +649,7 @@ impl AddUserOperation {
         &mut self,
         state: AddUserState,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
