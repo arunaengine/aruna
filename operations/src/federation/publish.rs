@@ -22,6 +22,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use url::Url;
 
+use crate::document_repository::read_effect;
+
 /// How often the reporting node renews its registration.
 pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
@@ -403,11 +405,7 @@ impl Operation for PublishSoonOperation {
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: config.storage_keyspace().to_string(),
-            key: config.storage_key(),
-            txn_id: None,
-        })]
+        smallvec![read_effect(&config, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
@@ -725,12 +723,7 @@ mod tests {
     }
 
     fn soon_read(realm_id: RealmId) -> Effect {
-        let target = DocumentTarget::RealmConfig { realm_id };
-        Effect::Storage(StorageEffect::Read {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            txn_id: None,
-        })
+        read_effect(&DocumentTarget::RealmConfig { realm_id }, None)
     }
 
     fn soon_config(config: &RealmConfigDocument) -> Event {
