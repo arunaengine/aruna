@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aruna_core::key_index::{KeyChange, KeyPage, KeyQuery};
 use aruna_core::keyspaces::prefix_upper_bound;
 use aruna_core::structs::execution::table::PREFIX_CHARS;
 use tantivy::directory::MmapDirectory;
@@ -61,53 +62,6 @@ pub enum KeyIndexError {
     Missing(PathBuf),
     #[error("range index task failed: {0}")]
     Task(String),
-}
-
-/// One live key of a range: its current version and size.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IndexedKey {
-    pub key: String,
-    pub size: u64,
-    pub version_id: Ulid,
-    /// The search terms of a searchable version.
-    pub terms: Option<MetaTerms>,
-}
-
-/// Free text tokens and exact `column=value` terms of one version's metadata.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct MetaTerms {
-    pub text: BTreeSet<String>,
-    pub exact: BTreeSet<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum KeyChange {
-    Put(IndexedKey),
-    Remove(String),
-}
-
-/// Keys between `start` and `end` in key order; `names` or `meta` keep keys with every token or
-/// term. Text tokens of three or more characters match by start; an overfull metadata one is left
-/// out, so callers check loaded versions. Terms cap matches at `limit`, else keys per segment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeyQuery {
-    pub start: Bound<String>,
-    pub end: Bound<String>,
-    pub names: Option<String>,
-    pub meta: Option<MetaTerms>,
-    pub limit: usize,
-}
-
-/// The live matching keys of the examined part of a window, in key order.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct KeyPage {
-    pub keys: Vec<String>,
-    /// Keys looked at: the matches of a query with terms, every walked key of one without.
-    pub examined: usize,
-    /// The last examined key when the window continues after it; `None` once it is read.
-    pub last: Option<String>,
-    /// When the index last committed, read after the search; `None` without a recorded time.
-    pub committed_at: Option<SystemTime>,
 }
 
 #[derive(Clone, Copy)]
@@ -186,16 +140,18 @@ impl RangeIndexes {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
+    /// Indexes with a smaller match scan limit, so tests reach the key walk.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_scan(root: impl Into<PathBuf>, scan_limit: u64) -> Self {
         Self {
             scan_limit,
             ..Self::new(root)
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_range_bytes(self, range_bytes: usize) -> Self {
+    /// Indexes with another range query budget, so tests reach the prefix check.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn with_range_bytes(self, range_bytes: usize) -> Self {
         Self {
             range_bytes,
             ..self
@@ -767,6 +723,7 @@ fn walk_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::key_index::{IndexedKey, MetaTerms};
 
     fn set() -> Ulid {
         Ulid::from_bytes([1; 16])

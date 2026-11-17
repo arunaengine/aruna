@@ -83,10 +83,7 @@ pub async fn search_local_objects(
             Err(error) => return Err(SearchObjectsError::Storage(error.to_string())),
         };
         if let Some(binding) = binding {
-            let indexes = context
-                .metadata_handle
-                .as_ref()
-                .map(|handle| handle.range_indexes());
+            let indexes = context.storage_handle.range_indexes();
             let search = index_search::RangeSearch {
                 binding,
                 indexes,

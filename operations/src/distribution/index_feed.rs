@@ -34,10 +34,11 @@ use ulid::Ulid;
 use super::feed_store::{
     Located, delete_row, drop_settled, iter, locate, put_row, read_many, split_key, storage_error,
 };
-use super::key_index::{IndexedKey, KeyChange, KeyIndexError, MetaTerms, RangeIndexes};
 use super::usage::{held_ranges, sum_held};
 use crate::driver::DriverContext;
 use crate::replication::members::read_record;
+use aruna_core::key_index::{IndexedKey, KeyChange, MetaTerms};
+use aruna_storage::key_index::{KeyIndexError, RangeIndexes};
 
 /// The key changes of one range and the feed rows they settle.
 type RangeBatch = (Vec<KeyChange>, Vec<(Key, Value)>);
@@ -437,12 +438,12 @@ struct Build {
     generation: u64,
 }
 
-/// Runs the feeder of this node until shutdown; nodes without metadata keep no indexes.
+/// Runs the feeder of this node until shutdown; nodes without range indexes feed none.
 pub fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
-    let Some(handle) = context.metadata_handle.as_ref() else {
+    let Some(indexes) = context.storage_handle.range_indexes() else {
         return;
     };
-    let mut feeder = Feeder::new(handle.range_indexes(), FeedLimits::default());
+    let mut feeder = Feeder::new(indexes, FeedLimits::default());
     let token = shutdown.token();
     shutdown.spawn(async move {
         loop {

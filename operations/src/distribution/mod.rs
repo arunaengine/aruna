@@ -17,7 +17,6 @@ pub(crate) mod imports;
 pub mod index_feed;
 pub mod inventory;
 pub mod keep;
-pub mod key_index;
 pub mod lifecycle;
 pub mod publish;
 pub mod pull;

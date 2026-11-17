@@ -861,12 +861,13 @@ fn record_line(row: usize, meta: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_pages_resume() {
     use crate::distribution::index_feed::{FeedLimits, Feeder};
-    use crate::distribution::key_index::{KeyQuery, RangeIndexes};
     use crate::staging::page::rows::MAX_PAGE_ENTRIES;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::key_index::KeyQuery;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+    use aruna_storage::key_index::RangeIndexes;
     use std::ops::Bound;
 
     let (endpoint, site, server) = serve(Site::ncbi).await;
@@ -1093,7 +1094,7 @@ async fn import_records(
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
         use crate::distribution::index_feed::{FeedLimits, Feeder};
-        use crate::distribution::key_index::RangeIndexes;
+        use aruna_storage::key_index::RangeIndexes;
         let mut feeder = Feeder::new(Arc::new(RangeIndexes::new(indexes)), FeedLimits::default());
         while background && !stopping.is_cancelled() {
             if !feeder.pass(&feed).await {

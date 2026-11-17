@@ -18,8 +18,8 @@ use tempfile::TempDir;
 use super::super::search_local_objects;
 use super::super::tests::{Fixture, input, seed_materialized, setup, write_value};
 use super::*;
-use crate::distribution::key_index::{IndexedKey, KeyChange, MetaTerms};
 use crate::distribution::test_record::{binding, record, store_record};
+use aruna_core::key_index::{IndexedKey, KeyChange, MetaTerms};
 
 struct Distributed {
     fixture: Fixture,

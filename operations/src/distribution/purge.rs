@@ -683,11 +683,10 @@ async fn clear_range_rows(
 
 /// Removes every generation of the range's search index from disk.
 async fn drop_index(context: &DriverContext, set_id: Ulid, range_id: Ulid) -> Result<(), String> {
-    let Some(metadata) = &context.metadata_handle else {
+    let Some(indexes) = context.storage_handle.range_indexes() else {
         return Ok(());
     };
-    (metadata.range_indexes().prune(set_id, range_id, None).await)
-        .map_err(|error| error.to_string())
+    (indexes.prune(set_id, range_id, None).await).map_err(|error| error.to_string())
 }
 
 /// Deletes every row under `prefix` in bounded batches.

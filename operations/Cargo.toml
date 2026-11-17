@@ -58,7 +58,6 @@ smallvec = { workspace = true }
 spareval = { workspace = true }
 spargebra = { workspace = true }
 sysinfo = { workspace = true }
-tantivy = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -75,6 +74,7 @@ url = { workspace = true }
 
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
 axum = { workspace = true }
 flate2 = { workspace = true }
 proptest = { workspace = true }

@@ -6,9 +6,9 @@
 use std::ops::Bound;
 
 use super::*;
-use crate::distribution::key_index::KeyQuery;
 use crate::distribution::test_record::{record, searched, store_record};
 use crate::distribution::test_store::{apply, context, get, install, open, purge, range, write};
+use aruna_core::key_index::KeyQuery;
 use aruna_core::structs::storage::distribution::inventory::head_position;
 use tempfile::TempDir;
 

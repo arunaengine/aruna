@@ -378,8 +378,8 @@ pub async fn read_status(
 /// Adds this node's search index progress and, for the ranges it coordinates, what it still
 /// owes each member. Both are hints, so a failed read leaves them out.
 pub async fn add_progress(context: &Arc<DriverContext>, status: &mut DistributionStatus) {
-    if let Some(handle) = context.metadata_handle.as_ref() {
-        let progress = range_progress(context, &handle.range_indexes(), &status.bucket).await;
+    if let Some(indexes) = context.storage_handle.range_indexes() {
+        let progress = range_progress(context, &indexes, &status.bucket).await;
         let progress = progress.unwrap_or_default();
         for range in &mut status.ranges {
             range.search_index = progress.get(&range.range_id).copied();
