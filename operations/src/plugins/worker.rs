@@ -66,8 +66,7 @@ use super::replay::{
     COVERAGE_ROW, CoverageRow, StartReplay, growth, replay_page, replay_rows, replay_scan, row_key,
 };
 use super::rows::{
-    RowsOperation, Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows,
-    write_rows,
+    Scan, StoreError, decode, encode, page_rows, row as row_of, scan_rows, write_rows,
 };
 use super::runs::{
     ADMISSIONS, Ended, RunError, TICK, conclude, drop_run, ended, expired_runs, read_run, save_run,
@@ -636,7 +635,7 @@ async fn decide(
     // Its dedup record would be gone, so a run now could repeat one already made.
     if now_ms > row.event.anchor_ms.saturating_add(DEDUP_RETENTION_MS) {
         let late = GapCount::new(local, row, GapReason::Late);
-        drive(RowsOperation::transaction(LateEvent(late)), ctx).await?;
+        drive(LateEvent(late), ctx).await?;
         return Ok(Outcome::Expired);
     }
     let verdict = judge(ctx, config, local, row, now_ms).await?;
@@ -856,7 +855,7 @@ pub(crate) async fn notify_work(
         let finished = event_run(config, install, &event, now_ms);
         let _admitting = ADMISSIONS.lock().await;
         let notify = NotifyWork::new(install.install_id, row.work_id, finished);
-        match drive(RowsOperation::transaction(notify), ctx).await {
+        match drive(notify, ctx).await {
             Ok(true) => notified += 1,
             Ok(false) => {}
             // A full queue takes the completion at a later pass.
@@ -894,7 +893,7 @@ pub(crate) async fn recheck_waiting(
             },
         };
         let settle = SettleWaiting::new(key, waiting, verdict, (local, now_ms));
-        drive(RowsOperation::transaction(settle), ctx).await?;
+        drive(settle, ctx).await?;
         left += 1;
     }
     Ok(left)
@@ -948,7 +947,7 @@ pub(crate) async fn plan_replays<F: Future<Output = Option<ClockReading>>>(
             None => None,
         };
         let replay = StartReplay::new(target, (next, old), (start, by), now_ms);
-        drive(RowsOperation::direct(replay), ctx).await?;
+        drive(replay, ctx).await?;
         started += 1;
     }
     Ok(started)

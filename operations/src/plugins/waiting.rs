@@ -4,11 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{PLUGIN_QUEUE_KEYSPACE, PLUGIN_WAITING_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::GapReason;
 
 use super::decide::{GapCount, Verdict, WaitingRow, seen_row};
-use super::rows::{Answer, Ask, Plan, Row, StoreError, Turn, done};
+use super::rows::{Row, StoreError, delete_call, done};
 use super::runs::{Admission, RunError};
 use aruna_core::plugin_runs::Outcome;
 
@@ -46,25 +48,29 @@ impl SettleWaiting {
         }
     }
 
-    fn record(&mut self, outcome: Outcome, mut rows: Vec<Row>) -> Result<Turn<()>, StoreError> {
+    fn record(&mut self, outcome: Outcome, mut rows: Vec<Row>) -> Result<Next<()>, StoreError> {
         rows.push(seen_row(&self.waiting.row, &outcome, self.now_ms)?);
         self.phase = SettlePhase::Writing;
-        Ok(Turn::Ask(Ask::Write(rows)))
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
-impl Plan for SettleWaiting {
+impl Operation for SettleWaiting {
     type Output = ();
     type Error = StoreError;
 
-    fn first(&mut self) -> Result<Turn<()>, StoreError> {
-        Ok(Turn::Ask(Ask::Delete(vec![
+    fn transaction(&self) -> bool {
+        true
+    }
+
+    fn first(&mut self) -> Result<Next<()>, StoreError> {
+        Ok(Next::Call(delete_call(vec![
             (PLUGIN_WAITING_KEYSPACE, self.key.clone()),
             (PLUGIN_QUEUE_KEYSPACE, self.key.clone()),
         ])))
     }
 
-    fn next(&mut self, answer: Answer) -> Result<Turn<()>, StoreError> {
+    fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         match std::mem::replace(&mut self.phase, SettlePhase::Writing) {
             SettlePhase::Freeing(verdict, gap) => {
                 done(answer)?;
@@ -73,13 +79,13 @@ impl Plan for SettleWaiting {
                         let admission = Admission::new(*run);
                         let ask = admission.ask();
                         self.phase = SettlePhase::Admitting(admission);
-                        Ok(Turn::Ask(ask))
+                        Ok(Next::Call(ask))
                     }
                     Some(Verdict::Denied(reason)) => self.record(Outcome::Denied(reason), vec![]),
                     _ => {
                         let ask = gap.ask();
                         self.phase = SettlePhase::Counting(gap);
-                        Ok(Turn::Ask(ask))
+                        Ok(Next::Call(ask))
                     }
                 }
             }
@@ -87,7 +93,7 @@ impl Plan for SettleWaiting {
                 Ok(None) => {
                     let ask = admission.ask();
                     self.phase = SettlePhase::Admitting(admission);
-                    Ok(Turn::Ask(ask))
+                    Ok(Next::Call(ask))
                 }
                 Ok(Some(rows)) => self.record(Outcome::Queued, rows),
                 Err(RunError::Store(error)) => Err(error),
@@ -99,7 +105,7 @@ impl Plan for SettleWaiting {
             }
             SettlePhase::Writing => {
                 done(answer)?;
-                Ok(Turn::Finish(()))
+                Ok(Next::Done(()))
             }
         }
     }
