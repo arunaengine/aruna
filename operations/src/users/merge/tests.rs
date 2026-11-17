@@ -9,10 +9,9 @@ use crate::auth::revoke_token::RevokeTokenError;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::operation::{EffectOperation, Operation};
+use aruna_core::operation::Operation;
 use aruna_core::reducer::AdminDocumentState;
 use aruna_core::storage_entries::reducer_state_entry;
 use aruna_core::storage_entries::subject_index_value;
@@ -22,7 +21,7 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::{TxnId, Value};
+use aruna_core::types::Value;
 use aruna_core::user::validation::{
     DEACTIVATED_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX, SERVICE_GROUP_ATTRIBUTE,
 };
@@ -96,16 +95,6 @@ fn bytes(user: &User) -> Option<Value> {
 
 fn read(values: Vec<Option<Value>>) -> IoResult {
     IoResult::Values(values)
-}
-
-/// A batch read answer for the handoff, which still runs on effects.
-fn batch_read(values: Vec<Option<Value>>) -> Event {
-    Event::Storage(StorageEvent::BatchReadResult {
-        values: values
-            .into_iter()
-            .map(|value| (ByteView::from(Vec::new()), value))
-            .collect(),
-    })
 }
 
 fn role(name: &str, permission: Permission, users: &[UserId]) -> Role {
@@ -733,28 +722,24 @@ fn hand_off_in(
     pinned: Option<NodeId>,
     extra: &[(NodeId, RealmNodeKind)],
 ) -> Result<Option<NodeId>, MergeError> {
-    use super::handoff::{HandoffConfig, HandoffOperation};
+    use super::handoff::{HandoffConfig, HandoffWrite};
     let mut realm = RealmConfigDocument::new(REALM, Vec::new(), 3);
     realm.ensure_node(node(), RealmNodeKind::Management);
     realm.ensure_node(target, RealmNodeKind::Management);
     for (node_id, kind) in extra {
         realm.ensure_node(*node_id, kind.clone());
     }
-    let mut operation = HandoffOperation::new(HandoffConfig {
+    let mut write = HandoffWrite::new(HandoffConfig {
         actor: actor(id(1)),
         auth_context: portal(id(1)),
         node_id: target,
     });
-    operation.start();
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-    ));
-    let txn_id = TxnId::generate();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    write.first().unwrap();
     let realm_bytes = Some(realm.to_bytes(&actor(id(1))).unwrap().into());
-    let effects = operation.step(batch_read(vec![realm_bytes, pin(pinned)]));
-    let Some(Effect::Storage(StorageEffect::BatchWrite { writes, .. })) = effects.first() else {
-        return operation.finalize().map(|()| None);
+    let writes = match write.next(read(vec![realm_bytes, pin(pinned)])) {
+        Ok(Next::Call(IoCall::Write(writes))) => writes,
+        Err(error) => return Err(error),
+        _ => panic!("expected the handoff write"),
     };
     let state = writes
         .iter()
@@ -762,6 +747,33 @@ fn hand_off_in(
         .map(|(_, _, value)| aruna_core::reducer::decode_reducer_state(value).unwrap())
         .unwrap();
     Ok(state.materialized_merge_coordinator())
+}
+
+#[test]
+fn handoff_needs_permission() {
+    // A denied check refuses the handoff; an allowed one hands it to the write transaction.
+    use super::handoff::{HandoffConfig, HandoffOperation};
+    use aruna_core::errors::AuthorizationError;
+    let handoff = || {
+        let mut operation = HandoffOperation::new(HandoffConfig {
+            actor: actor(id(1)),
+            auth_context: portal(id(1)),
+            node_id: node(),
+        });
+        operation.first().unwrap();
+        operation
+    };
+    let allowed =
+        |allowed| IoResult::Child(ChildOutcome::new(Ok::<_, AuthorizationError>(allowed)));
+    assert_eq!(
+        handoff().next(allowed(false)).err(),
+        Some(MergeError::Unauthorized)
+    );
+    let mut operation = handoff();
+    let write = operation.next(allowed(true));
+    assert!(matches!(write, Ok(Next::Call(IoCall::Child(_)))));
+    let finished = IoResult::Child(ChildOutcome::new(Ok::<(), MergeError>(())));
+    assert!(matches!(operation.next(finished), Ok(Next::Done(()))));
 }
 
 #[test]
