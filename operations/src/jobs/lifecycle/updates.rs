@@ -69,25 +69,6 @@ fn chain_tip(updates: &[&ExecutionUpdate], root: [u8; 32]) -> Option<(u64, [u8; 
     Some((next, previous))
 }
 
-/// What one publication did: whether its obligation is met, and whether it stored a new
-/// record, which the dashboard shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Publication {
-    pub done: bool,
-    pub changed: bool,
-}
-
-impl Publication {
-    const PENDING: Self = Self {
-        done: false,
-        changed: false,
-    };
-    const DONE: Self = Self {
-        done: true,
-        changed: false,
-    };
-}
-
 /// This node and the realm it serves, or `None` without a net transport.
 type Serving = Option<(NodeId, RealmId)>;
 
@@ -105,7 +86,7 @@ pub async fn publish_state(
         context.node_and_realm(),
         unix_timestamp_millis(),
     );
-    published(context, drive(operation, context).await)
+    published(drive(operation, context).await)
 }
 
 /// Publishes a non-terminal state of a receipted execution. A job with no
@@ -129,7 +110,7 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
         context.node_and_realm(),
         unix_timestamp_millis(),
     );
-    published(context, drive(operation, context).await)
+    published(drive(operation, context).await)
 }
 
 /// Retries terminal publication and capacity release for every durable local
@@ -138,24 +119,15 @@ pub async fn publish_terminal(context: &DriverContext, record: &JobRecord) -> bo
 pub async fn settle_terminals(context: &DriverContext) -> Result<bool, String> {
     let operation =
         SettleTerminalsOperation::new(context.node_and_realm(), unix_timestamp_millis());
-    let settled = drive(operation, context)
+    drive(operation, context)
         .await
-        .map_err(|error| error.to_string())?;
-    if settled.changed {
-        context.notify_dashboard_change();
-    }
-    Ok(!settled.done)
+        .map_err(|error| error.to_string())
 }
 
-/// Whether a publication met its obligation; a new record also refreshes the dashboard.
-fn published(context: &DriverContext, outcome: Result<Publication, LifecycleError>) -> bool {
+/// Whether a publication met its obligation.
+fn published(outcome: Result<bool, LifecycleError>) -> bool {
     match outcome {
-        Ok(publication) => {
-            if publication.changed {
-                context.notify_dashboard_change();
-            }
-            publication.done
-        }
+        Ok(done) => done,
         Err(error) => {
             warn!(error = %error, "Execution publication failed");
             false
@@ -171,7 +143,7 @@ enum PublishState {
     Append,
 }
 
-type PublishStep = Result<Next<Publication>, LifecycleError>;
+type PublishStep = Result<Next<bool>, LifecycleError>;
 
 /// Publishes one state of the local execution. The sequence and the previous
 /// digest are derived from the records already stored, so a replay of the same
@@ -215,7 +187,7 @@ impl PublishStateOperation {
     fn pending(&self, reason: &'static str) -> PublishStep {
         let chain = &self.chain;
         warn!(job_id = %chain.job_id, execution_id = %chain.execution_id, "{reason}");
-        Ok(Next::Done(Publication::PENDING))
+        Ok(Next::Done(false))
     }
 
     /// The chain is extended only from evidence proven complete: the receipt
@@ -244,7 +216,7 @@ impl PublishStateOperation {
             Ok(records) => records,
             Err(error) => {
                 warn!(error = %error, "Execution update read is incomplete; publication deferred");
-                return Ok(Next::Done(Publication::PENDING));
+                return Ok(Next::Done(false));
             }
         };
         let chain = self.chain;
@@ -258,7 +230,7 @@ impl PublishStateOperation {
             })
             .collect();
         if mine.iter().any(|update| update.state == self.state) {
-            return Ok(Next::Done(Publication::DONE));
+            return Ok(Next::Done(true));
         }
         let Some((sequence, previous)) = chain_tip(&mine, self.root) else {
             return self.pending("Execution update chain is not contiguous");
@@ -297,7 +269,7 @@ impl PublishStateOperation {
             Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Signed(envelope))) => envelope,
             Event::Net(NetEvent::ExecutionSign(ExecutionSignEvent::Unavailable(reason))) => {
                 warn!(reason = %reason, "Execution update signing failed");
-                return Ok(Next::Done(Publication::PENDING));
+                return Ok(Next::Done(false));
             }
             other => {
                 return Err(IoError::Unexpected {
@@ -334,7 +306,7 @@ impl PublishStateOperation {
                     error = %error,
                     "Execution update append failed"
                 );
-                return Ok(Next::Done(Publication::PENDING));
+                return Ok(Next::Done(false));
             }
         };
         if !matches!(
@@ -347,7 +319,7 @@ impl PublishStateOperation {
                 admission = ?outcome.admission,
                 "Execution update was not admitted"
             );
-            return Ok(Next::Done(Publication::PENDING));
+            return Ok(Next::Done(false));
         }
         debug!(state = self.state.name(), "Execution update published");
         let mut calls = Vec::new();
@@ -361,16 +333,19 @@ impl PublishStateOperation {
             Duration::ZERO,
         ))));
         // A duplicate is a retry of a stored state; only a new record is a change.
-        let output = Publication {
-            done: true,
-            changed: matches!(outcome.admission, Admission::Authentic),
-        };
-        Ok(Next::Then { output, calls })
+        if matches!(outcome.admission, Admission::Authentic) {
+            let changed = Effect::Net(NetEffect::DashboardChanged);
+            calls.push(IoCall::Effect(Box::new(changed)));
+        }
+        Ok(Next::Then {
+            output: true,
+            calls,
+        })
     }
 }
 
 impl Operation for PublishStateOperation {
-    type Output = Publication;
+    type Output = bool;
     type Error = LifecycleError;
 
     fn first(&mut self) -> PublishStep {
@@ -386,7 +361,7 @@ impl Operation for PublishStateOperation {
 
     fn next(&mut self, result: IoResult) -> PublishStep {
         let Some(serving) = self.serving else {
-            return Ok(Next::Done(Publication::PENDING));
+            return Ok(Next::Done(false));
         };
         match self.stage {
             PublishState::Receipts => self.receipts(result),
@@ -402,7 +377,7 @@ enum TerminalState {
     Held,
     Chain,
     Publish(Ulid),
-    Release(bool),
+    Release,
 }
 
 /// Publishes the terminal state of a receipted execution and releases its
@@ -428,7 +403,7 @@ impl PublishTerminalOperation {
 
     fn deferred(&self, reason: &'static str) -> PublishStep {
         warn!(job_id = %self.record.job_id, "{reason}");
-        Ok(Next::Done(Publication::PENDING))
+        Ok(Next::Done(false))
     }
 
     fn chain(&mut self, result: IoResult) -> PublishStep {
@@ -440,12 +415,12 @@ impl PublishTerminalOperation {
                     error = %error,
                     "Execution reservation read failed; terminal publication deferred"
                 );
-                return Ok(Next::Done(Publication::PENDING));
+                return Ok(Next::Done(false));
             }
         };
         // No reservation is a purely local execution: it owes nothing here.
         let Some(reservation) = held.into_iter().next() else {
-            return Ok(Next::Done(Publication::DONE));
+            return Ok(Next::Done(true));
         };
         self.stage = TerminalState::Chain;
         let chain = ExecutionChainOperation::of_execution(
@@ -487,12 +462,12 @@ impl PublishTerminalOperation {
 }
 
 impl Operation for PublishTerminalOperation {
-    type Output = Publication;
+    type Output = bool;
     type Error = LifecycleError;
 
     fn first(&mut self) -> PublishStep {
         if terminal_state(&self.record).is_none() {
-            return Ok(Next::Done(Publication::DONE));
+            return Ok(Next::Done(true));
         }
         Ok(Next::Call(IoCall::child(HeldReservations::of_job(
             self.record.job_id,
@@ -501,49 +476,41 @@ impl Operation for PublishTerminalOperation {
 
     fn next(&mut self, result: IoResult) -> PublishStep {
         let Some(state) = terminal_state(&self.record) else {
-            return Ok(Next::Done(Publication::DONE));
+            return Ok(Next::Done(true));
         };
         match self.stage {
             TerminalState::Held => self.chain(result),
             TerminalState::Chain => self.publish(result, state),
             TerminalState::Publish(execution_id) => {
-                let publication = result
-                    .child::<Publication, LifecycleError>()?
-                    .unwrap_or(Publication::PENDING);
-                if !publication.done {
-                    return Ok(Next::Done(publication));
+                if !result.child::<bool, LifecycleError>()?.unwrap_or(false) {
+                    return Ok(Next::Done(false));
                 }
-                self.stage = TerminalState::Release(publication.changed);
+                self.stage = TerminalState::Release;
                 let release = ReleaseExecutionOperation::new(execution_id);
                 Ok(Next::Call(IoCall::child(release)))
             }
-            TerminalState::Release(changed) => {
+            TerminalState::Release => {
                 if let Err(error) = result.child::<bool, LifecycleError>()? {
                     warn!(error = %error, "Execution reservation release failed");
-                    return Ok(Next::Done(Publication {
-                        done: false,
-                        changed,
-                    }));
+                    return Ok(Next::Done(false));
                 }
-                Ok(Next::Done(Publication {
-                    done: true,
-                    changed,
-                }))
+                Ok(Next::Done(true))
             }
         }
     }
 }
 
 /// Retries terminal publication and capacity release for every durable local
-/// terminal execution that still has a reservation. A result that is not `done` means at
-/// least one obligation stayed pending, so the caller must run it again.
+/// terminal execution that still has a reservation. `true` means at least one obligation
+/// stayed pending, so the caller must run it again.
 #[derive(Debug, PartialEq)]
 pub struct SettleTerminalsOperation {
     serving: Serving,
     now_ms: u64,
     held: VecDeque<JobReservationRecord>,
     current: Option<JobReservationRecord>,
-    settled: Publication,
+    /// Whether an obligation stayed pending, so the settle must run again.
+    pending: bool,
     publishing: bool,
 }
 
@@ -554,7 +521,7 @@ impl SettleTerminalsOperation {
             now_ms,
             held: VecDeque::new(),
             current: None,
-            settled: Publication::DONE,
+            pending: false,
             publishing: false,
         }
     }
@@ -562,7 +529,7 @@ impl SettleTerminalsOperation {
     /// Reads the job of the next held reservation, or ends once none is left.
     fn read_next(&mut self) -> PublishStep {
         let Some(reservation) = self.held.pop_front() else {
-            return Ok(Next::Done(self.settled));
+            return Ok(Next::Done(self.pending));
         };
         let row = (JOB_KEYSPACE.to_string(), job_record_key(reservation.job_id));
         self.current = Some(reservation);
@@ -588,11 +555,7 @@ impl SettleTerminalsOperation {
 
     fn published(&mut self, result: IoResult) -> PublishStep {
         self.publishing = false;
-        let publication = result
-            .child::<Publication, LifecycleError>()?
-            .unwrap_or(Publication::PENDING);
-        self.settled.changed |= publication.changed;
-        if !publication.done {
+        if !result.child::<bool, LifecycleError>()?.unwrap_or(false) {
             if let Some(reservation) = &self.current {
                 warn!(
                     job_id = %reservation.job_id,
@@ -600,14 +563,14 @@ impl SettleTerminalsOperation {
                     "Terminal obligation remains pending; the reservation stays held"
                 );
             }
-            self.settled.done = false;
+            self.pending = true;
         }
         self.read_next()
     }
 }
 
 impl Operation for SettleTerminalsOperation {
-    type Output = Publication;
+    type Output = bool;
     type Error = LifecycleError;
 
     fn first(&mut self) -> PublishStep {
