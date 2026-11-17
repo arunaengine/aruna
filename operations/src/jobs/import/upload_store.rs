@@ -7,14 +7,11 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::ROCRATE_UPLOAD_KEYSPACE;
 use aruna_core::structs::execution::job::{JobId, RoCrateUploadRecord};
-use aruna_core::types::TxnId;
 use byteview::ByteView;
 use ulid::Ulid;
 
-use super::upload::{UploadClaimError, claim_upload};
-use crate::driver::DriverContext;
-use crate::jobs::MUTATE_MAX_ATTEMPTS;
-use crate::jobs::store::query::{CommitStep, commit_write};
+use super::upload::{ClaimUploadOperation, UploadClaimError};
+use crate::driver::{DriverContext, drive_retry};
 use aruna_core::structs::execution::job::upload_key;
 
 pub async fn read_rocrate_upload(
@@ -76,34 +73,8 @@ pub async fn claim_rocrate_upload(
     job_id: JobId,
     now_ms: u64,
 ) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_txn(context)
-            .await
-            .map_err(UploadClaimError::Storage)?;
-        let result = claim_in_txn(context, txn_id, upload_id, owner, job_id, now_ms).await;
-        let record = match result {
-            Ok(record) => record,
-            Err(error) => {
-                abort_txn(context, txn_id).await;
-                return Err(error);
-            }
-        };
-        match commit_write(
-            context,
-            txn_id,
-            attempt,
-            "upload claim exhausted conflict retries",
-        )
-        .await
-        .map_err(|error| UploadClaimError::Storage(error.to_string()))?
-        {
-            CommitStep::Committed => return Ok(record),
-            CommitStep::Retry => continue,
-        }
-    }
-    Err(UploadClaimError::Storage(
-        "upload claim exhausted conflict retries".to_string(),
-    ))
+    let build = || ClaimUploadOperation::new(upload_id, owner, job_id, now_ms);
+    drive_retry(build, context, &upload_id.to_bytes()).await
 }
 
 pub async fn delete_rocrate_upload(
@@ -130,88 +101,4 @@ pub async fn delete_rocrate_upload(
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected upload delete event: {}", other.label())),
     }
-}
-
-async fn claim_in_txn(
-    context: &DriverContext,
-    txn_id: TxnId,
-    upload_id: Ulid,
-    owner: UserId,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    let value = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => value,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            return Err(UploadClaimError::NotFound);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(UploadClaimError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(UploadClaimError::Storage(format!(
-                "unexpected upload claim read event: {}",
-                other.label()
-            )));
-        }
-    };
-    let mut record: RoCrateUploadRecord = postcard::from_bytes(value.as_ref())
-        .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    if !claim_upload(&mut record, owner, job_id, now_ms)? {
-        return Ok(record);
-    }
-    let value = postcard::to_allocvec(&record)
-        .map(ByteView::from)
-        .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(record),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(UploadClaimError::Storage(error.to_string()))
-        }
-        other => Err(UploadClaimError::Storage(format!(
-            "unexpected upload claim write event: {}",
-            other.label()
-        ))),
-    }
-}
-
-async fn start_txn(context: &DriverContext) -> Result<TxnId, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!(
-            "unexpected upload transaction event: {}",
-            other.label()
-        )),
-    }
-}
-
-async fn abort_txn(context: &DriverContext, txn_id: TxnId) {
-    let _ = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
 }

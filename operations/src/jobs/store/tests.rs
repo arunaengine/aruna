@@ -2447,23 +2447,13 @@ async fn external_live_skipped() {
     assert_eq!(stored.state, JobState::Running);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn capacity_not_conflict() {
-    // Cleanup-capacity exhaustion must fail fast, never feed the OCC retry.
-    let (storage, receivers) = StorageHandle::new();
-    let context = crate::testing::test_context(storage.clone());
-    let receiver = receivers.foreground;
-    let actor = std::thread::spawn(move || {
-        let (_effect, response_tx, ..) = receiver.recv().expect("commit effect arrives");
-        assert!(response_tx.send(StorageEvent::Error {
-            error: StorageError::CleanupCapacity,
-        }));
-    });
-
-    let result = commit_txn(&context, Ulid::generate()).await;
-    actor.join().expect("storage actor finishes");
-
-    assert!(matches!(result, CommitResult::Failed(_)));
+#[test]
+fn capacity_not_conflict() {
+    // Cleanup-capacity exhaustion must fail fast, never feed the conflict retry.
+    use aruna_core::calls::IoError;
+    use aruna_core::errors::StorageError;
+    let error = JobMutationError::from(IoError::Storage(StorageError::CleanupCapacity));
+    assert!(matches!(error, JobMutationError::Storage(_)));
 }
 
 // A listing reads the record of an index row that carries none, and a short page ends it.
