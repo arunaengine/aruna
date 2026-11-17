@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::UserId;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventKind, watch_path_matches,
 };
@@ -12,7 +13,7 @@ use tracing::warn;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::notifications::client::deliver_events_remote;
+use crate::notifications::client::{HolderRequestOperation, events_delivered};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::digest::InterestOperation;
 use crate::notifications::watch::expand::expand_watch_events;
@@ -82,10 +83,13 @@ pub async fn emit_watch_event(context: &DriverContext, event: WatchEvent) {
                     warn!(%error, "Failed to expand watch event for local holder");
                 }
             }
-        } else if let Err(error) =
-            deliver_events_remote(net_handle, holder, vec![event.clone()]).await
-        {
-            warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+        } else {
+            let events = vec![event.clone()];
+            let deliver = NotificationTransportMessage::DeliverWatchEvents { events };
+            let answer = drive(HolderRequestOperation::new(holder, deliver), context).await;
+            if let Err(error) = events_delivered(answer) {
+                warn!(holder = %holder, %error, "Failed to forward watch event to remote holder");
+            }
         }
     }
 }

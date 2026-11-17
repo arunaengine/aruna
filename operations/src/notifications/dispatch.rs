@@ -5,6 +5,7 @@
 use aruna_core::NodeId;
 use aruna_core::UserId;
 use aruna_core::metrics::WatchMetricReason;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -18,8 +19,8 @@ use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
 use crate::notifications::client::{
-    create_watch_remote, delete_watch_remote, list_remote, list_watches_remote, mark_read_remote,
-    unread_count_remote,
+    HolderRequestOperation, listed, marked_read, unread_counted, watch_created, watch_deleted,
+    watches_listed,
 };
 use crate::notifications::list::{
     LIST_MAX_LIMIT, ListNotificationsInput, ListNotificationsOperation,
@@ -143,13 +144,18 @@ pub async fn list_for_user(
             .await
             .map_err(NotificationDispatchError::Internal)
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(NotificationDispatchError::Unavailable)?;
-        list_remote(net_handle, holder, recipient, cursor, limit as u32)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        let limit = limit as u32;
+        let list = NotificationTransportMessage::List {
+            recipient,
+            cursor,
+            limit,
+        };
+        let answer = drive(HolderRequestOperation::new(holder, list), context).await;
+        listed(answer).map_err(NotificationDispatchError::Remote)
     }
 }
 
@@ -270,13 +276,13 @@ pub async fn unread_for_user(
             .await
             .map_err(NotificationDispatchError::Internal)
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(NotificationDispatchError::Unavailable)?;
-        unread_count_remote(net_handle, holder, recipient)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        let count = NotificationTransportMessage::UnreadCount { recipient };
+        let answer = drive(HolderRequestOperation::new(holder, count), context).await;
+        unread_counted(answer).map_err(NotificationDispatchError::Remote)
     }
 }
 
@@ -299,13 +305,17 @@ pub async fn mark_for_user(
         }
         Ok(marked)
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(NotificationDispatchError::Unavailable)?;
-        mark_read_remote(net_handle, holder, recipient, ids, up_to_ms)
-            .await
-            .map_err(NotificationDispatchError::Remote)
+        let mark = NotificationTransportMessage::MarkRead {
+            recipient,
+            ids,
+            up_to_ms,
+        };
+        let answer = drive(HolderRequestOperation::new(holder, mark), context).await;
+        marked_read(answer).map_err(NotificationDispatchError::Remote)
     }
 }
 
@@ -390,34 +400,33 @@ pub async fn create_for_user(
         let _ = drive(InterestOperation::publish(), context).await;
         subscription
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(WatchDispatchError::Unavailable)?;
-        create_watch_remote(
-            net_handle,
-            holder,
+        let create = NotificationTransportMessage::CreateWatch {
             owner,
             path_prefix,
             event_mask,
             authorization,
-        )
-        .await
-        .map_err(|reason| {
-            if reason == WATCH_CAP_REACHED {
-                WatchDispatchError::CapExceeded
-            } else if let Some(reason) = reason
-                .strip_prefix(WATCH_SUBSCRIPTION_UNAUTHORIZED)
-                .and_then(|value| value.strip_prefix(": "))
-                .and_then(WatchMetricReason::parse)
-            {
-                WatchDispatchError::Unauthorized(reason)
-            } else if reason.starts_with(WATCH_SUBSCRIPTION_UNAVAILABLE) {
-                WatchDispatchError::Unavailable
-            } else {
-                WatchDispatchError::Remote(reason)
-            }
-        })?
+        };
+        watch_created(drive(HolderRequestOperation::new(holder, create), context).await).map_err(
+            |reason| {
+                if reason == WATCH_CAP_REACHED {
+                    WatchDispatchError::CapExceeded
+                } else if let Some(reason) = reason
+                    .strip_prefix(WATCH_SUBSCRIPTION_UNAUTHORIZED)
+                    .and_then(|value| value.strip_prefix(": "))
+                    .and_then(WatchMetricReason::parse)
+                {
+                    WatchDispatchError::Unauthorized(reason)
+                } else if reason.starts_with(WATCH_SUBSCRIPTION_UNAVAILABLE) {
+                    WatchDispatchError::Unavailable
+                } else {
+                    WatchDispatchError::Remote(reason)
+                }
+            },
+        )?
     };
     // The creator knows the holder before its interest digest propagates.
     // Register locally so events in that window still reach the holder.
@@ -454,13 +463,13 @@ pub async fn delete_for_user(
         .map_err(|error| WatchDispatchError::Internal(error.to_string()))?;
         let _ = drive(InterestOperation::publish(), context).await;
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(WatchDispatchError::Unavailable)?;
-        delete_watch_remote(net_handle, holder, owner, watch_id)
-            .await
-            .map_err(WatchDispatchError::Remote)?;
+        let delete = NotificationTransportMessage::DeleteWatch { owner, watch_id };
+        let answer = drive(HolderRequestOperation::new(holder, delete), context).await;
+        watch_deleted(answer).map_err(WatchDispatchError::Remote)?;
     }
     if let Some(net_handle) = context.net_handle.as_ref() {
         net_handle.retract_local_interest(watch_id);
@@ -479,12 +488,12 @@ pub async fn list_watches(
             .await
             .map_err(WatchDispatchError::Internal)
     } else {
-        let net_handle = context
+        context
             .net_handle
             .as_ref()
             .ok_or(WatchDispatchError::Unavailable)?;
-        list_watches_remote(net_handle, holder, owner)
-            .await
-            .map_err(WatchDispatchError::Remote)
+        let list = NotificationTransportMessage::ListWatches { owner };
+        let answer = drive(HolderRequestOperation::new(holder, list), context).await;
+        watches_listed(answer).map_err(WatchDispatchError::Remote)
     }
 }
