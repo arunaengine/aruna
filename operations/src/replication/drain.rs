@@ -42,7 +42,7 @@ use super::members::{bound_record, member_publication};
 use super::obligations::{REPLICATION_PAGE_SIZE, live_obligations_exist, process_live_obligations};
 use super::page::PAGE_RECORDS;
 use super::page::deliver::{MetadataSender, PageSender, deliver_pages, pageable};
-use super::parking::{PARKED_DUE, park_job};
+use super::parking::{PARKED_DUE, ParkJobOperation};
 use super::plaintext::{HolderCheckOperation, job_consent};
 use super::queue::BlobQueueError;
 use super::version_replication::{
@@ -294,7 +294,8 @@ pub(crate) async fn drain_batch(
             }
             // No attempt, no error: the next unlock of a key makes the job due again.
             Ok(BlobJobOutcome::AwaitingKey(keys)) => {
-                if let Some(due_at_ms) = park_job(context, job_key, &job, &keys).await? {
+                let park = ParkJobOperation::new(job_key, job, keys, unix_timestamp_millis());
+                if let Some(due_at_ms) = drive(park, context).await? {
                     next_due_ms = min_due_at(next_due_ms, due_at_ms);
                 }
             }

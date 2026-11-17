@@ -9,13 +9,9 @@ use super::queue::{BlobQueueError, schedule_blob_drain};
 use std::collections::VecDeque;
 
 use super::drain::REPLICATION_POLL_AFTER;
-use crate::driver::{DriverContext, drive};
-use crate::jobs::runtime::key_unlocked;
-use crate::storage_read::iter_prefix_page;
-use aruna_core::effects::{Effect, IterStart, StorageEffect, abort_effects};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect, abort_effects};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
@@ -28,7 +24,6 @@ use aruna_core::structs::storage::encryption::{
 use aruna_core::structs::storage::replication_queue::ReplicateScopeTarget;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
 use smallvec::smallvec;
 use std::collections::BTreeSet;
 use tracing::warn;
@@ -46,184 +41,432 @@ fn wait_row(key: BucketKeyRef, job_key: &[u8]) -> Vec<u8> {
     [&key.key()[..], job_key].concat()
 }
 
-/// Parks `job` until one of `keys` unlocks: the job and its wait rows commit together, with no
-/// attempt counted and no error recorded. A key unlocked meanwhile makes it due at once, and
-/// that due time is returned.
-pub(crate) async fn park_job(
-    context: &DriverContext,
-    job_key: Vec<u8>,
-    job: &BlobJobRecord,
-    keys: &[BucketKeyRef],
-) -> Result<Option<u64>, BlobQueueError> {
-    let storage = &context.storage_handle;
-    let txn_id = start(storage).await?;
-    let current = match wait_current(storage, job, keys, Some(txn_id)).await {
-        Ok(current) => current,
-        Err(error) => {
-            abort(storage, txn_id).await;
-            return Err(error);
-        }
-    };
-    let mut parked = job.clone();
-    parked.due_at_ms = if current {
-        PARKED_DUE
-    } else {
-        aruna_core::time::unix_timestamp_millis()
-            .saturating_add(REPLICATION_POLL_AFTER.as_millis() as u64)
-    };
-    let relationship = postcard::to_allocvec(&job.relationship_id)
-        .map_err(aruna_core::errors::ConversionError::from)?;
-    let mut writes: Vec<(String, Key, Value)> = vec![(
-        REPLICATION_JOB_KEYSPACE.to_string(),
-        job_key.clone().into(),
-        parked.to_bytes()?.into(),
-    )];
-    for key in keys.iter().filter(|_| current) {
-        writes.push((
-            COPY_WAIT_KEYSPACE.to_string(),
-            wait_row(*key, &job_key).into(),
-            relationship.clone().into(),
-        ));
-    }
-    let write = StorageEffect::BatchWrite {
-        writes,
-        txn_id: Some(txn_id),
-    };
-    if let Err(error) = run(storage, write).await {
-        abort(storage, txn_id).await;
-        return Err(error);
-    }
-    commit(storage, txn_id).await?;
-    if !current {
-        return Ok(Some(parked.due_at_ms));
-    }
-    let current = wait_current(storage, job, keys, None).await?;
-    // A key unlocked while the job parked wakes it here; no unlock call would.
-    for key in keys {
-        if !current || key_unlocked(context, *key).await {
-            let now_ms = aruna_core::time::unix_timestamp_millis();
-            drive(
-                WakeJobOperation::new(wait_row(*key, &job_key), now_ms),
-                context,
-            )
-            .await?;
-            return Ok(Some(now_ms));
-        }
-    }
-    Ok(None)
+/// Checks inside one read view that a job still waits for `keys`: each key is the bucket's active
+/// or retiring key, and every one of them seals a version the job copies.
+#[derive(Debug, PartialEq)]
+struct WaitCheck {
+    keys: Vec<BucketKeyRef>,
+    bucket: String,
+    target: ReplicateScopeTarget,
+    txn_id: Option<TxnId>,
+    settings: Option<BucketEncryption>,
+    prefix: Vec<u8>,
+    after: Option<Key>,
+    found: BTreeSet<BucketKeyRef>,
 }
 
-async fn wait_current(
-    storage: &StorageHandle,
-    job: &BlobJobRecord,
-    keys: &[BucketKeyRef],
-    txn_id: Option<TxnId>,
-) -> Result<bool, BlobQueueError> {
-    let mut reads = vec![(
-        BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-        job.input.bucket.as_bytes().into(),
-    )];
-    reads.extend(
-        keys.iter()
-            .map(|key| (BUCKET_KEY_KEYSPACE.to_string(), key.key().into())),
-    );
-    let Event::Storage(event) = storage
-        .send_storage_effect(StorageEffect::BatchRead { reads, txn_id })
-        .await
-    else {
-        return Err(BlobQueueError::UnexpectedEvent(
-            "not a storage event".to_string(),
-        ));
-    };
-    let mut values = match event {
-        StorageEvent::BatchReadResult { values } if values.len() == keys.len() + 1 => {
-            values.into_iter()
-        }
-        StorageEvent::Error { error } => return Err(error.into()),
-        other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
-    };
-    let settings = values.next().and_then(|(_, value)| value);
-    let settings = BucketEncryption::from_row(settings.as_deref())?;
-    for (key, (_, value)) in keys.iter().zip(values) {
-        let record = value
-            .map(|value| BucketKeyRecord::from_bytes(&value))
-            .transpose()?;
-        if !record.is_some_and(|record| {
-            record.key == *key
-                && match record.state {
-                    KeyState::Active => settings.active_key() == Some(*key),
-                    KeyState::Retiring => settings.bucket_id == Some(key.bucket_id),
-                    KeyState::Retired => false,
-                }
-        }) {
-            return Ok(false);
+/// What one step of a wait check asks for next.
+enum CheckStep {
+    Read(Effect),
+    Done(bool),
+}
+
+impl WaitCheck {
+    fn new(job: &BlobJobRecord, keys: &[BucketKeyRef], txn_id: Option<TxnId>) -> Self {
+        Self {
+            keys: keys.to_vec(),
+            bucket: job.input.bucket.clone(),
+            target: job.input.target.clone(),
+            txn_id,
+            settings: None,
+            prefix: Vec::new(),
+            after: None,
+            found: BTreeSet::new(),
         }
     }
-    let prefix = match &job.input.target {
-        ReplicateScopeTarget::Version { key, version_id } => {
-            VersionKey::new(&job.input.bucket, key, *version_id).to_bytes()?
+
+    fn start(&self) -> Effect {
+        let mut reads = vec![(
+            BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+            self.bucket.as_bytes().into(),
+        )];
+        reads.extend(
+            (self.keys.iter()).map(|key| (BUCKET_KEY_KEYSPACE.to_string(), key.key().into())),
+        );
+        Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })
+    }
+
+    fn step(&mut self, event: Event) -> Result<CheckStep, BlobQueueError> {
+        match event {
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            Event::Storage(StorageEvent::BatchReadResult { values }) if self.settings.is_none() => {
+                self.records_read(values)
+            }
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) if self.settings.is_some() => self.versions_read(values, next_start_after),
+            Event::Storage(StorageEvent::BatchReadResult { values }) => self.locations_read(values),
+            other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
         }
-        ReplicateScopeTarget::Object { key } => VersionKey::object_prefix(&job.input.bucket, key)?,
-        ReplicateScopeTarget::Bucket | ReplicateScopeTarget::Prefix(_) => {
-            VersionKey::bucket_prefix(&job.input.bucket)?
+    }
+
+    fn records_read(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Result<CheckStep, BlobQueueError> {
+        if values.len() != self.keys.len() + 1 {
+            return Err(BlobQueueError::UnexpectedEvent(
+                "short key record read".to_string(),
+            ));
         }
-    };
-    let mut start_after = None;
-    let mut found = BTreeSet::new();
-    loop {
-        let (rows, next) = iter_prefix_page(
-            storage,
-            BLOB_VERSIONS_KEYSPACE,
-            Some(prefix.clone().into()),
-            start_after,
-            WAIT_PAGE,
-            txn_id,
-        )
-        .await
-        .map_err(StorageError::ReadError)?;
-        for (row, value) in rows {
+        let mut values = values.into_iter().map(|(_, value)| value);
+        let settings = BucketEncryption::from_row(values.next().flatten().as_deref())?;
+        for (key, value) in self.keys.iter().zip(values) {
+            let record = value
+                .map(|value| BucketKeyRecord::from_bytes(&value))
+                .transpose()?;
+            let current = record.is_some_and(|record| {
+                record.key == *key
+                    && match record.state {
+                        KeyState::Active => settings.active_key() == Some(*key),
+                        KeyState::Retiring => settings.bucket_id == Some(key.bucket_id),
+                        KeyState::Retired => false,
+                    }
+            });
+            if !current {
+                return Ok(CheckStep::Done(false));
+            }
+        }
+        self.settings = Some(settings);
+        self.prefix = match &self.target {
+            ReplicateScopeTarget::Version { key, version_id } => {
+                VersionKey::new(&self.bucket, key, *version_id).to_bytes()?
+            }
+            ReplicateScopeTarget::Object { key } => VersionKey::object_prefix(&self.bucket, key)?,
+            ReplicateScopeTarget::Bucket | ReplicateScopeTarget::Prefix(_) => {
+                VersionKey::bucket_prefix(&self.bucket)?
+            }
+        };
+        Ok(self.read_versions(None))
+    }
+
+    fn read_versions(&self, start: Option<Key>) -> CheckStep {
+        CheckStep::Read(Effect::Storage(StorageEffect::Iter {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(self.prefix.clone().into()),
+            start: start.map(IterStart::After),
+            limit: WAIT_PAGE,
+            txn_id: self.txn_id,
+        }))
+    }
+
+    /// The location rows of one page are read in one batch, in the same read view.
+    fn versions_read(
+        &mut self,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Result<CheckStep, BlobQueueError> {
+        let mut reads = Vec::new();
+        for (row, value) in values {
             let version_key = VersionKey::from_bytes(&row)?;
-            if matches!(&job.input.target, ReplicateScopeTarget::Prefix(prefix) if !version_key.key.starts_with(prefix))
+            if matches!(&self.target, ReplicateScopeTarget::Prefix(prefix) if !version_key.key.starts_with(prefix))
             {
                 continue;
             }
             let version = BlobVersion::from_bytes(&value)?;
-            let (space, row) = match (version.location_key(), version.state.pending_archive()) {
-                (Some(location), _) => (BLOB_LOCATIONS_KEYSPACE, location.to_bytes()),
-                (_, Some(archive)) => (PENDING_LOCATION_KEYSPACE, archive.to_bytes()),
-                _ => continue,
-            };
-            match storage
-                .send_storage_effect(StorageEffect::Read {
-                    key_space: space.to_string(),
-                    key: row.into(),
-                    txn_id,
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => {
-                    if let Some(key) = BackendLocation::from_bytes(&value)?
-                        .format
-                        .bucket_key()
-                        .or(settings.active_key())
-                    {
-                        found.insert(key);
-                    }
-                }
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
-                Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-                other => return Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
+            match (version.location_key(), version.state.pending_archive()) {
+                (Some(location), _) => reads.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    location.to_bytes().into(),
+                )),
+                (_, Some(archive)) => reads.push((
+                    PENDING_LOCATION_KEYSPACE.to_string(),
+                    archive.to_bytes().into(),
+                )),
+                _ => {}
             }
         }
-        if keys.iter().all(|key| found.contains(key)) {
-            return Ok(true);
+        self.after = next;
+        if reads.is_empty() {
+            return Ok(self.page_done());
         }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => return Ok(false),
+        Ok(CheckStep::Read(Effect::Storage(StorageEffect::BatchRead {
+            reads,
+            txn_id: self.txn_id,
+        })))
+    }
+
+    fn locations_read(
+        &mut self,
+        values: Vec<(Key, Option<Value>)>,
+    ) -> Result<CheckStep, BlobQueueError> {
+        let active = self
+            .settings
+            .as_ref()
+            .and_then(BucketEncryption::active_key);
+        for value in values.into_iter().filter_map(|(_, value)| value) {
+            if let Some(key) = BackendLocation::from_bytes(&value)?
+                .format
+                .bucket_key()
+                .or(active)
+            {
+                self.found.insert(key);
+            }
         }
+        Ok(self.page_done())
+    }
+
+    fn page_done(&mut self) -> CheckStep {
+        if self.keys.iter().all(|key| self.found.contains(key)) {
+            return CheckStep::Done(true);
+        }
+        match self.after.take() {
+            Some(after) => self.read_versions(Some(after)),
+            None => CheckStep::Done(false),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ParkState {
+    Init,
+    StartTransaction,
+    Check(WaitCheck),
+    WriteJob { current: bool },
+    Commit { current: bool },
+    Recheck(WaitCheck),
+    KeyStatus { index: usize },
+    Wake,
+    Finish,
+    Error,
+}
+
+/// Parks `job` until one of `keys` unlocks: the job and its wait rows commit together, with no
+/// attempt counted and no error recorded. A key unlocked meanwhile makes it due at once, and
+/// that due time is the output.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ParkJobOperation {
+    job_key: Vec<u8>,
+    job: BlobJobRecord,
+    keys: Vec<BucketKeyRef>,
+    now_ms: u64,
+    txn_id: Option<TxnId>,
+    due: Option<u64>,
+    state: ParkState,
+    error: Option<BlobQueueError>,
+}
+
+impl ParkJobOperation {
+    pub(crate) fn new(
+        job_key: Vec<u8>,
+        job: BlobJobRecord,
+        keys: Vec<BucketKeyRef>,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            job_key,
+            job,
+            keys,
+            now_ms,
+            txn_id: None,
+            due: None,
+            state: ParkState::Init,
+            error: None,
+        }
+    }
+
+    fn fail(&mut self, error: BlobQueueError) -> Effects {
+        self.state = ParkState::Error;
+        self.error = Some(error);
+        abort_effects(&mut self.txn_id)
+    }
+
+    fn finish(&mut self, due: Option<u64>) -> Effects {
+        self.due = due;
+        self.state = ParkState::Finish;
+        smallvec![]
+    }
+
+    fn check_step(&mut self, event: Event) -> Effects {
+        let (mut check, first) = match std::mem::replace(&mut self.state, ParkState::Error) {
+            ParkState::Check(check) => (check, true),
+            ParkState::Recheck(check) => (check, false),
+            _ => return self.fail(BlobQueueError::UnexpectedEvent("no wait check".into())),
+        };
+        match check.step(event) {
+            Err(error) => self.fail(error),
+            Ok(CheckStep::Read(effect)) => {
+                self.state = if first {
+                    ParkState::Check(check)
+                } else {
+                    ParkState::Recheck(check)
+                };
+                smallvec![effect]
+            }
+            Ok(CheckStep::Done(current)) if first => self.write_job(current),
+            Ok(CheckStep::Done(current)) => self.after_recheck(current),
+        }
+    }
+
+    fn write_job(&mut self, current: bool) -> Effects {
+        let mut parked = self.job.clone();
+        parked.due_at_ms = if current {
+            PARKED_DUE
+        } else {
+            (self.now_ms).saturating_add(REPLICATION_POLL_AFTER.as_millis() as u64)
+        };
+        let relationship = match postcard::to_allocvec(&self.job.relationship_id) {
+            Ok(relationship) => relationship,
+            Err(error) => return self.fail(ConversionError::from(error).into()),
+        };
+        let value = match parked.to_bytes() {
+            Ok(value) => value,
+            Err(error) => return self.fail(error.into()),
+        };
+        let mut writes: Vec<(String, Key, Value)> = vec![(
+            REPLICATION_JOB_KEYSPACE.to_string(),
+            self.job_key.clone().into(),
+            value.into(),
+        )];
+        for key in self.keys.iter().filter(|_| current) {
+            writes.push((
+                COPY_WAIT_KEYSPACE.to_string(),
+                wait_row(*key, &self.job_key).into(),
+                relationship.clone().into(),
+            ));
+        }
+        self.due = Some(parked.due_at_ms);
+        self.state = ParkState::WriteJob { current };
+        smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    /// A key unlocked while the job parked wakes it here; no unlock call would.
+    fn after_recheck(&mut self, current: bool) -> Effects {
+        match self.keys.first() {
+            Some(key) if !current => self.wake(*key),
+            Some(_) => self.key_status(0),
+            None => self.finish(None),
+        }
+    }
+
+    fn key_status(&mut self, index: usize) -> Effects {
+        let Some(key) = self.keys.get(index) else {
+            return self.finish(None);
+        };
+        self.state = ParkState::KeyStatus { index };
+        smallvec![Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: key.bucket_id,
+        })]
+    }
+
+    fn status_read(&mut self, index: usize, unlocked: bool) -> Effects {
+        match self.keys.get(index) {
+            Some(key) if unlocked => self.wake(*key),
+            _ => self.key_status(index + 1),
+        }
+    }
+
+    fn wake(&mut self, key: BucketKeyRef) -> Effects {
+        self.state = ParkState::Wake;
+        let wake = WakeJobOperation::new(wait_row(key, &self.job_key), self.now_ms);
+        smallvec![Effect::SubOperation(boxed_suboperation(wake, |result| {
+            Event::SubOperation(SubOperationEvent::CopyWoken {
+                result: result.map_err(|error| error.to_string()),
+            })
+        }))]
+    }
+}
+
+impl Operation for ParkJobOperation {
+    type Output = Option<u64>;
+    type Error = BlobQueueError;
+
+    fn start(&mut self) -> Effects {
+        self.state = ParkState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        match (&self.state, event) {
+            (
+                ParkState::StartTransaction,
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
+            ) => {
+                self.txn_id = Some(txn_id);
+                let check = WaitCheck::new(&self.job, &self.keys, Some(txn_id));
+                let read = check.start();
+                self.state = ParkState::Check(check);
+                smallvec![read]
+            }
+            (ParkState::Check(_) | ParkState::Recheck(_), event) => self.check_step(event),
+            (
+                &ParkState::WriteJob { current },
+                Event::Storage(StorageEvent::BatchWriteResult { .. }),
+            ) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.fail(BlobQueueError::UnexpectedEvent("no transaction".into()));
+                };
+                self.state = ParkState::Commit { current };
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            (
+                &ParkState::Commit { current },
+                Event::Storage(StorageEvent::TransactionCommitted { .. }),
+            ) => {
+                self.txn_id = None;
+                if !current {
+                    return self.finish(self.due);
+                }
+                let check = WaitCheck::new(&self.job, &self.keys, None);
+                let read = check.start();
+                self.state = ParkState::Recheck(check);
+                smallvec![read]
+            }
+            (ParkState::Commit { .. }, Event::Storage(StorageEvent::Error { error })) => {
+                // The failed commit closed the transaction.
+                self.txn_id = None;
+                self.fail(error.into())
+            }
+            (
+                ParkState::StartTransaction | ParkState::WriteJob { .. },
+                Event::Storage(StorageEvent::Error { error }),
+            ) => self.fail(error.into()),
+            (
+                &ParkState::KeyStatus { index },
+                Event::Blob(BlobEvent::KeyStatus { generations }),
+            ) => {
+                let key = self.keys.get(index).copied();
+                let unlocked =
+                    (generations.iter()).any(|status| Some(status.key) == key && status.active);
+                self.status_read(index, unlocked)
+            }
+            // Without a blob backend no key counts as unlocked here.
+            (&ParkState::KeyStatus { index }, Event::Blob(_)) => self.status_read(index, false),
+            (ParkState::Wake, Event::SubOperation(SubOperationEvent::CopyWoken { result })) => {
+                match result {
+                    Ok(_) => self.finish(Some(self.now_ms)),
+                    Err(error) => self.fail(BlobQueueError::Wake(error)),
+                }
+            }
+            (_, event) => self.fail(BlobQueueError::UnexpectedEvent(format!("{event:?}"))),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.state, ParkState::Finish | ParkState::Error)
+    }
+
+    fn finalize(self) -> Result<Option<u64>, BlobQueueError> {
+        match (self.state, self.error) {
+            (ParkState::Finish, _) => Ok(self.due),
+            (_, Some(error)) => Err(error),
+            _ => Err(BlobQueueError::UnexpectedEvent(
+                "park did not finish".into(),
+            )),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        abort_effects(&mut self.txn_id)
     }
 }
 
@@ -675,48 +918,23 @@ impl Operation for AwaitingJobsOperation {
     }
 }
 
-async fn start(storage: &StorageHandle) -> Result<TxnId, BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-async fn run(storage: &StorageHandle, effect: StorageEffect) -> Result<(), BlobQueueError> {
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        Event::Storage(_) => Ok(()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-async fn commit(storage: &StorageHandle, txn_id: TxnId) -> Result<(), BlobQueueError> {
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(BlobQueueError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-async fn abort(storage: &StorageHandle, txn_id: TxnId) {
-    let effect = StorageEffect::AbortTransaction { txn_id };
-    if let Event::Storage(StorageEvent::Error { error }) = storage.send_storage_effect(effect).await
-    {
-        warn!(%error, "Failed to abort a copy job wait transaction");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::drive;
+    use crate::driver::{DriverContext, drive};
+    use aruna_storage::StorageHandle;
+
+    /// Parks through the operation at the current time, as the drain does.
+    async fn park_job(
+        context: &DriverContext,
+        job_key: Vec<u8>,
+        job: &BlobJobRecord,
+        keys: &[BucketKeyRef],
+    ) -> Result<Option<u64>, BlobQueueError> {
+        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let park = ParkJobOperation::new(job_key, job.clone(), keys.to_vec(), now_ms);
+        drive(park, context).await
+    }
     use crate::replication::drain::next_blob_timer;
     use aruna_core::UserId;
     use aruna_core::compute::{SecretBytes, SharedSecret};
@@ -1344,9 +1562,11 @@ mod tests {
             while let Ok((effect, response, _span, _queued, _in_flight)) =
                 receivers.foreground.recv()
             {
+                // The recheck reads the location rows of a page in one batch, outside the
+                // transaction.
                 let gated = read_tx.is_some()
-                    && matches!(&effect, StorageEffect::Read { key_space, txn_id: None, .. }
-                        if key_space == BLOB_LOCATIONS_KEYSPACE);
+                    && matches!(&effect, StorageEffect::BatchRead { reads, txn_id: None }
+                        if reads.iter().any(|(space, _)| space == BLOB_LOCATIONS_KEYSPACE));
                 let Event::Storage(event) = runtime.block_on(direct.send_storage_effect(effect))
                 else {
                     panic!("expected a storage event");
@@ -1354,7 +1574,8 @@ mod tests {
                 if gated {
                     assert!(matches!(
                         &event,
-                        StorageEvent::ReadResult { value: Some(_), .. }
+                        StorageEvent::BatchReadResult { values }
+                            if values.iter().any(|(_, value)| value.is_some())
                     ));
                     read_tx.take().unwrap().send(()).unwrap();
                     release_rx.recv().unwrap();
