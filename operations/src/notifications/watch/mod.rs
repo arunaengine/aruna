@@ -7,6 +7,7 @@ pub mod check;
 pub mod digest;
 pub mod emit;
 pub mod expand;
+pub mod expansion;
 pub mod interest;
 pub mod listing;
 pub mod paths;
