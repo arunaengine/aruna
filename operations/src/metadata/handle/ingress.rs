@@ -1061,7 +1061,7 @@ impl MetadataHandle {
             } => {
                 let result = match self.authorize_read_peer(peer, auth_token, false).await {
                     Ok(auth) => match self.inner.net_handle.as_ref() {
-                        Some(net_handle) => crate::metadata::secondary_ids::lookup_local(
+                        Some(net_handle) => crate::metadata::identifier_lookup::lookup_local(
                             context.as_ref(),
                             *net_handle.realm_id(),
                             auth.as_ref(),

@@ -19,6 +19,7 @@ pub mod get_document;
 pub mod global_entries;
 pub(crate) mod handle;
 pub mod id_mapping;
+pub mod identifier_lookup;
 mod iri_index;
 pub mod list_documents;
 pub mod materialization_queue;
