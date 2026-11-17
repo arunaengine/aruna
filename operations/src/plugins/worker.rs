@@ -47,11 +47,12 @@ use super::prune::{prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
 use super::release::ReleaseKeys;
 use super::replay::{plan_replays, run_replays};
-use super::runs::{prune_runs, read_run, save_run, unfinished};
+use super::runs::{RunError, prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
 use super::waiting::recheck_waiting;
-use super::work::{prune_work, retire_work, settle_work};
-use crate::driver::DriverContext;
+use super::jobs::{retire_work, settle_work};
+use super::work::prune_work;
+use crate::driver::{DriverContext, drive};
 
 /// How often the worker looks for due runs.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -179,7 +180,7 @@ impl Worker {
                 warn!(%error, "Could not recheck waiting plugin events");
             }
         }
-        let queued = unfinished(&self.ctx)
+        let queued = drive(unfinished(), &self.ctx)
             .await
             .map_err(|error| error.to_string())?;
         let here = eligible(&config, self.local);
@@ -201,7 +202,7 @@ impl Worker {
             if !ready || !here || busy >= RUNS_PARALLEL {
                 continue;
             }
-            let mut run = read_run(&self.ctx, install_id, run_id)
+            let mut run = drive(read_run(install_id, run_id), &self.ctx)
                 .await
                 .map_err(|error| error.to_string())?;
             if run.due_ms > now_ms || run.state.finished() {
@@ -209,9 +210,7 @@ impl Worker {
             }
             run.state = RunState::Running;
             run.attempts += 1;
-            save_run(&self.ctx, &run)
-                .await
-                .map_err(|error| error.to_string())?;
+            self.save(&run).await.map_err(|error| error.to_string())?;
             let cancel = CancellationToken::new();
             self.running().insert(run_id, (install_id, cancel.clone()));
             let worker = self.clone();
@@ -233,7 +232,7 @@ impl Worker {
     async fn sweep(&self, now_ms: u64) -> Result<usize, String> {
         let config = read_config(&self.ctx, self.realm_id).await;
         let config = config.map_err(|error| error.to_string())?;
-        let swept = sweep_events(&self.ctx, &config, now_ms).await;
+        let swept = drive(sweep_events(&config, now_ms), &self.ctx).await;
         let swept = swept.map_err(|error| error.to_string())?;
         let hooks = prune_hooks(&self.ctx, &config, now_ms).await;
         let hooks = hooks.map_err(|error| error.to_string())?;
@@ -305,15 +304,18 @@ impl Worker {
 
     /// Ends a queued run whose install is gone, unless its intents decide otherwise.
     async fn drop_run(&self, install_id: Ulid, run_id: Ulid, now_ms: u64) -> Result<(), String> {
-        let mut run = read_run(&self.ctx, install_id, run_id)
+        let mut run = drive(read_run(install_id, run_id), &self.ctx)
             .await
             .map_err(|error| error.to_string())?;
-        let open = open_intent(&self.ctx, run_id).await;
+        let open = drive(open_intent(run_id), &self.ctx).await;
         let ended = Ended::Cancelled("the install was removed".to_string());
         conclude(&mut run, ended, false, open, now_ms);
-        save_run(&self.ctx, &run)
-            .await
-            .map_err(|error| error.to_string())
+        self.save(&run).await.map_err(|error| error.to_string())
+    }
+
+    /// Writes the run; one that ended leaves the queue in the same transaction.
+    async fn save(&self, run: &PluginRun) -> Result<(), RunError> {
+        drive(save_run(run)?, &self.ctx).await
     }
 
     /// Stops claiming, cancels every running guest and waits until each attempt ended.
@@ -357,7 +359,7 @@ impl Worker {
         run.log = broker.take_log();
         let ended = scrub_ended(&broker, ended);
         let now = unix_timestamp_millis();
-        let open = open_intent(&self.ctx, run.run_id).await;
+        let open = drive(open_intent(run.run_id), &self.ctx).await;
         let ended = match ended {
             Ended::Cancelled(message) => {
                 let reason = self.reasons().remove(&run.run_id);
@@ -366,7 +368,7 @@ impl Worker {
             other => other,
         };
         conclude(&mut run, ended, broker.changed(), open, now);
-        if let Err(error) = save_run(&self.ctx, &run).await {
+        if let Err(error) = self.save(&run).await {
             warn!(run = %run.run_id, %error, "Could not save a finished plugin run");
         }
         self.reasons().remove(&run.run_id);
@@ -601,19 +603,19 @@ pub fn spawn_worker(
             }
             if now.saturating_sub(pruned_at) >= PRUNE_MS {
                 pruned_at = now;
-                if let Err(error) = prune_runs(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_runs(now), &worker.ctx).await {
                     warn!(%error, "Could not prune finished plugin runs");
                 }
                 if let Err(error) = prune_journal(&worker.ctx, now).await {
                     warn!(%error, "Could not prune the plugin event journal");
                 }
-                if let Err(error) = prune_seen(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_seen(now), &worker.ctx).await {
                     warn!(%error, "Could not prune plugin event dedup records");
                 }
                 if let Err(error) = prune_uses(&worker.ctx, now).await {
                     warn!(%error, "Could not prune plugin secret use audit rows");
                 }
-                if let Err(error) = prune_work(&worker.ctx, now).await {
+                if let Err(error) = drive(prune_work(now), &worker.ctx).await {
                     warn!(%error, "Could not prune settled plugin work");
                 }
                 if let Err(error) = sweep_marks(&worker.ctx).await {

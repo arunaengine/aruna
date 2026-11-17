@@ -323,7 +323,7 @@ impl RunBroker {
         (install, key): (&PluginInstall, &str),
         minted: PinnedCreate,
     ) -> Result<String, Outcome> {
-        let stored = claim_key(&self.ctx, (install, key), minted).await;
+        let stored = drive(claim_key((install, key), minted), &self.ctx).await;
         let (pinned, claim) = stored.map_err(|error| Outcome::None(unavailable(error.0)))?;
         let mut lookup = None;
         loop {
@@ -469,7 +469,7 @@ impl RunBroker {
 
     /// Closes an attempt of a create key. A failure only keeps the key's arguments fixed.
     async fn settle(&self, key: (&PluginInstall, &str), rejected: bool) {
-        if let Err(error) = settle_key(&self.ctx, key, rejected).await {
+        if let Err(error) = drive(settle_key(key, rejected), &self.ctx).await {
             warn!(%error, "A plugin create key could not record its attempt's outcome");
         }
     }
@@ -613,7 +613,10 @@ impl RunBroker {
         let Ok(version_id) = Ulid::from_string(version) else {
             return Ok(false);
         };
-        let marked = is_marked(&self.ctx, (bucket, key, version_id)).await;
+        let marked = match is_marked((bucket, key, version_id)) {
+            Ok(marked) => drive(marked, &self.ctx).await,
+            Err(error) => Err(error),
+        };
         marked.map_err(|error| unavailable(error.0))
     }
 
