@@ -7,12 +7,11 @@ use std::time::Duration;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
-    Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, NetEffect, StorageEffect, VaultFetchEffect,
-    VaultQuery,
+    Effect, HolderList, IterStart, MAX_FETCH_HOLDERS, StorageEffect, VaultFetchEffect, VaultQuery,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, StorageEvent, VaultFetchEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::vault::{
     MAX_KEY_RECORDS, MAX_VAULT_HEADS, UserKeyRecord, VaultRecords, retain_newest_keys,
@@ -25,6 +24,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use aruna_core::placement::{PlacementResolveError, holds_placement, plan_target_placement, read_holder_sets};
+
+use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
+use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadVaultConfig {
@@ -142,14 +144,12 @@ impl ReadVaultOperation {
         let holders = HolderList::new(holders)
             .map_err(|_| ReadVaultError::Unavailable("the vault has no holder".to_string()))?;
         self.state = ReadState::Fetch;
-        Ok(smallvec![Effect::Net(NetEffect::VaultFetch(Box::new(
-            VaultFetchEffect {
-                holders,
-                user_id,
-                query: self.config.query.clone(),
-                deadline: self.config.deadline,
-            }
-        )))])
+        Ok(smallvec![fetch_effect(&VaultFetchEffect {
+            holders,
+            user_id,
+            query: self.config.query.clone(),
+            deadline: self.config.deadline,
+        })])
     }
 
     fn local(&self, rows: Vec<(Key, Value)>) -> Result<VaultRecords, ReadVaultError> {
@@ -290,6 +290,49 @@ impl Operation for ReadVaultOperation {
     }
 }
 
+impl HolderRecord for VaultRecords {
+    const LABEL: &'static str = "vault";
+
+    fn read(message: MetadataTransportMessage) -> Answer<Self> {
+        match message {
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Ok(records),
+            } if records.is_empty() => Answer::Missing,
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Ok(records),
+            } => Answer::Found(records),
+            MetadataTransportMessage::FetchedVaultRecords {
+                result: Err(MetadataReadError::Unauthorized | MetadataReadError::Forbidden),
+            } => Answer::Denied,
+            _ => Answer::Skip,
+        }
+    }
+}
+
+/// Asks the holders in rank order, each with its share of the deadline; the answer arrives as a
+/// vault fetch event.
+pub(crate) fn fetch_effect(fetch: &VaultFetchEffect) -> Effect {
+    let request = MetadataTransportMessage::FetchVaultRecords {
+        user_id: fetch.user_id,
+        query: fetch.query.clone(),
+    };
+    let holders = fetch.holders.as_slice();
+    let operation =
+        HolderFetchOperation::<VaultRecords>::new(holders, &request, fetch.deadline, Budget::Split);
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::Net(NetEvent::VaultFetch(match result {
+            Ok(Fetched::Found { holder, value }) => VaultFetchEvent::Fetched {
+                holder,
+                records: value,
+            },
+            Ok(Fetched::NotFound) => VaultFetchEvent::NotFound,
+            Ok(Fetched::Denied) => VaultFetchEvent::Denied,
+            Ok(Fetched::Unavailable(reason)) => VaultFetchEvent::Unavailable(reason),
+            Err(error) => VaultFetchEvent::Unavailable(error.to_string()),
+        }))
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,11 +406,15 @@ mod tests {
     #[test]
     fn fetches_from_holders() {
         let (mut operation, effects, holders) = started(false, VaultQuery::Keys);
-        let Some(Effect::Net(NetEffect::VaultFetch(fetch))) = effects.first() else {
-            panic!("a non-holder fetches, got {effects:?}");
-        };
-        assert_eq!(fetch.holders.as_slice(), holders.as_slice());
-        assert_eq!(fetch.user_id, user(7));
+        let (asked, request) = crate::tests::policy::fetch_requests(effects);
+        assert_eq!(asked, holders);
+        assert_eq!(
+            request,
+            MetadataTransportMessage::FetchVaultRecords {
+                user_id: user(7),
+                query: VaultQuery::Keys,
+            }
+        );
         // Every reached holder answered without records: the user has none.
         fetched(&mut operation, VaultFetchEvent::NotFound);
         assert_eq!(operation.finalize(), Ok(VaultRecords::Keys(Vec::new())));
@@ -487,5 +534,117 @@ mod tests {
             },
         );
         assert_eq!(operation.finalize(), Err(ReadVaultError::ForeignRecords));
+    }
+
+    fn key_record(node_id: NodeId) -> UserKeyRecord {
+        UserKeyRecord {
+            realm_id: user(7).realm_id,
+            user_id: user(7),
+            record_id: Ulid::from_bytes([1; 16]),
+            key_id: "key-1".to_string(),
+            public_key: [1; 32],
+            fingerprint: aruna_core::vault_format::key_fingerprint(&[1; 32]),
+            has_recovery: false,
+            node_id,
+            placement: PlacementRef::NIL,
+            created_at_ms: 1,
+            signature: None,
+        }
+    }
+
+    fn vault_fetch() -> (Box<dyn aruna_core::operation::SubOperation>, Vec<NodeId>) {
+        let holders = vec![node(1), node(2)];
+        let effect = fetch_effect(&VaultFetchEffect {
+            holders: HolderList::new(holders.clone()).unwrap(),
+            user_id: user(7),
+            query: VaultQuery::Keys,
+            deadline: Duration::from_secs(10),
+        });
+        let Effect::SubOperation(fetch) = effect else {
+            panic!("a vault fetch is a sub-operation");
+        };
+        (fetch, holders)
+    }
+
+    fn answer(peer: NodeId, seconds: u64, result: Result<VaultRecords, MetadataReadError>) -> Event {
+        let message = MetadataTransportMessage::FetchedVaultRecords { result };
+        let frame = crate::metadata::protocol::encode_message(&message).unwrap();
+        reply(peer, seconds, Ok(frame))
+    }
+
+    fn reply(
+        peer: NodeId,
+        seconds: u64,
+        result: Result<Vec<u8>, aruna_core::events::PeerRequestError>,
+    ) -> Event {
+        Event::Net(NetEvent::MetadataAnswer(Box::new(
+            aruna_core::events::MetadataAnswer {
+                peer,
+                elapsed: Duration::from_secs(seconds),
+                result,
+            },
+        )))
+    }
+
+    fn timed_out(peer: NodeId) -> Event {
+        reply(peer, 5, Err(aruna_core::events::PeerRequestError::TimedOut))
+    }
+
+    fn timeout_of(effects: &Effects) -> Duration {
+        let Some(Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(request))) =
+            effects.first()
+        else {
+            panic!("expected a holder request, got {effects:?}");
+        };
+        request.timeout
+    }
+
+    #[test]
+    fn tries_later_holder() {
+        // A silent holder spends only its share of the deadline; the next one still answers.
+        let (mut fetch, holders) = vault_fetch();
+        assert_eq!(timeout_of(&fetch.start()), Duration::from_secs(5));
+        let next = fetch.step(timed_out(holders[0]));
+        assert_eq!(timeout_of(&next), Duration::from_secs(5));
+        let keys = VaultRecords::Keys(vec![key_record(node(2))]);
+        assert!(fetch.step(answer(holders[1], 1, Ok(keys.clone()))).is_empty());
+        assert_eq!(
+            fetch.finalize(),
+            Event::Net(NetEvent::VaultFetch(VaultFetchEvent::Fetched {
+                holder: holders[1],
+                records: keys,
+            }))
+        );
+    }
+
+    #[test]
+    fn preserves_fetch_results() {
+        // Silence is unavailable, an empty answer is a miss, and a refusal ends the fetch.
+        let empty = || Ok(VaultRecords::Keys(Vec::new()));
+        let forbidden = || Err(MetadataReadError::Forbidden);
+        let cases: [(Vec<Option<Event>>, VaultFetchEvent); 4] = [
+            (
+                vec![Some(timed_out(node(1))), Some(timed_out(node(2)))],
+                VaultFetchEvent::Unavailable("no vault holder answered".to_string()),
+            ),
+            (
+                vec![Some(answer(node(1), 1, empty())), Some(timed_out(node(2)))],
+                VaultFetchEvent::NotFound,
+            ),
+            (
+                vec![Some(timed_out(node(1))), Some(answer(node(2), 1, forbidden()))],
+                VaultFetchEvent::Denied,
+            ),
+            (vec![Some(answer(node(1), 1, forbidden())), None], VaultFetchEvent::Denied),
+        ];
+        for (events, expected) in cases {
+            let (mut fetch, _) = vault_fetch();
+            fetch.start();
+            for event in events.into_iter().flatten() {
+                fetch.step(event);
+            }
+            assert!(fetch.is_complete());
+            assert_eq!(fetch.finalize(), Event::Net(NetEvent::VaultFetch(expected)));
+        }
     }
 }

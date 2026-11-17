@@ -5,11 +5,11 @@
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{
-    Effect, HolderList, MAX_FETCH_HOLDERS, NetEffect, PolicyFetchEffect, StorageEffect,
+    Effect, HolderList, MAX_FETCH_HOLDERS, PolicyFetchEffect, StorageEffect,
 };
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, NetEvent, PolicyFetchEvent, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
@@ -26,6 +26,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 use aruna_core::placement::{PlacementResolveError, read_holder_sets};
+
+use crate::forward::fetch::{Answer, Budget, Fetched, HolderFetchOperation, HolderRecord};
+use crate::metadata::protocol::MetadataTransportMessage;
 
 /// Wall-clock budget one policy fetch may spend across its holders.
 pub const POLICY_FETCH_DEADLINE: Duration = Duration::from_secs(10);
@@ -311,14 +314,12 @@ impl ReadPolicyOperation {
             .map_err(|error| ReadPolicyError::Unavailable(error.to_string()))?;
 
         self.state = ReadPolicyState::Fetch { asked };
-        Ok(smallvec![Effect::Net(NetEffect::PolicyFetch(Box::new(
-            PolicyFetchEffect {
-                realm_id: self.config.realm_id,
-                holders,
-                policy_ref: self.config.policy_ref,
-                deadline: POLICY_FETCH_DEADLINE,
-            }
-        )))])
+        Ok(smallvec![fetch_effect(&PolicyFetchEffect {
+            realm_id: self.config.realm_id,
+            holders,
+            policy_ref: self.config.policy_ref,
+            deadline: POLICY_FETCH_DEADLINE,
+        })])
     }
 
     /// Accepts one holder answer or drops that holder and asks the rest, so a
@@ -464,13 +465,54 @@ impl Operation for ReadPolicyOperation {
     }
 }
 
+impl HolderRecord for Box<PlacementPolicyDocument> {
+    const LABEL: &'static str = "policy";
+
+    fn read(message: MetadataTransportMessage) -> Answer<Self> {
+        match message {
+            MetadataTransportMessage::ForwardedPlacementPolicy {
+                result: Ok(Some(document)),
+            } => Answer::Found(document),
+            MetadataTransportMessage::ForwardedPlacementPolicy { result: Ok(None) } => {
+                Answer::Missing
+            }
+            _ => Answer::Skip,
+        }
+    }
+}
+
+/// Asks the holders in rank order under one deadline; the answer arrives as a policy fetch event.
+pub(crate) fn fetch_effect(fetch: &PolicyFetchEffect) -> Effect {
+    let request = MetadataTransportMessage::ForwardPlacementPolicy {
+        policy_ref: fetch.policy_ref,
+    };
+    let holders = fetch.holders.as_slice();
+    let operation = HolderFetchOperation::<Box<PlacementPolicyDocument>>::new(
+        holders,
+        &request,
+        fetch.deadline,
+        Budget::Shared,
+    );
+    Effect::SubOperation(boxed_suboperation(operation, |result| {
+        Event::Net(NetEvent::PolicyFetch(match result {
+            Ok(Fetched::Found { holder, value }) => PolicyFetchEvent::Fetched {
+                publisher: holder,
+                document: value,
+            },
+            Ok(Fetched::NotFound) => PolicyFetchEvent::NotFound,
+            Ok(Fetched::Denied) => PolicyFetchEvent::Unavailable("a holder refused".to_string()),
+            Ok(Fetched::Unavailable(reason)) => PolicyFetchEvent::Unavailable(reason),
+            Err(error) => PolicyFetchEvent::Unavailable(error.to_string()),
+        }))
+    }))
+}
+
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::tests::policy::{admin_user, realm_view, signed_document};
+    use crate::tests::policy::{admin_user, fetch_requests, realm_view, signed_document};
     use aruna_core::NodeId;
     use aruna_core::UserId;
-    use aruna_core::effects::NetEffect;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::structs::placement::policy::document::PolicyPublicationClaim;
     use aruna_core::structs::placement::policy::{PlacementPolicy, PlacementSelector};
@@ -569,10 +611,7 @@ mod pure_tests {
         let mut operation = operation(node(9), policy_ref);
         operation.start();
         let effects = operation.step(opened(&config(), None));
-        let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
-            panic!("expected a policy fetch, got {effects:?}");
-        };
-        let holders = fetch.holders.as_slice().to_vec();
+        let (holders, _) = fetch_requests(effects);
         (operation, holders)
     }
 
@@ -597,15 +636,18 @@ mod pure_tests {
         operation.start();
         let effects = operation.step(opened(&config, None));
 
-        let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
-            panic!("expected a policy fetch, got {effects:?}");
-        };
-        assert_eq!(fetch.policy_ref, policy.policy_ref());
+        let (holders, request) = fetch_requests(effects);
+        assert_eq!(
+            request,
+            MetadataTransportMessage::ForwardPlacementPolicy {
+                policy_ref: policy.policy_ref()
+            }
+        );
         let placement = config
             .policy_placement(policy.policy().policy_id)
             .expect("policy bucket resolves");
         let expected = aruna_core::placement::read_holder_sets(&config, &placement).expect("holders");
-        assert_eq!(fetch.holders.as_slice(), expected.as_slice());
+        assert_eq!(holders.as_slice(), expected.as_slice());
 
         operation.step(answered(expected[0], &policy));
         let (authentic, source) = operation.finalize().expect("policy resolves");
@@ -711,10 +753,8 @@ mod pure_tests {
         assert!(holders.len() >= 2, "the fixture needs a fallback holder");
 
         let effects = operation.step(answered(holders[0], &policy("us-east")));
-        let Some(Effect::Net(NetEffect::PolicyFetch(retry))) = effects.first() else {
-            panic!("expected a retry against the remaining holders, got {effects:?}");
-        };
-        assert_eq!(retry.holders.as_slice(), &holders[1..]);
+        let (retry, _) = fetch_requests(effects);
+        assert_eq!(retry.as_slice(), &holders[1..]);
 
         operation.step(answered(holders[1], &requested));
         assert_eq!(

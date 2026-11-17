@@ -1,82 +1,23 @@
-//! Runs the adapter side of a policy fetch, one request per resolved holder in rank order.
-//! It uses the existing control transport and never reroutes or widens the holder list.
+//! Serves one policy document to a peer that fetches it, after checking the peer and the hash.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::sync::Arc;
 
 use aruna_core::NodeId;
-use aruna_core::effects::{Effect, PolicyFetchEffect, StorageEffect};
-use aruna_core::events::{Event, PolicyFetchEvent, StorageEvent};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::{
     PlacementPolicyDocument, placement_policy_target,
 };
 use aruna_core::structs::placement::policy::{PlacementPolicyRef, VerifiedPolicy};
-use tokio::time::timeout_at;
 use tracing::warn;
 
 use crate::driver::DriverContext;
 use crate::metadata::api::load_realm_config;
 use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
-use crate::metadata::transport_message_kind;
-
-/// Asks each holder in turn for the document. A holder that answers without it
-/// contributes `NotFound`; only a complete absence of answers is `Unavailable`,
-/// so a missing policy can never be reported as a definitive denial.
-pub(crate) async fn fetch_policy(
-    context: &DriverContext,
-    effect: PolicyFetchEffect,
-) -> PolicyFetchEvent {
-    let Some(metadata) = context.metadata_handle.as_ref() else {
-        return PolicyFetchEvent::Unavailable("metadata transport unavailable".to_string());
-    };
-    let deadline = tokio::time::Instant::now() + effect.deadline;
-    let mut answered = false;
-    for holder in effect.holders.as_slice() {
-        let request = MetadataTransportMessage::ForwardPlacementPolicy {
-            policy_ref: effect.policy_ref,
-        };
-        let reply =
-            match timeout_at(deadline, metadata.request_forwarded_write(*holder, request)).await {
-                Ok(Ok(reply)) => reply,
-                Ok(Err(error)) => {
-                    warn!(peer = %holder, error = %error, "Policy fetch failed");
-                    continue;
-                }
-                Err(_) => break,
-            };
-        match reply {
-            MetadataTransportMessage::ForwardedPlacementPolicy {
-                result: Ok(Some(document)),
-            } => {
-                return PolicyFetchEvent::Fetched {
-                    publisher: *holder,
-                    document,
-                };
-            }
-            MetadataTransportMessage::ForwardedPlacementPolicy { result: Ok(None) } => {
-                answered = true;
-            }
-            MetadataTransportMessage::ForwardedPlacementPolicy { result: Err(error) } => {
-                warn!(peer = %holder, error = ?error, "Policy holder refused the fetch");
-            }
-            other => {
-                // Only the discriminant: a peer reply may carry a bearer token.
-                warn!(
-                    peer = %holder,
-                    reply = transport_message_kind(&other),
-                    "Unexpected policy fetch reply"
-                );
-            }
-        }
-    }
-    if answered {
-        return PolicyFetchEvent::NotFound;
-    }
-    PolicyFetchEvent::Unavailable("no policy holder answered".to_string())
-}
 
 /// Serves one policy document to a peer. The peer must be a sync-eligible node
 /// of this realm, and the answer must hash to the requested ref. The original

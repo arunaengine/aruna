@@ -410,7 +410,6 @@ impl Operation for ResolvePolicyOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::effects::NetEffect;
     use aruna_core::events::{NetEvent, PolicyFetchEvent};
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
     use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -501,10 +500,8 @@ mod pure_tests {
         operation.start();
         operation.step(read_result(None));
         let effects = operation.step(opened(None));
-        let Some(Effect::Net(NetEffect::PolicyFetch(fetch))) = effects.first() else {
-            panic!("a cache miss must resolve holders and fetch, got {effects:?}");
-        };
-        let holder = fetch.holders.as_slice()[0];
+        let (holders, _) = crate::tests::policy::fetch_requests(effects);
+        let holder = holders[0];
         operation.step(Event::Net(NetEvent::PolicyFetch(
             PolicyFetchEvent::Fetched {
                 publisher: holder,
