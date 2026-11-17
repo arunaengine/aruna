@@ -40,7 +40,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::id_mapping::{mapping_revision, mapping_route_for, transition_entries};
-use crate::metadata::profile::validation::{
+use crate::metadata::profile::rules::{
     crate_is_profile, not_profiled_status, profile_path_rule, submission_profile_tag,
 };
 use crate::metadata::repository::{create_projection_entries, read_document_registry};

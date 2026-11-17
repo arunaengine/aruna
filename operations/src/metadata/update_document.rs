@@ -36,7 +36,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::metadata::profile::validation::{
+use crate::metadata::profile::rules::{
     batch_adds_profile, not_profiled_status, profile_path_rule, stale_status,
     submission_profile_tag,
 };

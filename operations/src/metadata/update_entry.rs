@@ -22,7 +22,8 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use ulid::Ulid;
 
 use crate::driver::{DriverContext, drive};
-use crate::metadata::profile::validation::{stale_status, validate_submission};
+use crate::metadata::profile::rules::stale_status;
+use crate::metadata::profile::validation::validate_submission;
 use crate::metadata::projector::dot_applied;
 use crate::metadata::update_document::{
     UpdateDocumentError, UpdateDocumentMutation, UpdateDocumentOperation,

@@ -20,7 +20,8 @@ use crate::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentPayload,
     CreateDocumentResult, mint_document_for,
 };
-use crate::metadata::profile::validation::{not_profiled_status, validate_submission};
+use crate::metadata::profile::rules::not_profiled_status;
+use crate::metadata::profile::validation::validate_submission;
 use crate::metadata::projector::schedule_projection_drain;
 
 pub async fn create_metadata_document(
