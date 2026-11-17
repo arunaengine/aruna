@@ -15,7 +15,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::notifications::checks::{
-    batch_realm, validate_inbound_batch, verify_batch_holder, verify_node_origin,
+    batch_realm, peer_config, validate_inbound_batch, verify_batch_holder, verify_node_origin,
 };
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::inbox::UpsertInboxOperation;
@@ -89,27 +89,8 @@ impl DeliverBatchOperation {
     }
 
     /// The realm config with the peer checked against it.
-    fn authorized(
-        &self,
-        realm_id: RealmId,
-        value: Option<&[u8]>,
-    ) -> Result<RealmConfigDocument, String> {
-        let peer = self.input.peer;
-        let bytes = value.ok_or_else(|| format!("realm `{realm_id}` config unavailable"))?;
-        let config = RealmConfigDocument::from_bytes(bytes).map_err(|error| error.to_string())?;
-        let eligible = config
-            .sync_eligible_nodes()
-            .map_err(|error| error.to_string())?;
-        if !eligible.contains(&peer) {
-            return Err(format!(
-                "notification peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
-            ));
-        }
-        Ok(config)
-    }
-
     fn checked(&mut self, realm_id: RealmId, value: Option<&[u8]>) -> Effects {
-        let config = match self.authorized(realm_id, value) {
+        let config = match peer_config(self.input.peer, realm_id, value) {
             Ok(config) => config,
             Err(reason) => return self.reject(reason),
         };

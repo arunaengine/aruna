@@ -10,5 +10,6 @@ pub mod interest;
 pub mod listing;
 pub mod paths;
 pub mod records;
+pub mod remove;
 pub mod store;
 pub mod subscriptions;

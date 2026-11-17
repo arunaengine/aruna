@@ -522,3 +522,23 @@ pub(crate) fn message_realm(message: &NotificationTransportMessage) -> Result<Re
         }
     }
 }
+
+/// The stored realm config when `peer` may speak for the realm: only sync-eligible
+/// (server-class) nodes, stricter than the metadata `has_node` gate.
+pub(crate) fn peer_config(
+    peer: NodeId,
+    realm_id: RealmId,
+    value: Option<&[u8]>,
+) -> Result<RealmConfigDocument, String> {
+    let bytes = value.ok_or_else(|| format!("realm `{realm_id}` config unavailable"))?;
+    let config = RealmConfigDocument::from_bytes(bytes).map_err(|error| error.to_string())?;
+    let eligible = config
+        .sync_eligible_nodes()
+        .map_err(|error| error.to_string())?;
+    if !eligible.contains(&peer) {
+        return Err(format!(
+            "notification peer `{peer}` is not a sync-eligible node in realm `{realm_id}`"
+        ));
+    }
+    Ok(config)
+}
