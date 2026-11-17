@@ -5,13 +5,14 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 
 use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, finished, one_value,
-    outgoing_read, repair_key, repair_read,
+    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, outgoing_read,
+    repair_key, repair_read,
 };
 
 /// What a reconcile pass finds when it tries to claim a rollback.
@@ -103,7 +104,7 @@ impl Operation for SettleReconcileOperation {
             Phase::Record => self.check_record(one_value(result)?),
             Phase::Outgoing => self.check_outgoing(one_value(result)?),
             Phase::Claiming => {
-                finished(result)?;
+                done(result)?;
                 Ok(Next::Done(RollbackClaim::Claimed))
             }
         }

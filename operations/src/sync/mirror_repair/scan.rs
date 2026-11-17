@@ -5,11 +5,11 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done};
 use aruna_core::types::{Key, Value};
-use byteview::ByteView;
 use tracing::warn;
 
-use super::{SyncMirrorError, SyncMirrorRecord, finished, unexpected};
+use super::{SyncMirrorError, SyncMirrorRecord};
 
 const REPAIR_PAGE_SIZE: usize = 128;
 const REPAIR_BATCH_SIZE: usize = 64;
@@ -29,8 +29,9 @@ pub(super) struct ScanRepairsOperation {
     now_ms: u64,
     scan: RepairScan,
     due: Vec<(Key, SyncMirrorRecord)>,
-    /// Set while malformed rows of a page are dropped: the page to continue after.
-    dropping: Option<Option<Key>>,
+    pages: PrefixPages,
+    /// Set while the malformed rows of a page are dropped.
+    dropping: bool,
 }
 
 impl ScanRepairsOperation {
@@ -39,20 +40,12 @@ impl ScanRepairsOperation {
             now_ms: 0,
             scan: RepairScan::default(),
             due: Vec::new(),
-            dropping: None,
+            pages: PrefixPages::new(MIRROR_REPAIR_KEYSPACE, Vec::new(), REPAIR_PAGE_SIZE),
+            dropping: false,
         }
     }
 
-    fn page(after: Option<Key>) -> Next<RepairScan> {
-        Next::Call(IoCall::Page {
-            space: MIRROR_REPAIR_KEYSPACE.to_string(),
-            prefix: ByteView::from(Vec::new()),
-            after,
-            limit: REPAIR_PAGE_SIZE,
-        })
-    }
-
-    fn rows(&mut self, rows: Vec<(Key, Value)>, next: Option<Key>) -> Next<RepairScan> {
+    fn rows(&mut self, rows: Vec<(Key, Value)>) -> Next<RepairScan> {
         let mut malformed = Vec::new();
         for (key, value) in rows {
             let record = match SyncMirrorRecord::from_bytes(&key, &value) {
@@ -71,15 +64,15 @@ impl ScanRepairsOperation {
             }
         }
         if !malformed.is_empty() {
-            self.dropping = Some(next);
+            self.dropping = true;
             return Next::Call(IoCall::Delete(malformed));
         }
-        self.advance(next)
+        self.advance()
     }
 
-    fn advance(&mut self, next: Option<Key>) -> Next<RepairScan> {
-        if next.is_some() {
-            return Self::page(next);
+    fn advance(&mut self) -> Next<RepairScan> {
+        if !self.pages.done() {
+            return Next::Call(self.pages.call());
         }
         let mut due = std::mem::take(&mut self.due);
         due.sort_by(|(left_key, left), (right_key, right)| {
@@ -100,18 +93,16 @@ impl Operation for ScanRepairsOperation {
     type Error = SyncMirrorError;
 
     fn first(&mut self) -> Result<Next<RepairScan>, SyncMirrorError> {
-        Ok(Self::page(None))
+        Ok(Next::Call(self.pages.call()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<RepairScan>, SyncMirrorError> {
-        if let Some(next) = self.dropping.take() {
-            finished(result)?;
-            return Ok(self.advance(next));
+        if std::mem::take(&mut self.dropping) {
+            done(result)?;
+            return Ok(self.advance());
         }
-        match result {
-            IoResult::Page { rows, next } => Ok(self.rows(rows, next)),
-            other => Err(unexpected("IoResult::Page", &other)),
-        }
+        let rows = self.pages.take(result)?;
+        Ok(self.rows(rows))
     }
 
     fn stamp(&mut self, now_ms: u64) {
@@ -125,6 +116,7 @@ mod tests {
     use super::super::{SyncMirrorIntent, repair_key};
     use super::*;
     use aruna_core::calls::IoError;
+    use byteview::ByteView;
     use ulid::Ulid;
 
     fn record(seed: u8, due_at_ms: u64) -> (Key, Value) {
@@ -140,10 +132,19 @@ mod tests {
         )
     }
 
+    fn page(after: Option<Key>) -> Next<RepairScan> {
+        Next::Call(IoCall::Page {
+            space: MIRROR_REPAIR_KEYSPACE.to_string(),
+            prefix: ByteView::from(Vec::new()),
+            after,
+            limit: REPAIR_PAGE_SIZE,
+        })
+    }
+
     fn listing() -> ScanRepairsOperation {
         let mut operation = ScanRepairsOperation::new();
         operation.stamp(50);
-        assert_eq!(operation.first(), Ok(ScanRepairsOperation::page(None)));
+        assert_eq!(operation.first(), Ok(page(None)));
         operation
     }
 
@@ -162,10 +163,7 @@ mod tests {
             rows: vec![late, future.clone()],
             next: Some(future.0.clone()),
         };
-        assert_eq!(
-            operation.next(first),
-            Ok(ScanRepairsOperation::page(Some(future.0)))
-        );
+        assert_eq!(operation.next(first), Ok(page(Some(future.0))));
         let last = IoResult::Page {
             rows: vec![early],
             next: None,

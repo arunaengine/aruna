@@ -4,9 +4,10 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::{SyncRelationship, SyncState};
 
-use super::{SyncRelationshipDirection, SyncRelationshipError, delete_call, finished, write_call};
+use super::{SyncRelationshipDirection, SyncRelationshipError, delete_call, write_call};
 
 /// Relationships serving references are detached, not deleted: reads are authorized through
 /// the outgoing record, so a stub must survive for retained data to stay readable.
@@ -40,7 +41,7 @@ impl Operation for RemoveOutgoingOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncRelationshipError> {
-        finished(result)?;
+        done(result)?;
         Ok(Next::Done(()))
     }
 }

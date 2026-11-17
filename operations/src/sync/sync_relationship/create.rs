@@ -6,15 +6,18 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, done, read_row, values};
 use aruna_core::structs::{SyncRelationship, SyncState};
-use aruna_core::types::{Key, Value};
+use aruna_core::types::Value;
 use byteview::ByteView;
 
 use super::{
-    SyncRelationshipDirection, SyncRelationshipError, finished, page_call, page_rows, parse_values,
-    same_create_identity, storage_key, unexpected,
+    SyncRelationshipDirection, SyncRelationshipError, pages, parse_values, same_create_identity,
+    storage_key,
 };
-use crate::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord, same_relationship};
+use crate::sync::mirror_repair::{
+    SyncMirrorIntent, SyncMirrorRecord, repair_key, same_relationship,
+};
 
 #[derive(Debug, PartialEq)]
 enum Phase {
@@ -31,6 +34,7 @@ pub struct CreateRelationshipOperation {
     relationship: SyncRelationship,
     /// Scans the source bucket for an enabled relationship with the same endpoints and mode.
     check_duplicates: bool,
+    scan: PrefixPages,
     phase: Phase,
 }
 
@@ -45,32 +49,23 @@ impl CreateRelationshipOperation {
 
     /// A relationship that replaces older ones of the same endpoints, so no duplicate check.
     pub fn activate(relationship: SyncRelationship) -> Self {
+        let bucket = relationship.source.bucket();
         Self {
+            scan: pages(SyncRelationshipDirection::Outgoing, bucket),
             relationship,
             check_duplicates: false,
             phase: Phase::Scanning,
         }
     }
 
-    fn scan_call(&self, after: Option<Key>) -> IoCall {
-        let bucket = self.relationship.source.bucket();
-        page_call(SyncRelationshipDirection::Outgoing, bucket, after)
-    }
-
     fn claim_read(&mut self) -> Next<SyncRelationship> {
         self.phase = Phase::Claiming;
-        let row = (
-            MIRROR_REPAIR_KEYSPACE.to_string(),
-            repair_key(&self.relationship),
-        );
-        Next::Call(IoCall::Read(vec![row]))
+        let key = repair_key(&self.relationship);
+        Next::Call(read_row(MIRROR_REPAIR_KEYSPACE, key))
     }
 
-    fn scan(
-        &mut self,
-        rows: Vec<(Key, Value)>,
-        next: Option<Key>,
-    ) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
+    fn scan(&mut self, result: IoResult) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
+        let rows = self.scan.take(result)?;
         let existing = parse_values(SyncRelationshipDirection::Outgoing, rows)?;
         // Detached stubs keep retained references readable without blocking recreation.
         if existing.iter().any(|existing| {
@@ -79,9 +74,9 @@ impl CreateRelationshipOperation {
         }) {
             return Err(SyncRelationshipError::Duplicate);
         }
-        Ok(match next {
-            Some(after) => Next::Call(self.scan_call(Some(after))),
-            None => self.claim_read(),
+        Ok(match self.scan.done() {
+            true => self.claim_read(),
+            false => Next::Call(self.scan.call()),
         })
     }
 
@@ -121,24 +116,20 @@ impl Operation for CreateRelationshipOperation {
             .into());
         }
         if self.check_duplicates {
-            self.phase = Phase::Scanning;
-            return Ok(Next::Call(self.scan_call(None)));
+            return Ok(Next::Call(self.scan.call()));
         }
         Ok(self.claim_read())
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
         match self.phase {
-            Phase::Scanning => {
-                let (rows, next) = page_rows(result)?;
-                self.scan(rows, next)
+            Phase::Scanning => self.scan(result),
+            Phase::Claiming => {
+                let [value] = values::<1>(result)?;
+                self.claim(value)
             }
-            Phase::Claiming => match result {
-                IoResult::Values(mut values) if values.len() == 1 => self.claim(values.remove(0)),
-                other => Err(unexpected("IoResult::Values", &other)),
-            },
             Phase::Writing => {
-                finished(result)?;
+                done(result)?;
                 Ok(Next::Done(self.relationship.clone()))
             }
         }
@@ -153,16 +144,13 @@ impl Operation for CreateRelationshipOperation {
     }
 }
 
-fn repair_key(relationship: &SyncRelationship) -> Key {
-    ByteView::from(relationship.id.to_bytes().to_vec())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::tests::relationship;
+    use super::super::tests::{page_call, relationship};
     use super::*;
     use aruna_core::calls::IoError;
     use aruna_core::structs::storage::replication::ArunaArnType;
+    use aruna_core::types::Key;
 
     fn subject() -> SyncRelationship {
         relationship(1, "source-a", "target-a")
@@ -188,8 +176,7 @@ mod tests {
     }
 
     fn claim_read() -> Next<SyncRelationship> {
-        let row = (MIRROR_REPAIR_KEYSPACE.to_string(), repair_key(&subject()));
-        Next::Call(IoCall::Read(vec![row]))
+        Next::Call(read_row(MIRROR_REPAIR_KEYSPACE, repair_key(&subject())))
     }
 
     fn staged(intent: SyncMirrorIntent) -> Value {

@@ -4,9 +4,10 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 
-use super::{SyncRelationshipDirection, SyncRelationshipError, delete_call, finished};
+use super::{SyncRelationshipDirection, SyncRelationshipError, delete_call};
 
 /// Deletes the record of a valid `relationship`.
 #[derive(Debug, PartialEq)]
@@ -33,7 +34,7 @@ impl Operation for DeleteRelationshipOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncRelationshipError> {
-        finished(result)?;
+        done(result)?;
         Ok(Next::Done(()))
     }
 }

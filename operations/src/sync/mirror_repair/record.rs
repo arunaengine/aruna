@@ -5,13 +5,14 @@
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::MIRROR_REPAIR_KEYSPACE;
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 
 use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, finished, one_value,
-    repair_key, repair_read, same_relationship,
+    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, repair_key,
+    repair_read, same_relationship,
 };
 use crate::tasks::queue_backoff::retry_delay_ms;
 
@@ -180,7 +181,7 @@ impl Operation for MirrorRecordOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, SyncMirrorError> {
         if self.changing {
-            finished(result)?;
+            done(result)?;
             return Ok(Next::Done(()));
         }
         let value = one_value(result)?;

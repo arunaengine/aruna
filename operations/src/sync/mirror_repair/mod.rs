@@ -24,6 +24,7 @@ use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{MIRROR_REPAIR_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::SyncRelationship;
 use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
@@ -142,32 +143,22 @@ fn repair_entry(record: SyncMirrorRecord) -> Result<(KeySpace, Key, Value), Conv
 }
 
 /// The repair record key of a relationship: its id.
-fn repair_key(relationship: &SyncRelationship) -> Key {
+pub(crate) fn repair_key(relationship: &SyncRelationship) -> Key {
     ByteView::from(relationship.id.to_bytes().to_vec())
 }
 
 fn repair_read(key: &Key) -> IoCall {
-    IoCall::Read(vec![(MIRROR_REPAIR_KEYSPACE.to_string(), key.clone())])
+    read_row(MIRROR_REPAIR_KEYSPACE, key.clone())
 }
 
 fn outgoing_read(key: &Key) -> IoCall {
-    IoCall::Read(vec![(RELATIONSHIP_OUT_KEYSPACE.to_string(), key.clone())])
+    read_row(RELATIONSHIP_OUT_KEYSPACE, key.clone())
 }
 
 /// The one value a single-row read answered.
 fn one_value(result: IoResult) -> Result<Option<Value>, SyncMirrorError> {
-    match result {
-        IoResult::Values(mut values) if values.len() == 1 => Ok(values.pop().flatten()),
-        other => Err(unexpected("IoResult::Values", &other)),
-    }
-}
-
-/// Checks that a write or delete finished.
-fn finished(result: IoResult) -> Result<(), SyncMirrorError> {
-    match result {
-        IoResult::Done => Ok(()),
-        other => Err(unexpected("IoResult::Done", &other)),
-    }
+    let [value] = values::<1>(result)?;
+    Ok(value)
 }
 
 fn unexpected(expected: &'static str, result: &IoResult) -> SyncMirrorError {

@@ -18,9 +18,10 @@ pub use list::ListRelationshipsOperation;
 pub use remove::RemoveOutgoingOperation;
 pub use store::StoreRelationshipOperation;
 
-use aruna_core::calls::{IoCall, IoError, IoResult};
+use aruna_core::calls::{IoCall, IoError};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE};
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::{SyncRelationship, sync_relationship_key, sync_relationship_prefix};
 use aruna_core::types::{Key, Value};
 use byteview::ByteView;
@@ -92,18 +93,10 @@ fn storage_key(
     )))
 }
 
-/// One page of relationships of `direction`, of one bucket or of all.
-fn page_call(
-    direction: SyncRelationshipDirection,
-    bucket: Option<&str>,
-    after: Option<Key>,
-) -> IoCall {
-    IoCall::Page {
-        space: direction.keyspace().to_string(),
-        prefix: ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default()),
-        after,
-        limit: RELATIONSHIP_PAGE_SIZE,
-    }
+/// The pages of relationships of `direction`, of one bucket or of all.
+fn pages(direction: SyncRelationshipDirection, bucket: Option<&str>) -> PrefixPages {
+    let prefix = ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default());
+    PrefixPages::new(direction.keyspace(), prefix, RELATIONSHIP_PAGE_SIZE)
 }
 
 /// Writes `relationship` in the keyspace of `direction`.
@@ -130,29 +123,6 @@ fn delete_call(
         storage_key(direction, relationship)?,
     );
     Ok(IoCall::Delete(vec![row]))
-}
-
-/// The rows of a page, or the error for any other result.
-fn page_rows(result: IoResult) -> Result<(Vec<(Key, Value)>, Option<Key>), SyncRelationshipError> {
-    match result {
-        IoResult::Page { rows, next } => Ok((rows, next)),
-        other => Err(unexpected("IoResult::Page", &other)),
-    }
-}
-
-/// Checks that a write or delete finished.
-fn finished(result: IoResult) -> Result<(), SyncRelationshipError> {
-    match result {
-        IoResult::Done => Ok(()),
-        other => Err(unexpected("IoResult::Done", &other)),
-    }
-}
-
-fn unexpected(expected: &'static str, result: &IoResult) -> SyncRelationshipError {
-    SyncRelationshipError::Io(IoError::Unexpected {
-        expected,
-        got: result.label(),
-    })
 }
 
 fn parse_values(

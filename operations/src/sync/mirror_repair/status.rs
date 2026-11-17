@@ -6,6 +6,7 @@ use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{RELATIONSHIP_OUT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
+use aruna_core::rows::done;
 use aruna_core::structs::storage::blob::{BucketInfo, object_permission_path};
 use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
 use aruna_core::types::{Key, KeySpace, Value};
@@ -13,8 +14,8 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::{
-    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, finished, one_value,
-    outgoing_read, repair_entry, repair_key, repair_read, same_relationship,
+    SyncMirrorError, SyncMirrorIntent, SyncMirrorRecord, decode_record, one_value, outgoing_read,
+    repair_entry, repair_key, repair_read, same_relationship,
 };
 
 type Writes = Vec<(KeySpace, Key, Value)>;
@@ -138,7 +139,7 @@ impl Operation for StoreStatusOperation {
             Phase::Record(previous) => self.check_record(previous, one_value(result)?),
             Phase::Bucket(writes) => self.journal(writes, one_value(result)?),
             Phase::Writing => {
-                finished(result)?;
+                done(result)?;
                 Ok(Next::Done(true))
             }
         }

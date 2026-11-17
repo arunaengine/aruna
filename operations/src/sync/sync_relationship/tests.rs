@@ -5,7 +5,7 @@
 use super::*;
 use crate::driver::{DriverContext, drive, drive_retry};
 use crate::sync::mirror_repair::{MirrorRecordOperation, SyncMirrorIntent};
-use aruna_core::calls::Next;
+use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
@@ -218,6 +218,20 @@ async fn create_is_atomic() {
         .await
         .unwrap();
         assert_eq!(stored.len(), 1);
+    }
+}
+
+/// The page call the operations should make, built here independently of `pages`.
+pub(super) fn page_call(
+    direction: SyncRelationshipDirection,
+    bucket: Option<&str>,
+    after: Option<Key>,
+) -> IoCall {
+    IoCall::Page {
+        space: direction.keyspace().to_string(),
+        prefix: ByteView::from(bucket.map(sync_relationship_prefix).unwrap_or_default()),
+        after,
+        limit: RELATIONSHIP_PAGE_SIZE,
     }
 }
 

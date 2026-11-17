@@ -4,9 +4,10 @@
 
 use aruna_core::calls::{IoResult, Next};
 use aruna_core::operation::Operation;
+use aruna_core::rows::done;
 use aruna_core::structs::SyncRelationship;
 
-use super::{SyncRelationshipDirection, SyncRelationshipError, finished, write_call};
+use super::{SyncRelationshipDirection, SyncRelationshipError, write_call};
 
 /// Writes `relationship` and answers it back.
 #[derive(Debug, PartialEq)]
@@ -33,7 +34,7 @@ impl Operation for StoreRelationshipOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<SyncRelationship>, SyncRelationshipError> {
-        finished(result)?;
+        done(result)?;
         Ok(Next::Done(self.relationship.clone()))
     }
 }
