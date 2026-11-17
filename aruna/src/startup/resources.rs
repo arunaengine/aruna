@@ -245,6 +245,7 @@ pub(crate) async fn acquire(
     if settings.event_recording {
         aruna_operations::recorder::enable(RECORD_LIMITS);
     }
+    aruna_operations::driver::set_hang_limits(settings.hang_limits);
     let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
