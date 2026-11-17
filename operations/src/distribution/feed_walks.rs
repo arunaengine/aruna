@@ -1363,3 +1363,140 @@ impl Operation for StateWalk {
 }
 
 /// One bounded pass over each walk, one after another; a failed walk is logged and the next
+/// one runs. Outputs whether the pass changed an index or a row, and the new cursors.
+#[derive(Debug, PartialEq)]
+pub struct FeedPassOperation {
+    limits: FeedLimits,
+    cursors: FeedCursors,
+    walk: Option<Walk>,
+    changed: usize,
+    done: bool,
+    refused: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Walk {
+    Feed(FeedWalk),
+    Open(OpenWalk),
+    States(StateWalk),
+}
+
+impl Walk {
+    fn name(&self) -> &'static str {
+        match self {
+            Walk::Feed(_) => "feed",
+            Walk::Open(_) => "open",
+            Walk::States(_) => "build",
+        }
+    }
+}
+
+impl FeedPassOperation {
+    pub fn new(limits: FeedLimits, cursors: FeedCursors) -> Self {
+        Self {
+            limits,
+            cursors,
+            walk: None,
+            changed: 0,
+            done: false,
+            refused: None,
+        }
+    }
+
+    /// Starts `walk`, and the walks after it while one finishes without effects.
+    fn begin(&mut self, mut walk: Walk) -> Effects {
+        let effects = match &mut walk {
+            Walk::Feed(feed) => feed.start(),
+            Walk::Open(open) => open.start(),
+            Walk::States(states) => states.start(),
+        };
+        self.settle(walk, effects)
+    }
+
+    /// Keeps a running walk; a finished one records its cursor and result, then the next starts.
+    fn settle(&mut self, walk: Walk, effects: Effects) -> Effects {
+        let complete = match &walk {
+            Walk::Feed(feed) => feed.is_complete(),
+            Walk::Open(open) => open.is_complete(),
+            Walk::States(states) => states.is_complete(),
+        };
+        if !complete {
+            self.walk = Some(walk);
+            return effects;
+        }
+        let name = walk.name();
+        let (result, next) = match walk {
+            Walk::Feed(feed) => {
+                self.cursors.feed = feed.cursor();
+                let next = OpenWalk::new(self.limits.account_rows, self.cursors.accounts.clone());
+                (feed.finalize(), Some(Walk::Open(next)))
+            }
+            Walk::Open(open) => {
+                self.cursors.accounts = open.cursor();
+                let next = StateWalk::new(self.limits, self.cursors.states.clone());
+                (open.finalize(), Some(Walk::States(next)))
+            }
+            Walk::States(states) => {
+                self.cursors.states = states.cursor();
+                (states.finalize(), None)
+            }
+        };
+        match result {
+            Ok(count) => self.changed += count,
+            Err(error) => warn!(walk = name, %error, "Range search index pass failed"),
+        }
+        match next {
+            Some(next) => self.begin(next),
+            None => {
+                self.done = true;
+                smallvec![]
+            }
+        }
+    }
+}
+
+impl Operation for FeedPassOperation {
+    type Output = FeedPass;
+    type Error = FeedError;
+
+    fn start(&mut self) -> Effects {
+        let feed = FeedWalk::new(self.limits.feed_rows, self.cursors.feed.clone());
+        self.begin(Walk::Feed(feed))
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        let Some(mut walk) = self.walk.take() else {
+            self.done = true;
+            self.refused = Some(format!("{event:?}"));
+            return smallvec![];
+        };
+        let effects = match &mut walk {
+            Walk::Feed(feed) => feed.step(event),
+            Walk::Open(open) => open.step(event),
+            Walk::States(states) => states.step(event),
+        };
+        self.settle(walk, effects)
+    }
+
+    fn is_complete(&self) -> bool {
+        self.done
+    }
+
+    fn finalize(self) -> Result<Self::Output, Self::Error> {
+        match (self.done, self.refused) {
+            (true, None) => Ok(FeedPass {
+                busy: self.changed > 0,
+                cursors: self.cursors,
+            }),
+            (true, Some(event)) => Err(FeedError::Storage(format!("unexpected event: {event}"))),
+            (false, _) => Err(FeedError::NotFinished),
+        }
+    }
+
+    fn abort(&mut self) -> Effects {
+        match self.walk.as_mut() {
+            Some(Walk::Feed(feed)) => feed.abort(),
+            _ => smallvec![],
+        }
+    }
+}
