@@ -1086,12 +1086,22 @@ pub async fn drive_retry<O: Operation>(
 #[cfg(test)]
 mod test {
     use crate::driver::{
-        DeadlineAbort, DriverContext, MAX_TRACKED_TRANSACTIONS, TransactionEffect,
-        TransactionState, TransactionTracker, drive, extend_unblocked,
+        DeadlineAbort, DriverContext, GroupEnd, GroupRun, Instant, MAX_TRACKED_TRANSACTIONS,
+        MemberStop, ParentRun, TransactionEffect, TransactionState, TransactionTracker, drive,
+        drive_retry, extend_unblocked, run_all, run_window,
     };
-    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::effects::{
+        BlobEffect, Effect, EffectGroup, GroupForm, StagingSourceEffect, StorageEffect,
+    };
     use aruna_core::errors::StorageError;
-    use aruna_core::events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{
+        BlobEvent, Event, GroupEvent, GroupResult, StagingSourceEvent, StorageEvent,
+        SubOperationEvent,
+    };
+    use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
+    use futures_util::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::time::Duration;
     use aruna_core::operation::{Operation, boxed_suboperation};
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -2598,5 +2608,394 @@ mod test {
         assert!(matches!(effect, StorageEffect::Read { key_space, .. } if key_space == "bulk"));
         assert!(receivers.foreground.try_recv().is_err());
         pending.abort();
+    }
+
+    /// Members in flight now and at most, as a fake dispatch counts them.
+    #[derive(Default)]
+    struct Flight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    /// Answers a storage read the seconds its first key byte names after it starts, and a
+    /// reservation release after three seconds; tests run it on paused time only.
+    fn slow_dispatch(
+        flight: Arc<Flight>,
+    ) -> impl Fn(Effect, Option<Instant>) -> BoxFuture<'static, Event> {
+        move |effect, _| {
+            let flight = flight.clone();
+            Box::pin(async move {
+                let now = flight.now.fetch_add(1, SeqCst) + 1;
+                flight.peak.fetch_max(now, SeqCst);
+                let (seconds, event) = match effect {
+                    Effect::Storage(StorageEffect::Read { key, .. }) => (
+                        u64::from(key[0]),
+                        Event::Storage(StorageEvent::ReadResult { key, value: None }),
+                    ),
+                    Effect::Blob(BlobEffect::ReleaseReservation { id }) => {
+                        (3, Event::Blob(BlobEvent::ReservationReleased { id }))
+                    }
+                    other => panic!("unexpected member {other:?}"),
+                };
+                tokio::time::sleep_until(Instant::now() + Duration::from_secs(seconds)).await;
+                flight.now.fetch_sub(1, SeqCst);
+                event
+            })
+        }
+    }
+
+    fn slow_read(seconds: u8) -> Effect {
+        Effect::Storage(StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from([seconds]),
+            txn_id: None,
+        })
+    }
+
+    fn read_seconds(result: &GroupResult) -> Option<u8> {
+        match result {
+            GroupResult::Done(event) => match event.as_ref() {
+                Event::Storage(StorageEvent::ReadResult { key, .. }) => Some(key[0]),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// A context whose storage has no worker, for groups that only use a fake dispatch.
+    fn bare_context() -> DriverContext {
+        let (storage_handle, _) = storage::StorageHandle::new();
+        DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+            compute_handle: None,
+        }
+    }
+
+    const UNBOUNDED: MemberStop = MemberStop {
+        at: None,
+        protect_managed: true,
+    };
+
+    #[tokio::test(start_paused = true)]
+    async fn group_waits_slowest() {
+        let context = bare_context();
+        let flight = Arc::new(Flight::default());
+        let mut run = GroupRun::new(slow_dispatch(flight.clone()), &context, 8, UNBOUNDED);
+        run.add([slow_read(3), slow_read(1), slow_read(2)]);
+        let started = Instant::now();
+        let results = run_all(&mut run, &mut Vec::new()).await;
+        // Paused time jumps from timer to timer: the group takes its slowest member, not the
+        // six seconds of the same reads one after another.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let order: Vec<_> = results.iter().map(read_seconds).collect();
+        assert_eq!(order, [Some(3), Some(1), Some(2)]);
+        assert_eq!(flight.peak.load(SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_spares_managed() {
+        let context = bare_context();
+        let stop = MemberStop {
+            at: Some(Instant::now() + Duration::from_secs(1)),
+            protect_managed: true,
+        };
+        let mut run = GroupRun::new(slow_dispatch(Arc::default()), &context, 8, stop);
+        let id = ulid::Ulid::from_bytes([3u8; 16]);
+        run.add([
+            slow_read(5),
+            Effect::Blob(BlobEffect::ReleaseReservation { id }),
+        ]);
+        let started = Instant::now();
+        let results = run_all(&mut run, &mut Vec::new()).await;
+        assert_eq!(
+            results,
+            [
+                GroupResult::Unfinished,
+                GroupResult::Done(Box::new(Event::Blob(BlobEvent::ReservationReleased { id }))),
+            ]
+        );
+        // The managed release finishes after the deadline instead of being cut off.
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    /// Records window results as (index, seconds) and asks for one more member per result
+    /// while it has any left.
+    #[derive(Debug, PartialEq)]
+    struct WindowRows {
+        rest: Vec<Effect>,
+        seen: Vec<(usize, Option<u8>)>,
+        closed: bool,
+    }
+
+    impl Operation for WindowRows {
+        type Output = ();
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match event {
+                Event::Group(GroupEvent::Member { index, result }) => {
+                    self.seen.push((index, read_seconds(&result)));
+                    self.rest.pop().into_iter().collect()
+                }
+                Event::Group(GroupEvent::Closed) => {
+                    self.closed = true;
+                    smallvec::smallvec![]
+                }
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+
+        fn is_complete(&self) -> bool {
+            self.closed
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn window_refills_slots() {
+        let context = bare_context();
+        let flight = Arc::new(Flight::default());
+        let mut run = GroupRun::new(slow_dispatch(flight.clone()), &context, 2, UNBOUNDED);
+        run.add([slow_read(4), slow_read(1)]);
+        let mut operation = WindowRows {
+            rest: vec![slow_read(1)],
+            seen: Vec::new(),
+            closed: false,
+        };
+        let end = run_window(
+            &mut ParentRun(&mut operation),
+            &mut run,
+            &mut Vec::new(),
+            GroupEnd::Expired,
+        )
+        .await;
+        assert!(matches!(end, GroupEnd::Stepped(effects) if effects.is_empty()));
+        // Member 1 frees its slot after one second, so member 2 runs before member 0 ends.
+        assert_eq!(operation.seen, [(1, Some(1)), (2, Some(1)), (0, Some(4))]);
+        assert!(operation.closed);
+        assert_eq!(flight.peak.load(SeqCst), 2);
+    }
+
+    /// Emits one group and keeps its results.
+    #[derive(Debug, PartialEq)]
+    struct OneGroup {
+        members: Vec<Effect>,
+        results: Option<Vec<GroupResult>>,
+    }
+
+    impl Operation for OneGroup {
+        type Output = Vec<GroupResult>;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Group(EffectGroup {
+                members: std::mem::take(&mut self.members),
+                limit: 4,
+                form: GroupForm::All { deadline: None },
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            if let Event::Group(GroupEvent::Finished { results }) = event {
+                self.results = Some(results);
+            }
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.results.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            self.results.ok_or(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn group_refuses_transaction() {
+        let (_directory, context) = test_context();
+        let read = StorageEffect::Read {
+            key_space: "default".to_string(),
+            key: ByteView::from(*b"absent"),
+            txn_id: None,
+        };
+        let operation = OneGroup {
+            members: vec![
+                Effect::Storage(StorageEffect::StartTransaction { read: false }),
+                Effect::Storage(read),
+            ],
+            results: None,
+        };
+        let read = Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(*b"absent"),
+            value: None,
+        });
+        assert_eq!(
+            drive(operation, &context).await,
+            Ok(vec![
+                GroupResult::Refused,
+                GroupResult::Done(Box::new(read))
+            ])
+        );
+    }
+
+    /// Runs one member that names a tenant backend and asks `idle` after the group ended.
+    struct HeldGroup {
+        backend_id: ulid::Ulid,
+        idle: Box<dyn Fn() -> bool + Send>,
+        idle_after: Option<bool>,
+    }
+
+    impl std::fmt::Debug for HeldGroup {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("HeldGroup")
+                .field("idle_after", &self.idle_after)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl PartialEq for HeldGroup {
+        fn eq(&self, other: &Self) -> bool {
+            self.idle_after == other.idle_after
+        }
+    }
+
+    impl Operation for HeldGroup {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            let location = BackendLocation {
+                backend: BackendRef::Group(self.backend_id),
+                storage_class: None,
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                backend_path: "blob/held".to_string(),
+                ulid: self.backend_id,
+                format: Default::default(),
+                created_by: aruna_core::UserId::default(),
+                created_at: std::time::SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: false,
+                blob_size: 1,
+                hashes: Default::default(),
+            };
+            smallvec::smallvec![Effect::Group(EffectGroup {
+                members: vec![Effect::Blob(BlobEffect::Delete { location })],
+                limit: 1,
+                form: GroupForm::All { deadline: None },
+            })]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            self.idle_after = Some((self.idle)());
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.idle_after.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            self.idle_after.ok_or(())
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn hold_outlives_member() {
+        let (_directory, context) = blob_context().await;
+        let blob = context.blob_handle.clone().expect("blob handle");
+        let backend_id = ulid::Ulid::from_bytes([4u8; 16]);
+        let probe = blob.clone();
+        let operation = HeldGroup {
+            backend_id,
+            idle: Box::new(move || probe.idle_generation(backend_id).is_some()),
+            idle_after: None,
+        };
+        // Removal needs an idle generation: the member ended, but its parent still holds.
+        assert_eq!(drive(operation, &context).await, Ok(false));
+        assert!(blob.idle_generation(backend_id).is_some());
+    }
+
+    /// Fails with a conflict until attempt `conflicts`, then answers its attempt.
+    #[derive(Debug, PartialEq)]
+    struct Conflicted {
+        attempt: usize,
+        conflicts: usize,
+    }
+
+    impl Operation for Conflicted {
+        type Output = usize;
+        type Error = StorageError;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn step(&mut self, _: Event) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            true
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            match self.attempt < self.conflicts {
+                true => Err(StorageError::TransactionConflict),
+                false => Ok(self.attempt),
+            }
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+
+        fn is_conflict(error: &Self::Error) -> bool {
+            matches!(error, StorageError::TransactionConflict)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_reruns_conflict() {
+        let context = bare_context();
+        for (conflicts, expected, attempts) in [
+            (2, Ok(2), 3),
+            (usize::MAX, Err(StorageError::TransactionConflict), 4),
+        ] {
+            let mut built = 0;
+            let build = || {
+                built += 1;
+                Conflicted {
+                    attempt: built - 1,
+                    conflicts,
+                }
+            };
+            assert_eq!(drive_retry(build, &context, &[7u8; 16]).await, expected);
+            assert_eq!(built, attempts);
+        }
     }
 }
