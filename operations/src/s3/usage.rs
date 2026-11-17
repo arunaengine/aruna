@@ -10,6 +10,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, REALM_CONFIG_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::operation::EffectOperation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredLayout;
@@ -455,6 +456,14 @@ pub enum QuotaGateError {
     ConversionError(#[from] ConversionError),
     #[error("quota gate received unexpected event: {0}")]
     UnexpectedEvent(&'static str),
+    #[error("quota gate read failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for QuotaGateError {
+    fn from(error: IoError) -> Self {
+        Self::Io(error)
+    }
 }
 
 /// Read side of the per-group quota gate: sums realm-wide `logical_bytes` in the caller's write
@@ -527,100 +536,75 @@ impl QuotaGate {
     }
 
     /// Reads the rebuild marker first, inside the write transaction, so a rebuild that begins
-    /// or finishes meanwhile makes the write conflict and retry.
-    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+    /// or finishes meanwhile makes the write conflict and retry. Every call of the gate runs in
+    /// the host's transaction.
+    pub fn start_calls(&mut self) -> IoCall {
         self.phase = QuotaGatePhase::ReadMarker;
-        smallvec![rebuild_marker_read(Some(txn_id))]
+        read_row(USAGE_STATS_KEYSPACE, USAGE_REBUILD_KEY.to_vec())
     }
 
-    fn read_config_effect(&mut self, txn_id: TxnId) -> Effects {
+    fn read_config_call(&mut self) -> IoCall {
         if let Some(realm_id) = self.realm_id {
             self.phase = QuotaGatePhase::ReadRealmConfig;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                key: DocumentTarget::RealmConfig { realm_id }.storage_key(),
-                txn_id: Some(txn_id),
-            })];
+            let key = DocumentTarget::RealmConfig { realm_id }.storage_key();
+            return read_row(REALM_CONFIG_KEYSPACE, key);
         }
-        self.read_local_effect(txn_id)
+        self.read_local_call()
     }
 
-    fn read_local_effect(&mut self, txn_id: TxnId) -> Effects {
+    fn read_local_call(&mut self) -> IoCall {
         self.phase = QuotaGatePhase::ReadLocal;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USAGE_STATS_KEYSPACE.to_string(),
-            key: self.group_key.clone().into(),
-            txn_id: Some(txn_id),
-        })]
+        read_row(USAGE_STATS_KEYSPACE, self.group_key.clone())
     }
 
-    fn scan_effect(&self, start_after: Option<Key>, txn_id: TxnId) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: NODE_STATS_KEYSPACE.to_string(),
-            prefix: Some(self.remote_prefix.clone().into()),
-            start: start_after.map(IterStart::After),
+    fn scan_call(&self, after: Option<Key>) -> IoCall {
+        IoCall::Page {
+            space: NODE_STATS_KEYSPACE.to_string(),
+            prefix: self.remote_prefix.clone().into(),
+            after,
             limit: Self::SCAN_LIMIT,
-            txn_id: Some(txn_id),
-        })]
+        }
     }
 
-    /// Returns `Ok(Some(effects))` while more storage work is needed and
-    /// `Ok(None)` once the group's realm-wide usage has been summed.
-    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
-        match (&self.phase, event) {
-            (
-                QuotaGatePhase::ReadMarker,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                if value.is_some() {
+    /// The next call after `result`, or `None` once the group's realm-wide usage is summed.
+    pub fn step_calls(&mut self, result: IoResult) -> Result<Option<IoCall>, QuotaGateError> {
+        match self.phase {
+            QuotaGatePhase::ReadMarker => {
+                if result.value()?.is_some() {
                     // A rebuild runs: the last complete counters plus their deltas still hold.
                     self.phase = QuotaGatePhase::ReadComplete;
-                    return Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: USAGE_STATS_KEYSPACE.to_string(),
-                        key: Key::from(USAGE_COMPLETE_KEY.to_vec()),
-                        txn_id: Some(txn_id),
-                    })]));
+                    let key = USAGE_COMPLETE_KEY.to_vec();
+                    return Ok(Some(read_row(USAGE_STATS_KEYSPACE, key)));
                 }
-                Ok(Some(self.read_config_effect(txn_id)))
+                Ok(Some(self.read_config_call()))
             }
-            (
-                QuotaGatePhase::ReadComplete,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                if value.is_none() {
+            QuotaGatePhase::ReadComplete => {
+                if result.value()?.is_none() {
                     self.rebuilding = true;
                     self.phase = QuotaGatePhase::Done;
                     return Ok(None);
                 }
-                Ok(Some(self.read_config_effect(txn_id)))
+                Ok(Some(self.read_config_call()))
             }
-            (
-                QuotaGatePhase::ReadRealmConfig,
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
-                if let Some(bytes) = value {
+            QuotaGatePhase::ReadRealmConfig => {
+                if let Some(bytes) = result.value()? {
                     let document = RealmConfigDocument::from_bytes(bytes.as_ref())?;
                     self.active_node_ids =
                         Some(document.sync_eligible_nodes()?.into_iter().collect());
                     self.count_replicas = document.replica_quota.counts(&self.group_id);
                 }
-                Ok(Some(self.read_local_effect(txn_id)))
+                Ok(Some(self.read_local_call()))
             }
-            (QuotaGatePhase::ReadLocal, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if let Some(bytes) = value {
+            QuotaGatePhase::ReadLocal => {
+                if let Some(bytes) = result.value()? {
                     let counters = UsageCounters::from_bytes(bytes.as_ref())?;
                     self.usage = self.usage.saturating_add(counters.logical_bytes);
                 }
                 self.phase = QuotaGatePhase::ScanRemote;
-                Ok(Some(self.scan_effect(None, txn_id)))
+                Ok(Some(self.scan_call(None)))
             }
-            (
-                QuotaGatePhase::ScanRemote,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => {
+            QuotaGatePhase::ScanRemote => {
+                let (values, next_start_after) = result.page()?;
                 for (key, value) in values {
                     // Live counters already include our snapshot's counters, not its replica
                     // share. Snapshots must also bind their embedded node id to the storage key.
@@ -646,15 +630,12 @@ impl QuotaGate {
                     self.settle_shares();
                 }
                 match next_start_after {
-                    Some(start) => Ok(Some(self.scan_effect(Some(start), txn_id))),
+                    Some(start) => Ok(Some(self.scan_call(Some(start)))),
                     // The own share may exceed the live copies once a removal shrank it.
                     None if !self.count_replicas && self.own_replicas > 0 => {
                         self.phase = QuotaGatePhase::ReadDirty;
-                        Ok(Some(smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space: NODE_STATS_KEYSPACE.to_string(),
-                            key: Key::from(dirty_share_key(self.group_id)),
-                            txn_id: Some(txn_id),
-                        })]))
+                        let key = dirty_share_key(self.group_id);
+                        Ok(Some(read_row(NODE_STATS_KEYSPACE, key)))
                     }
                     None => {
                         self.phase = QuotaGatePhase::Done;
@@ -662,15 +643,44 @@ impl QuotaGate {
                     }
                 }
             }
-            (QuotaGatePhase::ReadDirty, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                if value.is_some() {
+            QuotaGatePhase::ReadDirty => {
+                if result.value()?.is_some() {
                     self.own_replicas = 0;
                 }
                 self.phase = QuotaGatePhase::Done;
                 Ok(None)
             }
-            (_, received) => Err(QuotaGateError::UnexpectedEvent(received.label())),
+            QuotaGatePhase::Pending | QuotaGatePhase::Done => {
+                Err(QuotaGateError::UnexpectedEvent(result.label()))
+            }
         }
+    }
+
+    pub fn start(&mut self, txn_id: TxnId) -> Effects {
+        let call = StagedCall::InTransaction(self.start_calls());
+        call.into_effect(txn_id).into_iter().collect()
+    }
+
+    /// Returns `Ok(Some(effects))` while more storage work is needed and
+    /// `Ok(None)` once the group's realm-wide usage has been summed.
+    pub fn step(&mut self, event: Event, txn_id: TxnId) -> Result<Option<Effects>, QuotaGateError> {
+        let result = match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => IoResult::Values(vec![value]),
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => IoResult::Page {
+                rows: values,
+                next: next_start_after,
+            },
+            received => return Err(QuotaGateError::UnexpectedEvent(received.label())),
+        };
+        let Some(call) = self.step_calls(result)? else {
+            return Ok(None);
+        };
+        let effect = StagedCall::InTransaction(call).into_effect(txn_id);
+        let effect = effect.map_err(|_| QuotaGateError::UnexpectedEvent("a gate storage call"))?;
+        Ok(Some(smallvec![effect]))
     }
 
     /// Deducts only shares, this node's own included, computed under the newest record known for

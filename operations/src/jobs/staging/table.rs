@@ -865,7 +865,7 @@ fn lasting_put(error: &PutObjectError) -> bool {
         | Put::ConversionError(_) => true,
         Put::QuotaGateError(error) => match error {
             QuotaGateError::ConversionError(_) => true,
-            QuotaGateError::UnexpectedEvent(_) => false,
+            QuotaGateError::UnexpectedEvent(_) | QuotaGateError::Io(_) => false,
         },
         Put::RoutingFailed(error) => match error {
             RoutingError::BackendFull(_) => false,
