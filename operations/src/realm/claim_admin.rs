@@ -303,10 +303,9 @@ impl ClaimInitialOperation {
                 self.output = Some(Ok(ClaimInitialResult::Claimed(auth_doc)));
                 smallvec![]
             }
-            other => self.unexpected_event(
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
+            other => {
+                self.unexpected_event("admin document outbox drain timer schedule", other.label())
+            }
         }
     }
 }

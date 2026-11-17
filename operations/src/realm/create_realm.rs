@@ -442,7 +442,7 @@ impl CreateRealmOperation {
             other => self.unexpected_event(
                 CreateRealmState::ScheduleSyncDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }

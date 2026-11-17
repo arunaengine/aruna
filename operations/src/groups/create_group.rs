@@ -551,7 +551,7 @@ impl CreateGroupOperation {
             other => self.unexpected_event(
                 CreateGroupState::ScheduleSyncDrain,
                 "Event::Task(TaskEvent::TimerScheduled)",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }

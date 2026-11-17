@@ -45,7 +45,10 @@ pub enum NodeSecretError {
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: &'static str },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("operation did not finish")]
     NotFinished,
 }
@@ -249,10 +252,9 @@ impl Operation for NodeSecretOperation {
             }
             (State::ReadRecord, Event::Storage(StorageEvent::BatchReadResult { values })) => {
                 let [(_, stored), (_, auth)] = values.as_slice() else {
-                    let got = format!("{} values", values.len());
                     return self.fail(NodeSecretError::UnexpectedEvent {
                         state: "ReadRecord",
-                        got,
+                        got: "a batch of another length",
                     });
                 };
                 match self.plan(stored.as_deref(), auth.as_deref()) {

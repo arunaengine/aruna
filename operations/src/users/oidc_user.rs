@@ -484,10 +484,9 @@ impl ResolveOidcOperation {
         match event {
             Event::Task(TaskEvent::TimerScheduled { .. })
             | Event::Task(TaskEvent::Error { .. }) => self.emit_finish(user),
-            other => self.unexpected_event(
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
+            other => {
+                self.unexpected_event("admin document outbox drain timer schedule", other.label())
+            }
         }
     }
 

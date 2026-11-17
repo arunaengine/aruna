@@ -61,7 +61,10 @@ pub enum RealmSecretError {
     #[error("this node is not a realm management node")]
     NotManagementNode,
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: &'static str },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("operation did not finish")]
     NotFinished,
 }

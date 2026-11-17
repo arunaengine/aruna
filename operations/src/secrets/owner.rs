@@ -75,7 +75,10 @@ pub enum OwnerSecretError {
     #[error(transparent)]
     Vault(#[from] RealmVaultError),
     #[error("unexpected event in state {state}: {got}")]
-    UnexpectedEvent { state: &'static str, got: &'static str },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
     #[error("this secret cannot be read back")]
     NotReadable,
     #[error("operation did not finish")]

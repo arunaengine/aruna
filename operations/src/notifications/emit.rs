@@ -46,7 +46,7 @@ impl EmitNotificationsOperation {
         }
     }
 
-    fn drop_emission(&mut self, event_desc: String, txn_id: Option<TxnId>) -> Effects {
+    fn drop_emission(&mut self, event_desc: &str, txn_id: Option<TxnId>) -> Effects {
         warn!(state = ?self.state, event = %event_desc, "Dropping notification emission");
         self.state = EmitNotificationsState::Finish;
         match txn_id {

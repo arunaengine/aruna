@@ -674,7 +674,7 @@ impl AddRoleOperation {
             other => self.unexpected_event(
                 self.state.clone(),
                 "admin document outbox drain timer schedule",
-                format!("{other:?}"),
+                other.label(),
             ),
         }
     }

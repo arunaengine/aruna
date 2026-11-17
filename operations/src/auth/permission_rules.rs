@@ -692,7 +692,7 @@ impl PermissionRulesOperation {
             AuthorizationError::UnexpectedEvent {
                 state: state.to_string(),
                 expected,
-                got,
+                got: got.to_string(),
             },
             cleanup_effects,
         )

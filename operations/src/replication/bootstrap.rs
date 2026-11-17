@@ -99,7 +99,10 @@ pub enum BootstrapError {
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: &'static str },
+    UnexpectedEvent {
+        state: &'static str,
+        got: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
