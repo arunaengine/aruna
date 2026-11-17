@@ -371,3 +371,179 @@ fn unexpected(got: &'static str) -> AnnounceTopicError {
         got,
     })
 }
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    use aruna_core::UserId;
+    use aruna_core::document::DocumentOutboxRecord;
+    use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::types::GroupId;
+    use std::time::Duration;
+
+    fn local_node_id() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1u8; 32]).public()
+    }
+
+    fn read(value: Option<Vec<u8>>) -> IoResult {
+        IoResult::Values(vec![value.map(Value::from)])
+    }
+
+    fn written_record(next: Result<Next<()>, AnnounceTopicError>) -> DocumentOutboxRecord {
+        let Ok(Next::Call(IoCall::Write(rows))) = next else {
+            panic!("expected one outbox write");
+        };
+        let [(space, _, value)] = rows.as_slice() else {
+            panic!("expected one outbox row");
+        };
+        assert_eq!(space, SYNC_OUTBOX_KEYSPACE);
+        postcard::from_bytes(value.as_ref()).expect("outbox record decodes")
+    }
+
+    fn lifecycle() -> (DocumentTarget, Vec<u8>) {
+        let lifecycle = GraphLifecycleRecord::deleted(
+            "urn:graph:placed-announce".to_string(),
+            RealmId::from_bytes([2u8; 32]),
+            GroupId::generate(),
+            Ulid::from_parts(2, 2),
+            42,
+        );
+        let document = DocumentTarget::MetadataGraphLifecycle {
+            graph_iri: lifecycle.graph_iri.clone(),
+        };
+        let bytes = postcard::to_allocvec(&lifecycle).expect("lifecycle serializes");
+        (document, bytes)
+    }
+
+    #[test]
+    fn announce_stamps_placement() {
+        let (document, bytes) = lifecycle();
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([8; 16]),
+            shard: 5,
+        };
+        for allow_genesis in [false, true] {
+            let mut operation = AnnounceTopicOperation::new(
+                document.clone(),
+                local_node_id(),
+                Vec::new(),
+                placement,
+                allow_genesis,
+            );
+            let call = read_row(document.storage_keyspace(), document.storage_key());
+            assert_eq!(operation.first(), Ok(Next::Call(call)));
+            let record = written_record(operation.next(read(Some(bytes.clone()))));
+            assert_eq!(record.target, document);
+            assert_eq!(record.allow_genesis, allow_genesis);
+            let DocumentOutboxEvent::Upsert {
+                bytes: actual,
+                change,
+            } = record.event
+            else {
+                panic!("expected revisioned upsert");
+            };
+            assert_eq!(actual, bytes);
+            assert_eq!(change.kind, DocumentChangeKind::Upsert);
+            assert_eq!(change.placement, placement);
+            let schedule = IoCall::Effect(Box::new(schedule_drain_effect()));
+            assert_eq!(operation.next(IoResult::Done), Ok(Next::Call(schedule)));
+            let scheduled = Event::Task(TaskEvent::TimerScheduled {
+                key: aruna_core::task::TaskKey::DrainSyncOutbox,
+                after: Duration::ZERO,
+            });
+            let scheduled = IoResult::Event(Box::new(scheduled));
+            assert_eq!(operation.next(scheduled), Ok(Next::Done(())));
+        }
+    }
+
+    #[test]
+    fn stamps_single_writer() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let node_id = local_node_id();
+        let document = DocumentTarget::NodeInfo { realm_id, node_id };
+        let mut operation =
+            AnnounceTopicOperation::new(document, node_id, Vec::new(), PlacementRef::NIL, false);
+        operation.stamp(77);
+        let record = written_record(operation.next(read(Some(b"info".to_vec()))));
+        let DocumentOutboxEvent::Upsert { change, .. } = record.event else {
+            panic!("expected revisioned upsert");
+        };
+        assert_eq!(change.current.generation, 77);
+        assert_eq!(change.current.updated_at_ms, 77);
+    }
+
+    #[test]
+    fn missing_document_ends() {
+        let (document, _) = lifecycle();
+        let mut operation = AnnounceTopicOperation::new(
+            document,
+            local_node_id(),
+            Vec::new(),
+            PlacementRef::NIL,
+            true,
+        );
+        assert_eq!(operation.next(read(None)), Ok(Next::Done(())));
+    }
+
+    #[test]
+    fn admin_refuses_announce() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = GroupId::generate();
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let admin_targets = [
+            DocumentTarget::Group { group_id },
+            DocumentTarget::GroupAuthorization { group_id },
+            DocumentTarget::RealmAuthorization { realm_id },
+            DocumentTarget::RealmConfig { realm_id },
+            DocumentTarget::User { user_id },
+        ];
+
+        for target in admin_targets {
+            assert!(target.is_admin_document(), "misclassified {target:?}");
+            let mut operation = AnnounceTopicOperation::new(
+                target.clone(),
+                local_node_id(),
+                Vec::new(),
+                PlacementRef::NIL,
+                true,
+            );
+            let whole = read(Some(b"whole admin document".to_vec()));
+            assert!(
+                matches!(
+                    operation.next(whole),
+                    Err(AnnounceTopicError::DocumentSync(error))
+                        if error.contains("admin documents must sync as operations")
+                ),
+                "whole-document announce must refuse {target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_bad_results() {
+        let (document, bytes) = lifecycle();
+        let mut operation = AnnounceTopicOperation::new(
+            document,
+            local_node_id(),
+            Vec::new(),
+            PlacementRef::NIL,
+            true,
+        );
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Err(AnnounceTopicError::Io(IoError::Unexpected { .. }))
+        ));
+        operation.next(read(Some(bytes))).unwrap();
+        operation.next(IoResult::Done).unwrap();
+        let refused = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "no task handle".to_string(),
+        });
+        assert!(matches!(
+            operation.next(IoResult::Event(Box::new(refused))),
+            Err(AnnounceTopicError::DocumentSync(_))
+        ));
+    }
+}
