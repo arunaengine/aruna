@@ -14,11 +14,11 @@ use aruna_core::keyspaces::{
     DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
     METADATA_AUDIT_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
 };
-use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataEventRecord,
     MetadataMaterializationRecord,
 };
+use aruna_core::metadata::{GraphPruneRecord, MetadataLifecycleRecord};
 pub use aruna_core::storage_entries::{
     create_event_entry, create_projection_entries, document_job_entry, document_lifecycle_entry,
     graph_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry, lifecycle_revision_entry,
@@ -38,7 +38,7 @@ use ulid::Ulid;
 
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::storage_read::{parse_storage_iter, parse_storage_read};
-use aruna_core::storage_entries::lifecycle_revision_change;
+use aruna_core::storage_entries::{graph_prune_entry, lifecycle_revision_change};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 
@@ -437,6 +437,27 @@ pub(crate) fn create_outbox_record(
         updated_at: event.occurred_at_ms / 1_000,
         allow_genesis,
     }
+}
+
+pub(crate) fn write_prune_effect(
+    record: &GraphPruneRecord,
+    txn_id: Option<Ulid>,
+) -> Result<Effect, ConversionError> {
+    let (key_space, key, value) = graph_prune_entry(record)?;
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id,
+    }))
+}
+
+/// Wakes the prune drain at once.
+pub(crate) fn schedule_prune_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainPruneQueue,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]

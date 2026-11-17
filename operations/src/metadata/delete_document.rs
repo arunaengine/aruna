@@ -33,11 +33,10 @@ use ulid::Ulid;
 use crate::metadata::persistent_id::{
     MappingRoute, mapping_route_for, parse_mapping_read, read_mapping_effect, tombstone_transition,
 };
-use crate::metadata::prune_queue::{new_prune_job, schedule_prune_drain, write_prune_effect};
 use crate::metadata::repository::{
     StorageReadError, delete_holders_effect, delete_index_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect, write_graph_lifecycle,
-    write_lifecycle_revision,
+    parse_registry_read, read_registry_effect, schedule_prune_drain, write_audit_effect,
+    write_graph_lifecycle, write_lifecycle_revision, write_prune_effect,
 };
 use crate::placement::{registry_placement, resolve_shard_holders};
 use crate::sync::outbox_record::{
@@ -484,7 +483,7 @@ impl DeleteDocumentOperation {
                     lifecycle_record.clone(),
                     event_id,
                 ));
-                self.prune_job_record = Some(new_prune_job(
+                self.prune_job_record = Some(GraphPruneRecord::new(
                     lifecycle_record.graph_iri.clone(),
                     deleted_at_ms,
                 ));

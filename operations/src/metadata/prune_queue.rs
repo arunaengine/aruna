@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::metadata::materialization_queue::metadata_graph_deleted;
+use crate::metadata::repository::schedule_prune_drain;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
@@ -77,30 +78,6 @@ impl From<MetadataQueueError> for MetadataGraphError {
             MetadataQueueError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
         }
     }
-}
-
-pub(crate) fn new_prune_job(graph_iri: String, due_at_ms: u64) -> GraphPruneRecord {
-    GraphPruneRecord::new(graph_iri, due_at_ms)
-}
-
-pub(crate) fn write_prune_effect(
-    record: &GraphPruneRecord,
-    txn_id: Option<Ulid>,
-) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = graph_prune_entry(record)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id,
-    }))
-}
-
-pub(crate) fn schedule_prune_drain() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainPruneQueue,
-        after: Duration::ZERO,
-    })
 }
 
 pub(crate) async fn restore_prune_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
@@ -247,7 +224,7 @@ pub(crate) async fn enqueue_prune_job(
     context: &DriverContext,
     graph_iri: String,
 ) -> Result<(), MetadataGraphError> {
-    let job = new_prune_job(graph_iri, unix_timestamp_millis());
+    let job = GraphPruneRecord::new(graph_iri, unix_timestamp_millis());
     write_prune_job(&context.storage_handle, &job).await?;
     if let Some(task_handle) = context.task_handle.as_ref() {
         match task_handle.send_effect(schedule_prune_drain()).await {
@@ -389,7 +366,7 @@ fn representative_job(graph_iri: &str, jobs: &[(Vec<u8>, GraphPruneRecord)]) -> 
         .map(|(_, job)| job)
         .max_by_key(|job| (job.attempts, job.due_at_ms))
         .cloned()
-        .unwrap_or_else(|| new_prune_job(graph_iri.to_string(), unix_timestamp_millis()))
+        .unwrap_or_else(|| GraphPruneRecord::new(graph_iri.to_string(), unix_timestamp_millis()))
 }
 
 async fn scan_due_prune(
@@ -996,7 +973,7 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
-        let job = new_prune_job("urn:graph:not-deleted".to_string(), 1);
+        let job = GraphPruneRecord::new("urn:graph:not-deleted".to_string(), 1);
         write_entries(&storage, vec![graph_prune_entry(&job).expect("job entry")]).await;
         let context = DriverContext {
             storage_handle: storage.clone(),
@@ -1054,7 +1031,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let corrupt_key = vec![0];
-        let valid_job = new_prune_job("urn:graph:valid".to_string(), 1);
+        let valid_job = GraphPruneRecord::new("urn:graph:valid".to_string(), 1);
         write_entries(
             &storage,
             vec![
@@ -1250,7 +1227,7 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
         let graph_iri = "urn:graph:deleted";
-        let job = new_prune_job(graph_iri.to_string(), 1);
+        let job = GraphPruneRecord::new(graph_iri.to_string(), 1);
         write_entries(
             &storage,
             vec![
@@ -1292,7 +1269,7 @@ mod tests {
             FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
 
         assert!(!prune_jobs_exist(&storage).await.unwrap());
-        let job = new_prune_job("urn:graph:queued".to_string(), 1);
+        let job = GraphPruneRecord::new("urn:graph:queued".to_string(), 1);
         write_entries(&storage, vec![graph_prune_entry(&job).expect("job entry")]).await;
 
         assert!(prune_jobs_exist(&storage).await.unwrap());
