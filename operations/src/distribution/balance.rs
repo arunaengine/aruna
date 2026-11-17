@@ -20,7 +20,6 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::create::submit;
-use super::sign_statement;
 use crate::driver::DriverContext;
 use crate::node::heartbeat::fresh_heartbeats;
 
@@ -141,7 +140,10 @@ pub async fn balance_set(
         signer: local,
         statement,
     };
-    let signed = match sign_statement(context, claim) {
+    let signed = match context.net_handle.as_ref().map_or_else(
+        || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+        |net| net.sign_statement(claim),
+    ) {
         StatementSignEvent::Signed(signed) => *signed,
         StatementSignEvent::Unavailable(reason) => {
             warn!(%reason, "A balancing transfer could not be signed");

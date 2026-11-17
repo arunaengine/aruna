@@ -42,7 +42,6 @@ use super::purge::{
     purge_range, purge_rest, read,
 };
 use super::roots::roots_checked;
-use super::sign_statement;
 use super::status::read_view;
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::{dirty_rows, wake_publish};
@@ -685,7 +684,10 @@ impl SetWork {
             signer: self.local,
             statement,
         };
-        let signed = match sign_statement(context, claim) {
+        let signed = match context.net_handle.as_ref().map_or_else(
+            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+            |net| net.sign_statement(claim),
+        ) {
             StatementSignEvent::Signed(signed) => *signed,
             StatementSignEvent::Unavailable(reason) => return Err(reason),
         };

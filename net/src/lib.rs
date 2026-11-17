@@ -197,6 +197,14 @@ impl NetHandle {
         self.inner.endpoint.secret_key().sign(message)
     }
 
+    /// Signs a member statement when it names this node; see the `StatementSign` effect.
+    pub fn sign_statement(
+        &self,
+        claim: aruna_core::structs::storage::distribution::StatementClaim,
+    ) -> aruna_core::events::StatementSignEvent {
+        effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
+    }
+
     /// Issuer-local key that encrypts S3 credential secrets at rest. Derived
     /// from this node's secret, so only this node can decrypt what it wrote.
     pub fn credential_encryption_key(

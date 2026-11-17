@@ -31,7 +31,6 @@ use ulid::Ulid;
 use super::create::submit;
 use super::rebuild::{RebuildConfig, RebuildOperation, RebuildOutcome};
 use super::refill::{RefillConfig, RefillOperation};
-use super::sign_statement;
 use super::split::{SplitConfig, SplitError, SplitOperation};
 use crate::driver::{DriverContext, drive};
 use crate::node::usage_stats::mark_dirty;
@@ -388,7 +387,10 @@ impl Tending<'_> {
             signer: self.local,
             statement,
         };
-        let signed = match sign_statement(context, claim) {
+        let signed = match context.net_handle.as_ref().map_or_else(
+            || StatementSignEvent::Unavailable("net transport unavailable".to_string()),
+            |net| net.sign_statement(claim),
+        ) {
             StatementSignEvent::Signed(signed) => *signed,
             StatementSignEvent::Unavailable(reason) => {
                 warn!(%reason, "A range split could not be signed");

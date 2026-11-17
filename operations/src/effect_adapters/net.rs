@@ -4,11 +4,16 @@
 
 use aruna_core::document::DocumentSyncPublish;
 use aruna_core::effects::{Effect, JobControlEffect, NetEffect};
-use aruna_core::events::{Event, JobControlEvent, NetError, NetEvent};
+use aruna_core::events::{
+    Event, JobControlEvent, NetError, NetEvent, SnapshotSignEvent, StatementSignEvent,
+};
 use aruna_core::handle::Handle;
 use aruna_core::{DocumentEffect, DocumentNetEvent, DocumentTarget};
 
 use crate::driver::DriverContext;
+
+/// Why signing fails on a node without a net handle, which holds the node key.
+const UNAVAILABLE: &str = "net transport unavailable";
 
 /// Executes a job-control request by opening the frame stream and reading the
 /// owner's reply; an unreachable owner is reported so the routing operation can
@@ -37,6 +42,12 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                     },
                 ))
             }
+            NetEffect::SnapshotSign(_) => Event::Net(NetEvent::SnapshotSign(
+                SnapshotSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
+            NetEffect::StatementSign(_) => Event::Net(NetEvent::StatementSign(
+                StatementSignEvent::Unavailable(UNAVAILABLE.to_string()),
+            )),
             _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
         }
     }
