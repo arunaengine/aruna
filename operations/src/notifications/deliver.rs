@@ -5,12 +5,12 @@
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{read_row, values};
-use aruna_core::structs::execution::notification::NotificationRecord;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use thiserror::Error;
 
@@ -18,7 +18,7 @@ use crate::notifications::checks::{
     batch_realm, peer_config, validate_inbound_batch, verify_batch_holder, verify_node_origin,
 };
 use crate::notifications::enqueue::{EnqueueDeliveriesOperation, EnqueueError};
-use crate::notifications::inbox::UpsertInboxOperation;
+use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
 use crate::notifications::unexpected;
 
 #[derive(Debug, Error, PartialEq)]
@@ -54,7 +54,7 @@ enum DeliverState {
         held: Vec<NotificationRecord>,
         written: usize,
     },
-    Enqueue(Box<EnqueueDeliveriesOperation>, usize),
+    Enqueue(usize),
 }
 
 /// Stores a sync-eligible peer's valid batch held here and queues its deliveries on every
@@ -90,11 +90,9 @@ impl DeliverBatchOperation {
             return reject(reason);
         }
         self.state = DeliverState::Upsert(Box::new(config));
-        let upsert = boxed_suboperation(UpsertInboxOperation::new(records), |result| {
-            let result = result.map_err(|error| error.to_string());
-            Event::SubOperation(SubOperationEvent::InboxUpserted { result })
-        });
-        Ok(Next::Call(IoCall::Child(upsert)))
+        Ok(Next::Call(IoCall::child(UpsertInboxOperation::new(
+            records,
+        ))))
     }
 
     fn enqueue(
@@ -104,23 +102,10 @@ impl DeliverBatchOperation {
         written: usize,
     ) -> AnswerTurn {
         let input = self.input;
-        let mut enqueue =
+        let enqueue =
             EnqueueDeliveriesOperation::new(input.local, Some(config), held, input.now_ms);
-        let turn = enqueue.first();
-        self.state = DeliverState::Enqueue(Box::new(enqueue), written);
-        enqueued(turn, written)
-    }
-}
-
-/// Follows the delivery queue; its failure is a rejection, so the sender delivers again.
-fn enqueued(turn: Result<Next<()>, EnqueueError>, written: usize) -> AnswerTurn {
-    match turn {
-        Ok(Next::Call(call)) => Ok(Next::Call(call)),
-        Ok(Next::Wait) => Ok(Next::Wait),
-        Ok(Next::Done(())) => Ok(Next::Done(NotificationTransportMessage::DeliverAck {
-            written: written as u32,
-        })),
-        Err(error) => reject(error.to_string()),
+        self.state = DeliverState::Enqueue(written);
+        Ok(Next::Call(IoCall::child(enqueue)))
     }
 }
 
@@ -151,13 +136,10 @@ impl Operation for DeliverBatchOperation {
                 let [value] = values::<1>(result)?;
                 self.checked(self.input.local_realm, value.as_deref())
             }
-            (
-                DeliverState::Upsert(config),
-                IoResult::Event(Event::SubOperation(SubOperationEvent::InboxUpserted { result })),
-            ) => {
-                let outcome = match result {
+            (DeliverState::Upsert(config), result) => {
+                let outcome = match result.child::<InboxWriteOutcome, InboxError>()? {
                     Ok(outcome) => outcome,
-                    Err(reason) => return reject(reason),
+                    Err(error) => return reject(error.to_string()),
                 };
                 if outcome.recipients.is_empty() {
                     return self.enqueue(&config, &outcome.held, outcome.written);
@@ -168,7 +150,7 @@ impl Operation for DeliverBatchOperation {
                     written: outcome.written,
                 };
                 let wake = NetEffect::WakeInbox(outcome.recipients);
-                Ok(Next::Call(IoCall::Effect(Effect::Net(wake))))
+                Ok(Next::Call(IoCall::from(Effect::Net(wake))))
             }
             (
                 DeliverState::Wake {
@@ -176,12 +158,18 @@ impl Operation for DeliverBatchOperation {
                     held,
                     written,
                 },
-                IoResult::Event(Event::Net(NetEvent::InboxWoken)),
-            ) => self.enqueue(&config, &held, written),
-            (DeliverState::Enqueue(mut enqueue, written), result) => {
-                let turn = enqueue.next(result);
-                self.state = DeliverState::Enqueue(enqueue, written);
-                enqueued(turn, written)
+                IoResult::Event(event),
+            ) if matches!(*event, Event::Net(NetEvent::InboxWoken)) => {
+                self.enqueue(&config, &held, written)
+            }
+            // A failed queue is a rejection, so the sender delivers again.
+            (DeliverState::Enqueue(written), result) => {
+                match result.child::<(), EnqueueError>()? {
+                    Ok(()) => Ok(Next::Done(NotificationTransportMessage::DeliverAck {
+                        written: written as u32,
+                    })),
+                    Err(error) => reject(error.to_string()),
+                }
             }
             (_, other) => Err(unexpected("an inbox upsert or a wake", &other).into()),
         }
@@ -193,7 +181,8 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
-    use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationClass};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::execution::notification::NotificationClass;
 
     fn input() -> DeliverInput {
         DeliverInput {
@@ -239,17 +228,25 @@ mod call_tests {
         assert!(rejected(deliver.first()).contains("foreign realm"));
     }
 
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
     /// A failed upsert is a rejection; new recipients are woken before the queue runs.
     #[test]
     fn upsert_outcomes_answered() {
         let config = Box::new(RealmConfigDocument::new(user(1, 2).realm_id, Vec::new(), 3));
         let mut deliver = DeliverBatchOperation::new(input(), batch());
         deliver.state = DeliverState::Upsert(config.clone());
-        let failed = SubOperationEvent::InboxUpserted {
-            result: Err("conflict".to_string()),
-        };
-        let failed = deliver.next(IoResult::Event(Event::SubOperation(failed)));
-        assert_eq!(rejected(failed), "conflict");
+        let failed = child::<InboxWriteOutcome, _>(Err(InboxError::Conflict));
+        assert_eq!(
+            rejected(deliver.next(failed)),
+            InboxError::Conflict.to_string()
+        );
 
         let mut deliver = DeliverBatchOperation::new(input(), batch());
         deliver.state = DeliverState::Upsert(config);
@@ -258,18 +255,17 @@ mod call_tests {
             recipients: vec![user(1, 2)],
             ..InboxWriteOutcome::default()
         };
-        let stored = SubOperationEvent::InboxUpserted {
-            result: Ok(outcome),
-        };
         assert_eq!(
-            deliver.next(IoResult::Event(Event::SubOperation(stored))),
-            Ok(Next::Call(IoCall::Effect(Effect::Net(
-                NetEffect::WakeInbox(vec![user(1, 2)])
-            ))))
+            deliver.next(child::<_, InboxError>(Ok(outcome))),
+            Ok(Next::Call(IoCall::from(Effect::Net(NetEffect::WakeInbox(
+                vec![user(1, 2)]
+            )))))
         );
-        let woken = deliver.next(IoResult::Event(Event::Net(NetEvent::InboxWoken)));
+        let woken = deliver.next(IoResult::Event(Box::new(Event::Net(NetEvent::InboxWoken))));
+        assert!(matches!(woken, Ok(Next::Call(IoCall::Child(_)))));
+        let queued = deliver.next(child::<_, EnqueueError>(Ok(())));
         assert_eq!(
-            woken,
+            queued,
             Ok(Next::Done(NotificationTransportMessage::DeliverAck {
                 written: 1
             }))

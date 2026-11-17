@@ -9,10 +9,12 @@ use std::time::Duration;
 use aruna_core::NodeId;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::execution::notification::{NotificationOutboxRecord, NotificationRecord};
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::notification::{
+    InboxWriteOutcome, NotificationOutboxRecord, NotificationRecord,
+};
 use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
 };
@@ -22,9 +24,9 @@ use aruna_core::types::{Key, Value};
 use tracing::warn;
 
 use crate::notifications::enqueue::{EnqueueDeliveriesOperation, EnqueueError};
-use crate::notifications::inbox::UpsertInboxOperation;
+use crate::notifications::inbox::{InboxError, UpsertInboxOperation};
 use crate::notifications::placement::resolve_inbox_holder;
-use crate::notifications::unexpected;
+use crate::notifications::{unexpected, unexpected_event};
 
 pub(crate) const OUTBOX_BATCH_SIZE: usize = 512;
 pub(crate) const DELIVERY_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -51,7 +53,7 @@ enum DrainState {
     Wake {
         held: Vec<NotificationRecord>,
     },
-    Enqueue(Box<EnqueueDeliveriesOperation>),
+    Enqueue,
     DeleteLocal,
     Remote {
         holder: NodeId,
@@ -116,22 +118,19 @@ impl DrainOutboxOperation {
             deletes,
             txn_id: None,
         };
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(delete))))
+        Ok(Next::Call(IoCall::from(Effect::Storage(delete))))
     }
 
     /// Logs a failed delete: the rows stay and the drain runs again later.
-    fn deleted(&mut self, event: StorageEvent) -> Result<(), IoError> {
+    fn deleted(&mut self, event: Event) -> Result<(), IoError> {
         match event {
-            StorageEvent::BatchDeleteResult { .. } => Ok(()),
-            StorageEvent::Error { error } => {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => {
                 warn!(%error, "Failed to delete notification outbox records");
                 self.retry = true;
                 Ok(())
             }
-            other => {
-                let other = IoResult::Event(Event::Storage(other));
-                Err(unexpected("a delete result", &other))
-            }
+            other => Err(unexpected_event("a delete result", &other)),
         }
     }
 
@@ -247,11 +246,9 @@ impl DrainOutboxOperation {
             return self.next_remote();
         }
         self.state = DrainState::Upsert;
-        let upsert = boxed_suboperation(UpsertInboxOperation::new(local_records), |result| {
-            let result = result.map_err(|error| error.to_string());
-            Event::SubOperation(SubOperationEvent::InboxUpserted { result })
-        });
-        Ok(Next::Call(IoCall::Child(upsert)))
+        Ok(Next::Call(IoCall::child(UpsertInboxOperation::new(
+            local_records,
+        ))))
     }
 
     fn run_enqueue(&mut self, held: Vec<NotificationRecord>) -> Turn {
@@ -261,27 +258,15 @@ impl DrainOutboxOperation {
         let config = (held.first())
             .and_then(|record| self.configs.get(&record.recipient.realm_id))
             .and_then(Option::as_ref);
-        let mut enqueue = EnqueueDeliveriesOperation::new(local, config, &held, self.now_ms);
-        let turn = enqueue.first();
-        self.enqueued(enqueue, turn)
+        let enqueue = EnqueueDeliveriesOperation::new(local, config, &held, self.now_ms);
+        self.state = DrainState::Enqueue;
+        Ok(Next::Call(IoCall::child(enqueue)))
     }
 
     /// The outbox rows stay until their deliveries are queued.
-    fn enqueued(
-        &mut self,
-        enqueue: EnqueueDeliveriesOperation,
-        turn: Result<Next<()>, EnqueueError>,
-    ) -> Turn {
-        match turn {
-            Ok(Next::Call(call)) => {
-                self.state = DrainState::Enqueue(Box::new(enqueue));
-                Ok(Next::Call(call))
-            }
-            Ok(Next::Wait) => {
-                self.state = DrainState::Enqueue(Box::new(enqueue));
-                Ok(Next::Wait)
-            }
-            Ok(Next::Done(())) => {
+    fn enqueued(&mut self, result: Result<(), EnqueueError>) -> Turn {
+        match result {
+            Ok(()) => {
                 let keys = std::mem::take(&mut self.page.local_keys);
                 self.delete(DrainState::DeleteLocal, keys)
             }
@@ -307,7 +292,7 @@ impl DrainOutboxOperation {
             message,
         };
         let effect = Effect::Net(NetEffect::Notification(Box::new(request)));
-        Ok(Next::Call(IoCall::Effect(effect)))
+        Ok(Next::Call(IoCall::from(effect)))
     }
 
     fn answered(
@@ -386,47 +371,42 @@ impl Operation for DrainOutboxOperation {
     fn next(&mut self, result: IoResult) -> Turn {
         match (std::mem::take(&mut self.state), result) {
             (DrainState::Page, IoResult::Page { rows, .. }) => self.page_read(rows),
-            (DrainState::Expire, IoResult::Event(Event::Storage(event))) => {
-                self.deleted(event)?;
+            (DrainState::Expire, IoResult::Event(event)) => {
+                self.deleted(*event)?;
                 self.read_configs()
             }
             (DrainState::Configs { realms }, IoResult::Values(values)) => {
                 self.configs_read(realms, values)
             }
-            (
-                DrainState::Upsert,
-                IoResult::Event(Event::SubOperation(SubOperationEvent::InboxUpserted { result })),
-            ) => match result {
-                Ok(outcome) if outcome.recipients.is_empty() => self.run_enqueue(outcome.held),
-                Ok(outcome) => {
-                    self.state = DrainState::Wake { held: outcome.held };
-                    let wake = Effect::Net(NetEffect::WakeInbox(outcome.recipients));
-                    Ok(Next::Call(IoCall::Effect(wake)))
+            (DrainState::Upsert, result) => {
+                match result.child::<InboxWriteOutcome, InboxError>()? {
+                    Ok(outcome) if outcome.recipients.is_empty() => self.run_enqueue(outcome.held),
+                    Ok(outcome) => {
+                        self.state = DrainState::Wake { held: outcome.held };
+                        let wake = Effect::Net(NetEffect::WakeInbox(outcome.recipients));
+                        Ok(Next::Call(IoCall::from(wake)))
+                    }
+                    Err(error) => {
+                        warn!(%error, "Failed to deliver notifications to local inbox");
+                        self.retry = true;
+                        self.next_remote()
+                    }
                 }
-                Err(error) => {
-                    warn!(%error, "Failed to deliver notifications to local inbox");
-                    self.retry = true;
-                    self.next_remote()
-                }
-            },
-            (DrainState::Wake { held }, IoResult::Event(Event::Net(NetEvent::InboxWoken))) => {
+            }
+            (DrainState::Wake { held }, IoResult::Event(event))
+                if matches!(*event, Event::Net(NetEvent::InboxWoken)) =>
+            {
                 self.run_enqueue(held)
             }
-            (DrainState::Enqueue(mut enqueue), result) => {
-                let turn = enqueue.next(result);
-                self.enqueued(*enqueue, turn)
-            }
-            (
-                DrainState::DeleteLocal | DrainState::DeleteRemote,
-                IoResult::Event(Event::Storage(event)),
-            ) => {
-                self.deleted(event)?;
+            (DrainState::Enqueue, result) => self.enqueued(result.child::<(), EnqueueError>()?),
+            (DrainState::DeleteLocal | DrainState::DeleteRemote, IoResult::Event(event)) => {
+                self.deleted(*event)?;
                 self.next_remote()
             }
-            (
-                DrainState::Remote { holder, keys },
-                IoResult::Event(Event::Net(NetEvent::Notification(answer))),
-            ) => self.answered(holder, keys, answer),
+            (DrainState::Remote { holder, keys }, IoResult::Event(event)) => match *event {
+                Event::Net(NetEvent::Notification(answer)) => self.answered(holder, keys, answer),
+                other => Err(unexpected_event("NetEvent::Notification", &other)),
+            },
             (DrainState::Head, IoResult::Page { rows, .. }) => Ok(Next::Done(head_rearm(rows))),
             (_, other) => Err(unexpected("an outbox drain result", &other)),
         }
@@ -480,11 +460,13 @@ impl Operation for RestoreOutboxOperation {
                     self.arming = true;
                     let key = TaskKey::DrainNotificationOutbox;
                     let arm = TaskEffect::ShortenTimer { key, after };
-                    Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
+                    Ok(Next::Call(IoCall::from(Effect::Task(arm))))
                 }
                 (empty, _) => Ok(Next::Done(!empty)),
             },
-            (true, IoResult::Event(Event::Task(TaskEvent::TimerScheduled { .. }))) => {
+            (true, IoResult::Event(event))
+                if matches!(*event, Event::Task(TaskEvent::TimerScheduled { .. })) =>
+            {
                 Ok(Next::Done(true))
             }
             (_, other) => Err(unexpected("an outbox page or a timer", &other)),
@@ -549,17 +531,19 @@ mod call_tests {
             deletes: vec![(NOTIFICATION_OUTBOX_KEYSPACE.to_string(), key)],
             txn_id: None,
         };
-        Ok(Next::Call(IoCall::Effect(Effect::Storage(delete))))
+        Ok(Next::Call(IoCall::from(Effect::Storage(delete))))
     }
 
     fn delete_result() -> IoResult {
-        IoResult::Event(Event::Storage(StorageEvent::BatchDeleteResult {
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::BatchDeleteResult {
             entries: Vec::new(),
-        }))
+        })))
     }
 
     fn answer(message: NotificationTransportMessage) -> IoResult {
-        IoResult::Event(Event::Net(NetEvent::Notification(Ok(Box::new(message)))))
+        IoResult::Event(Box::new(Event::Net(NetEvent::Notification(Ok(Box::new(
+            message,
+        ))))))
     }
 
     /// Reads one page with one remote row and its realm config, up to the remote delivery.
@@ -585,7 +569,7 @@ mod call_tests {
         };
         assert_eq!(
             operation.next(IoResult::Values(vec![Some(config)])),
-            Ok(Next::Call(IoCall::Effect(Effect::Net(
+            Ok(Next::Call(IoCall::from(Effect::Net(
                 NetEffect::Notification(Box::new(request))
             ))))
         );
@@ -607,9 +591,30 @@ mod call_tests {
         let (mut operation, _) = at_remote(node_id(2));
         let ack = answer(NotificationTransportMessage::DeliverAck { written: 1 });
         operation.next(ack).unwrap();
-        let failed = IoResult::Event(Event::Storage(StorageEvent::Error {
+        let failed = IoResult::Event(Box::new(Event::Storage(StorageEvent::Error {
             error: aruna_core::errors::StorageError::Timeout,
-        }));
+        })));
+        assert_eq!(
+            operation.next(failed),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    /// A failed local upsert keeps the rows and asks for a retry; the run goes on.
+    #[test]
+    fn local_failure_retries() {
+        let local = node_id(1);
+        let (key, value) = outbox_row(record(user(1, 2), NotificationClass::Direct, NOW_MS));
+        let (_, config) = config_bytes(local);
+        let mut operation = DrainOutboxOperation::new(Some(local), NOW_MS);
+        operation.first().unwrap();
+        operation.next(rows(vec![(key, value)])).unwrap();
+        assert!(matches!(
+            operation.next(IoResult::Values(vec![Some(config)])),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let failed = Err::<InboxWriteOutcome, _>(InboxError::Conflict);
+        let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(failed));
         assert_eq!(
             operation.next(failed),
             Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
@@ -690,14 +695,14 @@ mod call_tests {
         ));
         assert_eq!(
             shorten.next(page(vec![row.clone()])),
-            Ok(Next::Call(IoCall::Effect(Effect::Task(arm))))
+            Ok(Next::Call(IoCall::from(Effect::Task(arm))))
         );
         let scheduled = Event::Task(TaskEvent::TimerScheduled {
             key: TaskKey::DrainNotificationOutbox,
             after: Duration::ZERO,
         });
         assert_eq!(
-            shorten.next(IoResult::Event(scheduled)),
+            shorten.next(IoResult::Event(Box::new(scheduled))),
             Ok(Next::Done(true))
         );
 

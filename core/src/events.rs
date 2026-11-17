@@ -193,14 +193,6 @@ pub enum SubOperationEvent {
     DeliveryQueued {
         result: Result<(), String>,
     },
-    /// What a notification inbox upsert stored, or its failure as text.
-    InboxUpserted {
-        result: Result<crate::structs::execution::notification::InboxWriteOutcome, String>,
-    },
-    /// A page of outlived notification deletion times was pruned, or its failure as text.
-    CutoffsPruned {
-        result: Result<(), String>,
-    },
 }
 
 /// How the re-key of one version ended.
@@ -973,8 +965,6 @@ impl Event {
                     NotificationsFailed,
                     WatchStored,
                     DeliveryQueued,
-                    InboxUpserted,
-                    CutoffsPruned,
                 }
             ),
             Event::Task(event) => variant_label!(
