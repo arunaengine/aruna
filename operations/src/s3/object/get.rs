@@ -5,10 +5,9 @@
 use crate::abe::envelope::EnvelopeOperation;
 use crate::blob::holders::GetHoldersOperation;
 use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::promote::{
-    PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
-};
+use crate::blob::promote::{PromoteError, PromotePendingOperation, Promotion};
 use crate::blob::records::blob_location_read;
+use crate::blob::unlocked::{drop_mismatch, reject_archive};
 use crate::blob::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
 use crate::connectors::{ResolveBindingInput, resolve_binding_effect};

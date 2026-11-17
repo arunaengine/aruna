@@ -9,7 +9,8 @@ use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
 use crate::blob::migration::queue::resume_transitions;
-use crate::blob::promote::{PromoteError, promote_unlocked};
+use crate::blob::promote::PromoteError;
+use crate::blob::unlocked::promote_unlocked;
 use crate::driver::{DriverContext, drive};
 use crate::jobs::runtime::key_unlocked;
 use crate::jobs::store::{

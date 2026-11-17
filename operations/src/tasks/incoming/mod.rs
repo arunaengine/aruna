@@ -880,7 +880,7 @@ impl OperationsTaskHandler {
                 };
                 let key = BucketKeyRef::new(bucket_id, generation);
                 let origin = (*net_handle.realm_id(), net_handle.node_id());
-                let promoted = crate::blob::promote::promote_unlocked(
+                let promoted = crate::blob::unlocked::promote_unlocked(
                     &self.context,
                     key,
                     origin,
