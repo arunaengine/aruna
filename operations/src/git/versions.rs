@@ -4,7 +4,7 @@
 
 use super::GitError;
 use super::changes::{EntityChange, entity_changes};
-use super::project::{Projection, lock};
+use super::project::Projection;
 use super::push::record_made;
 use super::snapshot::{execute, read_view, refresh};
 use super::state::GitState;
@@ -89,7 +89,7 @@ pub(super) async fn open(
     permission: Permission,
 ) -> Result<(MetadataRegistryRecord, Projection, Guard), GitError> {
     let (document, _) = super::repository(context, auth, id, permission).await?;
-    let guard = lock(id).await;
+    let guard = store.lock(id).await;
     let projection = refresh(context, store, &document).await?;
     Ok((document, projection, guard))
 }

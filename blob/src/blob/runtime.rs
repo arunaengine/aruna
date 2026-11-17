@@ -257,6 +257,15 @@ impl BlobHandle {
         BlobHandle { handler }
     }
 
+    /// Installs the Git store on first call; later calls get the installed one.
+    pub fn install_git(&self, store: Arc<crate::git::GitStore>) -> Arc<crate::git::GitStore> {
+        self.handler.git.get_or_init(|| store).clone()
+    }
+
+    pub fn git(&self) -> Option<&crate::git::GitStore> {
+        self.handler.git.get().map(Arc::as_ref)
+    }
+
     /// Closes the blob write path before storage is closed. Mutations that
     /// arrive afterwards are rejected and counted.
     pub fn close_writes(&self) {
@@ -651,6 +660,7 @@ impl BlobHandler {
             spool_dir: spool_dir.map(Arc::new),
             spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
+            git: Arc::default(),
         };
         blob_handler.ensure_multipart_bucket().await?;
         if let Err(error) = blob_handler.backfill_free_index().await {

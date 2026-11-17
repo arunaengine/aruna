@@ -148,7 +148,7 @@ pub async fn transport(
     let mut request = request;
     let guard = match write {
         true => {
-            let guard = project::lock(document.document_id).await;
+            let guard = store.lock(document.document_id).await;
             snapshot::refresh(context, store, &document).await?;
             Some(guard)
         }

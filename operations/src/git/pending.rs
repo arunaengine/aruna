@@ -174,11 +174,7 @@ pub fn spawn_drain(context: Arc<DriverContext>, shutdown: &Shutdown) {
 }
 
 async fn drain(context: &DriverContext) {
-    let Some(store) = context
-        .metadata_handle
-        .as_ref()
-        .and_then(|handle| handle.git())
-    else {
+    let Some(store) = context.blob_handle.as_ref().and_then(|handle| handle.git()) else {
         return;
     };
     let rows = match records::prefixed::<PendingMerge>(context, PENDING, Vec::new()).await {
@@ -194,7 +190,7 @@ async fn drain(context: &DriverContext) {
         let Ok(Some(document)) = load_document_record(context, id).await else {
             continue;
         };
-        let _guard = super::project::lock(id).await;
+        let _guard = store.lock(id).await;
         // The same refresh as Git traffic: rebuilds a missing cache, then applies the merges.
         if let Err(error) = Box::pin(super::snapshot::refresh(context, store, &document)).await {
             warn!(document_id = %id, %error, "Pushed metadata waits");

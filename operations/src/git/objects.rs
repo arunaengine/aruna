@@ -338,11 +338,7 @@ pub async fn mark_imported(
     (document_id, actor): (ulid::Ulid, aruna_core::UserId),
     pack: &GitPack,
 ) {
-    let Some(store) = context
-        .metadata_handle
-        .as_ref()
-        .and_then(|handle| handle.git())
-    else {
+    let Some(store) = context.blob_handle.as_ref().and_then(|handle| handle.git()) else {
         return;
     };
     let effect = aruna_core::git::GitEffect::MarkImported {

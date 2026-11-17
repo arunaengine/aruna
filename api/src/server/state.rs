@@ -395,7 +395,7 @@ impl ServerState {
 
     pub fn with_git(mut self, root: PathBuf, helper: PathBuf) -> Self {
         let store = Arc::new(aruna_blob::git::GitStore::new(root, helper));
-        self.git = Some(match &self.driver_ctx.metadata_handle {
+        self.git = Some(match &self.driver_ctx.blob_handle {
             Some(handle) => handle.install_git(store),
             None => store,
         });
