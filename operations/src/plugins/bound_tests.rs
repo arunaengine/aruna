@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use serde_json::json;
 
 use super::*;
+use aruna_core::realm_vault::RealmKeys;
 use crate::driver::drive;
 use crate::plugins::install::tests::{Fixture, REALM_KEY};
 use crate::plugins::install::{pick_version, read_config, read_manifest};
@@ -21,12 +22,10 @@ use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 pub(crate) const TOKEN: &str = "canary-release-4f1e";
 pub(crate) const ORIGIN: &str = "https://api.example.org";
 
-pub(crate) fn keys() -> ReleaseKeys {
-    let key = SigningKey::from_bytes(&REALM_KEY);
-    ReleaseKeys {
-        seal: Some(Arc::new(RealmSealKey::derive(&key))),
-        vault: Some(Arc::new(RealmVaultKey::derive(&key))),
-    }
+/// Gives the node of `ctx` the realm keys of `REALM_KEY`, as a management node holds them.
+pub(crate) fn hold_keys(ctx: &DriverContext) {
+    let keys = RealmKeys::derive(&SigningKey::from_bytes(&REALM_KEY));
+    ctx.storage_handle.open_realm(keys);
 }
 
 /// Writes the realm config as it is after `edit`.
@@ -148,12 +147,12 @@ async fn selects_group_secret() {
         (selected.rules.len(), selected.incarnation.is_some()),
         (1, true)
     );
-    let opened = open(&fixture.ctx, &keys(), config.realm_id, &selected.sealed).await;
+    let missing = open(&fixture.ctx, config.realm_id, &selected.sealed).await;
+    assert!(matches!(missing, Err(ReleaseError::Unavailable(_))));
+    hold_keys(&fixture.ctx);
+    let opened = open(&fixture.ctx, config.realm_id, &selected.sealed).await;
     let fields = SecretFields::decode(&opened.unwrap());
     assert_eq!(fields.unwrap().get("token"), Some(TOKEN));
-    let none = ReleaseKeys::default();
-    let missing = open(&fixture.ctx, &none, config.realm_id, &selected.sealed).await;
-    assert!(matches!(missing, Err(ReleaseError::Unavailable(_))));
     let realm = SecretBinding::parse("realm:api-key").unwrap();
     assert!(
         select(&fixture.ctx, &config, &install, &realm)

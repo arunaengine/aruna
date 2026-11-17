@@ -12,7 +12,6 @@ use aruna_core::time::unix_timestamp_millis;
 use aruna_operations::distribution::delegate::node_urls;
 use aruna_operations::plugins::hooks::{HookError, admit_hook, checks_authorization};
 use aruna_operations::plugins::install::read_config;
-use aruna_operations::plugins::release::ReleaseKeys;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
@@ -120,12 +119,6 @@ pub async fn receive(
         return ServerError::NotFound.into_response();
     };
     let ctx = state.get_ctx();
-    let keys = (ctx.metadata_handle.as_ref())
-        .map(|handle| ReleaseKeys {
-            seal: handle.realm_seal_key(),
-            vault: handle.realm_vault_key(),
-        })
-        .unwrap_or_default();
     let request = HookRequest {
         delivery_id: None,
         method: method.to_string(),
@@ -135,9 +128,8 @@ pub async fn receive(
             .collect(),
         body: body.to_vec(),
     };
-    let place = (state.get_node_id(), &keys);
     let ids = (state.get_realm_id(), install_id);
-    match admit_hook(&ctx, place, ids, request, unix_timestamp_millis()).await {
+    match admit_hook(&ctx, state.get_node_id(), ids, request, unix_timestamp_millis()).await {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(HookError::Elsewhere(receiver)) => {
             let path = match query {

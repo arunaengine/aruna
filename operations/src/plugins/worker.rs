@@ -45,7 +45,6 @@ use super::matcher::match_pending;
 use super::outbound::Outbound;
 use super::prune::{prune_hooks, prune_uses};
 use super::receiver::{eligible, lost_reason};
-use super::release::ReleaseKeys;
 use super::replay::{plan_replays, run_replays};
 use super::runs::{prune_runs, read_run, save_run, unfinished};
 use super::store::StoreError;
@@ -94,8 +93,6 @@ pub struct Worker {
     backoff: tokio::sync::Mutex<Backoff>,
     /// Sends connection requests instead of the node's egress client, in tests.
     outbound: Mutex<Option<Arc<dyn Outbound>>>,
-    /// Releases with these realm keys instead of the node's, in tests.
-    keys: Mutex<Option<ReleaseKeys>>,
     /// When the waiting events were last rechecked.
     rechecked: AtomicU64,
     tasks: TaskTracker,
@@ -130,7 +127,6 @@ impl Worker {
             reasons: Mutex::new(HashMap::new()),
             backoff: tokio::sync::Mutex::default(),
             outbound: Mutex::new(None),
-            keys: Mutex::new(None),
             rechecked: AtomicU64::new(0),
             tasks: TaskTracker::new(),
             stopping: CancellationToken::new(),
@@ -248,13 +244,6 @@ impl Worker {
         }
     }
 
-    /// Releases secrets with `keys` instead of the node's realm keys.
-    pub fn use_keys(&self, keys: ReleaseKeys) {
-        if let Ok(mut held) = self.keys.lock() {
-            *held = Some(keys);
-        }
-    }
-
     /// Hands a batch to its receiver; this node decides the batches of the installs it runs.
     async fn forward(
         &self,
@@ -344,9 +333,6 @@ impl Worker {
         let outbound = self.outbound.lock().ok().and_then(|held| held.clone());
         if let Some(outbound) = outbound {
             broker = broker.with_outbound(outbound);
-        }
-        if let Some(keys) = self.keys.lock().ok().and_then(|held| held.clone()) {
-            broker = broker.with_keys(keys);
         }
         let broker = Arc::new(broker);
         let ended = self.attempt(&run, broker.clone(), cancel).await;

@@ -13,7 +13,7 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
 use super::artifacts::managers;
-use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest, Released, release};
+use super::release::{ReleaseError, ReleaseRequest, Released, release};
 use crate::driver::DriverContext;
 use crate::realm::mutate_placement::is_management;
 
@@ -57,14 +57,14 @@ impl HeldSecrets {
 pub async fn ask_release(
     ctx: &DriverContext,
     config: &RealmConfigDocument,
-    (local, keys): (NodeId, &ReleaseKeys),
+    local: NodeId,
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let install = (config.installs.iter()).find(|install| install.install_id == request.install_id);
     let binding = install.and_then(|install| install.secrets.get(&request.slot));
     let node_bound = binding.is_some_and(|binding| binding.scope == BoundScope::Node);
     if node_bound || is_management(config, local) {
-        let here = release(ctx, keys, (config, local, local), &request).await;
+        let here = release(ctx, (config, local, local), &request).await;
         if node_bound || !matches!(here, Err(ReleaseError::Unavailable(_))) {
             return here;
         }

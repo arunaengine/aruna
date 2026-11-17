@@ -38,7 +38,6 @@ use crate::plugins::grants::InstallScope;
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::marks::unmarked;
 use crate::plugins::outgoing::{outgoing, release_into};
-use crate::plugins::release::ReleaseKeys;
 use crate::plugins::work::{Send, WorkRow, begin_send, decided, record_sent, retried, update_work};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -58,7 +57,7 @@ pub async fn download_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    (download, keys): (Download<'_>, &ReleaseKeys),
+    download: Download<'_>,
 ) -> JobRunOutcome {
     let patterns = match download_grants(ctx, install, (row, download.target)).await {
         Ok(found) => found,
@@ -81,7 +80,7 @@ pub async fn download_work(
         Ok(None) => {}
         Err(error) => return retryable(error.to_string()),
     }
-    let request = prepared(ctx, (install, config, row), keys).await;
+    let request = prepared(ctx, (install, config, row)).await;
     let (outgoing, exposure, _) = match request {
         Ok(prepared) => prepared,
         Err(error) => return refused(error),
@@ -240,7 +239,7 @@ pub async fn upload_work(
     ctx: &JobContext,
     spec: &PluginWorkSpec,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    (upload, keys): (Upload<'_>, &ReleaseKeys),
+    upload: Upload<'_>,
 ) -> JobRunOutcome {
     let patterns = match upload_grants(ctx, install, (row, upload.source)).await {
         Ok(found) => found,
@@ -263,7 +262,7 @@ pub async fn upload_work(
         Ok(None) => return permanent("the object to upload is gone"),
         Err(error) => return refused(error),
     };
-    let (outgoing, exposure, fields) = match prepared(ctx, (install, config, row), keys).await {
+    let (outgoing, exposure, fields) = match prepared(ctx, (install, config, row)).await {
         Ok(prepared) => prepared,
         Err(error) => return refused(error),
     };
@@ -482,7 +481,6 @@ async fn download_grants(
 async fn prepared(
     ctx: &JobContext,
     (install, config, row): (&PluginInstall, &RealmConfigDocument, &WorkRow),
-    keys: &ReleaseKeys,
 ) -> Result<(OutgoingRequest, ResponseExposure, SecretFields), HostError> {
     let context = row.context.as_ref();
     let context = context.ok_or_else(|| HostError::new(ErrorKind::Invalid, "no request"))?;
@@ -495,7 +493,7 @@ async fn prepared(
         let fields = SecretFields::new(Default::default());
         return Ok((request, ResponseExposure::Full, fields));
     };
-    let place = (config, ctx.owner_node_id, keys);
+    let place = (config, ctx.owner_node_id);
     let released = release_into(
         &ctx.driver,
         place,

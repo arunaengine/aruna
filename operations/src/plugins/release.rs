@@ -21,7 +21,7 @@ use ulid::Ulid;
 use url::Url;
 
 use super::account::{owned, read_user};
-pub use super::bound::{Refusal, ReleaseError, ReleaseKeys};
+pub use super::bound::{Refusal, ReleaseError};
 use super::bound::{Selected, open, select, slot_kind};
 use super::grants::InstallScope;
 use super::store::Txn;
@@ -77,7 +77,6 @@ pub fn secret_path(
 /// The release a management node serves to `peer`, decided from `config` and its own storage.
 pub async fn release(
     ctx: &DriverContext,
-    keys: &ReleaseKeys,
     (config, local, peer): (&RealmConfigDocument, NodeId, NodeId),
     request: &ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
@@ -153,7 +152,7 @@ pub async fn release(
     audit.write(None, Some(&selected)).await?;
     let fields = match request.held == Some(selected.value_id) {
         true => None,
-        false => Some(open(ctx, keys, config.realm_id, &selected.sealed).await?),
+        false => Some(open(ctx, config.realm_id, &selected.sealed).await?),
     };
     Ok(Released {
         kind: selected.kind,
@@ -243,14 +242,13 @@ impl Audit<'_> {
 /// The management side of a release request from an infrastructure peer.
 pub(crate) async fn serve_release(
     ctx: &DriverContext,
-    keys: ReleaseKeys,
     peer: NodeId,
     request: ReleaseRequest,
 ) -> Result<Released, ReleaseError> {
     let local = super::artifacts::local_config(ctx).await;
     let local = local.map_err(|error| ReleaseError::Unavailable(format!("{error:?}")))?;
     let (config, local) = local;
-    release(ctx, &keys, (&config, local, peer), &request).await
+    release(ctx, (&config, local, peer), &request).await
 }
 
 #[cfg(test)]

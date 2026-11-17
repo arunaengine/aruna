@@ -22,7 +22,7 @@ use super::held::{HeldSecrets, ask_release};
 use super::install::{pick_version, read_config, read_manifest};
 use super::rate::take_hook;
 use super::receiver::lost_reason;
-use super::release::{ReleaseKeys, ReleaseRequest};
+use super::release::ReleaseRequest;
 use super::runs::{ADMISSIONS, RunError, admit_in};
 use super::store::{Txn, encode, transact};
 use crate::driver::DriverContext;
@@ -62,7 +62,7 @@ pub enum HookError {
 /// `false` for a delivery id the receiver already admitted, which starts nothing.
 pub async fn admit_hook(
     ctx: &DriverContext,
-    (local, keys): (NodeId, &ReleaseKeys),
+    local: NodeId,
     (realm_id, install_id): (RealmId, Ulid),
     mut request: HookRequest,
     now_ms: u64,
@@ -99,7 +99,7 @@ pub async fn admit_hook(
         held: None,
         run_id: None,
     };
-    let ask = |release| ask_release(ctx, &config, (local, keys), release);
+    let ask = |release| ask_release(ctx, &config, local, release);
     let released = HeldSecrets::default().obtain(release, ask).await;
     let (released, fields) = released.map_err(|error| unavailable(error.to_string()))?;
     // A secret edit can make the checked header the delivery id; nothing starts then.

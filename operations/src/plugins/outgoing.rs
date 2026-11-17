@@ -17,7 +17,7 @@ use url::Url;
 
 use super::check::unavailable;
 use super::held::ask_release;
-use super::release::{ReleaseError, ReleaseKeys, ReleaseRequest};
+use super::release::{ReleaseError, ReleaseRequest};
 use super::work::RequestContext;
 use crate::driver::DriverContext;
 
@@ -82,21 +82,11 @@ pub fn outgoing(
     Ok((outgoing, connection.auth.clone()))
 }
 
-/// The realm keys this node releases group and realm secrets with, if it holds them.
-pub fn node_keys(ctx: &DriverContext) -> ReleaseKeys {
-    (ctx.metadata_handle.as_ref())
-        .map(|handle| ReleaseKeys {
-            seal: handle.realm_seal_key(),
-            vault: handle.realm_vault_key(),
-        })
-        .unwrap_or_default()
-}
-
 /// Releases the secret of `slot` for one request of a work that run `run_id` started and adds it
 /// to `outgoing`; answers the exposure the rule allows now and the fields it added.
 pub async fn release_into(
     ctx: &DriverContext,
-    (config, local, keys): (&RealmConfigDocument, NodeId, &ReleaseKeys),
+    (config, local): (&RealmConfigDocument, NodeId),
     (install, slot, run_id): (&PluginInstall, &str, Ulid),
     outgoing: &mut OutgoingRequest,
 ) -> Result<(ResponseExposure, SecretFields), HostError> {
@@ -108,7 +98,7 @@ pub async fn release_into(
         held: None,
         run_id: Some(run_id),
     };
-    let released = ask_release(ctx, config, (local, keys), request).await;
+    let released = ask_release(ctx, config, local, request).await;
     let mut released = released.map_err(|error| match error {
         ReleaseError::Refused(_) => HostError::new(ErrorKind::Denied, error.to_string()),
         ReleaseError::Unavailable(why) => unavailable(why),

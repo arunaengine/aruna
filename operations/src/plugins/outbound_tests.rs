@@ -263,7 +263,7 @@ async fn stored(fixture: &Fixture) -> Vec<u8> {
 
 #[tokio::test]
 async fn injects_without_showing() {
-    use crate::plugins::bound::tests::{TOKEN, keys};
+    use crate::plugins::bound::tests::{TOKEN, hold_keys};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
     // The destination echoes the token back in a field the code may read.
@@ -273,7 +273,7 @@ async fn injects_without_showing() {
         "call": "send", "connection": "api", "method": "POST", "path": "records", "body": {"a": 1}
     });
     let worker = worker(&fixture);
-    worker.use_keys(keys());
+    hold_keys(&fixture.ctx);
     let done = probe_with(&fixture, &install, (&worker, sender.clone()), input).await;
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     let (request, _) = sender.asked.lock().unwrap()[0].clone();
@@ -319,7 +319,7 @@ async fn probe_with(
 
 #[tokio::test]
 async fn narrowed_rules_refuse() {
-    use crate::plugins::bound::tests::keys;
+    use crate::plugins::bound::tests::hold_keys;
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
     let fixture = Fixture::keyed().await;
     let install = secured_install(&fixture).await;
@@ -328,7 +328,7 @@ async fn narrowed_rules_refuse() {
         "call": "send", "connection": "api", "method": "POST", "path": "records"
     });
     let worker = worker(&fixture);
-    worker.use_keys(keys());
+    hold_keys(&fixture.ctx);
     let mut run = probe_with(&fixture, &install, (&worker, sender.clone()), input).await;
     assert_eq!(run.state, RunState::Succeeded, "{:?}", run.message);
     // An admin narrows the rule by hand: a retry refuses the settled call instead of filtering
@@ -360,7 +360,7 @@ async fn narrowed_rules_refuse() {
 
 #[tokio::test]
 async fn whole_answers_gated() {
-    use crate::plugins::bound::tests::{bound, edit_config, keys, secret_with};
+    use crate::plugins::bound::tests::{bound, edit_config, hold_keys, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::check::RunScope;
     use aruna_plugins::broker::{Broker, CallContext, ErrorKind, Method, SendRequest};
@@ -385,6 +385,7 @@ async fn whole_answers_gated() {
         .find(|i| i.install_id == install.install_id)
         .unwrap();
     secret_with(&fixture, &install, ResponseExposure::Status).await;
+    hold_keys(&fixture.ctx);
     let send = || {
         let ctx = Arc::new(fixture.ctx.clone());
         let mut run = queued(install.install_id, 1);
@@ -395,9 +396,7 @@ async fn whole_answers_gated() {
             run,
         };
         let sender = fake(200, r#"{"id":1}"#);
-        let broker = RunBroker::new(ctx, scope)
-            .with_outbound(sender)
-            .with_keys(keys());
+        let broker = RunBroker::new(ctx, scope).with_outbound(sender);
         let install = &install;
         async move {
             let cx = CallContext {
@@ -477,7 +476,7 @@ pub(crate) async fn leaks(fixture: &Fixture, canary: &str) -> Vec<&'static str> 
 
 #[tokio::test]
 async fn canaries_stay_hidden() {
-    use crate::plugins::bound::tests::{TOKEN, keys};
+    use crate::plugins::bound::tests::{TOKEN, hold_keys};
     use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
     use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
     let fixture = Fixture::keyed().await;
@@ -496,7 +495,7 @@ async fn canaries_stay_hidden() {
         "call": "send", "connection": "api", "method": "POST", "path": "records", "body": {}
     });
     let worker = worker(&fixture);
-    worker.use_keys(keys());
+    hold_keys(&fixture.ctx);
     let done = probe_with(&fixture, &install, (&worker, sender), input).await;
     assert_eq!(done.state, RunState::Succeeded, "{:?}", done.message);
     // Run records, guest log lines, intents and audit rows hold no form of the value; the scan

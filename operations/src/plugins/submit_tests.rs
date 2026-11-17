@@ -438,7 +438,7 @@ async fn narrowed_download_refused() {
     use aruna_core::secrets::ResponseExposure;
     use aruna_plugins::broker::{Broker, CallContext, Intent, JobDownload};
 
-    use crate::plugins::bound::tests::{ORIGIN, keys, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, hold_keys, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::work::list_work;
     let fixture = Fixture::keyed().await;
@@ -446,7 +446,8 @@ async fn narrowed_download_refused() {
     secret_with(&fixture, &install, ResponseExposure::Status).await;
     let mut scope = scope(&fixture, &install);
     scope.run.settings = format!(r#"{{"catalog_url":"{ORIGIN}"}}"#);
-    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys());
+    hold_keys(&fixture.ctx);
+    let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope);
     let cx = CallContext {
         run: "run".into(),
         install: install.install_id.to_string(),
@@ -561,7 +562,7 @@ async fn reply_rechecked() {
     use aruna_core::secrets::{ResponseExposure, SecretName};
     use aruna_plugins::broker::{Broker, CallContext};
 
-    use crate::plugins::bound::tests::{ORIGIN, keys, rule_for, secret_with};
+    use crate::plugins::bound::tests::{ORIGIN, hold_keys, rule_for, secret_with};
     use crate::plugins::broker::RunBroker;
     use crate::plugins::rules::{RuleGuard, consumer, edit_rules};
     use crate::plugins::work::{record_sent, reserve};
@@ -598,7 +599,7 @@ async fn reply_rechecked() {
         .await
         .unwrap();
     let broker = RunBroker::new(Arc::new(fixture.ctx.clone()), scope(&fixture, &install));
-    let broker = broker.with_keys(keys());
+    hold_keys(&fixture.ctx);
     let cx = CallContext {
         run: "run".into(),
         install: install.install_id.to_string(),

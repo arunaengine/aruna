@@ -527,12 +527,13 @@ async fn invalid_patches() {
 #[tokio::test]
 async fn secret_values_granted() {
     use crate::plugins::account::{Identity, ensure_role, guard_of};
-    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, keys, secret};
+    use crate::plugins::bound::tests::{TOKEN, bound, edit_config, hold_keys, secret};
     use crate::plugins::grants::role_paths;
     use crate::plugins::rules::ensure_rules;
     let fixture = Fixture::keyed().await;
     let install = bound(&fixture).await;
     secret(&fixture, &install).await;
+    hold_keys(&fixture.ctx);
     let broker = |install: &PluginInstall| {
         let mut run = queued(install.install_id, 1);
         run.digest = install.digest.clone();
@@ -541,7 +542,7 @@ async fn secret_values_granted() {
             local: fixture.actor.node_id,
             run,
         };
-        RunBroker::new(Arc::new(fixture.ctx.clone()), scope).with_keys(keys())
+        RunBroker::new(Arc::new(fixture.ctx.clone()), scope)
     };
     let kind = async |install: &PluginInstall| {
         let refused = broker(install).secret_value(&cx(), "api_key").await;
