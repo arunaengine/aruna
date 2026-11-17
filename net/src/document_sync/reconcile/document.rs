@@ -45,7 +45,8 @@ struct ReconcileBatch {
     /// The cursor the batch starts from, where an overflow replay resumes.
     start: ::irokle::ActorClock,
     cursor_key: ByteView,
-    cursor: ::irokle::ActorClock,
+    /// The stored form of the advanced cursor, written once the batch applied.
+    cursor_value: Value,
     rejections: Vec<SyncRejection>,
     events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
 }
@@ -85,8 +86,8 @@ impl DocumentSyncService {
                 continue;
             };
             let genesis = batch.genesis;
-            let cursor = batch.cursor.clone();
             let cursor_key = batch.cursor_key.clone();
+            let value = batch.cursor_value.clone();
             let start = batch.start.clone();
             let mut outcome = self.apply_reconcile_batch(topic_id, batch).await?;
             if outcome.overflowed {
@@ -113,7 +114,6 @@ impl DocumentSyncService {
                 // unresolved topic is safe to mark as applied.
                 continue;
             }
-            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
             if outcome.deferred_creates {
                 deferred_rejections.append(&mut outcome.rejections);
                 deferred_cursor_writes.push((
@@ -255,11 +255,13 @@ impl DocumentSyncService {
         if batch.cursor == cursor {
             return Ok(None);
         }
+        let cursor_value =
+            applied_cursor_value(self.node.storage(), topic_id, genesis, &batch.cursor)?;
         Ok(Some(ReconcileBatch {
             genesis,
             start: cursor,
             cursor_key,
-            cursor: batch.cursor,
+            cursor_value,
             rejections: batch.rejections,
             events: batch.events,
         }))
