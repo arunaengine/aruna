@@ -53,8 +53,9 @@ use crate::routes::storage::bucket::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
+use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_operations::s3::bucket::release::read::release_members;
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);

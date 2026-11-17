@@ -58,8 +58,9 @@ use crate::metadata::{AuthToken, WritePeerError};
 use crate::s3::bucket::dataset::{DescriptionError, bucket_metadata, dataset_description};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use crate::s3::bucket::release::read::release_members;
-use crate::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
+use crate::s3::bucket::release::{BucketScope, MembershipCaller};
 use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_core::structs::storage::release::MembershipQuery;
 
 /// Launches one witness may spend on a request over its whole lifetime. It is
 /// stored in the immutable spec, so a later config change cannot widen it.

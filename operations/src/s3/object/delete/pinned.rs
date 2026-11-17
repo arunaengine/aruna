@@ -19,8 +19,9 @@ use crate::driver::{DriverContext, drive};
 use crate::s3::bucket::release::read::load_access;
 use crate::s3::bucket::release::view::{FilePage, ReleaseViewOperation, ViewConfig, ViewError};
 use crate::s3::bucket::release::{
-    BucketScope, MembersConfig, MembersOutput, MembershipQuery, ReleaseMembersOperation,
+    BucketScope, MembersConfig, MembersOutput, ReleaseMembersOperation,
 };
+use aruna_core::structs::storage::release::MembershipQuery;
 
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PinnedError {

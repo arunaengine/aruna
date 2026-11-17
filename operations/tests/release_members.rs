@@ -21,6 +21,7 @@ use aruna_core::structs::storage::bucket_metadata::{
 };
 use aruna_core::structs::storage::distribution::KeyRange;
 use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::release::MembershipQuery;
 use aruna_core::structs::storage::release::{CRATE_CHUNK, CrateChunk, HolderAnswer, HolderAsk};
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
@@ -32,7 +33,7 @@ use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use aruna_operations::s3::bucket::metadata::PutMetadataOperation;
 use aruna_operations::s3::bucket::release::publish::release_files;
 use aruna_operations::s3::bucket::release::read::{load_access, release_members};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, MembershipQuery};
+use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller};
 use aruna_operations::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use serde_json::json;
 use topology::{TestResult, Topology};
@@ -83,7 +84,7 @@ async fn ask(
     scope: BucketScope<'_>,
     auth: AuthContext,
     queries: &[MembershipQuery],
-) -> TestResult<Vec<aruna_operations::s3::bucket::release::ReleaseMembers>> {
+) -> TestResult<Vec<aruna_core::structs::storage::release::ReleaseMembers>> {
     let caller = MembershipCaller {
         auth: &auth,
         bearer: None,

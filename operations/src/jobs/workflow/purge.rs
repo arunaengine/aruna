@@ -29,7 +29,7 @@ use crate::auth::request_policy::{PolicyEnforcementError, PolicyRequestExtras};
 use crate::driver::{drive, drive_retry};
 use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::{BucketScope, MembershipQuery};
+use crate::s3::bucket::release::BucketScope;
 use crate::s3::fence_store::AcquireFenceOperation;
 use crate::s3::multipart::abort::{AbortUploadError, AbortUploadInput, AbortUploadOperation};
 use crate::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
@@ -38,6 +38,7 @@ use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_o
 use crate::s3::object::delete::pinned::{PinnedError, ReleaseGuards, version_pins};
 use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
 use crate::s3::purge_fence::PurgeFenceError;
+use aruna_core::structs::storage::release::MembershipQuery;
 
 const PURGE_BATCH_SIZE: usize = 1_000;
 /// How often a paused purge looks whether it was resumed.

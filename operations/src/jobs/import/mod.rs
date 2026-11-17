@@ -78,13 +78,14 @@ use crate::notifications::watch::emit::emit_metadata_created;
 use crate::realm::get_config::GetConfigOperation;
 use crate::replication::queue::{LiveVersionInput, LiveVersionOperation};
 use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::release::{BucketScope, MembershipQuery};
+use crate::s3::bucket::release::BucketScope;
 use crate::s3::object::delete::DeleteObjectError;
 use crate::s3::object::delete::bulk::{BulkDeleteEntry, BulkDeleteInput, delete_objects};
 use crate::s3::object::delete::pinned::version_pins;
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
 use crate::staging::read_source::{ReadSourceError, ReadSourceInput, ReadSourceOperation};
+use aruna_core::structs::storage::release::MembershipQuery;
 
 const PAYLOAD_CHUNK_BYTES: usize = 64 * 1024;
 /// Longest wait for the source realm to confirm a grant.

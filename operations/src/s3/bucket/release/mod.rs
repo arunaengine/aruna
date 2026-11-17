@@ -29,7 +29,7 @@ use aruna_core::structs::storage::release::{
     CrateBytes, CrateRead, CrateReadError, HolderAnswer, HolderAsk, HolderRequest, ReleaseEffect,
     ReleaseEvent, ValidRelease,
 };
-pub use aruna_core::structs::storage::release::{
+use aruna_core::structs::storage::release::{
     MembershipQuery, RangeFiles, RangeMembers, ReleaseFile, ReleaseMembers,
 };
 use aruna_core::structs::storage::replication::VersionedObjectArn;
