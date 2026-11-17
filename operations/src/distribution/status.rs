@@ -27,7 +27,7 @@ use crate::distribution::index_feed::{IndexProgress, range_progress};
 use crate::driver::{DriverContext, drive};
 use crate::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
 use crate::placement::process_placements::load_realm_config;
-use crate::replication::catch_up::read_cursor;
+use crate::replication::bootstrap::ReadCursorOperation;
 use crate::replication::members::{CopyLag, CopyLagOperation};
 
 #[derive(Debug, Error, PartialEq)]
@@ -433,7 +433,8 @@ async fn add_fills(context: &DriverContext, set_id: Ulid, range: &mut RangeStatu
             admitted: true,
         }
         .intent();
-        let cursor = read_cursor(context, key).await.ok().flatten();
+        let cursor = drive(ReadCursorOperation::new(key), context).await;
+        let cursor = cursor.ok().flatten();
         fill.progress = Some(match cursor.filter(|cursor| cursor.intent == intent) {
             Some(cursor) => FillProgress {
                 versions: cursor.versions,

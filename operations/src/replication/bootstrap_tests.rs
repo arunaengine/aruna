@@ -129,3 +129,64 @@ async fn newer_intent_restarts() {
         "a later join catches up again"
     );
 }
+
+fn cursor_row(value: Option<Vec<u8>>) -> Event {
+    Event::Storage(StorageEvent::ReadResult {
+        key: b"cursor".to_vec().into(),
+        value: value.map(Into::into),
+    })
+}
+
+#[test]
+fn reads_stored_cursor() {
+    let stored = BootstrapCursor::start([3; 32], 7);
+    let start = Effect::Storage(StorageEffect::Read {
+        key_space: BOOTSTRAP_KEYSPACE.to_string(),
+        key: b"cursor".to_vec().into(),
+        txn_id: None,
+    });
+    let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+    let steps = vec![(cursor_row(Some(stored.to_bytes().unwrap())), vec![])];
+    aruna_core::operation_check::check_trace(&mut operation, &[start], steps);
+    assert_eq!(operation.finalize(), Ok(Some(stored)));
+}
+
+#[test]
+fn cursor_read_outcomes() {
+    let read = |event: Event| {
+        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+        operation.start();
+        operation.step(event);
+        operation.finalize()
+    };
+    assert_eq!(read(cursor_row(None)), Ok(None));
+    assert!(matches!(
+        read(cursor_row(Some(vec![0xff]))),
+        Err(BootstrapError::Conversion(_))
+    ));
+    let failed = Event::Storage(StorageEvent::Error {
+        error: StorageError::Timeout,
+    });
+    assert_eq!(
+        read(failed),
+        Err(BootstrapError::Storage(StorageError::Timeout))
+    );
+}
+
+#[test]
+fn cursor_read_contract() {
+    use aruna_core::operation_check::{
+        check_abort, rejects_events, rejects_finalize, sample_events,
+    };
+    let make = || {
+        let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+        operation.start();
+        operation
+    };
+    let accepted = |event: &Event| matches!(event, Event::Storage(StorageEvent::ReadResult { .. }));
+    let refused = rejects_events(make, sample_events, accepted);
+    assert_eq!(refused.len(), sample_events().len() - 1);
+    let mut fresh = ReadCursorOperation::new(b"cursor".to_vec());
+    check_abort(&mut fresh, &[]);
+    rejects_finalize(fresh);
+}

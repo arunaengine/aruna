@@ -362,6 +362,58 @@ impl Operation for BootstrapPage {
     }
 }
 
+/// One stored bootstrap cursor, read on its own key.
+pub struct ReadCursorOperation {
+    key: Vec<u8>,
+    result: Option<Result<Option<BootstrapCursor>, BootstrapError>>,
+}
+
+impl ReadCursorOperation {
+    pub fn new(key: Vec<u8>) -> Self {
+        Self { key, result: None }
+    }
+}
+
+impl Operation for ReadCursorOperation {
+    type Output = Option<BootstrapCursor>;
+    type Error = BootstrapError;
+
+    fn start(&mut self) -> Effects {
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BOOTSTRAP_KEYSPACE.to_string(),
+            key: self.key.clone().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn step(&mut self, event: Event) -> Effects {
+        self.result = Some(match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .map(|value| BootstrapCursor::from_bytes(&value))
+                .transpose()
+                .map_err(BootstrapError::from),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(BootstrapError::UnexpectedEvent {
+                state: "ReadCursor",
+                got: other.label(),
+            }),
+        });
+        smallvec![]
+    }
+
+    fn is_complete(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn finalize(self) -> Result<Option<BootstrapCursor>, BootstrapError> {
+        self.result.unwrap_or(Err(BootstrapError::NotFinished))
+    }
+
+    fn abort(&mut self) -> Effects {
+        smallvec![]
+    }
+}
+
 #[cfg(test)]
 #[path = "bootstrap_tests.rs"]
 mod tests;

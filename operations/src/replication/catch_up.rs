@@ -25,7 +25,7 @@ use aruna_storage::StorageHandle;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use super::bootstrap::{BootstrapPage, PAGE_ROWS, PageConfig, PageProgress};
+use super::bootstrap::{BootstrapPage, PAGE_ROWS, PageConfig, PageProgress, ReadCursorOperation};
 use super::members::ReadRecordOperation;
 use super::queue::schedule_blob_drain;
 use crate::distribution::create::submit;
@@ -90,23 +90,12 @@ async fn delete(context: &DriverContext, deletes: Vec<(String, Key)>) -> Result<
 }
 
 /// One stored cursor, read on its own key.
-pub(crate) async fn read_cursor(
+async fn read_cursor(
     context: &DriverContext,
     key: Vec<u8>,
 ) -> Result<Option<BootstrapCursor>, String> {
-    let read = StorageEffect::Read {
-        key_space: BOOTSTRAP_KEYSPACE.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| BootstrapCursor::from_bytes(&value))
-            .transpose()
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected cursor answer {}", other.label())),
-    }
+    let read = drive(ReadCursorOperation::new(key), context).await;
+    read.map_err(|error| error.to_string())
 }
 
 /// The range index a walk continues at; with `next` it records where the next walk starts.
